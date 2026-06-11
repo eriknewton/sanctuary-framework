@@ -60,7 +60,9 @@ public enum SocketPath {
     ) -> ResolvedSocketPath {
         if platform == "darwin" {
             if let active = resolveActiveConfigSocketPath(configPath: activeConfigPath) {
-                return active
+                if fortressPath == nil || active.fortressPath == fortressPath {
+                    return ResolvedSocketPath(path: active.path, source: .macosActiveConfig)
+                }
             }
             // Legacy /tmp read-fallback ONLY for the production default path, so a
             // test passing an explicit (hermetic) configPath is not perturbed by
@@ -68,7 +70,9 @@ public enum SocketPath {
             if activeConfigPath == SocketPath.activeConfigPath,
                let legacyActive = resolveActiveConfigSocketPath(
                    configPath: SocketPath.legacyActiveConfigPath) {
-                return legacyActive
+                if fortressPath == nil || legacyActive.fortressPath == fortressPath {
+                    return ResolvedSocketPath(path: legacyActive.path, source: .macosActiveConfig)
+                }
             }
         }
 
@@ -113,7 +117,9 @@ public enum SocketPath {
         )
     }
 
-    private static func resolveActiveConfigSocketPath(configPath: String) -> ResolvedSocketPath? {
+    private static func resolveActiveConfigSocketPath(
+        configPath: String
+    ) -> (path: String, fortressPath: String?)? {
         guard let data = FileManager.default.contents(atPath: configPath) else {
             return nil
         }
@@ -128,7 +134,10 @@ public enum SocketPath {
         else {
             return nil
         }
-        return ResolvedSocketPath(path: socketPath, source: .macosActiveConfig)
+        return (
+            path: socketPath,
+            fortressPath: object["fortress_path"] as? String
+        )
     }
 
     private static func isPidAlive(_ pid: Int) -> Bool {

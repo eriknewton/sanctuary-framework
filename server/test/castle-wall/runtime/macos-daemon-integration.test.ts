@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import { parseFrame } from "../../../src/castle-wall/ipc/framing.js";
+import type { ArmLeaseNotification } from "../../../src/castle-wall/ipc/messages.js";
 import { AuditLog } from "../../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
@@ -74,7 +75,14 @@ describe("Castle Wall macOS daemon integration", () => {
       async broadcastDecisionResponse() {
         return 0;
       },
+      async broadcastArmLease() {
+        return 0;
+      },
     };
+  }
+
+  function wait(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function makeMessageReader(socket: Socket): () => Promise<Record<string, unknown>> {
@@ -171,6 +179,62 @@ describe("Castle Wall macOS daemon integration", () => {
 
     await handle.stop();
     await expect(stat(configPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("stops daemon heartbeat re-arm after listener receives operator revoke", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const broadcasts: ArmLeaseNotification[] = [];
+    let revokeHook: ((lease: ArmLeaseNotification) => void | Promise<void>) | undefined;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      armLeaseHeartbeatIntervalSeconds: 0.01,
+      listenerFactory(options) {
+        revokeHook = options.onArmLeaseRevoke;
+        return {
+          async start() {
+            await writeFile(options.socketPath, "");
+          },
+          async stop() {
+            await unlink(options.socketPath).catch(() => {});
+          },
+          async broadcastManifestUpdate() {
+            return 0;
+          },
+          async broadcastDecisionResponse() {
+            return 0;
+          },
+          async broadcastArmLease(lease: ArmLeaseNotification) {
+            broadcasts.push(lease);
+            return 0;
+          },
+        };
+      },
+    });
+
+    await wait(35);
+    expect(broadcasts.some((lease) => lease.armed === true)).toBe(true);
+
+    broadcasts.length = 0;
+    const revoke: ArmLeaseNotification = {
+      type: "arm_lease",
+      armed: false,
+      revoked: true,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-06-10T00:00:00.000Z",
+    };
+    await revokeHook?.(revoke);
+    broadcasts.push(revoke);
+    await wait(35);
+
+    expect(broadcasts).toEqual([revoke]);
+    await handle.stop();
   });
 
   it("rejects a second daemon for the same fortress with the Phase 3 message", async () => {

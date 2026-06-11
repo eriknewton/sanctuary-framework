@@ -21,6 +21,7 @@ public final class FlowEvaluatorEngine {
     public let manifestStore: ManifestStore
     public let flowCache: FlowCache
     public let agentResolver: AgentResolver
+    public let armLease: ArmLease
 
     /// The last signed `agentOrigin` descriptor delivered over IPC, retained
     /// across daemon restarts (pre-seed retention). `nil` means none has been
@@ -36,11 +37,13 @@ public final class FlowEvaluatorEngine {
         manifestStore: ManifestStore = ManifestStore(),
         flowCache: FlowCache = FlowCache(),
         agentResolver: @escaping AgentResolver = FlowEvaluatorEngine.defaultAgentResolver,
-        agentOrigin: AgentOriginDescriptor? = nil
+        agentOrigin: AgentOriginDescriptor? = nil,
+        armLease: ArmLease = ArmLease()
     ) {
         self.manifestStore = manifestStore
         self.flowCache = flowCache
         self.agentResolver = agentResolver
+        self.armLease = armLease
         self._agentOrigin = agentOrigin
         // When the manifest store changes, evict cached outcomes wholesale
         // so a deny rule that arrives after a flow was allowed cannot keep
@@ -84,6 +87,14 @@ public final class FlowEvaluatorEngine {
     /// tuple short-circuit. Uncertain outcomes are NOT cached because the
     /// resolution arrives via the operator-decision IPC path.
     public func evaluate(_ descriptor: FilterFlowDescriptor) -> EvaluationOutcome {
+        if armLease.failOpenReason() != nil {
+            // Intentional operator-armed degrade: an expired/stopped dead-man
+            // lease fails OPEN so an SSH-only operator can always recover from
+            // a wedged Tahoe NE preference subsystem. The marker is surfaced as
+            // the matched rule id so every bypassed flow is loud in audit.
+            return .allow(matchedRuleId: ArmLease.failOpenRuleId)
+        }
+
         let key = FlowCacheKey.from(descriptor)
         if let cached = flowCache.get(key) {
             return cached

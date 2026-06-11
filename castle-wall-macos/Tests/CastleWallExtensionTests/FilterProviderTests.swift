@@ -106,6 +106,113 @@ final class FilterProviderTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
+    func testExpiredArmLeaseFailsOpenWithAuditMarker() {
+        var now = Date(timeIntervalSince1970: 100)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: 10, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 111)
+
+        let store = ManifestStore()
+        let cache = FlowCache(capacity: 8)
+        let engine = FlowEvaluatorEngine(
+            manifestStore: store,
+            flowCache: cache,
+            armLease: lease
+        )
+        loadStore(store, rules: [rule(host: "other.example.com")])
+
+        let outcome = engine.evaluate(flow(host: "novel.example.com"))
+        XCTAssertEqual(outcome, .allow(matchedRuleId: ArmLease.failOpenRuleId))
+        XCTAssertEqual(cache.count, 0, "fail-open verdicts must not outlive a renewed lease")
+    }
+
+    func testStoppedHeartbeatFailsOpenWithAuditMarker() {
+        var now = Date(timeIntervalSince1970: 200)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 211)
+
+        let engine = FlowEvaluatorEngine(armLease: lease)
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+        )
+    }
+
+    func testRevokedArmLeaseFailsOpenWithLeaseRevokedReason() {
+        let lease = ArmLease()
+        lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+
+        let engine = FlowEvaluatorEngine(armLease: lease)
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+        )
+    }
+
+    func testNeverArmedLeaseStillEnforcesManifest() {
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(manifestStore: store, armLease: ArmLease())
+        loadStore(store, rules: [rule(host: "blocked.example.com", disposition: "deny")])
+
+        XCTAssertNil(engine.armLease.failOpenReason())
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .drop(matchedRuleId: "r-1")
+        )
+    }
+
+    func testDaemonDetachedLeaseStillEnforcesManifest() {
+        let lease = ArmLease()
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        lease.update(ArmLeaseUpdate(armed: false, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(manifestStore: store, armLease: lease)
+        loadStore(store, rules: [rule(host: "blocked.example.com", disposition: "deny")])
+
+        XCTAssertNil(lease.failOpenReason())
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .drop(matchedRuleId: "r-1")
+        )
+    }
+
+    func testRevokeSurvivesGracefulDaemonDetach() {
+        // Lockout regression guard: after an operator revoke, a graceful
+        // daemon-detach (armed=false WITHOUT the revoke flag) must not clear
+        // the revoked state — else the wall silently re-enforces with no
+        // heartbeat tripwire left. Only an explicit re-arm clears revoke.
+        let lease = ArmLease()
+        lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+
+        lease.update(ArmLeaseUpdate(armed: false, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+        XCTAssertTrue(lease.snapshot().revoked)
+    }
+
+    func testArmLeaseRearmAfterRevokeRestoresEnforcement() {
+        let lease = ArmLease()
+        lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+
+        XCTAssertNil(lease.failOpenReason())
+        XCTAssertFalse(lease.snapshot().revoked)
+        let store = ManifestStore()
+        let engine = FlowEvaluatorEngine(manifestStore: store, armLease: lease)
+        loadStore(store, rules: [rule(host: "blocked.example.com", disposition: "deny")])
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .drop(matchedRuleId: "r-1")
+        )
+    }
+
     func testEvaluateReturnsUncertainWhenOnlyPromptMatches() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)

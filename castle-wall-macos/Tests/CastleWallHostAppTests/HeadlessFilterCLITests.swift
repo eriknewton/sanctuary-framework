@@ -30,6 +30,22 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertEqual(invocation.timeoutSeconds, 5.0)
     }
 
+    func testParseLeaseFlags() {
+        let ttl = HeadlessFilterCLI.parse(["app", "--headless", "enable", "--ttl=300"])
+        guard case let .invocation(ttlInvocation)? = ttl else {
+            return XCTFail("expected ttl invocation")
+        }
+        XCTAssertEqual(ttlInvocation.ttlSeconds, 300)
+        XCTAssertFalse(ttlInvocation.noTTL)
+
+        let durable = HeadlessFilterCLI.parse(["app", "--headless", "enable", "--no-ttl"])
+        guard case let .invocation(durableInvocation)? = durable else {
+            return XCTFail("expected durable invocation")
+        }
+        XCTAssertNil(durableInvocation.ttlSeconds)
+        XCTAssertTrue(durableInvocation.noTTL)
+    }
+
     func testParseInvalidTimeoutIsUsageError() {
         for bad in ["--timeout=abc", "--timeout=0", "--timeout=-3"] {
             let result = HeadlessFilterCLI.parse(["app", "--headless", "enable", bad])

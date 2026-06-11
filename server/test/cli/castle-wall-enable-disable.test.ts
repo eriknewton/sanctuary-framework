@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
+import { parseFrame } from "../../src/castle-wall/ipc/framing.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -50,6 +52,16 @@ function makeInvoker(
   return { invoke, calls };
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error("timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("castle-wall enable/disable CLI verbs", () => {
   const tempDirs: string[] = [];
 
@@ -78,7 +90,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const err = new CaptureStream();
     const { invoke, calls } = makeInvoker({});
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out,
       err,
       env,
@@ -103,7 +115,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out,
       err,
       env,
@@ -119,7 +131,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
-      [hostAppPath, "--headless", "enable"],
+      [hostAppPath, "--headless", "enable", "--no-ttl"],
       [hostAppPath, "--headless", "status"],
     ]);
   });
@@ -131,7 +143,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env,
@@ -196,7 +208,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       },
     });
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -237,6 +249,65 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(calls.map((c) => c[2])).toEqual(["disable", "status"]);
   });
 
+  it("disable sends a revoke-flagged lease before claiming fail-open recovery", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const received: Array<Record<string, unknown>> = [];
+    const socketPath = join(fortressPath, "castle.sock");
+    const server: Server = createServer((socket) => {
+      let buffer = Buffer.alloc(0);
+      socket.on("data", (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        const parsed = parseFrame(buffer);
+        if (parsed.kind !== "complete") return;
+        buffer = buffer.subarray(parsed.consumedBytes);
+        const envelope = JSON.parse(parsed.body) as { params?: Record<string, unknown> };
+        received.push(envelope.params ?? {});
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      // port-discipline: ignore - Unix domain socket path, not a TCP port.
+      server.listen(socketPath, resolve);
+    });
+
+    const invoke: HostAppInvoker = async (_binaryPath, args) => {
+      if (args[1] === "disable") {
+        await waitFor(() => received.length > 0);
+        expect(received[0]).toMatchObject({
+          type: "arm_lease",
+          armed: false,
+          revoked: true,
+          ttl_seconds: null,
+        });
+        return {
+          stdout: reportLine("disable", "enabled", false, "NE save timed out"),
+          stderr: "",
+          exitCode: 1,
+        };
+      }
+      throw new Error(`unexpected headless action: ${args[1]}`);
+    };
+
+    try {
+      const code = await runDisable([], {
+        out,
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(err.text()).toContain("fail-open path is active");
+      expect(out.text()).toContain("provider dead-man lease revoked");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("fails when post-change verification disagrees with the mutation report", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
@@ -245,7 +316,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -373,7 +444,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
   it("is macOS-only", async () => {
     const err = new CaptureStream();
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env: {},
@@ -388,12 +459,39 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(parseCastleWallArgs([]).force).toBeUndefined();
   });
 
-  it("enable returns distinct exit 4 + toggle guidance when the sysext is activated-but-disabled", async () => {
+  it("enable requires an explicit dead-man TTL mode", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
     const { invoke, calls } = makeInvoker({});
 
     const code = await runEnable([], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(2);
+    expect(err.text()).toContain("requires either --ttl");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("parseCastleWallArgs understands ttl modes", () => {
+    expect(parseCastleWallArgs(["--ttl", "30s"]).ttlSeconds).toBe(30);
+    expect(parseCastleWallArgs(["--ttl=5m"]).ttlSeconds).toBe(300);
+    expect(parseCastleWallArgs(["--no-ttl"]).noTtl).toBe(true);
+  });
+
+  it("enable returns distinct exit 4 + toggle guidance when the sysext is activated-but-disabled", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -444,7 +542,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     // No hostAppInvoke: exercises the real default (LaunchServices) path,
     // but with the `open` runner + report path stubbed so no process spawns.
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out,
       err: new CaptureStream(),
       env,
@@ -474,6 +572,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       "--args",
       "--headless",
       "enable",
+      "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);

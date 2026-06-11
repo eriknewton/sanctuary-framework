@@ -56,6 +56,7 @@ import type {
   PolicyReloadRequest,
   PolicyReloadResponse,
   DecisionResponse,
+  ArmLeaseNotification,
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 
@@ -98,6 +99,8 @@ export interface MacOSFlowIpcListenerOptions {
   handshakeSigner?: MacOSHandshakeSigner;
   /** Optional local-admin command handler used by the CLI verbs. */
   adminHandler?: MacOSFlowIpcAdminHandler;
+  /** Called before an inbound operator revoke is broadcast to subscribers. */
+  onArmLeaseRevoke?: (lease: ArmLeaseNotification) => void | Promise<void>;
 }
 
 export interface MacOSHandshakeSigner {
@@ -180,6 +183,8 @@ export class MacOSFlowIpcListener {
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
   private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
+  private readonly onArmLeaseRevoke: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
+  private currentArmLease: ArmLeaseNotification | null = null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -198,6 +203,7 @@ export class MacOSFlowIpcListener {
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
     this.handshakeSigner = opts.handshakeSigner ?? null;
     this.adminHandler = opts.adminHandler ?? null;
+    this.onArmLeaseRevoke = opts.onArmLeaseRevoke ?? null;
   }
 
   /** Bind the UDS socket and start accepting connections. */
@@ -266,6 +272,18 @@ export class MacOSFlowIpcListener {
     for (const conn of this.connections.values()) {
       if (!conn.registered) continue;
       this.writeMessage(conn, response);
+      emitted += 1;
+    }
+    return emitted;
+  }
+
+  /** Fan the current arm lease heartbeat to active extension subscribers. */
+  async broadcastArmLease(lease: ArmLeaseNotification): Promise<number> {
+    this.currentArmLease = lease;
+    let emitted = 0;
+    for (const conn of this.connections.values()) {
+      if (!conn.registered) continue;
+      this.writeMessage(conn, lease);
       emitted += 1;
     }
     return emitted;
@@ -425,6 +443,9 @@ export class MacOSFlowIpcListener {
       case "decision_response":
         await this.handleDecisionResponse(state, message as DecisionResponse);
         return;
+      case "arm_lease":
+        await this.handleArmLease(message as ArmLeaseNotification);
+        return;
       case "flow_decision_recorded":
         await this.consumer.handleFlowDecisionRecorded(
           message as FlowDecisionRecordedNotification,
@@ -443,11 +464,21 @@ export class MacOSFlowIpcListener {
     }
   }
 
+  private async handleArmLease(message: ArmLeaseNotification): Promise<void> {
+    if (message.revoked === true) {
+      await this.onArmLeaseRevoke?.(message);
+    }
+    await this.broadcastArmLease(message);
+  }
+
   private async handleSubscribe(
     state: ConnectionState,
     request: ManifestSubscribeRequest,
   ): Promise<void> {
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
+    if (this.currentArmLease) {
+      this.writeMessage(state, this.currentArmLease);
+    }
   }
 
   private async handlePolicyReload(
