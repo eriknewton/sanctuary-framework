@@ -1,0 +1,175 @@
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import {
+  federationEventHash,
+  type FederationEvent,
+} from "../../src/v1/federation.js";
+import { signOperatorPayload } from "../../src/v1/operator-signed.js";
+import { toBase64url } from "../../src/core/encoding.js";
+import {
+  OPERATOR,
+  openDurableSession,
+  openLoopbackSession,
+  startRig,
+  type TestRig,
+} from "./rig.js";
+import { makeFederationMaterials, type FedMaterials } from "./fed-materials.js";
+
+let rig: TestRig;
+let materials: FedMaterials;
+
+beforeEach(async () => {
+  rig = await startRig({ withOperatorIdentity: true });
+  materials = makeFederationMaterials();
+  rig.dashboard.setFederationContext(materials.context);
+});
+
+afterEach(async () => {
+  await rig.stop();
+});
+
+function makeEvent(params: {
+  nodeId: string;
+  sequence: number;
+  previousHash: string | null;
+  kind?: string;
+}): FederationEvent {
+  const withoutHash = {
+    event_id: `${params.nodeId}:${params.sequence}`,
+    origin_node_id: params.nodeId,
+    sequence: params.sequence,
+    occurred_at: `2026-06-10T00:00:0${params.sequence}.000Z`,
+    kind: params.kind ?? "agent.seen",
+    payload: { agent_id: `agent-${params.sequence}` },
+    previous_hash: params.previousHash,
+  };
+  return {
+    ...withoutHash,
+    event_hash: federationEventHash(withoutHash),
+  };
+}
+
+function operatorSigned(action: string, payload: Record<string, unknown>) {
+  return {
+    ...payload,
+    operator_signature: toBase64url(signOperatorPayload(action, payload, OPERATOR.privateKey)),
+  };
+}
+
+async function enable(token: string) {
+  const res = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(operatorSigned("/v1/federation/enable", { idempotency_key: "enable" })),
+  });
+  expect(res.status).toBe(200);
+}
+
+async function sync(token: string, payload: Record<string, unknown>) {
+  return fetch(`${rig.baseUrl}/v1/federation/sync`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+describe("/v1/nodes + /v1/federation/sync", () => {
+  it("lists joined nodes with attestation and sync metadata", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+    const event = makeEvent({ nodeId: "linux-1", sequence: 1, previousHash: null });
+    const payload = {
+      node_id: "linux-1",
+      events: [event],
+      cursor: { after_sequence: 0 },
+      idempotency_key: "sync-1",
+    };
+    const res = await sync(token, operatorSigned("/v1/federation/sync", payload));
+    expect(res.status).toBe(200);
+
+    const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(nodesRes.status).toBe(200);
+    const body = (await nodesRes.json()) as { nodes: Array<Record<string, any>> };
+    expect(body.nodes).toHaveLength(1);
+    expect(body.nodes[0].node_id).toBe("linux-1");
+    expect(body.nodes[0].attestation_status).toBe("verified");
+    expect(body.nodes[0].last_sync.last_sequence).toBe(1);
+  });
+
+  it("requires OPERATOR_SIGNED for sync; a loopback session alone is not enough", async () => {
+    const token = await openLoopbackSession(rig);
+    const res = await sync(token, {
+      node_id: "linux-1",
+      events: [],
+      idempotency_key: "unsigned",
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+  });
+
+  it("rejects a tampered operator signature before appending events", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+    const event = makeEvent({ nodeId: "linux-1", sequence: 1, previousHash: null });
+    const payload = {
+      node_id: "linux-1",
+      events: [event],
+      idempotency_key: "tampered",
+    };
+    const signed = operatorSigned("/v1/federation/sync", payload);
+    const res = await sync(token, { ...signed, node_id: "cloud-1" });
+    expect(res.status).toBe(403);
+
+    const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(((await nodesRes.json()) as { nodes: unknown[] }).nodes).toHaveLength(0);
+  });
+
+  it("accepts a two-node exchange and rejects hash tampering, replay, and stale events", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+    const linux1 = makeEvent({ nodeId: "linux-1", sequence: 1, previousHash: null });
+    const linux2 = makeEvent({ nodeId: "linux-1", sequence: 2, previousHash: linux1.event_hash });
+    const cloud1 = makeEvent({ nodeId: "cloud-1", sequence: 1, previousHash: null });
+    const tampered = { ...makeEvent({ nodeId: "cloud-1", sequence: 2, previousHash: cloud1.event_hash }) };
+    tampered.payload = { agent_id: "changed-after-hash" };
+    const staleWithoutHash = {
+      event_id: "linux-1:stale",
+      origin_node_id: "linux-1",
+      sequence: 1,
+      occurred_at: "2026-06-10T00:00:09.000Z",
+      kind: "stale",
+      payload: { agent_id: "old" },
+      previous_hash: null,
+    };
+    const stale = {
+      ...staleWithoutHash,
+      event_hash: federationEventHash(staleWithoutHash),
+    };
+    const payload = {
+      node_id: "linux-1",
+      events: [linux1, linux2, cloud1, tampered, linux1, stale],
+      cursor: { node_id: "linux-1", after_sequence: 0 },
+      idempotency_key: "exchange",
+    };
+    const res = await sync(token, operatorSigned("/v1/federation/sync", payload));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      accepted: string[];
+      rejected: Array<{ event_id: string; reason: string }>;
+      events: FederationEvent[];
+    };
+    expect(body.accepted).toEqual(["linux-1:1", "linux-1:2", "cloud-1:1"]);
+    expect(body.rejected).toEqual(
+      expect.arrayContaining([
+        { event_id: "cloud-1:2", reason: "hash_mismatch" },
+        { event_id: "linux-1:1", reason: "replay" },
+        { event_id: "linux-1:stale", reason: "stale_sequence" },
+      ]),
+    );
+    expect(body.events.map((event) => event.event_id)).toEqual(["linux-1:1", "linux-1:2"]);
+  });
+});

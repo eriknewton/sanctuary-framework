@@ -167,6 +167,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "nodes") {
+    const { runNodesCommand } = await import("./cli/nodes.js");
+    const code = await runNodesCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (
     args[0] === "verify-exit-bundle" ||
     args[0] === "import-exit-bundle"
