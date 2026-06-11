@@ -933,6 +933,10 @@ public struct ManifestUpdatedBody: Codable, Equatable {
     public let manifest: ManifestSignedBody?
     public let signature: ManifestSignatureEnvelope?
     public let rules: [ManifestRule]
+    /// Opaque rule JSON as delivered on the wire. Digest verification uses
+    /// this representation so additive fields unknown to `ManifestRule` remain
+    /// inside the signed digest boundary.
+    public let receivedRules: [JSONValue]?
 
     public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
         self.type = "manifest_updated"
@@ -953,17 +957,20 @@ public struct ManifestUpdatedBody: Codable, Equatable {
             self.signature = nil
         }
         self.rules = rules
+        self.receivedRules = nil
     }
 
     public init(
         manifest: ManifestSignedBody,
         signature: ManifestSignatureEnvelope,
-        rules: [ManifestRule]
+        rules: [ManifestRule],
+        receivedRules: [JSONValue]? = nil
     ) {
         self.type = "manifest_updated"
         self.manifest = manifest
         self.signature = signature
         self.rules = rules
+        self.receivedRules = receivedRules
     }
 
     public var manifestSignatureB64url: String? {
@@ -975,6 +982,27 @@ public struct ManifestUpdatedBody: Codable, Equatable {
         case manifest
         case signature
         case rules
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try container.decode(String.self, forKey: .type)
+        self.manifest = try container.decodeIfPresent(ManifestSignedBody.self, forKey: .manifest)
+        self.signature = try container.decodeIfPresent(ManifestSignatureEnvelope.self, forKey: .signature)
+        self.rules = try container.decode([ManifestRule].self, forKey: .rules)
+        self.receivedRules = try container.decode([JSONValue].self, forKey: .rules)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(manifest, forKey: .manifest)
+        try container.encodeIfPresent(signature, forKey: .signature)
+        if let receivedRules, receivedRules.count == rules.count {
+            try container.encode(receivedRules, forKey: .rules)
+        } else {
+            try container.encode(rules, forKey: .rules)
+        }
     }
 }
 
@@ -1160,6 +1188,7 @@ private struct ManifestSubscribeEnvelopeBody: Codable {
 public enum JSONValue: Codable, Equatable {
     case null
     case bool(Bool)
+    case integer(Int64)
     case number(Double)
     case string(String)
     case array([JSONValue])
@@ -1171,6 +1200,8 @@ public enum JSONValue: Codable, Equatable {
             self = .null
         } else if let v = try? container.decode(Bool.self) {
             self = .bool(v)
+        } else if let v = try? container.decode(Int64.self) {
+            self = .integer(v)
         } else if let v = try? container.decode(Double.self) {
             self = .number(v)
         } else if let v = try? container.decode(String.self) {
@@ -1194,6 +1225,8 @@ public enum JSONValue: Codable, Equatable {
             try container.encodeNil()
         case .bool(let v):
             try container.encode(v)
+        case .integer(let v):
+            try container.encode(v)
         case .number(let v):
             try container.encode(v)
         case .string(let v):
@@ -1202,6 +1235,25 @@ public enum JSONValue: Codable, Equatable {
             try container.encode(v)
         case .object(let v):
             try container.encode(v)
+        }
+    }
+
+    public func jsonObject() -> Any {
+        switch self {
+        case .null:
+            return NSNull()
+        case .bool(let v):
+            return v
+        case .integer(let v):
+            return NSNumber(value: v)
+        case .number(let v):
+            return NSNumber(value: v)
+        case .string(let v):
+            return v
+        case .array(let v):
+            return v.map { $0.jsonObject() }
+        case .object(let v):
+            return v.mapValues { $0.jsonObject() }
         }
     }
 }
