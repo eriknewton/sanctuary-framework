@@ -33,6 +33,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import { fromBase64url } from "../core/encoding.js";
 import {
   issueBootstrapToken,
@@ -53,7 +54,7 @@ import type {
   JoinRequest,
 } from "../mesh/lifecycle/types.js";
 import type { V1SessionClaims } from "./session-service.js";
-import { verifyOperatorSignature } from "./operator-signed.js";
+import { canonicalJson, verifyOperatorSignature } from "./operator-signed.js";
 import { writeJson, readJsonBody, denyUnauthorized, denyForbidden } from "./http.js";
 
 const NODE_MODES: readonly NodeMode[] = [
@@ -68,7 +69,9 @@ export function isFederationPath(pathname: string): boolean {
     pathname === "/v1/federation/enable" ||
     pathname === "/v1/federation/disable" ||
     pathname === "/v1/federation/status" ||
-    pathname === "/v1/federation/authorize/init"
+    pathname === "/v1/federation/authorize/init" ||
+    pathname === "/v1/federation/sync" ||
+    pathname === "/v1/nodes"
   );
 }
 
@@ -272,6 +275,46 @@ export interface V1FederationDeps {
   rosterNodeIds(): string[];
   /** Record a newly joined node (status roster). */
   recordJoin(nodeId: string): void;
+  /** List federated nodes for GET /v1/nodes. */
+  listNodes(): FederationNodeView[];
+  /** Local append-only events available for exchange. */
+  listFederationEvents(since?: FederationSyncCursor): FederationEvent[];
+  /** Validate and append remote sync events. */
+  appendFederationEvents(events: FederationEvent[]): FederationAppendResult;
+}
+
+export interface FederationNodeView {
+  node_id: string;
+  label: string | null;
+  attestation_status: "verified" | "pending" | "failed" | "unknown";
+  first_seen: string;
+  last_seen: string;
+  last_sync: {
+    received_at: string | null;
+    sent_at: string | null;
+    last_sequence: number;
+  };
+}
+
+export interface FederationEvent {
+  event_id: string;
+  origin_node_id: string;
+  sequence: number;
+  occurred_at: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  previous_hash: string | null;
+  event_hash: string;
+}
+
+export interface FederationSyncCursor {
+  node_id?: string;
+  after_sequence?: number;
+}
+
+export interface FederationAppendResult {
+  accepted: FederationEvent[];
+  rejected: Array<{ event_id: string; reason: string }>;
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -288,6 +331,10 @@ export async function handleFederationRequest(
   method: string,
   claims: V1SessionClaims,
 ): Promise<boolean> {
+  if (method === "GET" && url.pathname === "/v1/nodes") {
+    handleNodes(deps, res);
+    return true;
+  }
   if (method === "GET" && url.pathname === "/v1/federation/status") {
     handleStatus(deps, res);
     return true;
@@ -304,9 +351,20 @@ export async function handleFederationRequest(
     await handleAuthorizeInit(deps, req, res, claims);
     return true;
   }
+  if (method === "POST" && url.pathname === "/v1/federation/sync") {
+    await handleSync(deps, req, res, claims);
+    return true;
+  }
   // Wrong method on an owned path: not found to an authenticated caller.
   writeJson(res, 404, { error: "not found" });
   return true;
+}
+
+function handleNodes(deps: V1FederationDeps, res: ServerResponse): void {
+  writeJson(res, 200, {
+    nodes: deps.listNodes(),
+    total: deps.listNodes().length,
+  });
 }
 
 function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
@@ -484,6 +542,89 @@ async function handleAuthorizeInit(
   writeJson(res, 200, { bootstrap_token: token });
 }
 
+async function handleSync(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+): Promise<void> {
+  const action = "/v1/federation/sync";
+  const operation = "v1_federation_sync";
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const { node_id, events, cursor, idempotency_key, operator_signature } = body as {
+    node_id?: unknown;
+    events?: unknown;
+    cursor?: unknown;
+    idempotency_key?: unknown;
+    operator_signature?: unknown;
+  };
+  if (typeof node_id !== "string" || node_id.length === 0 || !Array.isArray(events)) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const parsedEvents = parseFederationEvents(events);
+  if (parsedEvents === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const parsedCursor = parseSyncCursor(cursor);
+  if (cursor !== undefined && parsedCursor === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+
+  const signedPayload: Record<string, unknown> = {
+    node_id,
+    events: parsedEvents,
+  };
+  if (parsedCursor) signedPayload.cursor = parsedCursor;
+  if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+
+  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "operator_signature_invalid" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  if (!deps.isEnabled() || deps.getContext() === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "federation_disabled" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  const append = deps.appendFederationEvents(parsedEvents);
+  const outbound = deps.listFederationEvents(parsedCursor ?? undefined);
+  await deps.audit({
+    operation,
+    result: append.rejected.length === 0 ? "success" : "failure",
+    identityId: node_id,
+    details: {
+      accepted: append.accepted.length,
+      rejected: append.rejected.length,
+    },
+  });
+  writeJson(res, 200, {
+    accepted: append.accepted.map((event) => event.event_id),
+    rejected: append.rejected,
+    events: outbound,
+    nodes: deps.listNodes(),
+  });
+}
+
 /**
  * Pre-session join-submission ceremony (BOOTSTRAP_TOKEN auth class). Reached
  * by the router BEFORE the session gate, like session/init. Every failure —
@@ -578,4 +719,68 @@ function joinRequestNodeId(body: unknown): string {
     }
   }
   return "unknown";
+}
+
+export function federationEventHash(event: Omit<FederationEvent, "event_hash">): string {
+  return createHash("sha256").update(canonicalJson(event)).digest("base64url");
+}
+
+export function validateFederationEventHash(event: FederationEvent): boolean {
+  const { event_hash, ...withoutHash } = event;
+  return federationEventHash(withoutHash) === event_hash;
+}
+
+function parseFederationEvents(events: unknown[]): FederationEvent[] | null {
+  const out: FederationEvent[] = [];
+  for (const event of events) {
+    if (typeof event !== "object" || event === null) return null;
+    const e = event as Record<string, unknown>;
+    if (typeof e.event_id !== "string" || e.event_id.length === 0) return null;
+    if (typeof e.origin_node_id !== "string" || e.origin_node_id.length === 0) return null;
+    if (typeof e.sequence !== "number" || !Number.isSafeInteger(e.sequence) || e.sequence < 1) {
+      return null;
+    }
+    if (typeof e.occurred_at !== "string" || e.occurred_at.length === 0) return null;
+    if (typeof e.kind !== "string" || e.kind.length === 0) return null;
+    if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload)) {
+      return null;
+    }
+    if (e.previous_hash !== null && e.previous_hash !== undefined && typeof e.previous_hash !== "string") {
+      return null;
+    }
+    if (typeof e.event_hash !== "string" || e.event_hash.length === 0) return null;
+    out.push({
+      event_id: e.event_id,
+      origin_node_id: e.origin_node_id,
+      sequence: e.sequence,
+      occurred_at: e.occurred_at,
+      kind: e.kind,
+      payload: e.payload as Record<string, unknown>,
+      previous_hash: e.previous_hash === undefined ? null : e.previous_hash,
+      event_hash: e.event_hash,
+    });
+  }
+  return out;
+}
+
+function parseSyncCursor(cursor: unknown): FederationSyncCursor | null {
+  if (cursor === undefined || cursor === null) return {};
+  if (typeof cursor !== "object" || Array.isArray(cursor)) return null;
+  const c = cursor as Record<string, unknown>;
+  const out: FederationSyncCursor = {};
+  if (c.node_id !== undefined) {
+    if (typeof c.node_id !== "string" || c.node_id.length === 0) return null;
+    out.node_id = c.node_id;
+  }
+  if (c.after_sequence !== undefined) {
+    if (
+      typeof c.after_sequence !== "number" ||
+      !Number.isSafeInteger(c.after_sequence) ||
+      c.after_sequence < 0
+    ) {
+      return null;
+    }
+    out.after_sequence = c.after_sequence;
+  }
+  return out;
 }

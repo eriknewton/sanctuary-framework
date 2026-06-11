@@ -49,7 +49,16 @@ import {
   type V1AgentsDeps,
   type UnprotectOutcome,
 } from "../v1/agents.js";
-import type { V1FederationDeps, FederationContext } from "../v1/federation.js";
+import {
+  federationEventHash,
+  validateFederationEventHash,
+  type FederationAppendResult,
+  type FederationContext,
+  type FederationEvent,
+  type FederationNodeView,
+  type FederationSyncCursor,
+  type V1FederationDeps,
+} from "../v1/federation.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -255,6 +264,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
   private readonly _federationRoster = new Set<string>();
+  private readonly _federationNodes = new Map<string, FederationNodeView>();
+  private readonly _federationEventLog: FederationEvent[] = [];
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -939,7 +950,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       rosterNodeIds: () => [...this._federationRoster],
       recordJoin: (nodeId) => {
         this._federationRoster.add(nodeId);
+        this.upsertFederationNode(nodeId, {
+          attestation_status: "verified",
+        });
+        this.appendLocalFederationEvent("node.joined", {
+          node_id: nodeId,
+        });
       },
+      listNodes: () => [...this._federationNodes.values()],
+      listFederationEvents: (since) => this.listFederationEvents(since),
+      appendFederationEvents: (events) => this.appendFederationEvents(events),
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -949,6 +969,108 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         }
       },
     };
+  }
+
+  private upsertFederationNode(
+    nodeId: string,
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+      last_sync?: Partial<FederationNodeView["last_sync"]>;
+    },
+  ): FederationNodeView {
+    const now = new Date().toISOString();
+    const existing = this._federationNodes.get(nodeId);
+    const node: FederationNodeView = {
+      node_id: nodeId,
+      label: update?.label ?? existing?.label ?? null,
+      attestation_status: update?.attestation_status ?? existing?.attestation_status ?? "unknown",
+      first_seen: existing?.first_seen ?? update?.first_seen ?? now,
+      last_seen: update?.last_seen ?? now,
+      last_sync: {
+        received_at: update?.last_sync?.received_at ?? existing?.last_sync.received_at ?? null,
+        sent_at: update?.last_sync?.sent_at ?? existing?.last_sync.sent_at ?? null,
+        last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
+      },
+    };
+    this._federationNodes.set(nodeId, node);
+    return node;
+  }
+
+  private appendLocalFederationEvent(kind: string, payload: Record<string, unknown>): FederationEvent {
+    const originNodeId = this._federationContext?.nodeId ?? "local";
+    const previous = [...this._federationEventLog]
+      .reverse()
+      .find((event) => event.origin_node_id === originNodeId);
+    const eventWithoutHash = {
+      event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
+      origin_node_id: originNodeId,
+      sequence: (previous?.sequence ?? 0) + 1,
+      occurred_at: new Date().toISOString(),
+      kind,
+      payload,
+      previous_hash: previous?.event_hash ?? null,
+    };
+    const event: FederationEvent = {
+      ...eventWithoutHash,
+      event_hash: federationEventHash(eventWithoutHash),
+    };
+    this._federationEventLog.push(event);
+    return event;
+  }
+
+  private listFederationEvents(since?: FederationSyncCursor): FederationEvent[] {
+    const nodeId = since?.node_id;
+    const after = since?.after_sequence ?? 0;
+    return this._federationEventLog.filter((event) => {
+      if (nodeId && event.origin_node_id !== nodeId) return false;
+      return event.sequence > after;
+    });
+  }
+
+  private appendFederationEvents(events: FederationEvent[]): FederationAppendResult {
+    const accepted: FederationEvent[] = [];
+    const rejected: Array<{ event_id: string; reason: string }> = [];
+    const byNode = new Map<string, FederationEvent[]>();
+    for (const event of events) {
+      const list = byNode.get(event.origin_node_id) ?? [];
+      list.push(event);
+      byNode.set(event.origin_node_id, list);
+    }
+
+    for (const [nodeId, nodeEvents] of byNode) {
+      nodeEvents.sort((a, b) => a.sequence - b.sequence);
+      let last = [...this._federationEventLog]
+        .reverse()
+        .find((event) => event.origin_node_id === nodeId);
+      for (const event of nodeEvents) {
+        if (!validateFederationEventHash(event)) {
+          rejected.push({ event_id: event.event_id, reason: "hash_mismatch" });
+          continue;
+        }
+        if (this._federationEventLog.some((existing) => existing.event_id === event.event_id)) {
+          rejected.push({ event_id: event.event_id, reason: "replay" });
+          continue;
+        }
+        if (event.sequence <= (last?.sequence ?? 0)) {
+          rejected.push({ event_id: event.event_id, reason: "stale_sequence" });
+          continue;
+        }
+        if (event.previous_hash !== (last?.event_hash ?? null)) {
+          rejected.push({ event_id: event.event_id, reason: "previous_hash_mismatch" });
+          continue;
+        }
+        this._federationEventLog.push(event);
+        accepted.push(event);
+        last = event;
+        this.upsertFederationNode(nodeId, {
+          attestation_status: "verified",
+          last_sync: {
+            received_at: new Date().toISOString(),
+            last_sequence: event.sequence,
+          },
+        });
+      }
+    }
+    return { accepted, rejected };
   }
 
   /**
