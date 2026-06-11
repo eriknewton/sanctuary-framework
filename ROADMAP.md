@@ -28,7 +28,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, and Cline today (others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-*Status: shipped through v1.3.3.*
+*Status: shipped through v1.3.2 (latest release tag); v1.3.3 is staged on main, release pending.*
 
 ### Castle Wall on Linux: kernel-level enforcement
 
@@ -90,7 +90,7 @@ Concrete, scoped, on the engineering path. Each item has named decision artifact
 
 End-to-end Mini1 drill closes the macOS thesis-gate. A wrapped agent's outbound packets are intercepted at the kernel layer via `NEFilterDataProvider`, routed through Castle Wall policy with full audit evidence, and the operator-facing notification fires. **Why it matters:** closes the cross-platform security claim. Retail surfaces can honestly say "Castle Wall enforces on Linux and macOS" once this PASSes.
 
-*Status: in flight. PR #365 landed the load-bearing code; sysext rebuild + Mini1 drill re-fire remaining.*
+*Status: in flight. Enforcement loop proven on Mini1 (2026-05-28); Tahoe fix rounds W1 through W4 merged (#469, #470, #471, #472) with fail-loud binding diagnostics; the clean end-to-end drill (operator baseline, dead-man, agent differential) remains.*
 
 #### Castle Wall on Windows
 
@@ -102,19 +102,19 @@ Windows Filtering Platform backend. Same drill discipline as Linux Phase 1 and m
 
 Operator runs Sanctuary on a Mac, a Linux home server, and a cloud VPS, and sees one unified agent list, one audit feed, and one place to apply policy changes that propagate everywhere. The substrate scales across the operator's hardware, not across a vendor's network. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) is the structural differentiator. Federation across your own machines is not a feature a vendor-substrate competitor can copy without abandoning their business model.
 
-*Status: Phase A scoping complete (auth model + Federation Security RFC v7 ratified). Implementation gated on Castle Wall macOS drill PASS.*
+*Status: Phase A implementation underway. PR-A1 through PR-A4 merged (/v1 skeleton, agents API, join ceremony with durable operator attestations, cross-machine sync over HTTP with hash-chained event log). PR-A5 cross-machine demo gated on the next hardware drill.*
 
 #### Plugin ecosystem
 
 The security vendors operators already use (Crowdstrike, Cloudflare, Lakera, Pi-hole, NextDNS, and others) plug into Sanctuary as first-class enforcement. Their verdicts contribute to audit events with per-plugin attribution. Sanctuary does not build detection intelligence in-house; the substrate hosts everyone. **Why it matters:** composes Sanctuary with the rest of the operator's security stack rather than competing with it. Every vendor partnership is a distribution channel and a co-marketing surface.
 
-*Status: Plugin Security RFC in scope; gated on the cooperative-feature audit so the contract reflects which features are toggleable vs always-enforced.*
+*Status: Plugin Security RFC authored and adversarially reviewed (3 rounds); Linux-first substrate decision ratified. Confinement substrate shipped: sanctuary-jail (#439), static-binary jail delivery (#443), launcher per-plugin seccomp (#441). The plugin host and vendor-facing contract surface are not yet built.*
 
 #### Agent-native ergonomic surface
 
 Wrapped agents reach for Sanctuary's tools by default because the cooperative path is shorter than the non-cooperative path. Convenience verbs over primitives (`sanctuary_remember(key, value)` instead of `state_write(namespace, key, value, metadata, ...)`). Discoverable help (`sanctuary_help(intent)` returns the right tool plus a working example). Structured denial responses with paths forward, not dead ends. **Why it matters:** empirical evidence shows agents reach for native non-Sanctuary alternatives when the Sanctuary path is longer. Fixing the ergonomics is what makes voluntary use real.
 
-*Status: design scoped; implementation queued.*
+*Status: shipped. Phase 1 safety base (#417) and Phase 2 cooperative surface: verbs, help, introspection, compound operations, events, audit search (#419).*
 
 #### Feature-usage observability
 
@@ -126,7 +126,7 @@ Operator sees which security features actually fired today, with per-plugin attr
 
 Your agent's working data, query history, document corpus, and intermediate state live on your substrate, not in a vendor's silo. The data-custody operationalization of the embodiment framing: in the physical world, your body holds your memory; in the agent world, your substrate has to. **Why it matters:** the "your data" claim is structural only if the operator's working data actually lives where the operator controls it.
 
-*Status: scoped; not yet built.*
+*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps; approval-bound signed export/import. Remaining: the OSS memory-engine backend adapter (Letta first) and the PAM conformance profile.*
 
 ### On the horizon
 
@@ -136,11 +136,11 @@ Scoped and acknowledged, but without a near-term timeline. Each item ships when 
 - **PWA mobile companion.** Your phone as approval surface, alert surface, emergency brake. Install on home screen; push notifications via Web Push; biometric unlock via WebAuthn / passkeys; QR pairing from the desktop dashboard.
 - **Query-layer anonymity Tier 3.** Mix-network or zero-knowledge-proof network-layer anonymity on top of the existing Tier 1 + Tier 2 query-layer privacy. Closes the last sovereignty principle (opacity at the query layer) at strength. Research-grade.
 - **Post-quantum cryptography migration.** Hybrid Ed25519 + ML-DSA / FIPS 204 signing for the audit chain. Audit entries already embed a scheme identifier so the migration lands without breaking historical receipts.
-- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. Architecture-independent first-mile (signed audit, signed receipts, signed-event envelopes) shipped; full pack ships when regulated-industry pilot demand materializes.
+- **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. First-mile (signed audit, signed receipts, signed-event envelopes) AND the bundle generator with coverage matrix and CLI are shipped (`server/src/compliance/eu_ai_act/`); the full productized pack and NIST alignment docs ship when regulated-industry pilot demand materializes.
 - **Operator-cloud deployment mode.** Sanctuary running in the operator's own GCP / Azure / AWS account. Same code, same keys, on rented hardware the operator controls. Prosumer / small-business deployment path.
 - **Sovereign-managed TEE.** Trusted Execution Environment with hardware-backed remote attestation (Intel TDX, AMD SEV-SNP, ARM CCA). Sanctuary operates the hardware; the hardware proves to the operator's console that even Sanctuary cannot see inside. Highest-assurance deployment.
 - **Fleet operator console.** Multi-operator-estate management for organizations running Sanctuary across many operators. Ships when organizational-scale customers materialize.
-- **Castle Wall Phase 3 (container or microVM isolation).** Per-agent microVM enforcement for highest-assurance enterprises where per-process isolation is insufficient. Ships on explicit enterprise demand.
+- **Castle Wall Phase 3 (container or microVM isolation).** Per-agent microVM enforcement for highest-assurance enterprises where per-process isolation is insufficient. The mechanism is shipped and drill-proven (castle-wall-vmm box runtime on Apple Containerization, single-vsock no-network guests; hostile-guest containment ASSURANCE row); the per-agent enterprise productization ships on explicit enterprise demand.
 
 ---
 
