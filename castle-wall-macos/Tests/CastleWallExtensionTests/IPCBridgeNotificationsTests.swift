@@ -48,7 +48,14 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         let original = IpcMessage.manifestUpdated(body)
         let encoded = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(IpcMessage.self, from: encoded)
-        XCTAssertEqual(decoded, original)
+        guard case .manifestUpdated(let decodedBody) = decoded else {
+            return XCTFail("expected manifest_updated")
+        }
+        XCTAssertEqual(decodedBody.type, body.type)
+        XCTAssertEqual(decodedBody.manifest, body.manifest)
+        XCTAssertEqual(decodedBody.signature, body.signature)
+        XCTAssertEqual(decodedBody.rules, body.rules)
+        XCTAssertEqual(decodedBody.receivedRules?.count, body.rules.count)
 
         let json = String(data: encoded, encoding: .utf8) ?? ""
         XCTAssertTrue(json.contains("\"type\":\"manifest_updated\""))

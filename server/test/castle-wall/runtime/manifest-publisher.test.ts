@@ -41,6 +41,10 @@ import { fromBase64url } from "../../../src/core/encoding.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
+import {
+  DERIVED_DNS_RULE_ID,
+  deriveDnsRuleForHostnameRules,
+} from "../../../src/castle-wall/allowlist/dns-derivation.js";
 
 void _did;
 
@@ -207,6 +211,69 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     const entry = signed.manifest.rules[0]!;
     const file = ruleFiles[0]!;
     expect(entry.sha256).toBe(sha256Hex(file.bytes));
+  });
+
+  it("publishes the derived DNS rule with the captured stable digest", async () => {
+    const hostnameRule: AllowlistRule = {
+      id: "allow-openrouter",
+      schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+      created_at: "2026-06-11T00:14:32Z",
+      description: "Agent may reach inference endpoint",
+      match: { host: "openrouter.ai", port: 443, protocol: "tcp" },
+      scope: {},
+      disposition: "allow",
+    };
+    const denyRule: AllowlistRule = {
+      id: "deny-exfil",
+      schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+      created_at: "2026-06-11T00:14:32Z",
+      description: "Pinned benign exfil target",
+      match: { host: "1.1.1.1" },
+      scope: {},
+      disposition: "deny",
+    };
+    const derivedDns = deriveDnsRuleForHostnameRules({
+      rules: [hostnameRule, denyRule],
+      resolvers: ["100.100.100.100", "fd7a:115c:a1e0::53", "192.168.4.1"],
+      createdAt: "2026-06-11T18:47:42.985Z",
+    });
+    expect(derivedDns).not.toBeNull();
+
+    const { signed, ruleFiles } = await buildSignedManifest({
+      fortressId: "fortress-capture",
+      issuedAt: "2026-06-11T18:47:42.986Z",
+      rules: [hostnameRule, denyRule, derivedDns!],
+      signer,
+      agentOrigin: {
+        mode: "uid",
+        agent_uid: 502,
+        system_uid_allow_ceiling: 500,
+      },
+      operatorBaseline: {
+        essentials: [
+          { name: "mdnsresponder", signing_id: "com.apple.mDNSResponder" },
+          { name: "screensharing", signing_id: "com.apple.screensharing.agent" },
+          { name: "sshd", signing_id: "com.openssh.sshd" },
+          {
+            name: "tailscaled",
+            signing_id: "io.tailscale.ipn.macsys.network-extension",
+          },
+        ],
+      },
+    });
+
+    const derivedEntry = signed.manifest.rules.find(
+      (entry) => entry.rule_id === DERIVED_DNS_RULE_ID
+    );
+    expect(derivedEntry).toEqual({
+      rule_id: DERIVED_DNS_RULE_ID,
+      file: `${DERIVED_DNS_RULE_ID}.json`,
+      sha256: "5fc5aba5ae6c1e5dfd907528759ff73038d3a6ed7351499d51c84c90843ab26e",
+    });
+    expect(signed.manifest.rules).toHaveLength(3);
+    expect(ruleFiles.map((file) => file.filename)).toContain(
+      `${DERIVED_DNS_RULE_ID}.json`
+    );
   });
 
   // --- agent_origin descriptor (2026-05-29 origin-classifier foundation) ---
