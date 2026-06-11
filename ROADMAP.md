@@ -90,7 +90,7 @@ Concrete, scoped, on the engineering path. Each item has named decision artifact
 
 End-to-end Mini1 drill closes the macOS thesis-gate. A wrapped agent's outbound packets are intercepted at the kernel layer via `NEFilterDataProvider`, routed through Castle Wall policy with full audit evidence, and the operator-facing notification fires. **Why it matters:** closes the cross-platform security claim. Retail surfaces can honestly say "Castle Wall enforces on Linux and macOS" once this PASSes.
 
-*Status: in flight. PR #365 landed the load-bearing code; sysext rebuild + Mini1 drill re-fire remaining.*
+*Status: in flight. Enforcement loop proven on Mini1 (2026-05-28); Tahoe fix rounds W1 through W4 merged (#469, #470, #471, #472) with fail-loud binding diagnostics; the clean end-to-end drill (operator baseline, dead-man, agent differential) remains.*
 
 #### Castle Wall on Windows
 
@@ -102,19 +102,19 @@ Windows Filtering Platform backend. Same drill discipline as Linux Phase 1 and m
 
 Operator runs Sanctuary on a Mac, a Linux home server, and a cloud VPS, and sees one unified agent list, one audit feed, and one place to apply policy changes that propagate everywhere. The substrate scales across the operator's hardware, not across a vendor's network. **Why it matters:** the operator-substrate model (versus the vendor-substrate model) is the structural differentiator. Federation across your own machines is not a feature a vendor-substrate competitor can copy without abandoning their business model.
 
-*Status: Phase A scoping complete (auth model + Federation Security RFC v7 ratified). Implementation gated on Castle Wall macOS drill PASS.*
+*Status: Phase A implementation underway. PR-A1 through PR-A4 merged (/v1 skeleton, agents API, join ceremony with durable operator attestations, cross-machine sync over HTTP with hash-chained event log). PR-A5 cross-machine demo gated on the next hardware drill.*
 
 #### Plugin ecosystem
 
 The security vendors operators already use (Crowdstrike, Cloudflare, Lakera, Pi-hole, NextDNS, and others) plug into Sanctuary as first-class enforcement. Their verdicts contribute to audit events with per-plugin attribution. Sanctuary does not build detection intelligence in-house; the substrate hosts everyone. **Why it matters:** composes Sanctuary with the rest of the operator's security stack rather than competing with it. Every vendor partnership is a distribution channel and a co-marketing surface.
 
-*Status: Plugin Security RFC in scope; gated on the cooperative-feature audit so the contract reflects which features are toggleable vs always-enforced.*
+*Status: Plugin Security RFC authored and adversarially reviewed (3 rounds); Linux-first substrate decision ratified. Confinement substrate shipped: sanctuary-jail (#439), static-binary jail delivery (#443), launcher per-plugin seccomp (#441). The plugin host and vendor-facing contract surface are not yet built.*
 
 #### Agent-native ergonomic surface
 
 Wrapped agents reach for Sanctuary's tools by default because the cooperative path is shorter than the non-cooperative path. Convenience verbs over primitives (`sanctuary_remember(key, value)` instead of `state_write(namespace, key, value, metadata, ...)`). Discoverable help (`sanctuary_help(intent)` returns the right tool plus a working example). Structured denial responses with paths forward, not dead ends. **Why it matters:** empirical evidence shows agents reach for native non-Sanctuary alternatives when the Sanctuary path is longer. Fixing the ergonomics is what makes voluntary use real.
 
-*Status: design scoped; implementation queued.*
+*Status: shipped. Phase 1 safety base (#417) and Phase 2 cooperative surface: verbs, help, introspection, compound operations, events, audit search (#419).*
 
 #### Feature-usage observability
 
@@ -126,7 +126,7 @@ Operator sees which security features actually fired today, with per-plugin attr
 
 Your agent's working data, query history, document corpus, and intermediate state live on your substrate, not in a vendor's silo. The data-custody operationalization of the embodiment framing: in the physical world, your body holds your memory; in the agent world, your substrate has to. **Why it matters:** the "your data" claim is structural only if the operator's working data actually lives where the operator controls it.
 
-*Status: scoped; not yet built.*
+*Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps; approval-bound signed export/import. Remaining: the OSS memory-engine backend adapter (Letta first) and the PAM conformance profile.*
 
 ### On the horizon
 
