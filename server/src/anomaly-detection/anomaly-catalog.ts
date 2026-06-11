@@ -13,10 +13,10 @@
  * so the operator can subscribe via the dashboard / CLI rather than
  * editing server boot code.
  *
- * Chi-2's CUSUM + PSI classifiers will register additional catalog
- * entries (same detector + alternative classifier) once that PR
- * lands. Chi-3's UX layer surfaces the catalog as-is; new entries
- * light up automatically on the dashboard.
+ * Chi-2's CUSUM + PSI classifiers are LANDED and registered below
+ * (same detector + alternative classifier). Chi-3's UX layer
+ * surfaces the catalog as-is; new entries light up automatically
+ * on the dashboard.
  */
 
 import {
@@ -73,14 +73,8 @@ export interface AnomalyCatalogEntry {
  * (detector_id, classifier_id) pairs; the dashboard view + CLI
  * surface this catalog as the available menu.
  *
- * Chi-2 adds CUSUM + PSI entries here when those classifiers land:
- *
- *   {
- *     detectorId: PER_AGENT_ACTIVITY_DETECTOR_ID,
- *     classifierId: CUSUM_CLASSIFIER_ID,
- *     description: "...",
- *     factory: () => new PerAgentActivityDetector({ classifier: new CusumClassifier(...) }),
- *   },
+ * Chi-2's CUSUM + PSI entries are registered below (LANDED — do not
+ * re-scope "land Chi-2" from this comment; check the entries first).
  */
 export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
   {
