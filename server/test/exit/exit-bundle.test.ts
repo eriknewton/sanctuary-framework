@@ -107,7 +107,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     const vault = new PrivacyPlaceholderVault(source.storage, source.masterKey);
     await vault.placeholderFor("email", "operator@example.com", sourceIdentityId);
 
-    source.auditLog.append("l1", "exit_drill_source_unwrap", sourceIdentityId, {
+    await source.auditLog.append("l1", "exit_drill_source_unwrap", sourceIdentityId, {
       harness: "source",
     });
 
@@ -239,7 +239,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     });
     expect(importedSourceAudit.total).toBe(0);
 
-    destination.auditLog.append("l1", "exit_drill_destination_wrap", destinationIdentityId, {
+    await destination.auditLog.append("l1", "exit_drill_destination_wrap", destinationIdentityId, {
       imported_identity_id: sourceIdentityId,
     });
     await destination.auditLog.flush();

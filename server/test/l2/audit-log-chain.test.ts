@@ -324,7 +324,7 @@ describe("AuditLog tamper-evident chain", () => {
     const started = Date.now();
 
     for (let i = 0; i < 1000; i++) {
-      writer.append("l2", `op-${i}`, "id-1", { i });
+      await writer.append("l2", `op-${i}`, "id-1", { i });
     }
     await writer.flush();
 

@@ -536,7 +536,7 @@ describe("Fortress exit-bundle export happy path (Test 5)", () => {
         identity_id: string;
       }
     ).identity_id;
-    bundleAuditLog.append("l2", "wrap", sourceIdentityId, {
+    await bundleAuditLog.append("l2", "wrap", sourceIdentityId, {
       agent_id: "agent-alpha",
     });
 

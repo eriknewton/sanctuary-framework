@@ -106,13 +106,13 @@ function buildDeterministicIdentity(masterKey: Uint8Array): StoredIdentity {
  * gate outcome category so the Article 12 and Article 26 documents
  * show non-trivial counts.
  */
-function seedAuditActivity(auditLog: AuditLog): void {
+async function seedAuditActivity(auditLog: AuditLog): Promise<void> {
   const identity = "did:sanctuary:meridian-hr-screening-agent";
 
   // Representative tool-call traffic: 24 allow, 12 allow_proxy,
   // 3 deny, 2 injection_detected.
   for (let i = 0; i < 24; i++) {
-    auditLog.append(
+    await auditLog.append(
       "l2",
       `gate_allow:state_read`,
       identity,
@@ -120,7 +120,7 @@ function seedAuditActivity(auditLog: AuditLog): void {
     );
   }
   for (let i = 0; i < 12; i++) {
-    auditLog.append(
+    await auditLog.append(
       "l2",
       `gate_allow_proxy:ats/fetch_resume`,
       identity,
@@ -128,14 +128,14 @@ function seedAuditActivity(auditLog: AuditLog): void {
     );
   }
   for (let i = 0; i < 3; i++) {
-    auditLog.append(
+    await auditLog.append(
       "l2",
       `gate_deny:state_export`,
       identity,
       { reason: "tier1_timeout" }
     );
   }
-  auditLog.append(
+  await auditLog.append(
     "l2",
     "injection_detected:state_write",
     "system",
@@ -144,7 +144,7 @@ function seedAuditActivity(auditLog: AuditLog): void {
       signals: [{ type: "role_override", severity: "high" }],
     }
   );
-  auditLog.append(
+  await auditLog.append(
     "l2",
     "injection_detected:bridge_commit",
     "system",
@@ -156,7 +156,7 @@ function seedAuditActivity(auditLog: AuditLog): void {
 
   // A few L1 reads to show cross-layer activity.
   for (let i = 0; i < 6; i++) {
-    auditLog.append("l1", "state_read", identity, {
+    await auditLog.append("l1", "state_read", identity, {
       namespace: "applicants",
     });
   }
@@ -197,7 +197,7 @@ describe("EU AI Act example bundle generator", () => {
       const storedIdentity = buildDeterministicIdentity(FIXED_MASTER_KEY);
       await identityManager.save(storedIdentity);
 
-      seedAuditActivity(auditLog);
+      await seedAuditActivity(auditLog);
 
       const deps: GeneratorDeps = {
         config: defaultConfig(),

@@ -35,7 +35,7 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
 
   it("breaks a stale lock left by a dead holder and proceeds", async () => {
     const { log, lockPath } = await makeLog();
-    log.append("l1", "egress_allowed", "id-1", { n: 1 });
+    await log.append("l1", "egress_allowed", "id-1", { n: 1 });
     await log.flush();
 
     // A crashed/rebooted daemon stranded the lock with a dead holder pid.
@@ -45,7 +45,7 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
       JSON.stringify({ pid: 999_999, acquired_at: new Date().toISOString() }),
     );
 
-    log.append("l1", "egress_allowed", "id-2", { n: 2 });
+    await log.append("l1", "egress_allowed", "id-2", { n: 2 });
     await expect(log.flush()).resolves.toBeUndefined();
     // Lock released after the write (proves the stale lock was broken, not waited on).
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
@@ -53,7 +53,7 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
 
   it("breaks a lock that predates the current boot (PID-reuse-safe)", async () => {
     const { log, lockPath } = await makeLog();
-    log.append("l1", "egress_allowed", "id-1", { n: 1 });
+    await log.append("l1", "egress_allowed", "id-1", { n: 1 });
     await log.flush();
 
     // pid 1 is always alive, but the lock was acquired long before this boot, so
@@ -64,7 +64,7 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
       JSON.stringify({ pid: 1, acquired_at: "2020-01-01T00:00:00.000Z" }),
     );
 
-    log.append("l1", "egress_allowed", "id-2", { n: 2 });
+    await log.append("l1", "egress_allowed", "id-2", { n: 2 });
     await expect(log.flush()).resolves.toBeUndefined();
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });

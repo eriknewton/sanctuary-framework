@@ -91,8 +91,8 @@ async function buildFixture(): Promise<GeneratorDeps> {
   await identityManager.save(buildDeterministicIdentity());
   // Seed a small amount of audit activity so period summaries are
   // non-zero but deterministic.
-  auditLog.append("l1", "state_read", "did:test", {});
-  auditLog.append("l2", "gate_allow:test", "did:test", {});
+  await auditLog.append("l1", "state_read", "did:test", {});
+  await auditLog.append("l2", "gate_allow:test", "did:test", {});
   return {
     config: defaultConfig(),
     identityManager,

@@ -41,7 +41,7 @@ describe("Activity feed: per-action attestation projection", () => {
   afterEach(() => undefined);
 
   it("successful entries render attestation.state = 'verified'", async () => {
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
     await rig.auditLog.flush();
     const entries = await aggregateActivity(
       { auditLog: rig.auditLog, identityId: IDENTITY_ID },
@@ -53,7 +53,7 @@ describe("Activity feed: per-action attestation projection", () => {
   });
 
   it("failed entries render attestation.state = 'degraded'", async () => {
-    rig.auditLog.append("l2", "policy_deny", IDENTITY_ID, {}, "failure");
+    await rig.auditLog.append("l2", "policy_deny", IDENTITY_ID, {}, "failure");
     await rig.auditLog.flush();
     const entries = await aggregateActivity(
       { auditLog: rig.auditLog, identityId: IDENTITY_ID },
@@ -65,10 +65,10 @@ describe("Activity feed: per-action attestation projection", () => {
   });
 
   it("distinct entry ids derive distinct fragments", async () => {
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
     // Force a different timestamp so the synthesized entry_id differs.
     await new Promise((resolve) => setTimeout(resolve, 5));
-    rig.auditLog.append("l2", "approval_granted", IDENTITY_ID, {}, "success");
+    await rig.auditLog.append("l2", "approval_granted", IDENTITY_ID, {}, "success");
     await rig.auditLog.flush();
     const entries = await aggregateActivity(
       { auditLog: rig.auditLog, identityId: IDENTITY_ID },
@@ -80,7 +80,7 @@ describe("Activity feed: per-action attestation projection", () => {
   });
 
   it("fragment shape is '<4hex>..<2hex>' (6 hex chars + dots)", async () => {
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
     await rig.auditLog.flush();
     const entries = await aggregateActivity(
       { auditLog: rig.auditLog, identityId: IDENTITY_ID },
