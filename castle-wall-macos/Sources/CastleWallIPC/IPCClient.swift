@@ -218,6 +218,7 @@ public final class IPCClient {
         case .handshakeResponse: return "handshake_response"
         case .manifestSubscribe: return "manifest_subscribe"
         case .manifestUpdated: return "manifest_updated"
+        case .armLease: return "arm_lease"
         case .flowDecisionRecorded: return "flow_decision_recorded"
         case .flowPendingApproval: return "flow_pending_approval"
         }

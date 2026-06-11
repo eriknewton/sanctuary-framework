@@ -30,6 +30,8 @@ enum HeadlessFilterCLI {
     struct Invocation: Equatable {
         let action: Action
         let timeoutSeconds: Double
+        let ttlSeconds: UInt32?
+        let noTTL: Bool
         /// When set, the JSON report is ALSO written here (in addition to
         /// stdout). `sanctuary castle-wall enable|disable` launches this binary
         /// through `open` on macOS Tahoe — the only way to reach NE preferences
@@ -37,10 +39,18 @@ enum HeadlessFilterCLI {
         /// reads the report back from this file instead.
         let reportFilePath: String?
 
-        init(action: Action, timeoutSeconds: Double, reportFilePath: String? = nil) {
+        init(
+            action: Action,
+            timeoutSeconds: Double,
+            reportFilePath: String? = nil,
+            ttlSeconds: UInt32? = nil,
+            noTTL: Bool = false
+        ) {
             self.action = action
             self.timeoutSeconds = timeoutSeconds
             self.reportFilePath = reportFilePath
+            self.ttlSeconds = ttlSeconds
+            self.noTTL = noTTL
         }
     }
 
@@ -78,6 +88,8 @@ enum HeadlessFilterCLI {
         var action: Action?
         var timeout = defaultTimeoutSeconds
         var reportFilePath: String?
+        var ttlSeconds: UInt32?
+        var noTTL = false
         for argument in arguments[(flagIndex + 1)...] {
             if argument.hasPrefix("--timeout=") {
                 guard let value = Double(argument.dropFirst("--timeout=".count)),
@@ -91,6 +103,14 @@ enum HeadlessFilterCLI {
                     return .usageError("invalid --report-file value: \(argument)")
                 }
                 reportFilePath = path
+            } else if argument.hasPrefix("--ttl=") {
+                guard let value = UInt32(argument.dropFirst("--ttl=".count)),
+                      value > 0 else {
+                    return .usageError("invalid --ttl value: \(argument)")
+                }
+                ttlSeconds = value
+            } else if argument == "--no-ttl" {
+                noTTL = true
             } else if action == nil, let parsed = Action(rawValue: argument) {
                 action = parsed
             } else {
@@ -104,7 +124,13 @@ enum HeadlessFilterCLI {
             )
         }
         return .invocation(
-            Invocation(action: action, timeoutSeconds: timeout, reportFilePath: reportFilePath)
+            Invocation(
+                action: action,
+                timeoutSeconds: timeout,
+                reportFilePath: reportFilePath,
+                ttlSeconds: ttlSeconds,
+                noTTL: noTTL
+            )
         )
     }
 

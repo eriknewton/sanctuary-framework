@@ -76,6 +76,8 @@ export interface CastleWallParsedArgs {
   requestId?: string;
   force?: boolean;
   acceptBrokenChain?: boolean;
+  ttlSeconds?: number;
+  noTtl?: boolean;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -109,6 +111,15 @@ interface HeadlessReport {
   action: string;
   state: "enabled" | "disabled" | "needs_user_approval" | "unknown";
   error?: string;
+}
+
+interface LeaseStatusFile {
+  armed: boolean;
+  revoked?: boolean;
+  ttl_seconds: number | null;
+  heartbeat_interval_seconds: number;
+  updated_at: string;
+  source: "castle-wall-cli";
 }
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
@@ -661,6 +672,14 @@ export async function runStatus(
   }
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
+  const lease = await readLeaseStatus(storagePath);
+  if (lease) {
+    const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
+    write(
+      out,
+      `Dead-man lease: ${lease.armed ? "armed" : "disarmed"}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`,
+    );
+  }
 
   // Sysext "[activated enabled]" only means installed, not filtering. When the
   // host-app binary is present, corroborate the live NE filter state through
@@ -1440,9 +1459,10 @@ function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
  * retained for the read-only status probe and pre-Tahoe paths.
  */
 const ARM_INVOKE_TIMEOUT_MS = 90_000;
-function defaultArmInvoke(ctx: CastleWallCommandContext): HostAppInvoker {
+const DISARM_INVOKE_TIMEOUT_MS = 7_000;
+function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "disable"): HostAppInvoker {
   return makeLaunchServicesHostAppInvoke({
-    timeoutMs: ARM_INVOKE_TIMEOUT_MS,
+    timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
     ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
     ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
   });
@@ -1532,6 +1552,84 @@ async function appendArmAuditBestEffort(
   }
 }
 
+function leaseStatusPath(fortressPath: string): string {
+  return join(fortressPath, "castle-wall-lease.json");
+}
+
+async function writeLeaseStatusBestEffort(
+  fortressPath: string,
+  lease: LeaseStatusFile,
+): Promise<void> {
+  try {
+    await writeFile(leaseStatusPath(fortressPath), JSON.stringify(lease, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    await chmod(leaseStatusPath(fortressPath), 0o600);
+  } catch {
+    // Advisory-only status surface; enforcement rides authenticated IPC.
+  }
+}
+
+async function readLeaseStatus(fortressPath: string): Promise<LeaseStatusFile | null> {
+  try {
+    const parsed = JSON.parse(await readFile(leaseStatusPath(fortressPath), "utf8")) as LeaseStatusFile;
+    if (
+      typeof parsed.armed !== "boolean" ||
+      typeof parsed.heartbeat_interval_seconds !== "number" ||
+      typeof parsed.updated_at !== "string"
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function buildArmLeaseMessage(input: {
+  armed: boolean;
+  revoked?: boolean;
+  ttlSeconds: number | null;
+  heartbeatIntervalSeconds?: number;
+}): LeaseStatusFile & { type: "arm_lease" } {
+  return {
+    type: "arm_lease",
+    armed: input.armed,
+    ...(input.revoked === true ? { revoked: true } : {}),
+    ttl_seconds: input.ttlSeconds,
+    heartbeat_interval_seconds: input.heartbeatIntervalSeconds ?? 5,
+    updated_at: new Date().toISOString(),
+    source: "castle-wall-cli",
+  };
+}
+
+async function sendArmLeaseBestEffort(
+  socketPath: string,
+  message: ReturnType<typeof buildArmLeaseMessage>,
+): Promise<boolean> {
+  return await new Promise<boolean>((resolvePromise) => {
+    const socket = createConnection(socketPath);
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolvePromise(ok);
+    };
+    const timer = setTimeout(() => finish(false), 1_500);
+    timer.unref();
+    socket.once("connect", () => {
+      socket.write(frame(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "castle-wall.arm_lease",
+        params: message,
+      })), () => finish(true));
+    });
+    socket.once("error", () => finish(false));
+  });
+}
+
 const NEEDS_APPROVAL_GUIDANCE =
   "The one-time macOS content-filter consent has not been granted on this machine.\n" +
   "That single step is GUI-only (macOS requirement): at the console, launch\n" +
@@ -1587,15 +1685,15 @@ async function runArmDisarm(
 
   const parsed = parseCastleWallArgs(argv);
   const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const socketPath = resolveCastleWallSocketPath({
+    platform,
+    fortressPath,
+  }).path;
 
   if (action === "enable" && !parsed.force) {
     // Brick-condition gate: filter on + no policy daemon = deny-all with no
     // recovery channel (the 2026-06-09 Hermes drill lockout). Refuse to arm
     // unless the daemon socket answers, or the operator explicitly overrides.
-    const socketPath = resolveCastleWallSocketPath({
-      platform,
-      fortressPath,
-    }).path;
     const probe = ctx.daemonProbe ?? defaultDaemonProbe;
     if (!(await probe(socketPath))) {
       write(
@@ -1608,6 +1706,18 @@ async function runArmDisarm(
       );
       return 1;
     }
+  }
+
+  if (action === "enable" && !parsed.noTtl && parsed.ttlSeconds === undefined) {
+    write(
+      err,
+      "Usage: sanctuary castle-wall enable requires either --ttl <duration> for drills or --no-ttl for durable arming.\n",
+    );
+    return 2;
+  }
+  if (action === "enable" && parsed.noTtl && parsed.ttlSeconds !== undefined) {
+    write(err, "Usage: choose only one dead-man TTL mode: --ttl <duration> or --no-ttl.\n");
+    return 2;
   }
 
   if (action === "enable") {
@@ -1628,8 +1738,21 @@ async function runArmDisarm(
     return 1;
   }
 
-  const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx);
-  const result = await invoke(resolved.path, ["--headless", action]);
+  const invoke = ctx.hostAppInvoke ?? defaultArmInvoke(ctx, action);
+  const headlessArgs = ["--headless", action];
+  if (action === "enable") {
+    if (parsed.noTtl) headlessArgs.push("--no-ttl");
+    else headlessArgs.push(`--ttl=${parsed.ttlSeconds}`);
+  } else {
+    headlessArgs.push("--timeout=3");
+  }
+  let leaseRevoked = false;
+  if (action === "disable") {
+    const leaseMessage = buildArmLeaseMessage({ armed: false, revoked: true, ttlSeconds: null });
+    leaseRevoked = await sendArmLeaseBestEffort(socketPath, leaseMessage);
+    await writeLeaseStatusBestEffort(fortressPath, leaseMessage);
+  }
+  const result = await invoke(resolved.path, headlessArgs);
   const report = parseHeadlessReport(result.stdout);
 
   if (result.exitCode === HEADLESS_EXIT_NEEDS_APPROVAL) {
@@ -1641,6 +1764,22 @@ async function runArmDisarm(
       report?.error ||
       result.stderr.trim() ||
       `host app exited with code ${result.exitCode}`;
+    if (action === "disable" && leaseRevoked) {
+      write(
+        err,
+        `Warning: best-effort NE preference disable did not complete (${detail}); the authenticated dead-man lease was revoked, so the provider fail-open path is active.\n`,
+      );
+      await appendArmAuditBestEffort(
+        action,
+        "fail_open_deadman",
+        parsed.force ?? false,
+        fortressPath,
+        env,
+        err,
+      );
+      write(out, "Castle Wall disarmed: provider dead-man lease revoked (NE preference disable best-effort did not complete).\n");
+      return 0;
+    }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
     return 1;
   }
@@ -1707,6 +1846,18 @@ async function runArmDisarm(
   );
 
   if (action === "enable") {
+    const leaseMessage = buildArmLeaseMessage({
+      armed: true,
+      ttlSeconds: parsed.noTtl ? null : parsed.ttlSeconds ?? null,
+    });
+    const leaseSent = await sendArmLeaseBestEffort(socketPath, leaseMessage);
+    await writeLeaseStatusBestEffort(fortressPath, leaseMessage);
+    if (!leaseSent) {
+      write(
+        err,
+        "Warning: Castle Wall armed, but the daemon did not accept the dead-man lease update. Existing daemon heartbeat state remains authoritative.\n",
+      );
+    }
     write(out, "Castle Wall armed: content filter enabled (verified via host-app status).\n");
   } else if (confirmed) {
     write(out, "Castle Wall disarmed: content filter disabled (verified via host-app status).\n");
@@ -1753,6 +1904,12 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.fortress = argv[++i];
     } else if (arg === "--since") {
       parsed.since = argv[++i];
+    } else if (arg === "--ttl") {
+      parsed.ttlSeconds = parseLeaseTtlSeconds(argv[++i]);
+    } else if (arg.startsWith("--ttl=")) {
+      parsed.ttlSeconds = parseLeaseTtlSeconds(arg.slice("--ttl=".length));
+    } else if (arg === "--no-ttl") {
+      parsed.noTtl = true;
     } else if (arg.startsWith("--scope=")) {
       parsed.scope = parseScope(arg.slice("--scope=".length));
     } else if (arg === "--scope") {
@@ -1791,6 +1948,16 @@ function parseDurationMs(value: string): number {
   const amount = Number(match[1]);
   const unit = match[2];
   const multiplier = unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
+  return amount * multiplier;
+}
+
+function parseLeaseTtlSeconds(value: string | undefined): number {
+  if (!value) throw new Error("--ttl requires a duration like 30s, 5m, or 1h");
+  const match = /^(\d+)([smh])$/.exec(value);
+  if (!match) throw new Error("--ttl must use forms like 30s, 5m, or 1h");
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const multiplier = unit === "s" ? 1 : unit === "m" ? 60 : 3600;
   return amount * multiplier;
 }
 
