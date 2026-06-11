@@ -35,17 +35,20 @@ public struct ManifestSnapshot: Equatable {
     /// the IPC bridge can install it on the engine after signature
     /// verification (2026-05-29 origin-classifier foundation).
     public let agentOrigin: AgentOriginWire?
+    public let operatorBaseline: OperatorBaselineWire?
 
     public init(
         signatureB64url: String?,
         rules: [ManifestRule],
         updatedAt: Date,
-        agentOrigin: AgentOriginWire? = nil
+        agentOrigin: AgentOriginWire? = nil,
+        operatorBaseline: OperatorBaselineWire? = nil
     ) {
         self.signatureB64url = signatureB64url
         self.rules = rules
         self.updatedAt = updatedAt
         self.agentOrigin = agentOrigin
+        self.operatorBaseline = operatorBaseline
     }
 }
 

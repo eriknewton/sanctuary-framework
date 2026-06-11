@@ -828,6 +828,42 @@ public struct AgentOriginWire: Codable, Equatable {
     }
 }
 
+/// Operator-approved baseline essentials. Carried inside the signed manifest
+/// body; the extension never reads a mutable local baseline file for verdicts.
+public struct OperatorBaselineEssentialWire: Codable, Equatable {
+    public let name: String
+    public let signingId: String?
+    public let teamId: String?
+    public let sourceAppIdentifier: String?
+
+    public init(
+        name: String,
+        signingId: String? = nil,
+        teamId: String? = nil,
+        sourceAppIdentifier: String? = nil
+    ) {
+        self.name = name
+        self.signingId = signingId
+        self.teamId = teamId
+        self.sourceAppIdentifier = sourceAppIdentifier
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case signingId = "signing_id"
+        case teamId = "team_id"
+        case sourceAppIdentifier = "source_app_identifier"
+    }
+}
+
+public struct OperatorBaselineWire: Codable, Equatable {
+    public let essentials: [OperatorBaselineEssentialWire]
+
+    public init(essentials: [OperatorBaselineEssentialWire]) {
+        self.essentials = essentials
+    }
+}
+
 /// Signed allowlist manifest body. The extension verifies the Ed25519
 /// signature over canonical JSON of this exact shape before trusting rules.
 public struct ManifestSignedBody: Codable, Equatable {
@@ -838,19 +874,22 @@ public struct ManifestSignedBody: Codable, Equatable {
     /// Additive, optional agent-origin descriptor. `nil` encodes to absent so
     /// legacy/unsigned bodies stay byte-identical. Covered by the signature.
     public let agentOrigin: AgentOriginWire?
+    public let operatorBaseline: OperatorBaselineWire?
 
     public init(
         schemaVersion: UInt32,
         fortressId: String,
         issuedAt: String,
         rules: [ManifestRuleDigestEntry],
-        agentOrigin: AgentOriginWire? = nil
+        agentOrigin: AgentOriginWire? = nil,
+        operatorBaseline: OperatorBaselineWire? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.fortressId = fortressId
         self.issuedAt = issuedAt
         self.rules = rules
         self.agentOrigin = agentOrigin
+        self.operatorBaseline = operatorBaseline
     }
 
     enum CodingKeys: String, CodingKey {
@@ -859,6 +898,7 @@ public struct ManifestSignedBody: Codable, Equatable {
         case issuedAt = "issued_at"
         case rules
         case agentOrigin = "agent_origin"
+        case operatorBaseline = "operator_baseline"
     }
 }
 

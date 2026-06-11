@@ -102,7 +102,8 @@ public final class FlowEvaluatorEngine {
         let outcome = AllowlistEvaluator.evaluate(
             flow: descriptor,
             rules: manifestStore.currentRules(),
-            agentOrigin: agentOrigin
+            agentOrigin: agentOrigin,
+            operatorBaseline: manifestStore.currentSnapshot()?.operatorBaseline
         )
         switch outcome {
         case .allow, .drop:

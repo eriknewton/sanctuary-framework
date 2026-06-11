@@ -218,9 +218,9 @@ export class MacOSFlowEventConsumer {
     // OPERATOR ATTRIBUTION (#381): the matched rule id is written into the
     // stored audit entry so the operator -- who owns the policy -- can attribute
     // each flow to the specific rule that decided it (a specific allow/deny rule
-    // id, `operator_passthrough` for the baseline-allow fast path, or null for a
-    // baseline default-deny that matched no rule). It is null only when the
-    // sysext reported no matched rule.
+    // id, `operator-baseline-uid` / `essentials-<name>` for baseline-allow
+    // fast paths, or null for a baseline default-deny that matched no rule). It
+    // is null only when the sysext reported no matched rule.
     //
     // SECURITY (property #11, no-policy-inference): `rule_id` is an operator-only
     // key. It is redacted at every agent-facing read boundary -- `monitor_audit_log`

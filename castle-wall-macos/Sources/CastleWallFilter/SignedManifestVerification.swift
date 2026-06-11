@@ -87,7 +87,8 @@ public enum SignedManifestVerifier {
             signatureB64url: signature.signatureB64url,
             rules: body.rules,
             updatedAt: now,
-            agentOrigin: manifest.agentOrigin
+            agentOrigin: manifest.agentOrigin,
+            operatorBaseline: manifest.operatorBaseline
         )
     }
 

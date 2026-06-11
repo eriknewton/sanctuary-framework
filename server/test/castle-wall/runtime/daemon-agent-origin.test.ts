@@ -161,7 +161,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
       });
     });
 
-    it("records operator_passthrough as the matched rule id for baseline allows", async () => {
+    it("records operator-baseline-uid as the matched rule id for baseline allows", async () => {
       const notification: FlowDecisionRecordedNotification = {
         type: "flow_decision_recorded",
         decision: "allow",
@@ -174,12 +174,34 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           opaque: false,
         },
         agent: { id: "test-agent", template: "unknown" },
-        matched_rule_id: "operator_passthrough",
+        matched_rule_id: "operator-baseline-uid",
         recorded_at: new Date().toISOString(),
       };
       await consumer.handleFlowDecisionRecorded(notification);
       expect(auditEntries).toHaveLength(1);
-      expect(auditEntries[0]!.metadata.rule_id).toBe("operator_passthrough");
+      expect(auditEntries[0]!.metadata.rule_id).toBe("operator-baseline-uid");
+      expect(auditEntries[0]!.operation).toBe("egress_allowed");
+    });
+
+    it("records essentials rule ids for system-essential baseline allows", async () => {
+      const notification: FlowDecisionRecordedNotification = {
+        type: "flow_decision_recorded",
+        decision: "allow",
+        destination: {
+          host: null,
+          ip: "100.100.100.100",
+          port: 443,
+          protocol: "tcp",
+          hostname_source: null,
+          opaque: true,
+        },
+        agent: { id: "tailscaled", template: "system" },
+        matched_rule_id: "essentials-tailscaled",
+        recorded_at: new Date().toISOString(),
+      };
+      await consumer.handleFlowDecisionRecorded(notification);
+      expect(auditEntries).toHaveLength(1);
+      expect(auditEntries[0]!.metadata.rule_id).toBe("essentials-tailscaled");
       expect(auditEntries[0]!.operation).toBe("egress_allowed");
     });
 

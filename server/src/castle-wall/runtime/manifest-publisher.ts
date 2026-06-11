@@ -29,6 +29,7 @@ import type {
   SignedManifest,
 } from "../allowlist/manifest.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
+import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 
@@ -99,6 +100,8 @@ export interface BuildSignedManifestInput {
    * runtime launch happens here.
    */
   agentOrigin?: unknown;
+  /** Optional operator/system-essential baseline candidate. */
+  operatorBaseline?: unknown;
 }
 
 /** Compute SHA-256 hex of UTF-8 bytes. */
@@ -164,6 +167,12 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
     const validated = validateAgentOrigin(input.agentOrigin);
     if (validated !== null) {
       manifest.agent_origin = validated;
+    }
+  }
+  if (input.operatorBaseline !== undefined) {
+    const validated = validateOperatorBaseline(input.operatorBaseline);
+    if (validated !== null) {
+      manifest.operator_baseline = validated;
     }
   }
 

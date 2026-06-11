@@ -31,11 +31,10 @@ import CastleWallIPC
 
 public enum AllowlistEvaluator {
 
-    /// The synthetic matched-rule id stamped on an operator-passthrough
-    /// allow. Distinct from any real rule id so the audit log can tell an
-    /// operator fast-path allow apart from a rule-matched allow, and so the
-    /// legacy `"unknown"` templateId can never be confused with it.
-    public static let operatorPassthroughRuleId = "operator_passthrough"
+    /// The synthetic matched-rule id stamped on non-agent UID baseline allows.
+    /// Distinct from real policy rule ids so the audit log can distinguish
+    /// operator/system baseline traffic from rule-matched agent traffic.
+    public static let operatorBaselineUidRuleId = "operator-baseline-uid"
 
     /// Origin-gated evaluation (2026-05-29 fail-closed origin classifier).
     ///
@@ -47,7 +46,8 @@ public enum AllowlistEvaluator {
     public static func evaluate(
         flow: FilterFlowDescriptor,
         rules: [ManifestRule],
-        agentOrigin: AgentOriginDescriptor?
+        agentOrigin: AgentOriginDescriptor?,
+        operatorBaseline: OperatorBaselineWire? = nil
     ) -> EvaluationOutcome {
         let origin = OriginClassifier.originClass(
             descriptor: flow,
@@ -58,12 +58,42 @@ public enum AllowlistEvaluator {
         // here. This gate sits BEFORE the rule loop. `.agent` and
         // `.unattributed` deliberately do NOT take it.
         if origin == .operator {
-            return .allow(matchedRuleId: operatorPassthroughRuleId)
+            return .allow(matchedRuleId: baselineRuleId(flow: flow, operatorBaseline: operatorBaseline))
         }
 
         // `.agent` and `.unattributed` route to the unchanged default-deny +
         // allowlist evaluation. Default-deny on no match is preserved.
         return evaluate(flow: flow, rules: rules)
+    }
+
+    static func baselineRuleId(
+        flow: FilterFlowDescriptor,
+        operatorBaseline: OperatorBaselineWire?
+    ) -> String {
+        if let essential = matchingEssential(flow: flow, operatorBaseline: operatorBaseline) {
+            return "essentials-\(essential.name)"
+        }
+        return operatorBaselineUidRuleId
+    }
+
+    static func matchingEssential(
+        flow: FilterFlowDescriptor,
+        operatorBaseline: OperatorBaselineWire?
+    ) -> OperatorBaselineEssentialWire? {
+        guard let operatorBaseline else { return nil }
+        return operatorBaseline.essentials.first { entry in
+            if let signingId = entry.signingId, signingId != flow.sourceSigningId {
+                return false
+            }
+            if let teamId = entry.teamId, teamId != flow.sourceTeamId {
+                return false
+            }
+            if let sourceAppIdentifier = entry.sourceAppIdentifier,
+               sourceAppIdentifier != flow.sourceAppIdentifier {
+                return false
+            }
+            return entry.signingId != nil || entry.teamId != nil || entry.sourceAppIdentifier != nil
+        }
     }
 
     /// Evaluate a flow against the current manifest snapshot.

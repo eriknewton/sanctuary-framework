@@ -11,6 +11,7 @@ import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
 import { deriveDnsRuleForHostnameRules } from "../allowlist/dns-derivation.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
+import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
@@ -71,6 +72,11 @@ export interface MacOSCastleWallDaemonInput {
    * sysext classifies every flow as `.agent` (machine-wide default-deny).
    */
   agentOrigin?: unknown;
+  /**
+   * Optional operator-baseline descriptor (config / test fixture). When absent,
+   * the daemon loads `policy/egress/operator-baseline.json` from the fortress.
+   */
+  operatorBaseline?: unknown;
   /**
    * Explicit signing handle. When provided it is used verbatim (tests inject a
    * fake). When absent the daemon builds one via the helper path (default) or
@@ -165,11 +171,16 @@ export async function startMacOSCastleWallDaemon(
   await writeSystemPinnedPublicKey(signer);
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
+  const operatorBaseline = await resolveOperatorBaseline(
+    input.fortressPath,
+    input.operatorBaseline,
+  );
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
     signer,
     agentOrigin,
+    operatorBaseline,
     ...(input.globalPinnedPublicKeyPath
       ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
       : {}),
@@ -301,11 +312,16 @@ export async function startMacOSCastleWallDaemon(
   ): Promise<PolicyReloadResponse> {
     try {
       const reloadedOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
+      const reloadedBaseline = await resolveOperatorBaseline(
+        input.fortressPath,
+        input.operatorBaseline,
+      );
       manifestState = await loadManifestState({
         fortressPath: input.fortressPath,
         fortressId: input.fortressId,
         signer,
         agentOrigin: reloadedOrigin,
+        operatorBaseline: reloadedBaseline,
         ...(input.globalPinnedPublicKeyPath
           ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
           : {}),
@@ -399,6 +415,7 @@ function buildArmLease(input: {
 }
 
 const AGENT_ORIGIN_FILENAME = "agent-origin.json";
+const OPERATOR_BASELINE_FILENAME = "operator-baseline.json";
 
 /**
  * Resolve the agent-origin descriptor from config: prefer the explicit input,
@@ -422,6 +439,43 @@ async function resolveAgentOrigin(
       // SAFETY: daemon startup diagnostics are operator-facing stderr output.
       console.warn(
         `[castle-wall] warning: ${AGENT_ORIGIN_FILENAME} is structurally invalid; ignoring (classify-all-agent fallback)`,
+      );
+      return undefined;
+    }
+    return validated;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
+async function resolveOperatorBaseline(
+  fortressPath: string,
+  explicitInput: unknown,
+): Promise<unknown> {
+  if (explicitInput !== undefined) {
+    return explicitInput;
+  }
+  const filePath = join(fortressPath, "policy", "egress", OPERATOR_BASELINE_FILENAME);
+  try {
+    const fileStat = await stat(filePath);
+    if ((fileStat.mode & 0o077) !== 0) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} must be mode 0600/0700-equivalent for non-owner bits; ignoring`,
+      );
+      return undefined;
+    }
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateOperatorBaseline(parsed);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} is structurally invalid; ignoring`,
       );
       return undefined;
     }
@@ -601,6 +655,7 @@ async function loadManifestState(input: {
   fortressId: string;
   signer: DaemonSigner;
   agentOrigin?: unknown;
+  operatorBaseline?: unknown;
   globalPinnedPublicKeyPath?: string;
 }): Promise<ManifestState> {
   // Defense-in-depth: cross-check the persisted root-owned pin against the live
@@ -653,6 +708,7 @@ async function loadManifestState(input: {
       sign: (bytes) => input.signer.signManifest(bytes),
     },
     agentOrigin: input.agentOrigin,
+    operatorBaseline: input.operatorBaseline,
   });
   const verifyResult = verifyManifestSignature(signed, input.signer.publicKey);
   if (!verifyResult.ok) {

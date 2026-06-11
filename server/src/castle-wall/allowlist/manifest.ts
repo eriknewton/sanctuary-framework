@@ -60,6 +60,22 @@ export interface AgentOrigin {
 }
 
 /**
+ * One operator-approved system-essential baseline entry. The daemon sources
+ * this from `policy/egress/operator-baseline.json` and signs it into the same
+ * manifest body as the allowlist. The extension consumes only the signed copy.
+ */
+export interface OperatorBaselineEssential {
+  name: string;
+  signing_id?: string;
+  team_id?: string;
+  source_app_identifier?: string;
+}
+
+export interface OperatorBaseline {
+  essentials: OperatorBaselineEssential[];
+}
+
+/**
  * The unsigned manifest. Canonical-JSON of this structure is the signing input.
  */
 export interface AllowlistManifest {
@@ -74,6 +90,11 @@ export interface AllowlistManifest {
    * the signature byte-compatible across versions.
    */
   agent_origin?: AgentOrigin;
+  /**
+   * Optional operator/system-essential baseline allowlist. Omitted when absent;
+   * when present, it is covered by the manifest signature.
+   */
+  operator_baseline?: OperatorBaseline;
 }
 
 /**
