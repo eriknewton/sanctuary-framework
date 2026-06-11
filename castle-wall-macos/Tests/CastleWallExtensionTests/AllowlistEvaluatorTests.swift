@@ -462,19 +462,19 @@ final class AllowlistEvaluatorTests: XCTestCase {
             rules: [r],
             agentOrigin: uidOrigin()
         )
-        // Rule-matched allow, NOT operator_passthrough.
+        // Rule-matched allow, NOT operator-baseline.
         XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
     }
 
     func testUidMode_operatorFlowFastPathAllows() {
-        // operator-UID (high uid != agent) => operator_passthrough, even with
+        // operator-UID (high uid != agent) => operator-baseline, even with
         // an empty ruleset that would otherwise default-deny.
         let outcome = AllowlistEvaluator.evaluate(
             flow: originFlow(ruid: 501),
             rules: [],
             agentOrigin: uidOrigin()
         )
-        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorBaselineUidRuleId))
     }
 
     func testUidMode_systemLowUidFastPathAllows() {
@@ -483,7 +483,39 @@ final class AllowlistEvaluatorTests: XCTestCase {
             rules: [],
             agentOrigin: uidOrigin()
         )
-        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorBaselineUidRuleId))
+    }
+
+    func testUidMode_systemEssentialUsesNamedBaselineRuleId() {
+        let baseline = OperatorBaselineWire(essentials: [
+            OperatorBaselineEssentialWire(
+                name: "tailscaled",
+                signingId: "com.tailscale.ipn.macos.network-extension"
+            )
+        ])
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, signingId: "com.tailscale.ipn.macos.network-extension"),
+            rules: [],
+            agentOrigin: uidOrigin(),
+            operatorBaseline: baseline
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: "essentials-tailscaled"))
+    }
+
+    func testUidMode_agentUidCannotRideBaselineEvenWhenEssentialMatches() {
+        let baseline = OperatorBaselineWire(essentials: [
+            OperatorBaselineEssentialWire(
+                name: "curl",
+                sourceAppIdentifier: "deadbeef"
+            )
+        ])
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 502),
+            rules: [],
+            agentOrigin: AgentOriginDescriptor(mode: .uid, agentUid: 502, systemUidAllowCeiling: 500),
+            operatorBaseline: baseline
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
     func testUidMode_unattributedDropsFailClosed() {
@@ -514,7 +546,7 @@ final class AllowlistEvaluatorTests: XCTestCase {
             rules: [],
             agentOrigin: natOrigin()
         )
-        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorPassthroughRuleId))
+        XCTAssertEqual(outcome, .allow(matchedRuleId: AllowlistEvaluator.operatorBaselineUidRuleId))
     }
 
     func testNatMode_unresolvedSigningIdDropsFailClosed() {

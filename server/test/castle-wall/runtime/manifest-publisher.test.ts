@@ -128,6 +128,56 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     expect(ids).toEqual(["rule-a", "rule-b", "rule-c"]);
   });
 
+  it("signs a valid operator_baseline into the manifest body", async () => {
+    const { signed } = await buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signer,
+      operatorBaseline: {
+        essentials: [
+          {
+            name: "tailscaled",
+            signing_id: "com.tailscale.ipn.macos.network-extension",
+          },
+          {
+            name: "sshd",
+            source_app_identifier: "com.openssh.sshd",
+          },
+        ],
+      },
+    });
+
+    expect(signed.manifest.operator_baseline).toEqual({
+      essentials: [
+        {
+          name: "sshd",
+          source_app_identifier: "com.openssh.sshd",
+        },
+        {
+          name: "tailscaled",
+          signing_id: "com.tailscale.ipn.macos.network-extension",
+        },
+      ],
+    });
+    expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
+  });
+
+  it("omits malformed operator_baseline candidates", async () => {
+    const { signed } = await buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signer,
+      operatorBaseline: {
+        essentials: [{ name: "tailscaled" }],
+      },
+    });
+
+    expect(signed.manifest).not.toHaveProperty("operator_baseline");
+    expect(verifyManifestSignature(signed, pinnedPublicKey).ok).toBe(true);
+  });
+
   it("rejects duplicate rule ids", async () => {
     await expect(
       buildSignedManifest({
