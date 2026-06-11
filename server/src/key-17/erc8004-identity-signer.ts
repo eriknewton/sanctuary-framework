@@ -151,7 +151,7 @@ export function signErc8004Registration(
 export function verifyErc8004Registration(
   signed: SignedErc8004Registration
 ): boolean {
-  const { signature, signer_address, public_key, ...unsigned } = signed;
+  const { signature, signer_address, public_key: _public_key, ...unsigned } = signed;
 
   const messageBytes = canonicalizeToBytes(unsigned);
   const msgHash = ethMessageHash(messageBytes);

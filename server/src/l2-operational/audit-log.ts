@@ -1980,7 +1980,7 @@ export class AuditLog {
   private async writeCheckpointRecord(
     payload: AuditCheckpointSigningPayload
   ): Promise<void> {
-    let signed: AuditCheckpointSignature | null = null;
+    let signed: AuditCheckpointSignature | null;
     try {
       signed = (await this.checkpointSigner?.(payload)) ?? null;
     } catch {

@@ -117,7 +117,7 @@ async function openExitContext(
   const storage = new FilesystemStorage(stateStoragePath);
 
   let masterKey: Uint8Array;
-  let keySource: ExitContext["keySource"] = "unknown";
+  let keySource: ExitContext["keySource"];
   if (passphrase) {
     let existingParams: KeyDerivationParams | undefined;
     const raw = await storage.read("_meta", "key-params");

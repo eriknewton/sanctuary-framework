@@ -186,7 +186,6 @@ export async function startMacOSCastleWallDaemon(
       : {}),
   });
   const pendingRequests = new Set<string>();
-  let listener: MacOSCastleWallListenerHandle;
   const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
   const stopLeaseHeartbeat = (): void => {
@@ -255,7 +254,7 @@ export async function startMacOSCastleWallDaemon(
       stopLeaseHeartbeat();
     },
   };
-  listener = input.listenerFactory
+  const listener = input.listenerFactory
     ? input.listenerFactory(listenerOptions)
     : new MacOSFlowIpcListener(listenerOptions);
 
@@ -635,13 +634,14 @@ async function assertGlobalPinMatchesLiveKey(
   livePublicKey: Uint8Array,
   pinPath: string,
 ): Promise<void> {
-  let pin: { uid: number; bytes: Uint8Array } | null = null;
+  let pin: { uid: number; bytes: Uint8Array } | null;
   try {
     const uid = (await stat(pinPath)).uid;
     const bytes = await readFile(pinPath);
     pin = { uid, bytes };
   } catch {
-    pin = null; // absent / unreadable — additive check, skip
+    // absent / unreadable — additive check, skip
+    return;
   }
   if (evaluateGlobalPinTrust(pin, livePublicKey) === "mismatch") {
     throw new Error(

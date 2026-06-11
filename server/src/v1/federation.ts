@@ -175,7 +175,7 @@ export class JoinCeremony {
 
     // 3. HKDF salt proof: the requester must hold the master-derived transport
     //    key, not merely a stolen bootstrap token.
-    let proofOk = false;
+    let proofOk: boolean;
     try {
       const transportKey = deriveNodeTransportKey({
         fortress_master_secret: this.ctx.getFortressMasterSecret(),

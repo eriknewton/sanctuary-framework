@@ -390,7 +390,7 @@ export async function handleEnglishPolicyRoute(
       };
       try {
         parsedBody = await readOptionalJSONBody(req);
-      } catch (err) {
+      } catch {
         writeJSON(res, 400, { ok: false, error: "invalid_json" });
         return true;
       }
@@ -540,7 +540,7 @@ export async function handleEnglishPolicyRoute(
 
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
-  } catch (err) {
+  } catch {
     writeJSON(res, 500, { ok: false, error: "internal" });
     return true;
   }

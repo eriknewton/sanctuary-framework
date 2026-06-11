@@ -215,7 +215,7 @@ function yamlScalar(value: unknown): string {
   if (typeof value === "string") {
     // Quote anything that could parse as a non-string or contains
     // structure characters.
-    if (/^[A-Za-z0-9._\/-]+$/.test(value) && !/^(true|false|null|~|[0-9.+-]+)$/i.test(value)) {
+    if (/^[A-Za-z0-9._/-]+$/.test(value) && !/^(true|false|null|~|[0-9.+-]+)$/i.test(value)) {
       return value;
     }
     return JSON.stringify(value);

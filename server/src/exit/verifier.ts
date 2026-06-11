@@ -401,7 +401,7 @@ export async function verifyExitBundle(
   for (const artifact of body.artifacts) {
     const artifactPath = join(root, artifact.path);
     let bytes: Uint8Array;
-    let fileSize = -1;
+    let fileSize: number;
     try {
       const linkStat = await lstat(artifactPath);
       if (linkStat.isSymbolicLink()) {
@@ -586,4 +586,3 @@ export async function verifyExitBundle(
     failure_class: detailedFailureClass,
   };
 }
-

@@ -239,7 +239,6 @@ function assessL2(
   let auditTrailExists = false;
   let toolSandboxing: "policy-enforced" | "basic" | "none" = "none";
   let contextGating = false;
-  let processIsolationHardening: "full" | "hardened" | "basic" | "none" = "none";
 
   if (sanctuaryActive) {
     approvalGate = "three-tier";
@@ -274,7 +273,7 @@ function assessL2(
   // L2 hardening is optional and can be verified via tools at runtime
   // This assessment assumes default "none"; actual hardening is measured
   // by the l2_hardening_status and l2_verify_isolation tools
-  processIsolationHardening = "none";
+  const processIsolationHardening = "none";
 
   const status = approvalGate === "three-tier" && auditTrailEncrypted
     ? "active"

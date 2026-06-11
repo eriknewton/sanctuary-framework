@@ -521,7 +521,7 @@ export async function rewriteConfigForWrap(
 
   // Resolve existing servers so we can preserve env vars from the original
   // sanctuary entry when no explicit sanctuaryEnv is provided.
-  let existingServers: Record<string, unknown> = {};
+  let existingServers: Record<string, unknown>;
   if (agentConfig.platform === "openclaw") {
     const existingMcp = (raw.mcp as Record<string, unknown>) ?? {};
     existingServers = (existingMcp.servers as Record<string, unknown>) ?? {};

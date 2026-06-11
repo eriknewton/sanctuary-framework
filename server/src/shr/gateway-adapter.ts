@@ -311,7 +311,7 @@ function extractAuthorizationSignals(body: SHRBody): PingAuthorizationContext["a
  */
 function transformDegradations(degradations: SHRDegradation[]): GatewayDegradation[] {
   return degradations.map((deg) => {
-    let authzImpact = "";
+    let authzImpact: string;
 
     if (deg.code === "NO_TEE") {
       authzImpact = "Restricted to read-only operations until TEE available";
