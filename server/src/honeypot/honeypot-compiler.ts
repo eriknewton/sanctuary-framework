@@ -579,12 +579,12 @@ interface HeuristicResult {
 
 /** Patterns the heuristic walks for "honeypot at <path>" extractions. */
 const HEURISTIC_PATH_PATTERNS: RegExp[] = [
-  /honeypot\s+(?:at|on)\s+([\/][\w\/\-:*\.]+)/i,
-  /trap\s+(?:at|on|for)\s+([\/][\w\/\-:*\.]+)/i,
-  /deploy\s+(?:at|on)\s+([\/][\w\/\-:*\.]+)/i,
-  /catch\s+(?:requests?\s+to|callers?\s+at)\s+([\/][\w\/\-:*\.]+)/i,
-  /watch\s+(?:for\s+)?(?:requests?\s+(?:to|on))\s+([\/][\w\/\-:*\.]+)/i,
-  /([\/][\w\/\-:*\.]+)\s+(?:endpoint|path|route)/i,
+  /honeypot\s+(?:at|on)\s+([/][\w/\-:*.]+)/i,
+  /trap\s+(?:at|on|for)\s+([/][\w/\-:*.]+)/i,
+  /deploy\s+(?:at|on)\s+([/][\w/\-:*.]+)/i,
+  /catch\s+(?:requests?\s+to|callers?\s+at)\s+([/][\w/\-:*.]+)/i,
+  /watch\s+(?:for\s+)?(?:requests?\s+(?:to|on))\s+([/][\w/\-:*.]+)/i,
+  /([/][\w/\-:*.]+)\s+(?:endpoint|path|route)/i,
 ];
 
 const SEVERITY_HINTS: Array<{ phrase: RegExp; severity: "warn" | "alert" }> = [

@@ -1853,7 +1853,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Not found" }));
       }
-    } catch (err) {
+    } catch {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Internal server error" }));
     }

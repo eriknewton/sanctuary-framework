@@ -95,7 +95,7 @@ export function signX402Request(
  * and checks the Ed25519 signature against the embedded public key.
  */
 export function verifyX402Request(signed: SignedX402Request): boolean {
-  const { signature, algorithm, public_key, ...unsigned } = signed;
+  const { signature, algorithm: _algorithm, public_key, ...unsigned } = signed;
   const bytes = canonicalizeToBytes(unsigned);
   const sigBytes = Buffer.from(
     signature.replace(/-/g, "+").replace(/_/g, "/") + "==",

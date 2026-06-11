@@ -675,7 +675,7 @@ export async function runStatus(
     return 0;
   }
 
-  let sysextState: SysextState = "not loaded";
+  let sysextState: SysextState;
   try {
     const raw = execSyncFn(
       "systemextensionsctl list 2>/dev/null | grep castle-wall"
@@ -1434,7 +1434,7 @@ export function makeLaunchServicesHostAppInvoke(
       };
     }
 
-    let raw = "";
+    let raw: string;
     try {
       raw = await readFile(reportPath, "utf8");
     } catch {

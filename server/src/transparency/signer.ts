@@ -98,13 +98,13 @@ async function assertGlobalPinMatches(
   liveKey: Uint8Array,
   pinPath: string
 ): Promise<void> {
-  let pin: { uid: number; bytes: Uint8Array } | null = null;
+  let pin: { uid: number; bytes: Uint8Array } | null;
   try {
     const uid = (await stat(pinPath)).uid;
     const bytes = await readFile(pinPath);
     pin = { uid, bytes };
   } catch {
-    pin = null;
+    return;
   }
   if (!pin || pin.uid !== 0) return;
   const equal =

@@ -512,7 +512,7 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   const { readStoredPassphrase, PassphraseUnreadableError } = await import(
     "./wrap/passphrase.js"
   );
-  let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
+  let stored: Awaited<ReturnType<typeof readStoredPassphrase>>;
   try {
     stored = await readStoredPassphrase();
   } catch (err) {

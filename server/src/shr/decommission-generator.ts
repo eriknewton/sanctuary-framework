@@ -67,7 +67,7 @@ export async function generateDecommissionCertificate(
 
   // ── Check 1: No user-created state (all non-reserved namespaces empty)
   let stateCheckPassed = true;
-  let stateCheckDetails = "";
+  let stateCheckDetails: string;
   try {
     // List all namespaces
     await storage.list("_meta");
@@ -93,7 +93,7 @@ export async function generateDecommissionCertificate(
 
   // ── Check 2: No active identities
   let identityCheckPassed = true;
-  let identityCheckDetails = "";
+  let identityCheckDetails: string;
   try {
     const allIdentities = identityManager.list();
     if (allIdentities.length > 0) {
@@ -118,7 +118,7 @@ export async function generateDecommissionCertificate(
 
   // ── Check 3: No active attestations or reputation records
   let reputationCheckPassed = true;
-  let reputationCheckDetails = "";
+  let reputationCheckDetails: string;
   try {
     if (reputationStore) {
       // Try to query reputation — should be empty

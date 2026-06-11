@@ -272,7 +272,7 @@ export class AggregatorBackedChannel implements ApprovalChannel {
     let underlyingPromise: Promise<ApprovalResponse>;
     try {
       underlyingPromise = this.underlying.requestApproval(request);
-    } catch (err) {
+    } catch {
       // Synchronous throw → defer to aggregator alone.
       const response = await aggregatorPromise;
       return response;

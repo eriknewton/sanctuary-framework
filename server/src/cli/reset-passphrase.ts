@@ -160,7 +160,7 @@ export async function runResetPassphraseCommand(
   // Tests pass a pre-loaded Readable; production hands process.stdin which
   // stays open for the duration of the command.
   const lines = new LineReader(stdin);
-  let code = 1;
+  let code: number;
   let nukeSucceeded = false;
   try {
     const availability = await surveyAvailableModes(storagePath);

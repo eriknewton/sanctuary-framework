@@ -432,7 +432,7 @@ export const ANNEX_III_REGULATION_VERSION =
 function normalizeForMatching(text: string): string {
   return text
     .toLowerCase()
-    .replace(/[,.;:!?()\[\]{}"']/g, " ")
+    .replace(/[,.;:!?()[]{}"']/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }

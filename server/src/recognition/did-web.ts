@@ -888,7 +888,7 @@ function unsafeAuthorityHostReason(authorityHost: string): string | undefined {
 async function resolvedHostNotPublicReason(
   authorityHost: string,
 ): Promise<string | undefined> {
-  let addresses: Array<{ address: string }> = [];
+  let addresses: Array<{ address: string }>;
   try {
     addresses = await lookup(authorityHost, { all: true, verbatim: true });
   } catch (err) {

@@ -285,7 +285,7 @@ export class WebhookApprovalChannel implements ApprovalChannel {
     const requestId = match[1];
 
     // Read and verify the body
-    let bodyChunks: Buffer[] = [];
+    const bodyChunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
     req.on("end", () => {
       const body = Buffer.concat(bodyChunks).toString("utf-8");

@@ -131,7 +131,7 @@ async function fileExists(path: string): Promise<boolean> {
 
 async function newestAuditMtime(storagePath: string): Promise<string | null> {
   const auditDir = join(storagePath, "state", "_audit");
-  let entries: string[] = [];
+  let entries: string[];
   try {
     entries = await readdir(auditDir);
   } catch {
