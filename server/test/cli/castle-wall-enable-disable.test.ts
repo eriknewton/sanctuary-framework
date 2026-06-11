@@ -359,7 +359,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       enable: { stdout: legacyReportLine("enable", "enabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -387,7 +387,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
