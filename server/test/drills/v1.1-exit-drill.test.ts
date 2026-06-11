@@ -377,7 +377,7 @@ describe("v1.1 acceptance drill - Pillar 4: portability + exit", () => {
       context: "drill-exit",
       identity_id: sourceIdentityId,
     });
-    source.auditLog.append("l1", "drill_exit_seed", sourceIdentityId, {
+    await source.auditLog.append("l1", "drill_exit_seed", sourceIdentityId, {
       seeded: true,
     });
 

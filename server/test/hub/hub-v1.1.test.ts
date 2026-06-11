@@ -974,16 +974,16 @@ describe("Hub activity feed pagination (Test 5)", () => {
   afterEach(async () => rig.stop());
 
   it("respects since + limit", async () => {
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
     await new Promise((r) => setTimeout(r, 5));
     const cutoff = new Date().toISOString();
     await new Promise((r) => setTimeout(r, 5));
-    rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
-    rig.auditLog.append("l2", "privacy_event", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "privacy_event", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
     await rig.auditLog.flush();
@@ -1023,13 +1023,13 @@ describe("Hub activity feed pagination (Test 5)", () => {
   });
 
   it("filter by agent_id and category narrows results", async () => {
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
-    rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-beta",
     });
-    rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
       agent_id: "agent-beta",
     });
     await rig.auditLog.flush();

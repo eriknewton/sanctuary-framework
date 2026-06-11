@@ -72,9 +72,10 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new SlowMemoryStorage(40);
     const log = new AuditLog(storage, generateRandomKey());
 
-    log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S1" });
-    log.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "S1", skill: "k" });
-    log.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "S1" });
+    // Intentionally fire-and-forget: this test proves storage can lag before flush().
+    void log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S1" });
+    void log.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "S1", skill: "k" });
+    void log.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "S1" });
 
     const beforeFlush = await storage.list("_audit");
     expect(beforeFlush.length).toBeLessThan(3);
@@ -84,11 +85,11 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new SlowMemoryStorage(40);
     const log = new AuditLog(storage, generateRandomKey());
 
-    log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S1" });
-    log.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "S1", skill: "k" });
-    log.append("l3", BROKER_OPS.SECRET_ROTATED, "id", { secret: "S1" });
-    log.append("l3", BROKER_OPS.SECRET_REVOKED, "id", { secret: "S1", skill: "k" });
-    log.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "S1" });
+    await log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S1" });
+    await log.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "S1", skill: "k" });
+    await log.append("l3", BROKER_OPS.SECRET_ROTATED, "id", { secret: "S1" });
+    await log.append("l3", BROKER_OPS.SECRET_REVOKED, "id", { secret: "S1", skill: "k" });
+    await log.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "S1" });
 
     await log.flush();
 
@@ -104,11 +105,11 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const masterKey = generateRandomKey();
 
     const writer = new AuditLog(storage, masterKey);
-    writer.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "STRIPE_KEY" });
-    writer.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "STRIPE_KEY", skill: "demo" });
-    writer.append("l3", BROKER_OPS.SECRET_ROTATED, "id", { secret: "STRIPE_KEY" });
-    writer.append("l3", BROKER_OPS.SECRET_REVOKED, "id", { secret: "STRIPE_KEY", skill: "demo" });
-    writer.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "STRIPE_KEY" });
+    await writer.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "STRIPE_KEY" });
+    await writer.append("l3", BROKER_OPS.SECRET_GRANTED, "id", { secret: "STRIPE_KEY", skill: "demo" });
+    await writer.append("l3", BROKER_OPS.SECRET_ROTATED, "id", { secret: "STRIPE_KEY" });
+    await writer.append("l3", BROKER_OPS.SECRET_REVOKED, "id", { secret: "STRIPE_KEY", skill: "demo" });
+    await writer.append("l3", BROKER_OPS.SECRET_DELETED, "id", { secret: "STRIPE_KEY" });
     await writer.flush();
 
     const reader = new AuditLog(storage, masterKey);
@@ -125,7 +126,7 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new MemoryStorage();
     const log = new AuditLog(storage, generateRandomKey());
     await log.flush();
-    log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S" });
+    await log.append("l3", BROKER_OPS.SECRET_ADDED, "id", { secret: "S" });
     await log.flush();
     await log.flush();
     const entries = await storage.list("_audit");
@@ -215,7 +216,8 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const log = new AuditLog(storage, generateRandomKey());
 
     const callerResult = (() => {
-      log.append("l1", "state_read", "id", { namespace: "memory", key: "k" });
+      // Intentionally fire-and-forget: this test proves append does not block caller flow.
+      void log.append("l1", "state_read", "id", { namespace: "memory", key: "k" });
       return "continued";
     })();
 

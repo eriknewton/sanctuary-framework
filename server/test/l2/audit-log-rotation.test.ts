@@ -25,7 +25,7 @@ describe("AuditLog Rotation", () => {
     const { log, storage } = createLog({ maxEntries: 50 });
 
     for (let i = 0; i < 10; i++) {
-      log.append("l1", `op-${i}`, "id-1");
+      await log.append("l1", `op-${i}`, "id-1");
     }
 
     // Wait for async persist + rotation
@@ -39,7 +39,7 @@ describe("AuditLog Rotation", () => {
     const { log, storage } = createLog({ maxEntries: 5 });
 
     for (let i = 0; i < 10; i++) {
-      log.append("l1", `op-${i}`, "id-1");
+      await log.append("l1", `op-${i}`, "id-1");
       // Small delay to ensure keys are ordered
       await new Promise((r) => setTimeout(r, 10));
     }
@@ -56,7 +56,7 @@ describe("AuditLog Rotation", () => {
     const { log, storage } = createLog({ maxTotalSizeBytes: 1024 });
 
     for (let i = 0; i < 20; i++) {
-      log.append("l1", `op-${i}`, "id-1", { padding: "x".repeat(100) });
+      await log.append("l1", `op-${i}`, "id-1", { padding: "x".repeat(100) });
       await new Promise((r) => setTimeout(r, 10));
     }
 

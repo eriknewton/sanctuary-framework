@@ -36,7 +36,7 @@ describe("SIEM Export Integration", () => {
     // set historical timestamps directly. All entries will be recent.
 
     // Entry 1: sovereignty_audit, approve/T2, success
-    auditLog.append("l2", "sovereignty_audit", "agent-001", {
+    await auditLog.append("l2", "sovereignty_audit", "agent-001", {
       gate_decision: "approve",
       tier: 2,
       session_id: "sess-audit-1",
@@ -44,7 +44,7 @@ describe("SIEM Export Integration", () => {
     });
 
     // Entry 2: state_read, auto-allow/T3, success
-    auditLog.append("l2", "state_read", "agent-001", {
+    await auditLog.append("l2", "state_read", "agent-001", {
       gate_decision: "auto-allow",
       tier: 3,
       session_id: "sess-read-1",
@@ -52,7 +52,7 @@ describe("SIEM Export Integration", () => {
     });
 
     // Entry 3: state_delete, deny, failure
-    auditLog.append("l2", "state_delete", "agent-002", {
+    await auditLog.append("l2", "state_delete", "agent-002", {
       gate_decision: "deny",
       tier: 1,
       session_id: "sess-delete-1",
@@ -60,7 +60,7 @@ describe("SIEM Export Integration", () => {
     }, "failure");
 
     // Entry 4: reputation_import, deny, failure
-    auditLog.append("l4", "reputation_import", "agent-003", {
+    await auditLog.append("l4", "reputation_import", "agent-003", {
       gate_decision: "deny",
       tier: 1,
       session_id: "sess-rep-1",

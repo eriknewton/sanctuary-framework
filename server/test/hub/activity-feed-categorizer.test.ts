@@ -36,7 +36,7 @@ async function categoryFor(
   layer: "l1" | "l2" | "l3" | "l4",
   operation: string,
 ): Promise<string | undefined> {
-  rig.auditLog.append(layer, operation, IDENTITY_ID, {});
+  await rig.auditLog.append(layer, operation, IDENTITY_ID, {});
   await rig.auditLog.flush();
   const entries = await aggregateActivity(
     { auditLog: rig.auditLog, identityId: IDENTITY_ID },

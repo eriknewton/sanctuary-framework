@@ -359,7 +359,7 @@ describe("v1.1 acceptance drill - Pillar 2: operator hub end-to-end", () => {
 
     // Step 4: privacy event seeded into the same audit log surfaces under
     // category=privacy.
-    rig.auditLog.append("l2", "privacy_event", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "privacy_event", IDENTITY_ID, {
       version: "1.1",
       kind: "filtered",
       event_id: "drill-priv-evt-1",

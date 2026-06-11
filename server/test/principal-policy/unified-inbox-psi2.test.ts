@@ -196,7 +196,7 @@ describe("Psi-2 - producer wiring", () => {
       [{ name: "User-Agent", reason: "user-agent" }],
       [{ name: "Accept-Language", reason: "locale-fingerprint" }, { name: "User-Agent", reason: "user-agent" }],
     ]) {
-      auditLog.append("l2", "query_anonymity_headers_stripped", IDENTITY, {
+      await auditLog.append("l2", "query_anonymity_headers_stripped", IDENTITY, {
         fortress_id: FORTRESS,
         stripped_count: removed.length,
         removed,
@@ -301,7 +301,7 @@ describe("Psi-2 - producer wiring", () => {
 
   it("wrapped-agent error reporter maps transient, repeated, and fatal errors", async () => {
     const { auditLog, bridge } = rig();
-    auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
+    await auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
       context: "wrapped_agent",
       severity: "error",
       agent_id: "agent_err",
@@ -309,14 +309,14 @@ describe("Psi-2 - producer wiring", () => {
       error_class: "TransientNetworkError",
     });
     for (let i = 0; i < 4; i++) {
-      auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
+      await auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
         context: "wrapped_agent",
         severity: "error",
         agent_id: "agent_repeat",
         error_class: "RetryableToolError",
       });
     }
-    auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
+    await auditLog.append("l2", "wrapped_agent_error", IDENTITY, {
       context: "wrapped_agent",
       severity: "error",
       fatal: true,

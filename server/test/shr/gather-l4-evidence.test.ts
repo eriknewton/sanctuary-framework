@@ -55,7 +55,7 @@ describe("gatherL4Evidence", () => {
 
   it("marks verascore_linked=true when reputation_publish succeeded for this identity", async () => {
     const { store, auditLog, identity } = setup();
-    auditLog.append(
+    await auditLog.append(
       "l4",
       "reputation_publish",
       identity.identity_id,
@@ -68,7 +68,7 @@ describe("gatherL4Evidence", () => {
 
   it("does NOT flip verascore_linked on a failed reputation_publish", async () => {
     const { store, auditLog, identity } = setup();
-    auditLog.append(
+    await auditLog.append(
       "l4",
       "reputation_publish",
       identity.identity_id,
@@ -81,7 +81,7 @@ describe("gatherL4Evidence", () => {
 
   it("ignores reputation_publish entries attributed to a different identity", async () => {
     const { store, auditLog, identity } = setup();
-    auditLog.append(
+    await auditLog.append(
       "l4",
       "reputation_publish",
       "some-other-identity",

@@ -45,7 +45,7 @@ async function bootstrapIdentity(
       "passphrase",
     );
     await identityMgr.save(storedIdentity);
-    auditLog.append("l1", "identity_create", publicIdentity.identity_id, {
+    await auditLog.append("l1", "identity_create", publicIdentity.identity_id, {
       label: "default",
       source: "wrap-auto",
     });

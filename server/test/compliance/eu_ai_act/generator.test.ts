@@ -83,17 +83,17 @@ async function buildFixture(
   return { deps, masterKey, storage, identityManager, auditLog };
 }
 
-function seedAuditEntries(auditLog: AuditLog, count: number): void {
+async function seedAuditEntries(auditLog: AuditLog, count: number): Promise<void> {
   for (let i = 0; i < count; i++) {
-    auditLog.append(
+    await auditLog.append(
       i % 2 === 0 ? "l1" : "l2",
       i % 3 === 0 ? `gate_allow:test_tool_${i}` : `gate_allow_proxy:upstream_${i}`,
       "test-principal",
       { iteration: i }
     );
   }
-  auditLog.append("l2", "gate_deny:dangerous_op", "test-principal", {});
-  auditLog.append(
+  await auditLog.append("l2", "gate_deny:dangerous_op", "test-principal", {});
+  await auditLog.append(
     "l2",
     "injection_detected:malicious_op",
     "system",
@@ -165,7 +165,7 @@ describe("computeAuditPeriodSummary", () => {
 
   it("counts gate decisions across all prefixes including gate_allow_proxy", async () => {
     const fx = await buildFixture();
-    seedAuditEntries(fx.auditLog, 6);
+    await seedAuditEntries(fx.auditLog, 6);
     const summary = await computeAuditPeriodSummary(
       fx.auditLog,
       "2020-01-01T00:00:00Z",
@@ -184,7 +184,7 @@ describe("computeAuditPeriodSummary", () => {
   it("filters entries by period_end upper bound", async () => {
     const fx = await buildFixture();
     // Entries get now() timestamps; pick an end in the past to filter all out.
-    seedAuditEntries(fx.auditLog, 3);
+    await seedAuditEntries(fx.auditLog, 3);
     const summary = await computeAuditPeriodSummary(
       fx.auditLog,
       "1970-01-01T00:00:00Z",
@@ -199,7 +199,7 @@ describe("generateEuAiActBundle", () => {
 
   beforeEach(async () => {
     fx = await buildFixture();
-    seedAuditEntries(fx.auditLog, 4);
+    await seedAuditEntries(fx.auditLog, 4);
   });
 
   it("throws a clear error if no primary identity is configured", async () => {

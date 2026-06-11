@@ -181,7 +181,7 @@ describe("Broker", () => {
   it("queryAudit surfaces only broker-scoped entries", async () => {
     const { broker, auditLog } = await makeBroker();
     // Inject an unrelated L2 entry.
-    auditLog.append("l2", "unrelated_op", "did:sanctuary:principal", {}, "success");
+    await auditLog.append("l2", "unrelated_op", "did:sanctuary:principal", {}, "success");
     await broker.addSecret("gmail_oauth", "v");
     const summary = await broker.queryAudit();
     for (const e of summary.entries) {

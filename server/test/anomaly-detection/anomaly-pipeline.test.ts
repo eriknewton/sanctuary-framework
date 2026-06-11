@@ -587,7 +587,7 @@ describe("WP-V1.3-2 Chi-1 AnomalyPipelineDispatcher", () => {
     // Seed fortress A's REAL audit log with activity. Fortress B
     // gets nothing.
     for (let i = 0; i < 5; i += 1) {
-      rigA.auditLog.append("l1", "state_read", "agent-a");
+      await rigA.auditLog.append("l1", "state_read", "agent-a");
     }
     await rigA.dispatcher.registerDetector(
       new PerAgentActivityDetector({ minSamplesForPrediction: 1 }),
