@@ -118,6 +118,10 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
             CastleWallLog.lifecycle.notice(
                 "ipc socket path resolved: \(resolved.path) (\(resolved.source.rawValue)); bootstrap_reason=\(reason)"
             )
+            let diagnostics = resolved.diagnostics
+            CastleWallLog.lifecycle.notice(
+                "ipc socket diagnostics: active_config=\(diagnostics.activeConfigPath ?? "none") active_status=\(diagnostics.activeConfigStatus ?? "not_checked") legacy_config=\(diagnostics.legacyActiveConfigPath ?? "none") legacy_status=\(diagnostics.legacyActiveConfigStatus ?? "not_checked") selected_config=\(diagnostics.selectedConfigPath ?? "fallback") selected_fortress=\(diagnostics.selectedFortressPath ?? "none") env_fortress=\(ProcessInfo.processInfo.environment["SANCTUARY_FORTRESS_PATH"] ?? "none")"
+            )
 
             let keyLoad: (path: URL, key: Data)
             do {
@@ -155,12 +159,16 @@ public final class CastleWallFilterProvider: NEFilterDataProvider {
                 options: IPCClientOptions(path: resolved.path),
                 pinnedPublicKey: keyLoad.key,
                 pathResolver: {
-                    SocketPath.resolve(
+                    let rerResolved = SocketPath.resolve(
                         platform: "darwin",
                         fortressPath: ProcessInfo.processInfo.environment["SANCTUARY_FORTRESS_PATH"],
                         homeDir: NSHomeDirectory(),
                         explicitOverride: ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_SOCKET"]
-                    ).path
+                    )
+                    CastleWallLog.lifecycle.notice(
+                        "ipc reconnect socket diagnostics: path=\(rerResolved.path) source=\(rerResolved.source.rawValue) active_status=\(rerResolved.diagnostics.activeConfigStatus ?? "not_checked") legacy_status=\(rerResolved.diagnostics.legacyActiveConfigStatus ?? "not_checked") selected_config=\(rerResolved.diagnostics.selectedConfigPath ?? "fallback")"
+                    )
+                    return rerResolved.path
                 }
             )
             self.ipcClient = client

@@ -54,6 +54,16 @@ public final class ExtensionDispatcher {
         case deadChannel
     }
 
+    public struct BindingState: Equatable {
+        public let connected: Bool
+        public let manifestReceived: Bool
+        public let armLeaseReceived: Bool
+
+        public var bound: Bool {
+            connected && manifestReceived && armLeaseReceived
+        }
+    }
+
     private let engine: FlowEvaluatorEngine
     private let ipcClient: IPCClient
     private let manifestStore: ManifestStore
@@ -70,10 +80,16 @@ public final class ExtensionDispatcher {
     private var isStopping = false
     private var verdictsDroppedDeadChannel = 0
     private var lastVerdictDropLogAt = Date.distantPast
+    private var manifestReceived = false
+    private var armLeaseReceived = false
+    private var providerUnboundAuditSent = false
+    private var connectedFortressId: String?
+    private var unboundTimer: DispatchSourceTimer?
 
     private static let initialRetryDelaySeconds: TimeInterval = 1.0
     private static let maxRetryDelaySeconds: TimeInterval = 30.0
     private static let retryJitterPercent: Double = 0.15
+    private static let unboundAuditDelaySeconds: TimeInterval = 5.0
 
     public init(
         engine: FlowEvaluatorEngine,
@@ -149,14 +165,29 @@ public final class ExtensionDispatcher {
         return stateQueue.sync { connectionStateValue }
     }
 
+    public var bindingState: BindingState {
+        return stateQueue.sync {
+            BindingState(
+                connected: connectionStateValue == .connected,
+                manifestReceived: manifestReceived,
+                armLeaseReceived: armLeaseReceived
+            )
+        }
+    }
+
     /// Close the underlying IPC client. Idempotent.
     public func stop() {
         stateQueue.sync {
             isStopping = true
             retryTimer?.cancel()
             retryTimer = nil
+            unboundTimer?.cancel()
+            unboundTimer = nil
             connectionStateValue = .disconnected
             retryDelaySeconds = Self.initialRetryDelaySeconds
+            manifestReceived = false
+            armLeaseReceived = false
+            connectedFortressId = nil
         }
         ipcClient.setTransportClosedListener(nil)
         ipcClient.setMessageListener(nil)
@@ -180,6 +211,7 @@ public final class ExtensionDispatcher {
             recordDroppedVerdict(state: state)
             return
         }
+        maybeEmitProviderUnboundAudit(trigger: "verdict")
 
         switch outcome {
         case .allow, .drop:
@@ -211,6 +243,10 @@ public final class ExtensionDispatcher {
                     heartbeatIntervalSeconds: body.heartbeatIntervalSeconds
                 )
             )
+            stateQueue.sync {
+                armLeaseReceived = true
+                cancelUnboundTimerIfBoundLocked()
+            }
             flowCache.clear()
         case .manifestUpdated:
             // Apply via the existing helper to keep store + cache invariants paired.
@@ -221,6 +257,10 @@ public final class ExtensionDispatcher {
                 pinnedPublicKey: ipcClient.pinnedPublicKeyBytes,
                 engine: engine
             )
+            stateQueue.sync {
+                manifestReceived = true
+                cancelUnboundTimerIfBoundLocked()
+            }
         case .decisionResponse:
             // Operator-approval / -deny resume path; round-trip wiring
             // for uncertain-flow resume lands in the Alpha-4 install
@@ -262,17 +302,22 @@ public final class ExtensionDispatcher {
 
         updateConnectionState(.handshaking)
         do {
-            _ = try await ipcClient.start()
+            let identity = try await ipcClient.start()
             stateQueue.sync {
                 retryDelaySeconds = Self.initialRetryDelaySeconds
                 retryTimer?.cancel()
                 retryTimer = nil
                 connectionStateValue = .connected
+                manifestReceived = false
+                armLeaseReceived = false
+                providerUnboundAuditSent = false
+                connectedFortressId = identity.fortressId
             }
             ipcClient.send(
                 IPCBridgeNotifications.buildSubscribeRequest(),
                 onError: handleSendError
             )
+            scheduleUnboundAuditCheck(trigger: trigger)
             CastleWallLog.lifecycle.notice("ExtensionDispatcher connected; trigger=\(trigger)")
             return true
         } catch {
@@ -313,6 +358,92 @@ public final class ExtensionDispatcher {
         }
     }
 
+    private func scheduleUnboundAuditCheck(trigger: String) {
+        stateQueue.sync {
+            unboundTimer?.cancel()
+            let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+            timer.schedule(deadline: .now() + Self.unboundAuditDelaySeconds)
+            timer.setEventHandler { [weak self] in
+                self?.emitProviderUnboundAuditLocked(trigger: "bind-timeout-\(trigger)")
+            }
+            unboundTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func cancelUnboundTimerIfBoundLocked() {
+        guard connectionStateValue == .connected && manifestReceived && armLeaseReceived else {
+            return
+        }
+        unboundTimer?.cancel()
+        unboundTimer = nil
+        CastleWallLog.lifecycle.notice("ExtensionDispatcher bound: manifest_received=true arm_lease_received=true")
+    }
+
+    private func maybeEmitProviderUnboundAudit(trigger: String) {
+        stateQueue.sync {
+            emitProviderUnboundAuditLocked(trigger: trigger)
+        }
+    }
+
+    private func emitProviderUnboundAuditLocked(trigger: String) {
+        guard connectionStateValue == .connected else {
+            return
+        }
+        guard !(manifestReceived && armLeaseReceived) else {
+            return
+        }
+        guard !providerUnboundAuditSent else {
+            return
+        }
+        providerUnboundAuditSent = true
+        let fortressId = connectedFortressId ?? "unknown"
+        CastleWallLog.lifecycle.error(
+            "ExtensionDispatcher provider_unbound: trigger=\(trigger) manifest_received=\(self.manifestReceived) arm_lease_received=\(self.armLeaseReceived)"
+        )
+        ipcClient.send(
+            ExtensionDispatcher.buildProviderUnboundAudit(
+                fortressId: fortressId,
+                trigger: trigger,
+                manifestReceived: manifestReceived,
+                armLeaseReceived: armLeaseReceived
+            ),
+            onError: handleSendError
+        )
+    }
+
+    static func buildProviderUnboundAudit(
+        fortressId: String,
+        trigger: String,
+        manifestReceived: Bool,
+        armLeaseReceived: Bool,
+        timestamp: String = ExtensionDispatcher.isoTimestamp()
+    ) -> IpcMessage {
+        return .auditEmit(event: .object([
+            "schema_version": .number(1),
+            "layer": .string("l1"),
+            "timestamp": .string(timestamp),
+            "fortress_id": .string(fortressId),
+            "event_type": .string("provider_unbound"),
+            "agent": .null,
+            "destination": .null,
+            "decision": .null,
+            "rule_id": .null,
+            "details": .object([
+                "source": .string("macos_extension"),
+                "trigger": .string(trigger),
+                "manifest_received": .bool(manifestReceived),
+                "arm_lease_received": .bool(armLeaseReceived)
+            ])
+        ]))
+    }
+
+    private static func isoTimestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
+    }
+
     private func normalizeError(_ error: Error) -> IPCClientError {
         if let ipcError = error as? IPCClientError {
             return ipcError
@@ -348,6 +479,8 @@ public final class ExtensionDispatcher {
 
             self.retryTimer?.cancel()
             self.retryTimer = nil
+            self.unboundTimer?.cancel()
+            self.unboundTimer = nil
 
             let base = self.retryDelaySeconds
             let jitterRange = base * Self.retryJitterPercent
@@ -378,6 +511,10 @@ public final class ExtensionDispatcher {
     private func updateConnectionState(_ newValue: ConnectionState) {
         stateQueue.sync {
             connectionStateValue = newValue
+            if newValue != .connected {
+                unboundTimer?.cancel()
+                unboundTimer = nil
+            }
         }
     }
 

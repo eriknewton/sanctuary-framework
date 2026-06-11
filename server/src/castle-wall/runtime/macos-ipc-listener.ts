@@ -47,6 +47,7 @@ import { randomBytes } from "node:crypto";
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import type {
+  AuditEmitNotification,
   CastleWallMessage,
   FlowDecisionRecordedNotification,
   HandshakeResponse,
@@ -445,6 +446,9 @@ export class MacOSFlowIpcListener {
         return;
       case "arm_lease":
         await this.handleArmLease(message as ArmLeaseNotification);
+        return;
+      case "audit_emit":
+        await this.consumer.handleAuditEmit(message as AuditEmitNotification);
         return;
       case "flow_decision_recorded":
         await this.consumer.handleFlowDecisionRecorded(

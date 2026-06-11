@@ -29,6 +29,7 @@ import type { AllowlistRule } from "../allowlist/schema.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import { CASTLE_WALL_AUDIT_LAYER } from "../constants.js";
 import type {
+  AuditEmitNotification,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   IpcAgentAttribution,
@@ -81,6 +82,8 @@ export interface MacOSFlowEventStats {
   manifestSnapshotsEmitted: number;
   decisionsRecorded: number;
   decisionsRejected: number;
+  extensionDiagnosticsRecorded: number;
+  extensionDiagnosticsRejected: number;
   pendingApprovalsEnqueued: number;
   pendingApprovalsRejected: number;
 }
@@ -115,6 +118,8 @@ export class MacOSFlowEventConsumer {
     manifestSnapshotsEmitted: 0,
     decisionsRecorded: 0,
     decisionsRejected: 0,
+    extensionDiagnosticsRecorded: 0,
+    extensionDiagnosticsRejected: 0,
     pendingApprovalsEnqueued: 0,
     pendingApprovalsRejected: 0,
   };
@@ -281,6 +286,48 @@ export class MacOSFlowEventConsumer {
       expiresInSeconds: expires,
     });
     this.stats.pendingApprovalsEnqueued += 1;
+  }
+
+  /**
+   * Handle extension-origin diagnostic audit events. This path is for provider
+   * state, not flow verdicts, so it appends directly to the macOS audit sink
+   * instead of requiring WAL chain fields from the extension.
+   */
+  async handleAuditEmit(notification: AuditEmitNotification): Promise<void> {
+    const event = notification.event;
+    if (
+      notification.type !== "audit_emit" ||
+      event.layer !== CASTLE_WALL_AUDIT_LAYER ||
+      event.event_type !== "provider_unbound" ||
+      typeof event.fortress_id !== "string" ||
+      event.fortress_id.length === 0
+    ) {
+      this.stats.extensionDiagnosticsRejected += 1;
+      this.auditSink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "extension_diagnostic_rejected",
+        event?.fortress_id ?? "unknown",
+        {
+          reason: "invalid_extension_diagnostic",
+          event_type: event?.event_type,
+        },
+        "failure"
+      );
+      await this.auditSink.flush();
+      return;
+    }
+    this.auditSink.append(
+      CASTLE_WALL_AUDIT_LAYER,
+      event.event_type,
+      event.fortress_id,
+      {
+        ...event.details,
+        timestamp: event.timestamp,
+      },
+      "failure"
+    );
+    await this.auditSink.flush();
+    this.stats.extensionDiagnosticsRecorded += 1;
   }
 
   getStats(): MacOSFlowEventStats {

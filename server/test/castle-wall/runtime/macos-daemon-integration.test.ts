@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
-import { parseFrame } from "../../../src/castle-wall/ipc/framing.js";
+import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";
 import type { ArmLeaseNotification } from "../../../src/castle-wall/ipc/messages.js";
 import { AuditLog } from "../../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
@@ -123,6 +123,16 @@ describe("Castle Wall macOS daemon integration", () => {
       socket.once("error", reject);
       drain();
     });
+  }
+
+  function writeIpc(socket: Socket, message: Record<string, unknown>): void {
+    socket.write(
+      frame(JSON.stringify({
+        jsonrpc: "2.0",
+        method: `castle-wall.${String(message.type)}`,
+        params: message,
+      }))
+    );
   }
 
   it("binds the fortress-scoped castle.sock and removes it on shutdown", async () => {
@@ -351,7 +361,7 @@ describe("Castle Wall macOS daemon integration", () => {
     }
   });
 
-  it("lets a sysext-style client read active config, connect, and receive handshake", async () => {
+  it("lets a sysext-style client read active config, subscribe, and receive manifest plus lease", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     const configPath = activeConfigPath(fortressPath);
     const handle = await startMacOSCastleWallDaemon({
@@ -380,6 +390,18 @@ describe("Castle Wall macOS daemon integration", () => {
       expect(response).toMatchObject({
         type: "handshake_response",
         fortress_id: "fortress-test",
+      });
+
+      writeIpc(socket, { type: "manifest_subscribe", request_id: "bind-test" });
+      const manifest = await readNextMessage();
+      const lease = await readNextMessage();
+      expect(manifest).toMatchObject({
+        type: "manifest_updated",
+        manifest: { fortress_id: "fortress-test" },
+      });
+      expect(lease).toMatchObject({
+        type: "arm_lease",
+        armed: true,
       });
     } finally {
       await handle.stop();

@@ -120,6 +120,7 @@ describe("castle-wall/runtime/audit-consumer : validateEvent", () => {
   it("ACCEPTED_EVENT_TYPES set is non-empty and includes core types", () => {
     expect(ACCEPTED_EVENT_TYPES.has("egress_blocked")).toBe(true);
     expect(ACCEPTED_EVENT_TYPES.has("operator_decision")).toBe(true);
+    expect(ACCEPTED_EVENT_TYPES.has("provider_unbound")).toBe(true);
     expect(ACCEPTED_EVENT_TYPES.has("queue_saturated")).toBe(true);
   });
 });

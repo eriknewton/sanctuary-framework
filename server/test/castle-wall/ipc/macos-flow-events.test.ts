@@ -23,6 +23,7 @@
 import { describe, it, expect } from "vitest";
 
 import type {
+  AuditEmitNotification,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   ManifestSubscribeRequest,
@@ -394,6 +395,78 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         matched_rule_id: 42 as never,
       })
     ).toMatch(/matched_rule_id/);
+  });
+});
+
+describe("MacOSFlowEventConsumer : extension diagnostics", () => {
+  it("records provider_unbound diagnostics from audit_emit", async () => {
+    const { consumer, auditSinkBundle } = buildConsumer();
+    const notification: AuditEmitNotification = {
+      type: "audit_emit",
+      event: {
+        schema_version: 1,
+        layer: "l1",
+        timestamp: "2026-06-11T00:00:00.000Z",
+        fortress_id: "fortress-test",
+        event_type: "provider_unbound",
+        agent: null,
+        destination: null,
+        decision: null,
+        rule_id: null,
+        details: {
+          source: "macos_extension",
+          trigger: "verdict",
+          manifest_received: false,
+          arm_lease_received: false,
+        },
+      },
+    };
+
+    await consumer.handleAuditEmit(notification);
+
+    expect(auditSinkBundle.entries).toHaveLength(1);
+    expect(auditSinkBundle.entries[0]).toMatchObject({
+      layer: "l1",
+      operation: "provider_unbound",
+      identityId: "fortress-test",
+      result: "failure",
+    });
+    expect(auditSinkBundle.entries[0]?.details).toMatchObject({
+      source: "macos_extension",
+      trigger: "verdict",
+      manifest_received: false,
+      arm_lease_received: false,
+      timestamp: "2026-06-11T00:00:00.000Z",
+    });
+    expect(consumer.getStats().extensionDiagnosticsRecorded).toBe(1);
+    expect(consumer.getStats().extensionDiagnosticsRejected).toBe(0);
+  });
+
+  it("rejects non-provider extension audit events", async () => {
+    const { consumer, auditSinkBundle } = buildConsumer();
+    const notification: AuditEmitNotification = {
+      type: "audit_emit",
+      event: {
+        schema_version: 1,
+        layer: "l1",
+        timestamp: "2026-06-11T00:00:00.000Z",
+        fortress_id: "fortress-test",
+        event_type: "egress_allowed",
+        agent: null,
+        destination: null,
+        decision: null,
+        rule_id: null,
+        details: {},
+      },
+    };
+
+    await consumer.handleAuditEmit(notification);
+
+    expect(auditSinkBundle.entries).toHaveLength(1);
+    expect(auditSinkBundle.entries[0]?.operation).toBe("extension_diagnostic_rejected");
+    expect(auditSinkBundle.entries[0]?.result).toBe("failure");
+    expect(consumer.getStats().extensionDiagnosticsRecorded).toBe(0);
+    expect(consumer.getStats().extensionDiagnosticsRejected).toBe(1);
   });
 });
 
