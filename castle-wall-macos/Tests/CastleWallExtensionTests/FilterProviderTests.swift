@@ -180,6 +180,21 @@ final class FilterProviderTests: XCTestCase {
         )
     }
 
+    func testRevokeSurvivesGracefulDaemonDetach() {
+        // Lockout regression guard: after an operator revoke, a graceful
+        // daemon-detach (armed=false WITHOUT the revoke flag) must not clear
+        // the revoked state — else the wall silently re-enforces with no
+        // heartbeat tripwire left. Only an explicit re-arm clears revoke.
+        let lease = ArmLease()
+        lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+
+        lease.update(ArmLeaseUpdate(armed: false, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+
+        XCTAssertEqual(lease.failOpenReason(), "lease_revoked")
+        XCTAssertTrue(lease.snapshot().revoked)
+    }
+
     func testArmLeaseRearmAfterRevokeRestoresEnforcement() {
         let lease = ArmLease()
         lease.update(ArmLeaseUpdate(armed: false, revoked: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
