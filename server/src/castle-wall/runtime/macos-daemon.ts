@@ -14,6 +14,7 @@ import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
+  ArmLeaseNotification,
   DecisionResponse,
   PolicyReloadRequest,
   PolicyReloadResponse,
@@ -94,6 +95,13 @@ export interface MacOSCastleWallDaemonInput {
    * pin installed on the build host.
    */
   globalPinnedPublicKeyPath?: string;
+  /**
+   * Provider-side dead-man lease. Undefined/null means durable arming
+   * (--no-ttl); a positive number means the extension fails open after that
+   * many seconds unless renewed by the authenticated daemon channel.
+   */
+  armLeaseTtlSeconds?: number | null;
+  armLeaseHeartbeatIntervalSeconds?: number;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -105,6 +113,7 @@ export interface MacOSCastleWallListenerHandle {
   stop(): Promise<void>;
   broadcastManifestUpdate(): Promise<number>;
   broadcastDecisionResponse(response: DecisionResponse): Promise<number>;
+  broadcastArmLease(lease: ArmLeaseNotification): Promise<number>;
 }
 
 export interface MacOSCastleWallDaemonHandle {
@@ -121,6 +130,7 @@ interface ManifestState {
 interface ActiveCastleWallConfig {
   socket_path: string;
   fortress_id: string;
+  fortress_path?: string;
   pid: number;
   started_at: string;
   pinned_pubkey_sha256?: string;
@@ -166,6 +176,8 @@ export async function startMacOSCastleWallDaemon(
   });
   const pendingRequests = new Set<string>();
   let listener: MacOSCastleWallListenerHandle;
+  const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
+  let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -240,6 +252,7 @@ export async function startMacOSCastleWallDaemon(
       {
         socket_path: socketPath,
         fortress_id: input.fortressId,
+        fortress_path: input.fortressPath,
         pid: process.pid,
         started_at: new Date().toISOString(),
         pinned_pubkey_sha256: pinnedPublicKeySha256,
@@ -255,6 +268,18 @@ export async function startMacOSCastleWallDaemon(
       "success",
     );
     await input.auditLog.flush();
+    const emitLease = async (): Promise<void> => {
+      await listener.broadcastArmLease(buildArmLease({
+        armed: true,
+        ttlSeconds: input.armLeaseTtlSeconds ?? null,
+        heartbeatIntervalSeconds,
+      })).catch(() => undefined);
+    };
+    await emitLease();
+    leaseHeartbeat = setInterval(() => {
+      void emitLease();
+    }, heartbeatIntervalSeconds * 1000);
+    leaseHeartbeat.unref();
   } catch (err) {
     if (activeConfigWritten) {
       await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
@@ -327,6 +352,15 @@ export async function startMacOSCastleWallDaemon(
     reloadPolicy,
     async stop() {
       try {
+        if (leaseHeartbeat) {
+          clearInterval(leaseHeartbeat);
+          leaseHeartbeat = undefined;
+        }
+        await listener.broadcastArmLease(buildArmLease({
+          armed: false,
+          ttlSeconds: null,
+          heartbeatIntervalSeconds,
+        })).catch(() => undefined);
         await listener.stop();
         await input.auditLog.append(
           "l1",
@@ -340,6 +374,20 @@ export async function startMacOSCastleWallDaemon(
         await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
       }
     },
+  };
+}
+
+function buildArmLease(input: {
+  armed: boolean;
+  ttlSeconds: number | null;
+  heartbeatIntervalSeconds: number;
+}): ArmLeaseNotification {
+  return {
+    type: "arm_lease",
+    armed: input.armed,
+    ttl_seconds: input.ttlSeconds,
+    heartbeat_interval_seconds: input.heartbeatIntervalSeconds,
+    updated_at: new Date().toISOString(),
   };
 }
 
@@ -793,6 +841,9 @@ async function readActiveConfig(
     return {
       socket_path: parsed.socket_path,
       fortress_id: parsed.fortress_id,
+      ...(typeof parsed.fortress_path === "string"
+        ? { fortress_path: parsed.fortress_path }
+        : {}),
       pid: parsed.pid,
       started_at: parsed.started_at,
       ...(parsed.pinned_pubkey_sha256 !== undefined

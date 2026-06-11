@@ -30,15 +30,29 @@ final class SocketPathTests: XCTestCase {
 
     func testActiveConfigTakesPrecedenceOverExplicitOverrideOnMacOS() throws {
         let configPath = try writeActiveConfig("""
-        {"socket_path":"/tmp/from-active-config.sock","fortress_id":"fortress-test","pid":\(getpid()),"started_at":"2026-05-25T00:00:00.000Z"}
+        {"socket_path":"/tmp/from-active-config.sock","fortress_id":"fortress-test","fortress_path":"/Users/op/.sanctuary-a","pid":\(getpid()),"started_at":"2026-05-25T00:00:00.000Z"}
         """)
         let out = SocketPath.resolve(
             platform: "darwin",
+            fortressPath: "/Users/op/.sanctuary-a",
             explicitOverride: "/tmp/from-env.sock",
             activeConfigPath: configPath
         )
         XCTAssertEqual(out.path, "/tmp/from-active-config.sock")
         XCTAssertEqual(out.source, .macosActiveConfig)
+    }
+
+    func testActiveConfigFromDifferentFortressFallsThrough() throws {
+        let configPath = try writeActiveConfig("""
+        {"socket_path":"/tmp/wrong-fortress.sock","fortress_id":"fortress-a","fortress_path":"/Users/op/.sanctuary-a","pid":\(getpid()),"started_at":"2026-05-25T00:00:00.000Z"}
+        """)
+        let out = SocketPath.resolve(
+            platform: "darwin",
+            fortressPath: "/Users/op/.sanctuary-b",
+            activeConfigPath: configPath
+        )
+        XCTAssertEqual(out.path, "/Users/op/.sanctuary-b/castle.sock")
+        XCTAssertEqual(out.source, .macosPerFortress)
     }
 
     func testActiveConfigFallsThroughWhenAbsent() {

@@ -58,6 +58,7 @@ public enum IpcMessage: Codable, Equatable {
     case handshakeResponse(HandshakeResponseBody)
     case manifestSubscribe(requestId: String)
     case manifestUpdated(ManifestUpdatedBody)
+    case armLease(ArmLeaseBody)
     case flowDecisionRecorded(FlowDecisionRecordedBody)
     case flowPendingApproval(FlowPendingApprovalBody)
 
@@ -118,6 +119,8 @@ public enum IpcMessage: Codable, Equatable {
             self = .manifestSubscribe(requestId: inner.requestId)
         case "manifest_updated":
             self = .manifestUpdated(try body.decode(ManifestUpdatedBody.self))
+        case "arm_lease":
+            self = .armLease(try body.decode(ArmLeaseBody.self))
         case "flow_decision_recorded":
             self = .flowDecisionRecorded(try body.decode(FlowDecisionRecordedBody.self))
         case "flow_pending_approval":
@@ -194,6 +197,8 @@ public enum IpcMessage: Codable, Equatable {
                 requestId: requestId
             ))
         case .manifestUpdated(let body):
+            try container.encode(body)
+        case .armLease(let body):
             try container.encode(body)
         case .flowDecisionRecorded(let body):
             try container.encode(body)
@@ -513,6 +518,35 @@ public struct HandshakeResponseBody: Codable, Equatable {
         case fortressId = "fortress_id"
         case signingKeyId = "signing_key_id"
         case nonceSignatureB64url = "nonce_signature_b64url"
+    }
+}
+
+public struct ArmLeaseBody: Codable, Equatable {
+    public let type: String
+    public let armed: Bool
+    public let ttlSeconds: UInt32?
+    public let heartbeatIntervalSeconds: UInt32
+    public let updatedAt: String
+
+    public init(
+        armed: Bool,
+        ttlSeconds: UInt32?,
+        heartbeatIntervalSeconds: UInt32,
+        updatedAt: String
+    ) {
+        self.type = "arm_lease"
+        self.armed = armed
+        self.ttlSeconds = ttlSeconds
+        self.heartbeatIntervalSeconds = heartbeatIntervalSeconds
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case armed
+        case ttlSeconds = "ttl_seconds"
+        case heartbeatIntervalSeconds = "heartbeat_interval_seconds"
+        case updatedAt = "updated_at"
     }
 }
 

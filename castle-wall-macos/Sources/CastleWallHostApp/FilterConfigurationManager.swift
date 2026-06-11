@@ -118,9 +118,13 @@ final class FilterConfigurationManager: NSObject, ObservableObject {
     }
 
     func disableFilter() {
-        NEFilterManager.shared().loadFromPreferences { [weak self] _ in
+        NEFilterManager.shared().loadFromPreferences { [weak self] loadError in
             DispatchQueue.main.async {
                 guard let self else { return }
+                if let loadError {
+                    self.filterState = .error(loadError.localizedDescription)
+                    return
+                }
                 NEFilterManager.shared().isEnabled = false
                 NEFilterManager.shared().saveToPreferences { [weak self] saveError in
                     DispatchQueue.main.async {

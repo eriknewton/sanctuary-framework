@@ -74,6 +74,9 @@ describe("Castle Wall macOS daemon integration", () => {
       async broadcastDecisionResponse() {
         return 0;
       },
+      async broadcastArmLease() {
+        return 0;
+      },
     };
   }
 

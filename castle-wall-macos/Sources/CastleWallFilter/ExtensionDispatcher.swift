@@ -202,6 +202,15 @@ public final class ExtensionDispatcher {
     /// it directly without exercising the IPC client.
     public func handleInbound(_ message: IpcMessage) {
         switch message {
+        case .armLease(let body):
+            engine.armLease.update(
+                ArmLeaseUpdate(
+                    armed: body.armed,
+                    ttlSeconds: body.ttlSeconds,
+                    heartbeatIntervalSeconds: body.heartbeatIntervalSeconds
+                )
+            )
+            flowCache.clear()
         case .manifestUpdated:
             // Apply via the existing helper to keep store + cache invariants paired.
             _ = IPCBridgeNotifications.applyManifestUpdated(

@@ -40,6 +40,7 @@ export type CastleWallMessage =
   | LockNotification
   | HandshakeChallenge
   | HandshakeResponse
+  | ArmLeaseNotification
   | ManifestSubscribeRequest
   | ManifestUpdatedNotification
   | FlowDecisionRecordedNotification
@@ -188,6 +189,15 @@ export interface HandshakeResponse {
   fortress_id: string;
   signing_key_id: string;
   nonce_signature_b64url: string;
+}
+
+/** Authenticated daemon-to-extension lease heartbeat for the armed wall. */
+export interface ArmLeaseNotification {
+  type: "arm_lease";
+  armed: boolean;
+  ttl_seconds?: number | null;
+  heartbeat_interval_seconds: number;
+  updated_at: string;
 }
 
 /**

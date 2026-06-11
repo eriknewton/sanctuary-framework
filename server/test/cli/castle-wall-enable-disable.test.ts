@@ -78,7 +78,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const err = new CaptureStream();
     const { invoke, calls } = makeInvoker({});
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out,
       err,
       env,
@@ -103,7 +103,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out,
       err,
       env,
@@ -119,7 +119,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
     expect(calls).toEqual([
-      [hostAppPath, "--headless", "enable"],
+      [hostAppPath, "--headless", "enable", "--no-ttl"],
       [hostAppPath, "--headless", "status"],
     ]);
   });
@@ -131,7 +131,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env,
@@ -196,7 +196,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       },
     });
 
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -245,7 +245,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
     });
 
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -373,7 +373,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
   it("is macOS-only", async () => {
     const err = new CaptureStream();
-    const code = await runEnable([], {
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env: {},
@@ -388,12 +388,39 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(parseCastleWallArgs([]).force).toBeUndefined();
   });
 
-  it("enable returns distinct exit 4 + toggle guidance when the sysext is activated-but-disabled", async () => {
+  it("enable requires an explicit dead-man TTL mode", async () => {
     const { hostAppPath, env } = await makeFixture();
     const err = new CaptureStream();
     const { invoke, calls } = makeInvoker({});
 
     const code = await runEnable([], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(2);
+    expect(err.text()).toContain("requires either --ttl");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("parseCastleWallArgs understands ttl modes", () => {
+    expect(parseCastleWallArgs(["--ttl", "30s"]).ttlSeconds).toBe(30);
+    expect(parseCastleWallArgs(["--ttl=5m"]).ttlSeconds).toBe(300);
+    expect(parseCastleWallArgs(["--no-ttl"]).noTtl).toBe(true);
+  });
+
+  it("enable returns distinct exit 4 + toggle guidance when the sysext is activated-but-disabled", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--no-ttl"], {
       out: new CaptureStream(),
       err,
       env,
@@ -444,7 +471,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     // No hostAppInvoke: exercises the real default (LaunchServices) path,
     // but with the `open` runner + report path stubbed so no process spawns.
-    const code = await runEnable(["--force"], {
+    const code = await runEnable(["--force", "--no-ttl"], {
       out,
       err: new CaptureStream(),
       env,
@@ -474,6 +501,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       "--args",
       "--headless",
       "enable",
+      "--no-ttl",
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);

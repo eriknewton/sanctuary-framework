@@ -106,6 +106,39 @@ final class FilterProviderTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
+    func testExpiredArmLeaseFailsOpenWithAuditMarker() {
+        var now = Date(timeIntervalSince1970: 100)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: 10, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 111)
+
+        let store = ManifestStore()
+        let cache = FlowCache(capacity: 8)
+        let engine = FlowEvaluatorEngine(
+            manifestStore: store,
+            flowCache: cache,
+            armLease: lease
+        )
+        loadStore(store, rules: [rule(host: "other.example.com")])
+
+        let outcome = engine.evaluate(flow(host: "novel.example.com"))
+        XCTAssertEqual(outcome, .allow(matchedRuleId: ArmLease.failOpenRuleId))
+        XCTAssertEqual(cache.count, 0, "fail-open verdicts must not outlive a renewed lease")
+    }
+
+    func testStoppedHeartbeatFailsOpenWithAuditMarker() {
+        var now = Date(timeIntervalSince1970: 200)
+        let lease = ArmLease(now: { now })
+        lease.update(ArmLeaseUpdate(armed: true, ttlSeconds: nil, heartbeatIntervalSeconds: 5))
+        now = Date(timeIntervalSince1970: 211)
+
+        let engine = FlowEvaluatorEngine(armLease: lease)
+        XCTAssertEqual(
+            engine.evaluate(flow(host: "blocked.example.com")),
+            .allow(matchedRuleId: ArmLease.failOpenRuleId)
+        )
+    }
+
     func testEvaluateReturnsUncertainWhenOnlyPromptMatches() {
         let store = ManifestStore()
         let cache = FlowCache(capacity: 8)

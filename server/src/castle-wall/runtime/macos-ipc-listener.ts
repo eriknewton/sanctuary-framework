@@ -56,6 +56,7 @@ import type {
   PolicyReloadRequest,
   PolicyReloadResponse,
   DecisionResponse,
+  ArmLeaseNotification,
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 
@@ -180,6 +181,7 @@ export class MacOSFlowIpcListener {
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
   private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
+  private currentArmLease: ArmLeaseNotification | null = null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
   private stats: MacOSFlowIpcListenerStats = {
@@ -266,6 +268,18 @@ export class MacOSFlowIpcListener {
     for (const conn of this.connections.values()) {
       if (!conn.registered) continue;
       this.writeMessage(conn, response);
+      emitted += 1;
+    }
+    return emitted;
+  }
+
+  /** Fan the current arm lease heartbeat to active extension subscribers. */
+  async broadcastArmLease(lease: ArmLeaseNotification): Promise<number> {
+    this.currentArmLease = lease;
+    let emitted = 0;
+    for (const conn of this.connections.values()) {
+      if (!conn.registered) continue;
+      this.writeMessage(conn, lease);
       emitted += 1;
     }
     return emitted;
@@ -425,6 +439,9 @@ export class MacOSFlowIpcListener {
       case "decision_response":
         await this.handleDecisionResponse(state, message as DecisionResponse);
         return;
+      case "arm_lease":
+        await this.broadcastArmLease(message as ArmLeaseNotification);
+        return;
       case "flow_decision_recorded":
         await this.consumer.handleFlowDecisionRecorded(
           message as FlowDecisionRecordedNotification,
@@ -448,6 +465,9 @@ export class MacOSFlowIpcListener {
     request: ManifestSubscribeRequest,
   ): Promise<void> {
     await this.consumer.handleManifestSubscribe(request, state.subscriberId);
+    if (this.currentArmLease) {
+      this.writeMessage(state, this.currentArmLease);
+    }
   }
 
   private async handlePolicyReload(
