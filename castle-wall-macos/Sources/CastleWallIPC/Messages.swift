@@ -524,26 +524,40 @@ public struct HandshakeResponseBody: Codable, Equatable {
 public struct ArmLeaseBody: Codable, Equatable {
     public let type: String
     public let armed: Bool
+    public let revoked: Bool
     public let ttlSeconds: UInt32?
     public let heartbeatIntervalSeconds: UInt32
     public let updatedAt: String
 
     public init(
         armed: Bool,
+        revoked: Bool = false,
         ttlSeconds: UInt32?,
         heartbeatIntervalSeconds: UInt32,
         updatedAt: String
     ) {
         self.type = "arm_lease"
         self.armed = armed
+        self.revoked = revoked
         self.ttlSeconds = ttlSeconds
         self.heartbeatIntervalSeconds = heartbeatIntervalSeconds
         self.updatedAt = updatedAt
     }
 
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try container.decode(String.self, forKey: .type)
+        self.armed = try container.decode(Bool.self, forKey: .armed)
+        self.revoked = try container.decodeIfPresent(Bool.self, forKey: .revoked) ?? false
+        self.ttlSeconds = try container.decodeIfPresent(UInt32.self, forKey: .ttlSeconds)
+        self.heartbeatIntervalSeconds = try container.decode(UInt32.self, forKey: .heartbeatIntervalSeconds)
+        self.updatedAt = try container.decode(String.self, forKey: .updatedAt)
+    }
+
     enum CodingKeys: String, CodingKey {
         case type
         case armed
+        case revoked
         case ttlSeconds = "ttl_seconds"
         case heartbeatIntervalSeconds = "heartbeat_interval_seconds"
         case updatedAt = "updated_at"

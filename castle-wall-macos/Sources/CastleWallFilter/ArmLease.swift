@@ -5,6 +5,7 @@ public final class ArmLease {
 
     private let lock = NSLock()
     private var armed = false
+    private var revoked = false
     private var leaseExpiresAt: Date?
     private var heartbeatExpiresAt: Date?
     private let now: () -> Date
@@ -17,6 +18,14 @@ public final class ArmLease {
         lock.lock()
         defer { lock.unlock() }
 
+        if update.revoked {
+            armed = false
+            revoked = true
+            leaseExpiresAt = nil
+            heartbeatExpiresAt = nil
+            return
+        }
+
         armed = update.armed
         guard update.armed else {
             leaseExpiresAt = nil
@@ -24,6 +33,7 @@ public final class ArmLease {
             return
         }
 
+        revoked = false
         let current = now()
         if let ttlSeconds = update.ttlSeconds {
             leaseExpiresAt = current.addingTimeInterval(TimeInterval(ttlSeconds))
@@ -39,6 +49,9 @@ public final class ArmLease {
         lock.lock()
         defer { lock.unlock() }
 
+        if revoked {
+            return "lease_revoked"
+        }
         guard armed else {
             return nil
         }
@@ -59,6 +72,7 @@ public final class ArmLease {
 
         return ArmLeaseSnapshot(
             armed: armed,
+            revoked: revoked,
             leaseExpiresAt: leaseExpiresAt,
             heartbeatExpiresAt: heartbeatExpiresAt,
             failOpenReason: failOpenReasonLocked(now())
@@ -66,6 +80,9 @@ public final class ArmLease {
     }
 
     private func failOpenReasonLocked(_ current: Date) -> String? {
+        if revoked {
+            return "lease_revoked"
+        }
         guard armed else {
             return nil
         }
@@ -81,15 +98,18 @@ public final class ArmLease {
 
 public struct ArmLeaseUpdate: Equatable {
     public let armed: Bool
+    public let revoked: Bool
     public let ttlSeconds: UInt32?
     public let heartbeatIntervalSeconds: UInt32
 
     public init(
         armed: Bool,
+        revoked: Bool = false,
         ttlSeconds: UInt32?,
         heartbeatIntervalSeconds: UInt32
     ) {
         self.armed = armed
+        self.revoked = revoked
         self.ttlSeconds = ttlSeconds
         self.heartbeatIntervalSeconds = heartbeatIntervalSeconds
     }
@@ -97,6 +117,7 @@ public struct ArmLeaseUpdate: Equatable {
 
 public struct ArmLeaseSnapshot: Equatable {
     public let armed: Bool
+    public let revoked: Bool
     public let leaseExpiresAt: Date?
     public let heartbeatExpiresAt: Date?
     public let failOpenReason: String?

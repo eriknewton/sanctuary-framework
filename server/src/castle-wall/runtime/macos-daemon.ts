@@ -178,6 +178,11 @@ export async function startMacOSCastleWallDaemon(
   let listener: MacOSCastleWallListenerHandle;
   const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
+  const stopLeaseHeartbeat = (): void => {
+    if (!leaseHeartbeat) return;
+    clearInterval(leaseHeartbeat);
+    leaseHeartbeat = undefined;
+  };
 
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -234,6 +239,9 @@ export async function startMacOSCastleWallDaemon(
         await input.auditLog.flush();
         return { ok: true };
       },
+    },
+    onArmLeaseRevoke() {
+      stopLeaseHeartbeat();
     },
   };
   listener = input.listenerFactory
@@ -352,10 +360,7 @@ export async function startMacOSCastleWallDaemon(
     reloadPolicy,
     async stop() {
       try {
-        if (leaseHeartbeat) {
-          clearInterval(leaseHeartbeat);
-          leaseHeartbeat = undefined;
-        }
+        stopLeaseHeartbeat();
         await listener.broadcastArmLease(buildArmLease({
           armed: false,
           ttlSeconds: null,
@@ -381,10 +386,12 @@ function buildArmLease(input: {
   armed: boolean;
   ttlSeconds: number | null;
   heartbeatIntervalSeconds: number;
+  revoked?: boolean;
 }): ArmLeaseNotification {
   return {
     type: "arm_lease",
     armed: input.armed,
+    ...(input.revoked === true ? { revoked: true } : {}),
     ttl_seconds: input.ttlSeconds,
     heartbeat_interval_seconds: input.heartbeatIntervalSeconds,
     updated_at: new Date().toISOString(),

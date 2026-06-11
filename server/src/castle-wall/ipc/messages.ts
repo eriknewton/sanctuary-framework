@@ -195,6 +195,7 @@ export interface HandshakeResponse {
 export interface ArmLeaseNotification {
   type: "arm_lease";
   armed: boolean;
+  revoked?: boolean;
   ttl_seconds?: number | null;
   heartbeat_interval_seconds: number;
   updated_at: string;

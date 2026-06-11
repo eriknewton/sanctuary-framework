@@ -115,6 +115,7 @@ interface HeadlessReport {
 
 interface LeaseStatusFile {
   armed: boolean;
+  revoked?: boolean;
   ttl_seconds: number | null;
   heartbeat_interval_seconds: number;
   updated_at: string;
@@ -1587,12 +1588,14 @@ async function readLeaseStatus(fortressPath: string): Promise<LeaseStatusFile | 
 
 function buildArmLeaseMessage(input: {
   armed: boolean;
+  revoked?: boolean;
   ttlSeconds: number | null;
   heartbeatIntervalSeconds?: number;
 }): LeaseStatusFile & { type: "arm_lease" } {
   return {
     type: "arm_lease",
     armed: input.armed,
+    ...(input.revoked === true ? { revoked: true } : {}),
     ttl_seconds: input.ttlSeconds,
     heartbeat_interval_seconds: input.heartbeatIntervalSeconds ?? 5,
     updated_at: new Date().toISOString(),
@@ -1745,7 +1748,7 @@ async function runArmDisarm(
   }
   let leaseRevoked = false;
   if (action === "disable") {
-    const leaseMessage = buildArmLeaseMessage({ armed: false, ttlSeconds: null });
+    const leaseMessage = buildArmLeaseMessage({ armed: false, revoked: true, ttlSeconds: null });
     leaseRevoked = await sendArmLeaseBestEffort(socketPath, leaseMessage);
     await writeLeaseStatusBestEffort(fortressPath, leaseMessage);
   }

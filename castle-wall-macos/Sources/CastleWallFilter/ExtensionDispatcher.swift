@@ -206,6 +206,7 @@ public final class ExtensionDispatcher {
             engine.armLease.update(
                 ArmLeaseUpdate(
                     armed: body.armed,
+                    revoked: body.revoked,
                     ttlSeconds: body.ttlSeconds,
                     heartbeatIntervalSeconds: body.heartbeatIntervalSeconds
                 )
