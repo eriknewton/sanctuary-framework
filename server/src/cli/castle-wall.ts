@@ -1650,18 +1650,56 @@ async function runArmDisarm(
   const verify = await invoke(resolved.path, ["--headless", "status"]);
   const verifyReport = parseHeadlessReport(verify.stdout);
   const expectedState = action === "enable" ? "enabled" : "disabled";
-  if (verify.exitCode !== 0 || verifyReport?.state !== expectedState) {
+  const confirmed =
+    verify.exitCode === 0 && verifyReport?.state === expectedState;
+  const observedState = verifyReport?.state ?? "unparseable";
+
+  if (!confirmed) {
+    if (action === "enable") {
+      // Arm is the protection-increasing direction: never claim "armed"
+      // without a positive corroboration. Fail closed.
+      write(
+        err,
+        `castle-wall enable: state change reported but post-change verification ` +
+          `returned '${observedState}' (expected 'enabled').\n`,
+      );
+      return 1;
+    }
+
+    // Disarm is the dead-man recovery lever. Its authoritative signal is the
+    // mutation itself (saveToPreferences returned ok, above); the status
+    // re-read is only corroboration. On macOS Tahoe that re-read spawns a
+    // SECOND LaunchServices app instance, which can time out or yield no report
+    // even though the wall is already down — so an INCONCLUSIVE corroboration
+    // must not flip a genuine recovery into a reported failure, or the lever
+    // stops being trustworthy (the whole point of the SSH-only drill is that
+    // `disable` reliably means "wall down"). A corroboration that
+    // AFFIRMATIVELY still shows the wall 'enabled' is a real contradiction (the
+    // disarm did not stick): fail loud rather than hand back a false recovery
+    // assurance (CLAUDE.md invariant 5).
+    if (verify.exitCode === 0 && verifyReport?.state === "enabled") {
+      write(
+        err,
+        `castle-wall disable: disarm reported success but post-change ` +
+          `verification still shows the wall ENABLED. The wall may still be ` +
+          `up — re-run 'sanctuary castle-wall disable' and confirm with ` +
+          `'sanctuary castle-wall status'.\n`,
+      );
+      return 1;
+    }
     write(
       err,
-      `castle-wall ${action}: state change reported but post-change verification ` +
-        `returned '${verifyReport?.state ?? "unparseable"}' (expected '${expectedState}').\n`,
+      `Warning: castle-wall disable succeeded (the host app confirmed the NE ` +
+        `configuration was saved disabled) but post-change corroboration was ` +
+        `inconclusive (status returned '${observedState}'). Disarm is the ` +
+        `authoritative dead-man lever and is treated as effective; confirm ` +
+        `with 'sanctuary castle-wall status' once the host is responsive.\n`,
     );
-    return 1;
   }
 
   await appendArmAuditBestEffort(
     action,
-    verifyReport.state,
+    confirmed ? expectedState : observedState,
     parsed.force ?? false,
     fortressPath,
     env,
@@ -1670,8 +1708,13 @@ async function runArmDisarm(
 
   if (action === "enable") {
     write(out, "Castle Wall armed: content filter enabled (verified via host-app status).\n");
-  } else {
+  } else if (confirmed) {
     write(out, "Castle Wall disarmed: content filter disabled (verified via host-app status).\n");
+  } else {
+    write(
+      out,
+      "Castle Wall disarmed: content filter disabled (host app confirmed the save; status corroboration pending).\n",
+    );
   }
   return 0;
 }

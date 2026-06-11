@@ -259,6 +259,60 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).toContain("post-change verification");
   });
 
+  it("disarm treats an inconclusive post-change verification as success (dead-man lever)", async () => {
+    // On macOS Tahoe the corroborating status re-read spawns a SECOND
+    // LaunchServices app instance that can time out / yield no parseable report
+    // even though the disarm already took effect. That inconclusive
+    // corroboration must NOT flip a genuine recovery into a reported failure.
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: "host app produced no report\n", exitCode: 4 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall disarmed");
+    expect(out.text()).toContain("corroboration pending");
+    expect(err.text()).toContain("inconclusive");
+  });
+
+  it("disarm fails loud when verification affirmatively shows the wall still enabled", async () => {
+    // Distinct from an inconclusive read: a positive 'enabled' corroboration
+    // means the disarm did not stick, so we must NOT hand back a false recovery
+    // assurance (CLAUDE.md invariant 5).
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("still shows the wall ENABLED");
+    expect(out.text()).not.toContain("Castle Wall disarmed");
+  });
+
   it("errors usefully when the host app binary is missing", async () => {
     const { fortressPath, env } = await makeFixture();
     const err = new CaptureStream();
