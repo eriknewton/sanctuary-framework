@@ -28,7 +28,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
-import { writeFile, readFile, mkdir, access } from "node:fs/promises";
+import { writeFile, readFile, mkdir, access, unlink } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
 import { platform } from "node:os";
@@ -44,7 +44,15 @@ import {
   getPlatformPaths,
   type AgentPlatform,
   type MCPServerEntry,
+  type WrapMetaAuxiliaryFile,
 } from "./config-reader.js";
+import {
+  hermesConfigYamlPath,
+  planHermesYamlInjection,
+  yamlContainsSanctuaryEntry,
+  HermesYamlUnsupportedError,
+  type HermesYamlPlan,
+} from "./hermes-yaml.js";
 import {
   getOrCreatePassphrase,
   persistUserProvidedPassphrase,
@@ -216,6 +224,126 @@ export function formatMcpServerCount(
   return `MCP servers found: 1 Sanctuary entry (existing), ${otherCount} other ${otherWord}`;
 }
 
+/**
+ * Build the env block for the sanctuary entry. These vars are required for
+ * the dashboard and passphrase resolution to work after the config rewrite.
+ * Pulled from process.env so they survive the rewrite.
+ *
+ * v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
+ * path so harness restarts (Claude Code re-spawning the MCP server)
+ * keep the same fortress directory. Pre-fix, --fortress was honored at
+ * wrap time (via promoteFortressToStoragePath) but never written
+ * into ~/.claude.json — every harness restart fell back to the default
+ * fortress location, silently drifting fortress isolation across reboots.
+ *
+ * The args list stays constant: persistence travels through env vars
+ * exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
+ * promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
+ * identically, so the spawned MCP server resolves the right storage
+ * path on its boot path. Resolved to absolute so subsequent CWD
+ * changes do not break the persisted reference.
+ */
+function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
+  const sanctuaryEnv: Record<string, string> = {};
+  if (process.env.SANCTUARY_PASSPHRASE) {
+    sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_AUTH_TOKEN = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
+  }
+  if (options.fortress) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
+  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
+      process.env.SANCTUARY_FORTRESS_PATH,
+    );
+  }
+  return sanctuaryEnv;
+}
+
+/**
+ * Resolve the command + args registered for the `sanctuary` MCP entry.
+ *
+ * Dogfood path (`--dev-dist <path>`): when set, point the main
+ * `sanctuary` entry at a local Sanctuary build instead of the
+ * npm-published version. Without this flag, an unpublished branch
+ * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
+ * because npx pulls from the registry. Published-version wraps omit
+ * the flag and use the npx default unchanged.
+ */
+function resolveSanctuaryCommand(options: WrapOptions): {
+  command: string;
+  args: string[];
+} {
+  const useDevDist = options.devDist !== undefined;
+  return {
+    command: useDevDist ? "node" : "npx",
+    args: useDevDist ? [options.devDist!] : ["@sanctuary-framework/mcp-server"],
+  };
+}
+
+/** Operator-facing one-liner for what the YAML injection did / would do. */
+function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
+  const preserved =
+    plan.preservedEntryNames.length > 0
+      ? ` (${plan.preservedEntryNames.length} existing ${
+          plan.preservedEntryNames.length === 1 ? "entry" : "entries"
+        } preserved)`
+      : "";
+  switch (plan.action) {
+    case "create-file":
+      return `create ${yamlPath} with the sanctuary entry under mcp_servers`;
+    case "add-key":
+      return `add mcp_servers with the sanctuary entry to ${yamlPath}${preserved}`;
+    case "append-entry":
+      return `add the sanctuary entry to mcp_servers in ${yamlPath}${preserved}`;
+    case "replace-entry":
+      return `update the existing sanctuary entry in ${yamlPath}${preserved}`;
+  }
+}
+
+/**
+ * D4 staging, Bugs 1+2: dry-run preview of the Hermes config.yaml
+ * injection. Read-only by construction (planHermesYamlInjection is pure;
+ * the only filesystem touch is the readFile probe), and previews the
+ * exact entry the real run would write because it shares
+ * buildSanctuaryEnv / resolveSanctuaryCommand with the write path.
+ */
+async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
+  const yamlPath = hermesConfigYamlPath();
+  let existingYaml: string | null = null;
+  try {
+    existingYaml = await readFile(yamlPath, "utf-8");
+  } catch {
+    // File absent — the plan would create it.
+  }
+  const sanctuaryEnv = buildSanctuaryEnv(options);
+  const { command, args } = resolveSanctuaryCommand(options);
+  try {
+    const plan = planHermesYamlInjection(existingYaml, {
+      command,
+      args,
+      ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+    });
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Hermes MCP routing: would ${formatHermesYamlAction(plan, yamlPath)}`
+    );
+  } catch (err) {
+    if (err instanceof HermesYamlUnsupportedError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Hermes MCP routing: wrap would FAIL before modifying anything: ${err.message}`
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /** Default CallGovernor limits for wrapped agents. */
@@ -318,6 +446,22 @@ export async function runWrap(
   if (!agentConfig && platformHint && !options.wrap) {
     const candidatePaths = getPlatformPaths()[platformHint];
     const canonicalPath = candidatePaths[0];
+    // D4 staging, Bug 1: --dry-run must guarantee ZERO filesystem writes.
+    // This bootstrap ran BEFORE the dry-run gate below, so `protect
+    // --hermes --dry-run` on a host with no config still created the file.
+    // Report what would be bootstrapped and stop before any write path.
+    if (canonicalPath && options.dryRun) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  No existing ${platformHint} config found.`);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
+      if (platformHint === "hermes") {
+        await reportHermesYamlDryRun(options);
+      }
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Dry run. No changes made.\n`);
+      return;
+    }
     if (canonicalPath) {
       try {
         await mkdir(dirname(canonicalPath), { recursive: true, mode: 0o700 });
@@ -421,6 +565,13 @@ export async function runWrap(
   }
 
   if (options.dryRun) {
+    // D4 staging, Bug 2: report what WOULD be written to Hermes's
+    // config.yaml so the dry run previews the full wrap, while Bug 1
+    // keeps this path guaranteed write-free (the gate sits above every
+    // write: config bootstrap, fortress state, agent-record persistence).
+    if (agentConfig.platform === "hermes") {
+      await reportHermesYamlDryRun(options);
+    }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Dry run. No changes made.\n`);
     return;
@@ -631,63 +782,83 @@ export async function runWrap(
     mode: 0o600,
   });
 
-  // Back up and rewrite agent config.
+  // The args list is a constant — never inject `--passphrase`. The launcher
+  // re-resolves the stored passphrase at runtime from Keychain / fallback
+  // file / SANCTUARY_PASSPHRASE env var. See SEC-061. Env-block and
+  // command/args construction live in buildSanctuaryEnv /
+  // resolveSanctuaryCommand so the dry-run reporter previews the exact
+  // entry the real run writes.
+  const sanctuaryEnv = buildSanctuaryEnv(options);
+  const { command: sanctuaryCommand, args: sanctuaryArgs } =
+    resolveSanctuaryCommand(options);
+
+  // D4 staging, Bug 2: Hermes v0.16.0 loads MCP servers from
+  // ~/.hermes/config.yaml (`mcp_servers:` key, upstream
+  // hermes_cli/mcp_config.py and mcp_startup.py), not from the JSON
+  // cli-config.json wrap rewrites below. Without the YAML injection the
+  // wrap records the agent but Hermes MCP traffic silently bypasses the
+  // Sanctuary proxy. The plan is computed BEFORE any harness config is
+  // touched so an unsupported YAML shape aborts with both surfaces
+  // untouched; the JSON write is kept for forward-compat with the
+  // documented cli-config.json surface.
+  let hermesYaml:
+    | { yamlPath: string; existedBefore: boolean; plan: HermesYamlPlan }
+    | undefined;
+  if (agentConfig.platform === "hermes") {
+    const yamlPath = hermesConfigYamlPath();
+    let existingYaml: string | null = null;
+    try {
+      existingYaml = await readFile(yamlPath, "utf-8");
+    } catch {
+      // File absent — the plan creates it.
+    }
+    try {
+      const plan = planHermesYamlInjection(existingYaml, {
+        command: sanctuaryCommand,
+        args: sanctuaryArgs,
+        ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+      });
+      hermesYaml = { yamlPath, existedBefore: existingYaml !== null, plan };
+    } catch (err) {
+      if (err instanceof HermesYamlUnsupportedError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+        console.error(`  ${err.message}`);
+        console.error(
+          `  Nothing was modified. Hermes routes MCP traffic through ${yamlPath};` +
+            `\n  wrap will not proceed without updating it (a JSON-only wrap would` +
+            `\n  silently leave Hermes traffic outside the Sanctuary proxy).\n`
+        );
+        process.exit(1);
+      }
+      throw err;
+    }
+  }
+
+  // Back up and rewrite agent config. For Hermes, config.yaml is backed up
+  // alongside cli-config.json and recorded in the wrap meta so unwrap
+  // restores both surfaces.
   const backupPath = await backupConfig(agentConfig.configPath);
+  let hermesYamlBackupPath: string | null = null;
+  if (hermesYaml?.existedBefore) {
+    hermesYamlBackupPath = await backupConfig(hermesYaml.yamlPath);
+  }
   await saveWrapMeta({
     backupPath,
     originalPath: agentConfig.configPath,
     platform: agentConfig.platform,
     wrappedAt: new Date().toISOString(),
+    ...(hermesYaml
+      ? {
+          auxiliary: [
+            {
+              originalPath: hermesYaml.yamlPath,
+              backupPath: hermesYamlBackupPath,
+            },
+          ] satisfies WrapMetaAuxiliaryFile[],
+        }
+      : {}),
   });
-
-  // The args list is a constant — never inject `--passphrase`. The launcher
-  // re-resolves the stored passphrase at runtime from Keychain / fallback
-  // file / SANCTUARY_PASSPHRASE env var. See SEC-061.
-  // Build the env block for the sanctuary entry. These three vars are
-  // required for the dashboard and passphrase resolution to work after
-  // the config rewrite. Pull from process.env so they survive the rewrite.
-  const sanctuaryEnv: Record<string, string> = {};
-  if (process.env.SANCTUARY_PASSPHRASE) {
-    sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
-    sanctuaryEnv.SANCTUARY_DASHBOARD_AUTH_TOKEN = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
-    sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
-  }
-  // v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
-  // path so harness restarts (Claude Code re-spawning the MCP server)
-  // keep the same fortress directory. Pre-fix, --fortress was honored at
-  // wrap time (via promoteFortressToStoragePath above) but never written
-  // into ~/.claude.json — every harness restart fell back to the default
-  // fortress location, silently drifting fortress isolation across reboots.
-  //
-  // The args list stays constant: persistence travels through env vars
-  // exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
-  // promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
-  // identically, so the spawned MCP server resolves the right storage
-  // path on its boot path. Resolved to absolute so subsequent CWD
-  // changes do not break the persisted reference.
-  if (options.fortress) {
-    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
-  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
-    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
-      process.env.SANCTUARY_FORTRESS_PATH,
-    );
-  }
-
-  // Dogfood path (`--dev-dist <path>`): when set, point the main
-  // `sanctuary` entry at a local Sanctuary build instead of the
-  // npm-published version. Without this flag, an unpublished branch
-  // (e.g. an in-flight PR) gets shadowed by the npm-resolved version
-  // because npx pulls from the registry. Published-version wraps omit
-  // the flag and use the npx default unchanged.
-  const useDevDist = options.devDist !== undefined;
-  const sanctuaryCommand = useDevDist ? "node" : "npx";
-  const sanctuaryArgs = useDevDist
-    ? [options.devDist!]
-    : ["@sanctuary-framework/mcp-server"];
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
   await rewrite(
@@ -702,6 +873,46 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
+  // the JSON surface verified. A failed YAML verify rolls BOTH surfaces back
+  // and exits non-zero; a Hermes wrap with only the JSON written is the
+  // exact silent-bypass state this fix exists to prevent.
+  if (hermesYaml) {
+    await mkdir(dirname(hermesYaml.yamlPath), { recursive: true, mode: 0o700 });
+    await writeFile(hermesYaml.yamlPath, hermesYaml.plan.content, {
+      mode: 0o600,
+    });
+    let yamlVerified = false;
+    try {
+      yamlVerified = yamlContainsSanctuaryEntry(
+        await readFile(hermesYaml.yamlPath, "utf-8")
+      );
+    } catch {
+      yamlVerified = false;
+    }
+    if (!yamlVerified) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Verification FAILED: No sanctuary entry in rewritten ${hermesYaml.yamlPath}.`
+      );
+      if (hermesYamlBackupPath) {
+        await restoreFromBackup(hermesYaml.yamlPath, hermesYamlBackupPath);
+      } else {
+        try {
+          await unlink(hermesYaml.yamlPath);
+        } catch {
+          // Best-effort removal of the file this wrap created.
+        }
+      }
+      await restoreFromBackup(agentConfig.configPath, backupPath);
+      process.exit(1);
+    }
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Hermes MCP routing: ${formatHermesYamlAction(hermesYaml.plan, hermesYaml.yamlPath)}`
+    );
+  }
 
   // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
   // permissions.allow list at wrap time so the wrapped agent's routine
@@ -1451,7 +1662,43 @@ async function unwrap(): Promise<void> {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
-  console.error(`  Backup preserved at: ${meta.backupPath}\n`);
+  console.error(`  Backup preserved at: ${meta.backupPath}`);
+
+  // D4 staging, Bug 2: restore auxiliary files the wrap touched (the
+  // Hermes config.yaml surface). A null backupPath means wrap created the
+  // file fresh; restoring the pre-wrap state removes it. Best-effort: the
+  // primary config restore above already succeeded, so an auxiliary
+  // failure reports loudly with the manual recovery path instead of
+  // aborting the unwrap.
+  for (const aux of meta.auxiliary ?? []) {
+    try {
+      if (aux.backupPath) {
+        await restoreConfig(aux.backupPath, aux.originalPath);
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`  Original config restored to: ${aux.originalPath}`);
+        console.error(`  Backup preserved at: ${aux.backupPath}`);
+      } else {
+        await unlink(aux.originalPath);
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+        );
+      }
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not restore ${aux.originalPath}: ${(err as Error).message}`
+      );
+      if (aux.backupPath) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Manual recovery: copy ${aux.backupPath} to ${aux.originalPath}`
+        );
+      }
+    }
+  }
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error("");
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

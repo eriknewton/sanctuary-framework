@@ -9,7 +9,7 @@
  */
 
 import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
-import { join } from "node:path";
+import { join, extname } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
 import { detectHarnessSchema } from "./harness-schema.js";
@@ -66,11 +66,13 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
       join(home, "Library", "Application Support", "OpenClaw", "openclaw.json"),
       join(home, "Library", "Application Support", "OpenClaw", "config.json"),
     ],
-    // Hermes Agent (NousResearch, v0.9.0) canonicals live under ~/.hermes.
-    // Hermes ships `cli-config.yaml` as the primary surface per upstream docs.
-    // Sanctuary wrap v1.0 detects the JSON variant only: operators who keep
-    // YAML can still wrap via `sanctuary wrap --wrap <path>` after exporting
-    // to JSON. YAML-native detection is flagged as a v1.x follow-up.
+    // Hermes Agent (NousResearch) canonicals live under ~/.hermes. These
+    // JSON paths drive detection (and the upstream-server listing); the
+    // MCP surface Hermes v0.16.0 actually loads at runtime is
+    // ~/.hermes/config.yaml (`mcp_servers:` key), which the wrap CLI
+    // additionally injects via wrap/hermes-yaml.ts (D4 staging, Bug 2).
+    // The JSON write is kept for forward-compat with the documented
+    // cli-config.json surface.
     "hermes": [
       join(home, ".hermes", "cli-config.json"),
       join(home, ".hermes", "config.json"),
@@ -160,12 +162,18 @@ function backupDir(): string {
 /**
  * Back up a config file before modification.
  * Returns the backup path.
+ *
+ * The backup keeps the source file's extension (D4 staging, Bug 2: the
+ * Hermes wrap now also backs up ~/.hermes/config.yaml, and a .yaml backup
+ * named .json would mislead manual recovery). JSON configs keep the
+ * historical `config-backup-<timestamp>.json` name unchanged.
  */
 export async function backupConfig(configPath: string): Promise<string> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupPath = join(dir, `config-backup-${timestamp}.json`);
+  const extension = extname(configPath) || ".json";
+  const backupPath = join(dir, `config-backup-${timestamp}${extension}`);
   await copyFile(configPath, backupPath);
   return backupPath;
 }
@@ -189,13 +197,33 @@ const WRAP_META_FILENAME = "wrap-meta.json";
 const LEGACY_WRAP_META_FILENAME = "cocoon-meta.json";
 
 /**
+ * A secondary file the wrap modified or created alongside the primary
+ * harness config. D4 staging, Bug 2: the Hermes wrap also edits
+ * ~/.hermes/config.yaml, and unwrap must restore it too.
+ */
+export interface WrapMetaAuxiliaryFile {
+  /** Path of the file the wrap touched. */
+  originalPath: string;
+  /**
+   * Backup to restore on unwrap, or null when wrap created the file
+   * fresh (unwrap then removes it to restore the pre-wrap state).
+   */
+  backupPath: string | null;
+}
+
+/**
  * Find the most recent backup.
  *
  * Read-both, write-new: prefers the canonical meta filename, then falls
  * back to the legacy name so installs wrapped by earlier releases can
- * still unwrap.
+ * still unwrap. The `auxiliary` list is absent from metas written by
+ * earlier releases; callers must treat it as optional.
  */
-export async function findLatestBackup(): Promise<{ backupPath: string; originalPath: string } | null> {
+export async function findLatestBackup(): Promise<{
+  backupPath: string;
+  originalPath: string;
+  auxiliary?: WrapMetaAuxiliaryFile[];
+} | null> {
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     const metaPath = join(backupDir(), filename);
     try {
@@ -204,6 +232,7 @@ export async function findLatestBackup(): Promise<{ backupPath: string; original
       return {
         backupPath: meta.backupPath,
         originalPath: meta.originalPath,
+        ...(Array.isArray(meta.auxiliary) ? { auxiliary: meta.auxiliary } : {}),
       };
     } catch {
       // Missing or unreadable — try the next candidate.
@@ -220,6 +249,7 @@ export async function saveWrapMeta(meta: {
   originalPath: string;
   platform: AgentPlatform;
   wrappedAt: string;
+  auxiliary?: WrapMetaAuxiliaryFile[];
 }): Promise<void> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
