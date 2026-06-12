@@ -1,3 +1,4 @@
+export * from "./adapters/index.js";
 export * from "./catalog-store.js";
 export * from "./document-corpus-store.js";
 export * from "./errors.js";
