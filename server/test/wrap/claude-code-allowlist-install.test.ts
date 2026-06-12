@@ -31,6 +31,7 @@ import {
   readFile,
   writeFile,
   access,
+  symlink,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -189,6 +190,28 @@ describe("installClaudeCodeAllowlist (WP-V1.2 reshape)", () => {
     await expect(
       installClaudeCodeAllowlist({ settingsJsonPath: settingsPath }),
     ).rejects.toThrow(/contains a non-string entry/);
+  });
+
+  // D4 round-3: settings.json lives in an agent config dir (~/.claude). A
+  // symlinked PARENT directory would redirect the atomic tmp-write + rename
+  // out of the agent tree. The hardened atomicWrite refuses it; the victim
+  // file the link points at is left untouched.
+  it("symlinked parent directory: install refused, victim file untouched (D4 round-3)", async () => {
+    const victimDir = join(tmpDir, "victim-dir");
+    await mkdir(victimDir, { recursive: true });
+    const victimFile = join(victimDir, "settings.json");
+    await writeFile(victimFile, '{"precious":true}\n', "utf8");
+
+    const linkedConfigDir = join(tmpDir, "linked-claude");
+    await symlink(victimDir, linkedConfigDir);
+    const redirectedSettings = join(linkedConfigDir, "settings.json");
+
+    await expect(
+      installClaudeCodeAllowlist({ settingsJsonPath: redirectedSettings }),
+    ).rejects.toThrow(/symlink/);
+
+    // The victim's own settings.json was NOT clobbered by the broker entries.
+    expect(await readFile(victimFile, "utf8")).toBe('{"precious":true}\n');
   });
 });
 

@@ -8,7 +8,7 @@
  * All original configs are backed up before any modification.
  */
 
-import { readFile, writeFile, mkdir, copyFile, access, realpath, open } from "node:fs/promises";
+import { readFile, writeFile, mkdir, copyFile, access, realpath, open, lstat, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
@@ -226,18 +226,235 @@ export async function writeFileNoFollow(
 }
 
 /**
+ * The operator HOME, treated as the trusted root for every wrap-module
+ * write. Returned resolve()d but NOT realpath-resolved: every wrap sink
+ * builds its target from homedir() (e.g. join(homedir(), ".hermes", ...)),
+ * so the trusted root must use the same lexical home for the prefix check
+ * to hold. The walk only inspects components BELOW this root, so a symlink
+ * in the HOME prefix itself (which is operator-owned and trusted) is out of
+ * scope by design; the segments wrap actually creates (`.hermes`, the leaf)
+ * are the ones an attacker could redirect, and those ARE walked.
+ */
+function trustedHomeRoot(): string {
+  return resolve(homedir());
+}
+
+/**
+ * Pick the trusted root for an arbitrary write target.
+ *
+ * Under the operator HOME (the production case — every agent config path is
+ * built from homedir()), HOME is the trust anchor and the full
+ * `.hermes`/`.claude`-config-dir/leaf chain below it is walked, so a
+ * symlinked config DIRECTORY is caught.
+ *
+ * For a target NOT under HOME (operator- or test-injected custom location,
+ * e.g. a tmpdir config path), the anchor is the GRANDPARENT — `dirname` of
+ * the leaf's parent — so the leaf's IMMEDIATE parent directory is always
+ * walked and a symlinked config dir is still caught. (Anchoring at the leaf's
+ * own parent would skip exactly the directory most likely to be the redirect
+ * link.) The chain above the grandparent is treated as operator-owned.
+ */
+function deriveTrustedRoot(targetPath: string): string {
+  const home = trustedHomeRoot();
+  const resolved = resolve(targetPath);
+  if (isWithin(resolved, home)) return home;
+  const parent = dirname(resolved);
+  const grandparent = dirname(parent);
+  // dirname() is idempotent at the filesystem root; fall back to the parent
+  // when the target is too shallow to have a distinct grandparent.
+  return grandparent === parent ? parent : grandparent;
+}
+
+/**
+ * D4 round-3 P1-A/B/C — close the WHOLE symlink-redirection class, not just
+ * the leaf.
+ *
+ * `writeFileNoFollow` opens the FINAL path component O_NOFOLLOW, which the
+ * kernel honours only for that last component: a symlinked PARENT directory
+ * (e.g. `~/.hermes -> /tmp/victim`) is still traversed transparently, so
+ * every "hardened" write/restore/mkdir lands wherever the link points. The
+ * leaf-only guard cannot see that — only a walk can.
+ *
+ * This helper lstat()s every component from `trustedRoot` (exclusive) down
+ * to the leaf's PARENT (inclusive) and refuses loudly if any is a symlink.
+ * The trustedRoot itself is trusted (the operator HOME / agent config dir)
+ * and is NOT re-checked. The leaf is intentionally NOT walked here: the
+ * caller's O_NOFOLLOW open is the leaf enforcement and closes the
+ * final-component leaf-swap TOCTOU window that a pure lstat walk cannot.
+ *
+ * THREAT-MODEL BOUNDARY (documented honestly, not papered over): between
+ * this walk and the caller's subsequent open/mkdir there is a non-atomic
+ * window in which a same-privilege attacker who can win the parent-directory
+ * race could swap a parent into a symlink. Node exposes no portable
+ * openat()/O_NOFOLLOW-per-component primitive to make the parent walk atomic,
+ * so we re-walk immediately before the sink to MINIMISE (not eliminate) that
+ * window. A same-privilege local attacker racing the parent dir of a
+ * single-operator wrap is out of scope; cross-privilege redirection (the
+ * actual attack this class represents) is closed because the attacker cannot
+ * create a symlink the walk does not see.
+ */
+async function assertNoSymlinkInPath(
+  targetPath: string,
+  trustedRoot: string
+): Promise<void> {
+  const resolved = resolve(targetPath);
+  const root = resolve(trustedRoot);
+  if (resolved !== root && !isWithin(resolved, root)) {
+    throw new Error(
+      `${targetPath} is not under the trusted root ${trustedRoot}; ` +
+        `refusing to write through an unverified path.`
+    );
+  }
+  // Components from root (exclusive) down to the leaf's parent (inclusive).
+  const rel = resolved.slice(root.length).split(sep).filter(Boolean);
+  // Drop the leaf — its no-follow open is the enforcement for that segment.
+  rel.pop();
+  let cursor = root;
+  for (const segment of rel) {
+    cursor = join(cursor, segment);
+    let stats;
+    try {
+      stats = await lstat(cursor);
+    } catch {
+      // Missing ancestor: nothing to follow yet. A later mkdir/open creates
+      // it under the verified prefix; re-walk before the sink re-checks.
+      return;
+    }
+    if (stats.isSymbolicLink()) {
+      throw new Error(
+        `${cursor} is a symlink in the path to ${targetPath}; refusing to ` +
+          `write through a symlinked parent directory. Replace the symlink ` +
+          `with a regular directory and re-run.`
+      );
+    }
+  }
+}
+
+/**
+ * mkdir each missing segment from `trustedRoot` down to `dir`, refusing if
+ * any EXISTING segment is a symlink (D4 round-3 P2: `mkdir(recursive:true)`
+ * follows a symlinked ancestor and creates the tree wherever it points).
+ * Each segment is created individually under the just-verified parent
+ * instead of letting `recursive:true` walk blindly.
+ */
+async function mkdirNoFollowUnderRoot(
+  dir: string,
+  trustedRoot: string,
+  mode = 0o700
+): Promise<void> {
+  const resolved = resolve(dir);
+  const root = resolve(trustedRoot);
+  if (resolved !== root && !isWithin(resolved, root)) {
+    throw new Error(
+      `${dir} is not under the trusted root ${trustedRoot}; refusing to mkdir.`
+    );
+  }
+  const rel = resolved.slice(root.length).split(sep).filter(Boolean);
+  let cursor = root;
+  for (const segment of rel) {
+    cursor = join(cursor, segment);
+    let stats;
+    try {
+      stats = await lstat(cursor);
+    } catch {
+      // Missing — create just this segment under the verified parent.
+      await mkdir(cursor, { mode });
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      throw new Error(
+        `${cursor} is a symlink in the path to ${dir}; refusing to mkdir ` +
+          `through a symlinked parent directory.`
+      );
+    }
+  }
+}
+
+/**
+ * Symlink-safe write that closes the ENTIRE redirection class (D4 round-3):
+ * walk + verify no parent component is a symlink (re-walked here, right
+ * before the open, to minimise the parent-race window), recreate any
+ * missing parent segments individually under the verified prefix, then open
+ * the leaf O_NOFOLLOW so the final component cannot be a swapped-in symlink
+ * either. `trustedRoot` defaults to the operator HOME.
+ */
+export async function writeFileSafeUnderRoot(
+  targetPath: string,
+  data: string | Uint8Array,
+  options: { mode?: number; trustedRoot?: string } = {}
+): Promise<void> {
+  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(targetPath);
+  await assertNoSymlinkInPath(targetPath, trustedRoot);
+  await mkdirNoFollowUnderRoot(dirname(resolve(targetPath)), trustedRoot);
+  // Re-walk immediately before the open: minimises (does not eliminate, see
+  // assertNoSymlinkInPath threat-model note) the walk→open parent window.
+  await assertNoSymlinkInPath(targetPath, trustedRoot);
+  await writeFileNoFollow(targetPath, data, options.mode ?? 0o600);
+}
+
+/**
+ * Symlink-safe unlink (D4 round-3 P1-A): refuse to remove a target reached
+ * through a symlinked parent directory before unlinking it. The created-by-
+ * wrap unlink on unwrap (`~/.hermes/config.yaml`) was protected at
+ * validate-time, but a symlink raced into the parent AFTER validation would
+ * make the bare `unlink` remove a file in the link's destination. unlink()
+ * itself does not follow a symlinked FINAL component (it removes the link,
+ * not its target), so the leaf needs no O_NOFOLLOW; only the PARENT walk is
+ * required. Re-walked here, immediately before the unlink, to minimise the
+ * same parent-race window documented on assertNoSymlinkInPath.
+ */
+export async function unlinkSafeUnderRoot(
+  targetPath: string,
+  options: { trustedRoot?: string } = {}
+): Promise<void> {
+  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(targetPath);
+  await assertNoSymlinkInPath(targetPath, trustedRoot);
+  await unlink(targetPath);
+}
+
+/**
+ * Public wrapper: refuse if any PARENT component of `targetPath` (from the
+ * trusted root down to the leaf's parent) is a symlink. Exported so sibling
+ * wrap sinks that do their own write (e.g. the Claude Code allowlist's
+ * tmp-file + rename atomic write) share the one safe-path discipline instead
+ * of re-deriving it. The leaf is NOT inspected — the caller is responsible
+ * for the leaf (O_NOFOLLOW open, or a rename that replaces the link itself).
+ */
+export async function assertNoSymlinkParentUnderRoot(
+  targetPath: string,
+  trustedRoot?: string
+): Promise<void> {
+  await assertNoSymlinkInPath(targetPath, trustedRoot ?? deriveTrustedRoot(targetPath));
+}
+
+/**
+ * Public wrapper: mkdir `dir` segment-by-segment under its trusted root,
+ * refusing a symlinked ancestor (never `mkdir(recursive)` through a link).
+ */
+export async function mkdirSafeUnderRoot(
+  dir: string,
+  trustedRoot?: string,
+  mode = 0o700
+): Promise<void> {
+  await mkdirNoFollowUnderRoot(dir, trustedRoot ?? deriveTrustedRoot(dir), mode);
+}
+
+/**
  * Restore a config from backup.
  *
  * D4 round-2 P1-A: the backup side is read normally (callers validate its
  * location), but the target is written through the no-follow primitive so
  * a symlink raced into place at the restore target cannot redirect the
  * write. D4 round-2 P2: a missing parent directory is recreated (0o700)
- * rather than stranding the operator mid-unwrap.
+ * rather than stranding the operator mid-unwrap. D4 round-3 P1-A: the
+ * target is now written through writeFileSafeUnderRoot, which additionally
+ * refuses a SYMLINKED PARENT directory (the round-2 leaf-only O_NOFOLLOW
+ * could be redirected by a symlinked `~/.hermes`) and recreates the parent
+ * segment-by-segment instead of `mkdir(recursive)` following a link.
  */
 export async function restoreConfig(backupPath: string, targetPath: string): Promise<void> {
   const data = await readFile(backupPath);
-  await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
-  await writeFileNoFollow(targetPath, data);
+  await writeFileSafeUnderRoot(targetPath, data);
 }
 
 /** Canonical unwrap-meta filename — all new wraps write this. */
@@ -368,9 +585,19 @@ async function allowedAuxiliaryConfigDirs(): Promise<string[]> {
  * surface — not merely to "anything under an agent config directory".
  * The round-1 rule let a forged meta name a LEGITIMATE file (e.g.
  * ~/.hermes/cli-config.json) as null-backup and have unwrap unlink it.
+ *
+ * D4 round-3 P1-B: this list is now LEXICAL (resolve only, NO realpath).
+ * Round-2 canonicalized BOTH sides through realpath, so a symlinked
+ * `~/.hermes -> /tmp/victim` made a forged `originalPath: "/tmp/victim/
+ * config.yaml"` realpath-EQUAL to the canonicalized allowlist entry and let
+ * unwrap unlink the outside file. The caller now first refuses any
+ * symlinked component on the candidate path (assertNoSymlinkInPath), so a
+ * symlinked `.hermes` is rejected before this lexical equality ever runs;
+ * the equality itself compares the link-free lexical path against the
+ * link-free lexical allowlist.
  */
-async function allowedCreatedByWrapPaths(): Promise<string[]> {
-  return [await canonicalizeAllowingMissingTail(hermesConfigYamlPath())];
+function allowedCreatedByWrapPathsLexical(): string[] {
+  return [resolve(hermesConfigYamlPath())];
 }
 
 /**
@@ -411,7 +638,7 @@ export async function validateWrapMetaAuxiliary(
 
   const backupRoot = await realpathOrNull(backupDir());
   const allowedDirs = await allowedAuxiliaryConfigDirs();
-  const createdByWrapAllowlist = await allowedCreatedByWrapPaths();
+  const createdByWrapAllowlist = allowedCreatedByWrapPathsLexical();
   const validated: ValidatedWrapMetaAuxiliaryFile[] = [];
 
   for (const entry of auxiliary) {
@@ -432,11 +659,23 @@ export async function validateWrapMetaAuxiliary(
 
     if (backupPath === null) {
       // Round-2 P1-B: null backup = created-by-wrap = delete-on-unwrap.
-      // Byte-equality against the explicit created-by-wrap allowlist, with
-      // both sides canonicalized the same way.
-      const canonicalOriginal =
-        await canonicalizeAllowingMissingTail(resolvedOriginal);
-      if (!createdByWrapAllowlist.includes(canonicalOriginal)) {
+      // Round-3 P1-B: refuse FIRST if any component of the candidate path is
+      // a symlink. Round-2 realpath-canonicalized both sides, so a symlinked
+      // `~/.hermes -> /tmp/victim` made a forged originalPath of
+      // "/tmp/victim/config.yaml" resolve EQUAL to the allowlist entry and
+      // let unwrap unlink the outside file. With the symlink walk gating it,
+      // a symlinked .hermes is rejected before the lexical equality runs.
+      try {
+        await assertNoSymlinkInPath(resolvedOriginal, deriveTrustedRoot(resolvedOriginal));
+      } catch (err) {
+        throw new WrapMetaValidationError(
+          `wrap-meta auxiliary originalPath ${originalPath} has a symlinked ` +
+            `parent directory; refusing to unwrap. ${(err as Error).message}`
+        );
+      }
+      // Lexical byte-equality (resolve only, NO realpath on either side) so a
+      // symlink cannot launder a forged outside path into an allowlist hit.
+      if (!createdByWrapAllowlist.includes(resolvedOriginal)) {
         throw new WrapMetaValidationError(
           `wrap-meta auxiliary originalPath ${originalPath} carries a null ` +
             "backupPath but is not a file wrap creates; refusing to unwrap."
@@ -947,6 +1186,16 @@ export async function rewriteConfigForWrap(
     };
   }
 
-  await writeFile(agentConfig.configPath, JSON.stringify(rewritten, null, 2), { mode: 0o600 });
+  // D4 round-3 P1-C: the primary-config write was a plain writeFile with NO
+  // symlink protection — a symlinked config path (or a symlinked parent dir
+  // such as ~/.hermes) redirected the rewritten config wherever the link
+  // pointed. Route it through the same safe-path discipline as every other
+  // wrap sink: refuse a symlinked parent (walk from the trusted root) and
+  // open the leaf O_NOFOLLOW.
+  await writeFileSafeUnderRoot(
+    agentConfig.configPath,
+    JSON.stringify(rewritten, null, 2),
+    { mode: 0o600 }
+  );
   return agentConfig.configPath;
 }

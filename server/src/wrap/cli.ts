@@ -28,7 +28,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
-import { writeFile, readFile, mkdir, access, unlink, lstat } from "node:fs/promises";
+import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
 import { platform } from "node:os";
@@ -43,7 +43,8 @@ import {
   rewriteConfigForWrap,
   getPlatformPaths,
   validateWrapMetaAuxiliary,
-  writeFileNoFollow,
+  writeFileSafeUnderRoot,
+  unlinkSafeUnderRoot,
   WrapMetaValidationError,
   type AgentPlatform,
   type MCPServerEntry,
@@ -494,8 +495,11 @@ export async function runWrap(
     }
     if (canonicalPath) {
       try {
-        await mkdir(dirname(canonicalPath), { recursive: true, mode: 0o700 });
-        await writeFile(canonicalPath, "{}", { mode: 0o600 });
+        // Round-3 P1-A: the fresh-config bootstrap used mkdir(recursive) +
+        // plain writeFile, both of which follow a symlinked parent (e.g.
+        // ~/.hermes -> /tmp/victim). Route it through the same safe-path
+        // discipline as every other wrap sink.
+        await writeFileSafeUnderRoot(canonicalPath, "{}", { mode: 0o600 });
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  No existing ${platformHint} config found.`
@@ -930,23 +934,30 @@ export async function runWrap(
         await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
       } else {
         try {
-          await unlink(yamlSurface.yamlPath);
+          // Round-3 P1-A: parent-walk-safe even on the rollback path.
+          await unlinkSafeUnderRoot(yamlSurface.yamlPath);
         } catch {
           // Best-effort removal of the file this wrap created (it may not
-          // exist when the write itself was what failed).
+          // exist when the write itself was what failed, or be refused if a
+          // symlink was raced into its parent).
         }
       }
       await restoreFromBackup(agentConfig.configPath, backupPath);
     };
     let yamlVerified = false;
     try {
-      await mkdir(dirname(yamlSurface.yamlPath), { recursive: true, mode: 0o700 });
       // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
-      // write is TOCTOU-raceable, so the writeFileNoFollow below is the
-      // actual enforcement — its O_NOFOLLOW open refuses a symlink raced
-      // into place in the same syscall that creates/truncates the sink.
+      // write is TOCTOU-raceable, so the no-follow open is the leaf
+      // enforcement. Round-3 P1-A: the leaf-only O_NOFOLLOW could STILL be
+      // redirected by a symlinked PARENT (`~/.hermes -> /tmp/victim`), so
+      // writeFileSafeUnderRoot walks every parent component from HOME and
+      // refuses a symlinked ancestor, recreates missing parents segment-by-
+      // segment (no recursive mkdir following a link), then opens the leaf
+      // O_NOFOLLOW.
       await refuseSymlinkTarget(yamlSurface.yamlPath, "Hermes config.yaml");
-      await writeFileNoFollow(yamlSurface.yamlPath, yamlSurface.plan.content, 0o600);
+      await writeFileSafeUnderRoot(yamlSurface.yamlPath, yamlSurface.plan.content, {
+        mode: 0o600,
+      });
       yamlVerified = yamlContainsSanctuaryEntry(
         await readFile(yamlSurface.yamlPath, "utf-8")
       );
@@ -1813,7 +1824,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Skipped ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
-        await unlink(aux.originalPath);
+        // Round-3 P1-A: refuse the unlink if a symlink was raced into the
+        // parent dir after validate-time; unlink() does not follow a
+        // symlinked leaf, so only the parent walk is needed.
+        await unlinkSafeUnderRoot(aux.originalPath);
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
