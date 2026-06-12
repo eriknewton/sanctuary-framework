@@ -46,7 +46,7 @@ There are two useful meanings of "catalog" in the current source:
 1. The operator-facing `ANOMALY_CATALOG` in `server/src/anomaly-detection/anomaly-catalog.ts`.
 2. The shipped detector classes under `server/src/anomaly-detection/detectors/`.
 
-Source note: the operator-facing catalog currently exposes only `per-agent-activity` with `rolling-baseline`. The additional detector classes exist in source, but are not listed in `ANOMALY_CATALOG` on this branch.
+Source note: `ANOMALY_CATALOG` now registers all seven shipped detectors, including the alternative CUSUM and PSI classifier tuples for `per-agent-activity`. An earlier revision of this note predated the Chi-4 through Chi-7 catalog registrations.
 
 | Detector | Feature space | Primary classifier id | Defaults | Detects | Finding shape |
 | --- | --- | --- | --- | --- | --- |
