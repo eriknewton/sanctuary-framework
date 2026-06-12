@@ -95,6 +95,17 @@ outbound channels by configuring them:
   OS notification + dashboard view + signed local file write. Email
   (operator-chosen SMTP), Slack webhook, Telegram bot are explicit
   operator opt-in with operator-chosen endpoints.
+- **Transparency anchoring:** `sanctuary transparency anchor enable`
+  (or `sanctuary wrap --anchor-transparency`) publishes a salted hash
+  commitment of each enforcement checkpoint to a public transparency
+  log. OFF by default behind an explicit consent flow; the operator
+  confirms (and may override with `--rekor-url`) the log endpoint,
+  which defaults to the community-run `https://rekor.sigstore.dev`.
+  The consent record and every anchor attempt (success or failure) are
+  logged in the audit chain. Payload is a salted SHA-256 digest, a
+  signature from a dedicated derived key, and that key's public half,
+  never state content, counts, policy data, or fortress identifiers.
+  See `docs/transparency-checkpoints.md`, "External anchoring".
 
 Each escape hatch must be:
 

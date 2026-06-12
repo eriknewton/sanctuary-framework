@@ -58,6 +58,9 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | `operator-chat-store-v1` | `server/src/chat/operator-chat-store.ts:40` | `HKDF_INFO` | Encrypts the operator-chat (concierge) store. |
 | `query-anonymity-reverse-mapping-v1` | `server/src/query-anonymity/reverse-mapping-store.ts:20` | `HKDF_INFO` | Encrypts Rho-3 per-query reverse mappings for smart-mode render-time restoration. |
 | `sanctuary-v1.1-coordination-handoffs` | `server/src/coordination/handoff-store.ts:27` | `HANDOFF_PURPOSE_KEY` | Encrypts the v1.1 coordination handoff store. |
+| `transparency-counter-floor` | `server/src/transparency/emitter.ts` | (literal) | MAC key for the transparency checkpoint anti-rollback counter floor. (Registered retroactively; shipped with PR #451.) |
+| `transparency-anchor-signing-v1` | `server/src/transparency/anchor.ts` | `TRANSPARENCY_ANCHOR_SIGNING_PURPOSE` | Derives the dedicated ECDSA P-256 anchoring key (the per-fortress pseudonym that signs salted commitment preimages for Sigstore Rekor anchors). Retry suffix `/retry-N` reserved for the astronomically rare out-of-range derivation. |
+| `transparency-anchor-config-mac-v1` | `server/src/transparency/anchor.ts` | `TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE` | MAC key authenticating the opt-in anchoring config (a tampered config must not silently enable transmission or silently disable anchoring). |
 
 ### C. Namespace strings (info to deriveNamespaceKey, salt = sanctuary-namespace-v1)
 

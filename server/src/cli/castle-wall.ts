@@ -949,6 +949,44 @@ export async function runDaemon(
             out,
             `[transparency] enforcement checkpoint ${record.counter} emitted (audit head seq ${record.audit.highest_sequence}).\n`,
           );
+          // Opt-in external anchoring (PR-2). OFF by default: with no
+          // consent record nothing is transmitted. FAIL LOUD, never
+          // blocking: an anchor failure (or a tampered anchoring config)
+          // is reported on the console and in the audit log, but the
+          // emitted checkpoint above stands and enforcement continues.
+          try {
+            const { anchorCheckpoint, readAnchorConfig } = await import(
+              "../transparency/anchoring.js"
+            );
+            const anchorState = await readAnchorConfig({
+              storage,
+              masterKey: derived.key,
+            });
+            if (anchorState.status === "enabled") {
+              const outcome = await anchorCheckpoint({
+                storage,
+                masterKey: derived.key,
+                auditLog,
+                record,
+              });
+              if (outcome.status === "anchored") {
+                write(
+                  out,
+                  `[transparency] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`,
+                );
+              } else if (outcome.status === "failed") {
+                write(
+                  err,
+                  `[transparency] checkpoint ${record.counter} ANCHORING FAILED (emission stands; recorded in the audit log): ${outcome.error}. Retry with: sanctuary transparency anchor now\n`,
+                );
+              }
+            }
+          } catch (anchorError) {
+            write(
+              err,
+              `[transparency] checkpoint ${record.counter} ANCHORING REFUSED (emission stands): ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`,
+            );
+          }
         },
         onError: (error) => {
           write(
