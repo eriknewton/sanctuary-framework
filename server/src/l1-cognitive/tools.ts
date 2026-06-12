@@ -534,7 +534,7 @@ export class IdentityManager {
     // paths cannot bypass it. Audited degraded install modes pass; an
     // interactive install that never completed custody verification does not.
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
-    await enforceCustodyFloor(this.storage, "identity_create");
+    await enforceCustodyFloor(this.storage, "identity_create", this.masterKey);
     await this.save(identity);
   }
 

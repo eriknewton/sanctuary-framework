@@ -234,15 +234,24 @@ export async function createSanctuaryServer(options?: {
       operation:
         custody.origin === "first-run"
           ? "custody_envelope_created"
-          : "custody_legacy_migrated",
+          : custody.origin === "legacy-deferred"
+            ? "custody_migration_deferred"
+            : "custody_legacy_migrated",
       identity_id: fortressIdFromStoragePath(config.storage_path),
       result: "success",
-      details: {
-        install_mode: custody.envelope.install_mode,
-        wrap_types: custody.envelope.wraps.map((w) => w.type),
-        verified_wraps: custody.envelope.wraps.filter((w) => w.verified).length,
-        origin: custody.origin,
-      },
+      details: custody.envelope
+        ? {
+            install_mode: custody.envelope.install_mode,
+            wrap_types: custody.envelope.wraps.map((w) => w.type),
+            verified_wraps: custody.envelope.wraps.filter((w) => w.verified)
+              .length,
+            origin: custody.origin,
+          }
+        : {
+            origin: custody.origin,
+            reason:
+              "existing data could not be evidence-checked against this master; envelope not written",
+          },
     });
     const pinCustody = await checkCastlePinCustody(
       config.storage_path,

@@ -36,10 +36,11 @@ import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "./encryption.js";
 import {
   deriveMasterKey,
+  derivePurposeKey,
   type KeyDerivationParams,
 } from "./key-derivation.js";
 import { generateRandomKey } from "./random.js";
-import { hashToString } from "./hashing.js";
+import { hashToString, hmacSha256 } from "./hashing.js";
 import {
   toBase64url,
   fromBase64url,
@@ -65,6 +66,12 @@ export type CustodyInstallMode =
   | "legacy-migrated";
 
 export interface CustodyWrap {
+  /**
+   * Random per-wrap id, bound into the wrap's AEAD AAD so a wrap cannot be
+   * duplicated or transplanted between envelopes without detection (the
+   * envelope MAC covers the id list and ciphertext digests).
+   */
+  id: string;
   type: CustodyWrapType;
   /** AES-256-GCM wrap of the 32-byte master key. */
   payload: EncryptedPayload;
@@ -84,7 +91,22 @@ export interface CustodyEnvelope {
   install_mode: CustodyInstallMode;
   wraps: CustodyWrap[];
   created_at: string;
+  /**
+   * HMAC-SHA256 over the envelope's policy-bearing metadata (install_mode,
+   * wrap ids/types/verified flags, wrap-ciphertext digests), keyed from
+   * HKDF(master, "custody-envelope-mac"). An attacker with bare write
+   * access to `_meta` cannot flip install_mode or verified flags, nor
+   * splice wraps in or out, without the master (codex finding H2/M2).
+   */
+  mac: string;
 }
+
+const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
+  "interactive",
+  "headless",
+  "stdio-server",
+  "legacy-migrated",
+]);
 
 /** `_meta` key holding the envelope. */
 export const CUSTODY_ENVELOPE_KEY = "custody-envelope";
@@ -186,10 +208,50 @@ export class SilentCustodyRefusedError extends Error {
   }
 }
 
+/**
+ * Custody envelope integrity failure: the envelope's MAC does not verify
+ * under the established master. Either the envelope was tampered with or
+ * it belongs to a different fortress. Always fail closed.
+ */
+export class CustodyEnvelopeIntegrityError extends Error {
+  constructor() {
+    super(
+      "Sanctuary: custody envelope failed its integrity check.\n" +
+        "The envelope's policy metadata (install mode, enrolled factors) does not\n" +
+        "verify under this fortress's master key — it may have been tampered with\n" +
+        "or replaced. Refusing to proceed. Restore _meta/custody-envelope from a\n" +
+        "trusted backup."
+    );
+    this.name = "CustodyEnvelopeIntegrityError";
+  }
+}
+
+/**
+ * Existing encrypted data was found with no custody envelope and no legacy
+ * markers. Creating fresh custody over it would orphan the data (split
+ * state) — fail closed instead (codex finding H1).
+ */
+export class OrphanedFortressStateError extends Error {
+  constructor() {
+    super(
+      "Sanctuary: this fortress contains existing data but no custody envelope\n" +
+        "and no legacy key markers. Refusing to create a fresh master over it —\n" +
+        "that would orphan the existing encrypted state.\n" +
+        "Restore _meta/custody-envelope (or _meta/key-params / _meta/recovery-key-hash)\n" +
+        "from backup, or explicitly re-initialize the fortress at a clean path."
+    );
+    this.name = "OrphanedFortressStateError";
+  }
+}
+
 // ── Wrap primitives ─────────────────────────────────────────────────
 
-function custodyAad(type: CustodyWrapType): Uint8Array {
-  return stringToBytes(`${CUSTODY_HKDF_SALT}:${type}`);
+function custodyAad(type: CustodyWrapType, id: string): Uint8Array {
+  return stringToBytes(`${CUSTODY_HKDF_SALT}:${type}:${id}`);
+}
+
+function newWrapId(): string {
+  return toBase64url(generateRandomKey().subarray(0, 16));
 }
 
 function recoveryWrapKey(recoveryKeyBytes: Uint8Array): Uint8Array {
@@ -235,10 +297,12 @@ export async function wrapMasterWithPassphrase(
   opts?: { verified?: boolean; now?: () => Date }
 ): Promise<CustodyWrap> {
   assertMaster(master);
+  const id = newWrapId();
   const { key: wrapKey, params } = await deriveMasterKey(passphrase);
-  const payload = encrypt(master, wrapKey, custodyAad("passphrase"));
+  const payload = encrypt(master, wrapKey, custodyAad("passphrase", id));
   wrapKey.fill(0);
   return {
+    id,
     type: "passphrase",
     payload,
     kdf: params,
@@ -254,10 +318,12 @@ export function wrapMasterWithRecoveryKey(
   opts?: { verified?: boolean; now?: () => Date }
 ): CustodyWrap {
   assertMaster(master);
+  const id = newWrapId();
   const wrapKey = recoveryWrapKey(recoveryKeyBytes);
-  const payload = encrypt(master, wrapKey, custodyAad("recovery-key"));
+  const payload = encrypt(master, wrapKey, custodyAad("recovery-key", id));
   wrapKey.fill(0);
   return {
+    id,
     type: "recovery-key",
     payload,
     verified: opts?.verified ?? false,
@@ -272,10 +338,12 @@ export function wrapMasterWithKeychainKey(
   opts?: { verified?: boolean; now?: () => Date }
 ): CustodyWrap {
   assertMaster(master);
+  const id = newWrapId();
   const wrapKey = keychainWrapKey(custodyKeyBytes);
-  const payload = encrypt(master, wrapKey, custodyAad("keychain"));
+  const payload = encrypt(master, wrapKey, custodyAad("keychain", id));
   wrapKey.fill(0);
   return {
+    id,
     type: "keychain",
     payload,
     verified: opts?.verified ?? true,
@@ -305,6 +373,20 @@ export async function unwrapMaster(
         ? "recovery-key"
         : "keychain";
 
+  const match = await unwrapMatchingWrap(envelope, credential, type);
+  if (!match) throw new CustodyUnlockError();
+  return match.master;
+}
+
+/**
+ * Try every wrap of `type`; return the master AND the exact wrap that
+ * decrypted it (so verification flows mark only that wrap — codex M1).
+ */
+async function unwrapMatchingWrap(
+  envelope: CustodyEnvelope,
+  credential: CustodyCredential,
+  type: CustodyWrapType
+): Promise<{ master: Uint8Array; wrapId: string } | null> {
   for (const wrap of envelope.wraps) {
     if (wrap.type !== type) continue;
     try {
@@ -319,7 +401,8 @@ export async function unwrapMaster(
         wrapKey = keychainWrapKey(credential.keychainKey);
       }
       try {
-        return decrypt(wrap.payload, wrapKey, custodyAad(type));
+        const master = decrypt(wrap.payload, wrapKey, custodyAad(type, wrap.id));
+        return { master, wrapId: wrap.id };
       } finally {
         wrapKey.fill(0);
       }
@@ -328,7 +411,57 @@ export async function unwrapMaster(
       // wrap of the same type. Never fall back to a weaker path.
     }
   }
-  throw new CustodyUnlockError();
+  return null;
+}
+
+// ── Envelope MAC (codex H2/M2) ──────────────────────────────────────
+
+const ENVELOPE_MAC_DOMAIN = "sanctuary-custody-envelope-mac-v1\n";
+
+function envelopeCanonicalMetadata(
+  envelope: Omit<CustodyEnvelope, "mac">
+): string {
+  // Field order is fixed by construction; ciphertext digests bind the wrap
+  // payloads without putting key-derived bytes in the MAC input.
+  return JSON.stringify({
+    v: envelope.v,
+    install_mode: envelope.install_mode,
+    wraps: envelope.wraps.map((w) => ({
+      id: w.id,
+      type: w.type,
+      verified: w.verified,
+      ct: hashToString(stringToBytes(w.payload.ct)),
+    })),
+  });
+}
+
+function computeEnvelopeMac(
+  envelope: Omit<CustodyEnvelope, "mac">,
+  master: Uint8Array
+): string {
+  const macKey = derivePurposeKey(master, "custody-envelope-mac");
+  const mac = hmacSha256(
+    macKey,
+    stringToBytes(ENVELOPE_MAC_DOMAIN + envelopeCanonicalMetadata(envelope))
+  );
+  macKey.fill(0);
+  return toBase64url(mac);
+}
+
+/**
+ * Verify the envelope's policy MAC under the established master. Throws
+ * {@link CustodyEnvelopeIntegrityError} on mismatch — always fail closed.
+ */
+export function verifyEnvelopeMac(
+  envelope: CustodyEnvelope,
+  master: Uint8Array
+): void {
+  const expected = computeEnvelopeMac(envelope, master);
+  if (
+    !constantTimeEqual(stringToBytes(expected), stringToBytes(envelope.mac))
+  ) {
+    throw new CustodyEnvelopeIntegrityError();
+  }
 }
 
 // ── Envelope persistence ────────────────────────────────────────────
@@ -358,7 +491,16 @@ export async function readCustodyEnvelope(
     envelope === null ||
     typeof envelope !== "object" ||
     envelope.v !== 1 ||
-    !Array.isArray(envelope.wraps)
+    !Array.isArray(envelope.wraps) ||
+    typeof envelope.mac !== "string" ||
+    !CUSTODY_INSTALL_MODES.has(envelope.install_mode) ||
+    envelope.wraps.some(
+      (w) =>
+        typeof w?.id !== "string" ||
+        typeof w?.type !== "string" ||
+        typeof w?.verified !== "boolean" ||
+        typeof w?.payload !== "object"
+    )
   ) {
     throw new Error(
       "Sanctuary: custody envelope exists but has an unsupported shape or version.\n" +
@@ -368,43 +510,87 @@ export async function readCustodyEnvelope(
   return envelope;
 }
 
+/** Plaintext + purpose label for the custody sentinel (see write below). */
+const CUSTODY_SENTINEL_KEY = "custody-sentinel";
+const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
+
+/**
+ * Persist the envelope: stamps the policy MAC (requires the master) and
+ * maintains the custody sentinel — a small ciphertext under
+ * HKDF(master, "custody-sentinel") that future recovery/diagnostic flows
+ * can verify a candidate master against even if the envelope itself is
+ * lost or damaged.
+ */
 export async function writeCustodyEnvelope(
   storage: StorageBackend,
-  envelope: CustodyEnvelope
-): Promise<void> {
+  envelope: Omit<CustodyEnvelope, "mac"> | CustodyEnvelope,
+  master: Uint8Array
+): Promise<CustodyEnvelope> {
+  assertMaster(master);
+  const stamped: CustodyEnvelope = {
+    v: envelope.v,
+    install_mode: envelope.install_mode,
+    wraps: envelope.wraps,
+    created_at: envelope.created_at,
+    mac: computeEnvelopeMac(envelope, master),
+  };
   await storage.write(
     "_meta",
     CUSTODY_ENVELOPE_KEY,
-    stringToBytes(JSON.stringify(envelope))
+    stringToBytes(JSON.stringify(stamped))
   );
+  const sentinelKey = derivePurposeKey(master, "custody-sentinel");
+  const sentinel = encrypt(
+    stringToBytes(CUSTODY_SENTINEL_PLAINTEXT),
+    sentinelKey,
+    stringToBytes(CUSTODY_SENTINEL_PLAINTEXT)
+  );
+  sentinelKey.fill(0);
+  await storage.write(
+    "_meta",
+    CUSTODY_SENTINEL_KEY,
+    stringToBytes(JSON.stringify(sentinel))
+  );
+  return stamped;
 }
 
 // ── Two-factor floor (I4 / F6) ──────────────────────────────────────
 
+/**
+ * Count DISTINCT verified factor types (codex M1: duplicated wraps of one
+ * factor must not satisfy a two-factor floor).
+ */
 export function countVerifiedWraps(envelope: CustodyEnvelope): number {
-  return envelope.wraps.filter((w) => w.verified).length;
+  return new Set(
+    envelope.wraps.filter((w) => w.verified).map((w) => w.type)
+  ).size;
 }
 
 /**
  * Enforce the two-factor custody floor at a "persist trust-bearing state"
- * boundary. Passes when:
+ * boundary. The caller supplies the fortress master so the envelope's
+ * policy metadata can be authenticated first (codex H2: never honor
+ * unauthenticated install_mode / verified flags). Passes when:
  *  - the fortress predates the envelope (legacy compat — it becomes
  *    `legacy-migrated` on first unified unlock), or
- *  - ≥ {@link CUSTODY_FLOOR_WRAPS} verified wraps exist, or
+ *  - ≥ {@link CUSTODY_FLOOR_WRAPS} distinct verified factor types exist, or
  *  - the fortress was created through an explicit degraded install mode
  *    (`headless`, `stdio-server`, `legacy-migrated`) — those modes are
  *    audited at creation and visible in the envelope, never silent.
  *
  * Refuses (throws {@link CustodyFloorError}) for an `interactive` install
  * that never completed verification — by construction such a fortress holds
- * nothing precious yet, so re-initializing it is safe.
+ * nothing precious yet, so re-initializing it is safe. Throws
+ * {@link CustodyEnvelopeIntegrityError} on a tampered envelope.
  */
 export async function enforceCustodyFloor(
   storage: StorageBackend,
-  action: string
+  action: string,
+  masterKey: Uint8Array
 ): Promise<void> {
   const envelope = await readCustodyEnvelope(storage);
   if (!envelope) return; // pre-envelope legacy fortress
+  verifyEnvelopeMac(envelope, masterKey);
   if (countVerifiedWraps(envelope) >= CUSTODY_FLOOR_WRAPS) return;
   if (envelope.install_mode !== "interactive") return;
   throw new CustodyFloorError(action);
@@ -412,40 +598,154 @@ export async function enforceCustodyFloor(
 
 // ── Migration evidence check ────────────────────────────────────────
 
+const EVIDENCE_PROBE_LIMIT = 3;
+
+function parseEncryptedPayload(raw: Uint8Array): EncryptedPayload | null {
+  try {
+    const parsed = JSON.parse(bytesToString(raw)) as EncryptedPayload;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed.v === 1 &&
+      parsed.alg === "aes-256-gcm" &&
+      typeof parsed.iv === "string" &&
+      typeof parsed.ct === "string"
+    ) {
+      return parsed;
+    }
+  } catch {
+    // not an EncryptedPayload — no signal either way
+  }
+  return null;
+}
+
 /**
  * Verify a candidate master against existing fortress ciphertext before
- * trusting it for migration. Uses the first stored identity (encrypted
- * under HKDF(master, "identity-encryption")) as evidence. Returns:
- *  - "confirmed": evidence decrypted — the master is right.
- *  - "contradicted": evidence exists but does not decrypt — wrong master.
- *  - "no-evidence": nothing to check against (empty fortress).
+ * trusting it for migration. Probes fortress-wide (codex H3), in order:
+ * the custody sentinel, stored identities, reputation attestations, and
+ * the encrypted audit chain. Returns:
+ *  - "confirmed": some evidence decrypted — the master is right.
+ *  - "contradicted": well-formed evidence exists but none decrypts.
+ *  - "no-evidence": nothing checkable was found.
  */
 async function checkMasterEvidence(
   storage: StorageBackend,
   master: Uint8Array
 ): Promise<"confirmed" | "contradicted" | "no-evidence"> {
-  let entries: Array<{ key: string }>;
-  try {
-    entries = await storage.list("_identities");
-  } catch {
-    return "no-evidence";
-  }
-  if (entries.length === 0) return "no-evidence";
+  let sawWellFormed = false;
 
-  const { derivePurposeKey } = await import("./key-derivation.js");
-  const identityKey = derivePurposeKey(master, "identity-encryption");
-  for (const entry of entries) {
-    const raw = await storage.read("_identities", entry.key);
-    if (!raw) continue;
+  // Sentinel (present on every envelope-format fortress).
+  try {
+    const raw = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    if (raw) {
+      const payload = parseEncryptedPayload(raw);
+      if (payload) {
+        sawWellFormed = true;
+        try {
+          const sentinelKey = derivePurposeKey(master, "custody-sentinel");
+          try {
+            decrypt(payload, sentinelKey, stringToBytes(CUSTODY_SENTINEL_PLAINTEXT));
+            return "confirmed";
+          } finally {
+            sentinelKey.fill(0);
+          }
+        } catch {
+          // contradiction vote — fall through to other probes
+        }
+      }
+    }
+  } catch {
+    // unreadable storage — no signal; the caller's data-presence check
+    // decides whether migration may proceed
+  }
+
+  const purposeProbes: Array<{ namespace: string; purpose: string }> = [
+    { namespace: "_identities", purpose: "identity-encryption" },
+    { namespace: "_reputation", purpose: "l4-reputation" },
+  ];
+  for (const probe of purposeProbes) {
+    let entries: Array<{ key: string }>;
     try {
-      const payload = JSON.parse(bytesToString(raw)) as EncryptedPayload;
-      decrypt(payload, identityKey);
-      return "confirmed";
+      entries = await storage.list(probe.namespace);
     } catch {
-      // try the next identity; a single corrupt file must not condemn the key
+      continue;
+    }
+    const key = derivePurposeKey(master, probe.purpose);
+    try {
+      for (const entry of entries.slice(0, EVIDENCE_PROBE_LIMIT)) {
+        const raw = await storage.read(probe.namespace, entry.key);
+        if (!raw) continue;
+        const payload = parseEncryptedPayload(raw);
+        if (!payload) continue;
+        sawWellFormed = true;
+        try {
+          decrypt(payload, key);
+          return "confirmed";
+        } catch {
+          // contradiction vote; keep probing
+        }
+      }
+    } finally {
+      key.fill(0);
     }
   }
-  return "contradicted";
+
+  // Audit chain: entries are { ..., encrypted_payload_bytes: base64url(
+  // JSON(EncryptedPayload)) } under HKDF(master, "audit-log").
+  try {
+    const entries = await storage.list("_audit");
+    const auditKey = derivePurposeKey(master, "audit-log");
+    try {
+      for (const entry of entries.slice(0, EVIDENCE_PROBE_LIMIT)) {
+        const raw = await storage.read("_audit", entry.key);
+        if (!raw) continue;
+        try {
+          const outer = JSON.parse(bytesToString(raw)) as {
+            encrypted_payload_bytes?: string;
+          };
+          if (typeof outer?.encrypted_payload_bytes !== "string") continue;
+          const payload = parseEncryptedPayload(
+            fromBase64url(outer.encrypted_payload_bytes)
+          );
+          if (!payload) continue;
+          sawWellFormed = true;
+          decrypt(payload, auditKey);
+          return "confirmed";
+        } catch {
+          // malformed entry or contradiction vote; keep probing
+        }
+      }
+    } finally {
+      auditKey.fill(0);
+    }
+  } catch {
+    // no audit namespace — no signal
+  }
+
+  return sawWellFormed ? "contradicted" : "no-evidence";
+}
+
+/**
+ * True when the fortress holds any data beyond the legacy custody markers.
+ * Used to (a) refuse first-run creation over orphaned state (codex H1) and
+ * (b) defer migration when existing data cannot be evidence-checked
+ * (codex H3 — never capture an unverifiable master into the envelope).
+ * Errors count as "has data": the safe direction is to defer/refuse.
+ */
+async function fortressHasDataBeyondMarkers(
+  storage: StorageBackend
+): Promise<boolean> {
+  try {
+    const total = await storage.totalSize();
+    if (total === 0) return false;
+    const KNOWN_MARKERS = new Set(["key-params", "recovery-key-hash"]);
+    const metaEntries = await storage.list("_meta");
+    if (metaEntries.some((e) => !KNOWN_MARKERS.has(e.key))) return true;
+    const markerBytes = metaEntries.reduce((sum, e) => sum + e.size_bytes, 0);
+    return total > markerBytes;
+  } catch {
+    return true;
+  }
 }
 
 // ── Unified establishment ───────────────────────────────────────────
@@ -474,11 +774,20 @@ export interface EstablishMasterOptions {
 
 export interface EstablishMasterResult {
   masterKey: Uint8Array;
-  envelope: CustodyEnvelope;
+  /**
+   * Null only for `legacy-deferred`: the legacy unlock succeeded but the
+   * fortress holds data the evidence probe could not verify the master
+   * against, so NO envelope was written (capturing an unverifiable master
+   * would risk locking out the real credential — codex H3). The fortress
+   * stays pure-legacy and migrates on a later unlock once verifiable
+   * evidence exists.
+   */
+  envelope: CustodyEnvelope | null;
   origin:
     | "envelope"
     | "migrated-passphrase"
     | "migrated-recovery-key"
+    | "legacy-deferred"
     | "first-run";
   keyProtection: "passphrase" | "recovery-key";
   /** Present only when a fresh recovery key was minted on this call. */
@@ -519,25 +828,28 @@ export async function establishMaster(
 
   const envelope = await readCustodyEnvelope(storage);
   if (envelope) {
+    let masterKey: Uint8Array;
+    let keyProtection: "passphrase" | "recovery-key";
     if (opts.passphrase !== undefined) {
-      const masterKey = await unwrapMaster(envelope, {
-        passphrase: opts.passphrase,
-      });
-      return { masterKey, envelope, origin: "envelope", keyProtection: "passphrase" };
-    }
-    if (opts.recoveryKey !== undefined) {
-      const masterKey = await unwrapMaster(envelope, {
+      masterKey = await unwrapMaster(envelope, { passphrase: opts.passphrase });
+      keyProtection = "passphrase";
+    } else if (opts.recoveryKey !== undefined) {
+      masterKey = await unwrapMaster(envelope, {
         recoveryKey: decodeRecoveryKey(opts.recoveryKey),
       });
-      return { masterKey, envelope, origin: "envelope", keyProtection: "recovery-key" };
-    }
-    if (opts.keychainKey !== undefined) {
-      const masterKey = await unwrapMaster(envelope, {
+      keyProtection = "recovery-key";
+    } else if (opts.keychainKey !== undefined) {
+      masterKey = await unwrapMaster(envelope, {
         keychainKey: opts.keychainKey,
       });
-      return { masterKey, envelope, origin: "envelope", keyProtection: "passphrase" };
+      keyProtection = "passphrase";
+    } else {
+      throw new CustodyCredentialMissingError(opts.storagePathHint);
     }
-    throw new CustodyCredentialMissingError(opts.storagePathHint);
+    // Authenticate the envelope's policy metadata under the unwrapped
+    // master before anyone trusts install_mode / verified flags (H2).
+    verifyEnvelopeMac(envelope, masterKey);
+    return { masterKey, envelope, origin: "envelope", keyProtection };
   }
 
   // No envelope — inspect legacy markers.
@@ -557,17 +869,34 @@ export async function establishMaster(
       masterKey.fill(0);
       throw new CustodyMigrationRefusedError();
     }
+    if (
+      evidence === "no-evidence" &&
+      (await fortressHasDataBeyondMarkers(storage))
+    ) {
+      // Data exists that the probe could not verify the master against
+      // (H3). Do NOT capture this master into an envelope — proceed
+      // legacy-style; migration retries once verifiable evidence exists.
+      return {
+        masterKey,
+        envelope: null,
+        origin: "legacy-deferred",
+        keyProtection: "passphrase",
+      };
+    }
 
     const wrap = await wrapMasterWithPassphrase(masterKey, opts.passphrase, {
       verified: true,
     });
-    const migrated: CustodyEnvelope = {
-      v: 1,
-      install_mode: "legacy-migrated",
-      wraps: [wrap],
-      created_at: now,
-    };
-    await writeCustodyEnvelope(storage, migrated);
+    const migrated = await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: "legacy-migrated",
+        wraps: [wrap],
+        created_at: now,
+      },
+      masterKey
+    );
     return {
       masterKey,
       envelope: migrated,
@@ -598,17 +927,31 @@ export async function establishMaster(
       masterKey.fill(0);
       throw new CustodyMigrationRefusedError();
     }
+    if (
+      evidence === "no-evidence" &&
+      (await fortressHasDataBeyondMarkers(storage))
+    ) {
+      return {
+        masterKey,
+        envelope: null,
+        origin: "legacy-deferred",
+        keyProtection: "recovery-key",
+      };
+    }
 
     const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
       verified: true,
     });
-    const migrated: CustodyEnvelope = {
-      v: 1,
-      install_mode: "legacy-migrated",
-      wraps: [wrap],
-      created_at: now,
-    };
-    await writeCustodyEnvelope(storage, migrated);
+    const migrated = await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: "legacy-migrated",
+        wraps: [wrap],
+        created_at: now,
+      },
+      masterKey
+    );
     return {
       masterKey,
       envelope: migrated,
@@ -643,6 +986,13 @@ export async function establishMaster(
   // Genuine first run.
   if (!opts.firstRun) {
     throw new CustodyCredentialMissingError(opts.storagePathHint);
+  }
+
+  // H1 guard: never create fresh custody over existing data. A fortress
+  // with state but no envelope and no legacy markers is damaged/orphaned —
+  // generating a new master here would silently split state.
+  if (await fortressHasDataBeyondMarkers(storage)) {
+    throw new OrphanedFortressStateError();
   }
 
   const wraps: CustodyWrap[] = [];
@@ -698,13 +1048,16 @@ export async function establishMaster(
     throw new SilentCustodyRefusedError("first run with no enrollable factor");
   }
 
-  const fresh: CustodyEnvelope = {
-    v: 1,
-    install_mode: opts.firstRun.installMode,
-    wraps,
-    created_at: now,
-  };
-  await writeCustodyEnvelope(storage, fresh);
+  const fresh = await writeCustodyEnvelope(
+    storage,
+    {
+      v: 1,
+      install_mode: opts.firstRun.installMode,
+      wraps,
+      created_at: now,
+    },
+    masterKey
+  );
 
   const result: EstablishMasterResult = {
     masterKey,
@@ -758,27 +1111,38 @@ export async function resolveCliMasterKey(
 }
 
 /**
- * Mark the recovery-key wrap as operator-verified (after re-entry). The
+ * Mark a recovery-key wrap as operator-verified (after re-entry). The
  * re-entered key is proven by unwrapping the master with it — an end-to-end
- * "the string the user saved unlocks everything" check, not a string compare.
+ * "the string the user saved unlocks everything" check, not a string
+ * compare. Only the EXACT wrap the re-entered key decrypted is marked
+ * (codex M1: never bulk-promote other recovery wraps).
  */
 export async function verifyRecoveryWrapByReentry(
   storage: StorageBackend,
   envelope: CustodyEnvelope,
   reenteredKey: string
 ): Promise<CustodyEnvelope> {
-  const master = await unwrapMaster(envelope, {
-    recoveryKey: decodeRecoveryKey(reenteredKey),
-  });
-  master.fill(0);
-  const updated: CustodyEnvelope = {
-    ...envelope,
-    wraps: envelope.wraps.map((w) =>
-      w.type === "recovery-key" ? { ...w, verified: true } : w
-    ),
-  };
-  await writeCustodyEnvelope(storage, updated);
-  return updated;
+  const match = await unwrapMatchingWrap(
+    envelope,
+    { recoveryKey: decodeRecoveryKey(reenteredKey) },
+    "recovery-key"
+  );
+  if (!match) throw new CustodyUnlockError();
+  try {
+    const updated = await writeCustodyEnvelope(
+      storage,
+      {
+        ...envelope,
+        wraps: envelope.wraps.map((w) =>
+          w.id === match.wrapId ? { ...w, verified: true } : w
+        ),
+      },
+      match.master
+    );
+    return updated;
+  } finally {
+    match.master.fill(0);
+  }
 }
 
 /**
@@ -798,11 +1162,14 @@ export async function mintRecoveryWrap(
     verified: false,
   });
   recoveryKeyBytes.fill(0);
-  const updated: CustodyEnvelope = {
-    ...envelope,
-    wraps: [...envelope.wraps, wrap],
-  };
-  await writeCustodyEnvelope(storage, updated);
+  const updated = await writeCustodyEnvelope(
+    storage,
+    {
+      ...envelope,
+      wraps: [...envelope.wraps, wrap],
+    },
+    masterKey
+  );
   return { envelope: updated, recoveryKey };
 }
 

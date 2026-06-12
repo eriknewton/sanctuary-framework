@@ -24,12 +24,15 @@ import {
   readCustodyEnvelope,
   mintRecoveryWrap,
   verifyRecoveryWrapByReentry,
+  verifyEnvelopeMac,
   enforceCustodyFloor,
   countVerifiedWraps,
   checkCastlePinCustody,
   CustodyUnlockError,
   CustodyCredentialMissingError,
   CustodyMigrationRefusedError,
+  CustodyEnvelopeIntegrityError,
+  OrphanedFortressStateError,
   CustodyFloorError,
   CUSTODY_ENVELOPE_KEY,
   type CustodyEnvelope,
@@ -60,6 +63,7 @@ describe("custody wraps", () => {
       install_mode: "interactive",
       wraps: [wrap],
       created_at: new Date().toISOString(),
+      mac: "", // unwrap tests bypass establishMaster; MAC checked there
     };
 
     const unwrapped = await unwrapMaster(envelope, { passphrase: "correct horse" });
@@ -79,6 +83,7 @@ describe("custody wraps", () => {
       install_mode: "interactive",
       wraps: [wrap],
       created_at: new Date().toISOString(),
+      mac: "", // unwrap tests bypass establishMaster; MAC checked there
     };
 
     const unwrapped = await unwrapMaster(envelope, { recoveryKey });
@@ -100,6 +105,7 @@ describe("custody wraps", () => {
       install_mode: "interactive",
       wraps: [wrap],
       created_at: new Date().toISOString(),
+      mac: "", // unwrap tests bypass establishMaster; MAC checked there
     };
     const unwrapped = await unwrapMaster(envelope, { keychainKey: custodyKey });
     expect(b64(unwrapped)).toBe(b64(master));
@@ -114,6 +120,7 @@ describe("custody wraps", () => {
       install_mode: "interactive",
       wraps: [wrap],
       created_at: new Date().toISOString(),
+      mac: "", // unwrap tests bypass establishMaster; MAC checked there
     };
     const wrongKey = generateRandomKey();
     try {
@@ -168,6 +175,26 @@ describe("establishMaster — first run", () => {
     expect(bytesToString(envelopeRaw!)).not.toContain(b64(result.masterKey));
     expect(await storage.read("_meta", "key-params")).toBeNull();
     expect(await storage.read("_meta", "recovery-key-hash")).toBeNull();
+  });
+
+  it("refuses a first run over orphaned existing data (codex H1: no split-state)", async () => {
+    const storage = new MemoryStorage();
+    // A fortress with data but no envelope and no legacy markers — e.g.
+    // someone deleted _meta/custody-envelope.
+    await storage.write(
+      "_identities",
+      "orphan",
+      stringToBytes(JSON.stringify({ some: "ciphertext" }))
+    );
+    await expect(
+      establishMaster({
+        storage,
+        passphrase: "any",
+        firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+      })
+    ).rejects.toThrow(OrphanedFortressStateError);
+    // Nothing was created over the orphaned state.
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toBeNull();
   });
 
   it("refuses a first run when nothing enrollable exists (no silent custody)", async () => {
@@ -247,6 +274,42 @@ describe("establishMaster — legacy migration", () => {
     expect(await readCustodyEnvelope(storage)).toBeNull();
     const recovered = await establishMaster({ storage, passphrase: "right-pass" });
     expect(recovered.origin).toBe("migrated-passphrase");
+  });
+
+  it("DEFERS migration when data exists that the evidence probe cannot verify (codex H3)", async () => {
+    const storage = new MemoryStorage();
+    // Legacy fortress: key-params + data in a namespace the probe cannot
+    // evidence-check (no identities/reputation/audit/sentinel).
+    const { params } = await deriveMasterKey("any-pass");
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    await storage.write(
+      "user-data",
+      "entry",
+      stringToBytes(JSON.stringify({ opaque: "blob" }))
+    );
+
+    // Even a wrong passphrase must NOT get captured into an envelope here.
+    const result = await establishMaster({ storage, passphrase: "any-pass" });
+    expect(result.origin).toBe("legacy-deferred");
+    expect(result.envelope).toBeNull();
+    expect(await storage.read("_meta", CUSTODY_ENVELOPE_KEY)).toBeNull();
+  });
+
+  it("migrates a legacy passphrase fortress with ONLY markers (empty, nothing to lose)", async () => {
+    const storage = new MemoryStorage();
+    const { params } = await deriveMasterKey("fresh-pass");
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    const result = await establishMaster({ storage, passphrase: "fresh-pass" });
+    expect(result.origin).toBe("migrated-passphrase");
+    expect(result.envelope).not.toBeNull();
   });
 
   it("migrates a legacy recovery-key fortress (key IS the master) after hash verification", async () => {
@@ -333,60 +396,86 @@ describe("establishMaster — legacy migration", () => {
 });
 
 describe("two-factor custody floor", () => {
+  /**
+   * Build a MAC'd envelope with `verifiedTypes` distinct verified factor
+   * types (recovery-key first, then keychain) plus one unverified recovery
+   * wrap, under a caller-visible master.
+   */
   async function envelopeWith(
     storage: MemoryStorage,
     installMode: CustodyEnvelope["install_mode"],
-    verifiedCount: number
-  ): Promise<void> {
-    const master = generateRandomKey();
-    const wraps = [];
-    for (let i = 0; i < Math.max(verifiedCount, 1); i++) {
-      wraps.push(
-        wrapMasterWithRecoveryKey(master, generateRandomKey(), {
-          verified: i < verifiedCount,
-        })
-      );
-    }
-    await writeCustodyEnvelope(storage, {
-      v: 1,
-      install_mode: installMode,
-      wraps,
-      created_at: new Date().toISOString(),
-    });
+    verifiedTypes: number,
+    master: Uint8Array = generateRandomKey()
+  ): Promise<Uint8Array> {
+    const wraps = [
+      wrapMasterWithRecoveryKey(master, generateRandomKey(), {
+        verified: verifiedTypes >= 1,
+      }),
+      wrapMasterWithKeychainKey(master, generateRandomKey(), {
+        verified: verifiedTypes >= 2,
+      }),
+    ];
+    await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: installMode,
+        wraps,
+        created_at: new Date().toISOString(),
+      },
+      master
+    );
+    return master;
   }
 
   it("passes for pre-envelope legacy fortresses (compat)", async () => {
     const storage = new MemoryStorage();
-    await expect(enforceCustodyFloor(storage, "test")).resolves.toBeUndefined();
+    await expect(
+      enforceCustodyFloor(storage, "test", generateRandomKey())
+    ).resolves.toBeUndefined();
   });
 
-  it("REFUSES an interactive install below 2 verified wraps", async () => {
+  it("REFUSES an interactive install below 2 verified factor types", async () => {
     const storage = new MemoryStorage();
-    await envelopeWith(storage, "interactive", 1);
-    await expect(enforceCustodyFloor(storage, "identity_create")).rejects.toThrow(
-      CustodyFloorError
-    );
+    const master = await envelopeWith(storage, "interactive", 1);
+    await expect(
+      enforceCustodyFloor(storage, "identity_create", master)
+    ).rejects.toThrow(CustodyFloorError);
   });
 
-  it("passes an interactive install at 2 verified wraps", async () => {
+  it("passes an interactive install at 2 verified factor types", async () => {
     const storage = new MemoryStorage();
-    await envelopeWith(storage, "interactive", 2);
-    await expect(enforceCustodyFloor(storage, "test")).resolves.toBeUndefined();
+    const master = await envelopeWith(storage, "interactive", 2);
+    await expect(
+      enforceCustodyFloor(storage, "test", master)
+    ).resolves.toBeUndefined();
   });
 
   it("unverified wraps do not count toward the floor", async () => {
     const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "interactive", 0);
+    await expect(enforceCustodyFloor(storage, "test", master)).rejects.toThrow(
+      CustodyFloorError
+    );
+  });
+
+  it("duplicated wraps of ONE factor type do not satisfy the floor (codex M1)", async () => {
+    const storage = new MemoryStorage();
     const master = generateRandomKey();
-    await writeCustodyEnvelope(storage, {
-      v: 1,
-      install_mode: "interactive",
-      wraps: [
-        wrapMasterWithRecoveryKey(master, generateRandomKey(), { verified: false }),
-        wrapMasterWithRecoveryKey(master, generateRandomKey(), { verified: false }),
-      ],
-      created_at: new Date().toISOString(),
-    });
-    await expect(enforceCustodyFloor(storage, "test")).rejects.toThrow(
+    await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: "interactive",
+        wraps: [
+          wrapMasterWithRecoveryKey(master, generateRandomKey(), { verified: true }),
+          wrapMasterWithRecoveryKey(master, generateRandomKey(), { verified: true }),
+        ],
+        created_at: new Date().toISOString(),
+      },
+      master
+    );
+    await expect(enforceCustodyFloor(storage, "test", master)).rejects.toThrow(
       CustodyFloorError
     );
   });
@@ -394,18 +483,78 @@ describe("two-factor custody floor", () => {
   it("passes audited degraded install modes (headless / stdio-server / legacy-migrated)", async () => {
     for (const mode of ["headless", "stdio-server", "legacy-migrated"] as const) {
       const storage = new MemoryStorage();
-      await envelopeWith(storage, mode, 0);
-      await expect(enforceCustodyFloor(storage, "test")).resolves.toBeUndefined();
+      const master = await envelopeWith(storage, mode, 0);
+      await expect(
+        enforceCustodyFloor(storage, "test", master)
+      ).resolves.toBeUndefined();
     }
+  });
+
+  it("a TAMPERED install_mode is detected and fails closed (codex H2)", async () => {
+    const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "interactive", 0);
+
+    // Attacker with bare write access flips install_mode to a degraded
+    // (floor-exempt) mode without knowing the master.
+    const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    const tampered = JSON.parse(bytesToString(raw!));
+    tampered.install_mode = "headless";
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(JSON.stringify(tampered))
+    );
+
+    await expect(enforceCustodyFloor(storage, "test", master)).rejects.toThrow(
+      CustodyEnvelopeIntegrityError
+    );
+  });
+
+  it("a TAMPERED verified flag is detected and fails closed (codex H2)", async () => {
+    const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "interactive", 0);
+
+    const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    const tampered = JSON.parse(bytesToString(raw!));
+    for (const w of tampered.wraps) w.verified = true;
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(JSON.stringify(tampered))
+    );
+
+    await expect(enforceCustodyFloor(storage, "test", master)).rejects.toThrow(
+      CustodyEnvelopeIntegrityError
+    );
+  });
+
+  it("establishMaster refuses a tampered envelope at unlock (codex H2)", async () => {
+    const storage = new MemoryStorage();
+    const first = await establishMaster({
+      storage,
+      passphrase: "pass",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    const tampered = JSON.parse(bytesToString(raw!));
+    tampered.install_mode = "interactive";
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(JSON.stringify(tampered))
+    );
+    await expect(
+      establishMaster({ storage, passphrase: "pass" })
+    ).rejects.toThrow(CustodyEnvelopeIntegrityError);
+    expect(first.masterKey.length).toBe(32);
   });
 
   it("IdentityManager.saveNew enforces the floor in the core (F6: not bypassable by SDK paths)", async () => {
     const storage = new MemoryStorage();
-    await envelopeWith(storage, "interactive", 1);
+    const master = await envelopeWith(storage, "interactive", 1);
 
     const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
     const { createIdentity } = await import("../../src/core/identity.js");
-    const master = generateRandomKey();
     const mgr = new IdentityManager(storage, master);
     const { storedIdentity } = createIdentity(
       "blocked",
@@ -417,12 +566,12 @@ describe("two-factor custody floor", () => {
 
   it("ReputationStore.importBundle enforces the floor in the core", async () => {
     const storage = new MemoryStorage();
-    await envelopeWith(storage, "interactive", 1);
+    const master = await envelopeWith(storage, "interactive", 1);
 
     const { ReputationStore } = await import(
       "../../src/l4-reputation/reputation-store.js"
     );
-    const store = new ReputationStore(storage, generateRandomKey());
+    const store = new ReputationStore(storage, master);
     await expect(
       store.importBundle(
         { version: "1.0", exported_at: "", subject_did: "did:x", attestations: [] } as never,
@@ -473,6 +622,37 @@ describe("recovery wrap lifecycle", () => {
       recoveryKey: minted.recoveryKey,
     });
     expect(b64(viaRecovery.masterKey)).toBe(b64(established.masterKey));
+  });
+
+  it("re-entry marks ONLY the wrap the entered key decrypts (codex M1)", async () => {
+    const storage = new MemoryStorage();
+    const established = await establishMaster({
+      storage,
+      passphrase: "pass",
+      firstRun: { installMode: "interactive", mintRecoveryKey: false },
+    });
+    expect(established.envelope).not.toBeNull();
+    const firstMint = await mintRecoveryWrap(
+      storage,
+      established.envelope!,
+      established.masterKey
+    );
+    const secondMint = await mintRecoveryWrap(
+      storage,
+      firstMint.envelope,
+      established.masterKey
+    );
+
+    const verified = await verifyRecoveryWrapByReentry(
+      storage,
+      secondMint.envelope,
+      secondMint.recoveryKey
+    );
+    const recoveryWraps = verified.wraps.filter((w) => w.type === "recovery-key");
+    expect(recoveryWraps).toHaveLength(2);
+    expect(recoveryWraps.filter((w) => w.verified)).toHaveLength(1);
+    // And the envelope MAC still verifies under the master after the update.
+    verifyEnvelopeMac(verified, established.masterKey);
   });
 });
 

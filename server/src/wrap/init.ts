@@ -180,13 +180,16 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
     }
   }
 
-  let envelope: CustodyEnvelope = {
-    v: 1,
-    install_mode: interactive ? "interactive" : "headless",
-    wraps,
-    created_at: new Date().toISOString(),
-  };
-  await writeCustodyEnvelope(storage, envelope);
+  let envelope: CustodyEnvelope = await writeCustodyEnvelope(
+    storage,
+    {
+      v: 1,
+      install_mode: interactive ? "interactive" : "headless",
+      wraps,
+      created_at: new Date().toISOString(),
+    },
+    masterKey
+  );
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary init`);

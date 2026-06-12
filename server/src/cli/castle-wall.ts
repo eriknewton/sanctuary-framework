@@ -389,7 +389,8 @@ export async function runProvisionPin(
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
     await enforceCustodyFloor(
       new FilesystemStorage(join(storagePath, "state")),
-      "castle_pin_provision"
+      "castle_pin_provision",
+      masterKey
     );
 
     const privateSeed = randomBytes(32);

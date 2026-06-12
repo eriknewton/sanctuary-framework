@@ -53,7 +53,8 @@ export interface WrapCustodyOptions {
 
 export interface WrapCustodyResult {
   masterKey: Uint8Array;
-  envelope: CustodyEnvelope;
+  /** Null when migration was deferred (unverifiable existing data). */
+  envelope: CustodyEnvelope | null;
   /** Disclosed this run (newly minted recovery key), if any. */
   mintedRecoveryKey: boolean;
   origin: EstablishMasterResult["origin"] | "recovery-unlock-enroll";
@@ -123,17 +124,26 @@ export async function establishWrapCustody(
       recoveryKey: entered,
       storagePathHint: opts.storagePath,
     });
-    const passphraseWrap = await wrapMasterWithPassphrase(
-      result.masterKey,
-      opts.passphrase,
-      { verified: true }
-    );
-    result.envelope = {
-      ...result.envelope,
-      wraps: [...result.envelope.wraps, passphraseWrap],
-    };
-    await writeCustodyEnvelope(storage, result.envelope);
-    origin = "recovery-unlock-enroll";
+    if (result.envelope) {
+      const passphraseWrap = await wrapMasterWithPassphrase(
+        result.masterKey,
+        opts.passphrase,
+        { verified: true }
+      );
+      result.envelope = await writeCustodyEnvelope(
+        storage,
+        {
+          ...result.envelope,
+          wraps: [...result.envelope.wraps, passphraseWrap],
+        },
+        result.masterKey
+      );
+      origin = "recovery-unlock-enroll";
+    } else {
+      // Migration was deferred (unverifiable existing data) — the recovery
+      // key unlocked legacy-style; no envelope exists to enroll into yet.
+      origin = result.origin;
+    }
   }
 
   let envelope = result.envelope;
@@ -149,17 +159,40 @@ export async function establishWrapCustody(
           ? "custody_envelope_created"
           : origin === "recovery-unlock-enroll"
             ? "custody_wrap_added"
-            : "custody_legacy_migrated",
+            : origin === "legacy-deferred"
+              ? "custody_migration_deferred"
+              : "custody_legacy_migrated",
       identity_id: fortressId,
       result: "success",
-      details: {
-        install_mode: envelope.install_mode,
-        wrap_types: envelope.wraps.map((w) => w.type),
-        verified_wraps: envelope.wraps.filter((w) => w.verified).length,
-        origin,
-        source: "sanctuary-wrap",
-      },
+      details: envelope
+        ? {
+            install_mode: envelope.install_mode,
+            wrap_types: envelope.wraps.map((w) => w.type),
+            verified_wraps: envelope.wraps.filter((w) => w.verified).length,
+            origin,
+            source: "sanctuary-wrap",
+          }
+        : {
+            origin,
+            source: "sanctuary-wrap",
+            reason:
+              "existing data could not be evidence-checked against this master; envelope not written",
+          },
     });
+  }
+
+  if (!envelope) {
+    // Migration deferred: no envelope to mint into. Loud, honest, no
+    // silent custody claims — the fortress stays legacy until verifiable
+    // evidence exists (e.g. after the first identity is created).
+    (opts.io?.output ?? process.stderr).write(
+      "\n  Note: this fortress's custody migration was DEFERRED — its existing data\n" +
+        "  could not be verified against the supplied credential, so no recovery\n" +
+        "  key was issued this run. Re-run wrap after the fortress has been used\n" +
+        "  (a stored identity gives migration its verification evidence).\n"
+    );
+    await auditLog.flush();
+    return { masterKey, envelope: null, mintedRecoveryKey: false, origin };
   }
 
   // Complete custody: every wrap-managed fortress must hold a recovery-key
@@ -197,12 +230,13 @@ export async function establishWrapCustody(
     }
 
     if (opts.interactive) {
+      const envelopeForReentry = envelope;
       await verifyRecoveryKeyReentry({
         check: async (entered) => {
           try {
             envelope = await verifyRecoveryWrapByReentry(
               storage,
-              envelope,
+              envelopeForReentry,
               entered
             );
             return true;
