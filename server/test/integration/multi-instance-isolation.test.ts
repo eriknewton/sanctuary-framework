@@ -83,7 +83,9 @@ describe("Multi-Instance Isolation (WP1)", () => {
   });
 
   afterEach(async () => {
-    await rm(rootDir, { recursive: true, force: true });
+    // Tenant instances can still flush writes (_meta, audit) while the
+    // recursive walk deletes, racing to ENOTEMPTY under parallel-suite load.
+    await rm(rootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it("identities created in tenant A are invisible to tenant B", async () => {
