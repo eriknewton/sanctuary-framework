@@ -11,9 +11,9 @@
  * Chi-4 ships:    cross-agent-timing, tool-call-sequence
  * Chi-5 ships:    audit-event-class distribution drift
  * Chi-6 ships:    credential-use-sequence, cross-agent-distribution
- *                 (this PR)
- * Chi-7+ ships:   root-cause hints, time-of-day-conditioned
- *                 baselines, etc.
+ * Chi-7 ships:    time-of-day-activity (time-of-day-conditioned
+ *                 baselines; this PR)
+ * Chi-8+ ships:   root-cause hints, etc.
  *
  * Pattern mirrors Phi-1's `PHI1_BASELINE_CATALOG`. Default
  * subscription set is empty; operator opts in.
@@ -52,6 +52,10 @@ import {
   CrossAgentDistributionDetector,
   CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
 } from "./cross-agent-distribution-detector.js";
+import {
+  TimeOfDayActivityDetector,
+  TIME_OF_DAY_ACTIVITY_DETECTOR_ID,
+} from "./time-of-day-activity-detector.js";
 import type { AnomalyDetector } from "../types.js";
 
 export interface AnomalyDetectorCatalogEntry {
@@ -97,6 +101,12 @@ export const ANOMALY_DETECTOR_CATALOG: AnomalyDetectorCatalogEntry[] = [
       "Per-agent peer-relative activity z-scores plus peer count over a 24h window. Catches one agent diverging from its cohort when fortress-wide drift masks self-history baselines.",
     factory: () => new CrossAgentDistributionDetector(),
   },
+  {
+    detectorId: TIME_OF_DAY_ACTIVITY_DETECTOR_ID,
+    description:
+      "Per-agent activity counts and proportions across four fixed six-hour UTC time-of-day bands plus active-band count over a 24h window. Catches off-hours activity shifts at constant volume that count-based baselines miss.",
+    factory: () => new TimeOfDayActivityDetector(),
+  },
 ];
 
 export {
@@ -112,4 +122,6 @@ export {
   CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
   CrossAgentDistributionDetector,
   CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
+  TimeOfDayActivityDetector,
+  TIME_OF_DAY_ACTIVITY_DETECTOR_ID,
 };
