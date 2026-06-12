@@ -47,6 +47,10 @@ import {
   CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
 } from "./detectors/cross-agent-distribution-detector.js";
 import {
+  TimeOfDayActivityDetector,
+  TIME_OF_DAY_ACTIVITY_DETECTOR_ID,
+} from "./detectors/time-of-day-activity-detector.js";
+import {
   DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
   ROLLING_BASELINE_CLASSIFIER_ID,
 } from "./classifiers/rolling-baseline.js";
@@ -158,6 +162,13 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       `Cross-agent distribution detector: per-agent activity features re-expressed as peer-relative z-scores plus peer count over a 24h window. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
     factory: () => new CrossAgentDistributionDetector(),
+  },
+  {
+    detectorId: TIME_OF_DAY_ACTIVITY_DETECTOR_ID,
+    classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+    description:
+      `Time-of-day activity detector: per-agent audit-event counts and proportions across four fixed six-hour UTC bands plus active-band count over a 24h window. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
+    factory: () => new TimeOfDayActivityDetector(),
   },
 ];
 
