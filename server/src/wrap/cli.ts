@@ -28,7 +28,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
-import { writeFile, readFile, mkdir, access, unlink } from "node:fs/promises";
+import { writeFile, readFile, mkdir, access, unlink, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
 import { platform } from "node:os";
@@ -42,6 +42,8 @@ import {
   restoreConfig,
   rewriteConfigForWrap,
   getPlatformPaths,
+  validateWrapMetaAuxiliary,
+  WrapMetaValidationError,
   type AgentPlatform,
   type MCPServerEntry,
   type WrapMetaAuxiliaryFile,
@@ -344,6 +346,28 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   }
 }
 
+/**
+ * D4 P2-3: refuse to write through a symlinked config target. writeFile
+ * and copyFile follow symlinks, so a symlinked ~/.hermes/config.yaml (or a
+ * symlinked restore target on unwrap) would redirect the write to an
+ * arbitrary path outside the agent's config directory. lstat sees the link
+ * itself; an absent path is fine (the write creates it).
+ */
+async function refuseSymlinkTarget(path: string, surface: string): Promise<void> {
+  let isLink = false;
+  try {
+    isLink = (await lstat(path)).isSymbolicLink();
+  } catch {
+    return; // Absent — nothing to refuse.
+  }
+  if (isLink) {
+    throw new Error(
+      `${surface} at ${path} is a symlink; refusing to write through it. ` +
+        `Replace the symlink with a regular file and re-run.`
+    );
+  }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /** Default CallGovernor limits for wrapped agents. */
@@ -414,8 +438,12 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  // D4 P2-2: --unwrap honors --dry-run too — pre-fix, the unwrap dispatch
+  // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
+  // for real. The gate travels into unwrap() so it can report what WOULD
+  // be restored/removed while writing nothing.
   if (options.unwrap) {
-    await unwrap();
+    await unwrap(options.dryRun === true);
     return;
   }
 
@@ -806,6 +834,18 @@ export async function runWrap(
     | undefined;
   if (agentConfig.platform === "hermes") {
     const yamlPath = hermesConfigYamlPath();
+    // D4 P2-3: a symlinked config.yaml would redirect the writeFile below
+    // outside ~/.hermes. Checked here, before ANY surface is backed up or
+    // rewritten, so the refusal leaves everything untouched.
+    try {
+      await refuseSymlinkTarget(yamlPath, "Hermes config.yaml");
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+      console.error(`  ${(err as Error).message}`);
+      console.error(`  Nothing was modified.\n`);
+      process.exit(1);
+    }
     let existingYaml: string | null = null;
     try {
       existingYaml = await readFile(yamlPath, "utf-8");
@@ -875,42 +915,59 @@ export async function runWrap(
   if (!verifyOk) process.exit(1);
 
   // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
-  // the JSON surface verified. A failed YAML verify rolls BOTH surfaces back
-  // and exits non-zero; a Hermes wrap with only the JSON written is the
-  // exact silent-bypass state this fix exists to prevent.
+  // the JSON surface verified. D4 P1-1: the ENTIRE write+verify is inside
+  // one rollback scope — a thrown writeFile (unwritable file, bad symlink)
+  // previously escaped the verify-only rollback and left the wrap partially
+  // applied (JSON wrapped, YAML not: the exact silent-bypass state this fix
+  // exists to prevent). Any failure now rolls BOTH surfaces back and exits
+  // non-zero, so the wrap is atomic: fully applied or fully rolled back.
   if (hermesYaml) {
-    await mkdir(dirname(hermesYaml.yamlPath), { recursive: true, mode: 0o700 });
-    await writeFile(hermesYaml.yamlPath, hermesYaml.plan.content, {
-      mode: 0o600,
-    });
+    const yamlSurface = hermesYaml;
+    const rollbackBothSurfaces = async (): Promise<void> => {
+      if (hermesYamlBackupPath) {
+        await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
+      } else {
+        try {
+          await unlink(yamlSurface.yamlPath);
+        } catch {
+          // Best-effort removal of the file this wrap created (it may not
+          // exist when the write itself was what failed).
+        }
+      }
+      await restoreFromBackup(agentConfig.configPath, backupPath);
+    };
     let yamlVerified = false;
     try {
+      await mkdir(dirname(yamlSurface.yamlPath), { recursive: true, mode: 0o700 });
+      // D4 P2-3 re-check at write time: the plan-time refusal above ran
+      // before any state was written; this one closes the window where the
+      // path became a symlink in between.
+      await refuseSymlinkTarget(yamlSurface.yamlPath, "Hermes config.yaml");
+      await writeFile(yamlSurface.yamlPath, yamlSurface.plan.content, {
+        mode: 0o600,
+      });
       yamlVerified = yamlContainsSanctuaryEntry(
-        await readFile(hermesYaml.yamlPath, "utf-8")
+        await readFile(yamlSurface.yamlPath, "utf-8")
       );
-    } catch {
-      yamlVerified = false;
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
+      );
+      await rollbackBothSurfaces();
+      process.exit(1);
     }
     if (!yamlVerified) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        `\n  Verification FAILED: No sanctuary entry in rewritten ${hermesYaml.yamlPath}.`
+        `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
       );
-      if (hermesYamlBackupPath) {
-        await restoreFromBackup(hermesYaml.yamlPath, hermesYamlBackupPath);
-      } else {
-        try {
-          await unlink(hermesYaml.yamlPath);
-        } catch {
-          // Best-effort removal of the file this wrap created.
-        }
-      }
-      await restoreFromBackup(agentConfig.configPath, backupPath);
+      await rollbackBothSurfaces();
       process.exit(1);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
-      `  Hermes MCP routing: ${formatHermesYamlAction(hermesYaml.plan, hermesYaml.yamlPath)}`
+      `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
     );
   }
 
@@ -1641,8 +1698,28 @@ async function restoreFromBackup(
 
 // ── Unwrap ──────────────────────────────────────────────────────────
 
-async function unwrap(): Promise<void> {
-  const meta = await findLatestBackup();
+async function unwrap(dryRun: boolean): Promise<void> {
+  // D4 P1-2: findLatestBackup validates wrap-meta `auxiliary` entries on
+  // read and throws WrapMetaValidationError on a forged or corrupted list
+  // (arbitrary backupPath/originalPath would turn the restore loop below
+  // into an arbitrary-file write/delete primitive). Abort loudly with
+  // nothing modified.
+  let meta: Awaited<ReturnType<typeof findLatestBackup>>;
+  try {
+    meta = await findLatestBackup();
+  } catch (err) {
+    if (err instanceof WrapMetaValidationError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary: Unwrap REFUSED`);
+      console.error(`  ${err.message}`);
+      console.error(
+        `  Nothing was modified. Inspect the wrap metadata in your fortress` +
+          `\n  backup directory before retrying.\n`
+      );
+      process.exit(1);
+    }
+    throw err;
+  }
   if (!meta) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("No Sanctuary wrap found to restore.");
@@ -1658,6 +1735,47 @@ async function unwrap(): Promise<void> {
     process.exit(1);
   }
 
+  // D4 P1-2 (validate before use) + P2-3 (no symlinked restore targets):
+  // re-validate every auxiliary entry and refuse symlinked targets BEFORE
+  // any restore runs, so a forged or symlinked entry aborts the whole
+  // unwrap with nothing modified — including the primary config.
+  let auxiliary: WrapMetaAuxiliaryFile[] = [];
+  try {
+    auxiliary = await validateWrapMetaAuxiliary(meta.auxiliary);
+    for (const aux of auxiliary) {
+      await refuseSymlinkTarget(aux.originalPath, "Restore target");
+    }
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary: Unwrap REFUSED`);
+    console.error(`  ${(err as Error).message}`);
+    console.error(`  Nothing was modified.\n`);
+    process.exit(1);
+  }
+
+  // D4 P2-2: --unwrap --dry-run reports what WOULD be restored/removed
+  // and writes nothing. All checks above are read-only, so the dry run
+  // surfaces the same refusals the real unwrap would.
+  if (dryRun) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary: Unwrap (dry run)`);
+    console.error(`  Would restore ${meta.originalPath} from ${meta.backupPath}`);
+    for (const aux of auxiliary) {
+      if (aux.backupPath) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`  Would restore ${aux.originalPath} from ${aux.backupPath}`);
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+        );
+      }
+    }
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Dry run. No changes made.\n`);
+    return;
+  }
+
   await restoreConfig(meta.backupPath, meta.originalPath);
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary: Unwrapped`);
@@ -1670,7 +1788,7 @@ async function unwrap(): Promise<void> {
   // primary config restore above already succeeded, so an auxiliary
   // failure reports loudly with the manual recovery path instead of
   // aborting the unwrap.
-  for (const aux of meta.auxiliary ?? []) {
+  for (const aux of auxiliary) {
     try {
       if (aux.backupPath) {
         await restoreConfig(aux.backupPath, aux.originalPath);

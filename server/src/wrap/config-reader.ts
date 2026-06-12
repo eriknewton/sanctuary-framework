@@ -8,8 +8,8 @@
  * All original configs are backed up before any modification.
  */
 
-import { readFile, writeFile, mkdir, copyFile, access } from "node:fs/promises";
-import { join, extname } from "node:path";
+import { readFile, writeFile, mkdir, copyFile, access, realpath } from "node:fs/promises";
+import { join, extname, resolve, dirname, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
 import { detectHarnessSchema } from "./harness-schema.js";
@@ -212,12 +212,156 @@ export interface WrapMetaAuxiliaryFile {
 }
 
 /**
+ * Thrown when wrap-meta.json carries an `auxiliary` entry that fails
+ * validation (D4 P1-2). The meta file is data at rest in the fortress, but
+ * unwrap copies/unlinks the paths it names — a forged entry like
+ * `{backupPath: "/anything/readable", originalPath: "/anything/writable"}`
+ * would turn unwrap into an arbitrary-file write/delete primitive. Callers
+ * must abort the unwrap with NOTHING modified and surface this loudly.
+ */
+export class WrapMetaValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WrapMetaValidationError";
+  }
+}
+
+/** realpath() that returns null instead of throwing for missing paths. */
+async function realpathOrNull(path: string): Promise<string | null> {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
+}
+
+/** True when `path` equals `dir` or sits beneath it (both pre-resolved). */
+function isWithin(path: string, dir: string): boolean {
+  return path === dir || path.startsWith(dir + sep);
+}
+
+/**
+ * Directories an auxiliary `originalPath` may live in: the per-platform
+ * agent config directories (for Hermes: ~/.hermes and ~/.config/hermes).
+ * Derived from the same path table wrap itself uses; the home directory
+ * itself is excluded (it is the dirname of ~/.claude.json, and allowing it
+ * would make the allowlist cover every path under $HOME). Returned
+ * realpath-resolved so the prefix check compares like with like (macOS
+ * tmpdirs, for example, live under the /var → /private/var symlink);
+ * directories that do not exist are dropped — nothing can live inside them.
+ */
+async function allowedAuxiliaryConfigDirs(): Promise<string[]> {
+  const home = resolve(homedir());
+  const dirs = new Set<string>();
+  for (const paths of Object.values(getPlatformPaths())) {
+    for (const p of paths) {
+      const dir = resolve(dirname(p));
+      if (dir === home) continue;
+      const real = await realpathOrNull(dir);
+      if (real !== null) dirs.add(real);
+    }
+  }
+  return [...dirs];
+}
+
+/**
+ * Validate wrap-meta `auxiliary` entries before ANY use (D4 P1-2).
+ *
+ * Enforced invariants, each checked after path resolution (and realpath,
+ * so symlink/traversal tricks cannot smuggle a path past the prefix check):
+ *   - `backupPath` is either null (wrap created the file fresh) or a
+ *     non-empty string that resolves strictly inside the wrap backup
+ *     directory and exists there;
+ *   - `originalPath` is a non-empty string whose (existing) parent
+ *     directory resolves strictly inside one of the known agent config
+ *     directories (for Hermes: ~/.hermes).
+ *
+ * Throws WrapMetaValidationError on anything else; never modifies state.
+ * Returns the validated entries with both paths fully resolved.
+ */
+export async function validateWrapMetaAuxiliary(
+  auxiliary: unknown
+): Promise<WrapMetaAuxiliaryFile[]> {
+  if (auxiliary === undefined || auxiliary === null) return [];
+  if (!Array.isArray(auxiliary)) {
+    throw new WrapMetaValidationError(
+      "wrap-meta auxiliary is not an array; refusing to unwrap."
+    );
+  }
+  if (auxiliary.length === 0) return [];
+
+  const backupRoot = await realpathOrNull(backupDir());
+  const allowedDirs = await allowedAuxiliaryConfigDirs();
+  const validated: WrapMetaAuxiliaryFile[] = [];
+
+  for (const entry of auxiliary) {
+    if (!entry || typeof entry !== "object") {
+      throw new WrapMetaValidationError(
+        "wrap-meta auxiliary entry is not an object; refusing to unwrap."
+      );
+    }
+    const { originalPath, backupPath } = entry as Record<string, unknown>;
+
+    if (typeof originalPath !== "string" || originalPath.trim() === "") {
+      throw new WrapMetaValidationError(
+        "wrap-meta auxiliary entry has a missing or non-string originalPath; refusing to unwrap."
+      );
+    }
+    const resolvedOriginal = resolve(originalPath);
+    // The parent must already exist (unwrap only restores into / removes
+    // from directories the wrap touched) and must realpath-resolve inside
+    // a known agent config directory — symlinked parents that point
+    // elsewhere fail the prefix check.
+    const parentReal = await realpathOrNull(dirname(resolvedOriginal));
+    if (
+      parentReal === null ||
+      !allowedDirs.some((dir) => isWithin(parentReal, dir))
+    ) {
+      throw new WrapMetaValidationError(
+        `wrap-meta auxiliary originalPath ${originalPath} is not inside a ` +
+          "known agent config directory; refusing to unwrap."
+      );
+    }
+
+    let resolvedBackup: string | null = null;
+    if (backupPath !== null) {
+      if (typeof backupPath !== "string" || backupPath.trim() === "") {
+        throw new WrapMetaValidationError(
+          "wrap-meta auxiliary entry has a non-string backupPath; refusing to unwrap."
+        );
+      }
+      const backupReal = await realpathOrNull(resolve(backupPath));
+      if (
+        backupRoot === null ||
+        backupReal === null ||
+        !backupReal.startsWith(backupRoot + sep)
+      ) {
+        throw new WrapMetaValidationError(
+          `wrap-meta auxiliary backupPath ${backupPath} is not inside the ` +
+            "wrap backup directory; refusing to unwrap."
+        );
+      }
+      resolvedBackup = backupReal;
+    }
+
+    validated.push({ originalPath: resolvedOriginal, backupPath: resolvedBackup });
+  }
+  return validated;
+}
+
+/**
  * Find the most recent backup.
  *
  * Read-both, write-new: prefers the canonical meta filename, then falls
  * back to the legacy name so installs wrapped by earlier releases can
  * still unwrap. The `auxiliary` list is absent from metas written by
  * earlier releases; callers must treat it as optional.
+ *
+ * D4 P1-2: `auxiliary` entries are validated here on read (and again by
+ * the unwrap path before use). A meta whose auxiliary list fails
+ * validation throws WrapMetaValidationError — it is NOT swallowed like a
+ * missing file, because silently falling through would hide a forged or
+ * corrupted meta from the operator.
  */
 export async function findLatestBackup(): Promise<{
   backupPath: string;
@@ -226,17 +370,19 @@ export async function findLatestBackup(): Promise<{
 } | null> {
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     const metaPath = join(backupDir(), filename);
+    let meta: Record<string, unknown>;
     try {
-      const raw = await readFile(metaPath, "utf-8");
-      const meta = JSON.parse(raw);
-      return {
-        backupPath: meta.backupPath,
-        originalPath: meta.originalPath,
-        ...(Array.isArray(meta.auxiliary) ? { auxiliary: meta.auxiliary } : {}),
-      };
+      meta = JSON.parse(await readFile(metaPath, "utf-8"));
     } catch {
       // Missing or unreadable — try the next candidate.
+      continue;
     }
+    const auxiliary = await validateWrapMetaAuxiliary(meta.auxiliary);
+    return {
+      backupPath: meta.backupPath as string,
+      originalPath: meta.originalPath as string,
+      ...(auxiliary.length > 0 ? { auxiliary } : {}),
+    };
   }
   return null;
 }

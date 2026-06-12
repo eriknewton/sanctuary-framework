@@ -145,4 +145,90 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
     const after = await snapshotTree(tmpHome);
     expect([...after.keys()]).toEqual([]);
   });
+
+  /**
+   * Fabricate a wrapped Hermes state by hand: a wrapped JSON + YAML pair,
+   * their backups, and the wrap-meta.json pointing at them. Unwrap reads
+   * only these, so this exercises the real restore path without running a
+   * full wrap first.
+   */
+  async function fabricateWrappedHermesState(opts: { yamlCreatedFresh: boolean }) {
+    const hermesDir = join(tmpHome, ".hermes");
+    const backupDir = join(tmpHome, ".sanctuary", "backup");
+    await mkdir(hermesDir, { recursive: true });
+    await mkdir(backupDir, { recursive: true });
+    const jsonPath = join(hermesDir, "cli-config.json");
+    const yamlPath = join(hermesDir, "config.yaml");
+    const jsonBackup = join(backupDir, "config-backup-2026-01-01T00-00-00-000Z.json");
+    const yamlBackup = join(backupDir, "config-backup-2026-01-01T00-00-00-001Z.yaml");
+    await writeFile(
+      jsonPath,
+      JSON.stringify({ mcp_servers: { sanctuary: { command: "npx" } } }, null, 2)
+    );
+    await writeFile(yamlPath, 'mcp_servers:\n  sanctuary:\n    command: "npx"\n');
+    await writeFile(jsonBackup, JSON.stringify({ mcp_servers: {} }, null, 2));
+    if (!opts.yamlCreatedFresh) {
+      await writeFile(yamlBackup, "mcp_servers: {}\n");
+    }
+    await writeFile(
+      join(backupDir, "wrap-meta.json"),
+      JSON.stringify(
+        {
+          backupPath: jsonBackup,
+          originalPath: jsonPath,
+          platform: "hermes",
+          wrappedAt: "2026-01-01T00:00:00.000Z",
+          auxiliary: [
+            {
+              originalPath: yamlPath,
+              backupPath: opts.yamlCreatedFresh ? null : yamlBackup,
+            },
+          ],
+        },
+        null,
+        2
+      )
+    );
+    return { jsonPath, yamlPath, jsonBackup, yamlBackup };
+  }
+
+  it("restores NOTHING when --unwrap --dry-run runs against a wrapped agent (D4 P2-2)", async () => {
+    const { jsonPath, yamlPath, jsonBackup } = await fabricateWrappedHermesState({
+      yamlCreatedFresh: false,
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const before = await snapshotTree(tmpHome);
+    await runWrap({ unwrap: true, dryRun: true }, tripwireDeps());
+    const after = await snapshotTree(tmpHome);
+
+    // Byte-for-byte identical tree: nothing restored, nothing removed.
+    expect(after).toEqual(before);
+    const wrapped = JSON.parse(await readFile(jsonPath, "utf-8"));
+    expect(wrapped.mcp_servers.sanctuary).toBeDefined();
+
+    // And the dry run REPORTED the restore it would perform.
+    const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(output).toContain("Unwrap (dry run)");
+    expect(output).toContain(`Would restore ${jsonPath} from ${jsonBackup}`);
+    expect(output).toContain(`Would restore ${yamlPath} from`);
+    expect(output).toContain("Dry run. No changes made.");
+  });
+
+  it("removes NOTHING on --unwrap --dry-run when wrap created config.yaml fresh (D4 P2-2)", async () => {
+    const { yamlPath } = await fabricateWrappedHermesState({
+      yamlCreatedFresh: true,
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const before = await snapshotTree(tmpHome);
+    await runWrap({ unwrap: true, dryRun: true }, tripwireDeps());
+    const after = await snapshotTree(tmpHome);
+
+    expect(after).toEqual(before);
+    await expect(stat(yamlPath)).resolves.toBeDefined();
+    const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(output).toContain(`Would remove ${yamlPath}`);
+    expect(output).toContain("Dry run. No changes made.");
+  });
 });

@@ -13,8 +13,8 @@
  * both backed up, both restored on unwrap.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, readFile, rm, access } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { writeFile, mkdir, readFile, rm, access, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -165,6 +165,44 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(plan.content).toContain(
       '      SANCTUARY_FORTRESS_PATH: "/tmp/fortress"'
     );
+  });
+
+  it("refuses the block-sequence form (`- name: ...`) instead of emitting mixed YAML (D4 P2-1)", () => {
+    const existing = [
+      "mcp_servers:",
+      "  - name: weather",
+      '    command: "uvx"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      /block-sequence/
+    );
+  });
+
+  it("refuses the block-sequence form even when comments precede the first item (D4 P2-1)", () => {
+    const existing = [
+      "mcp_servers:",
+      "  # installed by hermes setup",
+      "",
+      "  - name: weather",
+      '    command: "uvx"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("carries the trailing comment on `mcp_servers: {}` onto the rewritten key line (D4 P2-4)", () => {
+    const existing = "mcp_servers: {} # managed by installer\n";
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("append-entry");
+    expect(plan.content).toContain("mcp_servers: # managed by installer");
+    expect(plan.content).not.toContain("{}");
+    expect(yamlContainsSanctuaryEntry(plan.content)).toBe(true);
   });
 
   it("refuses a non-empty inline flow mapping (fails loudly, never corrupts)", () => {
@@ -333,5 +371,115 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
 
     const yaml = await readFile(join(hermesDir, "config.yaml"), "utf-8");
     expect(yaml.match(/^ {2}sanctuary:/gm)?.length).toBe(1);
+  });
+});
+
+describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)", () => {
+  let tmpHome: string;
+  let originalHome: string | undefined;
+  let originalStoragePath: string | undefined;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    tmpHome = join(
+      tmpdir(),
+      `sanctuary-hermes-atomic-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(tmpHome, { recursive: true });
+    originalHome = process.env.HOME;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    process.env.HOME = tmpHome;
+    process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    exitSpy = vi
+      .spyOn(process, "exit")
+      .mockImplementation((code?: string | number | null) => {
+        throw new Error(`process.exit:${code}`);
+      });
+  });
+
+  afterEach(async () => {
+    errSpy.mockRestore();
+    exitSpy.mockRestore();
+    vi.restoreAllMocks();
+    if (originalHome !== undefined) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    if (originalStoragePath !== undefined)
+      process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    else delete process.env.SANCTUARY_STORAGE_PATH;
+    try {
+      await rm(tmpHome, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function makeDeps() {
+    const fakeHandle: DashboardHandle = {
+      url: "http://127.0.0.1:0",
+      port: 0,
+      host: "127.0.0.1",
+      mode: "co-located",
+      stop: async () => {},
+    } as unknown as DashboardHandle;
+    return {
+      startDashboard: async () => fakeHandle,
+      openBrowser: async () => {},
+      resolvePassphrase: async () => ({
+        value: "test-passphrase",
+        location: "test-keychain",
+        source: "generated",
+      }),
+    };
+  }
+
+  function stderrOutput(): string {
+    return errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+  }
+
+  it("rolls the JSON config back when the config.yaml write throws — wrap is atomic (P1-1)", async () => {
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    const jsonPath = join(hermesDir, "cli-config.json");
+    const originalJson = JSON.stringify(
+      { mcp_servers: { weather: { command: "uvx", args: ["mcp-weather"] } } },
+      null,
+      2
+    );
+    await writeFile(jsonPath, originalJson);
+    // A directory at the config.yaml path makes writeFile throw EISDIR
+    // AFTER the JSON surface has been rewritten and verified — the exact
+    // partially-applied window P1-1 closes.
+    await mkdir(join(hermesDir, "config.yaml"));
+
+    await expect(
+      runWrap({ hermes: true, noOpen: true }, makeDeps())
+    ).rejects.toThrow("process.exit:1");
+
+    // Loud failure + full rollback: the JSON config is byte-identical to
+    // the pre-wrap original (no sanctuary entry left behind).
+    expect(stderrOutput()).toContain("Hermes config.yaml write FAILED");
+    expect(await readFile(jsonPath, "utf-8")).toBe(originalJson);
+  });
+
+  it("refuses to wrap through a symlinked config.yaml, leaving every surface untouched (P2-3)", async () => {
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    const jsonPath = join(hermesDir, "cli-config.json");
+    const originalJson = JSON.stringify({ mcp_servers: {} }, null, 2);
+    await writeFile(jsonPath, originalJson);
+    const victimPath = join(tmpHome, "victim.yaml");
+    const victimContent = "do-not-touch: true\n";
+    await writeFile(victimPath, victimContent);
+    await symlink(victimPath, join(hermesDir, "config.yaml"));
+
+    await expect(
+      runWrap({ hermes: true, noOpen: true }, makeDeps())
+    ).rejects.toThrow("process.exit:1");
+
+    expect(stderrOutput()).toContain("symlink");
+    // The write never followed the link, and the refusal fired before any
+    // backup or JSON rewrite.
+    expect(await readFile(victimPath, "utf-8")).toBe(victimContent);
+    expect(await readFile(jsonPath, "utf-8")).toBe(originalJson);
   });
 });

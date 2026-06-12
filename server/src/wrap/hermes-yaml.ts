@@ -20,9 +20,13 @@
  * Shapes this module refuses to edit (HermesYamlUnsupportedError, so wrap
  * fails loudly with the file untouched rather than risking corruption):
  *   - `mcp_servers:` carrying a non-empty flow mapping or scalar value
+ *   - `mcp_servers:` carrying a block SEQUENCE (`- name: ...` items) —
+ *     merging a mapping entry into it would emit mixed sequence+mapping
+ *     YAML that PyYAML rejects, breaking Hermes startup
  *   - duplicate top-level `mcp_servers:` keys
  * The empty flow form `mcp_servers: {}` IS supported (rewritten to block
- * form), since fresh installs commonly ship it.
+ * form, any trailing comment preserved), since fresh installs commonly
+ * ship it.
  */
 
 import { join } from "node:path";
@@ -106,6 +110,12 @@ interface McpServersBlock {
   blockEnd: number;
   /** True for the `mcp_servers: {}` empty-flow form. */
   flowEmpty: boolean;
+  /**
+   * Trailing `# ...` comment on the empty-flow key line (e.g.
+   * `mcp_servers: {} # added by installer`), carried onto the rewritten
+   * block-form key line so the operator's note survives the rewrite.
+   */
+  flowEmptyComment: string | null;
   /** Indent of entry names (default 2 when the block is empty). */
   entryIndent: number;
   entries: EntryLocation[];
@@ -144,9 +154,12 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   // comment, or the empty flow mapping `{}`. Anything else (non-empty flow
   // mapping, scalar, anchor) is a shape we refuse to rewrite.
   let flowEmpty = false;
+  let flowEmptyComment: string | null = null;
   if (remainder !== "" && !remainder.startsWith("#")) {
-    if (/^\{\s*\}(\s*#.*)?$/.test(remainder)) {
+    const emptyFlow = /^\{\s*\}\s*(#.*)?$/.exec(remainder);
+    if (emptyFlow) {
       flowEmpty = true;
+      flowEmptyComment = emptyFlow[1] ?? null;
     } else {
       throw new HermesYamlUnsupportedError(
         "config.yaml mcp_servers uses an inline value this tool cannot " +
@@ -165,6 +178,25 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       break;
     }
     blockEnd++;
+  }
+
+  // Block-SEQUENCE form (`mcp_servers:\n  - name: weather`): upstream
+  // Hermes documents mcp_servers as a block MAPPING, and merging a mapping
+  // entry into a sequence would emit mixed sequence+mapping YAML that
+  // PyYAML rejects — breaking Hermes startup. The first content line in
+  // the block decides the form; a dash means sequence, so refuse loudly
+  // with the file untouched.
+  for (let i = keyLine + 1; i < blockEnd; i++) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    if (line.trimStart().startsWith("-")) {
+      throw new HermesYamlUnsupportedError(
+        "config.yaml mcp_servers uses a block-sequence form (`- name: ...`) " +
+          "this tool cannot safely edit; convert each `- name: <n>` item to " +
+          "a `<n>:` mapping key and re-run wrap."
+      );
+    }
+    break;
   }
 
   // Entries: the first indented `name:` line fixes the entry indent; only
@@ -187,7 +219,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
     entries.push({ name: m[2]!.trim(), start: i, end: entryEnd(lines, i, entryIndent, blockEnd) });
   }
 
-  return { keyLine, blockEnd, flowEmpty, entryIndent, entries };
+  return { keyLine, blockEnd, flowEmpty, flowEmptyComment, entryIndent, entries };
 }
 
 /**
@@ -300,10 +332,13 @@ export function planHermesYamlInjection(
     .filter((n) => n.toLowerCase() !== "sanctuary");
 
   if (block.flowEmpty) {
-    // `mcp_servers: {}` — rewrite the key line to block form.
+    // `mcp_servers: {}` — rewrite the key line to block form, carrying any
+    // trailing comment so the operator's note survives.
     const out = [
       ...lines.slice(0, block.keyLine),
-      "mcp_servers:",
+      block.flowEmptyComment
+        ? `mcp_servers: ${block.flowEmptyComment}`
+        : "mcp_servers:",
       ...serializeSanctuaryEntry(entry, 2),
       ...lines.slice(block.keyLine + 1),
     ];
