@@ -58,15 +58,18 @@
 
 import {
   readFile,
-  writeFile,
   rename,
   unlink,
-  copyFile,
-  mkdir,
   access,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import {
+  assertNoSymlinkParentUnderRoot,
+  mkdirSafeUnderRoot,
+  writeFileNoFollow,
+  writeFileSafeUnderRoot,
+} from "./config-reader.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -140,9 +143,33 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * Atomic settings.json write, hardened against symlink redirection
+ * (follow-up to #492, same threat model: a symlinked parent directory or a
+ * symlinked target redirecting a wrap-time write outside the operator's
+ * `~/.claude`).
+ *
+ *   - Parent walk: `assertNoSymlinkParentUnderRoot` lstat-walks every
+ *     component from the trusted root (HOME-anchored for `~/.claude`, derived
+ *     the same way every other wrap sink derives it — never `/`) down to the
+ *     leaf's parent and refuses loudly if any is a symlink. Re-checked here,
+ *     immediately before the write, to minimise the walk->write parent-race
+ *     window (see config-reader's threat-model note).
+ *   - Tmp leaf: the sibling `.tmp.<pid>` file is opened `O_NOFOLLOW`, so a
+ *     pre-planted symlink at the predictable tmp path is rejected (ELOOP)
+ *     instead of followed.
+ *   - Final rename: `rename` replaces the destination's final component
+ *     itself and never follows a symlinked destination, so even a symlinked
+ *     `settings.json` is neutralised (the link is replaced, its target left
+ *     untouched) rather than written through.
+ *
+ * Fails closed: any refusal throws and no operator file outside the verified
+ * prefix is touched (caller catches; wrap continues without the allowlist).
+ */
 async function atomicWrite(targetPath: string, content: string): Promise<void> {
+  await assertNoSymlinkParentUnderRoot(targetPath);
   const tmpPath = `${targetPath}.tmp.${process.pid}`;
-  await writeFile(tmpPath, content, { mode: 0o600 });
+  await writeFileNoFollow(tmpPath, content, 0o600);
   try {
     await rename(tmpPath, targetPath);
   } catch (e) {
@@ -225,7 +252,10 @@ export async function installClaudeCodeAllowlist(
   const settingsPath = opts.settingsJsonPath ?? defaultSettingsJsonPath();
 
   // Ensure the directory exists; fresh-install case has no ~/.claude/.
-  await mkdir(dirname(settingsPath), { recursive: true, mode: 0o700 });
+  // Created segment-by-segment under its trusted root (never mkdir(recursive)
+  // through a symlinked ancestor — #492 symlink-redirection threat model). A
+  // symlinked `~/.claude` is refused loudly rather than followed.
+  await mkdirSafeUnderRoot(dirname(settingsPath));
 
   const fileExists = await pathExists(settingsPath);
 
@@ -264,10 +294,20 @@ export async function installClaudeCodeAllowlist(
   // Append path: at least one Sanctuary entry is missing. Backup +
   // atomic write of the updated JSON. Backup is best-effort; do not
   // fail the install on backup error.
+  //
+  // The backup destination is a predictable sibling of settings.json
+  // (`settings.json.sanctuary-backup`) under the same operator parent, so it
+  // is exactly as redirectable as the primary sink: a pre-planted symlink at
+  // the backup path would make a plain `copyFile` follow the link and clobber
+  // an unrelated victim file outside `~/.claude`. Route it through the same
+  // safe-path sink as the primary write (parent symlink walk + O_NOFOLLOW
+  // leaf) and feed it the already-read source bytes rather than re-reading
+  // `settingsPath` through a possibly-raced symlink.
   try {
-    await copyFile(
-      settingsPath,
+    await writeFileSafeUnderRoot(
       `${settingsPath}${SANCTUARY_SETTINGS_BACKUP_SUFFIX}`,
+      priorText,
+      { mode: 0o600 },
     );
   } catch {
     /* best-effort */
