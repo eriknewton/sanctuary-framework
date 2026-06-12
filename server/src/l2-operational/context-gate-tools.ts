@@ -412,7 +412,7 @@ export function createContextGateTools(
           identityId
         );
 
-        auditLog.append("l2", "context_gate_apply_template", identityId ?? "system", {
+        void auditLog.append("l2", "context_gate_apply_template", identityId ?? "system", {
           policy_id: policy.policy_id,
           template_id: templateId,
         });
@@ -475,7 +475,7 @@ export function createContextGateTools(
 
         const recommendation = recommendPolicy(context, provider);
 
-        auditLog.append("l2", "context_gate_recommend", "system", {
+        void auditLog.append("l2", "context_gate_recommend", "system", {
           provider,
           fields_analyzed: recommendation.summary.total_fields,
           fields_allow: recommendation.summary.allow,
@@ -617,7 +617,7 @@ export function createContextGateTools(
           );
         } catch (err) {
           if (err instanceof PrivacyFilterRuntimeError) {
-            auditLog.append("l2", "context_gate_privacy_filter_failure", policy.identity_id ?? "system", {
+            void auditLog.append("l2", "context_gate_privacy_filter_failure", policy.identity_id ?? "system", {
               policy_id: policyId,
               provider,
               mode: privacyFilterConfig.mode,
@@ -640,7 +640,7 @@ export function createContextGateTools(
           throw err;
         }
 
-        auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
+        void auditLog.append("l2", "context_gate_filter", policy.identity_id ?? "system", {
           policy_id: policyId,
           provider,
           fields_total: Object.keys(context).length,
@@ -702,7 +702,7 @@ export function createContextGateTools(
       handler: async () => {
         const policies = await policyStore.list();
 
-        auditLog.append("l2", "context_gate_list_policies", "system", {
+        void auditLog.append("l2", "context_gate_list_policies", "system", {
           policy_count: policies.length,
         });
 
@@ -749,7 +749,7 @@ export function createContextGateTools(
               last_filter_success_at: status.last_filter_success_at,
             };
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "context_gate_enforcer_status_query",
           "system",
@@ -876,7 +876,7 @@ export function createContextGateTools(
 
         const newStatus = enforcer.getStatus();
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "context_gate_enforcer_configure",
           "system",

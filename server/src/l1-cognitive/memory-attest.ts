@@ -223,7 +223,7 @@ export function createMemoryAttestTools(
         const attestationId = hashToString(payloadBytes).slice(0, 22);
 
         // ── Record in audit trail ──────────────────────────────────────
-        auditLog.append("l1", `memory_${operation}`, identity.identity_id, {
+        void auditLog.append("l1", `memory_${operation}`, identity.identity_id, {
           attestation_id: attestationId,
           provider: payload.provider,
           content_hash: payload.content_hash,

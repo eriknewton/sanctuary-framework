@@ -176,7 +176,7 @@ async function computeWorkflowsAndTrackTransitions(
   // NOT carry raw handoff content; member-handoff details are
   // available through the detail route.
   for (const change of transitions) {
-    deps.auditLog.append(
+    void deps.auditLog.append(
       "l2",
       COORDINATION_VIEW_AUDIT_OPS.WORKFLOW_STATE_CHANGED,
       deps.operatorId,
@@ -356,7 +356,7 @@ export async function handleCoordinationRoute(
         ...(until !== undefined ? { until } : {}),
         ...(agentId !== undefined ? { agent_id: agentId } : {}),
       });
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         COORDINATION_VIEW_AUDIT_OPS.VIEW_OPENED,
         deps.operatorId,
@@ -397,7 +397,7 @@ export async function handleCoordinationRoute(
         ...(since !== undefined ? { since } : {}),
         limit,
       });
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         COORDINATION_VIEW_AUDIT_OPS.WORKFLOW_VIEW_OPENED,
         deps.operatorId,
@@ -422,7 +422,7 @@ export async function handleCoordinationRoute(
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;
       }
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         COORDINATION_VIEW_AUDIT_OPS.WORKFLOW_DRILLED,
         deps.operatorId,
@@ -445,7 +445,7 @@ export async function handleCoordinationRoute(
         writeJSON(res, 404, { ok: false, error: "not_found" });
         return true;
       }
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         COORDINATION_VIEW_AUDIT_OPS.ENTRY_DRILLED,
         deps.operatorId,
@@ -468,7 +468,7 @@ export async function handleCoordinationRoute(
           detail,
           deps.contextTransfer ?? {},
         );
-        deps.auditLog.append(
+        void deps.auditLog.append(
           "l2",
           CONTEXT_TRANSFER_AUDIT_OPS.DECODED,
           deps.operatorId,

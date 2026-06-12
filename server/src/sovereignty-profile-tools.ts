@@ -57,7 +57,7 @@ export function createSovereigntyProfileTools(
       handler: async () => {
         const profile = profileStore.get();
 
-        auditLog.append("l2", "sovereignty_profile_get", "system", {
+        void auditLog.append("l2", "sovereignty_profile_get", "system", {
           features_enabled: Object.entries(profile.features)
             .filter(([, v]) => v.enabled)
             .map(([k]) => k),
@@ -193,7 +193,7 @@ export function createSovereigntyProfileTools(
         const profile = profileStore.get();
         const prompt = generateSystemPrompt(profile);
 
-        auditLog.append("l2", "sovereignty_profile_generate_prompt", "system", {
+        void auditLog.append("l2", "sovereignty_profile_generate_prompt", "system", {
           features_enabled: Object.entries(profile.features)
             .filter(([, v]) => v.enabled)
             .map(([k]) => k),

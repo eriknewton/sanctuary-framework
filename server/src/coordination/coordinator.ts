@@ -497,7 +497,7 @@ export class LocalCoordinator {
     if (args.completion_audit_ref !== undefined) {
       auditDetails.completion_audit_ref = args.completion_audit_ref;
     }
-    this.auditLog.append(
+    await this.auditLog.append(
       "l2",
       HANDOFF_AUDIT_OPERATION,
       args.identity_id,

@@ -387,8 +387,9 @@ Commands:
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
 
-    // Non-blocking update check. Fire and forget.
-    checkForUpdate(PKG_VERSION);
+    // Non-blocking update check. Fire and forget (checkForUpdate catches
+    // all failures internally and never rejects).
+    void checkForUpdate(PKG_VERSION);
   } else {
     // HTTP transport (future implementation)
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -468,7 +469,9 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       `Sanctuary multi-agent dashboard running at ${handle.url} (press Ctrl+C to stop).`
     );
     const shutdown = () => {
-      handle.stop().finally(() => process.exit(0));
+      // Fire and forget: the finally callback exits the process whether or
+      // not stop() rejects, so there is nothing left to propagate to.
+      void handle.stop().finally(() => process.exit(0));
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);

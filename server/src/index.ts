@@ -1111,7 +1111,7 @@ export async function createSanctuaryServer(options?: {
       honeypotRegistry.deploy(spec);
     }
     if (persistedSpecs.length > 0) {
-      auditLog.append(
+      await auditLog.append(
         "l2",
         HONEYPOT_AUDIT_OPS.LOADED,
         aggregatorIdentityId,
@@ -1256,7 +1256,7 @@ export async function createSanctuaryServer(options?: {
             });
           }
           // Log state changes
-          auditLog.append("l2", `proxy_server_${state}`, "system", {
+          void auditLog.append("l2", `proxy_server_${state}`, "system", {
             server: serverName,
             tool_count: toolCount,
             error,

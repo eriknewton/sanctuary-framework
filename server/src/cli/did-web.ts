@@ -344,7 +344,7 @@ async function cmdIssue(
   });
 
   const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
-  auditLog.append("l1", "did-web.issue", snapshot.identityId, {
+  await auditLog.append("l1", "did-web.issue", snapshot.identityId, {
     did: identifier.did,
     authority_host: identifier.authority_host,
     ...(identifier.agent_label !== undefined
@@ -509,7 +509,7 @@ async function cmdRotateKey(
   await writeFile(persistPath, JSON.stringify(updated, null, 2), { mode: 0o600 });
   await writeFile(join(persistDir, "did.json"), artifact.artifact, { mode: 0o644 });
   const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
-  auditLog.append("l1", DID_WEB_AUDIT_OPS.KEY_ROTATED, snapshot.identityId, {
+  await auditLog.append("l1", DID_WEB_AUDIT_OPS.KEY_ROTATED, snapshot.identityId, {
     did: rotation.did,
     reason: rotation.rotation_reason,
     old_verification_method_id: rotation.old_verification_method_id,
@@ -648,7 +648,7 @@ async function cmdRegisterHosted(
   const entry = await registry.set(handle, didDocument);
 
   const auditLog = new AuditLog(snapshot.storage, snapshot.masterKey);
-  auditLog.append("l1", DID_WEB_AUDIT_OPS.PUBLISHED, snapshot.identityId, {
+  await auditLog.append("l1", DID_WEB_AUDIT_OPS.PUBLISHED, snapshot.identityId, {
     did: hostedDid,
     operator_handle: handle,
     authority_host: HOSTED_AUTHORITY_HOST,

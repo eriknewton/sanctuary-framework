@@ -207,7 +207,7 @@ async function cmdInit(
     }
     const fortressId = fortressIdFromStoragePath(storagePath);
     const auditLog = new AuditLog(storage, masterKey);
-    auditLog.append("l2", "template.init", `fortress:${fortressId}`, {
+    await auditLog.append("l2", "template.init", `fortress:${fortressId}`, {
       template_name: templateName,
       agent_id: agentId,
       fortress_id: fortressId,

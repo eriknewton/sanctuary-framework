@@ -155,7 +155,7 @@ async function handleRecognitionDidWebRoute(
     await writeFile(join(persistDir, "did-web.json"), JSON.stringify(updated, null, 2), { mode: 0o600 });
     await writeFile(join(persistDir, "did.json"), artifact.artifact, { mode: 0o644 });
     const auditLog = new AuditLog(storage, inputs.bindings.masterKey);
-    auditLog.append("l1", DID_WEB_AUDIT_OPS.KEY_ROTATED, inputs.bindings.identityId, {
+    void auditLog.append("l1", DID_WEB_AUDIT_OPS.KEY_ROTATED, inputs.bindings.identityId, {
       did: rotation.did,
       reason: rotation.rotation_reason,
       old_verification_method_id: rotation.old_verification_method_id,

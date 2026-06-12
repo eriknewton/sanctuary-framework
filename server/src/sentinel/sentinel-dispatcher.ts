@@ -139,7 +139,7 @@ export class SentinelDispatcher {
       ...(contextOverrides ?? {}),
     };
     const sentinel = await this.registry.subscribe(sentinelId, context);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       SENTINEL_AUDIT_OPS.SUBSCRIBED,
       this.identityId,
@@ -156,7 +156,7 @@ export class SentinelDispatcher {
   async unsubscribeSentinel(sentinelId: string): Promise<boolean> {
     const removed = await this.registry.unsubscribe(sentinelId);
     if (removed) {
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         SENTINEL_AUDIT_OPS.UNSUBSCRIBED,
         this.identityId,
@@ -188,7 +188,7 @@ export class SentinelDispatcher {
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : String(err);
           const observedAt = this.now().toISOString();
-          this.auditLog.append(
+          void this.auditLog.append(
             "l2",
             SENTINEL_AUDIT_OPS.EVALUATION_FAILED,
             this.identityId,
@@ -258,7 +258,7 @@ export class SentinelDispatcher {
       observed_at: raw.observed_at || this.now().toISOString(),
     };
     await this.findingStore.saveFinding(stamped);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       SENTINEL_AUDIT_OPS.FINDING_EMITTED,
       this.identityId,

@@ -189,7 +189,7 @@ export async function handlePiiRewriteRoute(
           updated.consented_at !== undefined &&
           updated.consented_at === updated.updated_at
         ) {
-          deps.auditLog.append(
+          void deps.auditLog.append(
             "l2",
             PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED,
             deps.identityId,
@@ -199,7 +199,7 @@ export async function handlePiiRewriteRoute(
             },
           );
         }
-        deps.auditLog.append(
+        void deps.auditLog.append(
           "l2",
           PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED,
           deps.identityId,
@@ -277,7 +277,7 @@ export function emitPiiRewriteAudit(opts: {
   llmResidualCount: number;
   consentedToTradeOff: boolean;
 }): void {
-  opts.auditLog.append(
+  void opts.auditLog.append(
     "l2",
     PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
     opts.identityId,

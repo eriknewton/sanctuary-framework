@@ -508,7 +508,10 @@ export class IdentityManager {
     // If this is the first identity, set it as primary
     if (!this.primaryIdentityId) {
       this.primaryIdentityId = identity.identity_id;
-      this.savePrimaryIdentityId();
+      // Fire and forget by design: savePrimaryIdentityId swallows its own
+      // storage errors (the primary pointer reverts to first-loaded on next
+      // startup), so this promise never rejects.
+      void this.savePrimaryIdentityId();
     }
   }
 
@@ -1267,7 +1270,7 @@ export function createL1Tools(
           return toolResult(fixedDenial("audit:state_read"));
         }
 
-        auditLog?.append("l1", "state_read", result.written_by, {
+        void auditLog?.append("l1", "state_read", result.written_by, {
           namespace: args.namespace,
           key: args.key,
         });

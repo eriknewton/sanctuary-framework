@@ -189,7 +189,7 @@ export async function handleHoneypotTriggerIfMatch(
   // the trap RESPONSE (the caller still gets the 404).
   await deps.findingStore.saveFinding(finding).catch(() => undefined);
 
-  deps.auditLog.append(
+  void deps.auditLog.append(
     "l2",
     HONEYPOT_AUDIT_OPS.TRIGGERED,
     deps.operatorId,
@@ -342,7 +342,7 @@ export async function handleHoneypotRoute(
         operator_id: deps.operatorId,
         observed_at: (deps.now ?? (() => new Date()))().toISOString(),
       };
-      deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DRAFTED, deps.operatorId, {
+      void deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DRAFTED, deps.operatorId, {
         fortress_id: deps.fortressId,
         english_hash: hashOfEnglishDraft(englishText),
       });
@@ -350,7 +350,7 @@ export async function handleHoneypotRoute(
         ...(deps.selector !== undefined ? { selector: deps.selector } : {}),
         ...(deps.now !== undefined ? { now: deps.now } : {}),
       });
-      deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.COMPILED, deps.operatorId, {
+      void deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.COMPILED, deps.operatorId, {
         fortress_id: deps.fortressId,
         trap_id: result.spec.trap_id,
         source: result.source,
@@ -396,7 +396,7 @@ export async function handleHoneypotRoute(
           persistError = err instanceof Error ? err.message : String(err);
         }
       }
-      deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
+      void deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
         fortress_id: deps.fortressId,
         trap_id: spec.trap_id,
         trap_class: spec.trap_class,
@@ -455,7 +455,7 @@ export async function handleHoneypotRoute(
         }
       }
       if (removed) {
-        deps.auditLog.append(
+        void deps.auditLog.append(
           "l2",
           HONEYPOT_AUDIT_OPS.UNDEPLOYED,
           deps.operatorId,

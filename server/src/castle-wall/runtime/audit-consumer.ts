@@ -287,7 +287,7 @@ export class AuditConsumer {
 
   /** Append one batch entry per scope-lock §8 metric-event shape. */
   ingestMetricBatch(fortressId: string, batch: MetricBatch): void {
-    this.sink.append(
+    void this.sink.append(
       CASTLE_WALL_AUDIT_LAYER,
       "egress_metric_batch",
       fortressId,

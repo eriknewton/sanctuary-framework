@@ -100,7 +100,7 @@ export async function aggregateRhoDailyPrivacyEvents(params: {
     .slice(0, 5)
     .map(([name]) => name);
   const day = now.toISOString().slice(0, 10);
-  params.auditLog.append("l2", PSI2_AUDIT_OPS.QUERY_ANONYMITY_DAILY_AGGREGATED, params.identityId, {
+  void params.auditLog.append("l2", PSI2_AUDIT_OPS.QUERY_ANONYMITY_DAILY_AGGREGATED, params.identityId, {
     fortress_id: params.fortressId,
     window_start: since,
     window_end: now.toISOString(),

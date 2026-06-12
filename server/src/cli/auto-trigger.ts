@@ -177,7 +177,7 @@ async function cmdRecommendations(
         return 2;
       }
       const result = await suggester.acceptRecommendation(ruleId);
-      auditLog.append("l2", "auto-trigger.recommendations.accept", identityId, {
+      await auditLog.append("l2", "auto-trigger.recommendations.accept", identityId, {
         rule_id: ruleId,
         rule_type: result.recommendation.rule_type,
         current_rung: result.recommendation.current_rung,
@@ -197,7 +197,7 @@ async function cmdRecommendations(
       }
       const cooldown = parseNumberFlag(argv, "--cooldown-hours");
       const result = await suggester.rejectRecommendation(ruleId, cooldown);
-      auditLog.append("l2", "auto-trigger.recommendations.reject", identityId, {
+      await auditLog.append("l2", "auto-trigger.recommendations.reject", identityId, {
         rule_id: ruleId,
         suppressed_until: result.suppressed_until,
         cooldown_hours: cooldown ?? 24,
@@ -316,7 +316,7 @@ async function cmdRulesPromote(
     const before = await store.get(ruleId);
     const after = await store.promote(ruleId, ruleType);
     const auditLog = new AuditLog(storage, masterKey);
-    auditLog.append("l2", "auto-trigger.rules.promote", identityId, {
+    await auditLog.append("l2", "auto-trigger.rules.promote", identityId, {
       rule_id: ruleId,
       rule_type: ruleType,
       before_rung: before?.current_rung ?? null,
@@ -359,7 +359,7 @@ async function cmdRulesDemote(
     const before = await store.get(ruleId);
     const after = await store.demote(ruleId, ruleType);
     const auditLog = new AuditLog(storage, masterKey);
-    auditLog.append("l2", "auto-trigger.rules.demote", identityId, {
+    await auditLog.append("l2", "auto-trigger.rules.demote", identityId, {
       rule_id: ruleId,
       rule_type: ruleType,
       before_rung: before?.current_rung ?? null,
@@ -431,7 +431,7 @@ async function cmdRulesSetThreshold(
   const before = await store.get(ruleId);
   const after = await store.updateConfig(ruleId, ruleType, patch);
   const auditLog = new AuditLog(storage, masterKey);
-  auditLog.append("l2", "auto-trigger.rules.set-threshold", identityId, {
+  await auditLog.append("l2", "auto-trigger.rules.set-threshold", identityId, {
     rule_id: ruleId,
     rule_type: ruleType,
     before: {

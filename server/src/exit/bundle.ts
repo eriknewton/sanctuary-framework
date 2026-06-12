@@ -616,7 +616,7 @@ export async function exportExitBundle(
 
   const exportApprovalAuditId =
     opts.exportApprovalAuditId ?? `exit-export-${Date.now()}`;
-  opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
+  void opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
     manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
   });
@@ -737,7 +737,7 @@ export async function exportExitBundle(
   // binding; absent-binding bundles emit nothing (backward-compat
   // for tooling that filters on this op).
   if (didWebBinding !== undefined) {
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       EXIT_BUNDLE_DID_WEB_AUDIT_OPS.EXPORT_INCLUDED,
       identity.identity_id,
@@ -1148,13 +1148,13 @@ export async function importExitBundle(
     const parsedDidWeb = parseDidWeb(manifestDidWeb.identifier);
     const authorityHost = parsedDidWeb.authority_host;
     if (authorityHost.toLowerCase() !== manifestDidWeb.authority_host.toLowerCase()) {
-      opts.auditLog.append(
+      void opts.auditLog.append(
         "l1",
         EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
         manifest.body.identity_binding.identity_id,
         { authority_host: authorityHost, identifier: manifestDidWeb.identifier },
       );
-      opts.auditLog.append(
+      void opts.auditLog.append(
         "l1",
         EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
         manifest.body.identity_binding.identity_id,
@@ -1187,14 +1187,14 @@ export async function importExitBundle(
       manifestDidWeb.identifier,
       resolveOpts,
     );
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST,
       manifest.body.identity_binding.identity_id,
       { authority_host: authorityHost, identifier: manifestDidWeb.identifier },
     );
     if (resolution.ok) {
-      opts.auditLog.append(
+      void opts.auditLog.append(
         "l1",
         EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
         manifest.body.identity_binding.identity_id,
@@ -1209,7 +1209,7 @@ export async function importExitBundle(
         },
       );
       if (resolution.historical_verification_used) {
-        opts.auditLog.append(
+        void opts.auditLog.append(
           "l1",
           "did_web_historical_verification_used",
           manifest.body.identity_binding.identity_id,
@@ -1222,7 +1222,7 @@ export async function importExitBundle(
         );
       }
     } else if (resolution.failure === "signature_mismatch") {
-      opts.auditLog.append(
+      void opts.auditLog.append(
         "l1",
         EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
         manifest.body.identity_binding.identity_id,
@@ -1242,7 +1242,7 @@ export async function importExitBundle(
       // host_not_allowed / fetch_failed / timeout / not_found /
       // invalid_json: surface as a warning, emit resolution_failure
       // audit, let the import proceed at degraded confidence.
-      opts.auditLog.append(
+      void opts.auditLog.append(
         "l1",
         EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
         manifest.body.identity_binding.identity_id,
@@ -1259,7 +1259,7 @@ export async function importExitBundle(
       );
     }
   } else if (manifestDidWeb !== undefined && opts.skipDidWebVerify) {
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED,
       manifest.body.identity_binding.identity_id,
@@ -1362,7 +1362,7 @@ export async function importExitBundle(
     );
   }
   if (conflicts.public_identity_exists && opts.forceRebind && identityArtifact) {
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       "exit_bundle_force_rebind",
       identityArtifact.json.bundle.identity_id,
@@ -1388,7 +1388,7 @@ export async function importExitBundle(
     );
   }
   if (stagedConflicts.length > 0 && allowStagedOverwrite) {
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       "exit_bundle_staged_artifact_overwrite",
       identityArtifact?.json.bundle.identity_id ??
@@ -1527,7 +1527,7 @@ export async function importExitBundle(
       ...stagedLocations,
     ];
     const cleanup = await cleanupStagedPaths(opts.storage, toCleanup);
-    opts.auditLog.append(
+    void opts.auditLog.append(
       "l1",
       "exit_bundle_rekey_failed_cleanup",
       manifest.body.identity_binding.identity_id,
@@ -1557,7 +1557,7 @@ export async function importExitBundle(
     }
   }
 
-  opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
+  void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
     import_id: importId,
     manifest_version: manifest.body.manifest_version,
     state_status: stateResult.status,

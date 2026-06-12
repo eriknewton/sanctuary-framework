@@ -162,7 +162,7 @@ export class FilesystemTrapMonitor {
     // whatever it was doing even if the finding fails to land.
     await this.findingStore.saveFinding(finding).catch(() => undefined);
 
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       HONEYPOT_AUDIT_OPS.TRIGGERED,
       this.operatorId,

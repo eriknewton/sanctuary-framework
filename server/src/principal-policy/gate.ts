@@ -144,7 +144,7 @@ export class ApprovalGate {
     // ── Pre-check: Prompt injection detection ────────────────────────
     const injectionResult = this.injectionDetector.scan(toolName, args);
     if (injectionResult.flagged) {
-      this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
+      await this.auditLog.append("l2", `injection_detected:${operation}`, "system", {
         confidence: injectionResult.confidence,
         signals: injectionResult.signals.map(s => ({
           type: s.type,

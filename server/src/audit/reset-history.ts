@@ -257,7 +257,7 @@ export async function consumeResetHistoryMarker(
   }
   for (let i = 0; i < markers.length; i++) {
     const marker = markers[i]!;
-    options.auditLog.append("l2", RECOVERED_FROM_RESET_OPERATION, "system", {
+    await options.auditLog.append("l2", RECOVERED_FROM_RESET_OPERATION, "system", {
       reset_at_started: marker.started_at,
       reset_at_completed: marker.completed_at,
       recovery_mode: marker.recovery_mode,

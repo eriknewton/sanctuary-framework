@@ -155,7 +155,7 @@ export class EnglishPolicyCompiler {
 
   async compile(draft: EnglishPolicyDraft): Promise<CompiledPolicy> {
     const draftId = computeDraftId(draft);
-    this.auditLog.append(
+    await this.auditLog.append(
       "l2",
       ENGLISH_POLICY_AUDIT_OPS.DRAFTED,
       draft.operator_id,
@@ -328,7 +328,7 @@ export class EnglishPolicyCompiler {
   }
 
   private auditCompiled(compiled: CompiledPolicy): void {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ENGLISH_POLICY_AUDIT_OPS.COMPILED,
       compiled.operator_id,
@@ -344,7 +344,7 @@ export class EnglishPolicyCompiler {
   }
 
   private auditCompileFailed(compiled: CompiledPolicy, reason: string): void {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ENGLISH_POLICY_AUDIT_OPS.COMPILE_FAILED,
       compiled.operator_id,

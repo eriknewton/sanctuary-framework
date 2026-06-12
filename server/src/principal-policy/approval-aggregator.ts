@@ -636,7 +636,7 @@ export class ApprovalAggregator {
     const payload = await this.getFullPayload(aggregatorId);
     if (payload === null) return null;
     const entry = this.entries.get(aggregatorId);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       APPROVAL_AGGREGATOR_AUDIT_OPS.PAYLOAD_DECRYPTED,
       operatorId,
@@ -704,7 +704,7 @@ export class ApprovalAggregator {
       a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
     );
 
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       APPROVAL_AGGREGATOR_AUDIT_OPS.AUDIT_TRAIL_VIEWED,
       operatorId,
@@ -757,7 +757,7 @@ export class ApprovalAggregator {
     });
     const sliced = matching.slice(0, limit);
 
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       APPROVAL_AGGREGATOR_AUDIT_OPS.REPLAYED,
       operatorId,
@@ -834,7 +834,7 @@ export class ApprovalAggregator {
         // resolution event lands on the existing record) and emit a
         // dedupe audit + listener notification.
         this.correlationIndex.set(event.correlation_id, existing);
-        this.auditLog.append(
+        void this.auditLog.append(
           "l2",
           APPROVAL_AGGREGATOR_AUDIT_OPS.DEDUPED,
           this.identityId,

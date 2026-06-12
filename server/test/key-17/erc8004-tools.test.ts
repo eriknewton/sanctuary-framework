@@ -438,7 +438,7 @@ describe("End-to-end approval flow", () => {
     expect(pendingResult.status).toBe("pending_approval");
 
     // Step 2: approve via inbox
-    const approvedResult = resolvePendingRequest(
+    const approvedResult = await resolvePendingRequest(
       pendingStore,
       auditLog as any,
       identityId,
@@ -476,7 +476,7 @@ describe("End-to-end approval flow", () => {
 
     const pendingResult = await handleErc8004Request(deps, reg);
 
-    const deniedResult = resolvePendingRequest(
+    const deniedResult = await resolvePendingRequest(
       pendingStore,
       auditLog as any,
       identityId,
@@ -491,11 +491,11 @@ describe("End-to-end approval flow", () => {
     expect(deniedResult!.reason).toBe("operator declined: unknown registry");
   });
 
-  it("resolve returns null for unknown request_id", () => {
+  it("resolve returns null for unknown request_id", async () => {
     const auditLog = createMockAuditLog();
     const pendingStore = new Erc8004PendingStore();
 
-    const result = resolvePendingRequest(
+    const result = await resolvePendingRequest(
       pendingStore,
       auditLog as any,
       identityId,
@@ -605,7 +605,7 @@ describe("MCP tool poll mode", () => {
     expect(created.status).toBe("pending_approval");
 
     // Resolve it
-    resolvePendingRequest(
+    await resolvePendingRequest(
       pendingStore,
       auditLog as any,
       identityId,

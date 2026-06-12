@@ -37,7 +37,7 @@ export function createL2HardeningTools(
         const includeDetails = (args.include_details as boolean) ?? false;
         const status = assessL2Hardening(storagePath);
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "l2_hardening_status",
           "system",
@@ -131,7 +131,7 @@ export function createL2HardeningTools(
 
         const status = assessL2Hardening(storagePath);
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "l2_verify_isolation",
           "system",

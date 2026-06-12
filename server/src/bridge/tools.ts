@@ -332,7 +332,7 @@ export function createBridgeTools(
 
         const result = verifyBridgeCommitment(storedCommitment, outcome, publicKey);
 
-        auditLog.append("l3", "bridge_verify", "system", {
+        void auditLog.append("l3", "bridge_verify", "system", {
           bridge_commitment_id: commitmentId,
           session_id: storedCommitment.session_id,
           valid: result.valid,

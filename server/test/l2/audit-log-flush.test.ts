@@ -137,9 +137,32 @@ describe("AuditLog flush() — rc.2 audit-visibility regression", () => {
     const storage = new FaultingWriteStorage();
     const log = new AuditLog(storage, generateRandomKey());
 
-    log.append("l1", "egress_allowed", "fortress-1", { seq: 0 });
+    // Intentionally fire-and-forget. append() supports BOTH fail-loud
+    // boundaries: awaiting the returned promise rejects immediately, while an
+    // un-awaited call stays tracked in pendingWrites and the failure is
+    // rethrown by flush() (asserted below). Awaiting here would throw before
+    // flush() and never exercise the flush-time surfacing this test guards.
+    void log.append("l1", "egress_allowed", "fortress-1", { seq: 0 });
 
     await expect(log.flush()).rejects.toThrow(AuditLogPersistenceError);
+    await expect(log.flush()).resolves.toBeUndefined();
+    const entries = await storage.list("_audit");
+    expect(entries).toHaveLength(0);
+  });
+
+  it("awaited append() rejects immediately on persistence failure", async () => {
+    // The other half of the append() contract: a caller that DOES await the
+    // returned promise gets the failure at the call site instead of at
+    // flush(). Both boundaries are fail-loud; neither silently degrades.
+    const storage = new FaultingWriteStorage();
+    const log = new AuditLog(storage, generateRandomKey());
+
+    await expect(
+      log.append("l1", "egress_allowed", "fortress-1", { seq: 0 })
+    ).rejects.toThrow(AuditPersistenceError);
+
+    // The awaited rejection consumed the tracked failure; flush() does not
+    // re-report it.
     await expect(log.flush()).resolves.toBeUndefined();
     const entries = await storage.list("_audit");
     expect(entries).toHaveLength(0);

@@ -325,6 +325,14 @@ export class AuditLog {
    * observations, health/heartbeat events, low-resolution metrics, and other
    * telemetry where losing the entry must not change the trust decision.
    *
+   * Failure contract (both boundaries fail loud, neither silently degrades):
+   *   - awaited: the returned promise rejects with `AuditPersistenceError`
+   *     at the call site;
+   *   - un-awaited (`void`): the failure stays tracked in `pendingWrites`
+   *     and is rethrown by `flush()` as `AuditLogPersistenceError`.
+   * An un-awaited call never produces an unhandled rejection (the tracking
+   * handler below consumes it).
+   *
    * Critical state changes, approval decisions, identity/key operations,
    * policy changes, egress denials, and export/exit operations MUST use
    * `appendCritical()` instead.

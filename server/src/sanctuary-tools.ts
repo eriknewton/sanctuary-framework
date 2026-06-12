@@ -158,7 +158,7 @@ export function createSanctuaryTools(
         );
         await identityManager.save(storedIdentity);
 
-        auditLog.append("l1", "sanctuary_bootstrap:identity_create", publicIdentity.identity_id, {
+        await auditLog.append("l1", "sanctuary_bootstrap:identity_create", publicIdentity.identity_id, {
           label,
           did: publicIdentity.did,
         });
@@ -187,7 +187,7 @@ export function createSanctuaryTools(
         const profileUrl = `${verascoreUrl.replace(/\/$/, "")}/agent/${publicIdentity.did}`;
 
         if (!publish || !config.verascore.auto_publish_to_verascore) {
-          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+          void auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
             did: publicIdentity.did,
             published: false,
           });
@@ -256,7 +256,7 @@ export function createSanctuaryTools(
             unknown
           >;
 
-          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+          void auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
             did: publicIdentity.did,
             verascore_url: verascoreUrl,
             status: response.status,
@@ -274,7 +274,7 @@ export function createSanctuaryTools(
             passphrase_warning: PASSPHRASE_BACKUP_WARNING,
           });
         } catch (err) {
-          auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
+          void auditLog.append("l4", "sanctuary_bootstrap", publicIdentity.identity_id, {
             did: publicIdentity.did,
             error: err instanceof Error ? err.message : String(err),
           });
@@ -313,7 +313,7 @@ export function createSanctuaryTools(
         // anomaly configuration so callers can reason about it.
         const tier2Config = policy.tier2_anomaly;
 
-        auditLog.append("l2", "sanctuary_policy_status", "system", {
+        void auditLog.append("l2", "sanctuary_policy_status", "system", {
           tier1_count: tier1.length,
           tier3_count: tier3.length,
         });
@@ -470,7 +470,7 @@ export function createSanctuaryTools(
 
           await response.json().catch(() => ({}));
 
-          auditLog.append("l4", "sanctuary_link_to_human", "system", {
+          void auditLog.append("l4", "sanctuary_link_to_human", "system", {
             verascore_url: verascoreUrl,
             status: response.status,
             // Do not log the email to the audit trail — keep it local.
@@ -597,7 +597,7 @@ export function createSanctuaryTools(
           });
         }
 
-        auditLog.append("l1", "sanctuary_sign_challenge", identity.identity_id, {
+        await auditLog.append("l1", "sanctuary_sign_challenge", identity.identity_id, {
           did: identity.did,
           nonce_len: nonce.length,
           purpose,

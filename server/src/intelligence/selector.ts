@@ -196,7 +196,7 @@ export class SubstrateSelector {
     // Bypass would require editing this constructor.
     const baseFetch = cfg.fetchImpl ?? globalThis.fetch;
     this.fetchImpl = createAnonymizedFetch(baseFetch, (event) => {
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         QUERY_ANONYMITY_AUDIT_OPS.HEADERS_STRIPPED,
         this.identityId,
@@ -1000,7 +1000,7 @@ export class SubstrateSelector {
   }
 
   private emit(operation: string, payload: IntelligenceAuditPayload, result: "success" | "failure"): void {
-    this.auditLog.append("l2", operation, this.identityId, payload as unknown as Record<string, unknown>, result);
+    void this.auditLog.append("l2", operation, this.identityId, payload as unknown as Record<string, unknown>, result);
   }
 }
 

@@ -295,7 +295,7 @@ export class EnglishPolicyActivator {
     ) {
       const reason: ActivationFailure = "low_confidence_refused";
       const message = `compile_confidence === "low" refuses activation; pass override_low_confidence: true to bypass`;
-      this.auditLog.append(
+      await this.auditLog.append(
         "l2",
         ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
         operatorId,
@@ -333,7 +333,7 @@ export class EnglishPolicyActivator {
     }
     const conflicts = detectConflicts(draft, principalPolicyToRules(prePolicy));
     if (conflicts.length > 0) {
-      this.auditLog.append(
+      await this.auditLog.append(
         "l2",
         ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
         operatorId,
@@ -357,7 +357,7 @@ export class EnglishPolicyActivator {
           conflicts,
         };
       }
-      this.auditLog.append(
+      await this.auditLog.append(
         "l2",
         ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_ACKNOWLEDGED,
         operatorId,
@@ -380,7 +380,7 @@ export class EnglishPolicyActivator {
             conflicts,
           };
         }
-        this.auditLog.append(
+        await this.auditLog.append(
           "l2",
           ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_CONFLICT_USED,
           operatorId,
@@ -437,7 +437,7 @@ export class EnglishPolicyActivator {
     await this.store.save(record);
 
     // 5. Audit emit.
-    this.auditLog.append(
+    await this.auditLog.append(
       "l2",
       ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATED,
       operatorId,
@@ -530,7 +530,7 @@ export class EnglishPolicyActivator {
     };
     await this.store.save(record);
 
-    this.auditLog.append(
+    await this.auditLog.append(
       "l2",
       ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
       operatorId,
@@ -562,7 +562,7 @@ export class EnglishPolicyActivator {
     const policy = await this.readPolicy();
     const conflicts = detectConflicts(draft, principalPolicyToRules(policy));
     if (conflicts.length > 0) {
-      this.auditLog.append(
+      await this.auditLog.append(
         "l2",
         ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.CONFLICT_DETECTED,
         operatorId,
