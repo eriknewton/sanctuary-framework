@@ -60,7 +60,6 @@ import {
   readFile,
   rename,
   unlink,
-  copyFile,
   access,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -69,6 +68,7 @@ import {
   assertNoSymlinkParentUnderRoot,
   mkdirSafeUnderRoot,
   writeFileNoFollow,
+  writeFileSafeUnderRoot,
 } from "./config-reader.js";
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -294,10 +294,20 @@ export async function installClaudeCodeAllowlist(
   // Append path: at least one Sanctuary entry is missing. Backup +
   // atomic write of the updated JSON. Backup is best-effort; do not
   // fail the install on backup error.
+  //
+  // The backup destination is a predictable sibling of settings.json
+  // (`settings.json.sanctuary-backup`) under the same operator parent, so it
+  // is exactly as redirectable as the primary sink: a pre-planted symlink at
+  // the backup path would make a plain `copyFile` follow the link and clobber
+  // an unrelated victim file outside `~/.claude`. Route it through the same
+  // safe-path sink as the primary write (parent symlink walk + O_NOFOLLOW
+  // leaf) and feed it the already-read source bytes rather than re-reading
+  // `settingsPath` through a possibly-raced symlink.
   try {
-    await copyFile(
-      settingsPath,
+    await writeFileSafeUnderRoot(
       `${settingsPath}${SANCTUARY_SETTINGS_BACKUP_SUFFIX}`,
+      priorText,
+      { mode: 0o600 },
     );
   } catch {
     /* best-effort */

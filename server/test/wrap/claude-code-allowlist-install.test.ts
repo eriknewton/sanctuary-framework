@@ -256,6 +256,45 @@ describe("installClaudeCodeAllowlist (WP-V1.2 reshape)", () => {
       ...SANCTUARY_BROKER_ALLOWLIST_ENTRIES,
     ]);
   });
+
+  it("symlinked backup destination: refused; victim untouched (fail-closed)", async () => {
+    // The append path writes a `.sanctuary-backup` sibling at a predictable
+    // path. An attacker who can plant a symlink there must not be able to
+    // redirect the backup copy and clobber an unrelated victim file. The
+    // backup write goes through the same safe-path sink as the primary write.
+    const operator = {
+      permissions: { allow: ["mcp__other-server__some_tool"] },
+    };
+    await writeFile(settingsPath, JSON.stringify(operator, null, 2), "utf8");
+
+    const victimFile = join(tmpDir, "victim.json");
+    const victimContent = JSON.stringify({ victim: "do-not-touch" }, null, 2);
+    await writeFile(victimFile, victimContent, "utf8");
+
+    // Pre-plant a symlink at the exact backup path the install will target.
+    const backupPath = `${settingsPath}${SANCTUARY_SETTINGS_BACKUP_SUFFIX}`;
+    await symlink(victimFile, backupPath);
+
+    // Backup is best-effort and the symlink is refused (ELOOP), so the install
+    // still completes the primary allowlist merge — but the victim that the
+    // backup symlink pointed at is byte-for-byte untouched.
+    const result = await installClaudeCodeAllowlist({
+      settingsJsonPath: settingsPath,
+    });
+    expect(result.alreadyPresent).toBe(false);
+
+    expect(await readFile(victimFile, "utf8")).toBe(victimContent);
+    // The backup path is still the attacker's symlink (the safe sink refused
+    // to write through it) rather than a regular file written via the link.
+    expect((await lstat(backupPath)).isSymbolicLink()).toBe(true);
+
+    // The primary settings file received the merge as normal.
+    const parsed = JSON.parse(await readFile(settingsPath, "utf8"));
+    expect(parsed.permissions.allow).toEqual([
+      "mcp__other-server__some_tool",
+      ...SANCTUARY_BROKER_ALLOWLIST_ENTRIES,
+    ]);
+  });
 });
 
 describe("removeClaudeCodeAllowlist (WP-V1.2 reshape)", () => {
