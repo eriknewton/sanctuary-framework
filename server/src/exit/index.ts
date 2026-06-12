@@ -8,6 +8,7 @@ export {
   type ImportExitBundleOptions,
   type ImportExitBundleResult,
   type ExitEncryptedStateBundle,
+  type ExitSourceCustody,
   type ExitPublicIdentityArtifact,
   type ExitPolicySetArtifact,
   type ExitAuditReceiptsArtifact,

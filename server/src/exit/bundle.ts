@@ -49,6 +49,12 @@ import {
 } from "../core/key-derivation.js";
 import { decrypt, type EncryptedPayload } from "../core/encryption.js";
 import {
+  unwrapMasterFromWraps,
+  wrapMasterWithRecoveryKey,
+  type CustodyWrap,
+} from "../core/master-custody.js";
+import { generateRandomKey } from "../core/random.js";
+import {
   sign as identitySign,
   verify as identityVerify,
   type StoredIdentity,
@@ -106,11 +112,50 @@ const EXIT_COMMITMENTS_NAMESPACE = "_exit_commitments";
 const EXIT_PLACEHOLDER_METADATA_NAMESPACE = "_exit_placeholder_metadata";
 const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
 
+/**
+ * Custody-envelope re-key block (post-#496). Carries a wrap of the SOURCE
+ * master under a fresh, random, export-scoped "bundle re-key key" minted at
+ * export time and disclosed to the operator (never written into the
+ * bundle). Import recovers the source master by unwrapping with that key —
+ * no parallel derivation path, no fortress credential travels.
+ *
+ * Deliberately NOT the fortress's own envelope wraps (codex round-1 MED):
+ * exporting a passphrase wrap would turn every fresh-envelope bundle into
+ * an offline passphrase-guessing oracle (a random-master fortress's bundle
+ * otherwise contains no passphrase-checkable material). The bundle re-key
+ * key is a full-entropy 32-byte key, so the embedded wrap verifies nothing
+ * an attacker could enumerate, and its HKDF unwrap path carries no
+ * attacker-controlled KDF parameters (codex round-1 LOW).
+ *
+ * Security: the wrap is AES-256-GCM authenticated (a wrong key or tampered
+ * wrap fails closed), and the artifact carrying this block is sha256-pinned
+ * in the Ed25519-signed manifest, so a tampered bundle fails verification
+ * before any wrap is touched.
+ */
+export interface ExitSourceCustody {
+  format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V1";
+  /** Bundle-scoped re-key wraps; only `recovery-key` wraps are permitted. */
+  wraps: CustodyWrap[];
+}
+
 export interface ExitEncryptedStateBundle {
   format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1";
   exported_at: string;
   key_source: "passphrase" | "recovery-key" | "unknown";
+  /**
+   * Legacy re-key parameters (pre-envelope custody): Argon2id params under
+   * which `master = Argon2id(passphrase, params)`. Still emitted when the
+   * legacy `_meta/key-params` marker exists (migrated fortresses keep their
+   * markers — #496) so older importers keep working on those bundles. For
+   * envelope-custody fortresses this mechanism is legacy-only; the
+   * authoritative re-key path is `source_custody`.
+   */
   source_key_derivation?: KeyDerivationParams;
+  /**
+   * Envelope-era re-key block. Present iff the export minted a bundle
+   * re-key key (`mintStateRekeyKey`) and the bundle carries state entries.
+   */
+  source_custody?: ExitSourceCustody;
   namespaces: string[];
   total_keys: number;
   contains_reserved_namespaces: false;
@@ -220,6 +265,20 @@ export interface ExportExitBundleOptions {
    * recognition-layer verification step).
    */
   didWeb?: ExitBundleDidWebBinding;
+  /**
+   * Mint a fresh, random bundle re-key key, embed a wrap of the source
+   * master under it (`source_custody`), and return the key in
+   * `state_rekey_key` for operator disclosure. OPT-IN because the caller
+   * must have a secure, non-persisted channel to the operator: the exit
+   * CLI prints it to the operator's terminal; callers whose results are
+   * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
+   * (key material must never be persisted — CLAUDE.md #6).
+   *
+   * Without it, an envelope-custody bundle's state can only be re-keyed by
+   * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
+   * `source_key_derivation` path).
+   */
+  mintStateRekeyKey?: boolean;
 }
 
 export interface ExportExitBundleResult {
@@ -228,6 +287,13 @@ export interface ExportExitBundleResult {
   manifest_hash: string;
   artifact_count: number;
   unsupported_artifacts: string[];
+  /**
+   * The minted bundle re-key key (base64url, 32 bytes), present only when
+   * `mintStateRekeyKey` was set and the bundle carries state entries. It is
+   * disclosed ONCE here and never written into the bundle or audit log;
+   * the importing operator supplies it as `--source-recovery-key`.
+   */
+  state_rekey_key?: string;
 }
 
 export interface ImportExitBundleOptions {
@@ -382,6 +448,38 @@ async function readSourceKeyParams(
   return JSON.parse(bytesToString(raw)) as KeyDerivationParams;
 }
 
+/**
+ * Maximum wraps accepted in a bundle's source_custody block. Export emits
+ * exactly one; the cap bounds work on crafted bundles (codex round-1 LOW).
+ */
+const SOURCE_CUSTODY_MAX_WRAPS = 4;
+
+/**
+ * Mint the bundle re-key key and the source_custody block that carries the
+ * source master wrapped under it. The key is returned for operator
+ * disclosure and is NEVER written into the bundle — it is the only
+ * credential that re-keys this bundle's state, held separately from it.
+ *
+ * Fortress envelope wraps are deliberately not copied (see
+ * {@link ExitSourceCustody}); the fortress's own credentials never leave
+ * the fortress in any form.
+ */
+function mintSourceCustody(masterKey: Uint8Array): {
+  custody: ExitSourceCustody;
+  rekeyKey: string;
+} {
+  const rekeyKeyBytes = generateRandomKey();
+  const wrap = wrapMasterWithRecoveryKey(masterKey, rekeyKeyBytes, {
+    verified: true,
+  });
+  const rekeyKey = toBase64url(rekeyKeyBytes);
+  rekeyKeyBytes.fill(0);
+  return {
+    custody: { format: "SANCTUARY_EXIT_SOURCE_CUSTODY_V1", wraps: [wrap] },
+    rekeyKey,
+  };
+}
+
 async function discoverFilesystemStateNamespaces(
   stateStoragePath?: string
 ): Promise<string[]> {
@@ -404,7 +502,7 @@ async function discoverFilesystemStateNamespaces(
 
 async function exportEncryptedState(
   opts: ExportExitBundleOptions
-): Promise<ExitEncryptedStateBundle> {
+): Promise<{ bundle: ExitEncryptedStateBundle; rekeyKey?: string }> {
   const namespaceSet = new Set(
     opts.stateNamespaces ??
       (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
@@ -431,15 +529,27 @@ async function exportEncryptedState(
     }
   }
 
+  // Mint the bundle re-key key only when requested AND there is state to
+  // re-key: minting a secret for an empty bundle would hand the operator a
+  // key that unlocks nothing.
+  const minted =
+    opts.mintStateRekeyKey && entries.length > 0
+      ? mintSourceCustody(opts.masterKey)
+      : undefined;
+
   return {
-    format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
-    exported_at: new Date().toISOString(),
-    key_source: opts.keySource ?? "unknown",
-    source_key_derivation: await readSourceKeyParams(opts.storage),
-    namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
-    total_keys: entries.length,
-    contains_reserved_namespaces: false,
-    entries,
+    bundle: {
+      format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
+      exported_at: new Date().toISOString(),
+      key_source: opts.keySource ?? "unknown",
+      source_key_derivation: await readSourceKeyParams(opts.storage),
+      ...(minted !== undefined ? { source_custody: minted.custody } : {}),
+      namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
+      total_keys: entries.length,
+      contains_reserved_namespaces: false,
+      entries,
+    },
+    ...(minted !== undefined ? { rekeyKey: minted.rekeyKey } : {}),
   };
 }
 
@@ -634,11 +744,12 @@ export async function exportExitBundle(
       "public_identity"
     )
   );
+  const encryptedStateExport = await exportEncryptedState(opts);
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/encrypted_state.json`,
-      await exportEncryptedState(opts),
+      encryptedStateExport.bundle,
       "encrypted_state"
     )
   );
@@ -758,6 +869,9 @@ export async function exportExitBundle(
     unsupported_artifacts: [
       "audit_receipts: legacy L2 audit entries are manifest-pinned but not individually signed",
     ],
+    ...(encryptedStateExport.rekeyKey !== undefined
+      ? { state_rekey_key: encryptedStateExport.rekeyKey }
+      : {}),
   };
 }
 
@@ -873,25 +987,135 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
   return `${manifest.body.identity_binding.identity_id}-${manifest.body.exported_at.replace(/[^0-9a-zA-Z_.-]/g, "_")}`;
 }
 
+/**
+ * Shape-check a bundle's `source_custody` block before any wrap is tried.
+ * A crafted or corrupted block fails closed with a structured error rather
+ * than being silently ignored (which would demote the import to the legacy
+ * derivation path — a downgrade, #5).
+ */
+function validateSourceCustody(custody: ExitSourceCustody): void {
+  const malformed =
+    custody === null ||
+    typeof custody !== "object" ||
+    custody.format !== "SANCTUARY_EXIT_SOURCE_CUSTODY_V1" ||
+    !Array.isArray(custody.wraps) ||
+    custody.wraps.length === 0 ||
+    // Bounded, and recovery-key wraps ONLY: a passphrase-type wrap here
+    // would both reintroduce the offline passphrase oracle and feed
+    // bundle-controlled Argon2id parameters into the unwrap path
+    // (codex round-1 findings 1 and 2). The HKDF unwrap for recovery-key
+    // wraps carries no attacker-tunable cost parameters.
+    custody.wraps.length > SOURCE_CUSTODY_MAX_WRAPS ||
+    custody.wraps.some(
+      (wrap) =>
+        wrap === null ||
+        typeof wrap !== "object" ||
+        typeof wrap.id !== "string" ||
+        wrap.type !== "recovery-key" ||
+        typeof wrap.payload !== "object"
+    );
+  if (malformed) {
+    throw new ExitBundleImportError(
+      "SOURCE_CUSTODY_MALFORMED",
+      "This bundle's source_custody block is malformed or carries a wrap type " +
+        "that may not travel in an exit bundle. Refusing to fall back to legacy " +
+        "key derivation. Re-export the bundle from the source fortress."
+    );
+  }
+}
+
+function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
+  const key = fromBase64url(sourceRecoveryKey);
+  if (key.length !== 32) {
+    throw new Error("Source recovery key must decode to 32 bytes.");
+  }
+  return key;
+}
+
+/**
+ * Recover the SOURCE fortress master for state re-key.
+ *
+ * Precedence:
+ *  1. An explicit `sourceMasterKey` (programmatic callers, tests).
+ *  2. Passphrase + legacy `source_key_derivation`: the explicit legacy path
+ *     (`master = Argon2id(passphrase, params)`, pre-envelope semantics).
+ *     Kept for migrated fortresses, whose bundles carry the legacy params
+ *     by design; a wrong passphrase is caught by the all-entries-failed
+ *     check in `rekeyState` (SOURCE_KEY_MISMATCH).
+ *  3. Passphrase WITHOUT legacy params: fails closed. Envelope-era bundles
+ *     deliberately carry no passphrase-checkable material (no offline
+ *     oracle), so a passphrase cannot re-key them — the error points the
+ *     operator at the bundle re-key key. No silent staging, no fallback.
+ *  4. Recovery key + `source_custody`: the bundle re-key key minted at
+ *     export, GCM-authenticated against the embedded wrap. A key that
+ *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` —
+ *     never falls through to the legacy raw-key path (that would silently
+ *     treat an arbitrary 32 bytes as the master and drop every entry).
+ *  5. Recovery key on a legacy bundle: pre-envelope semantics (the
+ *     recovery key IS the master), mismatch-checked in `rekeyState`.
+ *
+ * The recovered master is transient: it only decrypts bundle entries, which
+ * are immediately re-encrypted and re-signed under the DESTINATION
+ * fortress's custody (whose master is established exclusively by
+ * `establishMaster` — import has no parallel establishment path).
+ */
 async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
   opts: ImportExitBundleOptions
 ): Promise<Uint8Array | null> {
   if (!encryptedState || encryptedState.entries.length === 0) return null;
   if (opts.sourceMasterKey) return opts.sourceMasterKey;
-  if (opts.sourcePassphrase && encryptedState.source_key_derivation) {
-    return (await deriveMasterKey(
-      opts.sourcePassphrase,
-      encryptedState.source_key_derivation
-    )).key;
-  }
-  if (opts.sourceRecoveryKey) {
-    const key = fromBase64url(opts.sourceRecoveryKey);
-    if (key.length !== 32) {
-      throw new Error("Source recovery key must decode to 32 bytes.");
+
+  const sourceCustody = encryptedState.source_custody;
+  if (sourceCustody !== undefined) validateSourceCustody(sourceCustody);
+
+  if (opts.sourcePassphrase) {
+    if (encryptedState.source_key_derivation) {
+      return (await deriveMasterKey(
+        opts.sourcePassphrase,
+        encryptedState.source_key_derivation
+      )).key;
     }
-    return key;
+    if (sourceCustody !== undefined) {
+      throw new ExitBundleImportError(
+        "SOURCE_PASSPHRASE_UNSUPPORTED",
+        "This bundle's state cannot be re-keyed with a passphrase: it was " +
+          "exported from an envelope-custody fortress, and bundles deliberately " +
+          "carry no passphrase-checkable material (that would be an offline " +
+          "guessing oracle). Supply the bundle re-key key that was displayed " +
+          "when the bundle was exported: --source-recovery-key <key>."
+      );
+    }
+    throw new ExitBundleImportError(
+      "SOURCE_KEY_UNAVAILABLE",
+      "A source passphrase was supplied, but this bundle carries neither a " +
+        "source_custody block nor legacy key-derivation parameters, so the " +
+        "passphrase cannot recover the source master key. Re-export the bundle " +
+        "from the source fortress (the export prints a bundle re-key key), or " +
+        "supply the source master key programmatically."
+    );
   }
+
+  if (opts.sourceRecoveryKey) {
+    if (sourceCustody !== undefined) {
+      const master = await unwrapMasterFromWraps(sourceCustody.wraps, {
+        recoveryKey: decodeSourceRecoveryKey(opts.sourceRecoveryKey),
+      });
+      if (!master) {
+        throw new ExitBundleImportError(
+          "SOURCE_CREDENTIAL_INVALID",
+          "The supplied key does not unlock this bundle's encrypted state: it " +
+            "failed to authenticate against the bundle's re-key wrap. Supply the " +
+            "exact bundle re-key key displayed when this bundle was exported " +
+            "(--source-recovery-key). Refusing to re-key with an unverified key."
+        );
+      }
+      return master;
+    }
+    // Legacy semantics: the recovery key IS the master.
+    return decodeSourceRecoveryKey(opts.sourceRecoveryKey);
+  }
+
   return null;
 }
 
@@ -939,6 +1163,13 @@ async function rekeyState(
   let skippedInvalidSig = 0;
   let skippedUnknownKid = 0;
   let conflicts = 0;
+  // Source-master sanity (custody-envelope follow-on to #496): count how
+  // many entries reached AEAD decryption and how many failed it. When the
+  // source master decrypts NOTHING, the key is wrong (e.g. a legacy bundle
+  // from a dual-path-damaged fortress whose key-params derive a divergent
+  // master) — that must fail closed, not silently skip every entry.
+  let decryptAttempts = 0;
+  let decryptFailures = 0;
 
   for (const item of encryptedState.entries) {
     // F6: reject ALL underscore-prefixed (internal) namespaces on import, not
@@ -992,6 +1223,7 @@ async function rekeyState(
     }
 
     let plaintext: Uint8Array;
+    decryptAttempts++;
     try {
       plaintext = decrypt(
         item.entry.payload,
@@ -1003,9 +1235,11 @@ async function rekeyState(
         continue;
       }
     } catch {
-      // Source-key derivation or AEAD verification failed. Skip and
-      // continue, this is a per-entry data issue, not a fatal-import
-      // condition, so it does NOT trigger cleanup of prior writes.
+      // AEAD verification failed for this entry. When OTHER entries
+      // decrypt fine this is a per-entry data issue (skip and continue);
+      // when EVERY entry fails, the source master itself is wrong — the
+      // post-loop check below fails the import closed.
+      decryptFailures++;
       skippedInvalidSig++;
       skipped++;
       continue;
@@ -1033,6 +1267,24 @@ async function rekeyState(
     );
     imported++;
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
+  }
+
+  if (decryptAttempts > 0 && decryptFailures === decryptAttempts) {
+    // Nothing decrypted under the recovered source master: wrong source
+    // credential (legacy derivation path) or a bundle whose embedded key
+    // material does not match its entries. Fail closed — never report a
+    // "successful" re-key that silently imported zero entries (#5). No
+    // state writes happened on this path; the caller's cleanup handler
+    // removes the staged artifacts.
+    throw new ExitBundleImportError(
+      "SOURCE_KEY_MISMATCH",
+      `The recovered source master key failed to decrypt any of the bundle's ` +
+        `${decryptAttempts} encrypted state entr${decryptAttempts === 1 ? "y" : "ies"}. ` +
+        "The source credential does not match the key this state was actually " +
+        "encrypted under (on legacy bundles this can indicate a fortress whose " +
+        "passphrase-derived key diverged from its true master). Re-run with the " +
+        "correct source credential, or re-export the bundle from the source fortress."
+    );
   }
 
   return {
@@ -1485,12 +1737,17 @@ export async function importExitBundle(
     stagedArtifacts.push("reputation_bundle");
   }
 
-  const sourceMasterKey = await resolveSourceMasterKey(
-    encryptedState?.json ?? null,
-    opts
-  );
   let stateResult: ImportExitBundleResult["state"];
+  // Resolved INSIDE the try block: a fail-closed source-credential error
+  // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
+  // source_custody) must roll back the artifacts staged above, exactly like
+  // a re-key failure — otherwise a refused import leaves staged state behind.
+  let sourceMasterKey: Uint8Array | null = null;
   try {
+    sourceMasterKey = await resolveSourceMasterKey(
+      encryptedState?.json ?? null,
+      opts
+    );
     stateResult =
       encryptedState && encryptedState.json.entries.length > 0
         ? sourceMasterKey
@@ -1545,7 +1802,10 @@ export async function importExitBundle(
     await opts.auditLog.flush();
     const originalMessage = err instanceof Error ? err.message : String(err);
     throw new ExitBundleImportError(
-      "REKEY_FAILED_AND_CLEANED",
+      // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
+      // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
+      // generic code covers non-structured failures (disk full, etc.).
+      err instanceof ExitBundleImportError ? err.code : "REKEY_FAILED_AND_CLEANED",
       `Exit-bundle re-key failed: ${originalMessage}. ` +
         `Cleanup removed ${cleanup.removed} of ${toCleanup.length} staged paths ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +

@@ -385,9 +385,32 @@ export async function unwrapMaster(
         ? "recovery-key"
         : "keychain";
 
-  const match = await unwrapMatchingWrap(envelope, credential, type);
+  const match = await unwrapMatchingWrap(envelope.wraps, credential, type);
   if (!match) throw new CustodyUnlockError();
   return match.master;
+}
+
+/**
+ * Unwrap a master from a bare list of custody wraps with one credential.
+ * Used by flows that carry wraps OUTSIDE a fortress envelope (e.g. the
+ * exit bundle's `source_custody` block, where the source fortress's
+ * user-held wraps travel with the bundle so import can recover the source
+ * master without any parallel derivation path). Returns null when no wrap
+ * of the credential's type authenticates — the caller decides the error.
+ * GCM authentication decides; there is no weaker fallback (#5).
+ */
+export async function unwrapMasterFromWraps(
+  wraps: CustodyWrap[],
+  credential: CustodyCredential
+): Promise<Uint8Array | null> {
+  const type: CustodyWrapType =
+    "passphrase" in credential
+      ? "passphrase"
+      : "recoveryKey" in credential
+        ? "recovery-key"
+        : "keychain";
+  const match = await unwrapMatchingWrap(wraps, credential, type);
+  return match ? match.master : null;
 }
 
 /**
@@ -395,11 +418,11 @@ export async function unwrapMaster(
  * decrypted it (so verification flows mark only that wrap — codex M1).
  */
 async function unwrapMatchingWrap(
-  envelope: CustodyEnvelope,
+  wraps: CustodyWrap[],
   credential: CustodyCredential,
   type: CustodyWrapType
 ): Promise<{ master: Uint8Array; wrapId: string } | null> {
-  for (const wrap of envelope.wraps) {
+  for (const wrap of wraps) {
     if (wrap.type !== type) continue;
     try {
       let wrapKey: Uint8Array;
@@ -1149,7 +1172,7 @@ export async function verifyRecoveryWrapByReentry(
   reenteredKey: string
 ): Promise<CustodyEnvelope> {
   const match = await unwrapMatchingWrap(
-    envelope,
+    envelope.wraps,
     { recoveryKey: decodeRecoveryKey(reenteredKey) },
     "recovery-key"
   );
