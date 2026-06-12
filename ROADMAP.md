@@ -4,7 +4,7 @@ Sovereignty used to be embodied. In the physical world, your body provided the p
 
 This roadmap covers what Sanctuary ships today and what's coming next, with rationale for why each piece matters. Detailed shipped history lives in [`CHANGELOG.md`](CHANGELOG.md). Trust claims trace to rows in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md), preserving the platform, gap, and next-proof limits named on each row.
 
-Last updated: 2026-05-27.
+Last updated: 2026-06-11.
 
 ---
 
@@ -12,7 +12,7 @@ Last updated: 2026-05-27.
 
 Sanctuary's enforcement model is the Castle Architecture, codified at [`server/rfcs/RFC-0003-castle-architecture.md`](server/rfcs/RFC-0003-castle-architecture.md). Five named mechanisms, each with a distinct enforcement contract.
 
-- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend proven (shipped 2026-05-06); macOS active enforcement code on main awaiting end-to-end Mini1 drill PASS; Windows on the roadmap.
+- **Castle Wall (the perimeter).** OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend proven (shipped 2026-05-06); macOS proven (clean allow/deny drill on Mini1, 2026-06-11); Windows on the roadmap.
 - **Sentinels (the nerves).** Internal observation via process introspection and behavioral baselining. Anomalies surface to the operator via menubar and notifications. Observation, not enforcement.
 - **Charter (the will).** Cooperative MCP surface for compliant agents. Encrypted state, signed audit, mandate primitives, four canonical policy slots, substrate selector, Concordia receipt integration, Verascore reputation hooks.
 - **Heralds (the voice).** Concordia receipts for cross-castle commitments, Verascore reputation aggregating across operators. Cross-castle accountability post-action.
@@ -76,7 +76,7 @@ Concordia adds structured negotiation between agents with binding commitments an
 
 v1.3.3 shipped the signed system extension `ai.sanctuaryprotocol.macos.castle-wall`, the host app, the Phase 2.5 retail UX (agent detection, protect / unprotect UI, first-run welcome, plain-English activity log, vocabulary normalization), the Track 4A IPC integration wiring the daemon into `sanctuary protect` startup, and the Track 4A.2 sysext socket-path discovery. PR #365 (post-v1.3.3) wired `NEFilterManager` into the host-app launch flow, aligned the `os_log` subsystem so future drills can self-debug, and documented the wrap-only fortress workaround. **Why it matters:** Macs are where retail operators live; without macOS enforcement parity the security claim is asymmetric.
 
-*Status: code complete on main; end-to-end Mini1 drill PASS pending. ASSURANCE_MATRIX row "Egress enforcement: macOS" currently partial; closes when the drill PASSes.*
+*Status: end-to-end Mini1 drill PASSed 2026-06-11 (clean allow/deny under an armed wall, N=3). ASSURANCE_MATRIX row "Egress enforcement: macOS" is proven; evidence in [docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md).*
 
 ---
 
@@ -90,7 +90,7 @@ Concrete, scoped, on the engineering path. Each item has named decision artifact
 
 End-to-end Mini1 drill closes the macOS thesis-gate. A wrapped agent's outbound packets are intercepted at the kernel layer via `NEFilterDataProvider`, routed through Castle Wall policy with full audit evidence, and the operator-facing notification fires. **Why it matters:** closes the cross-platform security claim. Retail surfaces can honestly say "Castle Wall enforces on Linux and macOS" once this PASSes.
 
-*Status: in flight. Enforcement loop proven on Mini1 (2026-05-28); Tahoe fix rounds W1 through W4 merged (#469, #470, #471, #472) with fail-loud binding diagnostics; the clean end-to-end drill (operator baseline, dead-man, agent differential) remains.*
+*Status: PASSed. Enforcement loop proven on Mini1 (2026-05-28); Tahoe fix rounds W1 through W6 merged (#469, #470, #471, #472, #479, #480); the clean end-to-end drill (graceful disarm, dead-man, agent differential) captured 2026-06-11 with N=3 per leg. Evidence: [docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md](docs/audit/castle-wall-macos-allow-deny-drill-2026-06-11.md).*
 
 #### Castle Wall on Windows
 
