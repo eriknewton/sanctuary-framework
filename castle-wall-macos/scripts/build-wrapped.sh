@@ -16,6 +16,10 @@ SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 BUILD_ROOT="${BUILD_ROOT:-${PKG_DIR}/build}"
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${BUILD_ROOT}/Sanctuary-CastleWall.app}"
 CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+# Monotonic CFBundleVersion: macOS only replaces an activated system extension
+# when the version increases. A hardcoded version means rebuilt fixes never load
+# (root-caused on the 2026-06-11b W5 drill). git commit count is monotonic.
+CASTLE_WALL_BUNDLE_VERSION="${CASTLE_WALL_BUNDLE_VERSION:-$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || echo 10)}"
 CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
 
 HOST_TARGET="CastleWallHostApp"
@@ -172,6 +176,11 @@ cp "${EXT_INFO_SRC}" "${EXT_INFO_DST}"
     /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallHeadlessContractVersion string ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" "${HOST_INFO_DST}" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :CFBundleName ${EXT_EXECUTABLE_NAME}" "${EXT_INFO_DST}" >/dev/null 2>&1
+# Bump the extension AND host CFBundleVersion so macOS replaces the activated sysext.
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${CASTLE_WALL_BUNDLE_VERSION}" "${EXT_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${CASTLE_WALL_BUNDLE_VERSION}" "${EXT_INFO_DST}" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${CASTLE_WALL_BUNDLE_VERSION}" "${HOST_INFO_DST}" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${CASTLE_WALL_BUNDLE_VERSION}" "${HOST_INFO_DST}" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :NSExtension:NSExtensionPrincipalClass CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
 /usr/libexec/PlistBuddy -c "Set :NetworkExtension:NEProviderClasses:com.apple.networkextension.filter-data CastleWallFilterProvider" "${EXT_INFO_DST}" >/dev/null 2>&1
 

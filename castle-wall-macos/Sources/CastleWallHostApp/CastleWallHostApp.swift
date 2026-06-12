@@ -46,6 +46,15 @@ struct CastleWallHostApp: App {
 
         switch systemExtensionManager.extensionState {
         case .activated:
+            // Re-submit an activation request on launch so a newer BUNDLED
+            // extension version replaces the running one. macOS calls
+            // actionForReplacingExtension (-> .replace) only when the bundled
+            // version differs, and completes silently when it is unchanged.
+            // Without this, a rebuilt/fixed extension NEVER loads while an old
+            // one stays activated — root-caused on the 2026-06-11b drill, where
+            // a W5-fixed extension could not reach the box because the host app
+            // only re-enabled the filter and never re-requested activation.
+            systemExtensionManager.activate()
             if filterConfigurationManager.filterState != .enabled {
                 filterConfigurationManager.enableFilter()
             }
