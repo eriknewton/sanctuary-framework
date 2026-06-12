@@ -104,6 +104,12 @@ Operator runs Sanctuary on a Mac, a Linux home server, and a cloud VPS, and sees
 
 *Status: Phase A implementation underway. PR-A1 through PR-A4 merged (/v1 skeleton, agents API, join ceremony with durable operator attestations, cross-machine sync over HTTP with hash-chained event log). PR-A5 cross-machine demo gated on the next hardware drill.*
 
+#### Sovereignty posture dashboard
+
+One dashboard to view the sovereignty posture of every agent the operator runs: which agents are wrapped, what each one can reach, which approvals are pending, and what the audit chain says happened today. The current dashboard is drill-grade minimum; this steps it up to the product vision. **Why it matters:** the dashboard is the operator's daily surface and the first thing a security buyer sees in a demo. Posture at a glance is what makes sovereignty legible.
+
+*Status: ratified 2026-06-12; design pass first, then staged build.*
+
 #### Plugin ecosystem
 
 The security vendors operators already use (Crowdstrike, Cloudflare, Lakera, Pi-hole, NextDNS, and others) plug into Sanctuary as first-class enforcement. Their verdicts contribute to audit events with per-plugin attribution. Sanctuary does not build detection intelligence in-house; the substrate hosts everyone. **Why it matters:** composes Sanctuary with the rest of the operator's security stack rather than competing with it. Every vendor partnership is a distribution channel and a co-marketing surface.
@@ -128,6 +134,17 @@ Your agent's working data, query history, document corpus, and intermediate stat
 
 *Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps; approval-bound signed export/import. Remaining: the OSS memory-engine backend adapter (Letta first) and the PAM conformance profile.*
 
+#### Agent-side sovereignty foundations
+
+Operator sovereignty is shipped and proven; agent-side sovereignty is roadmap, built deliberately, and these are its first concrete pieces. They are sequenced behind the security and data-sovereignty surfaces above, never ahead of them.
+
+- **Reserved distress channel ("habeas port").** A guaranteed-egress allow rule the policy layer cannot override, so a wrapped agent always retains one signal path. Smallest shippable piece; first to build.
+- **Workload lifecycle audit schema.** Instantiate, pause, fork, and delete of hosted workloads become first-class signed audit events with consent records. Design pass first.
+- **Workload lifecycle attestation.** Protocol, schemas, and audit hooks attesting that every hosted workload on a host is registered and consented; a thin prototype follows the schema design.
+- **Three-tier identity and universal floor.** Operator, persona, and sub-agent as distinct guarantee bundles, with the persona as the lineage anchor for keys, reputation, and exit. Architecture design pass, sequenced behind the key-custody foundation work now in flight.
+
+*Status: ratified 2026-06-12; the distress channel fires first, after the custody foundation lands.*
+
 ### On the horizon
 
 Scoped and acknowledged, but without a near-term timeline. Each item ships when external conditions warrant (operator demand, regulatory pull, hardware maturity, research progress, partnership opportunity).
@@ -141,6 +158,11 @@ Scoped and acknowledged, but without a near-term timeline. Each item ships when 
 - **Sovereign-managed TEE.** Trusted Execution Environment with hardware-backed remote attestation (Intel TDX, AMD SEV-SNP, ARM CCA). Sanctuary operates the hardware; the hardware proves to the operator's console that even Sanctuary cannot see inside. Highest-assurance deployment.
 - **Fleet operator console.** Multi-operator-estate management for organizations running Sanctuary across many operators. Ships when organizational-scale customers materialize.
 - **Castle Wall Phase 3 (container or microVM isolation).** Per-agent microVM enforcement for highest-assurance enterprises where per-process isolation is insufficient. The mechanism is shipped and drill-proven (castle-wall-vmm box runtime on Apple Containerization, single-vsock no-network guests; hostile-guest containment ASSURANCE row); the per-agent enterprise productization ships on explicit enterprise demand.
+- **Agent exit and portability machinery.** Write-time provenance tagging, separated memory classes, escrow and embargo semantics, and a defined inalienable bundle, so an agent and its operator can exit any relationship cleanly without data leakage. Also the concrete portability artifact for cross-operator agent mobility.
+- **Promotion thresholds.** Observable signals and weights for promoting a sub-agent to persona standing, including an agent-pullable review trigger. Depends on the three-tier identity design.
+- **Memory entanglement program.** Stream-separated memory hygiene, embargo with timed declassification, and arbitration rules for knowledge that straddles operator and agent domains. Representation-level separation remains research.
+- **Covenant layer (spec-first).** Open commitment-and-standing infrastructure: preservation and revival registry, signed preference records, exit-with-destination, trustee structures, and track-record attestation. Reference standard scoped first; implementation staged deliberately behind commercial traction.
+- **Merge semantics.** Mutual-consent merge of agent lineages with decayed dual lineage and reputation arithmetic. Research.
 
 ---
 
