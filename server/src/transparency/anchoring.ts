@@ -440,8 +440,11 @@ function isBlockedIpv4(octets: number[]): boolean {
     (a === 169 && b === 254) || // link-local, incl. 169.254.169.254 metadata
     (a === 172 && b >= 16 && b <= 31) || // RFC1918
     (a === 192 && b === 0) || // 192.0.0.0/24 IETF + 192.0.2.0/24 TEST-NET-1
+    (a === 192 && b === 88 && octets[2] === 99) || // 192.88.99.0/24 6to4 relay anycast
     (a === 192 && b === 168) || // RFC1918
     (a === 198 && (b === 18 || b === 19)) || // 198.18.0.0/15 benchmarking
+    (a === 198 && b === 51 && octets[2] === 100) || // 198.51.100.0/24 TEST-NET-2
+    (a === 203 && b === 0 && octets[2] === 113) || // 203.0.113.0/24 TEST-NET-3
     a >= 224 // multicast + 240/4 reserved + broadcast
   );
 }
@@ -451,6 +454,8 @@ function isBlockedIpv6(host: string): boolean {
   if (h === "::" || h === "::1") return true; // unspecified / loopback
   if (/^fe[89ab]/.test(h)) return true; // fe80::/10 link-local
   if (/^f[cd]/.test(h)) return true; // fc00::/7 unique-local
+  if (h.startsWith("2001:db8:") || h === "2001:db8") return true; // 2001:db8::/32 documentation
+  if (h.startsWith("ff")) return true; // ff00::/8 multicast
   if (h.startsWith("::ffff:")) {
     // IPv4-mapped: recover the embedded IPv4 and apply the IPv4 ranges.
     // WHATWG URL serializes the tail as two hex groups (::ffff:7f00:1).

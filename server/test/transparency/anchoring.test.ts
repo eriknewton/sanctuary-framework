@@ -717,6 +717,9 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
       "https://192.0.0.192",
       "https://192.168.1.10",
       "https://198.18.0.1",
+      "https://192.88.99.1", // 6to4 relay anycast
+      "https://198.51.100.7", // TEST-NET-2
+      "https://203.0.113.9", // TEST-NET-3
       "https://224.0.0.1",
       "https://255.255.255.255",
       "https://0x7f000001", // hex-encoded 127.0.0.1 (WHATWG-normalized)
@@ -726,6 +729,8 @@ describe("Rekor URL guard (SSRF, fail-closed)", () => {
       "https://[fe80::1]",
       "https://[fd00::1]",
       "https://[fc00::1]",
+      "https://[2001:db8::1]", // documentation prefix
+      "https://[ff02::1]", // multicast
       "https://[::ffff:127.0.0.1]", // IPv4-mapped loopback
       "https://[::ffff:a9fe:a9fe]", // IPv4-mapped 169.254.169.254
     ]) {
