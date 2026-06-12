@@ -79,7 +79,26 @@ These limits are printed by the verifier on every run. Do not over-claim past th
 
 ## Publishing
 
-Publishing is an operator action. `sanctuary transparency export` writes a self-contained `SANCTUARY_TRANSPARENCY_BUNDLE_V1` JSON document; the operator may post it to a website, commit it to a repository, or hand it to an auditor. Nothing in this feature performs network I/O. Operators who publish should also publish their signing-key fingerprint through a separate channel so verifiers have an out-of-band key.
+Publishing is an operator action. `sanctuary transparency export` writes a self-contained `SANCTUARY_TRANSPARENCY_BUNDLE_V1` JSON document; the operator may post it to a website, commit it to a repository, or hand it to an auditor. The only network I/O in this feature is opt-in anchoring (below), which is off by default; everything else is local. Operators who publish should also publish their signing-key fingerprint through a separate channel so verifiers have an out-of-band key.
+
+## External anchoring (opt-in, off by default)
+
+Two honest limits above, freshness and fork detection across observers, exist because checkpoints live only on the operator's own disk: an operator (or an attacker who owns the host) can withhold the newest checkpoints or present different histories to different people. Anchoring closes the publication half of that gap by writing a tiny commitment to each checkpoint into Sigstore Rekor, a public append-only transparency log that neither the operator nor Sanctuary's authors can rewrite.
+
+Managed with `sanctuary transparency anchor enable|disable|status|now`, or opted into at setup with `sanctuary wrap --anchor-transparency`.
+
+**Consent and privacy (hard constraint: nothing leaves the machine without explicit, confirmed intent):**
+
+- Anchoring is OFF until the operator explicitly enables it. Enabling shows a plain-language consent statement; its hash and timestamp are recorded in the MAC-authenticated anchoring config and in the audit log.
+- Anchors are HASH-ONLY. What is published per checkpoint: a salted SHA-256 commitment (the salt is a per-fortress random value that stays local), an ECDSA P-256 signature over the commitment preimage, and the signing public key. That key is a dedicated anchoring key derived from the master key for this single purpose; it is NOT the Ed25519 checkpoint custody key, so public anchors do not link to the published checkpoint-verification key.
+- What is NEVER published: checkpoint contents, enforcement counts, policy or rule data, audit data, fortress identifiers, state content, or key material. An observer of the public log learns only that some pseudonymous party anchored at these times. (Anchor timing tracks the emission cadence, so uptime patterns are inferable from timing alone; an operator who finds that too revealing should not enable anchoring.)
+- The anchoring config is MAC'd with a master-key-derived key. A tampered config refuses in BOTH directions: an attacker can neither silently switch transmission on nor silently switch evidence anchoring off.
+
+**Failure semantics (fail loud, never blocking):** checkpoint emission never depends on Rekor's uptime. If an anchor attempt fails, the failure is persisted as a receipt, written to the audit log as a critical entry (`transparency_anchor_failed`), and reported on the operator console; the local checkpoint stands. `sanctuary transparency anchor now` re-anchors every checkpoint that lacks a success receipt after an outage. Anchor coverage is therefore honest by construction: receipts state exactly which checkpoints are anchored and which are not, rather than pretending.
+
+**What anchoring adds, once verification lands:** an anchored checkpoint must have existed near its anchor's log-integration time, so a withheld suffix is contradicted by newer public anchors, and two divergent histories anchored under the same pseudonym are publicly visible. Verifier-side anchor checking (`--check-anchors`, offline inclusion-proof verification, coverage reporting, `--compare` fork detection) ships in the next phase; until then, anchors are being laid down but a bundle verification does not yet consume them. Do not claim freshness or fork-evidence from this phase alone.
+
+**Audit trail:** every anchoring state change and every anchor attempt is recorded: `transparency_anchoring_enabled` (with the consent text hash), `transparency_anchoring_disabled`, `transparency_checkpoint_anchored` (with the Rekor log index and entry UUID), `transparency_anchor_failed` (with the error).
 
 ## Local anti-rollback
 

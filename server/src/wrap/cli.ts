@@ -150,6 +150,19 @@ export interface WrapOptions {
    * previously wrap wrote passphrase-backup.txt by default.
    */
   writePassphraseBackup?: string;
+  /**
+   * Opt-in transparency anchoring at setup (PR-2). OFF by default. When
+   * set, wrap records consent and enables publishing a salted hash
+   * commitment of each enforcement checkpoint to the public Sigstore
+   * Rekor transparency log. Only the salted hash, a signature from a
+   * dedicated derived key, and that key's public half are ever
+   * published; never checkpoint contents, counts, policy data, or
+   * fortress identifiers. Passing the flag IS the explicit consent
+   * action; the consent statement is printed and its hash recorded.
+   * If the flag is passed and enabling fails, wrap fails LOUDLY
+   * (exit 2) rather than silently continuing without anchoring.
+   */
+  anchorTransparency?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -780,6 +793,47 @@ export async function runWrap(
     );
   }
 
+  // PR-2 transparency anchoring opt-in (default OFF). Set to true only
+  // when consent is recorded and the MAC'd config is written; checked
+  // LOUDLY before each success exit so a requested opt-in can never be
+  // silently dropped by a best-effort failure above it.
+  let anchorTransparencyEnabled = false;
+  const enableAnchorTransparencyForWrap = async (
+    storageForWrap: import("../storage/interface.js").StorageBackend,
+    masterKeyForWrap: Uint8Array,
+    auditLogForWrap: AuditLog,
+  ): Promise<void> => {
+    if (!options.anchorTransparency || anchorTransparencyEnabled) return;
+    const { ANCHOR_CONSENT_TEXT, enableAnchoring } = await import(
+      "../transparency/anchoring.js"
+    );
+    // Print the exact consent statement the flag agreed to; its hash is
+    // recorded in the MAC'd config and the audit log.
+    process.stderr.write(`\n  ${ANCHOR_CONSENT_TEXT}\n`);
+    await enableAnchoring({
+      storage: storageForWrap,
+      masterKey: masterKeyForWrap,
+      auditLog: auditLogForWrap,
+      fortressId: fortressIdFromStoragePath(storagePath),
+    });
+    anchorTransparencyEnabled = true;
+    process.stderr.write(
+      `\n  Transparency anchoring ENABLED (consent recorded in the audit log).\n` +
+        `  Manage it with: sanctuary transparency anchor status|disable|now\n`,
+    );
+  };
+  const failIfAnchorOptInDropped = (): void => {
+    if (options.anchorTransparency && !anchorTransparencyEnabled) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  ERROR: --anchor-transparency was requested but anchoring could not be enabled.` +
+          `\n  Nothing was transmitted. Fix the error above, or enable it on the existing fortress with:` +
+          `\n    sanctuary transparency anchor enable\n`,
+      );
+      process.exit(2);
+    }
+  };
+
   if (options.noDashboard) {
     // v1.1.5 (Finding AA): operator opted out of the per-call dashboard
     // spawn. The agent record is already persisted above; a later
@@ -822,6 +876,11 @@ export async function runWrap(
           warnCastleWallDaemonNotStarted(err);
         }
 
+        // PR-2: setup opt-in for transparency anchoring (default OFF).
+        // NOT best-effort: a failure here is caught by the loud check
+        // before the success exit below.
+        await enableAnchorTransparencyForWrap(ndStorage, ndDerived.key, ndAuditLog);
+
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
         const { derivePurposeKey } = await import("../core/key-derivation.js");
@@ -850,6 +909,7 @@ export async function runWrap(
       }
     }
 
+    failIfAnchorOptInDropped();
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -951,6 +1011,12 @@ export async function runWrap(
         warnCastleWallDaemonNotStarted(err);
       }
 
+      // PR-2: setup opt-in for transparency anchoring (default OFF).
+      // NOT best-effort: if this throws, the outer catch prints the
+      // error and the loud check below exits 2 rather than letting a
+      // requested opt-in be silently dropped.
+      await enableAnchorTransparencyForWrap(v11Storage, derived.key, wrapAuditLog);
+
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {
         const { IdentityManager } = await import("../l1-cognitive/tools.js");
@@ -1041,6 +1107,8 @@ export async function runWrap(
       );
     }
   }
+
+  failIfAnchorOptInDropped();
 
   const dashboardUrl = `${dashboard.url}?token=${authToken}`;
 
@@ -1629,6 +1697,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--dry-run",
   "--no-open",
   "--no-dashboard",
+  "--anchor-transparency",
   "--help",
   "-h",
 ]);
@@ -1713,6 +1782,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-dashboard":
         options.noDashboard = true;
         break;
+      case "--anchor-transparency":
+        options.anchorTransparency = true;
+        break;
       case "--fortress":
         options.fortress = argv[++i];
         break;
@@ -1770,6 +1842,17 @@ function printWrapHelp(): void {
                        \`sanctuary dashboard\` (or a later wrap) sees the
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
+    --anchor-transparency
+                       Opt in to transparency anchoring at setup (OFF by
+                       default). Publishes a salted hash commitment of each
+                       enforcement checkpoint to the public Sigstore Rekor
+                       transparency log so the enforcement history becomes
+                       fork-evident. Only the salted hash, a signature from
+                       a dedicated derived key, and that key's public half
+                       ever leave the machine; never checkpoint contents,
+                       counts, policy data, or fortress identifiers.
+                       Equivalent to running
+                       \`sanctuary transparency anchor enable\` later.
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
                        local Sanctuary build (\`node <path>\` instead of
                        \`npx @sanctuary-framework/mcp-server\`). Required

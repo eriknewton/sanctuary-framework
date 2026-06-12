@@ -4,11 +4,16 @@
  *   sanctuary transparency checkpoint   Emit one signed checkpoint now
  *   sanctuary transparency export      Export a publishable bundle
  *   sanctuary transparency verify      Verify checkpoints (alias below)
+ *   sanctuary transparency anchor      Opt-in public-log anchoring
  *   sanctuary verify-transparency      Offline/host verification
  *
- * Publishing a bundle (website, repo, anywhere) is an OPERATOR action:
- * nothing here performs network I/O. See docs/transparency.md for what a
- * verifying party can and cannot conclude.
+ * Publishing a bundle (website, repo, anywhere) is an OPERATOR action.
+ * The ONLY network I/O in this feature is transparency anchoring, which
+ * is OFF by default and transmits nothing until the operator explicitly
+ * enables it ("sanctuary transparency anchor enable"); even then only a
+ * salted hash commitment leaves the machine. See
+ * docs/transparency-checkpoints.md for what a verifying party can and
+ * cannot conclude.
  */
 
 import { realpathSync } from "node:fs";
@@ -102,9 +107,229 @@ export async function runTransparencyCommand(
   if (sub === "verify") {
     return runVerifyTransparencyCommand({ ...args, argv: rest });
   }
+  if (sub === "anchor") {
+    return runAnchorCommand(rest, out, err, args.env ?? process.env);
+  }
   write(err, `Unknown transparency command: ${sub}\n`);
   printUsage(err);
   return 2;
+}
+
+// ---- anchor -------------------------------------------------------------------
+
+/**
+ * Opt-in external anchoring (Sigstore Rekor). Enabling REQUIRES explicit
+ * operator confirmation of the plain-language consent text (hard
+ * constraint #1: nothing leaves the machine without explicit, confirmed
+ * intent). Non-interactive runs must pass --yes; an interactive run is
+ * asked y/N on the terminal.
+ */
+async function runAnchorCommand(
+  argv: string[],
+  out: Writable,
+  err: Writable,
+  env: NodeJS.ProcessEnv
+): Promise<number> {
+  const [verb, ...rest] = argv;
+  if (!verb || verb === "--help" || verb === "-h") {
+    printAnchorUsage(verb ? out : err);
+    return verb ? 0 : 2;
+  }
+  if (rest.includes("--help") || rest.includes("-h")) {
+    printAnchorUsage(out);
+    return 0;
+  }
+  if (!["enable", "disable", "status", "now"].includes(verb)) {
+    write(err, `Unknown anchor command: ${verb}\n`);
+    printAnchorUsage(err);
+    return 2;
+  }
+
+  let masterKey: Uint8Array | undefined;
+  try {
+    const opts = parseFlags(
+      rest,
+      ["--fortress", "--passphrase", "--rekor-url"],
+      ["--yes", "--json"]
+    );
+    const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const {
+      ANCHOR_CONSENT_TEXT,
+      anchorPendingCheckpoints,
+      disableAnchoring,
+      enableAnchoring,
+      readAnchorConfig,
+      readAnchorReceipts,
+    } = await import("../transparency/anchoring.js");
+
+    if (verb === "status") {
+      // Status needs the master key only to AUTHENTICATE the config; a
+      // tampered config must be reported, not summarized.
+      masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+      const state = await readAnchorConfig({ storage, masterKey });
+      const receipts =
+        state.status === "absent" ? [] : await readAnchorReceipts(storage);
+      const anchored = receipts.filter((r) => r.status === "anchored");
+      const failed = receipts.filter((r) => r.status === "failed");
+      const payload = {
+        anchoring:
+          state.status === "absent" ? "off (never enabled; default)" : state.status,
+        ...(state.status !== "absent"
+          ? { rekor_url: state.config.rekor_url }
+          : {}),
+        receipts: {
+          anchored: anchored.length,
+          failed: failed.length,
+          latest_anchored_counter: anchored.at(-1)?.counter ?? null,
+        },
+      };
+      if (opts.flags["--json"]) {
+        write(out, JSON.stringify(payload, null, 2) + "\n");
+      } else {
+        write(out, `Anchoring: ${payload.anchoring}\n`);
+        if (state.status !== "absent") {
+          write(out, `Rekor log: ${state.config.rekor_url}\n`);
+        }
+        write(
+          out,
+          `Receipts: ${anchored.length} anchored, ${failed.length} failed` +
+            (anchored.length > 0
+              ? ` (latest anchored checkpoint: ${anchored.at(-1)!.counter})`
+              : "") +
+            `\n`
+        );
+        if (failed.length > 0) {
+          write(
+            out,
+            `Retry failed anchors with: sanctuary transparency anchor now\n`
+          );
+        }
+      }
+      return 0;
+    }
+
+    masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+    const auditLog = new AuditLog(storage, masterKey);
+    const fortressId = fortressIdFromStoragePath(storagePath);
+
+    if (verb === "enable") {
+      write(out, `\n${ANCHOR_CONSENT_TEXT}\n\n`);
+      if (!opts.flags["--yes"]) {
+        const confirmed = await confirmInteractive(
+          out,
+          "Enable transparency anchoring? [y/N] "
+        );
+        if (confirmed === null) {
+          write(
+            err,
+            "Not enabled: anchoring requires explicit consent. Re-run with --yes after reading the statement above, or answer interactively on a terminal.\n"
+          );
+          return 2;
+        }
+        if (!confirmed) {
+          write(err, "Not enabled (operator declined). Nothing was transmitted or changed.\n");
+          return 2;
+        }
+      }
+      const config = await enableAnchoring({
+        storage,
+        masterKey,
+        auditLog,
+        fortressId,
+        ...(opts.values["--rekor-url"]
+          ? { rekorUrl: opts.values["--rekor-url"] }
+          : {}),
+      });
+      write(
+        out,
+        `Anchoring ENABLED (log: ${config.rekor_url}). Consent recorded in the audit log.\n` +
+          `Each future checkpoint emission publishes a salted hash commitment to the public log.\n` +
+          `Anchor existing checkpoints now with: sanctuary transparency anchor now\n`
+      );
+      return 0;
+    }
+
+    if (verb === "disable") {
+      const config = await disableAnchoring({
+        storage,
+        masterKey,
+        auditLog,
+        fortressId,
+      });
+      write(
+        out,
+        `Anchoring DISABLED. Nothing will be transmitted. Previously published anchors remain in the public log (${config.rekor_url}) and stay verifiable.\n`
+      );
+      return 0;
+    }
+
+    // verb === "now": anchor every checkpoint lacking a success receipt.
+    const result = await anchorPendingCheckpoints({
+      storage,
+      masterKey,
+      auditLog,
+    });
+    if ("status" in result && result.status === "disabled") {
+      write(
+        err,
+        "Anchoring is not enabled (it is off by default). Enable it first: sanctuary transparency anchor enable\n"
+      );
+      return 1;
+    }
+    const summary = result as Exclude<typeof result, { status: "disabled" }>;
+    write(
+      out,
+      `Anchored ${summary.anchored} checkpoint(s); ${summary.already_anchored} already anchored; ${summary.failed} failed.\n`
+    );
+    for (const item of summary.outcomes) {
+      if (item.outcome.status === "anchored") {
+        write(
+          out,
+          `  checkpoint ${item.counter}: anchored (Rekor index ${item.outcome.receipt.rekor.log_index})\n`
+        );
+      } else if (item.outcome.status === "failed") {
+        write(
+          err,
+          `  checkpoint ${item.counter}: FAILED, ${item.outcome.error}\n`
+        );
+      }
+    }
+    if (summary.failed > 0) {
+      write(
+        err,
+        `Anchor coverage is incomplete (loud by design; emission is never blocked). Re-run "sanctuary transparency anchor now" when the log is reachable.\n`
+      );
+      return 1;
+    }
+    return 0;
+  } catch (error) {
+    return reportError(err, `transparency anchor ${verb}`, error);
+  } finally {
+    masterKey?.fill(0);
+  }
+}
+
+/**
+ * Interactive y/N confirmation. Returns null when no TTY is attached
+ * (non-interactive runs must use --yes; consent is never assumed).
+ */
+async function confirmInteractive(
+  out: Writable,
+  question: string
+): Promise<boolean | null> {
+  if (process.stdin.isTTY !== true) return null;
+  const readline = await import("node:readline/promises");
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: out as NodeJS.WritableStream,
+  });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
 }
 
 // ---- checkpoint -------------------------------------------------------------
@@ -157,6 +382,51 @@ async function runCheckpoint(
         signer_kid: record.signer_kid,
       },
     });
+    // Opt-in external anchoring (default OFF; nothing transmitted unless
+    // the operator enabled it). FAIL LOUD: an anchor failure is reported
+    // and exits nonzero, but the emitted checkpoint above stands; local
+    // evidence never depends on a third party's uptime.
+    let anchorFailed = false;
+    try {
+      const { anchorCheckpoint, readAnchorConfig } = await import(
+        "../transparency/anchoring.js"
+      );
+      const anchorState = await readAnchorConfig({ storage, masterKey });
+      if (anchorState.status === "enabled") {
+        const outcome = await anchorCheckpoint({
+          storage,
+          masterKey,
+          auditLog,
+          record,
+        });
+        if (outcome.status === "anchored") {
+          write(
+            out,
+            `[anchor] checkpoint ${record.counter} anchored to ${anchorState.config.rekor_url} (Rekor index ${outcome.receipt.rekor.log_index}).\n`
+          );
+        } else if (outcome.status === "already_anchored") {
+          write(
+            out,
+            `[anchor] checkpoint ${record.counter} was already anchored (Rekor index ${outcome.receipt.rekor.log_index}).\n`
+          );
+        } else if (outcome.status === "failed") {
+          anchorFailed = true;
+          write(
+            err,
+            `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING FAILED: ${outcome.error}\n` +
+              `[anchor] The failure was recorded in the audit log. Retry with: sanctuary transparency anchor now\n`
+          );
+        }
+      }
+    } catch (anchorError) {
+      // Config tamper or receipt-store failure: refuse to anchor, say so
+      // loudly, and exit nonzero. The emitted checkpoint above stands.
+      anchorFailed = true;
+      write(
+        err,
+        `[anchor] checkpoint ${record.counter} emission succeeded but ANCHORING REFUSED: ${anchorError instanceof Error ? anchorError.message : String(anchorError)}\n`
+      );
+    }
     if (opts.flags["--json"]) {
       write(out, JSON.stringify(record, null, 2) + "\n");
     } else {
@@ -171,7 +441,7 @@ async function runCheckpoint(
           `Export a publishable bundle with: sanctuary transparency export\n`
       );
     }
-    return 0;
+    return anchorFailed ? 1 : 0;
   } catch (error) {
     return reportError(err, "transparency checkpoint", error);
   } finally {
@@ -586,10 +856,49 @@ Commands:
   checkpoint   Emit one signed enforcement checkpoint now.
   export       Export all checkpoints as a publishable, offline-verifiable bundle.
   verify       Verify checkpoints (same as "sanctuary verify-transparency").
+  anchor       Opt-in anchoring of checkpoint commitments to a public
+               transparency log (Sigstore Rekor). OFF by default.
 
 Checkpoints contain hashes and counts only: no state content, no rule
-details, no key material. Publishing a bundle is an operator action;
-no command here performs network I/O.
+details, no key material. Publishing a bundle is an operator action.
+The only network I/O in this feature is anchoring, which transmits
+nothing until explicitly enabled, and then only a salted hash.
+`
+  );
+}
+
+function printAnchorUsage(out: Writable): void {
+  write(
+    out,
+    `Usage: sanctuary transparency anchor <command> [options]
+
+Anchor checkpoint commitments to the public Sigstore Rekor transparency
+log so the enforcement history is fork-evident and freshness-bounded:
+once anchored, even this machine cannot quietly rewrite or withhold it.
+
+OFF BY DEFAULT. Enabling requires explicit consent. What is published
+per checkpoint: a salted SHA-256 commitment (64 hex characters), a
+signature from a dedicated derived anchoring key, and that key's public
+half. Never published: checkpoint contents, counts, policy or rule data,
+audit data, fortress identifiers, or any state content.
+
+Anchor failures are LOUD, never blocking: a Rekor outage is recorded in
+the audit log and reported, and local checkpoint emission continues.
+
+Commands:
+  enable    Show the consent statement and switch anchoring on.
+            Requires --yes when not running on a terminal.
+  disable   Switch anchoring off (published anchors stay verifiable).
+  status    Show the anchoring state and receipt coverage.
+  now       Anchor every checkpoint that lacks a success receipt
+            (catch-up after an outage).
+
+Options:
+  --fortress <path>     Override fortress path.
+  --passphrase <val>    Fortress passphrase (or SANCTUARY_PASSPHRASE).
+  --rekor-url <url>     Override the transparency log URL (enable only).
+  --yes                 Non-interactive consent confirmation (enable only).
+  --json                Machine-readable output (status only).
 `
   );
 }
