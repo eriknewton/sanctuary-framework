@@ -28,7 +28,7 @@
  *   the advanced path; most operators want Layer 1.
  */
 
-import { writeFile, readFile, mkdir, access } from "node:fs/promises";
+import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
 import { platform } from "node:os";
@@ -42,9 +42,22 @@ import {
   restoreConfig,
   rewriteConfigForWrap,
   getPlatformPaths,
+  validateWrapMetaAuxiliary,
+  writeFileSafeUnderRoot,
+  unlinkSafeUnderRoot,
+  WrapMetaValidationError,
   type AgentPlatform,
   type MCPServerEntry,
+  type WrapMetaAuxiliaryFile,
+  type ValidatedWrapMetaAuxiliaryFile,
 } from "./config-reader.js";
+import {
+  hermesConfigYamlPath,
+  planHermesYamlInjection,
+  yamlContainsSanctuaryEntry,
+  HermesYamlUnsupportedError,
+  type HermesYamlPlan,
+} from "./hermes-yaml.js";
 import {
   getOrCreatePassphrase,
   persistUserProvidedPassphrase,
@@ -216,6 +229,148 @@ export function formatMcpServerCount(
   return `MCP servers found: 1 Sanctuary entry (existing), ${otherCount} other ${otherWord}`;
 }
 
+/**
+ * Build the env block for the sanctuary entry. These vars are required for
+ * the dashboard and passphrase resolution to work after the config rewrite.
+ * Pulled from process.env so they survive the rewrite.
+ *
+ * v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
+ * path so harness restarts (Claude Code re-spawning the MCP server)
+ * keep the same fortress directory. Pre-fix, --fortress was honored at
+ * wrap time (via promoteFortressToStoragePath) but never written
+ * into ~/.claude.json — every harness restart fell back to the default
+ * fortress location, silently drifting fortress isolation across reboots.
+ *
+ * The args list stays constant: persistence travels through env vars
+ * exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
+ * promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
+ * identically, so the spawned MCP server resolves the right storage
+ * path on its boot path. Resolved to absolute so subsequent CWD
+ * changes do not break the persisted reference.
+ */
+function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
+  const sanctuaryEnv: Record<string, string> = {};
+  if (process.env.SANCTUARY_PASSPHRASE) {
+    sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_AUTH_TOKEN = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
+  }
+  if (options.fortress) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
+  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
+    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
+      process.env.SANCTUARY_FORTRESS_PATH,
+    );
+  }
+  return sanctuaryEnv;
+}
+
+/**
+ * Resolve the command + args registered for the `sanctuary` MCP entry.
+ *
+ * Dogfood path (`--dev-dist <path>`): when set, point the main
+ * `sanctuary` entry at a local Sanctuary build instead of the
+ * npm-published version. Without this flag, an unpublished branch
+ * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
+ * because npx pulls from the registry. Published-version wraps omit
+ * the flag and use the npx default unchanged.
+ */
+function resolveSanctuaryCommand(options: WrapOptions): {
+  command: string;
+  args: string[];
+} {
+  const useDevDist = options.devDist !== undefined;
+  return {
+    command: useDevDist ? "node" : "npx",
+    args: useDevDist ? [options.devDist!] : ["@sanctuary-framework/mcp-server"],
+  };
+}
+
+/** Operator-facing one-liner for what the YAML injection did / would do. */
+function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
+  const preserved =
+    plan.preservedEntryNames.length > 0
+      ? ` (${plan.preservedEntryNames.length} existing ${
+          plan.preservedEntryNames.length === 1 ? "entry" : "entries"
+        } preserved)`
+      : "";
+  switch (plan.action) {
+    case "create-file":
+      return `create ${yamlPath} with the sanctuary entry under mcp_servers`;
+    case "add-key":
+      return `add mcp_servers with the sanctuary entry to ${yamlPath}${preserved}`;
+    case "append-entry":
+      return `add the sanctuary entry to mcp_servers in ${yamlPath}${preserved}`;
+    case "replace-entry":
+      return `update the existing sanctuary entry in ${yamlPath}${preserved}`;
+  }
+}
+
+/**
+ * D4 staging, Bugs 1+2: dry-run preview of the Hermes config.yaml
+ * injection. Read-only by construction (planHermesYamlInjection is pure;
+ * the only filesystem touch is the readFile probe), and previews the
+ * exact entry the real run would write because it shares
+ * buildSanctuaryEnv / resolveSanctuaryCommand with the write path.
+ */
+async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
+  const yamlPath = hermesConfigYamlPath();
+  let existingYaml: string | null = null;
+  try {
+    existingYaml = await readFile(yamlPath, "utf-8");
+  } catch {
+    // File absent — the plan would create it.
+  }
+  const sanctuaryEnv = buildSanctuaryEnv(options);
+  const { command, args } = resolveSanctuaryCommand(options);
+  try {
+    const plan = planHermesYamlInjection(existingYaml, {
+      command,
+      args,
+      ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+    });
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Hermes MCP routing: would ${formatHermesYamlAction(plan, yamlPath)}`
+    );
+  } catch (err) {
+    if (err instanceof HermesYamlUnsupportedError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Hermes MCP routing: wrap would FAIL before modifying anything: ${err.message}`
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * D4 P2-3: refuse to write through a symlinked config target. writeFile
+ * and copyFile follow symlinks, so a symlinked ~/.hermes/config.yaml (or a
+ * symlinked restore target on unwrap) would redirect the write to an
+ * arbitrary path outside the agent's config directory. lstat sees the link
+ * itself; an absent path is fine (the write creates it).
+ */
+async function refuseSymlinkTarget(path: string, surface: string): Promise<void> {
+  let isLink = false;
+  try {
+    isLink = (await lstat(path)).isSymbolicLink();
+  } catch {
+    return; // Absent — nothing to refuse.
+  }
+  if (isLink) {
+    throw new Error(
+      `${surface} at ${path} is a symlink; refusing to write through it. ` +
+        `Replace the symlink with a regular file and re-run.`
+    );
+  }
+}
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /** Default CallGovernor limits for wrapped agents. */
@@ -286,8 +441,12 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
+  // D4 P2-2: --unwrap honors --dry-run too — pre-fix, the unwrap dispatch
+  // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
+  // for real. The gate travels into unwrap() so it can report what WOULD
+  // be restored/removed while writing nothing.
   if (options.unwrap) {
-    await unwrap();
+    await unwrap(options.dryRun === true);
     return;
   }
 
@@ -318,10 +477,29 @@ export async function runWrap(
   if (!agentConfig && platformHint && !options.wrap) {
     const candidatePaths = getPlatformPaths()[platformHint];
     const canonicalPath = candidatePaths[0];
+    // D4 staging, Bug 1: --dry-run must guarantee ZERO filesystem writes.
+    // This bootstrap ran BEFORE the dry-run gate below, so `protect
+    // --hermes --dry-run` on a host with no config still created the file.
+    // Report what would be bootstrapped and stop before any write path.
+    if (canonicalPath && options.dryRun) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  No existing ${platformHint} config found.`);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
+      if (platformHint === "hermes") {
+        await reportHermesYamlDryRun(options);
+      }
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Dry run. No changes made.\n`);
+      return;
+    }
     if (canonicalPath) {
       try {
-        await mkdir(dirname(canonicalPath), { recursive: true, mode: 0o700 });
-        await writeFile(canonicalPath, "{}", { mode: 0o600 });
+        // Round-3 P1-A: the fresh-config bootstrap used mkdir(recursive) +
+        // plain writeFile, both of which follow a symlinked parent (e.g.
+        // ~/.hermes -> /tmp/victim). Route it through the same safe-path
+        // discipline as every other wrap sink.
+        await writeFileSafeUnderRoot(canonicalPath, "{}", { mode: 0o600 });
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  No existing ${platformHint} config found.`
@@ -421,6 +599,13 @@ export async function runWrap(
   }
 
   if (options.dryRun) {
+    // D4 staging, Bug 2: report what WOULD be written to Hermes's
+    // config.yaml so the dry run previews the full wrap, while Bug 1
+    // keeps this path guaranteed write-free (the gate sits above every
+    // write: config bootstrap, fortress state, agent-record persistence).
+    if (agentConfig.platform === "hermes") {
+      await reportHermesYamlDryRun(options);
+    }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Dry run. No changes made.\n`);
     return;
@@ -631,63 +816,95 @@ export async function runWrap(
     mode: 0o600,
   });
 
-  // Back up and rewrite agent config.
+  // The args list is a constant — never inject `--passphrase`. The launcher
+  // re-resolves the stored passphrase at runtime from Keychain / fallback
+  // file / SANCTUARY_PASSPHRASE env var. See SEC-061. Env-block and
+  // command/args construction live in buildSanctuaryEnv /
+  // resolveSanctuaryCommand so the dry-run reporter previews the exact
+  // entry the real run writes.
+  const sanctuaryEnv = buildSanctuaryEnv(options);
+  const { command: sanctuaryCommand, args: sanctuaryArgs } =
+    resolveSanctuaryCommand(options);
+
+  // D4 staging, Bug 2: Hermes v0.16.0 loads MCP servers from
+  // ~/.hermes/config.yaml (`mcp_servers:` key, upstream
+  // hermes_cli/mcp_config.py and mcp_startup.py), not from the JSON
+  // cli-config.json wrap rewrites below. Without the YAML injection the
+  // wrap records the agent but Hermes MCP traffic silently bypasses the
+  // Sanctuary proxy. The plan is computed BEFORE any harness config is
+  // touched so an unsupported YAML shape aborts with both surfaces
+  // untouched; the JSON write is kept for forward-compat with the
+  // documented cli-config.json surface.
+  let hermesYaml:
+    | { yamlPath: string; existedBefore: boolean; plan: HermesYamlPlan }
+    | undefined;
+  if (agentConfig.platform === "hermes") {
+    const yamlPath = hermesConfigYamlPath();
+    // D4 P2-3: a symlinked config.yaml would redirect the writeFile below
+    // outside ~/.hermes. Checked here, before ANY surface is backed up or
+    // rewritten, so the refusal leaves everything untouched.
+    try {
+      await refuseSymlinkTarget(yamlPath, "Hermes config.yaml");
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+      console.error(`  ${(err as Error).message}`);
+      console.error(`  Nothing was modified.\n`);
+      process.exit(1);
+    }
+    let existingYaml: string | null = null;
+    try {
+      existingYaml = await readFile(yamlPath, "utf-8");
+    } catch {
+      // File absent — the plan creates it.
+    }
+    try {
+      const plan = planHermesYamlInjection(existingYaml, {
+        command: sanctuaryCommand,
+        args: sanctuaryArgs,
+        ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+      });
+      hermesYaml = { yamlPath, existedBefore: existingYaml !== null, plan };
+    } catch (err) {
+      if (err instanceof HermesYamlUnsupportedError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+        console.error(`  ${err.message}`);
+        console.error(
+          `  Nothing was modified. Hermes routes MCP traffic through ${yamlPath};` +
+            `\n  wrap will not proceed without updating it (a JSON-only wrap would` +
+            `\n  silently leave Hermes traffic outside the Sanctuary proxy).\n`
+        );
+        process.exit(1);
+      }
+      throw err;
+    }
+  }
+
+  // Back up and rewrite agent config. For Hermes, config.yaml is backed up
+  // alongside cli-config.json and recorded in the wrap meta so unwrap
+  // restores both surfaces.
   const backupPath = await backupConfig(agentConfig.configPath);
+  let hermesYamlBackupPath: string | null = null;
+  if (hermesYaml?.existedBefore) {
+    hermesYamlBackupPath = await backupConfig(hermesYaml.yamlPath);
+  }
   await saveWrapMeta({
     backupPath,
     originalPath: agentConfig.configPath,
     platform: agentConfig.platform,
     wrappedAt: new Date().toISOString(),
+    ...(hermesYaml
+      ? {
+          auxiliary: [
+            {
+              originalPath: hermesYaml.yamlPath,
+              backupPath: hermesYamlBackupPath,
+            },
+          ] satisfies WrapMetaAuxiliaryFile[],
+        }
+      : {}),
   });
-
-  // The args list is a constant — never inject `--passphrase`. The launcher
-  // re-resolves the stored passphrase at runtime from Keychain / fallback
-  // file / SANCTUARY_PASSPHRASE env var. See SEC-061.
-  // Build the env block for the sanctuary entry. These three vars are
-  // required for the dashboard and passphrase resolution to work after
-  // the config rewrite. Pull from process.env so they survive the rewrite.
-  const sanctuaryEnv: Record<string, string> = {};
-  if (process.env.SANCTUARY_PASSPHRASE) {
-    sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
-    sanctuaryEnv.SANCTUARY_DASHBOARD_AUTH_TOKEN = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
-    sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
-  }
-  // v1.1.2 hotfix (Finding W): persist the operator-supplied --fortress
-  // path so harness restarts (Claude Code re-spawning the MCP server)
-  // keep the same fortress directory. Pre-fix, --fortress was honored at
-  // wrap time (via promoteFortressToStoragePath above) but never written
-  // into ~/.claude.json — every harness restart fell back to the default
-  // fortress location, silently drifting fortress isolation across reboots.
-  //
-  // The args list stays constant: persistence travels through env vars
-  // exclusively, matching the SANCTUARY_PASSPHRASE pattern. The runtime
-  // promotion at promoteFortressToStoragePath() honors SANCTUARY_FORTRESS_PATH
-  // identically, so the spawned MCP server resolves the right storage
-  // path on its boot path. Resolved to absolute so subsequent CWD
-  // changes do not break the persisted reference.
-  if (options.fortress) {
-    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
-  } else if (process.env.SANCTUARY_FORTRESS_PATH) {
-    sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
-      process.env.SANCTUARY_FORTRESS_PATH,
-    );
-  }
-
-  // Dogfood path (`--dev-dist <path>`): when set, point the main
-  // `sanctuary` entry at a local Sanctuary build instead of the
-  // npm-published version. Without this flag, an unpublished branch
-  // (e.g. an in-flight PR) gets shadowed by the npm-resolved version
-  // because npx pulls from the registry. Published-version wraps omit
-  // the flag and use the npx default unchanged.
-  const useDevDist = options.devDist !== undefined;
-  const sanctuaryCommand = useDevDist ? "node" : "npx";
-  const sanctuaryArgs = useDevDist
-    ? [options.devDist!]
-    : ["@sanctuary-framework/mcp-server"];
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
   await rewrite(
@@ -702,6 +919,69 @@ export async function runWrap(
     backupPath
   );
   if (!verifyOk) process.exit(1);
+
+  // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
+  // the JSON surface verified. D4 P1-1: the ENTIRE write+verify is inside
+  // one rollback scope — a thrown writeFile (unwritable file, bad symlink)
+  // previously escaped the verify-only rollback and left the wrap partially
+  // applied (JSON wrapped, YAML not: the exact silent-bypass state this fix
+  // exists to prevent). Any failure now rolls BOTH surfaces back and exits
+  // non-zero, so the wrap is atomic: fully applied or fully rolled back.
+  if (hermesYaml) {
+    const yamlSurface = hermesYaml;
+    const rollbackBothSurfaces = async (): Promise<void> => {
+      if (hermesYamlBackupPath) {
+        await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
+      } else {
+        try {
+          // Round-3 P1-A: parent-walk-safe even on the rollback path.
+          await unlinkSafeUnderRoot(yamlSurface.yamlPath);
+        } catch {
+          // Best-effort removal of the file this wrap created (it may not
+          // exist when the write itself was what failed, or be refused if a
+          // symlink was raced into its parent).
+        }
+      }
+      await restoreFromBackup(agentConfig.configPath, backupPath);
+    };
+    let yamlVerified = false;
+    try {
+      // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
+      // write is TOCTOU-raceable, so the no-follow open is the leaf
+      // enforcement. Round-3 P1-A: the leaf-only O_NOFOLLOW could STILL be
+      // redirected by a symlinked PARENT (`~/.hermes -> /tmp/victim`), so
+      // writeFileSafeUnderRoot walks every parent component from HOME and
+      // refuses a symlinked ancestor, recreates missing parents segment-by-
+      // segment (no recursive mkdir following a link), then opens the leaf
+      // O_NOFOLLOW.
+      await refuseSymlinkTarget(yamlSurface.yamlPath, "Hermes config.yaml");
+      await writeFileSafeUnderRoot(yamlSurface.yamlPath, yamlSurface.plan.content, {
+        mode: 0o600,
+      });
+      yamlVerified = yamlContainsSanctuaryEntry(
+        await readFile(yamlSurface.yamlPath, "utf-8")
+      );
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
+      );
+      await rollbackBothSurfaces();
+      process.exit(1);
+    }
+    if (!yamlVerified) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
+      );
+      await rollbackBothSurfaces();
+      process.exit(1);
+    }
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
+    );
+  }
 
   // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
   // permissions.allow list at wrap time so the wrapped agent's routine
@@ -1430,8 +1710,28 @@ async function restoreFromBackup(
 
 // ── Unwrap ──────────────────────────────────────────────────────────
 
-async function unwrap(): Promise<void> {
-  const meta = await findLatestBackup();
+async function unwrap(dryRun: boolean): Promise<void> {
+  // D4 P1-2: findLatestBackup validates wrap-meta `auxiliary` entries on
+  // read and throws WrapMetaValidationError on a forged or corrupted list
+  // (arbitrary backupPath/originalPath would turn the restore loop below
+  // into an arbitrary-file write/delete primitive). Abort loudly with
+  // nothing modified.
+  let meta: Awaited<ReturnType<typeof findLatestBackup>>;
+  try {
+    meta = await findLatestBackup();
+  } catch (err) {
+    if (err instanceof WrapMetaValidationError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary: Unwrap REFUSED`);
+      console.error(`  ${err.message}`);
+      console.error(
+        `  Nothing was modified. Inspect the wrap metadata in your fortress` +
+          `\n  backup directory before retrying.\n`
+      );
+      process.exit(1);
+    }
+    throw err;
+  }
   if (!meta) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("No Sanctuary wrap found to restore.");
@@ -1447,11 +1747,107 @@ async function unwrap(): Promise<void> {
     process.exit(1);
   }
 
+  // D4 P1-2 (validate before use) + P2-3 (no symlinked restore targets):
+  // re-validate every auxiliary entry and refuse symlinked targets BEFORE
+  // any restore runs, so a forged or symlinked entry aborts the whole
+  // unwrap with nothing modified — including the primary config. Round-2
+  // P1-A: the lstat loop below is a courtesy early refusal; the atomic
+  // enforcement is the O_NOFOLLOW open inside restoreConfig itself.
+  let auxiliary: ValidatedWrapMetaAuxiliaryFile[] = [];
+  try {
+    auxiliary = await validateWrapMetaAuxiliary(meta.auxiliary);
+    for (const aux of auxiliary) {
+      await refuseSymlinkTarget(aux.originalPath, "Restore target");
+    }
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary: Unwrap REFUSED`);
+    console.error(`  ${(err as Error).message}`);
+    console.error(`  Nothing was modified.\n`);
+    process.exit(1);
+  }
+
+  // D4 P2-2: --unwrap --dry-run reports what WOULD be restored/removed
+  // and writes nothing. All checks above are read-only, so the dry run
+  // surfaces the same refusals the real unwrap would.
+  if (dryRun) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary: Unwrap (dry run)`);
+    console.error(`  Would restore ${meta.originalPath} from ${meta.backupPath}`);
+    for (const aux of auxiliary) {
+      if (aux.backupPath) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`  Would restore ${aux.originalPath} from ${aux.backupPath}`);
+      } else if (aux.alreadyAbsent) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Would skip ${aux.originalPath} (created by wrap; already absent)`
+        );
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+        );
+      }
+    }
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Dry run. No changes made.\n`);
+    return;
+  }
+
   await restoreConfig(meta.backupPath, meta.originalPath);
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
-  console.error(`  Backup preserved at: ${meta.backupPath}\n`);
+  console.error(`  Backup preserved at: ${meta.backupPath}`);
+
+  // D4 staging, Bug 2: restore auxiliary files the wrap touched (the
+  // Hermes config.yaml surface). A null backupPath means wrap created the
+  // file fresh; restoring the pre-wrap state removes it. Best-effort: the
+  // primary config restore above already succeeded, so an auxiliary
+  // failure reports loudly with the manual recovery path instead of
+  // aborting the unwrap.
+  for (const aux of auxiliary) {
+    try {
+      if (aux.backupPath) {
+        // Round-2 P1-A/P2: restoreConfig writes the target O_NOFOLLOW
+        // (atomic symlink refusal) and recreates a missing parent (0o700).
+        await restoreConfig(aux.backupPath, aux.originalPath);
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`  Original config restored to: ${aux.originalPath}`);
+        console.error(`  Backup preserved at: ${aux.backupPath}`);
+      } else if (aux.alreadyAbsent) {
+        // Round-2 P2: created-by-wrap file whose parent directory is gone —
+        // the "absent" end-state already holds; informational no-op.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Skipped ${aux.originalPath} (created by wrap; already absent)`
+        );
+      } else {
+        // Round-3 P1-A: refuse the unlink if a symlink was raced into the
+        // parent dir after validate-time; unlink() does not follow a
+        // symlinked leaf, so only the parent walk is needed.
+        await unlinkSafeUnderRoot(aux.originalPath);
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+        );
+      }
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not restore ${aux.originalPath}: ${(err as Error).message}`
+      );
+      if (aux.backupPath) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Manual recovery: copy ${aux.backupPath} to ${aux.originalPath}`
+        );
+      }
+    }
+  }
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error("");
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
