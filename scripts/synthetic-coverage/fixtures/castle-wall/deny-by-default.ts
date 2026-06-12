@@ -7,7 +7,7 @@ import {
 // Recon: canonical deny surface is EgressDecision plus decisionIsTerminal(),
 // mirrored by server/test/castle-wall/decision/types.test.ts. Maps to row 10.
 const CLAIM_ID = "10";
-const CLAIM_LABEL = "Egress enforcement: macOS (Castle Wall Phase 1, Alpha-2/3/4 gaps)";
+const CLAIM_LABEL = "Egress enforcement: macOS (Castle Wall Phase 1)";
 
 interface SyntheticRequest {
   route?: string;
