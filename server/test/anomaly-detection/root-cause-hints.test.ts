@@ -51,6 +51,7 @@ import {
   ROOT_CAUSE_HINTS_DETAILS_KEY,
   ROOT_CAUSE_HINT_MAX_CLASS_HINTS,
   ROOT_CAUSE_HINT_MAX_HINTS,
+  ROOT_CAUSE_HINT_NAME_MAX_LENGTH,
   ROOT_CAUSE_HINT_Z_THRESHOLD,
   type RootCauseHint,
 } from "../../src/anomaly-detection/root-cause-hints.js";
@@ -732,5 +733,91 @@ describe("WP-V1.3-2 Chi-8 no-leakage invariant", () => {
     expect(hints[0]?.likely_cause).toContain("some_feature");
     expect(hints[0]?.likely_cause).not.toContain("rolling-baseline");
     expect(hints[0]?.likely_cause).not.toContain("24h_rolling");
+  });
+});
+
+describe("WP-V1.3-2 Chi-8 data-dependent name sanitization", () => {
+  it("hostile feature names cannot inject control characters into hint text", () => {
+    // Audit operation names can be composed from runtime strings
+    // (e.g. tool names), so a feature suffix may carry hostile text.
+    const hostile = "peer_z:evil\u001b[31m\nFAKE ALERT: disarm the wall";
+    const hints = buildRootCauseHints(
+      detailsFor(CROSS_AGENT_DISTRIBUTION_DETECTOR_ID, [
+        contribution(hostile, 4),
+      ]),
+    );
+    expect(hints.length).toBe(1);
+    const serialized = JSON.stringify(hints);
+    expect(serialized).not.toContain("\u001b");
+    expect(hints[0]?.likely_cause).not.toContain("\n");
+    expect(hints[0]?.feature_names[0]).not.toContain("\n");
+    // The safe-charset replacement keeps the structural prefix so the
+    // operator can still identify the feature namespace.
+    expect(hints[0]?.feature_names[0]?.startsWith("peer_z:evil_")).toBe(true);
+  });
+
+  it("hostile class names in per_class_drift are sanitized in text and feature_names", () => {
+    const hostileClass = "state read; rm -rf /\u001b[2J";
+    const hints = buildRootCauseHints(
+      detailsFor(AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID, [], {
+        per_class_drift: [
+          {
+            class_name: hostileClass,
+            baseline_proportion: 0.1,
+            current_proportion: 0.6,
+            absolute_delta: 0.5,
+            direction: "up",
+          },
+        ],
+      }),
+    );
+    expect(hints.length).toBe(1);
+    const serialized = JSON.stringify(hints);
+    expect(serialized).not.toContain("");
+    expect(serialized).not.toContain("\u001b");
+    expect(serialized).not.toContain(" rm -rf /");
+    expect(hints[0]?.feature_names[0]?.startsWith("class_proportion:")).toBe(
+      true,
+    );
+  });
+
+  it("overlong names are capped with a truncation marker", () => {
+    const overlong = `band_count:${"x".repeat(400)}`;
+    const hints = buildRootCauseHints(
+      detailsFor(TIME_OF_DAY_ACTIVITY_DETECTOR_ID, [
+        contribution(overlong, 3),
+      ]),
+    );
+    expect(hints.length).toBe(1);
+    const name = hints[0]?.feature_names[0];
+    expect(name?.length).toBe(ROOT_CAUSE_HINT_NAME_MAX_LENGTH + 3);
+    expect(name?.endsWith("...")).toBe(true);
+  });
+
+  it("legitimate feature keys and dotted operation class names pass through unchanged", () => {
+    const hints = buildRootCauseHints(
+      detailsFor(AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID, [], {
+        per_class_drift: [
+          {
+            class_name: "state.read",
+            baseline_proportion: 0.2,
+            current_proportion: 0.5,
+            absolute_delta: 0.3,
+            direction: "up",
+          },
+        ],
+      }),
+    );
+    expect(hints.length).toBe(1);
+    expect(hints[0]?.feature_names[0]).toBe("class_proportion:state.read");
+    expect(hints[0]?.likely_cause).toContain("state.read");
+    // And a prefixed detector feature still resolves its specific text.
+    const bandHints = buildRootCauseHints(
+      detailsFor(TIME_OF_DAY_ACTIVITY_DETECTOR_ID, [
+        contribution("band_proportion:night", 4),
+      ]),
+    );
+    expect(bandHints[0]?.feature_names[0]).toBe("band_proportion:night");
+    expect(bandHints[0]?.source).toBe("detector");
   });
 });

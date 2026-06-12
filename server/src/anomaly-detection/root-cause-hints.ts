@@ -17,7 +17,10 @@
  * detector id, feature names, and class names. No raw audit payloads,
  * no secrets, no key material flow into a hint. Class names on the
  * audit-event-class detector are audit operation names, which are
- * already part of the finding's attribution surface.
+ * already part of the finding's attribution surface; because audit
+ * operation names can be composed from runtime strings, every
+ * data-dependent name is charset-and-length sanitized at the parse
+ * boundary before it reaches hint text (see `sanitizeName`).
  *
  * Determinism + degradation contract:
  *  - Pure functions of the finding details; no clock, no randomness,
@@ -352,6 +355,34 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Upper bound on a data-dependent name (feature key, audit class
+ * name) after sanitization. Legitimate detector feature keys are far
+ * shorter; the cap exists so a hostile name cannot bloat hint text.
+ */
+export const ROOT_CAUSE_HINT_NAME_MAX_LENGTH = 100;
+
+/**
+ * Bound + sanitize a data-dependent name before it flows into
+ * operator-facing hint text or `feature_names`. Audit operation
+ * names (the audit-event-class detector's class names) can be
+ * composed from runtime strings such as tool names, so without this
+ * the hint text would be an injection channel for control
+ * characters, ANSI escapes, newlines, or unbounded payloads rendered
+ * by the dashboard and CLI. Characters outside a small safe charset
+ * are replaced with `_` and the result is length-capped. Legitimate
+ * detector feature keys (lowercase snake_case, `prefix:suffix`
+ * namespaces, dotted audit operation names) pass through unchanged,
+ * so detector hint-table lookups are unaffected.
+ */
+function sanitizeName(name: string): string {
+  let safe = name.replace(/[^A-Za-z0-9_.:/-]/g, "_");
+  if (safe.length > ROOT_CAUSE_HINT_NAME_MAX_LENGTH) {
+    safe = `${safe.slice(0, ROOT_CAUSE_HINT_NAME_MAX_LENGTH)}...`;
+  }
+  return safe;
+}
+
 function parseContributions(value: unknown): ParsedContribution[] {
   if (!Array.isArray(value)) return [];
   const parsed: ParsedContribution[] = [];
@@ -368,7 +399,10 @@ function parseContributions(value: unknown): ParsedContribution[] {
     }
     if (typeof zScore !== "number" || !Number.isFinite(zScore)) continue;
     parsed.push({
-      feature_name: featureName,
+      // Sanitized at the parse boundary so every downstream use
+      // (hint-table lookups, feature_names, interpolated text) is
+      // covered by one chokepoint.
+      feature_name: sanitizeName(featureName),
       observed,
       baseline_mean: baselineMean,
       z_score: zScore,
@@ -407,7 +441,10 @@ function parseClassDrift(value: unknown): ParsedClassDrift[] {
       continue;
     }
     parsed.push({
-      class_name: className,
+      // Same parse-boundary chokepoint as parseContributions: class
+      // names are audit operation strings, which can be composed
+      // from runtime input.
+      class_name: sanitizeName(className),
       baseline_proportion: baselineProportion,
       current_proportion: currentProportion,
       absolute_delta: absoluteDelta,

@@ -151,6 +151,7 @@ Degradation and sovereignty posture:
 
 - Fail-closed wiring: `enrichDetailsWithRootCauseHints` wraps hint generation so a thrown error degrades to an empty hints array, and a details copy failure degrades to the original details unchanged. The finding itself is the security signal and always survives.
 - Hints are built only from numeric contribution stats, feature names, audit-operation class names, and detector ids. No raw audit payloads, secrets, or key material can reach a hint.
+- Data-dependent names are sanitized at the parse boundary before they reach hint text or `feature_names`: audit operation names can be composed from runtime strings (tool names, for example), so characters outside a small safe charset are replaced with `_` and names are capped at 100 characters. Legitimate detector feature keys pass through unchanged. This keeps hint text from becoming a control-character, ANSI-escape, or unbounded-payload injection channel into the dashboard and CLI.
 - No classifier, scoring, severity, or persisted classifier-state change. The layer annotates finding details at routing time only.
 
 ## Audit Event Shape
