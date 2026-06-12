@@ -209,6 +209,13 @@ export interface EnableAnchoringInput extends AnchorKeyInput {
   auditLog: AuditLog;
   fortressId: string;
   rekorUrl?: string;
+  /**
+   * SSRF escape hatch (--allow-unsafe-rekor-url) for local/dev Rekor
+   * instances. Must be passed explicitly at EVERY enable; it is never
+   * inherited from a previous config. Recorded in the MAC'd config, the
+   * enable audit entry, and `anchor status` output.
+   */
+  allowUnsafeRekorUrl?: boolean;
   now?: () => Date;
 }
 
@@ -250,11 +257,15 @@ export async function enableAnchoring(
   const rekorUrl =
     input.rekorUrl ??
     (existing.status === "absent" ? DEFAULT_REKOR_URL : existing.config.rekor_url);
-  validateRekorUrl(rekorUrl);
+  // The unsafe override is NEVER inherited: each enable must state it
+  // explicitly, so a previously-unsafe URL fails closed on a plain re-enable.
+  const allowUnsafeUrl = input.allowUnsafeRekorUrl === true;
+  validateRekorUrl(rekorUrl, allowUnsafeUrl);
   const data: AnchorConfigData = {
     enabled: true,
     salt,
     rekor_url: rekorUrl,
+    allow_unsafe_url: allowUnsafeUrl,
     consent: {
       accepted_at: (input.now?.() ?? new Date()).toISOString(),
       text_sha256: consentTextSha256(ANCHOR_CONSENT_TEXT),
@@ -268,6 +279,7 @@ export async function enableAnchoring(
     result: "success",
     details: {
       rekor_url: rekorUrl,
+      allow_unsafe_rekor_url: allowUnsafeUrl,
       consent_text_sha256: data.consent.text_sha256,
       consent_accepted_at: data.consent.accepted_at,
       ...(recoveredFromTamper ? { recovered_from_tampered_config: true } : {}),
@@ -303,6 +315,7 @@ export async function disableAnchoring(
           enabled: false,
           salt: Buffer.from(randomBytes(32)).toString("hex"),
           rekor_url: DEFAULT_REKOR_URL,
+          allow_unsafe_url: false,
           consent: {
             accepted_at: (input.now?.() ?? new Date()).toISOString(),
             text_sha256: consentTextSha256(ANCHOR_CONSENT_TEXT),
@@ -323,7 +336,34 @@ export async function disableAnchoring(
   return data;
 }
 
-function validateRekorUrl(url: string): void {
+/**
+ * SSRF guard for the operator-configurable Rekor URL. The configured URL
+ * is an outbound POST target, so without validation it is an
+ * operator-configurable request primitive against loopback services,
+ * RFC1918/link-local hosts, and cloud metadata endpoints. The contract:
+ *
+ *   - https is required (a plaintext log URL invites on-path tampering
+ *     AND downgrades the guard).
+ *   - Hostnames that are IP LITERALS in loopback / private / link-local /
+ *     CGNAT / reserved ranges are rejected, as are well-known metadata
+ *     hostnames (169.254.169.254, metadata.google.internal, *.internal)
+ *     and localhost names.
+ *   - DELIBERATELY no DNS resolution here: resolving-then-checking is
+ *     TOCTOU theater (the answer can change between validation and the
+ *     POST). The contract is literal/range checks + https + the recorded
+ *     unsafe flag; the residual (a hostile log operator's hostname
+ *     rebinding to an internal address) is documented in
+ *     docs/transparency-checkpoints.md.
+ *   - Escape hatch for local/dev Rekor instances: allowUnsafe skips the
+ *     https and address checks (NOT the http(s)-scheme check). It is only
+ *     set by an explicit --allow-unsafe-rekor-url at enable time and is
+ *     recorded in the MAC'd config, the audit log, and status output.
+ *
+ * Enforced fail-closed at config-set time (enable) AND re-checked on every
+ * anchor attempt (`now`, emission, scheduler), so a config written by an
+ * older build or copied from elsewhere cannot re-arm an unsafe URL.
+ */
+export function validateRekorUrl(url: string, allowUnsafe: boolean): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -335,6 +375,97 @@ function validateRekorUrl(url: string): void {
       `Rekor URL must be http(s), got ${parsed.protocol}`
     );
   }
+  if (allowUnsafe) return;
+  if (parsed.protocol !== "https:") {
+    throw new TransparencyAnchorError(
+      `Rekor URL must use https, got ${parsed.protocol.slice(0, -1)}. ` +
+        UNSAFE_HATCH_HINT
+    );
+  }
+  // Trailing dots are stripped so absolute-FQDN spellings of blocked names
+  // (e.g. "metadata.google.internal.") cannot dodge the checks.
+  const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+  if (isBlockedRekorHostname(hostname)) {
+    throw new TransparencyAnchorError(
+      `Rekor URL host ${hostname} is a loopback, private, link-local, reserved, or metadata address; refusing (SSRF guard). ` +
+        UNSAFE_HATCH_HINT
+    );
+  }
+}
+
+const UNSAFE_HATCH_HINT =
+  "For a local/dev Rekor instance, re-run enable with --allow-unsafe-rekor-url " +
+  "(the override is recorded in the MAC'd config, the audit log, and 'anchor status').";
+
+/** Well-known metadata / local hostnames blocked by the default guard. */
+const BLOCKED_REKOR_HOSTNAMES = new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.goog",
+]);
+
+function isBlockedRekorHostname(hostname: string): boolean {
+  if (
+    BLOCKED_REKOR_HOSTNAMES.has(hostname) ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".internal")
+  ) {
+    return true;
+  }
+  // WHATWG URL parsing already normalized decimal/octal/hex IPv4 forms
+  // (e.g. http://0x7f000001) to dotted-quad, so a literal check on the
+  // parsed hostname covers the encoded variants.
+  const ipv4 = parseIpv4Literal(hostname);
+  if (ipv4) return isBlockedIpv4(ipv4);
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    return isBlockedIpv6(hostname.slice(1, -1));
+  }
+  return false;
+}
+
+function parseIpv4Literal(hostname: string): number[] | null {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  if (!match) return null;
+  const octets = match.slice(1).map(Number);
+  return octets.every((octet) => octet <= 255) ? octets : null;
+}
+
+function isBlockedIpv4(octets: number[]): boolean {
+  const [a, b] = octets as [number, number, number, number];
+  return (
+    a === 0 || // 0.0.0.0/8 "this network"
+    a === 10 || // RFC1918
+    a === 127 || // loopback
+    (a === 100 && b >= 64 && b <= 127) || // 100.64.0.0/10 CGNAT
+    (a === 169 && b === 254) || // link-local, incl. 169.254.169.254 metadata
+    (a === 172 && b >= 16 && b <= 31) || // RFC1918
+    (a === 192 && b === 0) || // 192.0.0.0/24 IETF + 192.0.2.0/24 TEST-NET-1
+    (a === 192 && b === 168) || // RFC1918
+    (a === 198 && (b === 18 || b === 19)) || // 198.18.0.0/15 benchmarking
+    a >= 224 // multicast + 240/4 reserved + broadcast
+  );
+}
+
+function isBlockedIpv6(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === "::" || h === "::1") return true; // unspecified / loopback
+  if (/^fe[89ab]/.test(h)) return true; // fe80::/10 link-local
+  if (/^f[cd]/.test(h)) return true; // fc00::/7 unique-local
+  if (h.startsWith("::ffff:")) {
+    // IPv4-mapped: recover the embedded IPv4 and apply the IPv4 ranges.
+    // WHATWG URL serializes the tail as two hex groups (::ffff:7f00:1).
+    const tail = h.slice("::ffff:".length);
+    const dotted = parseIpv4Literal(tail);
+    if (dotted) return isBlockedIpv4(dotted);
+    const groups = tail.split(":");
+    if (groups.length === 2 && groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) {
+      const hi = Number.parseInt(groups[0]!, 16);
+      const lo = Number.parseInt(groups[1]!, 16);
+      return isBlockedIpv4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff]);
+    }
+    return true; // unparseable mapped form: fail closed
+  }
+  return false;
 }
 
 // ---- Receipts -------------------------------------------------------------------
@@ -441,6 +572,13 @@ export async function anchorCheckpoint(
   const state = await readAnchorConfig(input);
   if (state.status !== "enabled") return { status: "disabled" };
   const config = state.config;
+
+  // Re-run the SSRF guard on every anchor attempt (fail closed): a config
+  // written by an older build, or copied in from elsewhere, must not
+  // re-arm an unsafe URL just because it authenticates. The recorded
+  // allow_unsafe_url override is honored because it sits under the same
+  // MAC and was set by an explicit operator action.
+  validateRekorUrl(config.rekor_url, config.allow_unsafe_url);
 
   const counter = input.record.counter;
   const checkpointHash = computeCheckpointHash(checkpointPayloadOf(input.record));
@@ -570,6 +708,9 @@ export async function anchorPendingCheckpoints(
 ): Promise<AnchorPendingResult | { status: "disabled" }> {
   const state = await readAnchorConfig(input);
   if (state.status !== "enabled") return { status: "disabled" };
+  // Fail closed before any work, even with zero pending checkpoints
+  // (anchorCheckpoint re-checks per attempt as well).
+  validateRekorUrl(state.config.rekor_url, state.config.allow_unsafe_url);
   const checkpoints = await readPersistedCheckpoints(input.storage);
   const result: AnchorPendingResult = {
     outcomes: [],

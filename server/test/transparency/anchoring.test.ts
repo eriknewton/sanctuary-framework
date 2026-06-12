@@ -39,11 +39,14 @@ import {
   type EnforcementCheckpointRecord,
 } from "../../src/transparency/checkpoint.js";
 import {
+  TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE,
   anchorCommitmentDigestHex,
   anchorCommitmentPreimage,
+  anchorConfigMacInput,
   anchorPublicKeyPem,
   deriveAnchorSigningKey,
   isAnchorReceipt,
+  type AnchorConfigData,
   type HashedRekordProposal,
 } from "../../src/transparency/anchor.js";
 import {
@@ -58,7 +61,10 @@ import {
   enableAnchoring,
   readAnchorConfig,
   readAnchorReceipts,
+  validateRekorUrl,
 } from "../../src/transparency/anchoring.js";
+import { hmacSha256 } from "../../src/core/hashing.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import {
   HttpRekorClient,
   RekorClientError,
@@ -134,10 +140,14 @@ interface FetchFixture {
   calls: Array<{ url: string; method: string; body?: string }>;
 }
 
-function rekorSuccessBody(uuid: string, logIndex: number): string {
+function rekorSuccessBody(
+  uuid: string,
+  logIndex: number,
+  bodyB64 = "ZHVtbXk="
+): string {
   return JSON.stringify({
     [uuid]: {
-      body: "ZHVtbXk=",
+      body: bodyB64,
       integratedTime: 1_760_000_000,
       logID: "c0ffee".padEnd(64, "0"),
       logIndex,
@@ -187,13 +197,18 @@ function makeFetchFixture(
   return { fetch, calls };
 }
 
-async function enable(env: Env, rekorUrl = "https://rekor.example.test") {
+async function enable(
+  env: Env,
+  rekorUrl = "https://rekor.example.test",
+  allowUnsafeRekorUrl = false
+) {
   return enableAnchoring({
     storage: env.storage,
     masterKey: env.masterKey,
     auditLog: env.auditLog,
     fortressId: FORTRESS_ID,
     rekorUrl,
+    ...(allowUnsafeRekorUrl ? { allowUnsafeRekorUrl: true } : {}),
   });
 }
 
@@ -394,19 +409,29 @@ describe("success path", () => {
     expect(fixture.calls).toHaveLength(1);
   });
 
-  it("treats a Rekor duplicate (409 + Location) as anchored with real log coordinates", async () => {
+  it("treats a Rekor duplicate (409 + Location) as anchored with real log coordinates after verifying the entry matches", async () => {
     const env = makeEnv();
     const record = await emitOne(env);
     await enable(env);
+    let postBody = "";
     const fixture = makeFetchFixture((url, init) => {
       if (init.method === "POST") {
+        postBody = init.body!;
         return {
           status: 409,
           body: "",
           headers: { location: "/api/v1/log/entries/uuid-dup" },
         };
       }
-      return { status: 200, body: rekorSuccessBody("uuid-dup", 41) };
+      // The duplicate entry's body carries OUR proposal (the honest case).
+      return {
+        status: 200,
+        body: rekorSuccessBody(
+          "uuid-dup",
+          41,
+          Buffer.from(postBody).toString("base64")
+        ),
+      };
     });
     const outcome = await anchorCheckpoint({
       storage: env.storage,
@@ -596,6 +621,7 @@ describe("tampered config refuses in both directions", () => {
         enabled: true,
         salt: "ab".repeat(32),
         rekor_url: "https://attacker.example",
+        allow_unsafe_url: false,
         consent: { accepted_at: new Date().toISOString(), text_sha256: "cd".repeat(32) },
       },
       mac: toBase64url(randomBytes(32)),
@@ -666,6 +692,262 @@ describe("tampered config refuses in both directions", () => {
   });
 });
 
+describe("Rekor URL guard (SSRF, fail-closed)", () => {
+  it("requires https at enable time unless the unsafe override is passed", async () => {
+    const env = makeEnv();
+    await expect(enable(env, "http://rekor.example.test")).rejects.toThrow(
+      /must use https/
+    );
+    expect(
+      await readAnchorConfig({ storage: env.storage, masterKey: env.masterKey })
+    ).toEqual({ status: "absent" });
+  });
+
+  it("rejects loopback, private, link-local, reserved, and metadata IP literals (including encoded forms)", () => {
+    for (const url of [
+      "https://127.0.0.1",
+      "https://127.8.9.10:3000",
+      "https://0.0.0.0",
+      "https://10.1.2.3",
+      "https://100.64.0.1",
+      "https://169.254.169.254", // AWS/GCP metadata endpoint
+      "https://169.254.0.7",
+      "https://172.16.0.1",
+      "https://172.31.255.255",
+      "https://192.0.0.192",
+      "https://192.168.1.10",
+      "https://198.18.0.1",
+      "https://224.0.0.1",
+      "https://255.255.255.255",
+      "https://0x7f000001", // hex-encoded 127.0.0.1 (WHATWG-normalized)
+      "https://2130706433", // integer-encoded 127.0.0.1
+      "https://[::1]",
+      "https://[::]",
+      "https://[fe80::1]",
+      "https://[fd00::1]",
+      "https://[fc00::1]",
+      "https://[::ffff:127.0.0.1]", // IPv4-mapped loopback
+      "https://[::ffff:a9fe:a9fe]", // IPv4-mapped 169.254.169.254
+    ]) {
+      expect(() => validateRekorUrl(url, false), url).toThrow(/SSRF guard/);
+    }
+  });
+
+  it("rejects well-known metadata and local hostnames", () => {
+    for (const url of [
+      "https://metadata.google.internal",
+      "https://metadata.google.internal./", // trailing-dot variant is not exempted
+      "https://anything.internal",
+      "https://metadata.goog",
+      "https://localhost",
+      "https://localhost:3000",
+      "https://dev.localhost",
+    ]) {
+      // The trailing-dot hostname keeps its dot in WHATWG parsing; the
+      // suffix check catches ".internal" while the exact-match set catches
+      // the rest. Validate each form rejects.
+      expect(() => validateRekorUrl(url, false), url).toThrow(
+        TransparencyAnchorError
+      );
+    }
+  });
+
+  it("accepts the default public Rekor URL and ordinary https hosts", async () => {
+    expect(() => validateRekorUrl("https://rekor.sigstore.dev", false)).not.toThrow();
+    expect(() => validateRekorUrl("https://rekor.example.test:8443/prefix", false)).not.toThrow();
+    const env = makeEnv();
+    const config = await enableAnchoring({
+      storage: env.storage,
+      masterKey: env.masterKey,
+      auditLog: env.auditLog,
+      fortressId: FORTRESS_ID,
+    });
+    expect(config.rekor_url).toBe("https://rekor.sigstore.dev");
+    expect(config.allow_unsafe_url).toBe(false);
+  });
+
+  it("the unsafe override never allows non-http(s) schemes", () => {
+    expect(() => validateRekorUrl("file:///etc/passwd", true)).toThrow(
+      /must be http/
+    );
+    expect(() => validateRekorUrl("gopher://127.0.0.1", true)).toThrow(
+      /must be http/
+    );
+  });
+
+  it("escape hatch: --allow-unsafe-rekor-url permits a local dev log and is recorded in the config AND the audit entry", async () => {
+    const env = makeEnv();
+    const config = await enable(env, "http://127.0.0.1:3000", true);
+    expect(config.allow_unsafe_url).toBe(true);
+    expect(config.rekor_url).toBe("http://127.0.0.1:3000");
+    const entries = await auditOps(env, "transparency_anchoring_enabled");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.details?.allow_unsafe_rekor_url).toBe(true);
+    // The safe default is recorded explicitly too (never ambiguous).
+    const env2 = makeEnv();
+    await enable(env2);
+    const safeEntries = await auditOps(env2, "transparency_anchoring_enabled");
+    expect(safeEntries[0]!.details?.allow_unsafe_rekor_url).toBe(false);
+  });
+
+  it("the unsafe override is never inherited: a plain re-enable over an unsafe URL fails closed", async () => {
+    const env = makeEnv();
+    await enable(env, "http://127.0.0.1:3000", true);
+    await disableAnchoring({
+      storage: env.storage,
+      masterKey: env.masterKey,
+      auditLog: env.auditLog,
+      fortressId: FORTRESS_ID,
+    });
+    // Re-enable without the flag inherits the URL but NOT the override.
+    await expect(
+      enableAnchoring({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        fortressId: FORTRESS_ID,
+      })
+    ).rejects.toThrow(/must use https/);
+  });
+
+  it("revalidates at anchor time: an authenticated config carrying an unsafe URL without the override refuses with zero network calls", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    // Simulate a config written by an older build (valid MAC, no override,
+    // unsafe URL): forge the envelope with the real master key.
+    const data: AnchorConfigData = {
+      enabled: true,
+      salt: "ab".repeat(32),
+      rekor_url: "http://169.254.169.254/latest/meta-data",
+      allow_unsafe_url: false,
+      consent: {
+        accepted_at: new Date().toISOString(),
+        text_sha256: "cd".repeat(32),
+      },
+    };
+    const macKey = derivePurposeKey(
+      env.masterKey,
+      TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE
+    );
+    const envelope = {
+      __sanctuary_transparency_anchor_config_v1: true,
+      data,
+      mac: toBase64url(hmacSha256(macKey, anchorConfigMacInput(data))),
+    };
+    await env.storage.write(
+      "_meta",
+      TRANSPARENCY_ANCHOR_CONFIG_META_KEY,
+      stringToBytes(JSON.stringify(envelope))
+    );
+    const fixture = makeFetchFixture();
+    await expect(
+      anchorCheckpoint({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        record,
+        fetchFn: fixture.fetch,
+      })
+    ).rejects.toThrow(/must use https/);
+    expect(fixture.calls).toHaveLength(0);
+    // The catch-up verb refuses the same way, even with nothing pending.
+    await expect(
+      anchorPendingCheckpoints({
+        storage: env.storage,
+        masterKey: env.masterKey,
+        auditLog: env.auditLog,
+        fetchFn: fixture.fetch,
+      })
+    ).rejects.toThrow(/must use https/);
+    expect(fixture.calls).toHaveLength(0);
+  });
+});
+
+describe("409 duplicate handling (verified, same-origin, time-bounded)", () => {
+  it("a cross-origin Location is a failure receipt + critical audit entry, never anchored and never fetched", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    await enable(env);
+    const fixture = makeFetchFixture((url, init) => {
+      if (init.method === "POST") {
+        return {
+          status: 409,
+          body: "",
+          headers: { location: "https://evil.example/api/v1/log/entries/uuid-x" },
+        };
+      }
+      throw new Error("the off-origin Location must never be fetched");
+    });
+    const outcome = await anchorCheckpoint({
+      storage: env.storage,
+      masterKey: env.masterKey,
+      auditLog: env.auditLog,
+      record,
+      fetchFn: fixture.fetch,
+    });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error).toContain("off-origin");
+    }
+    // Only the POST happened; the cross-origin GET was refused.
+    expect(fixture.calls).toHaveLength(1);
+    expect(fixture.calls[0]!.method).toBe("POST");
+    const receipts = await readAnchorReceipts(env.storage);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.status).toBe("failed");
+    expect(await auditOps(env, "transparency_anchor_failed")).toHaveLength(1);
+    expect(await auditOps(env, "transparency_checkpoint_anchored")).toHaveLength(0);
+  });
+
+  it("a duplicate entry whose body does not match the submitted proposal is a failure receipt + critical audit entry", async () => {
+    const env = makeEnv();
+    const record = await emitOne(env);
+    await enable(env);
+    // The fetched entry parses cleanly but carries SOMEONE ELSE'S proposal.
+    const foreign = {
+      apiVersion: "0.0.1",
+      kind: "hashedrekord",
+      spec: {
+        data: { hash: { algorithm: "sha256", value: "99".repeat(32) } },
+        signature: { content: "Zm9yZWlnbg==", publicKey: { content: "cGVt" } },
+      },
+    };
+    const fixture = makeFetchFixture((url, init) => {
+      if (init.method === "POST") {
+        return {
+          status: 409,
+          body: "",
+          headers: { location: "/api/v1/log/entries/uuid-foreign" },
+        };
+      }
+      return {
+        status: 200,
+        body: rekorSuccessBody(
+          "uuid-foreign",
+          7,
+          Buffer.from(JSON.stringify(foreign)).toString("base64")
+        ),
+      };
+    });
+    const outcome = await anchorCheckpoint({
+      storage: env.storage,
+      masterKey: env.masterKey,
+      auditLog: env.auditLog,
+      record,
+      fetchFn: fixture.fetch,
+    });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error).toContain("does not match the submitted proposal");
+    }
+    const receipts = await readAnchorReceipts(env.storage);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.status).toBe("failed");
+    expect(await auditOps(env, "transparency_anchor_failed")).toHaveLength(1);
+    expect(await auditOps(env, "transparency_checkpoint_anchored")).toHaveLength(0);
+  });
+});
+
 describe("HttpRekorClient", () => {
   const proposal: HashedRekordProposal = {
     apiVersion: "0.0.1",
@@ -704,6 +986,148 @@ describe("HttpRekorClient", () => {
       fetchFn: fixture.fetch,
     });
     await expect(client.submit(proposal)).rejects.toThrow(RekorClientError);
+  });
+
+  function duplicateResponder(location: string) {
+    return (url: string, init: { method: string; body?: string }) => {
+      if (init.method === "POST") {
+        return { status: 409, body: "", headers: { location } };
+      }
+      return {
+        status: 200,
+        body: rekorSuccessBody(
+          "uuid-dup",
+          41,
+          Buffer.from(JSON.stringify(proposal)).toString("base64")
+        ),
+      };
+    };
+  }
+
+  it("follows a same-origin ABSOLUTE Location on 409", async () => {
+    const fixture = makeFetchFixture(
+      duplicateResponder("https://rekor.example.test/api/v1/log/entries/uuid-dup")
+    );
+    const client = new HttpRekorClient({
+      baseUrl: "https://rekor.example.test",
+      fetchFn: fixture.fetch,
+    });
+    const result = await client.submit(proposal);
+    expect(result.duplicate).toBe(true);
+    expect(result.entry.uuid).toBe("uuid-dup");
+    expect(fixture.calls[1]!.url).toBe(
+      "https://rekor.example.test/api/v1/log/entries/uuid-dup"
+    );
+  });
+
+  it("refuses a cross-origin 409 Location (absolute URL) without fetching it", async () => {
+    for (const location of [
+      "https://evil.example/api/v1/log/entries/uuid-dup",
+      "http://rekor.example.test/api/v1/log/entries/uuid-dup", // scheme downgrade = different origin
+      "https://rekor.example.test:8443/api/v1/log/entries/uuid-dup", // port change = different origin
+    ]) {
+      const fixture = makeFetchFixture(duplicateResponder(location));
+      const client = new HttpRekorClient({
+        baseUrl: "https://rekor.example.test",
+        fetchFn: fixture.fetch,
+      });
+      await expect(client.submit(proposal)).rejects.toThrow(/off-origin/);
+      expect(fixture.calls, location).toHaveLength(1); // POST only, no GET
+    }
+  });
+
+  it("refuses a protocol-relative 409 Location (//host/...) without fetching it", async () => {
+    const fixture = makeFetchFixture(
+      duplicateResponder("//evil.example/api/v1/log/entries/uuid-dup")
+    );
+    const client = new HttpRekorClient({
+      baseUrl: "https://rekor.example.test",
+      fetchFn: fixture.fetch,
+    });
+    await expect(client.submit(proposal)).rejects.toThrow(/off-origin/);
+    expect(fixture.calls).toHaveLength(1);
+  });
+
+  it("a duplicate entry without a body cannot be confirmed and is an error", async () => {
+    const fixture = makeFetchFixture((url, init) => {
+      if (init.method === "POST") {
+        return {
+          status: 409,
+          body: "",
+          headers: { location: "/api/v1/log/entries/uuid-dup" },
+        };
+      }
+      // Entry parses (logIndex etc. present) but carries no body field.
+      return {
+        status: 200,
+        body: JSON.stringify({
+          "uuid-dup": {
+            integratedTime: 1_760_000_000,
+            logID: "c0ffee".padEnd(64, "0"),
+            logIndex: 41,
+          },
+        }),
+      };
+    });
+    const client = new HttpRekorClient({
+      baseUrl: "https://rekor.example.test",
+      fetchFn: fixture.fetch,
+    });
+    await expect(client.submit(proposal)).rejects.toThrow(/carried no body/);
+  });
+
+  it("a duplicate entry whose body is not base64 JSON is an error", async () => {
+    const fixture = makeFetchFixture((url, init) => {
+      if (init.method === "POST") {
+        return {
+          status: 409,
+          body: "",
+          headers: { location: "/api/v1/log/entries/uuid-dup" },
+        };
+      }
+      return { status: 200, body: rekorSuccessBody("uuid-dup", 41, "!!!not-base64-json!!!") };
+    });
+    const client = new HttpRekorClient({
+      baseUrl: "https://rekor.example.test",
+      fetchFn: fixture.fetch,
+    });
+    await expect(client.submit(proposal)).rejects.toThrow(/did not decode/);
+  });
+
+  it("applies the submit timeout (same abort signal) to the duplicate-entry GET", async () => {
+    let getSignal: AbortSignal | undefined;
+    const fetchFn: FetchLike = async (url, init) => {
+      if (init.method === "POST") {
+        return {
+          status: 409,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "location"
+                ? "/api/v1/log/entries/uuid-dup"
+                : null,
+          },
+          text: async () => "",
+        };
+      }
+      getSignal = init.signal;
+      // Hang until the client's timeout aborts us; if the signal were not
+      // wired through, this promise would never settle and the test would
+      // time out instead of passing.
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () =>
+          reject(new Error("aborted by timeout signal"))
+        );
+      });
+    };
+    const client = new HttpRekorClient({
+      baseUrl: "https://rekor.example.test",
+      fetchFn,
+      timeoutMs: 25,
+    });
+    await expect(client.submit(proposal)).rejects.toThrow(
+      /duplicate-entry lookup failed.*aborted by timeout signal/
+    );
+    expect(getSignal).toBeDefined();
   });
 
   it("surfaces the HTTP status and body on rejection", async () => {

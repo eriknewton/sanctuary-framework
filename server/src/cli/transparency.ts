@@ -150,7 +150,7 @@ async function runAnchorCommand(
     const opts = parseFlags(
       rest,
       ["--fortress", "--passphrase", "--rekor-url"],
-      ["--yes", "--json"]
+      ["--yes", "--json", "--allow-unsafe-rekor-url"]
     );
     const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
@@ -176,7 +176,12 @@ async function runAnchorCommand(
         anchoring:
           state.status === "absent" ? "off (never enabled; default)" : state.status,
         ...(state.status !== "absent"
-          ? { rekor_url: state.config.rekor_url }
+          ? {
+              rekor_url: state.config.rekor_url,
+              // Surfaced unconditionally so the unsafe-URL override can
+              // never be silently on.
+              allow_unsafe_rekor_url: state.config.allow_unsafe_url,
+            }
           : {}),
         receipts: {
           anchored: anchored.length,
@@ -190,6 +195,12 @@ async function runAnchorCommand(
         write(out, `Anchoring: ${payload.anchoring}\n`);
         if (state.status !== "absent") {
           write(out, `Rekor log: ${state.config.rekor_url}\n`);
+          if (state.config.allow_unsafe_url) {
+            write(
+              out,
+              `WARNING: --allow-unsafe-rekor-url is in effect for this log URL (http and loopback/private/metadata addresses permitted). Re-run "anchor enable" without the flag to restore the default URL guard.\n`
+            );
+          }
         }
         write(
           out,
@@ -240,6 +251,9 @@ async function runAnchorCommand(
         ...(opts.values["--rekor-url"]
           ? { rekorUrl: opts.values["--rekor-url"] }
           : {}),
+        ...(opts.flags["--allow-unsafe-rekor-url"]
+          ? { allowUnsafeRekorUrl: true }
+          : {}),
       });
       write(
         out,
@@ -247,6 +261,12 @@ async function runAnchorCommand(
           `Each future checkpoint emission publishes a salted hash commitment to the public log.\n` +
           `Anchor existing checkpoints now with: sanctuary transparency anchor now\n`
       );
+      if (config.allow_unsafe_url) {
+        write(
+          out,
+          `WARNING: --allow-unsafe-rekor-url is in effect: the URL guard (https-only, no loopback/private/link-local/metadata addresses) is bypassed for this log URL. The override is recorded in the config and the audit log, and "anchor status" reports it.\n`
+        );
+      }
       return 0;
     }
 
@@ -897,6 +917,13 @@ Options:
   --fortress <path>     Override fortress path.
   --passphrase <val>    Fortress passphrase (or SANCTUARY_PASSPHRASE).
   --rekor-url <url>     Override the transparency log URL (enable only).
+                        Must be https and must not point at a loopback,
+                        private, link-local, or metadata address.
+  --allow-unsafe-rekor-url
+                        Escape hatch for a LOCAL/DEV Rekor instance:
+                        bypasses the URL guard above (enable only). Must
+                        be re-passed at every enable; recorded in the
+                        config and the audit log, and reported by status.
   --yes                 Non-interactive consent confirmation (enable only).
   --json                Machine-readable output (status only).
 `

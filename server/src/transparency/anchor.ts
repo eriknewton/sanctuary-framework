@@ -221,6 +221,13 @@ export interface AnchorConfigData {
    * across disable/re-enable so earlier anchors stay verifiable. */
   salt: string;
   rekor_url: string;
+  /** SSRF escape hatch for local/dev Rekor instances: when true, the URL
+   * guard (https-only, no loopback/private/link-local/metadata addresses)
+   * is bypassed. Set ONLY by passing --allow-unsafe-rekor-url at enable
+   * time; never inherited across re-enables; recorded here (under the
+   * config MAC), in the enable audit entry, and in `anchor status` output
+   * so it can never be silently on. */
+  allow_unsafe_url: boolean;
   /** Consent record: when the operator confirmed, and the SHA-256 of the
    * exact consent text they confirmed. */
   consent: {
@@ -239,6 +246,7 @@ export function isAnchorConfigData(value: unknown): value is AnchorConfigData {
     HEX64.test(candidate.salt) &&
     typeof candidate.rekor_url === "string" &&
     candidate.rekor_url.length > 0 &&
+    typeof candidate.allow_unsafe_url === "boolean" &&
     !!consent &&
     typeof consent === "object" &&
     typeof consent.accepted_at === "string" &&

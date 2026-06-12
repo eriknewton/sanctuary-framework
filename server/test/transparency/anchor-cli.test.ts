@@ -126,7 +126,7 @@ describe("sanctuary transparency anchor CLI", () => {
     expect(status.out.text()).toContain("off (never enabled; default)");
   });
 
-  it("enable --yes prints the consent statement, records it, and status reflects it", async () => {
+  it("enable --yes prints the consent statement, records it, and status reflects it (incl. the unsafe-URL override)", async () => {
     const { fortress } = await makeFortress();
     const enable = run([
       "anchor",
@@ -137,11 +137,13 @@ describe("sanctuary transparency anchor CLI", () => {
       PASSPHRASE,
       "--rekor-url",
       "http://127.0.0.1:1",
+      "--allow-unsafe-rekor-url",
       "--yes",
     ]);
     expect(await enable.code).toBe(0);
     expect(enable.out.text()).toContain("salted SHA-256 hash");
     expect(enable.out.text()).toContain("Anchoring ENABLED");
+    expect(enable.out.text()).toContain("--allow-unsafe-rekor-url is in effect");
 
     const status = run([
       "anchor",
@@ -156,9 +158,65 @@ describe("sanctuary transparency anchor CLI", () => {
     const parsed = JSON.parse(status.out.text()) as {
       anchoring: string;
       rekor_url: string;
+      allow_unsafe_rekor_url: boolean;
     };
     expect(parsed.anchoring).toBe("enabled");
     expect(parsed.rekor_url).toBe("http://127.0.0.1:1");
+    // The override can never be silently on: machine AND human status say so.
+    expect(parsed.allow_unsafe_rekor_url).toBe(true);
+    const human = run([
+      "anchor",
+      "status",
+      "--fortress",
+      fortress,
+      "--passphrase",
+      PASSPHRASE,
+    ]);
+    expect(await human.code).toBe(0);
+    expect(human.out.text()).toContain("--allow-unsafe-rekor-url is in effect");
+  });
+
+  it("enable refuses an http or private-address Rekor URL without --allow-unsafe-rekor-url (SSRF guard)", async () => {
+    const { fortress } = await makeFortress();
+    const httpAttempt = run([
+      "anchor",
+      "enable",
+      "--fortress",
+      fortress,
+      "--passphrase",
+      PASSPHRASE,
+      "--rekor-url",
+      "http://127.0.0.1:1",
+      "--yes",
+    ]);
+    expect(await httpAttempt.code).toBe(1);
+    expect(httpAttempt.err.text()).toContain("must use https");
+
+    const metadataAttempt = run([
+      "anchor",
+      "enable",
+      "--fortress",
+      fortress,
+      "--passphrase",
+      PASSPHRASE,
+      "--rekor-url",
+      "https://169.254.169.254",
+      "--yes",
+    ]);
+    expect(await metadataAttempt.code).toBe(1);
+    expect(metadataAttempt.err.text()).toContain("SSRF guard");
+
+    // Nothing changed: status still reports the default-off state.
+    const status = run([
+      "anchor",
+      "status",
+      "--fortress",
+      fortress,
+      "--passphrase",
+      PASSPHRASE,
+    ]);
+    expect(await status.code).toBe(0);
+    expect(status.out.text()).toContain("off (never enabled; default)");
   });
 
   it("default OFF: checkpoint emission with anchoring never enabled has no anchor activity", async () => {
@@ -204,6 +262,7 @@ describe("sanctuary transparency anchor CLI", () => {
       PASSPHRASE,
       "--rekor-url",
       "http://127.0.0.1:1",
+      "--allow-unsafe-rekor-url",
       "--yes",
     ]);
     expect(await enable.code).toBe(0);

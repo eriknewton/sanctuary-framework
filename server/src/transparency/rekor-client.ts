@@ -75,64 +75,157 @@ export class HttpRekorClient implements RekorClient {
   async submit(proposal: HashedRekordProposal): Promise<RekorSubmitResult> {
     const url = `${this.baseUrl}${REKOR_ENTRIES_PATH}`;
     const controller = new AbortController();
+    // ONE timeout budget covers the whole submission, including the
+    // duplicate-entry lookup a 409 requires: the GET runs under the same
+    // abort signal as the POST, so a stalling log cannot hold the caller
+    // past timeoutMs.
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     if (typeof timer.unref === "function") timer.unref();
-    let response: Awaited<ReturnType<FetchLike>>;
     try {
-      response = await this.fetchFn(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify(proposal),
-        signal: controller.signal,
-      });
-    } catch (err) {
+      let response: Awaited<ReturnType<FetchLike>>;
+      try {
+        response = await this.fetchFn(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify(proposal),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw new RekorClientError(
+          `Rekor unreachable (${url}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+
+      if (response.status === 201) {
+        return { entry: (await parseEntryBody(response)).entry, duplicate: false };
+      }
+      if (response.status === 409) {
+        // The identical entry already exists. Rekor points at it via the
+        // Location header; fetch it so the receipt carries real log
+        // coordinates rather than a bare "duplicate" marker. The redirect
+        // is followed ONLY same-origin: a Location pointing anywhere else
+        // is a failure, never an outbound request (SSRF guard) and never
+        // "anchored" on someone else's say-so.
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new RekorClientError(
+            "Rekor reported a duplicate entry (409) without a Location header"
+          );
+        }
+        const entryUrl = this.resolveSameOriginLocation(location);
+        let existing: Awaited<ReturnType<FetchLike>>;
+        try {
+          existing = await this.fetchFn(entryUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: controller.signal,
+          });
+        } catch (err) {
+          throw new RekorClientError(
+            `Rekor duplicate-entry lookup failed (${entryUrl}): ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        if (existing.status !== 200) {
+          throw new RekorClientError(
+            `Rekor duplicate-entry lookup returned HTTP ${existing.status}`
+          );
+        }
+        const { entry, bodyB64 } = await parseEntryBody(existing);
+        // "Duplicate" is only true if the fetched entry IS our proposal:
+        // same digest, same signature, same public key. Anything else is
+        // a failure, never recorded as anchored.
+        assertDuplicateMatchesProposal(bodyB64, proposal);
+        return { entry, duplicate: true };
+      }
+      const bodyText = await response.text().catch(() => "");
       throw new RekorClientError(
-        `Rekor unreachable (${url}): ${err instanceof Error ? err.message : String(err)}`
+        `Rekor rejected the anchor (HTTP ${response.status})${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`
       );
     } finally {
       clearTimeout(timer);
     }
+  }
 
-    if (response.status === 201) {
-      return { entry: await parseEntryBody(response), duplicate: false };
+  /**
+   * Resolve a 409 Location header against the configured Rekor base URL,
+   * accepting it ONLY when the resolved origin exactly matches the
+   * configured origin. Relative paths resolve same-origin by construction;
+   * absolute URLs (and protocol-relative //host forms, which standard URL
+   * resolution sends off-origin) must match exactly or are refused.
+   */
+  private resolveSameOriginLocation(location: string): string {
+    let base: URL;
+    try {
+      base = new URL(this.baseUrl);
+    } catch {
+      throw new RekorClientError(
+        `configured Rekor base URL is not a valid URL: ${this.baseUrl}`
+      );
     }
-    if (response.status === 409) {
-      // The identical entry already exists. Rekor points at it via the
-      // Location header; fetch it so the receipt carries real log
-      // coordinates rather than a bare "duplicate" marker.
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new RekorClientError(
-          "Rekor reported a duplicate entry (409) without a Location header"
-        );
-      }
-      const entryUrl = location.startsWith("http")
-        ? location
-        : `${this.baseUrl}${location}`;
-      let existing: Awaited<ReturnType<FetchLike>>;
-      try {
-        existing = await this.fetchFn(entryUrl, {
-          method: "GET",
-          headers: { Accept: "application/json" },
-        });
-      } catch (err) {
-        throw new RekorClientError(
-          `Rekor duplicate-entry lookup failed (${entryUrl}): ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      if (existing.status !== 200) {
-        throw new RekorClientError(
-          `Rekor duplicate-entry lookup returned HTTP ${existing.status}`
-        );
-      }
-      return { entry: await parseEntryBody(existing), duplicate: true };
+    let resolved: URL;
+    try {
+      resolved = new URL(location, base);
+    } catch {
+      throw new RekorClientError(
+        `Rekor duplicate (409) Location header is not a valid URL: ${location}`
+      );
     }
-    const bodyText = await response.text().catch(() => "");
+    if (resolved.origin !== base.origin || resolved.origin === "null") {
+      throw new RekorClientError(
+        `Rekor duplicate (409) Location header points off-origin (${resolved.origin}, expected ${base.origin}); refusing to follow it`
+      );
+    }
+    return resolved.toString();
+  }
+}
+
+/**
+ * Verify that a duplicate entry fetched via a 409 Location actually
+ * contains the proposal we submitted. Rekor entries carry the canonical
+ * entry document base64-encoded in `body`; the digest, signature, and
+ * public key in it must match the submitted proposal byte-for-byte.
+ * A missing, undecodable, or mismatched body is a FAILURE: the receipt
+ * must never claim "anchored" pointing at someone else's entry.
+ */
+function assertDuplicateMatchesProposal(
+  bodyB64: string | undefined,
+  proposal: HashedRekordProposal
+): void {
+  if (!bodyB64) {
     throw new RekorClientError(
-      `Rekor rejected the anchor (HTTP ${response.status})${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`
+      "Rekor duplicate entry carried no body; cannot confirm it matches the submitted proposal"
+    );
+  }
+  let entry: unknown;
+  try {
+    entry = JSON.parse(Buffer.from(bodyB64, "base64").toString("utf8"));
+  } catch {
+    throw new RekorClientError(
+      "Rekor duplicate entry body did not decode to JSON; cannot confirm it matches the submitted proposal"
+    );
+  }
+  const candidate = entry as {
+    kind?: unknown;
+    spec?: {
+      data?: { hash?: { algorithm?: unknown; value?: unknown } };
+      signature?: { content?: unknown; publicKey?: { content?: unknown } };
+    };
+  } | null;
+  const matches =
+    !!candidate &&
+    typeof candidate === "object" &&
+    candidate.kind === "hashedrekord" &&
+    candidate.spec?.data?.hash?.algorithm === "sha256" &&
+    candidate.spec?.data?.hash?.value === proposal.spec.data.hash.value &&
+    candidate.spec?.signature?.content === proposal.spec.signature.content &&
+    candidate.spec?.signature?.publicKey?.content ===
+      proposal.spec.signature.publicKey.content;
+  if (!matches) {
+    throw new RekorClientError(
+      "Rekor duplicate entry does not match the submitted proposal (digest, signature, or public key differ); refusing to record it as anchored"
     );
   }
 }
@@ -141,10 +234,12 @@ export class HttpRekorClient implements RekorClient {
  * Parse Rekor's entry map `{ "<uuid>": { logIndex, logID, integratedTime,
  * verification, ... } }`. Strict: anything off-shape is an error, because a
  * receipt must never claim "anchored" on evidence that does not parse.
+ * Also surfaces the raw base64 `body` field (when present) so the
+ * duplicate path can verify the entry against the submitted proposal.
  */
 async function parseEntryBody(
   response: Awaited<ReturnType<FetchLike>>
-): Promise<RekorEntryRef> {
+): Promise<{ entry: RekorEntryRef; bodyB64?: string }> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(await response.text());
@@ -184,12 +279,15 @@ async function parseEntryBody(
   }
   const verification = candidate.verification;
   return {
-    uuid,
-    log_index: logIndex,
-    log_id: logId,
-    integrated_time: integratedTime,
-    ...(verification && typeof verification === "object" && !Array.isArray(verification)
-      ? { verification: verification as Record<string, unknown> }
-      : {}),
+    entry: {
+      uuid,
+      log_index: logIndex,
+      log_id: logId,
+      integrated_time: integratedTime,
+      ...(verification && typeof verification === "object" && !Array.isArray(verification)
+        ? { verification: verification as Record<string, unknown> }
+        : {}),
+    },
+    ...(typeof candidate.body === "string" ? { bodyB64: candidate.body } : {}),
   };
 }
