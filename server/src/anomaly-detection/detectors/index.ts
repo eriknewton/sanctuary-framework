@@ -8,9 +8,12 @@
  * Chi-3 code change is needed when Chi-4+ adds a new detector.
  *
  * Chi-1 ships:    per-agent-activity (Chi-1 PR #189)
- * Chi-4 ships:    cross-agent-timing, tool-call-sequence (this PR)
- * Chi-5+ ships:   audit-event-class distribution drift,
- *                 credential-use sequence patterns, etc.
+ * Chi-4 ships:    cross-agent-timing, tool-call-sequence
+ * Chi-5 ships:    audit-event-class distribution drift
+ * Chi-6 ships:    credential-use-sequence, cross-agent-distribution
+ *                 (this PR)
+ * Chi-7+ ships:   root-cause hints, time-of-day-conditioned
+ *                 baselines, etc.
  *
  * Pattern mirrors Phi-1's `PHI1_BASELINE_CATALOG`. Default
  * subscription set is empty; operator opts in.
@@ -41,6 +44,14 @@ import {
   AuditEventClassDistributionDetector,
   AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
 } from "./audit-event-class-distribution-detector.js";
+import {
+  CredentialUseSequenceDetector,
+  CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
+} from "./credential-use-sequence-detector.js";
+import {
+  CrossAgentDistributionDetector,
+  CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
+} from "./cross-agent-distribution-detector.js";
 import type { AnomalyDetector } from "../types.js";
 
 export interface AnomalyDetectorCatalogEntry {
@@ -74,6 +85,18 @@ export const ANOMALY_DETECTOR_CATALOG: AnomalyDetectorCatalogEntry[] = [
       "Per-agent audit-event class distribution PSI over the operation mix, with top per-class drift attribution. Catches behavioral-mix shifts at stable event volume.",
     factory: () => new AuditEventClassDistributionDetector(),
   },
+  {
+    detectorId: CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
+    description:
+      "Per-agent credential-use sequence shape: credential-event count, distinct credentials used, repeated credential-pair score, max 5-minute burst. Catches credential enumeration and burst-dump shapes.",
+    factory: () => new CredentialUseSequenceDetector(),
+  },
+  {
+    detectorId: CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
+    description:
+      "Per-agent peer-relative activity z-scores plus peer count over a 24h window. Catches one agent diverging from its cohort when fortress-wide drift masks self-history baselines.",
+    factory: () => new CrossAgentDistributionDetector(),
+  },
 ];
 
 export {
@@ -85,4 +108,8 @@ export {
   TOOL_CALL_SEQUENCE_DETECTOR_ID,
   AuditEventClassDistributionDetector,
   AUDIT_EVENT_CLASS_DISTRIBUTION_DETECTOR_ID,
+  CredentialUseSequenceDetector,
+  CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
+  CrossAgentDistributionDetector,
+  CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
 };
