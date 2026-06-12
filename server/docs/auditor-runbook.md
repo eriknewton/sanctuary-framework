@@ -114,6 +114,96 @@ prove packets were blocked on the wire.
    log recomputation needs Sanctuary storage and audit-log code, so it stays on
    the full `sanctuary verify-transparency` CLI.
 
+## Anchor Verification (PR-3, for fortresses with anchoring enabled)
+
+When the operator opted into external anchoring (PR-2), each checkpoint's
+salted commitment was published to a public Sigstore Rekor log. The auditor
+can then close the freshness and fork gaps that a bundle alone cannot.
+
+Operator steps (in addition to the bundle export above):
+
+1. Export the anchor evidence file:
+
+   ```sh
+   sanctuary transparency anchor export --output anchors.json
+   ```
+
+   The file carries the local commitment salt, the derived anchoring public
+   key, and every anchor receipt (including the Rekor entry bodies and
+   inclusion proofs captured at anchor time). It is assembled entirely from
+   local state and transmits nothing. The salt links the pseudonymous public
+   anchors to this fortress's history for whoever holds the file; hand it to
+   auditors deliberately, alongside the bundle.
+
+Auditor steps:
+
+1. Pin the Rekor log's public key OUT-OF-BAND (do not take it from the
+   operator). For the public-good instance:
+
+   ```sh
+   curl -sS https://rekor.sigstore.dev/api/v1/log/publicKey -o rekor-key.pem
+   ```
+
+   Pin it the same way you pin the operator's signing-key fingerprint.
+
+2. Verify offline (works on the standalone artifact too):
+
+   ```sh
+   node verify-transparency.js --input transparency-bundle.json \
+     --public-key-file castle-pinned-pubkey.bin \
+     --check-anchors anchors.json --rekor-public-key-file rekor-key.pem
+   ```
+
+   Per anchored checkpoint this recomputes the salted commitment against the
+   bundle's actual checkpoint, rebinds the Rekor entry body (digest, the
+   fortress anchoring key, its P-256 signature, the RFC 6962 leaf hash),
+   requires the inclusion proof's leaf index to match the entry's signed log
+   index and to lie inside the claimed tree, recomputes the Merkle inclusion
+   proof, and verifies the signed entry timestamp and checkpoint-note
+   signature under your pinned log key. The report states anchor coverage
+   plainly; missing evidence is "unverified", never silently passed.
+
+   The pinned log key is what makes verification log-attested. Without
+   `--rekor-public-key-file` the tool checks internal consistency only:
+   every input it has (salt, anchoring key, entry bodies, proofs, roots,
+   notes, timestamps) comes from the operator-supplied files and could have
+   been fabricated together. Such anchors are reported "consistent", never
+   "verified", the log-signature checks are honestly listed under
+   `not_checked`, the report says so on its trust-level line, and freshness
+   cannot be asserted.
+
+3. Apply the freshness policy you require:
+
+   ```sh
+   ... --check-anchors anchors.json --rekor-public-key-file rekor-key.pem --expect-fresh 36h
+   ```
+
+   `FAIL` with `anchor_freshness_stale` means the newest log-attested anchor
+   is older than your window: you are being shown a stale view.
+
+4. If you obtained a second bundle from another observer, check for split
+   views:
+
+   ```sh
+   ... --compare other-observer-bundle.json
+   ```
+
+   `fork_detected` means the same counter exists in both bundles with
+   different signed contents: divergent histories were presented.
+
+5. Optionally refresh evidence directly from the log (full CLI only; the
+   standalone artifact never performs network I/O):
+
+   ```sh
+   sanctuary verify-transparency --input transparency-bundle.json \
+     --public-key-file castle-pinned-pubkey.bin \
+     --check-anchors anchors.json --rekor-public-key-file rekor-key.pem --fetch-anchors
+   ```
+
+   A log that denies a claimed entry (`anchor_entry_not_found`) refutes the
+   receipt; an unreachable log is reported and the run falls back to
+   receipt-embedded material where present.
+
 ## Drill Criteria
 
 The PR-1 synthetic fixtures pre-declare the coordinator-run drill criteria:
@@ -128,6 +218,26 @@ The PR-1 synthetic fixtures pre-declare the coordinator-run drill criteria:
 The fixture test is `server/test/transparency/auditor-pack-drill.test.ts`.
 It uses synthetic local keys and logs, no network, no wall-clock soak, and no
 production signer dependency.
+
+The PR-3 synthetic fixtures pre-declare the anchor-loop drill criteria
+(fixture test: `server/test/transparency/anchor-verify-cli.test.ts`, scenarios
+D1 to D4; same discipline: synthetic keys, a synthetic in-memory Rekor log,
+no network, no soak):
+
+1. **D1 clean loop:** bundle + anchors evidence + pinned operator key +
+   pinned log key verify end-to-end, on the full CLI and on the standalone
+   artifact. Expected: `PASS`, exit `0`, every anchor `verified`.
+2. **D2 stale bundle caught:** the same evidence outside `--expect-fresh`.
+   Expected: `FAIL`, exit `1`, finding kind `anchor_freshness_stale`.
+3. **D3 forked history caught:** two bundles signed by the same key carrying
+   the same counter with different contents, via `--compare`. Expected:
+   `FAIL`, exit `1`, finding kind `fork_detected`.
+4. **D4 withheld suffix caught:** a truncated bundle against the full anchors
+   evidence. Expected: `FAIL`, exit `1`, finding kind `anchor_beyond_bundle`.
+
+Per the drill-acceptance rule, these fixtures are the deterministic twins of
+the coordinator-run drill; capability claims trace to captured drill evidence,
+not to this runbook or to merged code.
 
 ## What a verifying party CAN conclude
 
@@ -152,7 +262,7 @@ These limits are printed by the verifier on every run. Do not over-claim past th
 
 1. **That the wall was actually enforcing on the wire.** A checkpoint proves the recorded enforcement state and history. It is not a packet-level proof. Enforcement capability claims trace to drill evidence on the platform that matters, not to this format (see ASSURANCE_MATRIX.md).
 2. **That the named binary was the running binary.** `daemon.binary_sha256` is self-reported by the emitting process. Comparing it against a published release hash detects a mismatched report; it cannot prove the process that emitted the checkpoint was not itself modified. Remote attestation is out of scope.
-3. **Freshness / suffix completeness.** An operator who stops publishing the NEWEST checkpoints produces a shorter chain that is still genesis-rooted and still passes; one bundle cannot prove it is the latest. (Prefix withholding, dropping the genesis side, IS caught by default; see CAN, item 3.) Freshness comes from publication cadence and from cross-checking the highest counter across independently obtained bundles, not from any single bundle.
+3. **Freshness / suffix completeness, from a bundle alone.** An operator who stops publishing the NEWEST checkpoints produces a shorter chain that is still genesis-rooted and still passes; one bundle cannot prove it is the latest. (Prefix withholding, dropping the genesis side, IS caught by default; see CAN, item 3.) For fortresses with anchoring enabled, `--check-anchors` with `--expect-fresh` and a pinned Rekor log key bounds staleness against log-attested time, and an exported anchor receipt above the bundle's top counter is direct withheld-suffix evidence; an unanchored fortress retains only cadence and cross-bundle counter comparison.
 4. **Events between checkpoints.** The format commits to states at checkpoint moments. An entry appended and pruned between two checkpoints is not individually provable from checkpoints alone (the signed audit chain itself, exported via `sanctuary audit-chain export`, covers per-entry verification).
 5. **Anything about audit-entry contents or policy contents.** By design.
 

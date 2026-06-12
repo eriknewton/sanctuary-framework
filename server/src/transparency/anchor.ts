@@ -269,6 +269,11 @@ export interface RekorEntryRef {
   log_index: number;
   log_id: string;
   integrated_time: number;
+  /** The canonical Rekor entry body (base64), kept verbatim so the PR-3
+   * offline verifier can recompute the leaf hash and rebind the entry to
+   * the commitment digest, the fortress anchoring key, and the P-256
+   * signature with no network access. */
+  body_b64?: string;
   /** Rekor's verification blob (inclusion proof + signed entry timestamp),
    * kept verbatim for the PR-3 offline inclusion-proof verifier. */
   verification?: Record<string, unknown>;

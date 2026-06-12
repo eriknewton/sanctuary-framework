@@ -48,12 +48,21 @@ import {
   resolveTransparencySigner,
 } from "../transparency/signer.js";
 import {
+  compareTransparencyChains,
   isVerifierCheckpointRecord,
   verifyTransparencyCheckpoints,
+  type CompareChainsResult,
   type TransparencyVerifyReport,
   type VerifierCheckpointRecord,
 } from "../transparency/verify.js";
+import {
+  parseFreshnessWindow,
+  verifyAnchorEvidence,
+  type AnchorCoverage,
+  type FetchedAnchorEntry,
+} from "../transparency/anchor-verify.js";
 import { verifyAgainstLog } from "../transparency/against-log.js";
+import type { FetchLike } from "../transparency/rekor-client.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../../package.json") as {
@@ -73,6 +82,10 @@ export interface TransparencyCommandArgs {
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Injected HTTP transport for anchoring and --fetch-anchors (tests). */
+  fetchFn?: FetchLike;
+  /** Injected clock for --expect-fresh (tests). */
+  now?: () => Date;
 }
 
 function write(stream: Writable, text: string): void {
@@ -95,7 +108,7 @@ export async function runTransparencyCommand(
       printCheckpointUsage(out);
       return 0;
     }
-    return runCheckpoint(rest, out, err, args.env ?? process.env);
+    return runCheckpoint(rest, out, err, args.env ?? process.env, args.fetchFn);
   }
   if (sub === "export") {
     if (rest.includes("--help") || rest.includes("-h")) {
@@ -108,7 +121,7 @@ export async function runTransparencyCommand(
     return runVerifyTransparencyCommand({ ...args, argv: rest });
   }
   if (sub === "anchor") {
-    return runAnchorCommand(rest, out, err, args.env ?? process.env);
+    return runAnchorCommand(rest, out, err, args.env ?? process.env, args.fetchFn);
   }
   write(err, `Unknown transparency command: ${sub}\n`);
   printUsage(err);
@@ -128,7 +141,8 @@ async function runAnchorCommand(
   argv: string[],
   out: Writable,
   err: Writable,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  fetchFn?: FetchLike
 ): Promise<number> {
   const [verb, ...rest] = argv;
   if (!verb || verb === "--help" || verb === "-h") {
@@ -139,7 +153,7 @@ async function runAnchorCommand(
     printAnchorUsage(out);
     return 0;
   }
-  if (!["enable", "disable", "status", "now"].includes(verb)) {
+  if (!["enable", "disable", "status", "now", "export"].includes(verb)) {
     write(err, `Unknown anchor command: ${verb}\n`);
     printAnchorUsage(err);
     return 2;
@@ -149,7 +163,7 @@ async function runAnchorCommand(
   try {
     const opts = parseFlags(
       rest,
-      ["--fortress", "--passphrase", "--rekor-url"],
+      ["--fortress", "--passphrase", "--rekor-url", "--output"],
       ["--yes", "--json", "--allow-unsafe-rekor-url"]
     );
     const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
@@ -157,6 +171,7 @@ async function runAnchorCommand(
     const {
       ANCHOR_CONSENT_TEXT,
       anchorPendingCheckpoints,
+      buildAnchorsExport,
       disableAnchoring,
       enableAnchoring,
       readAnchorConfig,
@@ -224,6 +239,26 @@ async function runAnchorCommand(
     const auditLog = new AuditLog(storage, masterKey);
     const fortressId = fortressIdFromStoragePath(storagePath);
 
+    if (verb === "export") {
+      const doc = await buildAnchorsExport({ storage, masterKey, fortressId });
+      const anchored = doc.receipts.filter((r) => r.status === "anchored").length;
+      const json = JSON.stringify(doc, null, 2) + "\n";
+      if (opts.values["--output"]) {
+        await writeFile(opts.values["--output"]!, json, "utf8");
+        write(
+          err,
+          `Exported anchor evidence for ${doc.receipts.length} receipt(s) (${anchored} anchored) to ${opts.values["--output"]}\n` +
+            `This file contains the LOCAL commitment salt: whoever holds it can link this fortress's\n` +
+            `public anchors to its checkpoint history. Hand it to auditors deliberately, with the bundle:\n` +
+            `  sanctuary verify-transparency --input bundle.json --public-key <key> --check-anchors ${opts.values["--output"]}\n` +
+            `Nothing was transmitted.\n`
+        );
+      } else {
+        write(out, json);
+      }
+      return 0;
+    }
+
     if (verb === "enable") {
       write(out, `\n${ANCHOR_CONSENT_TEXT}\n\n`);
       if (!opts.flags["--yes"]) {
@@ -289,6 +324,7 @@ async function runAnchorCommand(
       storage,
       masterKey,
       auditLog,
+      ...(fetchFn ? { fetchFn } : {}),
     });
     if ("status" in result && result.status === "disabled") {
       write(
@@ -358,7 +394,8 @@ async function runCheckpoint(
   argv: string[],
   out: Writable,
   err: Writable,
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  fetchFn?: FetchLike
 ): Promise<number> {
   let masterKey: Uint8Array | undefined;
   try {
@@ -418,6 +455,7 @@ async function runCheckpoint(
           masterKey,
           auditLog,
           record,
+          ...(fetchFn ? { fetchFn } : {}),
         });
         if (outcome.status === "anchored") {
           write(
@@ -540,14 +578,52 @@ export async function runVerifyTransparencyCommand(
   try {
     const opts = parseFlags(
       argv,
-      ["--input", "--public-key", "--public-key-file", "--fortress", "--passphrase"],
-      ["--trust-embedded", "--against-log", "--allow-partial", "--json"]
+      [
+        "--input",
+        "--public-key",
+        "--public-key-file",
+        "--fortress",
+        "--passphrase",
+        "--check-anchors",
+        "--rekor-public-key-file",
+        "--expect-fresh",
+        "--compare",
+      ],
+      [
+        "--trust-embedded",
+        "--against-log",
+        "--allow-partial",
+        "--json",
+        "--fetch-anchors",
+        "--allow-unsafe-rekor-url",
+      ]
     );
     const inputPath = opts.values["--input"];
     if (!inputPath) {
       write(err, "Error: --input <path> is required\n");
       printVerifyUsage(err);
       return 2;
+    }
+    // Anchor-dependent flags fail closed at usage time: a run that silently
+    // ignored --expect-fresh would read as fresher than it proved.
+    for (const dependent of ["--expect-fresh", "--rekor-public-key-file"] as const) {
+      if (opts.values[dependent] && !opts.values["--check-anchors"]) {
+        write(err, `Error: ${dependent} requires --check-anchors <anchors.json>\n`);
+        return 2;
+      }
+    }
+    if (opts.flags["--fetch-anchors"] && !opts.values["--check-anchors"]) {
+      write(err, "Error: --fetch-anchors requires --check-anchors <anchors.json>\n");
+      return 2;
+    }
+    let expectFreshMs: number | undefined;
+    if (opts.values["--expect-fresh"]) {
+      try {
+        expectFreshMs = parseFreshnessWindow(opts.values["--expect-fresh"]!);
+      } catch (error) {
+        write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+        return 2;
+      }
     }
 
     let parsed: unknown;
@@ -607,6 +683,148 @@ export async function runVerifyTransparencyCommand(
       );
     }
 
+    // ---- --check-anchors: auditor-side anchor verification ------------------
+    let anchorsCoverage: AnchorCoverage | null = null;
+    if (opts.values["--check-anchors"]) {
+      const anchorsPath = opts.values["--check-anchors"]!;
+      let anchorsDoc: unknown;
+      try {
+        anchorsDoc = JSON.parse(await readFile(anchorsPath, "utf8"));
+      } catch (error) {
+        write(
+          err,
+          `Error reading ${anchorsPath}: ${error instanceof Error ? error.message : String(error)}\n`
+        );
+        return 1;
+      }
+      let rekorPublicKeyPem: string | undefined;
+      if (opts.values["--rekor-public-key-file"]) {
+        try {
+          rekorPublicKeyPem = await readFile(
+            opts.values["--rekor-public-key-file"]!,
+            "utf8"
+          );
+        } catch (error) {
+          write(
+            err,
+            `Error reading Rekor public key: ${error instanceof Error ? error.message : String(error)}\n`
+          );
+          return 1;
+        }
+      }
+      const records = extractRecords(parsed);
+      const fetchedEntries = new Map<number, FetchedAnchorEntry>();
+      if (opts.flags["--fetch-anchors"]) {
+        const { fetchAnchorEntries, validateRekorUrl } = await import(
+          "../transparency/anchoring.js"
+        );
+        const { isTransparencyAnchorsExport } = await import(
+          "../transparency/anchor-verify.js"
+        );
+        if (!isTransparencyAnchorsExport(anchorsDoc)) {
+          report.findings.push({
+            kind: "anchors_input_invalid",
+            message: `${anchorsPath} is not a SANCTUARY_TRANSPARENCY_ANCHORS_V1 export; cannot fetch entries for it`,
+          });
+        } else {
+          // Same SSRF posture as anchoring itself: validate the log URL
+          // fail-closed before any request, with the same explicit unsafe
+          // escape hatch for local/dev logs.
+          validateRekorUrl(
+            anchorsDoc.rekor_url,
+            opts.flags["--allow-unsafe-rekor-url"] === true
+          );
+          const { HttpRekorClient } = await import(
+            "../transparency/rekor-client.js"
+          );
+          const client = new HttpRekorClient({
+            baseUrl: anchorsDoc.rekor_url,
+            ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}),
+          });
+          const outcomes = await fetchAnchorEntries({
+            receipts: anchorsDoc.receipts,
+            client,
+          });
+          for (const outcome of outcomes) {
+            if (outcome.status === "fetched") {
+              fetchedEntries.set(outcome.counter, outcome.entry);
+            } else if (outcome.status === "not_found") {
+              report.findings.push({
+                kind: "anchor_entry_not_found",
+                counter: outcome.counter,
+                message: `the log at ${anchorsDoc.rekor_url} denies that the anchor entry for checkpoint ${outcome.counter} exists (UUID ${outcome.uuid}); the receipt's anchored claim is refuted by the log`,
+              });
+            } else {
+              report.not_checked.push(
+                `anchor entry fetch for checkpoint ${outcome.counter}: log unreachable (${outcome.message}); fell back to receipt-embedded material where present`
+              );
+            }
+          }
+        }
+      }
+      const anchorResult = verifyAnchorEvidence(records, anchorsDoc, {
+        ...(rekorPublicKeyPem ? { rekorPublicKeyPem } : {}),
+        ...(expectFreshMs !== undefined ? { expectFreshMs } : {}),
+        ...(args.now ? { now: args.now } : {}),
+        ...(fetchedEntries.size > 0 ? { fetchedEntries } : {}),
+      });
+      report.findings.push(...anchorResult.findings);
+      report.not_checked.push(...anchorResult.not_checked);
+      anchorsCoverage = anchorResult.coverage;
+    }
+
+    // ---- --compare: multi-bundle split-view detection ------------------------
+    let compareSummary:
+      | (Pick<CompareChainsResult, "relation" | "divergent_counter" | "overlap"> & {
+          input: string;
+          other_verdict: TransparencyVerifyReport["verdict"];
+        })
+      | null = null;
+    if (opts.values["--compare"]) {
+      const comparePath = opts.values["--compare"]!;
+      let otherParsed: unknown;
+      try {
+        otherParsed = JSON.parse(await readFile(comparePath, "utf8"));
+      } catch (error) {
+        write(
+          err,
+          `Error reading ${comparePath}: ${error instanceof Error ? error.message : String(error)}\n`
+        );
+        return 1;
+      }
+      // The comparison bundle is verified under the SAME key basis; a
+      // suffix fragment is fine for fork detection, so partial is allowed
+      // for it regardless of the primary's --allow-partial.
+      const otherReport = verifyTransparencyCheckpoints(otherParsed, {
+        ...(key.publicKey ? { publicKey: key.publicKey } : {}),
+        ...(opts.flags["--trust-embedded"] ? { trustEmbedded: true } : {}),
+        allowPartial: true,
+      });
+      if (otherReport.verdict === "FAIL") {
+        report.findings.push({
+          kind: "compare_input_invalid",
+          message: `the comparison bundle ${comparePath} fails verification on its own (${otherReport.findings.length} finding(s): ${[...new Set(otherReport.findings.map((f) => f.kind))].join(", ")}); refusing to draw fork conclusions from unverified evidence`,
+        });
+      } else {
+        const comparison = compareTransparencyChains(
+          extractRecords(parsed),
+          extractRecords(otherParsed)
+        );
+        report.findings.push(...comparison.findings);
+        report.not_checked.push(...comparison.notes);
+        compareSummary = {
+          input: comparePath,
+          other_verdict: otherReport.verdict,
+          relation: comparison.relation,
+          divergent_counter: comparison.divergent_counter,
+          overlap: comparison.overlap,
+        };
+      }
+    }
+
+    // Verdict reassembly after every evidence source contributed findings.
+    if (report.findings.length > 0) report.verdict = "FAIL";
+
     const payload = {
       ...report,
       ...(key.source ? { public_key_source: key.source } : {}),
@@ -619,6 +837,8 @@ export async function runVerifyTransparencyCommand(
             },
           }
         : {}),
+      ...(anchorsCoverage ? { anchors: anchorsCoverage } : {}),
+      ...(compareSummary ? { compare: compareSummary } : {}),
     };
     if (opts.flags["--json"]) {
       write(out, JSON.stringify(payload, null, 2) + "\n");
@@ -744,6 +964,14 @@ function printHumanReport(
       merkle_root_recomputed: boolean;
       counters_recomputed: boolean;
     };
+    anchors?: AnchorCoverage;
+    compare?: {
+      input: string;
+      other_verdict: TransparencyVerifyReport["verdict"];
+      relation: string;
+      divergent_counter: number | null;
+      overlap: { from: number; to: number } | null;
+    };
   }
 ): void {
   write(out, `Verdict: ${report.verdict}\n`);
@@ -765,6 +993,42 @@ function printHumanReport(
       `Against live log (checkpoint ${report.against_log.checked_counter ?? "n/a"}): ` +
         `merkle root ${report.against_log.merkle_root_recomputed ? "recomputed and MATCHED" : "not recomputed"}; ` +
         `counters ${report.against_log.counters_recomputed ? "recounted and MATCHED" : "not recounted"}\n`
+    );
+  }
+  if (report.anchors) {
+    const coverage = report.anchors;
+    write(
+      out,
+      `Anchor coverage (log signatures: ${coverage.log_signature_basis === "pinned-rekor-key" ? "verified under pinned log key" : "NOT verified, no pinned log key"}):\n` +
+        `  ${coverage.verified} verified, ${coverage.consistent} consistent, ${coverage.unverified} unverified, ${coverage.invalid} invalid, ` +
+        `${coverage.anchor_failed} failed-at-anchor-time, ${coverage.unanchored} unanchored ` +
+        `(of ${coverage.checkpoints} checkpoint(s))\n`
+    );
+    if (coverage.log_signature_basis === "none") {
+      write(
+        out,
+        `  anchors checked for internal consistency only (operator-supplied evidence); supply --rekor-public-key-file for log-attested verification\n`
+      );
+    }
+    if (coverage.newest_verified_integrated_time !== null) {
+      write(
+        out,
+        `  newest log-attested anchor: ${new Date(coverage.newest_verified_integrated_time * 1000).toISOString()}\n`
+      );
+    }
+  }
+  if (report.compare) {
+    write(
+      out,
+      `Compared against ${report.compare.input} (its verdict: ${report.compare.other_verdict}): ` +
+        `relation ${report.compare.relation}` +
+        (report.compare.divergent_counter !== null
+          ? `, FORK at counter ${report.compare.divergent_counter}`
+          : "") +
+        (report.compare.overlap
+          ? ` (shared counters ${report.compare.overlap.from}..${report.compare.overlap.to})`
+          : "") +
+        `\n`
     );
   }
   if (report.findings.length > 0) {
@@ -912,10 +1176,17 @@ Commands:
   status    Show the anchoring state and receipt coverage.
   now       Anchor every checkpoint that lacks a success receipt
             (catch-up after an outage).
+  export    Write the anchor evidence file (salt, anchoring public key,
+            receipts) an auditor needs for verify-transparency
+            --check-anchors. Local only; nothing is transmitted. The file
+            links this fortress's public anchors to its history for
+            whoever holds it; hand it out deliberately.
 
 Options:
   --fortress <path>     Override fortress path.
   --passphrase <val>    Fortress passphrase (or SANCTUARY_PASSPHRASE).
+  --output <path>       Write the evidence file here (export only;
+                        default: stdout).
   --rekor-url <url>     Override the transparency log URL (enable only).
                         Must be https and must not point at a loopback,
                         private, link-local, or metadata address.
@@ -993,6 +1264,31 @@ Options:
   --against-log             Also cross-check the live audit log (host mode).
   --fortress <path>         Fortress path for --against-log / pin discovery.
   --passphrase <val>        Enables counter recount in --against-log mode.
+  --check-anchors <path>    Verify external anchor evidence (the operator's
+                            "sanctuary transparency anchor export" file):
+                            salted commitments recomputed against THIS
+                            bundle, Rekor entry binding, RFC 6962 inclusion
+                            proofs, and anchor-coverage reporting. Without a
+                            pinned log key this checks internal consistency
+                            of the operator-supplied evidence only; anchors
+                            report "consistent", never "verified".
+  --rekor-public-key-file <path>
+                            Pinned Rekor log public key (SPKI PEM, obtained
+                            out-of-band). Enables log-signature checks
+                            (signed entry timestamps, checkpoint notes);
+                            required for anchors to count as "verified" and
+                            for --expect-fresh.
+  --fetch-anchors           Fetch fresh entries and inclusion proofs from
+                            the log named in the anchors file instead of
+                            trusting receipt-embedded material. The log URL
+                            passes the same SSRF guard as anchoring
+                            (--allow-unsafe-rekor-url for local/dev logs).
+  --expect-fresh <window>   FAIL unless the newest log-attested anchor is
+                            within the window (e.g. 36h, 7d). Requires
+                            --check-anchors and a pinned Rekor key.
+  --compare <path>          Verify a second, independently obtained bundle
+                            and detect split views: the same counter with
+                            different signed contents is a FORK finding.
   --json                    Emit the full report as JSON.
 
 Exit codes: 0 PASS (complete from genesis), 10 PARTIAL (suffix fragment via

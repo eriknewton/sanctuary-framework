@@ -136,7 +136,24 @@ export type TransparencyFindingKind =
   | "genesis_sentinel_mismatch"
   // a non-earliest record carries the genesis sentinel as its previous hash:
   // a spliced/forged second origin in the middle of a chain.
-  | "genesis_sentinel_misplaced";
+  | "genesis_sentinel_misplaced"
+  // anchor-verification (--check-anchors) finding kinds (anchor-verify.ts):
+  | "anchors_input_invalid"
+  | "anchors_fortress_mismatch"
+  | "anchor_checkpoint_mismatch"
+  | "anchor_commitment_mismatch"
+  | "anchor_entry_binding_invalid"
+  | "anchor_signature_invalid"
+  | "anchor_inclusion_proof_invalid"
+  | "anchor_log_signature_invalid"
+  | "anchor_entry_not_found"
+  | "anchor_beyond_bundle"
+  | "anchor_freshness_stale"
+  | "anchor_freshness_unverifiable"
+  // multi-bundle split-view (--compare) finding kinds:
+  | "fork_detected"
+  | "compare_input_invalid"
+  | "compare_no_overlap";
 
 export interface TransparencyFinding {
   kind: TransparencyFindingKind;
@@ -559,4 +576,123 @@ function failReport(
     findings,
     not_checked: [...OFFLINE_NOT_CHECKED],
   };
+}
+
+// ---- Multi-bundle split-view detection (--compare) ---------------------------
+
+/**
+ * Relation between two independently obtained chains of the same fortress:
+ *
+ *   "identical"  same counter range, every shared payload hash equal
+ *   "consistent" all shared counters carry equal payload hashes; one chain
+ *                simply extends (or fragments) the other. The bundle with
+ *                the LOWER top counter is the staler view, honestly noted.
+ *   "fork"       at least one counter exists in both chains with DIFFERENT
+ *                payload hashes: the operator presented divergent histories
+ *                to different observers. Always a finding.
+ *   "no_overlap" no shared counters; nothing can be concluded either way,
+ *                and that inconclusiveness is itself a finding so automation
+ *                cannot read "compared" as "compared meaningfully".
+ */
+export interface CompareChainsResult {
+  relation: "identical" | "consistent" | "fork" | "no_overlap";
+  /** Lowest counter where the payload hashes diverge (fork only). */
+  divergent_counter: number | null;
+  /** Shared counter range actually compared, when any. */
+  overlap: { from: number; to: number } | null;
+  findings: TransparencyFinding[];
+  notes: string[];
+}
+
+/**
+ * Pure cross-bundle comparison. Both inputs should already have been
+ * verified (signatures, linkage, continuity) by verifyTransparencyCheckpoints;
+ * this function only answers the split-view question the design doc assigns
+ * to --compare: did the operator hand different observers different
+ * histories under the same counters?
+ */
+export function compareTransparencyChains(
+  primary: VerifierCheckpointRecord[],
+  other: VerifierCheckpointRecord[]
+): CompareChainsResult {
+  const findings: TransparencyFinding[] = [];
+  const notes: string[] = [];
+  const primarySorted = [...primary].sort((a, b) => a.counter - b.counter);
+  const otherSorted = [...other].sort((a, b) => a.counter - b.counter);
+
+  const primaryFortress = primarySorted[0]?.fortress_id;
+  const otherFortress = otherSorted[0]?.fortress_id;
+  if (
+    primaryFortress !== undefined &&
+    otherFortress !== undefined &&
+    primaryFortress !== otherFortress
+  ) {
+    findings.push({
+      kind: "fortress_id_mismatch",
+      expected: primaryFortress,
+      actual: otherFortress,
+      message: `the comparison bundle belongs to fortress "${otherFortress}", not "${primaryFortress}"; the two bundles are not views of the same history`,
+    });
+  }
+
+  const otherByCounter = new Map<number, VerifierCheckpointRecord>();
+  for (const record of otherSorted) otherByCounter.set(record.counter, record);
+
+  let overlapFrom: number | null = null;
+  let overlapTo: number | null = null;
+  let divergentCounter: number | null = null;
+  for (const record of primarySorted) {
+    const peer = otherByCounter.get(record.counter);
+    if (!peer) continue;
+    overlapFrom = overlapFrom === null ? record.counter : overlapFrom;
+    overlapTo = record.counter;
+    const ours = checkpointPayloadHash(record);
+    const theirs = checkpointPayloadHash(peer);
+    if (ours !== theirs && divergentCounter === null) {
+      divergentCounter = record.counter;
+      findings.push({
+        kind: "fork_detected",
+        counter: record.counter,
+        expected: ours,
+        actual: theirs,
+        message: `checkpoint counter ${record.counter} exists in BOTH bundles with different signed contents (payload hash ${ours.slice(0, 16)}... vs ${theirs.slice(0, 16)}...); the operator presented divergent histories to different observers`,
+      });
+    }
+  }
+
+  if (overlapFrom === null) {
+    findings.push({
+      kind: "compare_no_overlap",
+      message:
+        "the two bundles share no checkpoint counters, so the comparison can neither confirm nor refute a fork; obtain overlapping ranges before concluding anything",
+    });
+    return {
+      relation: "no_overlap",
+      divergent_counter: null,
+      overlap: null,
+      findings,
+      notes,
+    };
+  }
+
+  const overlap = { from: overlapFrom, to: overlapTo! };
+  if (divergentCounter !== null) {
+    return { relation: "fork", divergent_counter: divergentCounter, overlap, findings, notes };
+  }
+
+  const primaryTop = primarySorted.at(-1)!.counter;
+  const otherTop = otherSorted.at(-1)!.counter;
+  if (
+    primaryTop === otherTop &&
+    primarySorted[0]!.counter === otherSorted[0]!.counter &&
+    primarySorted.length === otherSorted.length
+  ) {
+    return { relation: "identical", divergent_counter: null, overlap, findings, notes };
+  }
+  if (primaryTop !== otherTop) {
+    notes.push(
+      `the bundles agree on every shared counter; the bundle ending at counter ${Math.min(primaryTop, otherTop)} is a STALER view of the same history than the one ending at counter ${Math.max(primaryTop, otherTop)} (consistent, not forked)`
+    );
+  }
+  return { relation: "consistent", divergent_counter: null, overlap, findings, notes };
 }
