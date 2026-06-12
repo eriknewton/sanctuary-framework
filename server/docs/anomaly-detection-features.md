@@ -123,6 +123,36 @@ The audit-event class distribution detector also emits `per_class_drift` entries
 
 The top three classes are rendered into the alert summary and explanation. Source note: the prompt's example names `before_proportion`, `after_proportion`, and `percent_change`; the current source uses `baseline_proportion`, `current_proportion`, and `relative_delta`.
 
+## Root-Cause Hints
+
+Chi-8 adds an operator-facing root-cause hint layer on top of the existing drift attribution. When the dispatcher routes a finding, it attaches a `root_cause_hints` array into the finding details:
+
+```ts
+{
+  feature_names: string[];
+  direction: "above_baseline" | "below_baseline";
+  z_score: number | null;
+  likely_cause: string;
+  source: "detector" | "generic";
+}
+```
+
+Hints are a pure, deterministic function of attribution the finding already carries: `detector_id`, `feature_contributions`, and, for `audit-event-class-distribution`, `per_class_drift`. The implementation is `server/src/anomaly-detection/root-cause-hints.ts`; the single wiring seam is `routeFinding` in `server/src/anomaly-detection/anomaly-pipeline.ts`, so every detector, including ones with custom `evaluate()` overrides, gets hints without per-detector changes.
+
+Selection and direction rules:
+
+- A contribution earns a hint when its absolute z-score is at least 1, matching the severity floor in `severityFromAnomalyScore`. Positive z-scores map to `above_baseline`, negative to `below_baseline`.
+- Hints are sorted highest absolute z-score first, then by feature name, and capped at 5 per finding.
+- `per_class_drift` entries produce up to 3 additional class hints (top absolute proportion delta, `flat` entries skipped, `z_score` null because the attribution is delta-based). The mirrored `class_proportion:*` contributions are skipped to avoid double-hinting.
+- All seven shipped detectors have detector-specific hint text keyed off their real emitted feature names, including the prefixed namespaces (`band_count:*`, `band_proportion:*`, `peer_z:*`, `class_count:*`, `class_proportion:*`). Examples: a `distinct_credentials_used` spike on `credential-use-sequence` reads as the credential-enumeration shape; a `band_proportion:night` spike on `time-of-day-activity` reads as off-hours activity; a `co_fire_rate_24h` spike on `cross-agent-timing` reads as lockstep coordination.
+- Unknown detector ids and unknown feature names degrade to a generic hint built only from the contribution stats (feature name, observed value, baseline mean, sigma). Malformed or missing attribution degrades to an empty array. Hint generation never throws into the dispatcher.
+
+Degradation and sovereignty posture:
+
+- Fail-closed wiring: `enrichDetailsWithRootCauseHints` wraps hint generation so a thrown error degrades to an empty hints array, and a details copy failure degrades to the original details unchanged. The finding itself is the security signal and always survives.
+- Hints are built only from numeric contribution stats, feature names, audit-operation class names, and detector ids. No raw audit payloads, secrets, or key material can reach a hint.
+- No classifier, scoring, severity, or persisted classifier-state change. The layer annotates finding details at routing time only.
+
 ## Audit Event Shape
 
 Anomaly audit events are appended with layer `l2` and `identity_id` set to the dispatcher or route dependency identity. The anomaly subsystem emits the following operation names.
@@ -187,9 +217,9 @@ The anomaly subsystem preserves the operator-sovereign posture:
 
 These constraints matter because anomaly detection inspects sensitive operational behavior. Keeping extraction, state, scoring, and findings local prevents a monitoring subsystem from becoming an exfiltration or centralized telemetry path.
 
-## Extension Points For Chi-8+
+## Extension Points For Chi-9+
 
-Chi-7 landed time-of-day-conditioned baselines (the `time-of-day-activity` detector, named in the detector catalog's forward list since Chi-6): per-band features make the generic rolling baseline learn a separate mean and variance per six-hour UTC band per agent, so no classifier change was needed. Chi-6 landed cross-agent distribution comparison (`cross-agent-distribution`) and credential-use sequence patterns (`credential-use-sequence`, named in the forward list since Chi-4). Future detectors can add feature extractors and detector classes without changing `FeatureVector` as long as their feature payload stays numeric. The remaining likely additive surface is root-cause hints built from existing `feature_contributions`. Detector-local classifiers should use the `<detector-id>:<classifier-name>` namespace when their persisted state shape differs from a generic classifier.
+Chi-8 landed root-cause hints (named in the detector catalog's forward list since Chi-7): the dispatcher enriches finding details with `root_cause_hints` built from existing `feature_contributions` and `per_class_drift`, so no detector, classifier, or state-shape change was needed. Chi-7 landed time-of-day-conditioned baselines (the `time-of-day-activity` detector, named in the forward list since Chi-6): per-band features make the generic rolling baseline learn a separate mean and variance per six-hour UTC band per agent, so no classifier change was needed. Chi-6 landed cross-agent distribution comparison (`cross-agent-distribution`) and credential-use sequence patterns (`credential-use-sequence`, named in the forward list since Chi-4). Future detectors can add feature extractors and detector classes without changing `FeatureVector` as long as their feature payload stays numeric; new detectors that want detector-specific hint text add entries to the hint tables in `root-cause-hints.ts`, and detectors without entries degrade to generic stat-only hints automatically. Detector-local classifiers should use the `<detector-id>:<classifier-name>` namespace when their persisted state shape differs from a generic classifier.
 
 ## Source Verification Notes
 

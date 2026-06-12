@@ -41,6 +41,7 @@ import type {
 import { CUSUM_CLASSIFIER_ID } from "./classifiers/cusum.js";
 import { PSI_CLASSIFIER_ID } from "./classifiers/psi.js";
 import { AUDIT_EVENT_CLASS_DISTRIBUTION_PSI_CLASSIFIER_ID } from "./detectors/audit-event-class-distribution-detector.js";
+import { enrichDetailsWithRootCauseHints } from "./root-cause-hints.js";
 
 export const ANOMALY_AUDIT_OPS = {
   DETECTOR_REGISTERED: "anomaly_detector_registered",
@@ -306,6 +307,11 @@ export class AnomalyPipelineDispatcher {
       finding_id: raw.finding_id || randomUUID(),
       fortress_id: this.fortressId,
       observed_at: raw.observed_at || this.now().toISOString(),
+      // Chi-8: attach operator-facing root-cause hints derived from
+      // the finding's existing drift attribution. Fail-closed: hint
+      // generation errors degrade to empty hints / unchanged details;
+      // they never block or drop the finding.
+      details: enrichDetailsWithRootCauseHints(raw.details),
     };
     await this.findingStore.saveFinding(stamped);
     const classifierId = (
@@ -458,3 +464,14 @@ export {
   severityFromAnomalyScore,
   ANOMALY_SENTINEL_ID_PREFIX,
 } from "./types.js";
+// Chi-8: root-cause hint surface re-exported alongside the pipeline so
+// consumers keep a single import path for anomaly primitives.
+export type { RootCauseHint } from "./root-cause-hints.js";
+export {
+  buildRootCauseHints,
+  enrichDetailsWithRootCauseHints,
+  ROOT_CAUSE_HINTS_DETAILS_KEY,
+  ROOT_CAUSE_HINT_Z_THRESHOLD,
+  ROOT_CAUSE_HINT_MAX_HINTS,
+  ROOT_CAUSE_HINT_MAX_CLASS_HINTS,
+} from "./root-cause-hints.js";
