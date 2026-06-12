@@ -293,11 +293,45 @@ function deriveTrustedRoot(targetPath: string): string {
  * actual attack this class represents) is closed because the attacker cannot
  * create a symlink the walk does not see.
  */
+/**
+ * D4 round-3 P2 (post-merge finding) — the walk→sink path-identity gap.
+ *
+ * `assertNoSymlinkInPath` lstat-walks `resolve(targetPath)`, but the leaf
+ * sinks (`writeFileNoFollow`, `unlink`) historically opened the ORIGINAL,
+ * non-normalised `targetPath` string. A target with a `..` AFTER a symlinked
+ * component slips through: e.g. `<root>/link/../victim/config.yaml` where
+ * `<root>/link -> /outside`. Lexical `resolve()` collapses `link/..` away, so
+ * the walk inspects `<root>/victim` (clean, no symlink) — but the kernel
+ * resolves `link` to `/outside` FIRST, then applies `..`, so the actual
+ * open/unlink syscall lands at `/outside/../victim/config.yaml`. O_NOFOLLOW
+ * only guards the final component, never the intermediate `link`.
+ *
+ * Defence is path identity: every safe sink computes `resolve(targetPath)`
+ * ONCE and feeds that single byte-identical value to BOTH the symlink walk
+ * AND the syscall, so the kernel acts on exactly the path that was verified.
+ * Belt-and-suspenders: this guard additionally REFUSES any target that is not
+ * already equal to its own `resolve()` — i.e. carries `..`/`.`/non-normalised
+ * segments. wrap never legitimately needs a `..` in a config path, so a
+ * non-normalised target is treated as hostile and rejected loudly.
+ */
+function assertNormalisedTarget(targetPath: string): string {
+  const resolved = resolve(targetPath);
+  if (targetPath !== resolved) {
+    throw new Error(
+      `${targetPath} is not a normalised absolute path (resolves to ` +
+        `${resolved}); refusing to write through a path containing ` +
+        `traversal ('..') or non-normalised segments. A symlinked parent ` +
+        `followed by '..' would let the kernel escape the verified prefix.`
+    );
+  }
+  return resolved;
+}
+
 async function assertNoSymlinkInPath(
   targetPath: string,
   trustedRoot: string
 ): Promise<void> {
-  const resolved = resolve(targetPath);
+  const resolved = assertNormalisedTarget(targetPath);
   const root = resolve(trustedRoot);
   if (resolved !== root && !isWithin(resolved, root)) {
     throw new Error(
@@ -342,7 +376,11 @@ async function mkdirNoFollowUnderRoot(
   trustedRoot: string,
   mode = 0o700
 ): Promise<void> {
-  const resolved = resolve(dir);
+  // Normalise + reject traversal: the cursor below is rebuilt from `root` plus
+  // the resolved segments, so the mkdir syscall already acts on a normalised
+  // path; rejecting a non-normalised `dir` keeps the public mkdir sink on the
+  // same path-identity discipline as the write/unlink sinks.
+  const resolved = assertNormalisedTarget(dir);
   const root = resolve(trustedRoot);
   if (resolved !== root && !isWithin(resolved, root)) {
     throw new Error(
@@ -383,13 +421,17 @@ export async function writeFileSafeUnderRoot(
   data: string | Uint8Array,
   options: { mode?: number; trustedRoot?: string } = {}
 ): Promise<void> {
-  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(targetPath);
-  await assertNoSymlinkInPath(targetPath, trustedRoot);
-  await mkdirNoFollowUnderRoot(dirname(resolve(targetPath)), trustedRoot);
+  // Normalise ONCE; both the symlink walk and the leaf open act on this exact
+  // byte-identical value so the kernel cannot resolve a different path than
+  // the one verified (D4 walk→sink path-identity gap).
+  const resolved = assertNormalisedTarget(targetPath);
+  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(resolved);
+  await assertNoSymlinkInPath(resolved, trustedRoot);
+  await mkdirNoFollowUnderRoot(dirname(resolved), trustedRoot);
   // Re-walk immediately before the open: minimises (does not eliminate, see
   // assertNoSymlinkInPath threat-model note) the walk→open parent window.
-  await assertNoSymlinkInPath(targetPath, trustedRoot);
-  await writeFileNoFollow(targetPath, data, options.mode ?? 0o600);
+  await assertNoSymlinkInPath(resolved, trustedRoot);
+  await writeFileNoFollow(resolved, data, options.mode ?? 0o600);
 }
 
 /**
@@ -407,9 +449,12 @@ export async function unlinkSafeUnderRoot(
   targetPath: string,
   options: { trustedRoot?: string } = {}
 ): Promise<void> {
-  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(targetPath);
-  await assertNoSymlinkInPath(targetPath, trustedRoot);
-  await unlink(targetPath);
+  // Normalise ONCE so the walk and the unlink syscall act on the identical
+  // path (D4 walk→sink path-identity gap).
+  const resolved = assertNormalisedTarget(targetPath);
+  const trustedRoot = options.trustedRoot ?? deriveTrustedRoot(resolved);
+  await assertNoSymlinkInPath(resolved, trustedRoot);
+  await unlink(resolved);
 }
 
 /**

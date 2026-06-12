@@ -40,7 +40,7 @@ import {
   rm,
   symlink,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import {
   writeFileSafeUnderRoot,
@@ -314,6 +314,65 @@ describe("Wrap D4 round-3: symlinked-parent redirection closed across every sink
   });
 
   // ── parent-race walk re-runs immediately before the sink ────────────
+
+  // ── walk→sink path-identity: `..` after a symlinked component ───────
+  //
+  // The walk lstat-resolves `resolve(targetPath)`, but the leaf sink used to
+  // open/unlink the ORIGINAL string. A `..` AFTER a symlinked component slips
+  // the lexical walk: `<root>/link/../victim/config.yaml` collapses to
+  // `<root>/victim/config.yaml` (no symlink seen), but the kernel resolves
+  // `link` -> /outside FIRST, then `..`, so the syscall lands at
+  // `/outside/../victim/config.yaml`. The fix normalises ONCE so the path the
+  // kernel acts on is byte-identical to the path that was walked, and rejects
+  // any non-normalised target loudly.
+
+  it("writeFileSafeUnderRoot REFUSES `<root>/link/../victim` (symlink then ..), victim untouched (path-identity)", async () => {
+    // `<tmpHome>/link` -> outside victim dir.
+    const outsideVictimDir = join(tmpdir(), `d4-outside-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const victimSub = join(outsideVictimDir, "victim");
+    await mkdir(victimSub, { recursive: true });
+    const victimFile = join(victimSub, "config.yaml");
+    await writeFile(victimFile, "do-not-touch: true\n");
+
+    const link = join(tmpHome, "link");
+    await symlink(outsideVictimDir, link);
+
+    // Build the traversal string by hand: `join()`/`resolve()` would collapse
+    // `link/..` lexically, but the on-disk string handed to the helper (and
+    // ultimately the kernel) must keep the literal `..` AFTER the symlinked
+    // `link` component. That is precisely the byte sequence the gap exploits.
+    const traversalTarget = `${link}${sep}..${sep}victim${sep}config.yaml`;
+    await expect(
+      writeFileSafeUnderRoot(traversalTarget, "mcp_servers: {}\n", { mode: 0o600 })
+    ).rejects.toThrow(/normalised|traversal|symlink/);
+
+    // The victim is byte-identical: the write was refused, not redirected.
+    expect(await readFile(victimFile, "utf-8")).toBe("do-not-touch: true\n");
+
+    await rm(outsideVictimDir, { recursive: true, force: true });
+  });
+
+  it("unlinkSafeUnderRoot REFUSES `<root>/link/../victim` (symlink then ..), victim untouched (path-identity)", async () => {
+    const outsideVictimDir = join(tmpdir(), `d4-outside-unlink-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const victimSub = join(outsideVictimDir, "victim");
+    await mkdir(victimSub, { recursive: true });
+    const victimFile = join(victimSub, "config.yaml");
+    await writeFile(victimFile, "precious: true\n");
+
+    const link = join(tmpHome, "link-unlink");
+    await symlink(outsideVictimDir, link);
+
+    // Literal `..` after the symlinked component (not lexically collapsed).
+    const traversalTarget = `${link}${sep}..${sep}victim${sep}config.yaml`;
+    await expect(
+      unlinkSafeUnderRoot(traversalTarget)
+    ).rejects.toThrow(/normalised|traversal|symlink/);
+
+    // Still present: the unlink was refused, the kernel never reached it.
+    expect(await readFile(victimFile, "utf-8")).toBe("precious: true\n");
+
+    await rm(outsideVictimDir, { recursive: true, force: true });
+  });
 
   it("writeFileSafeUnderRoot re-walks before the open, catching a parent symlink swapped in after mkdir (race-window minimisation)", async () => {
     // Stand up a deep real chain, then swap an intermediate dir for a symlink
