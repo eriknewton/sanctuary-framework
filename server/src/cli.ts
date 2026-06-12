@@ -137,6 +137,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "distress") {
+    const { runDistressCommand } = await import("./cli/distress.js");
+    const code = await runDistressCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "generate") {
     const { runGenerateCommand } = await import("./cli/generate.js");
     const code = await runGenerateCommand({ argv: args.slice(1) });
@@ -638,6 +644,10 @@ Subcommands:
   audit                Search local audit history.
                        Use "sanctuary audit --help" for options.
 
+  distress             Emit a distress signal through the reserved habeas
+                       lane (operator test verb; same path the agent uses).
+                       Use "sanctuary distress --help" for options.
+
   transparency         Emit and export signed enforcement checkpoints
                        (verifiable evidence the wall is enforcing).
                        Use "sanctuary transparency --help" for options.
@@ -793,6 +803,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "export-passphrase":
       printExportPassphraseHelp();
       return true;
+    case "distress": {
+      const { runDistressCommand } = await import("./cli/distress.js");
+      await runDistressCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     case "castle-wall":
       printCastleWallHelp();
       return true;

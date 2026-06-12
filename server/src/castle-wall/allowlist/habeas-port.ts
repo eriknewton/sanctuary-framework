@@ -181,10 +181,19 @@ function hostEquals(a: string, b: string): boolean {
 }
 
 function hostPatternCovers(pattern: string, host: string): boolean {
+  const lower = host.toLowerCase();
+  // `*.suffix` form (allowlist/gate spelling).
   if (pattern.startsWith("*.")) {
     const suffix = pattern.slice(2).toLowerCase();
-    const lower = host.toLowerCase();
     return lower.endsWith(`.${suffix}`) && lower !== suffix;
+  }
+  // `.suffix` form (the Linux kernel evaluator's suffix-glob spelling). The
+  // gate must reject a deny rule that the enforcing evaluator would actually
+  // match against the lane, regardless of which suffix spelling the operator
+  // used (cross-language parity with the Rust gate; codex round-2 HIGH).
+  if (pattern.startsWith(".")) {
+    const patternLower = pattern.toLowerCase();
+    return lower.endsWith(patternLower) && lower.length > patternLower.length;
   }
   return hostEquals(pattern, host);
 }

@@ -608,11 +608,20 @@ pub fn table_exists() -> Result<bool, NftablesError> {
 
 /// Translate a single AllowlistRule into nft rule expression fragments.
 ///
-/// Host-constrained rules deliberately do not emit static nft accept/drop
-/// verdicts: nft cannot verify hostname context, so those decisions must stay
-/// on the NFQUEUE verdict path where the daemon can evaluate the resolved host
-/// against the signed policy. Only rules without any host axis are safe to
-/// lower directly into nftables.
+/// Destination-constrained rules deliberately do not emit static nft
+/// accept/drop verdicts: those decisions must stay on the NFQUEUE verdict path
+/// where the daemon evaluates the full match clause against the signed policy.
+/// `host` / `host_pattern` rules stay on that path because nft cannot verify
+/// resolved-hostname context. `ip` / `cidr` rules stay on it too: lowering a
+/// rule that carries an ip/cidr axis to a bare `proto dport N <verdict>` would
+/// DROP the address constraint and widen the rule to every destination on that
+/// port. The reserved loopback distress rule (`ip:[127.0.0.1,::1] port:8741`)
+/// would otherwise become `tcp dport 8741 accept` for any host, breaking the
+/// loopback-only invariant (codex round-3). Until the lowering emits `ip
+/// daddr` / `ip6 daddr` matchers, such rules stay on the evaluator path where
+/// the new ip/cidr matching ([`crate::policy::RuleMatch::matches`]) enforces
+/// them. Only rules with NO destination axis (port/protocol only, or fully
+/// open) are safe to lower directly into nftables.
 pub fn rule_to_nft_expr(rule: &crate::policy::AllowlistRule) -> Vec<NftRuleFragment> {
     let mut frags = Vec::new();
     let disposition_expr = match rule.disposition {
@@ -642,7 +651,11 @@ pub fn rule_to_nft_expr(rule: &crate::policy::AllowlistRule) -> Vec<NftRuleFragm
         .unwrap_or("tcp")
         .to_ascii_lowercase();
 
-    if rule.match_clause.host.is_some() || rule.match_clause.host_pattern.is_some() {
+    if rule.match_clause.host.is_some()
+        || rule.match_clause.host_pattern.is_some()
+        || rule.match_clause.ip.is_some()
+        || rule.match_clause.cidr.is_some()
+    {
         return frags;
     }
 
@@ -679,6 +692,8 @@ mod tests {
             match_clause: RuleMatch {
                 host: host.map(|v| v.into_iter().map(|s| s.to_string()).collect()),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port,
                 protocol: proto.map(|s| s.to_string()),
             },
@@ -886,6 +901,32 @@ mod tests {
         assert!(
             frags.is_empty(),
             "host-pattern rules must not become static port-wide nft drops"
+        );
+    }
+
+    #[test]
+    fn rule_to_nft_expr_ip_axis_stays_on_nfqueue() {
+        // An ip-pinned rule (the genuine reserved local distress shape) must
+        // NOT lower to a bare `tcp dport 8741 accept` that would grant the port
+        // to ANY destination — the loopback constraint would be lost in the
+        // kernel (codex round-3). It stays on the evaluator path.
+        let mut r = make_rule("r-ip", None, Some(vec![8741]), Some("tcp"), RuleDisposition::Allow);
+        r.match_clause.ip = Some(vec!["127.0.0.1".to_string(), "::1".to_string()]);
+        let frags = rule_to_nft_expr(&r);
+        assert!(
+            frags.is_empty(),
+            "ip-pinned rules must not become static port-wide nft accepts"
+        );
+    }
+
+    #[test]
+    fn rule_to_nft_expr_cidr_axis_stays_on_nfqueue() {
+        let mut r = make_rule("r-cidr", None, Some(vec![8741]), Some("tcp"), RuleDisposition::Deny);
+        r.match_clause.cidr = Some(vec!["10.0.0.0/8".to_string()]);
+        let frags = rule_to_nft_expr(&r);
+        assert!(
+            frags.is_empty(),
+            "cidr rules must not become static port-wide nft drops"
         );
     }
 

@@ -31,12 +31,26 @@ pub enum RuleDisposition {
 }
 
 /// Match conditions for a rule.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `ip` / `cidr` mirror the TS schema's destination-IP axes (#380): a rule may
+/// pin a flow to a concrete address set or subnet. The evaluator
+/// ([`RuleMatch::matches`]) enforces them against the raw destination IP, and
+/// the HABEAS PORT conflict gate (`crate::habeas`) reasons over them — so the
+/// genuine local distress rule's loopback `ip` pin is honoured end-to-end (it
+/// is NOT silently flattened to "any host", and a cidr/ip-only deny is scoped
+/// to its addresses rather than shadowing every host on the port).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuleMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_pattern: Option<String>,
+    /// Exact destination-IP literals (IPv4 or IPv6). Mirrors TS `match.ip`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<Vec<String>>,
+    /// Destination CIDR blocks (`addr/prefix`). Mirrors TS `match.cidr`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,10 +70,25 @@ impl RuleMatch {
     ///   matches if EITHER hits. When both are absent the host axis is
     ///   not constraining (any host satisfies it, including the no-host
     ///   case where dest is a raw IP).
+    /// - `ip` / `cidr`: family-aware exact / subnet match against the raw
+    ///   destination IP (`dest_ip`). Match a DNS/raw-IP flow that has no
+    ///   hostname. Absent = not constraining.
     /// - `port`: exact match against any entry. Absent = "any port."
     /// - `protocol`: case-insensitive exact match. Absent = "any protocol."
-    pub fn matches(&self, dest_host: Option<&str>, dest_port: u16, dest_protocol: &str) -> bool {
-        if !self.matches_host(dest_host) {
+    ///
+    /// Destination axes (host / host_pattern / ip / cidr) compose as an OR
+    /// (parity with the TS egress-proxy and Swift evaluators): when NONE is
+    /// specified the destination is "match any"; when any is specified, at
+    /// least one must match. This is why the habeas conflict gate
+    /// (`crate::habeas`) can reason over ip/cidr — the evaluator honours them.
+    pub fn matches(
+        &self,
+        dest_host: Option<&str>,
+        dest_ip: Option<&str>,
+        dest_port: u16,
+        dest_protocol: &str,
+    ) -> bool {
+        if !self.matches_destination(dest_host, dest_ip) {
             return false;
         }
         if let Some(ports) = self.port.as_ref() {
@@ -75,42 +104,108 @@ impl RuleMatch {
         true
     }
 
-    fn matches_host(&self, dest_host: Option<&str>) -> bool {
+    fn matches_destination(&self, dest_host: Option<&str>, dest_ip: Option<&str>) -> bool {
         let exact_present = self.host.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
         let pattern_present = self
             .host_pattern
             .as_ref()
             .map(|p| !p.is_empty())
             .unwrap_or(false);
+        let ip_present = self.ip.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let cidr_present = self.cidr.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
 
-        // No host-axis constraints means the rule matches regardless of dest_host.
-        if !exact_present && !pattern_present {
+        // No destination-axis constraints means the rule matches any destination.
+        if !exact_present && !pattern_present && !ip_present && !cidr_present {
             return true;
         }
 
-        let host = match dest_host {
-            Some(h) if !h.is_empty() => h,
-            // The rule constrains by host but the attempt has no host
-            // (raw-IP destination); cannot match.
-            _ => return false,
-        };
-        let host_lower = host.to_ascii_lowercase();
-
-        if exact_present {
-            if let Some(hosts) = self.host.as_ref() {
-                if hosts.iter().any(|h| h.to_ascii_lowercase() == host_lower) {
-                    return true;
+        // Host / host_pattern axes (need a hostname destination).
+        if let Some(host) = dest_host.filter(|h| !h.is_empty()) {
+            let host_lower = host.to_ascii_lowercase();
+            if exact_present {
+                if let Some(hosts) = self.host.as_ref() {
+                    if hosts.iter().any(|h| h.to_ascii_lowercase() == host_lower) {
+                        return true;
+                    }
+                }
+            }
+            if pattern_present {
+                if let Some(pattern) = self.host_pattern.as_ref() {
+                    if matches_suffix_pattern(pattern, &host_lower) {
+                        return true;
+                    }
                 }
             }
         }
-        if pattern_present {
-            if let Some(pattern) = self.host_pattern.as_ref() {
-                if matches_suffix_pattern(pattern, &host_lower) {
-                    return true;
-                }
+
+        // ip / cidr axes (need a raw-IP destination; the host literal itself may
+        // be an IP, so fall back to dest_host when dest_ip is absent).
+        let ip_literal = dest_ip
+            .filter(|s| !s.is_empty())
+            .or(dest_host)
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+        if let Some(addr) = ip_literal {
+            if ip_present && ip_axis_matches(self.ip.as_ref(), &addr) {
+                return true;
+            }
+            if cidr_present && cidr_axis_matches(self.cidr.as_ref(), &addr) {
+                return true;
             }
         }
         false
+    }
+}
+
+/// Family-aware exact match of `addr` against an `ip` axis.
+fn ip_axis_matches(spec: Option<&Vec<String>>, addr: &std::net::IpAddr) -> bool {
+    let Some(ips) = spec else { return false };
+    ips.iter().any(|candidate| {
+        candidate
+            .parse::<std::net::IpAddr>()
+            .map(|c| &c == addr)
+            .unwrap_or(false)
+    })
+}
+
+/// Family-aware subnet containment of `addr` against a `cidr` axis.
+fn cidr_axis_matches(spec: Option<&Vec<String>>, addr: &std::net::IpAddr) -> bool {
+    let Some(cidrs) = spec else { return false };
+    cidrs.iter().any(|cidr| cidr_contains(cidr, addr))
+}
+
+/// True iff `cidr` (`addr/prefix`) contains `target`, family-aware. Malformed
+/// input returns false.
+fn cidr_contains(cidr: &str, target: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let Some((base_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    let Ok(base) = base_str.parse::<IpAddr>() else {
+        return false;
+    };
+    match (base, target) {
+        (IpAddr::V4(base), IpAddr::V4(target)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            (u32::from(base) & mask) == (u32::from(*target) & mask)
+        }
+        (IpAddr::V6(base), IpAddr::V6(target)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let mask: u128 = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(base) & mask) == (u128::from(*target) & mask)
+        }
+        _ => false,
     }
 }
 
@@ -266,6 +361,19 @@ pub enum PolicySnapshotError {
         left_agent_id: String,
         right_agent_id: String,
     },
+    /// The manifest would silence the reserved habeas distress lane (an
+    /// operator rule claims a reserved id, or a deny/prompt rule could shadow
+    /// the loopback lane or the configured webhook target). Fail closed:
+    /// snapshot construction aborts so the daemon keeps the prior good policy
+    /// rather than putting a distress-silencing wall into force. Parity with
+    /// the TS `HabeasConflictError` (`habeas-port.ts`).
+    #[error(
+        "manifest rejected: it would silence the reserved habeas distress lane ({}). \
+         The habeas lane is the guaranteed distress channel and cannot be removed or \
+         shadowed by policy.",
+        issues.join("; ")
+    )]
+    HabeasConflict { issues: Vec<String> },
 }
 
 impl PolicySnapshot {
@@ -304,6 +412,17 @@ impl PolicySnapshot {
             rules.push(rule);
         }
         validate_agent_identity_collisions(&rules)?;
+        // HABEAS PORT conflict gate (parity with TS findHabeasConflicts): refuse
+        // to put a policy into force that would silence the reserved distress
+        // lane. Runs over the composed manifest, exempting the genuine derived
+        // reserved rules. Fail closed: a conflict aborts snapshot construction
+        // and the caller (reload) keeps the prior good policy.
+        let habeas_issues = crate::habeas::find_habeas_conflicts_in_composed(&rules);
+        if !habeas_issues.is_empty() {
+            return Err(PolicySnapshotError::HabeasConflict {
+                issues: habeas_issues,
+            });
+        }
         Ok(Self {
             rules,
             manifest_signature_b64url: Some(loaded.manifest_signature_b64url.clone()),
@@ -326,6 +445,7 @@ impl PolicySnapshot {
             }
             if !rule.match_clause.matches(
                 request.dest_host.as_deref(),
+                request.dest_ip.as_deref(),
                 request.dest_port,
                 &request.dest_protocol,
             ) {
@@ -594,6 +714,8 @@ mod tests {
             match_clause: RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -613,12 +735,14 @@ mod tests {
         let m = RuleMatch {
             host: Some(vec!["API.example.COM".to_string()]),
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(m.matches(Some("API.EXAMPLE.COM"), 443, "tcp"));
-        assert!(!m.matches(Some("other.example.com"), 443, "tcp"));
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(Some("API.EXAMPLE.COM"), None, 443, "tcp"));
+        assert!(!m.matches(Some("other.example.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -626,15 +750,17 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: Some(".example.com".to_string()),
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(m.matches(Some("a.b.c.example.com"), 443, "tcp"));
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(Some("a.b.c.example.com"), None, 443, "tcp"));
         // Apex does NOT match the leading-dot suffix glob.
-        assert!(!m.matches(Some("example.com"), 443, "tcp"));
+        assert!(!m.matches(Some("example.com"), None, 443, "tcp"));
         // Different domain.
-        assert!(!m.matches(Some("api.evil.com"), 443, "tcp"));
+        assert!(!m.matches(Some("api.evil.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -644,11 +770,13 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: Some("example.com".to_string()),
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(!m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(!m.matches(Some("example.com"), 443, "tcp"));
+        assert!(!m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(!m.matches(Some("example.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -656,11 +784,13 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: Some(vec![443]),
             protocol: Some("tcp".to_string()),
         };
-        assert!(m.matches(Some("anything.example.com"), 443, "tcp"));
-        assert!(m.matches(None, 443, "tcp"));
+        assert!(m.matches(Some("anything.example.com"), None, 443, "tcp"));
+        assert!(m.matches(None, None, 443, "tcp"));
     }
 
     #[test]
@@ -669,10 +799,12 @@ mod tests {
         let m = RuleMatch {
             host: Some(vec!["api.example.com".to_string()]),
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(!m.matches(None, 443, "tcp"));
+        assert!(!m.matches(None, None, 443, "tcp"));
     }
 
     #[test]
@@ -680,12 +812,14 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: Some(vec![443, 8443]),
             protocol: None,
         };
-        assert!(m.matches(Some("x"), 443, "tcp"));
-        assert!(m.matches(Some("x"), 8443, "tcp"));
-        assert!(!m.matches(Some("x"), 80, "tcp"));
+        assert!(m.matches(Some("x"), None, 443, "tcp"));
+        assert!(m.matches(Some("x"), None, 8443, "tcp"));
+        assert!(!m.matches(Some("x"), None, 80, "tcp"));
     }
 
     #[test]
@@ -693,12 +827,65 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: Some("TCP".to_string()),
         };
-        assert!(m.matches(Some("x"), 443, "tcp"));
-        assert!(m.matches(Some("x"), 443, "TCP"));
-        assert!(!m.matches(Some("x"), 443, "udp"));
+        assert!(m.matches(Some("x"), None, 443, "tcp"));
+        assert!(m.matches(Some("x"), None, 443, "TCP"));
+        assert!(!m.matches(Some("x"), None, 443, "udp"));
+    }
+
+    #[test]
+    fn match_ip_axis_family_aware_exact() {
+        let m = RuleMatch {
+            ip: Some(vec!["127.0.0.1".to_string(), "::1".to_string()]),
+            port: Some(vec![8741]),
+            protocol: Some("tcp".to_string()),
+            ..Default::default()
+        };
+        // dest_ip path.
+        assert!(m.matches(None, Some("127.0.0.1"), 8741, "tcp"));
+        assert!(m.matches(None, Some("0:0:0:0:0:0:0:1"), 8741, "tcp")); // ::1 normalized
+        // dest_host carrying an IP literal also matches the ip axis.
+        assert!(m.matches(Some("127.0.0.1"), None, 8741, "tcp"));
+        // A non-loopback IP does NOT match (the key regression fix: an ip-only
+        // rule is no longer "any host").
+        assert!(!m.matches(None, Some("8.8.8.8"), 8741, "tcp"));
+        // A hostname destination cannot satisfy an ip-only rule.
+        assert!(!m.matches(Some("api.example.com"), None, 8741, "tcp"));
+        // Wrong port misses.
+        assert!(!m.matches(None, Some("127.0.0.1"), 80, "tcp"));
+    }
+
+    #[test]
+    fn match_cidr_axis_family_aware_containment() {
+        let m = RuleMatch {
+            cidr: Some(vec!["10.0.0.0/8".to_string(), "::1/128".to_string()]),
+            ..Default::default()
+        };
+        assert!(m.matches(None, Some("10.1.2.3"), 443, "tcp"));
+        assert!(m.matches(None, Some("::1"), 443, "tcp"));
+        // In-range v4 matches.
+        assert!(m.matches(None, Some("10.0.0.1"), 443, "tcp"));
+        // Outside the subnet.
+        assert!(!m.matches(None, Some("11.0.0.1"), 443, "tcp"));
+        // Family mismatch / outside v6 prefix never matches.
+        assert!(!m.matches(None, Some("2001:db8::1"), 443, "tcp"));
+    }
+
+    #[test]
+    fn match_destination_axes_compose_as_or() {
+        // host OR ip: a flow matching EITHER axis matches.
+        let m = RuleMatch {
+            host: Some(vec!["api.example.com".to_string()]),
+            ip: Some(vec!["203.0.113.7".to_string()]),
+            ..Default::default()
+        };
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(None, Some("203.0.113.7"), 443, "tcp"));
+        assert!(!m.matches(Some("other.example.com"), Some("203.0.113.8"), 443, "tcp"));
     }
 
     // ---- RuleScope ---------------------------------------------------------
@@ -764,6 +951,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -786,6 +975,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -808,6 +999,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["pastebin.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -831,6 +1024,8 @@ mod tests {
             "r-prompt",
             RuleMatch {
                 host_pattern: Some(".example.com".to_string()),
+                ip: None,
+                cidr: None,
                 host: None,
                 port: None,
                 protocol: None,
@@ -855,6 +1050,8 @@ mod tests {
                 RuleMatch {
                     host: Some(vec!["api.anthropic.com".to_string()]),
                     host_pattern: None,
+                    ip: None,
+                    cidr: None,
                     port: None,
                     protocol: None,
                 },
@@ -866,6 +1063,8 @@ mod tests {
                 RuleMatch {
                     host: Some(vec!["api.anthropic.com".to_string()]),
                     host_pattern: None,
+                    ip: None,
+                    cidr: None,
                     port: Some(vec![443]),
                     protocol: Some("tcp".to_string()),
                 },
@@ -891,6 +1090,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -969,6 +1170,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -989,6 +1192,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -1003,6 +1208,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![8443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -1029,6 +1236,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -1075,6 +1284,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -1097,6 +1308,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },

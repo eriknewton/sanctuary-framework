@@ -636,6 +636,8 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         match_clause: RuleMatch {
             host: Some(vec!["api.anthropic.com".to_string()]),
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: Some(vec![443]),
             protocol: Some("tcp".to_string()),
         },
