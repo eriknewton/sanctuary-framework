@@ -8,11 +8,13 @@
  * All original configs are backed up before any modification.
  */
 
-import { readFile, writeFile, mkdir, copyFile, access, realpath } from "node:fs/promises";
-import { join, extname, resolve, dirname, sep } from "node:path";
+import { readFile, writeFile, mkdir, copyFile, access, realpath, open } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
 import { detectHarnessSchema } from "./harness-schema.js";
+import { hermesConfigYamlPath } from "./hermes-yaml.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -179,10 +181,63 @@ export async function backupConfig(configPath: string): Promise<string> {
 }
 
 /**
+ * Atomic no-follow write primitive (D4 round-2 P1-A).
+ *
+ * The round-1 symlink fix lstat()ed the sink and then wrote with
+ * writeFile/copyFile — two separate syscalls, so an attacker looping
+ * rename+symlink in the config directory could land a symlink between the
+ * check and the write and redirect it to an arbitrary victim file (classic
+ * TOCTOU). Opening the sink with O_NOFOLLOW makes the refusal atomic: the
+ * kernel rejects a symlink at the final path component with ELOOP (POSIX
+ * semantics on both Linux and macOS) in the same syscall that would
+ * otherwise create/truncate the file. Plan-time lstat checks remain as
+ * early courtesy refusals that leave every surface untouched; THIS is the
+ * enforcement at the sink.
+ */
+export async function writeFileNoFollow(
+  path: string,
+  data: string | Uint8Array,
+  mode = 0o600
+): Promise<void> {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_TRUNC |
+        fsConstants.O_NOFOLLOW,
+      mode
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error(
+        `${path} is a symlink; refusing to write through it. ` +
+          `Replace the symlink with a regular file and re-run.`
+      );
+    }
+    throw err;
+  }
+  try {
+    await handle.writeFile(data);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
  * Restore a config from backup.
+ *
+ * D4 round-2 P1-A: the backup side is read normally (callers validate its
+ * location), but the target is written through the no-follow primitive so
+ * a symlink raced into place at the restore target cannot redirect the
+ * write. D4 round-2 P2: a missing parent directory is recreated (0o700)
+ * rather than stranding the operator mid-unwrap.
  */
 export async function restoreConfig(backupPath: string, targetPath: string): Promise<void> {
-  await copyFile(backupPath, targetPath);
+  const data = await readFile(backupPath);
+  await mkdir(dirname(targetPath), { recursive: true, mode: 0o700 });
+  await writeFileNoFollow(targetPath, data);
 }
 
 /** Canonical unwrap-meta filename — all new wraps write this. */
@@ -209,6 +264,17 @@ export interface WrapMetaAuxiliaryFile {
    * fresh (unwrap then removes it to restore the pre-wrap state).
    */
   backupPath: string | null;
+}
+
+/**
+ * A wrap-meta auxiliary entry that has passed validateWrapMetaAuxiliary.
+ * D4 round-2 P2: `alreadyAbsent` marks a null-backup (created-by-wrap)
+ * entry whose parent directory no longer exists — the file cannot exist,
+ * so the desired end-state ("absent") is already satisfied and unwrap
+ * treats the entry as an informational no-op instead of refusing.
+ */
+export interface ValidatedWrapMetaAuxiliaryFile extends WrapMetaAuxiliaryFile {
+  alreadyAbsent?: boolean;
 }
 
 /**
@@ -241,14 +307,45 @@ function isWithin(path: string, dir: string): boolean {
 }
 
 /**
+ * Canonicalize a path for equality/containment checks even when a tail of
+ * it does not exist (yet, or any more): realpath the deepest EXISTING
+ * ancestor, then re-append the missing components lexically. The input is
+ * resolve()d first, so the re-appended tail carries no `..` segments and
+ * cannot traverse back out of the canonicalized ancestor. An existing
+ * symlinked component is still resolved by realpath, so a link pointing
+ * elsewhere fails any prefix/equality check against the legitimate
+ * location exactly as before.
+ */
+async function canonicalizeAllowingMissingTail(path: string): Promise<string> {
+  const resolved = resolve(path);
+  let base = resolved;
+  const missingTail: string[] = [];
+  for (;;) {
+    const real = await realpathOrNull(base);
+    if (real !== null) {
+      return missingTail.length === 0
+        ? real
+        : join(real, ...missingTail.reverse());
+    }
+    const parent = dirname(base);
+    if (parent === base) return resolved; // hit the fs root without an existing ancestor
+    missingTail.push(basename(base));
+    base = parent;
+  }
+}
+
+/**
  * Directories an auxiliary `originalPath` may live in: the per-platform
  * agent config directories (for Hermes: ~/.hermes and ~/.config/hermes).
  * Derived from the same path table wrap itself uses; the home directory
  * itself is excluded (it is the dirname of ~/.claude.json, and allowing it
  * would make the allowlist cover every path under $HOME). Returned
- * realpath-resolved so the prefix check compares like with like (macOS
- * tmpdirs, for example, live under the /var → /private/var symlink);
- * directories that do not exist are dropped — nothing can live inside them.
+ * canonicalized so the prefix check compares like with like (macOS
+ * tmpdirs, for example, live under the /var → /private/var symlink).
+ * D4 round-2 P2: directories that do not exist are kept (canonicalized via
+ * their deepest existing ancestor) — a backed auxiliary whose config
+ * directory was deleted after wrap must still validate so unwrap can
+ * recreate it instead of stranding the operator.
  */
 async function allowedAuxiliaryConfigDirs(): Promise<string[]> {
   const home = resolve(homedir());
@@ -257,31 +354,53 @@ async function allowedAuxiliaryConfigDirs(): Promise<string[]> {
     for (const p of paths) {
       const dir = resolve(dirname(p));
       if (dir === home) continue;
-      const real = await realpathOrNull(dir);
-      if (real !== null) dirs.add(real);
+      dirs.add(await canonicalizeAllowingMissingTail(dir));
     }
   }
   return [...dirs];
 }
 
 /**
- * Validate wrap-meta `auxiliary` entries before ANY use (D4 P1-2).
+ * The exact files wrap can CREATE fresh (recorded in wrap-meta with
+ * `backupPath: null` and removed again on unwrap). D4 round-2 P1-B: a
+ * null-backup auxiliary is a delete-on-unwrap instruction, so it must be
+ * pinned byte-for-byte to this list — today only the Hermes config.yaml
+ * surface — not merely to "anything under an agent config directory".
+ * The round-1 rule let a forged meta name a LEGITIMATE file (e.g.
+ * ~/.hermes/cli-config.json) as null-backup and have unwrap unlink it.
+ */
+async function allowedCreatedByWrapPaths(): Promise<string[]> {
+  return [await canonicalizeAllowingMissingTail(hermesConfigYamlPath())];
+}
+
+/**
+ * Validate wrap-meta `auxiliary` entries before ANY use (D4 P1-2, tightened
+ * by round-2 P1-B/P2).
  *
  * Enforced invariants, each checked after path resolution (and realpath,
- * so symlink/traversal tricks cannot smuggle a path past the prefix check):
+ * so symlink/traversal tricks cannot smuggle a path past the checks):
  *   - `backupPath` is either null (wrap created the file fresh) or a
  *     non-empty string that resolves strictly inside the wrap backup
  *     directory and exists there;
- *   - `originalPath` is a non-empty string whose (existing) parent
- *     directory resolves strictly inside one of the known agent config
- *     directories (for Hermes: ~/.hermes).
+ *   - a BACKED entry's `originalPath` is a non-empty string whose parent
+ *     directory canonicalizes strictly inside one of the known agent
+ *     config directories (for Hermes: ~/.hermes). Round-2 P2: the parent
+ *     may no longer exist — unwrap recreates it — but its deepest existing
+ *     ancestor is still realpath-anchored, so symlinked parents that point
+ *     elsewhere fail the prefix check exactly as before;
+ *   - a NULL-backup entry is a delete-on-unwrap instruction, so round-2
+ *     P1-B pins its `originalPath` byte-for-byte (after canonicalization)
+ *     to the explicit list of files wrap can create fresh — today only
+ *     hermesConfigYamlPath(). "Anywhere under an agent config dir" is NOT
+ *     sufficient: it let a forged meta unlink legitimate files such as
+ *     ~/.hermes/cli-config.json.
  *
  * Throws WrapMetaValidationError on anything else; never modifies state.
  * Returns the validated entries with both paths fully resolved.
  */
 export async function validateWrapMetaAuxiliary(
   auxiliary: unknown
-): Promise<WrapMetaAuxiliaryFile[]> {
+): Promise<ValidatedWrapMetaAuxiliaryFile[]> {
   if (auxiliary === undefined || auxiliary === null) return [];
   if (!Array.isArray(auxiliary)) {
     throw new WrapMetaValidationError(
@@ -292,7 +411,8 @@ export async function validateWrapMetaAuxiliary(
 
   const backupRoot = await realpathOrNull(backupDir());
   const allowedDirs = await allowedAuxiliaryConfigDirs();
-  const validated: WrapMetaAuxiliaryFile[] = [];
+  const createdByWrapAllowlist = await allowedCreatedByWrapPaths();
+  const validated: ValidatedWrapMetaAuxiliaryFile[] = [];
 
   for (const entry of auxiliary) {
     if (!entry || typeof entry !== "object") {
@@ -308,43 +428,63 @@ export async function validateWrapMetaAuxiliary(
       );
     }
     const resolvedOriginal = resolve(originalPath);
-    // The parent must already exist (unwrap only restores into / removes
-    // from directories the wrap touched) and must realpath-resolve inside
-    // a known agent config directory — symlinked parents that point
-    // elsewhere fail the prefix check.
-    const parentReal = await realpathOrNull(dirname(resolvedOriginal));
-    if (
-      parentReal === null ||
-      !allowedDirs.some((dir) => isWithin(parentReal, dir))
-    ) {
+    const parentDir = dirname(resolvedOriginal);
+
+    if (backupPath === null) {
+      // Round-2 P1-B: null backup = created-by-wrap = delete-on-unwrap.
+      // Byte-equality against the explicit created-by-wrap allowlist, with
+      // both sides canonicalized the same way.
+      const canonicalOriginal =
+        await canonicalizeAllowingMissingTail(resolvedOriginal);
+      if (!createdByWrapAllowlist.includes(canonicalOriginal)) {
+        throw new WrapMetaValidationError(
+          `wrap-meta auxiliary originalPath ${originalPath} carries a null ` +
+            "backupPath but is not a file wrap creates; refusing to unwrap."
+        );
+      }
+      // Round-2 P2: if the parent directory no longer exists, the file
+      // cannot exist either — the delete-on-unwrap end-state is already
+      // satisfied. Mark the entry so unwrap skips it as a no-op.
+      const parentReal = await realpathOrNull(parentDir);
+      validated.push({
+        originalPath: resolvedOriginal,
+        backupPath: null,
+        ...(parentReal === null ? { alreadyAbsent: true } : {}),
+      });
+      continue;
+    }
+
+    // Backed entry: parent must canonicalize inside a known agent config
+    // directory. Round-2 P2: a missing parent is tolerated (unwrap
+    // recreates it); canonicalizeAllowingMissingTail still realpath-anchors
+    // the deepest existing ancestor, so symlinked parents pointing outside
+    // the allowlist fail the prefix check.
+    const canonicalParent = await canonicalizeAllowingMissingTail(parentDir);
+    if (!allowedDirs.some((dir) => isWithin(canonicalParent, dir))) {
       throw new WrapMetaValidationError(
         `wrap-meta auxiliary originalPath ${originalPath} is not inside a ` +
           "known agent config directory; refusing to unwrap."
       );
     }
 
-    let resolvedBackup: string | null = null;
-    if (backupPath !== null) {
-      if (typeof backupPath !== "string" || backupPath.trim() === "") {
-        throw new WrapMetaValidationError(
-          "wrap-meta auxiliary entry has a non-string backupPath; refusing to unwrap."
-        );
-      }
-      const backupReal = await realpathOrNull(resolve(backupPath));
-      if (
-        backupRoot === null ||
-        backupReal === null ||
-        !backupReal.startsWith(backupRoot + sep)
-      ) {
-        throw new WrapMetaValidationError(
-          `wrap-meta auxiliary backupPath ${backupPath} is not inside the ` +
-            "wrap backup directory; refusing to unwrap."
-        );
-      }
-      resolvedBackup = backupReal;
+    if (typeof backupPath !== "string" || backupPath.trim() === "") {
+      throw new WrapMetaValidationError(
+        "wrap-meta auxiliary entry has a non-string backupPath; refusing to unwrap."
+      );
+    }
+    const backupReal = await realpathOrNull(resolve(backupPath));
+    if (
+      backupRoot === null ||
+      backupReal === null ||
+      !backupReal.startsWith(backupRoot + sep)
+    ) {
+      throw new WrapMetaValidationError(
+        `wrap-meta auxiliary backupPath ${backupPath} is not inside the ` +
+          "wrap backup directory; refusing to unwrap."
+      );
     }
 
-    validated.push({ originalPath: resolvedOriginal, backupPath: resolvedBackup });
+    validated.push({ originalPath: resolvedOriginal, backupPath: backupReal });
   }
   return validated;
 }
@@ -366,7 +506,7 @@ export async function validateWrapMetaAuxiliary(
 export async function findLatestBackup(): Promise<{
   backupPath: string;
   originalPath: string;
-  auxiliary?: WrapMetaAuxiliaryFile[];
+  auxiliary?: ValidatedWrapMetaAuxiliaryFile[];
 } | null> {
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     const metaPath = join(backupDir(), filename);

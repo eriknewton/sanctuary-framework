@@ -43,10 +43,12 @@ import {
   rewriteConfigForWrap,
   getPlatformPaths,
   validateWrapMetaAuxiliary,
+  writeFileNoFollow,
   WrapMetaValidationError,
   type AgentPlatform,
   type MCPServerEntry,
   type WrapMetaAuxiliaryFile,
+  type ValidatedWrapMetaAuxiliaryFile,
 } from "./config-reader.js";
 import {
   hermesConfigYamlPath,
@@ -939,13 +941,12 @@ export async function runWrap(
     let yamlVerified = false;
     try {
       await mkdir(dirname(yamlSurface.yamlPath), { recursive: true, mode: 0o700 });
-      // D4 P2-3 re-check at write time: the plan-time refusal above ran
-      // before any state was written; this one closes the window where the
-      // path became a symlink in between.
+      // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
+      // write is TOCTOU-raceable, so the writeFileNoFollow below is the
+      // actual enforcement — its O_NOFOLLOW open refuses a symlink raced
+      // into place in the same syscall that creates/truncates the sink.
       await refuseSymlinkTarget(yamlSurface.yamlPath, "Hermes config.yaml");
-      await writeFile(yamlSurface.yamlPath, yamlSurface.plan.content, {
-        mode: 0o600,
-      });
+      await writeFileNoFollow(yamlSurface.yamlPath, yamlSurface.plan.content, 0o600);
       yamlVerified = yamlContainsSanctuaryEntry(
         await readFile(yamlSurface.yamlPath, "utf-8")
       );
@@ -1738,8 +1739,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
   // D4 P1-2 (validate before use) + P2-3 (no symlinked restore targets):
   // re-validate every auxiliary entry and refuse symlinked targets BEFORE
   // any restore runs, so a forged or symlinked entry aborts the whole
-  // unwrap with nothing modified — including the primary config.
-  let auxiliary: WrapMetaAuxiliaryFile[] = [];
+  // unwrap with nothing modified — including the primary config. Round-2
+  // P1-A: the lstat loop below is a courtesy early refusal; the atomic
+  // enforcement is the O_NOFOLLOW open inside restoreConfig itself.
+  let auxiliary: ValidatedWrapMetaAuxiliaryFile[] = [];
   try {
     auxiliary = await validateWrapMetaAuxiliary(meta.auxiliary);
     for (const aux of auxiliary) {
@@ -1764,6 +1767,11 @@ async function unwrap(dryRun: boolean): Promise<void> {
       if (aux.backupPath) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Would restore ${aux.originalPath} from ${aux.backupPath}`);
+      } else if (aux.alreadyAbsent) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Would skip ${aux.originalPath} (created by wrap; already absent)`
+        );
       } else {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
@@ -1791,10 +1799,19 @@ async function unwrap(dryRun: boolean): Promise<void> {
   for (const aux of auxiliary) {
     try {
       if (aux.backupPath) {
+        // Round-2 P1-A/P2: restoreConfig writes the target O_NOFOLLOW
+        // (atomic symlink refusal) and recreates a missing parent (0o700).
         await restoreConfig(aux.backupPath, aux.originalPath);
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
+      } else if (aux.alreadyAbsent) {
+        // Round-2 P2: created-by-wrap file whose parent directory is gone —
+        // the "absent" end-state already holds; informational no-op.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Skipped ${aux.originalPath} (created by wrap; already absent)`
+        );
       } else {
         await unlink(aux.originalPath);
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
