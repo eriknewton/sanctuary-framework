@@ -12,8 +12,10 @@
  * Chi-5 ships:    audit-event-class distribution drift
  * Chi-6 ships:    credential-use-sequence, cross-agent-distribution
  * Chi-7 ships:    time-of-day-activity (time-of-day-conditioned
- *                 baselines; this PR)
- * Chi-8+ ships:   root-cause hints, etc.
+ *                 baselines)
+ * Chi-8 ships:    root-cause hints (this PR; finding-details
+ *                 enrichment in the dispatcher, not a new detector)
+ * Chi-9+ ships:   etc.
  *
  * Pattern mirrors Phi-1's `PHI1_BASELINE_CATALOG`. Default
  * subscription set is empty; operator opts in.
