@@ -170,7 +170,10 @@ Commands:
 Options:
   --passphrase <value>              Current destination/source passphrase
   --source-passphrase <value>       Source passphrase for state re-key on import
-  --source-recovery-key <value>     Source recovery key for state re-key on import
+                                    (legacy bundles only; envelope-era bundles
+                                    use the bundle re-key key instead)
+  --source-recovery-key <value>     Bundle re-key key (displayed at export) or
+                                    legacy source recovery key for state re-key
   --destination-identity-id <id>    Destination signer for re-keyed state
   --import-state                    Import encrypted state during activation.
                                     Requires --activate and source credentials.
@@ -219,6 +222,11 @@ Description:
   Exports identity, audit receipts, reputation data, policy metadata, optional
   encrypted state namespaces, and optional did:web binding into a portable exit
   bundle. Export requires Tier 1 approval unless --yes is supplied.
+
+  When state is exported, a one-time BUNDLE RE-KEY KEY is displayed: it is the
+  credential that re-keys the bundle's encrypted state at import
+  (--source-recovery-key). It is never written into the bundle — store it
+  separately. Fortress credentials never travel inside the bundle.
 
 Options:
   --out <dir>                       Destination bundle directory.
@@ -435,6 +443,9 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         stateStoragePath: ctx.stateStoragePath,
         stateNamespaces: repeatedFlagValues(argv, "--state-namespace"),
         keySource: ctx.keySource,
+        // The CLI is an operator terminal: safe to mint + display the
+        // bundle re-key key (it is never written into the bundle).
+        mintStateRekeyKey: true,
         ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
       });
       if (json) {
@@ -469,6 +480,22 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
         for (const item of result.unsupported_artifacts) {
           write(out, `unsupported: ${item}\n`);
+        }
+        if (result.state_rekey_key !== undefined) {
+          write(
+            out,
+            [
+              "",
+              "BUNDLE RE-KEY KEY (displayed once, NOT stored in the bundle):",
+              `  ${result.state_rekey_key}`,
+              "Store it separately from the bundle directory. Importing this",
+              "bundle's encrypted state requires it:",
+              "  sanctuary exit import <dir> --activate --import-state \\",
+              "    --source-recovery-key <key>",
+              "If it is lost, re-export the bundle from the source fortress.",
+              "",
+            ].join("\n")
+          );
         }
       }
       return 0;
