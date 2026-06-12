@@ -351,7 +351,7 @@ function encodeUlid(timestampMs: number, random: Uint8Array): string {
     }
   }
   if (bitCount > 0) {
-    chars[out++] = ULID_ALPHABET[(bitBuffer << (5 - bitCount)) & 31]!;
+    chars[out] = ULID_ALPHABET[(bitBuffer << (5 - bitCount)) & 31]!;
   }
   return chars.join("");
 }

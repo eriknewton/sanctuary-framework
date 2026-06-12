@@ -321,7 +321,8 @@ export async function persistUserProvidedPassphrase(
       `Could not persist the provided passphrase to either Keychain or ${fallback}: ` +
         `${(err as Error).message}. ` +
         `Refusing to proceed — writing the passphrase into the rewritten agent config would ` +
-        `leak it as plaintext at rest and in process argv.`
+        `leak it as plaintext at rest and in process argv.`,
+      { cause: err }
     );
   }
   return { location: fallback, source: "fallback-file" };

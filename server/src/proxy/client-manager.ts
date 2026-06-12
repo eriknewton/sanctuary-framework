@@ -163,7 +163,7 @@ export class ClientManager {
     }
 
     // SEC-047: Validate server names before processing
-    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_\-]+$/;
+    const SAFE_SERVER_NAME = /^[a-zA-Z0-9_-]+$/;
 
     const newNames = new Set(servers.filter(s => {
       if (!SAFE_SERVER_NAME.test(s.name)) {
@@ -347,7 +347,7 @@ export class ClientManager {
 
         // SEC-044: Validate stdio command args to prevent command injection
         if (conn.server.transport.args) {
-          const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-\/=:@]+$/;
+          const SAFE_ARG_PATTERN = /^[a-zA-Z0-9._\-/=:@]+$/;
           for (const arg of conn.server.transport.args) {
             if (!SAFE_ARG_PATTERN.test(arg)) {
               throw new Error(`Unsafe argument rejected: contains disallowed characters`);

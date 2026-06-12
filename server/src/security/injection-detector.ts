@@ -933,7 +933,9 @@ export class InjectionDetector {
     }
 
     // Zero-width character detection — single combined regex instead of four passes
-    const zeroWidthMatches = value.match(/[\u200B\u200C\u200D\uFEFF]/g);
+    // (alternation of the four single code points; equivalent to the character
+    // class form without tripping no-misleading-character-class on the ZWJ)
+    const zeroWidthMatches = value.match(/\u200B|\u200C|\u200D|\uFEFF/g);
     const zeroWidthCount = zeroWidthMatches ? zeroWidthMatches.length : 0;
 
     if (zeroWidthCount > 0) {

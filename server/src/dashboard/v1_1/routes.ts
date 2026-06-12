@@ -19,7 +19,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { renderDashboardV11Html, type DashboardV11HtmlOptions } from "./html.js";
 
-export interface DashboardV11RouteDeps extends DashboardV11HtmlOptions {}
+export type DashboardV11RouteDeps = DashboardV11HtmlOptions;
 
 /**
  * Render the v1.1 SPA HTML for the current request. Returns true when

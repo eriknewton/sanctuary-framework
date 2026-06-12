@@ -392,7 +392,8 @@ export async function startStandaloneDashboard(
     if (err instanceof ResetHistoryMalformedError) {
       throw new Error(
         `Sanctuary Dashboard: ${err.message}\n` +
-          `Refusing to start the dashboard while the reset-history marker is unreadable.`
+          `Refusing to start the dashboard while the reset-history marker is unreadable.`,
+        { cause: err }
       );
     }
     throw err;
