@@ -39,6 +39,14 @@ import {
   DEFAULT_BASELINE_SAMPLE_COUNT,
 } from "./detectors/audit-event-class-distribution-detector.js";
 import {
+  CredentialUseSequenceDetector,
+  CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
+} from "./detectors/credential-use-sequence-detector.js";
+import {
+  CrossAgentDistributionDetector,
+  CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
+} from "./detectors/cross-agent-distribution-detector.js";
+import {
   DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
   ROLLING_BASELINE_CLASSIFIER_ID,
 } from "./classifiers/rolling-baseline.js";
@@ -136,6 +144,20 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       `Audit-event class distribution detector: per-agent categorical PSI over audit operation mix, with top per-class drift attribution. Operator tunables: psiThreshold default ${DEFAULT_AUDIT_EVENT_CLASS_PSI_THRESHOLD}, baselineSampleCount default ${DEFAULT_BASELINE_SAMPLE_COUNT}.`,
     factory: () => new AuditEventClassDistributionDetector(),
+  },
+  {
+    detectorId: CREDENTIAL_USE_SEQUENCE_DETECTOR_ID,
+    classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+    description:
+      `Credential-use sequence detector: per-agent credential-event count, distinct credentials used, repeated credential-pair score, and max 5-minute burst over a 24h rolling window. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
+    factory: () => new CredentialUseSequenceDetector(),
+  },
+  {
+    detectorId: CROSS_AGENT_DISTRIBUTION_DETECTOR_ID,
+    classifierId: ROLLING_BASELINE_CLASSIFIER_ID,
+    description:
+      `Cross-agent distribution detector: per-agent activity features re-expressed as peer-relative z-scores plus peer count over a 24h window. Operator tunable: minSamplesForPrediction default ${DEFAULT_MIN_SAMPLES_FOR_PREDICTION}.`,
+    factory: () => new CrossAgentDistributionDetector(),
   },
 ];
 

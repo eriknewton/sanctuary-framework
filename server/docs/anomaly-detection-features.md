@@ -31,8 +31,10 @@ Feature names are detector-local, stable strings. Current examples include:
 | `cross-agent-timing` | `co_fire_rate_24h`, `inter_event_time_p50_ms`, `inter_event_time_p99_ms`, `correlation_strength` |
 | `tool-call-sequence` | `distinct_tools_used`, `max_sequence_length`, `ngram_3_histogram_entropy`, `repeat_pattern_score` |
 | `audit-event-class-distribution` | `total_events`, `class_count:<audit-operation>`, `class_proportion:<audit-operation>` |
+| `credential-use-sequence` | `credential_event_count`, `distinct_credentials_used`, `repeat_pair_score`, `burst_max_5min` |
+| `cross-agent-distribution` | `peer_z:<activity-feature>`, `peer_count` |
 
-Reserved namespaces are detector-owned. `audit-event-class-distribution` owns `class_count:*` and `class_proportion:*`; other detectors currently use unprefixed fixed feature names. New detectors should avoid reusing another detector's prefixed namespace unless they intentionally share feature semantics.
+Reserved namespaces are detector-owned. `audit-event-class-distribution` owns `class_count:*` and `class_proportion:*`; `cross-agent-distribution` owns `peer_z:*`; other detectors currently use unprefixed fixed feature names. New detectors should avoid reusing another detector's prefixed namespace unless they intentionally share feature semantics.
 
 `agent_id` is the classifier bucket. Most detectors use an audit-log `identity_id`; blank identities fall into the synthetic `system` bucket. `cross-agent-timing` uses a canonical unordered pair key, `<agent-a>|<agent-b>`. `observed_at` is an ISO timestamp for the vector observation. `window_label` is a diagnostic label such as `24h_rolling` or `5min_sliding`.
 
@@ -51,6 +53,8 @@ Source note: the operator-facing catalog currently exposes only `per-agent-activ
 | `cross-agent-timing` | 24-hour unordered agent-pair timing features: co-fire count within 60s, p50 and p99 inter-event time, Pearson correlation over 5-minute buckets | `rolling-baseline` | Same rolling-baseline defaults when constructed without an explicit classifier. | Agent pairs that begin firing together, stop correlating, or show unusual timing distribution. | Same standard anomaly finding shape, with `agent_id` set to the pair key. |
 | `tool-call-sequence` | 5-minute per-agent sequence features for proxy tool calls: distinct tools, sequence length, 3-gram entropy, repeated 2-gram score | `rolling-baseline` | Same rolling-baseline defaults when constructed without an explicit classifier. | Unusual tool ordering, repeated call pairs, or entropy shifts that count-based detectors miss. | Same standard anomaly finding shape. |
 | `audit-event-class-distribution` | 24-hour per-agent audit-operation distribution: total events plus per-operation class counts and proportions | `audit-event-class-distribution:psi` | PSI threshold `0.25`; baseline sample count `7`; 7-day prior-window priming when history exists. | Categorical distribution shift in the audit operation mix. | `sentinel_id` is `anomaly:audit-event-class-distribution`; details also include `psi_score`, `psi_threshold`, `baseline_class_proportions`, `current_class_proportions`, and `per_class_drift`. |
+| `credential-use-sequence` | 24-hour per-agent credential-consumption shape: broker credential-event count, distinct credentials used, repeated credential-pair score, max events in any 5-minute bucket | `rolling-baseline` | Same rolling-baseline defaults when constructed without an explicit classifier. Agent attribution prefers `details.agent`, then `identity_id`, then the `system` bucket; the credential token prefers `details.secret`, falling back to the operation name. | Credential enumeration breadth, hammered credential pairs, and burst-dump shapes that total counts miss. | Same standard anomaly finding shape. |
+| `cross-agent-distribution` | 24-hour per-agent activity features re-expressed as z-scores against the peer cohort in the same window (stddev floor `0.5`), plus peer count | `rolling-baseline` | Same rolling-baseline defaults when constructed without an explicit classifier. Vectors emit only when two or more agents are observed (at least one peer). | One agent diverging from its peers even when fortress-wide drift masks self-history baselines. | Same standard anomaly finding shape. |
 
 Shipped classifiers:
 
@@ -181,9 +185,9 @@ The anomaly subsystem preserves the operator-sovereign posture:
 
 These constraints matter because anomaly detection inspects sensitive operational behavior. Keeping extraction, state, scoring, and findings local prevents a monitoring subsystem from becoming an exfiltration or centralized telemetry path.
 
-## Extension Points For Chi-6+
+## Extension Points For Chi-7+
 
-Future detectors can add feature extractors and detector classes without changing `FeatureVector` as long as their feature payload stays numeric. Likely additive surfaces include cross-agent distribution comparison, root-cause hints built from existing `feature_contributions`, and time-of-day-conditioned baselines. Detector-local classifiers should use the `<detector-id>:<classifier-name>` namespace when their persisted state shape differs from a generic classifier.
+Chi-6 landed the first two surfaces previously listed here: cross-agent distribution comparison (the `cross-agent-distribution` detector) and credential-use sequence patterns (the `credential-use-sequence` detector, named in the detector catalog's forward list since Chi-4). Future detectors can add feature extractors and detector classes without changing `FeatureVector` as long as their feature payload stays numeric. Remaining likely additive surfaces include root-cause hints built from existing `feature_contributions` and time-of-day-conditioned baselines. Detector-local classifiers should use the `<detector-id>:<classifier-name>` namespace when their persisted state shape differs from a generic classifier.
 
 ## Source Verification Notes
 
