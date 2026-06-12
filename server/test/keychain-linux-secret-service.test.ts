@@ -34,6 +34,7 @@ import {
   OS_KEYRING_LOCATION_LINUX,
   type ExecResult,
 } from "../src/wrap/passphrase.js";
+import { SilentCustodyRefusedError } from "../src/core/master-custody.js";
 
 type ExecCall = { cmd: string; args: string[]; input?: string };
 
@@ -273,62 +274,69 @@ describe("Linux Secret Service keychain backend", () => {
     expect(reReadB.source).toBe("keychain");
   });
 
-  // ── Fall-through to fallback file ───────────────────────────────────
+  // ── F3: generation fails closed when the keyring is unusable ────────
+  // (The fallback file remains readable for pre-existing/user-supplied
+  // values; what is gone is SILENT generation into it — that was a
+  // machine-bound secret the user never saw, i.e. a lockout generator.)
 
-  it("falls through to the encrypted fallback file when secret-tool is not installed", async () => {
+  it("F3: refuses silent generation when secret-tool is not installed", async () => {
     const h = makeSecretServiceMock();
     h.mode.storeFailure = "enoent";
     h.mode.lookupFailure = "enoent";
 
-    const first = await getOrCreatePassphrase({
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec: h.exec,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
+    expect(h.stored.size).toBe(0);
+
+    // A user-supplied value still persists to the encrypted fallback file.
+    await persistUserProvidedPassphrase("user-held-linux-value", {
       home,
       platformOverride: "linux",
       exec: h.exec,
     });
-    expect(first.source).toBe("generated");
-    expect(first.location).toBe(fallbackFilePath(home));
-    expect(h.stored.size).toBe(0);
-
-    // File exists with non-plaintext content.
     await access(fallbackFilePath(home));
     const raw = await readFile(fallbackFilePath(home));
-    expect(raw.toString("utf-8")).not.toContain(first.value);
+    expect(raw.toString("utf-8")).not.toContain("user-held-linux-value");
   });
 
-  it("falls through to the fallback file when the D-Bus session bus is unavailable", async () => {
+  it("F3: refuses silent generation when the D-Bus session bus is unavailable", async () => {
     const h = makeSecretServiceMock();
     h.mode.storeFailure = "dbus-unavailable";
     h.mode.lookupFailure = "dbus-unavailable";
 
-    const first = await getOrCreatePassphrase({
-      home,
-      platformOverride: "linux",
-      exec: h.exec,
-    });
-    expect(first.source).toBe("generated");
-    expect(first.location).toBe(fallbackFilePath(home));
-    expect(isOsKeyringLocation(first.location)).toBe(false);
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec: h.exec,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
   });
 
-  it("falls through to the fallback file when the keyring unlock prompt is cancelled", async () => {
+  it("F3: refuses silent generation when the keyring unlock prompt is cancelled", async () => {
     const h = makeSecretServiceMock();
     h.mode.storeFailure = "user-cancelled";
 
-    const first = await getOrCreatePassphrase({
-      home,
-      platformOverride: "linux",
-      exec: h.exec,
-    });
-    expect(first.source).toBe("generated");
-    expect(first.location).toBe(fallbackFilePath(home));
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec: h.exec,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
   });
 
   it("prefers Secret Service when it holds a value even if a fallback file also exists", async () => {
     const h = makeSecretServiceMock();
-    // Seed the fallback file first under linux fallback behavior (force a
-    // store failure on the initial call to force fallback-file write).
+    // Seed the fallback file first (user-supplied persistence with the
+    // keyring down, forcing the fallback-file write).
     h.mode.storeFailure = "dbus-unavailable";
-    const seeded = await getOrCreatePassphrase({
+    const seeded = await persistUserProvidedPassphrase("fallback-seeded-value", {
       home,
       platformOverride: "linux",
       exec: h.exec,
@@ -353,7 +361,7 @@ describe("Linux Secret Service keychain backend", () => {
     expect(resolved.value).toBe("keychain-holds-the-canonical-value");
     expect(resolved.location).toBe(OS_KEYRING_LOCATION_LINUX);
     // Critically: the resolved value is NOT the one in the fallback file.
-    expect(resolved.value).not.toBe(seeded.value);
+    expect(resolved.value).not.toBe("fallback-seeded-value");
   });
 
   // ── persistUserProvidedPassphrase ───────────────────────────────────
@@ -512,7 +520,8 @@ describe("Linux Secret Service keychain backend", () => {
         if (args[0] === "find-generic-password") {
           return { stdout: "", stderr: "not found", code: 44 };
         }
-        if (args[0] === "add-generic-password") {
+        // F5: writes arrive as a `security -i` batch script on stdin.
+        if (args[0] === "-i" || args[0] === "add-generic-password") {
           return { stdout: "", stderr: "", code: 0 };
         }
       }

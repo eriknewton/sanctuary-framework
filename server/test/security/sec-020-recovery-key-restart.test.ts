@@ -55,16 +55,24 @@ afterEach(() => {
 describe("SEC-020: Recovery key path must not regenerate master key", () => {
   // ── First run behavior ─────────────────────────────────────────────
 
-  it("first run generates a recovery key and stores its hash", async () => {
+  it("first run generates a recovery key and stores a custody envelope wrapping the master", async () => {
     const storage = new MemoryStorage();
 
     // First run: no passphrase, no existing hash
-    const { config } = await createSanctuaryServer({ storage });
+    const { masterKey } = await createSanctuaryServer({ storage });
 
-    // Verify recovery-key-hash was stored
-    const storedHash = await storage.read("_meta", "recovery-key-hash");
-    expect(storedHash).not.toBeNull();
-    expect(storedHash!.length).toBeGreaterThan(0);
+    // Sovereign-custody build: the master is stored ONLY as wraps in the
+    // custody envelope; the recovery key is a wrap of the true master
+    // (never a parallel master, never a bare hash marker).
+    const raw = await storage.read("_meta", "custody-envelope");
+    expect(raw).not.toBeNull();
+    const envelope = JSON.parse(bytesToString(raw!));
+    expect(envelope.v).toBe(1);
+    expect(envelope.install_mode).toBe("stdio-server");
+    expect(
+      envelope.wraps.some((w: { type: string }) => w.type === "recovery-key")
+    ).toBe(true);
+    expect(masterKey.length).toBe(32);
   });
 
   // ── Subsequent run with correct recovery key ───────────────────────
@@ -213,12 +221,21 @@ describe("SEC-020: Recovery key path must not regenerate master key", () => {
     process.env.SANCTUARY_PASSPHRASE = "test-passphrase-for-sec-020";
 
     // Should start fine with passphrase
-    const { config } = await createSanctuaryServer({ storage });
+    const { config, masterKey } = await createSanctuaryServer({ storage });
     expect(config).toBeDefined();
 
-    // Verify key-params were stored (passphrase path)
-    const keyParams = await storage.read("_meta", "key-params");
-    expect(keyParams).not.toBeNull();
+    // Sovereign-custody build: a passphrase first-run stores the master as
+    // a passphrase wrap in the custody envelope (key-params is legacy-only),
+    // and a second boot with the same passphrase unwraps the SAME master.
+    const raw = await storage.read("_meta", "custody-envelope");
+    expect(raw).not.toBeNull();
+    const envelope = JSON.parse(bytesToString(raw!));
+    expect(
+      envelope.wraps.some((w: { type: string }) => w.type === "passphrase")
+    ).toBe(true);
+
+    const second = await createSanctuaryServer({ storage });
+    expect(toBase64url(second.masterKey)).toBe(toBase64url(masterKey));
   });
 
   // ── Recovery key hash uses constant-time comparison ────────────────

@@ -198,9 +198,12 @@ function aggregateMetrics(
 export class ReputationStore {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
+  /** Held for custody-floor envelope authentication (never logged). */
+  private masterKey: Uint8Array;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
     this.storage = storage;
+    this.masterKey = masterKey;
     this.encryptionKey = derivePurposeKey(masterKey, "l4-reputation");
   }
 
@@ -383,6 +386,11 @@ export class ReputationStore {
     verifySignatures: boolean,
     publicKeys: Map<string, Uint8Array>
   ): Promise<{ imported: number; invalid: number; contexts: string[] }> {
+    // Two-factor custody floor (I4/F6): reputation is trust-bearing state.
+    // Enforced in the core so no CLI/SDK path can bypass it.
+    const { enforceCustodyFloor } = await import("../core/master-custody.js");
+    await enforceCustodyFloor(this.storage, "reputation_import", this.masterKey);
+
     let imported = 0;
     let invalid = 0;
     const contexts = new Set<string>();

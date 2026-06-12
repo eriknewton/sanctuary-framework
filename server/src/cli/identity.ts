@@ -14,11 +14,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
-import {
-  deriveMasterKey,
-  type KeyDerivationParams,
-} from "../core/key-derivation.js";
-import { bytesToString, fromBase64url } from "../core/encoding.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 
 export interface IdentityCommandArgs {
@@ -158,21 +154,12 @@ async function cmdShow(
     const stateStoragePath = join(config.storage_path, "state");
     const storage = new FilesystemStorage(stateStoragePath);
 
-    let masterKey: Uint8Array;
-    if (passphrase) {
-      let existingParams: KeyDerivationParams | undefined;
-      const raw = await storage.read("_meta", "key-params");
-      if (raw)
-        existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-      const derived = await deriveMasterKey(passphrase, existingParams);
-      masterKey = derived.key;
-    } else {
-      masterKey = fromBase64url(recoveryKey!);
-      if (masterKey.length !== 32) {
-        write(err, "Error: SANCTUARY_RECOVERY_KEY must decode to 32 bytes.\n");
-        return 1;
-      }
-    }
+    // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+    const masterKey = await resolveCliMasterKey(storage, {
+      ...(passphrase !== undefined ? { passphrase } : {}),
+      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
+      storagePathHint: config.storage_path,
+    });
 
     const identityManager = new IdentityManager(storage, masterKey);
     const loadResult = await identityManager.load();

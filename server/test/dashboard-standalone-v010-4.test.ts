@@ -286,23 +286,22 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
     process.env.SANCTUARY_STORAGE_PATH = root;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "v010-4-banner-token";
 
-    const logs: string[] = [];
-    const origError = console.error;
-    console.error = (...args: unknown[]) => {
-      logs.push(args.map(String).join(" "));
-    };
-
+    // Sovereign-custody build: the boot FAILS CLOSED (migration refuses to
+    // capture a master the evidence contradicts); the error carries the
+    // diagnostics the old warning banner used to print.
+    let threw: Error | null = null;
     try {
       const r = await startWithRetry({
         passphrase: "passphrase-B-WRONG",
         host: "127.0.0.1",
       });
       dashboard = r.dashboard;
-    } finally {
-      console.error = origError;
+    } catch (err) {
+      threw = err as Error;
     }
 
-    const banner = logs.join("\n");
+    expect(threw).not.toBeNull();
+    const banner = threw!.message;
     expect(banner).toMatch(/Encrypted identities found but NONE loaded/);
     // Schema doc reference is now the canonical pointer.
     expect(banner).toMatch(/server\/docs\/keychain-schema\.md/);

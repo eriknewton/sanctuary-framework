@@ -13,6 +13,7 @@ import {
 } from "../../src/l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
   parseCastleWallArgs,
@@ -53,6 +54,16 @@ describe("castle-wall CLI verbs", () => {
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
+    // Faithful legacy fortress: persist the recovery-key-hash marker so the
+    // unified custody path (master-custody.ts) recognizes and migrates it.
+    // (The pre-custody CLI accepted SANCTUARY_RECOVERY_KEY with no marker at
+    // all; that fail-open is gone.)
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    await storage.write(
+      "_meta",
+      "recovery-key-hash",
+      stringToBytes(hashToString(masterKey)),
+    );
     return { fortressPath, masterKey, recoveryKey };
   }
 
@@ -61,7 +72,7 @@ describe("castle-wall CLI verbs", () => {
   }
 
   it("provision-pin creates keypair files", async () => {
-    const { fortressPath } = await makeFortress();
+    const { fortressPath, recoveryKey } = await makeFortress();
     const out = new CaptureStream();
     const err = new CaptureStream();
     const code = await runProvisionPin({
@@ -69,7 +80,7 @@ describe("castle-wall CLI verbs", () => {
       err,
       env: {
         SANCTUARY_STORAGE_PATH: fortressPath,
-        SANCTUARY_PASSPHRASE: "test-passphrase",
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
       },
     });
 
@@ -554,6 +565,16 @@ describe("castle-wall audit-chain operator override", () => {
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
+    // Faithful legacy fortress: persist the recovery-key-hash marker so the
+    // unified custody path (master-custody.ts) recognizes and migrates it.
+    // (The pre-custody CLI accepted SANCTUARY_RECOVERY_KEY with no marker at
+    // all; that fail-open is gone.)
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    await storage.write(
+      "_meta",
+      "recovery-key-hash",
+      stringToBytes(hashToString(masterKey)),
+    );
     return { fortressPath, masterKey, recoveryKey };
   }
 

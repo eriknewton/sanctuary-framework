@@ -117,20 +117,50 @@ describe("runInit", () => {
     expect(result.fortressPath).not.toBe(join(homedir(), ".sanctuary"));
   });
 
-  it("persists recovery-key-hash so subsequent boots can verify the key", async () => {
-    const fortressPath = join(tmp, "fortress-with-hash");
-    await runInit({ fortress: fortressPath, noConfirm: true });
+  it("persists a custody envelope whose recovery wrap unlocks the master on subsequent boots", async () => {
+    const fortressPath = join(tmp, "fortress-with-envelope");
+    const result = await runInit({ fortress: fortressPath, noConfirm: true });
 
-    // Hash file lives under <fortress>/state/_meta/recovery-key-hash.enc.
-    const hashFile = join(
+    // Sovereign-custody build: the envelope replaces recovery-key-hash. It
+    // lives under <fortress>/state/_meta/custody-envelope.enc and holds the
+    // master ONLY as wraps; the recovery key is a wrap of the true master.
+    const envelopeFile = join(
       fortressPath,
       "state",
       "_meta",
-      "recovery-key-hash.enc",
+      "custody-envelope.enc",
     );
-    const st = await stat(hashFile);
+    const st = await stat(envelopeFile);
     expect(st.isFile()).toBe(true);
     expect(st.size).toBeGreaterThan(0);
+
+    // End-to-end: the recovery key captured in recovery-key.txt actually
+    // unwraps the master (the 2026-06-12 incident regression check).
+    const recoveryFile = await readFile(
+      result.recoveryKeyDisclosurePath,
+      "utf-8",
+    );
+    const keyLine = recoveryFile
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => /^[A-Za-z0-9_-]{43}$/.test(l));
+    expect(keyLine).toBeDefined();
+
+    const { FilesystemStorage } = await import(
+      "../../src/storage/filesystem.js"
+    );
+    const { establishMaster } = await import(
+      "../../src/core/master-custody.js"
+    );
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const unlocked = await establishMaster({
+      storage,
+      recoveryKey: keyLine!,
+    });
+    expect(unlocked.masterKey.length).toBe(32);
+    expect(unlocked.origin).toBe("envelope");
+    // --no-confirm is an explicit, audited headless install mode (F13).
+    expect(unlocked.envelope.install_mode).toBe("headless");
   });
 
   it("creates the fortress directory with mode 0700", async () => {

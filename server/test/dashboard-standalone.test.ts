@@ -284,15 +284,18 @@ describe("Standalone Dashboard", () => {
 
     const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
     const { FilesystemStorage } = await import("../src/storage/filesystem.js");
-    const { deriveMasterKey, derivePurposeKey } = await import(
-      "../src/core/key-derivation.js"
-    );
+    const { derivePurposeKey } = await import("../src/core/key-derivation.js");
     const { createIdentity } = await import("../src/core/identity.js");
-    const { bytesToString } = await import("../src/core/encoding.js");
+    // Sovereign-custody build: unlock through the unified path — a local
+    // Argon2id re-derivation from key-params would produce a DIFFERENT
+    // master than the envelope holds (the exact divergence class the
+    // custody envelope ended; its MAC check catches the attempt).
+    const { establishMaster } = await import("../src/core/master-custody.js");
     const storage = new FilesystemStorage(`${tempDir}/state`);
-    const rawParams = await storage.read("_meta", "key-params");
-    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
-    const { key: mk } = await deriveMasterKey("autoauth-tenant-passphrase", params);
+    const { masterKey: mk } = await establishMaster({
+      storage,
+      passphrase: "autoauth-tenant-passphrase",
+    });
     const idEncKey = derivePurposeKey(mk, "identity-encryption");
     const idMgr = new IdentityManager(storage, mk);
     await idMgr.load();
@@ -329,9 +332,7 @@ describe("Standalone Dashboard", () => {
     expect(statusJson).toHaveProperty("pending_count");
   });
 
-  it("v0.10.2: the `identities none loaded` warning names the tenant's Keychain service", async () => {
-    const logs: string[] = [];
-
+  it("v0.10.2/custody: a wrong passphrase fails closed and names the tenant's Keychain service", async () => {
     // First boot establishes encrypted state under passphrase A.
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-warn-a";
@@ -340,70 +341,34 @@ describe("Standalone Dashboard", () => {
       passphrase: "tenant-passphrase-A",
       host: "127.0.0.1",
     });
-
-    // Create an identity so there is an encrypted `_identities/*.enc` file
-    // on disk. Without this the warning banner never fires (total === 0).
-    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
-    const { FilesystemStorage } = await import("../src/storage/filesystem.js");
-    const { deriveMasterKey, derivePurposeKey } = await import(
-      "../src/core/key-derivation.js"
-    );
-    const { createIdentity } = await import("../src/core/identity.js");
-    const storage = new FilesystemStorage(`${tempDir}/state`);
-    const { bytesToString } = await import("../src/core/encoding.js");
-    const rawParams = await storage.read("_meta", "key-params");
-    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
-    const { key: mkA } = await deriveMasterKey("tenant-passphrase-A", params);
-    const idEncKey = derivePurposeKey(mkA, "identity-encryption");
-    const idMgr = new IdentityManager(storage, mkA);
-    await idMgr.load();
-    const { storedIdentity } = createIdentity(
-      "test-identity",
-      idEncKey,
-      "passphrase"
-    );
-    await idMgr.save(storedIdentity);
-
     await first.dashboard.stop();
 
-    // The warning under test is specifically about identity decrypt
-    // failures. With fail-closed profile loading, the profile must be
-    // valid under the second boot key so startup can reach that identity
-    // diagnostic path instead of stopping at profile authentication.
-    await storage.delete("_sovereignty_profile", "active", false);
-    const { key: mkB } = await deriveMasterKey("tenant-passphrase-B-WRONG", params);
-    const { SovereigntyProfileStore } = await import("../src/sovereignty-profile.js");
-    const profileStore = new SovereigntyProfileStore(storage, mkB);
-    await profileStore.load();
-
-    // Second boot supplies a WRONG passphrase — encrypted identities exist
-    // on disk, but the master key derived here cannot decrypt any of them.
-    const origError = console.error;
+    // Second boot supplies a WRONG passphrase. Sovereign-custody build:
+    // the boot FAILS CLOSED (booting with a wrong master would split state,
+    // not recover it). The error carries the v0.10.4 diagnostics that used
+    // to live in the warning banner.
+    let threw: Error | null = null;
     try {
-      console.error = (...args: unknown[]) => {
-        logs.push(args.map(String).join(" "));
-      };
       const second = await startDashboardOnFreePort({
         passphrase: "tenant-passphrase-B-WRONG",
         host: "127.0.0.1",
       });
       dashboard = second.dashboard;
-    } finally {
-      console.error = origError;
+    } catch (err) {
+      threw = err as Error;
     }
 
-    const banner = logs.join("\n");
-    expect(banner).toMatch(/Encrypted identities found but NONE loaded/);
-    // v0.10.4: banner names this tenant's per-tenant Keychain service so
-    // operators can run `security find-generic-password -s <service> -w`.
-    expect(banner).toMatch(/sanctuary-passphrase-[0-9a-f]{16}/);
-    // v0.10.4: banner points at the canonical schema doc (which contains
-    // every diagnostic recipe) rather than inlining a remediation
-    // command that may go stale.
-    expect(banner).toMatch(/server\/docs\/keychain-schema\.md/);
+    expect(threw).not.toBeNull();
+    expect(threw!.message).toMatch(/Encrypted identities found but NONE loaded/);
+    // v0.10.4: names this tenant's per-tenant Keychain service so operators
+    // can run `security find-generic-password -s <service> -w`.
+    expect(threw!.message).toMatch(/sanctuary-passphrase-[0-9a-f]{16}/);
+    // v0.10.4: points at the canonical schema doc (which contains every
+    // diagnostic recipe) rather than inlining a remediation command.
+    expect(threw!.message).toMatch(/server\/docs\/keychain-schema\.md/);
     // v0.10.4: the misleading `SANCTUARY_PASSPHRASE=<your-passphrase>`
     // hint that v0.10.1–v0.10.3 printed must not return.
-    expect(banner).not.toMatch(/SANCTUARY_PASSPHRASE=<your-passphrase>/);
+    expect(threw!.message).not.toMatch(/SANCTUARY_PASSPHRASE=<your-passphrase>/);
   });
 
   // v1.3 cycle 2: standalone dashboard must wire TaskService so

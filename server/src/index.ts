@@ -100,9 +100,10 @@ import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
-import { deriveMasterKey, type KeyDerivationParams } from "./core/key-derivation.js";
-import { generateRandomKey } from "./core/random.js";
-import { toBase64url } from "./core/encoding.js";
+import {
+  establishMaster,
+  checkCastlePinCustody,
+} from "./core/master-custody.js";
 import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
 import {
   buildV11Bindings,
@@ -195,130 +196,87 @@ export async function createSanctuaryServer(options?: {
     `${config.storage_path}/state`
   );
 
-  // 4. Derive or generate master key
-  let masterKey: Uint8Array;
-  let keyProtection: "passphrase" | "hardware-key" | "recovery-key";
-  let recoveryKey: string | undefined;
-
+  // 4. Establish the master key through the unified custody path: one
+  // master per fortress, stored only as wraps in the custody envelope.
+  // Legacy fortresses (key-params / recovery-key-hash markers) migrate in
+  // place on this unlock — same master, no data re-encryption, markers
+  // kept (an interrupted migration leaves a pure-legacy fortress).
   const passphrase = options?.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
+  const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
 
-  if (passphrase) {
-    // Passphrase path: derive master key via Argon2id
-    keyProtection = "passphrase";
-
-    // Check for existing derivation params
-    let existingParams: KeyDerivationParams | undefined;
-    try {
-      const raw = await storage.read("_meta", "key-params");
-      if (raw) {
-        const { bytesToString } = await import("./core/encoding.js");
-        existingParams = JSON.parse(bytesToString(raw));
-      }
-    } catch {
-      // No existing params — first run
-    }
-
-    const result = await deriveMasterKey(passphrase, existingParams);
-    masterKey = result.key;
-
-    // Store derivation params (not the key!) for re-derivation
-    if (!existingParams) {
-      const { stringToBytes } = await import("./core/encoding.js");
-      await storage.write(
-        "_meta",
-        "key-params",
-        stringToBytes(JSON.stringify(result.params))
-      );
-    }
-  } else {
-    // Recovery key path
-    keyProtection = "recovery-key";
-
-    const { hashToString } = await import("./core/hashing.js");
-    const { stringToBytes, bytesToString } = await import("./core/encoding.js");
-    const { fromBase64url } = await import("./core/encoding.js");
-    const { constantTimeEqual } = await import("./core/encoding.js");
-
-    // Check if we already have a stored recovery key hash (existing installation)
-    const existingHash = await storage.read("_meta", "recovery-key-hash");
-    if (existingHash) {
-      // Existing installation — require the recovery key to proceed
-      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
-      if (!envRecoveryKey) {
-        throw new Error(
-          "Sanctuary: Existing encrypted data found but no credentials provided.\n" +
-          "This installation was previously set up with a recovery key.\n\n" +
-          "To start the server, provide one of:\n" +
-          "  - SANCTUARY_PASSPHRASE (if you later configured a passphrase)\n" +
-          "  - SANCTUARY_RECOVERY_KEY (the recovery key shown at first run)\n\n" +
-          "Without the correct credentials, encrypted state cannot be accessed.\n" +
-          "Refusing to start to prevent silent data loss."
-        );
-      }
-
-      // Decode and verify the recovery key against the stored hash
-      let recoveryKeyBytes: Uint8Array;
-      try {
-        recoveryKeyBytes = fromBase64url(envRecoveryKey);
-      } catch {
-        throw new Error(
-          "Sanctuary: SANCTUARY_RECOVERY_KEY is not valid base64url. " +
-          "The recovery key should be the exact string shown at first run."
-        );
-      }
-
-      if (recoveryKeyBytes.length !== 32) {
-        throw new Error(
-          "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +
-          "The recovery key should be the exact string shown at first run."
-        );
-      }
-
-      const providedHash = hashToString(recoveryKeyBytes);
-      const storedHash = bytesToString(existingHash);
-
-      // Constant-time comparison to prevent timing attacks on the hash
-      const providedHashBytes = stringToBytes(providedHash);
-      const storedHashBytes = stringToBytes(storedHash);
-      if (!constantTimeEqual(providedHashBytes, storedHashBytes)) {
-        throw new Error(
-          "Sanctuary: Recovery key does not match the stored key hash.\n" +
-          "The recovery key provided via SANCTUARY_RECOVERY_KEY is incorrect.\n" +
-          "Use the exact recovery key that was displayed at first run."
-        );
-      }
-
-      // Recovery key verified — use it as the master key
-      masterKey = recoveryKeyBytes;
-      // Do NOT set recoveryKey — this is not a first run, no banner should display
-    } else {
-      // First run — but check for orphaned encrypted data as a safety net
-      const existingNamespaces = await storage.list("_meta");
-      const hasKeyParams = existingNamespaces.some(e => e.key === "key-params");
-      if (hasKeyParams) {
-        throw new Error(
-          "Sanctuary: passphrase required.\n\n" +
-          "The fortress at this path uses passphrase-mode key derivation.\n" +
-          "Set SANCTUARY_PASSPHRASE in your environment, or run\n" +
-          "'sanctuary export-passphrase' to retrieve it from the macOS Keychain."
-        );
-      }
-
-      // Genuine first run: generate random master key and store its hash
-      masterKey = generateRandomKey();
-      recoveryKey = toBase64url(masterKey);
-
-      const keyHash = hashToString(masterKey);
-      await storage.write(
-        "_meta",
-        "recovery-key-hash",
-        stringToBytes(keyHash)
-      );
-    }
-  }
+  const custody = await establishMaster({
+    storage,
+    ...(passphrase ? { passphrase } : {}),
+    ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+    // The MCP server stdio boot is non-interactive by definition (the host
+    // harness owns stdin), so first runs here are a distinct, audited
+    // degraded install mode. A fresh recovery key — a wrap of the one true
+    // master — is minted and disclosed below regardless of credential mode,
+    // so the captured artifact always unlocks everything.
+    firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+    storagePathHint: config.storage_path,
+  });
+  const masterKey = custody.masterKey;
+  const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
+    custody.keyProtection;
+  const recoveryKey = custody.mintedRecoveryKey;
 
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5pre. Custody audit trail: record envelope creation/migration (never key
+  // material — wrap types and install mode only), and surface the dual-path
+  // damage signature (Castle pin wrapped under a master nobody can produce,
+  // the 2026-06-12 incident shape) instead of silently carrying it.
+  if (custody.origin !== "envelope") {
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation:
+        custody.origin === "first-run"
+          ? "custody_envelope_created"
+          : custody.origin === "legacy-deferred"
+            ? "custody_migration_deferred"
+            : "custody_legacy_migrated",
+      identity_id: fortressIdFromStoragePath(config.storage_path),
+      result: "success",
+      details: custody.envelope
+        ? {
+            install_mode: custody.envelope.install_mode,
+            wrap_types: custody.envelope.wraps.map((w) => w.type),
+            verified_wraps: custody.envelope.wraps.filter((w) => w.verified)
+              .length,
+            origin: custody.origin,
+          }
+        : {
+            origin: custody.origin,
+            reason:
+              "existing data could not be evidence-checked against this master; envelope not written",
+          },
+    });
+    const pinCustody = await checkCastlePinCustody(
+      config.storage_path,
+      masterKey
+    );
+    if (pinCustody === "mismatch") {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "castle_pin_custody_mismatch",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          message:
+            "Castle Wall pinned private key does not decrypt under the established master",
+        },
+      });
+      // SAFETY: stderr is the operator-facing channel for boot diagnostics.
+      console.error(
+        "\nSanctuary: WARNING — the Castle Wall pinned key at this fortress does NOT\n" +
+          "decrypt under the master your credential unlocks. This fortress was touched\n" +
+          "by two different custody paths in the past. The wall cannot sign with this\n" +
+          "pin; re-provision it with 'sanctuary castle-wall re-pin' when ready.\n"
+      );
+    }
+  }
 
   // 5a. Reset-history continuity (v1.0.2 item a). If a prior nuke left a
   // `.reset-history.log` marker beside the storage path, append one

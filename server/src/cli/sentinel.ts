@@ -23,8 +23,7 @@
 
 import { loadConfig } from "../config.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { stringToBytes, bytesToString } from "../core/encoding.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
@@ -235,24 +234,13 @@ async function cmdFindings(
     const resolved = await getOrCreatePassphrase();
     passphrase = resolved.value;
   }
-  let existingParams: KeyDerivationParams | undefined;
-  try {
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) existingParams = JSON.parse(bytesToString(raw));
-  } catch {
-    /* first run; nothing to read */
-  }
-  const { key: masterKey, params } = await deriveMasterKey(
+  // Unified custody (master-custody.ts): never derive a fortress master
+  // verb-locally — a local derivation can diverge from the envelope.
+  const masterKey = await resolveCliMasterKey(storage, {
     passphrase,
-    existingParams,
-  );
-  if (!existingParams) {
-    await storage.write(
-      "_meta",
-      "key-params",
-      stringToBytes(JSON.stringify(params)),
-    );
-  }
+    bootstrap: true,
+    storagePathHint: storagePath,
+  });
   const fortressId = fortressIdFromStoragePath(storagePath);
   const store = new SentinelFindingStore({
     storage,
@@ -325,23 +313,11 @@ async function deriveSentinelMasterKey(args: SentinelArgs): Promise<Uint8Array> 
     const resolved = await getOrCreatePassphrase();
     passphrase = resolved.value;
   }
-  let existingParams: KeyDerivationParams | undefined;
-  try {
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) existingParams = JSON.parse(bytesToString(raw));
-  } catch {
-    /* first run; nothing to read */
-  }
-  const { key: masterKey, params } = await deriveMasterKey(
+  // Unified custody (master-custody.ts): see runFindings above.
+  const masterKey = await resolveCliMasterKey(storage, {
     passphrase,
-    existingParams,
-  );
-  if (!existingParams) {
-    await storage.write(
-      "_meta",
-      "key-params",
-      stringToBytes(JSON.stringify(params)),
-    );
-  }
+    bootstrap: true,
+    storagePathHint: storagePath,
+  });
   return masterKey;
 }

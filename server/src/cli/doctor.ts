@@ -12,11 +12,7 @@ import { Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
-import {
-  deriveMasterKey,
-  type KeyDerivationParams,
-} from "../core/key-derivation.js";
-import { bytesToString, fromBase64url } from "../core/encoding.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { exportAuditChain } from "./audit-chain-export.js";
@@ -251,17 +247,22 @@ async function resolveMasterKeyIfAvailable(
   storagePath: string,
   env: NodeJS.ProcessEnv,
 ): Promise<Uint8Array | null> {
-  if (env.SANCTUARY_RECOVERY_KEY) {
-    const key = fromBase64url(env.SANCTUARY_RECOVERY_KEY);
-    return key.length === 32 ? key : null;
-  }
-  if (!env.SANCTUARY_PASSPHRASE) return null;
+  if (!env.SANCTUARY_RECOVERY_KEY && !env.SANCTUARY_PASSPHRASE) return null;
   const storage = new FilesystemStorage(join(storagePath, "state"));
-  let existingParams: KeyDerivationParams | undefined;
-  const raw = await storage.read("_meta", "key-params");
-  if (raw) existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-  const derived = await deriveMasterKey(env.SANCTUARY_PASSPHRASE, existingParams);
-  return derived.key;
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+  // Doctor is a read-only diagnostic: an unresolvable master degrades the
+  // identity check (null) instead of aborting the run. Recovery key keeps
+  // precedence over passphrase, matching the legacy resolution order.
+  try {
+    return await resolveCliMasterKey(storage, {
+      ...(env.SANCTUARY_RECOVERY_KEY !== undefined
+        ? { recoveryKey: env.SANCTUARY_RECOVERY_KEY }
+        : { passphrase: env.SANCTUARY_PASSPHRASE! }),
+      storagePathHint: storagePath,
+    });
+  } catch {
+    return null;
+  }
 }
 
 function runVersion(command: string): string | null {

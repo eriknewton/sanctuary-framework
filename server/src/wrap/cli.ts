@@ -75,8 +75,11 @@ import type {
   LocalHarnessKind,
 } from "../contracts/v1.1/local-agent-records.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { stringToBytes, bytesToString } from "../core/encoding.js";
+import { CustodyUnlockError } from "../core/master-custody.js";
+import {
+  establishWrapCustody,
+  type WrapCustodyResult,
+} from "./custody-flow.js";
 import { AuditLog } from "../l2-operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
@@ -715,6 +718,32 @@ export async function runWrap(
   // above (honours SANCTUARY_STORAGE_PATH for multi-agent hosts).
   await mkdir(storagePath, { recursive: true, mode: 0o700 });
 
+  // Establish the fortress's unified custody (core/master-custody.ts) BEFORE
+  // anything trust-bearing is written: one master, wrapped under the
+  // resolved passphrase AND a minted recovery key (a wrap of that same
+  // master — never a parallel one). Legacy fortresses migrate in place on
+  // this unlock. Interactive runs force recovery-key capture + re-entry
+  // verification; non-interactive runs are recorded as an audited headless
+  // install. Fail closed on a credential that does not unlock (#5).
+  let wrapCustody: WrapCustodyResult | undefined;
+  if (passphraseValue !== undefined) {
+    try {
+      wrapCustody = await establishWrapCustody({
+        storagePath,
+        passphrase: passphraseValue,
+        interactive: !options.noOpen && process.stdin.isTTY === true,
+      });
+    } catch (err) {
+      if (err instanceof CustodyUnlockError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary wrap: Custody Establishment Failed`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+  }
+
   if (passphraseValue !== undefined) {
     // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
     // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
@@ -1127,26 +1156,13 @@ export async function runWrap(
     // dashboard startup path. Derive the master key and create a default
     // identity so CLI surfaces (exit export, identity show) work
     // immediately after wrap without launching the dashboard first.
-    if (passphraseValue !== undefined) {
+    if (passphraseValue !== undefined && wrapCustody !== undefined) {
       try {
         const ndStorage = new FilesystemStorage(`${storagePath}/state`);
-        let existingParams: KeyDerivationParams | undefined;
-        try {
-          const raw = await ndStorage.read("_meta", "key-params");
-          if (raw) {
-            existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-          }
-        } catch {
-          // No existing params; deriveMasterKey will pick fresh params.
-        }
-        const ndDerived = await deriveMasterKey(passphraseValue, existingParams);
-        if (!existingParams) {
-          await ndStorage.write(
-            "_meta",
-            "key-params",
-            stringToBytes(JSON.stringify(ndDerived.params)),
-          );
-        }
+        // Unified custody: the master was established (or migrated) above;
+        // re-deriving from key-params here could produce a DIFFERENT master
+        // than the envelope holds — exactly the divergence this build ends.
+        const ndDerived = { key: wrapCustody.masterKey };
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
         // Best-effort: daemon failure does not block identity bootstrap.
         // See parallel block below (line ~939) for full rationale.
@@ -1256,28 +1272,13 @@ export async function runWrap(
   // Best-effort: a derivation failure does not fail wrap (operators still
   // get a working v1.0 dashboard at /). The v1.1 surface is reachable
   // via `sanctuary dashboard` if this wiring path errors.
-  if (passphraseValue !== undefined) {
+  if (passphraseValue !== undefined && wrapCustody !== undefined) {
     try {
       const v11Storage = new FilesystemStorage(`${storagePath}/state`);
-      let existingParams: KeyDerivationParams | undefined;
-      try {
-        const raw = await v11Storage.read("_meta", "key-params");
-        if (raw) {
-          existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-        }
-      } catch {
-        // No existing params; first run. deriveMasterKey will pick fresh
-        // params; we persist them below so the spawned MCP server derives
-        // the same key from the same passphrase.
-      }
-      const derived = await deriveMasterKey(passphraseValue, existingParams);
-      if (!existingParams) {
-        await v11Storage.write(
-          "_meta",
-          "key-params",
-          stringToBytes(JSON.stringify(derived.params)),
-        );
-      }
+      // Unified custody: reuse the master established above (envelope-backed)
+      // instead of re-deriving from key-params — the spawned MCP server
+      // unlocks the same envelope with the same passphrase.
+      const derived = { key: wrapCustody.masterKey };
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
       // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
       // Linux when the fortress-scoped socket dir requires root, or any
