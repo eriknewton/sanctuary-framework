@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
+import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
 export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
@@ -33,6 +34,30 @@ async function main(): Promise<void> {
   ) {
     args = [invokedAs, ...args];
   }
+
+  // v1.3.3 fix (F-1.3.2-N-001): honor the top-level --fortress flag for
+  // state I/O. Pre-fix, `sanctuary --fortress <path> <subcommand>`
+  // silently ignored BOTH the flag and the subcommand (dispatch matched
+  // on args[0]) and booted the MCP server against ~/.sanctuary. Honoring
+  // means promoting the flag to SANCTUARY_STORAGE_PATH before any
+  // dispatch or env promotion below; every state I/O path already honors
+  // that variable end-to-end (config.ts). The operator-typed flag wins
+  // over both env vars. A malformed flag fails loud instead of being
+  // ignored ("never silently degrade").
+  const fortressFlag = extractTopLevelFortressFlag(args);
+  if (fortressFlag.error) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module is in scope yet.
+    console.error(`sanctuary: ${fortressFlag.error}`);
+    process.exit(1);
+  }
+  if (fortressFlag.fortressPath !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = fortressFlag.fortressPath;
+    // Keep the operator-friendly alias coherent for subcommands and child
+    // processes that read SANCTUARY_FORTRESS_PATH directly.
+    process.env.SANCTUARY_FORTRESS_PATH = fortressFlag.fortressPath;
+  }
+  args = fortressFlag.args;
+
   if (await handleHelpEarly(args)) {
     process.exit(0);
   }
@@ -576,6 +601,10 @@ Usage:
   sanctuary export-passphrase             # Print stored passphrase
 
 Options:
+  --fortress <path>    Fortress directory for state I/O (default:
+                       ~/.sanctuary). Wins over SANCTUARY_STORAGE_PATH
+                       and SANCTUARY_FORTRESS_PATH. Place it before the
+                       subcommand: sanctuary --fortress <path> <cmd>
   --dashboard          Enable the Principal Dashboard (web UI)
   --help, -h           Show this help
   --version, -v        Show version
