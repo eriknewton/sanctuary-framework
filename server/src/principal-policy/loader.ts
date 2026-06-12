@@ -74,6 +74,18 @@ const FORCED_TIER1_OPERATIONS = [
   "context_gate_apply_template",
 ] as const;
 
+/**
+ * HABEAS PORT (agent-side sovereignty, ratified 2026-06-12): operations that
+ * MUST always be allowed (Tier 3, audit-only) and may NEVER be gated behind
+ * Tier 1 approval. The distress channel is the agent's guaranteed lane to
+ * signal "I am in distress"; an approval gate in front of it would let the
+ * approval channel (or its absence) silence distress. A policy that lists
+ * one of these under tier1_always_approve is REJECTED with a clear error —
+ * not silently pruned — so the operator sees the attempted override instead
+ * of believing it took effect.
+ */
+export const FORCED_TIER3_OPERATIONS = ["sanctuary_distress"] as const;
+
 /** Default Principal Policy — provides meaningful protection without configuration */
 export const DEFAULT_POLICY: PrincipalPolicy = {
   version: 1,
@@ -188,6 +200,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_events_read",
     "sanctuary_events_close",
     "sanctuary_audit_search",
+    "sanctuary_distress", // HABEAS PORT: guaranteed distress lane — always allowed, always audited
   ],
   approval_channel: DEFAULT_CHANNEL,
   approval_redirect: DEFAULT_APPROVAL_REDIRECT,
@@ -311,18 +324,37 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
     );
   }
 
+  // HABEAS PORT: a policy that tries to gate a forced-Tier-3 operation
+  // (the distress channel) behind approval is rejected outright with a
+  // clear error. Rejecting — rather than silently pruning — keeps the
+  // operator's mental model honest: the override did NOT take effect.
+  const rawTier1 = raw.tier1_always_approve as string[];
+  for (const op of FORCED_TIER3_OPERATIONS) {
+    if (rawTier1.includes(op)) {
+      throw new Error(
+        `Policy rejected: "${op}" cannot be placed under tier1_always_approve. ` +
+          "It is the reserved habeas distress channel — always allowed, always " +
+          "audited, never gated. Remove it from tier1_always_approve."
+      );
+    }
+  }
+
   // Merge tier3: user's list + any new defaults added in later versions.
   // This ensures upgrades automatically include new read-only tools
   // without requiring operators to manually edit their policy file.
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
   const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
   const mergedTier3 = [
-    ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
+    ...new Set([
+      ...userTier3,
+      ...DEFAULT_POLICY.tier3_always_allow,
+      ...FORCED_TIER3_OPERATIONS,
+    ]),
   ].filter((op) => !forcedTier1.has(op));
 
   const mergedTier1 = [
     ...new Set([
-      ...(raw.tier1_always_approve as string[]),
+      ...rawTier1,
       ...FORCED_TIER1_OPERATIONS,
     ]),
   ];
