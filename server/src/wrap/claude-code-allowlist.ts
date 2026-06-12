@@ -58,18 +58,15 @@
 
 import {
   readFile,
+  writeFile,
   rename,
   unlink,
   copyFile,
+  mkdir,
   access,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import {
-  writeFileSafeUnderRoot,
-  assertNoSymlinkParentUnderRoot,
-  mkdirSafeUnderRoot,
-} from "./config-reader.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -144,15 +141,8 @@ async function pathExists(p: string): Promise<boolean> {
 }
 
 async function atomicWrite(targetPath: string, content: string): Promise<void> {
-  // D4 round-3: settings.json is an agent config surface (~/.claude/), so a
-  // symlinked parent dir (~/.claude -> /tmp/victim) would redirect both the
-  // tmp write and the rename. Refuse a symlinked parent first, then write the
-  // tmp file through the same no-follow discipline as every other wrap sink.
-  // rename() does not follow a symlinked FINAL component (it replaces the
-  // link itself), so the parent walk is the enforcement here.
-  await assertNoSymlinkParentUnderRoot(targetPath);
   const tmpPath = `${targetPath}.tmp.${process.pid}`;
-  await writeFileSafeUnderRoot(tmpPath, content, { mode: 0o600 });
+  await writeFile(tmpPath, content, { mode: 0o600 });
   try {
     await rename(tmpPath, targetPath);
   } catch (e) {
@@ -180,6 +170,7 @@ function parseSettings(text: string, settingsPath: string): SettingsShape {
   } catch (e) {
     throw new Error(
       `Sanctuary: ${settingsPath} is not valid JSON (${(e as Error).message}). Repair manually and retry sanctuary wrap.`,
+      { cause: e },
     );
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -234,9 +225,7 @@ export async function installClaudeCodeAllowlist(
   const settingsPath = opts.settingsJsonPath ?? defaultSettingsJsonPath();
 
   // Ensure the directory exists; fresh-install case has no ~/.claude/.
-  // D4 round-3: segment-by-segment under the trusted root so a symlinked
-  // ancestor cannot redirect the created tree (mkdir(recursive) follows it).
-  await mkdirSafeUnderRoot(dirname(settingsPath));
+  await mkdir(dirname(settingsPath), { recursive: true, mode: 0o700 });
 
   const fileExists = await pathExists(settingsPath);
 

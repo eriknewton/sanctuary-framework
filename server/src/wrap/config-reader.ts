@@ -565,7 +565,14 @@ async function realpathOrNull(path: string): Promise<string | null> {
 
 /** True when `path` equals `dir` or sits beneath it (both pre-resolved). */
 function isWithin(path: string, dir: string): boolean {
-  return path === dir || path.startsWith(dir + sep);
+  if (path === dir) return true;
+  // Strip any trailing separator from `dir` before appending one, so a root
+  // of the filesystem root `/` (or any `…/`) does not become `//` and reject
+  // a legitimate child via a `startsWith("//")` that can never match. A path
+  // is "under" the filesystem root iff it is absolute, which the normalised
+  // `dir === sep` case reduces to here.
+  const base = dir.endsWith(sep) ? dir.slice(0, -sep.length) : dir;
+  return path.startsWith(base + sep);
 }
 
 /**

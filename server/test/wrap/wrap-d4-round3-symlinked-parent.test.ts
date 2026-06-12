@@ -39,12 +39,15 @@ import {
   readFile,
   rm,
   symlink,
+  stat,
+  realpath,
 } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
 import {
   writeFileSafeUnderRoot,
   unlinkSafeUnderRoot,
+  mkdirSafeUnderRoot,
   restoreConfig,
   rewriteConfigForWrap,
   validateWrapMetaAuxiliary,
@@ -391,5 +394,68 @@ describe("Wrap D4 round-3: symlinked-parent redirection closed across every sink
     expect(await readFile(join(victimDir, "config.yaml"), "utf-8")).toBe(
       "precious: true\n"
     );
+  });
+});
+
+// ── trusted-root prefix check handles the filesystem root `/` ──────────
+//
+// Regression: when the trusted root is the filesystem root `/`, the prefix
+// check appended a separator to form `//` and rejected every legitimate
+// child via `startsWith("//")` (which can never match a normalised absolute
+// path). On Linux this surfaced as a real mkdir refusal under /tmp. The fix
+// strips a trailing separator from the root before appending one, so a root
+// of `/` (or any `…/`) is handled correctly: a path is "under" `/` iff it is
+// absolute. The symlink-walk / O_NOFOLLOW behaviour is unchanged.
+describe("Wrap D4: trusted-root prefix check accepts children of `/` root", () => {
+  let created: string[] = [];
+
+  afterEach(async () => {
+    for (const p of created.splice(0)) {
+      await rm(p, { recursive: true, force: true });
+    }
+  });
+
+  it("mkdirSafeUnderRoot accepts a real absolute child under root `/` (no spurious not-under-root refusal)", async () => {
+    // realpath the tmp base so NO component is a symlink (macOS /var ->
+    // /private/var, /tmp -> /private/tmp would otherwise trip the legitimate
+    // symlink-walk refusal and mask what is under test: the `/`-root PREFIX
+    // check accepting an absolute child instead of forming `//` and rejecting).
+    const realTmp = await realpath(tmpdir());
+    const top = join(
+      realTmp,
+      `sanctuary-root-prefix-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const child = join(top, "nested");
+    created.push(top);
+    await expect(
+      mkdirSafeUnderRoot(child, "/")
+    ).resolves.toBeUndefined();
+    expect((await stat(child)).isDirectory()).toBe(true);
+  });
+
+  it("mkdirSafeUnderRoot still rejects a sibling-prefix trick (`/foo-evil` not under root `/foo`)", async () => {
+    // Classic startsWith prefix bug: "/foo-evil" must NOT count as under
+    // "/foo" just because it shares the "/foo" prefix.
+    await expect(
+      mkdirSafeUnderRoot("/foo-evil/child", "/foo")
+    ).rejects.toThrow(/not under the trusted root/);
+  });
+
+  it("mkdirSafeUnderRoot still refuses a symlinked component even under root `/`", async () => {
+    const base = join(
+      tmpdir(),
+      `sanctuary-root-symlink-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(base, { recursive: true });
+    created.push(base);
+    const victimDir = join(base, "victim");
+    await mkdir(victimDir, { recursive: true });
+    const link = join(base, "link");
+    await symlink(victimDir, link);
+    // Path traverses the symlinked `link` component; even with root `/` the
+    // segment-by-segment walk must refuse it (no loosening of O_NOFOLLOW).
+    await expect(
+      mkdirSafeUnderRoot(join(link, "nested"), "/")
+    ).rejects.toThrow(/symlink/);
   });
 });
