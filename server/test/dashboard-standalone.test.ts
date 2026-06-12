@@ -119,6 +119,53 @@ describe("Standalone Dashboard", () => {
     expect(data.pending_count).toBe(0);
   });
 
+  it("serves /api/snapshot in standalone mode (F-1.3.2-N-002)", async () => {
+    // v1.3.2 Mini1 drill finding: /api/snapshot returned 404 in standalone
+    // mode because the route only existed in the co-located server
+    // (dashboard/api.ts); the standalone legacy route table never
+    // registered it. This pins the fix: the standalone dashboard serves
+    // the same ProtectionSnapshot document the co-located server does.
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-snapshot";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-snapshot",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/snapshot`, {
+      headers: { Authorization: "Bearer test-token-snapshot" },
+    });
+    expect(res.status).toBe(200);
+    const snapshot = await res.json();
+    expect(snapshot.mode).toBe("standalone");
+    expect(snapshot).toHaveProperty("overall");
+    expect(snapshot).toHaveProperty("agent");
+    expect(snapshot).toHaveProperty("layers");
+    expect(snapshot.layers).toHaveProperty("l1");
+    expect(snapshot.layers).toHaveProperty("l4");
+    expect(snapshot).toHaveProperty("pending_approvals");
+    expect(snapshot).toHaveProperty("generated_at");
+    expect(snapshot).toHaveProperty("server_version");
+  });
+
+  it("rejects unauthenticated /api/snapshot requests in standalone mode", async () => {
+    // The fix must not weaken the auth posture: /api/snapshot sits behind
+    // the same bearer-token gate as every other legacy /api/* route.
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-snapshot-auth";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-snapshot-auth",
+      host: "127.0.0.1",
+    });
+    dashboard = result.dashboard;
+
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/snapshot`);
+    expect(res.status).toBe(401);
+  });
+
   it("uses custom port from options", async () => {
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
 

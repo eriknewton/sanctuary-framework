@@ -42,6 +42,10 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import {
+  getProtectionSnapshot,
+  type AggregatorSources,
+} from "../dashboard/aggregator.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
@@ -1819,6 +1823,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handleSSE(req, res);
       } else if (method === "GET" && url.pathname === "/api/status") {
         this.handleStatus(res);
+      } else if (method === "GET" && url.pathname === "/api/snapshot") {
+        // v1.3.3 fix (F-1.3.2-N-002): the standalone dashboard served its
+        // HTTP surface through this legacy route table, which never
+        // registered /api/snapshot; the route only existed in the
+        // co-located server (dashboard/api.ts). Direct curl hits and any
+        // client following the documented snapshot endpoint got a 404 in
+        // standalone mode. Serve the same ProtectionSnapshot shape here,
+        // built from the dependencies this channel already holds.
+        this.handleSnapshot(res);
       } else if (method === "GET" && url.pathname === "/api/pending") {
         this.handlePendingList(res);
       } else if (method === "GET" && url.pathname === "/api/audit-log") {
@@ -2007,6 +2020,59 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     req.on("close", () => {
       this.sseClients.delete(res);
     });
+  }
+
+  /**
+   * Build the AggregatorSources bundle for getProtectionSnapshot from the
+   * dependencies injected via setDependencies(). Mirrors what the
+   * co-located server (dashboard/server.ts) receives at construction, so
+   * /api/snapshot returns the same document shape in both modes.
+   */
+  private buildAggregatorSources(): AggregatorSources {
+    return {
+      mode: this._standaloneMode ? "standalone" : "co-located",
+      server_version: PKG_VERSION,
+      ...(this.identityManager ? { identityManager: this.identityManager } : {}),
+      ...(this.auditLog ? { auditLog: this.auditLog } : {}),
+      ...(this.baseline ? { baseline: this.baseline } : {}),
+      ...(this.policy ? { policy: this.policy } : {}),
+      ...(this.clientManager ? { clientManager: this.clientManager } : {}),
+      pendingApprovals: Array.from(this.pending.values()).map((p) => ({
+        id: p.id,
+        operation: p.request.operation,
+        tier: p.request.tier,
+        reason: p.request.reason,
+        created_at: p.created_at,
+      })),
+    };
+  }
+
+  /**
+   * GET /api/snapshot: unified ProtectionSnapshot JSON (v1.3.3 fix,
+   * F-1.3.2-N-002). Auth + rate limiting are enforced by
+   * handleLegacyRequest before this is reached, matching every other
+   * legacy /api/* route.
+   */
+  private handleSnapshot(res: ServerResponse): void {
+    getProtectionSnapshot(this.buildAggregatorSources())
+      .then((snapshot) => {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify(snapshot));
+      })
+      .catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "snapshot_failed",
+              message: (err as Error).message,
+            })
+          );
+        }
+      });
   }
 
   private handleStatus(res: ServerResponse): void {
