@@ -358,10 +358,16 @@ function printHumanReport(
     write(
       out,
       `Anchor coverage (log signatures: ${coverage.log_signature_basis === "pinned-rekor-key" ? "verified under pinned log key" : "NOT verified, no pinned log key"}):\n` +
-        `  ${coverage.verified} verified, ${coverage.unverified} unverified, ${coverage.invalid} invalid, ` +
+        `  ${coverage.verified} verified, ${coverage.consistent} consistent, ${coverage.unverified} unverified, ${coverage.invalid} invalid, ` +
         `${coverage.anchor_failed} failed-at-anchor-time, ${coverage.unanchored} unanchored ` +
         `(of ${coverage.checkpoints} checkpoint(s))\n`
     );
+    if (coverage.log_signature_basis === "none") {
+      write(
+        out,
+        `  anchors checked for internal consistency only (operator-supplied evidence); supply --rekor-public-key-file for log-attested verification\n`
+      );
+    }
     if (coverage.newest_verified_integrated_time !== null) {
       write(
         out,
@@ -418,11 +424,15 @@ Options:
   --check-anchors <path>    Verify the operator's exported anchor evidence
                             (salted commitments, Rekor entry binding, RFC 6962
                             inclusion proofs) against this bundle, offline,
-                            and report anchor coverage.
+                            and report anchor coverage. Without a pinned log
+                            key this checks internal consistency of the
+                            operator-supplied evidence only; anchors report
+                            "consistent", never "verified".
   --rekor-public-key-file <path>
                             Pinned Rekor log public key (SPKI PEM, obtained
-                            out-of-band). Enables log-signature verification
-                            and is required for --expect-fresh.
+                            out-of-band). Enables log-signature verification;
+                            required for anchors to count as "verified" and
+                            for --expect-fresh.
   --expect-fresh <window>   FAIL unless the newest log-attested anchor is
                             within the window (e.g. 36h, 7d).
   --compare <path>          Verify a second, independently obtained bundle and

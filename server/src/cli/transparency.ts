@@ -1000,10 +1000,16 @@ function printHumanReport(
     write(
       out,
       `Anchor coverage (log signatures: ${coverage.log_signature_basis === "pinned-rekor-key" ? "verified under pinned log key" : "NOT verified, no pinned log key"}):\n` +
-        `  ${coverage.verified} verified, ${coverage.unverified} unverified, ${coverage.invalid} invalid, ` +
+        `  ${coverage.verified} verified, ${coverage.consistent} consistent, ${coverage.unverified} unverified, ${coverage.invalid} invalid, ` +
         `${coverage.anchor_failed} failed-at-anchor-time, ${coverage.unanchored} unanchored ` +
         `(of ${coverage.checkpoints} checkpoint(s))\n`
     );
+    if (coverage.log_signature_basis === "none") {
+      write(
+        out,
+        `  anchors checked for internal consistency only (operator-supplied evidence); supply --rekor-public-key-file for log-attested verification\n`
+      );
+    }
     if (coverage.newest_verified_integrated_time !== null) {
       write(
         out,
@@ -1262,12 +1268,16 @@ Options:
                             "sanctuary transparency anchor export" file):
                             salted commitments recomputed against THIS
                             bundle, Rekor entry binding, RFC 6962 inclusion
-                            proofs, and anchor-coverage reporting.
+                            proofs, and anchor-coverage reporting. Without a
+                            pinned log key this checks internal consistency
+                            of the operator-supplied evidence only; anchors
+                            report "consistent", never "verified".
   --rekor-public-key-file <path>
                             Pinned Rekor log public key (SPKI PEM, obtained
                             out-of-band). Enables log-signature checks
-                            (signed entry timestamps, checkpoint notes) and
-                            is required for --expect-fresh.
+                            (signed entry timestamps, checkpoint notes);
+                            required for anchors to count as "verified" and
+                            for --expect-fresh.
   --fetch-anchors           Fetch fresh entries and inclusion proofs from
                             the log named in the anchors file instead of
                             trusting receipt-embedded material. The log URL

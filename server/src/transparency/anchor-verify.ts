@@ -15,14 +15,22 @@
  *      fetched by the caller) is a hashedrekord over exactly that digest,
  *      signed by the fortress's anchoring key (P-256, verified), and the
  *      entry UUID's leaf hash recomputes from the body bytes (RFC 6962).
- *   3. INCLUSION: the Merkle inclusion proof recomputes from the leaf to
- *      the proof's root, and the embedded signed checkpoint note agrees
- *      with that root and tree size.
+ *   3. INCLUSION: the proof's leaf index equals the entry's signed log
+ *      index and lies inside the claimed tree (RFC 6962 trees allow
+ *      duplicate leaves, so a proof for a DIFFERENT index with the same
+ *      leaf must not satisfy an entry signed for this index), the Merkle
+ *      inclusion proof recomputes from the leaf to the proof's root, and
+ *      the embedded signed checkpoint note agrees with that root and tree
+ *      size.
  *   4. LOG SIGNATURES (only with a pinned Rekor log key, obtained
  *      out-of-band): the signed entry timestamp and the checkpoint note
  *      signature verify under the log key, and the entry's logID matches
  *      that key. Without the pinned key these checks are honestly listed
- *      under not_checked; they are never silently skipped as passed.
+ *      under not_checked; they are never silently skipped as passed, and
+ *      an anchor that passes everything else is reported "consistent",
+ *      never "verified": every remaining input (salt, anchoring key, entry
+ *      body, proof, root, note, timestamp) is operator-supplied and could
+ *      have been fabricated together.
  *
  * Plus anchor-coverage reporting (which checkpoints are anchored, which
  * are not, stated plainly) and the --expect-fresh staleness policy.
@@ -37,8 +45,10 @@
  *
  * HONESTY DISCIPLINE: a check that cannot run (missing body, missing
  * proof, no log key) leaves the anchor in the "unverified" coverage state
- * with a stated reason. A check that runs and fails is a FINDING. There is
- * no state in which missing evidence reads as verified.
+ * with a stated reason. A check that runs and fails is a FINDING. An
+ * anchor whose checks all pass WITHOUT a pinned log key is "consistent",
+ * not "verified". There is no state in which missing evidence or
+ * operator-supplied-only evidence reads as verified.
  */
 
 import { Buffer } from "node:buffer";
@@ -430,7 +440,15 @@ export interface AnchorVerifyOptions {
 }
 
 export type AnchorCounterState =
+  /** Every check passed INCLUDING log signatures under a pinned log key. */
   | "verified"
+  /**
+   * Every runnable check passed, but no log key was pinned: only
+   * commitment and entry-shape arithmetic was checked, against
+   * operator-supplied data that could have been fabricated together.
+   * Internal consistency, not log-attested verification.
+   */
+  | "consistent"
   | "unverified"
   | "invalid"
   | "anchor_failed"
@@ -446,6 +464,8 @@ export interface AnchorCounterStatus {
 export interface AnchorCoverage {
   checkpoints: number;
   verified: number;
+  /** Anchors whose runnable checks passed without a pinned log key. */
+  consistent: number;
   unverified: number;
   invalid: number;
   anchor_failed: number;
@@ -454,10 +474,11 @@ export interface AnchorCoverage {
   newest_verified_integrated_time: number | null;
   /**
    * "pinned-rekor-key": signed entry timestamps and note signatures were
-   * verified under a caller-pinned log key. "none": only commitment
-   * binding, entry binding, and Merkle arithmetic against receipt-embedded
-   * roots were checked, all of which an operator could fabricate together;
-   * stated, never silently upgraded.
+   * verified under a caller-pinned log key; anchors can reach "verified".
+   * "none": only commitment binding, entry binding, and Merkle arithmetic
+   * against receipt-embedded roots were checked, all of which an operator
+   * could fabricate together; anchors top out at "consistent", never
+   * "verified". Stated, never silently upgraded.
    */
   log_signature_basis: "pinned-rekor-key" | "none";
 }
@@ -474,6 +495,7 @@ function emptyCoverage(
   return {
     checkpoints: 0,
     verified: 0,
+    consistent: 0,
     unverified: 0,
     invalid: 0,
     anchor_failed: 0,
@@ -651,7 +673,7 @@ export function verifyAnchorEvidence(
 
   if (basis === "none") {
     notChecked.push(
-      "Rekor log signatures: no log public key was pinned (--rekor-public-key-file). Inclusion proofs were recomputed only against receipt-embedded roots, which the receipt author could fabricate together with the proofs. Pin the log key, obtained out-of-band from the log operator, for log-attested verification."
+      "Rekor log signatures: no log public key was pinned (--rekor-public-key-file). Inclusion proofs were recomputed only against receipt-embedded roots, which the receipt author could fabricate together with the proofs, so anchors are reported as CONSISTENT (internal consistency of the operator-supplied evidence), never as verified. Pin the log key, obtained out-of-band from the log operator, for log-attested verification."
     );
   }
   notChecked.push(
@@ -691,6 +713,7 @@ export function verifyAnchorEvidence(
   const coverage: AnchorCoverage = {
     checkpoints: sorted.length,
     verified: statuses.filter((s) => s.status === "verified").length,
+    consistent: statuses.filter((s) => s.status === "consistent").length,
     unverified: statuses.filter((s) => s.status === "unverified").length,
     invalid: statuses.filter((s) => s.status === "invalid").length,
     anchor_failed: statuses.filter((s) => s.status === "anchor_failed").length,
@@ -902,6 +925,29 @@ function checkAnchoredReceipt(input: {
         counter,
         message: `anchor entry for checkpoint ${counter}: the inclusion proof is malformed`,
       });
+    } else if (proofIndex !== material.log_index) {
+      // INDEX BINDING, checked BEFORE any proof recomputation: the signed
+      // entry timestamp covers material.log_index, but the inclusion proof
+      // is recomputed over proof.logIndex. RFC 6962 trees allow duplicate
+      // leaves, so a valid proof for a DIFFERENT index with the same leaf
+      // hash must never satisfy an entry signed for this index.
+      invalid = true;
+      findings.push({
+        kind: "anchor_inclusion_proof_invalid",
+        counter,
+        expected: material.log_index,
+        actual: proofIndex,
+        message: `anchor entry for checkpoint ${counter}: the inclusion proof claims leaf index ${proofIndex} but the log entry (and its signed timestamp) name log index ${material.log_index}; a proof for a different index does not attest this entry's inclusion (duplicate leaves make such proofs forgeable)`,
+      });
+    } else if (material.log_index >= treeSize) {
+      invalid = true;
+      findings.push({
+        kind: "anchor_inclusion_proof_invalid",
+        counter,
+        expected: `log index below tree size ${treeSize}`,
+        actual: material.log_index,
+        message: `anchor entry for checkpoint ${counter}: the entry's log index ${material.log_index} is not inside the inclusion proof's claimed tree of size ${treeSize}; the proof cannot cover this entry`,
+      });
     } else {
       const computed = rootFromInclusionProof({
         leafHash: hexToBytes(leafHashHex),
@@ -1021,13 +1067,24 @@ function checkAnchoredReceipt(input: {
       integrated_time: null,
     };
   }
+  if (input.rekorPoint) {
+    return {
+      counter,
+      status: "verified",
+      detail:
+        "commitment, entry binding, inclusion proof, and log signatures verified",
+      integrated_time: material.integrated_time,
+    };
+  }
+  // No pinned log key: every input above (salt, anchoring key, entry body,
+  // proof, root, note, timestamp) is operator-supplied and could have been
+  // fabricated together. The honest ceiling is internal consistency; the
+  // integration time is unattested and therefore not reported as verified.
   return {
     counter,
-    status: "verified",
+    status: "consistent",
     detail:
-      input.rekorPoint
-        ? "commitment, entry binding, inclusion proof, and log signatures verified"
-        : "commitment, entry binding, and inclusion arithmetic verified (log signatures not checked: no pinned log key)",
-    integrated_time: material.integrated_time,
+      "commitment, entry binding, and inclusion arithmetic are internally consistent with the operator-supplied evidence; NOT log-attested (no pinned log key)",
+    integrated_time: null,
   };
 }

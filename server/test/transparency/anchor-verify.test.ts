@@ -8,12 +8,16 @@
  *     drift from anchor.ts silently.
  *   - EVERY BINDING IS ENFORCED: salt, checkpoint hash, commitment digest,
  *     entry body digest, anchoring key, P-256 signature, UUID leaf hash,
- *     Merkle inclusion arithmetic, note consistency, SET and note
- *     signatures, logID. Each tampered independently yields its specific
- *     finding; none can be skipped into a pass.
- *   - MISSING EVIDENCE IS NEVER VERIFIED: absent bodies/proofs/log key
- *     produce "unverified" coverage plus not_checked notes, not findings,
- *     and never "verified".
+ *     proof-index-to-signed-log-index binding (duplicate leaves make a
+ *     proof for a different index forgeable), Merkle inclusion arithmetic,
+ *     note consistency, SET and note signatures, logID. Each tampered
+ *     independently yields its specific finding; none can be skipped into
+ *     a pass.
+ *   - MISSING EVIDENCE IS NEVER VERIFIED: absent bodies/proofs produce
+ *     "unverified" coverage plus not_checked notes, not findings, and
+ *     never "verified". Without a pinned log key NOTHING is "verified":
+ *     anchors top out at "consistent" (operator-supplied evidence checked
+ *     for internal consistency only).
  *   - WITHHELD SUFFIX IS EVIDENCE: an anchored receipt above the bundle's
  *     top counter is a finding (anchor_beyond_bundle).
  *   - FRESHNESS IS LOG-ATTESTED OR NOTHING: --expect-fresh without a
@@ -244,11 +248,20 @@ describe("anchor evidence verification (real anchoring pipeline)", () => {
     expect(result.coverage.newest_verified_integrated_time).toBe(FIXTURE_TIME);
   });
 
-  it("without a pinned log key it still verifies arithmetic but states the weaker basis", async () => {
+  it("without a pinned log key anchors are at most consistent, NEVER verified", async () => {
     const { records, anchorsDoc } = await buildScenario(2);
     const result = verifyAnchorEvidence(records, anchorsDoc, {});
     expect(result.findings).toEqual([]);
-    expect(result.coverage.verified).toBe(2);
+    // Every input here (salt, anchoring key, bodies, proofs, roots, notes,
+    // timestamps) came from the operator-supplied evidence; "verified"
+    // would be self-referential. The pin: zero verified, all consistent.
+    expect(result.coverage.verified).toBe(0);
+    expect(result.coverage.consistent).toBe(2);
+    expect(result.coverage.invalid).toBe(0);
+    expect(result.coverage.statuses.every((s) => s.status !== "verified")).toBe(
+      true
+    );
+    expect(result.coverage.newest_verified_integrated_time).toBeNull();
     expect(result.coverage.log_signature_basis).toBe("none");
     expect(
       result.not_checked.some((note) => note.includes("no log public key was pinned"))
@@ -335,6 +348,84 @@ describe("anchor evidence verification (real anchoring pipeline)", () => {
     ).toBe(true);
   });
 
+  it("a valid proof for a DIFFERENT index over a duplicate leaf is rejected (index binding)", async () => {
+    const { records, anchorsDoc } = await buildScenario(1);
+    const tampered = clone(anchorsDoc);
+    const receipt = anchoredReceipt(tampered, 1);
+    // RFC 6962 trees allow duplicate leaves. Build a tree carrying the SAME
+    // leaf at indices 0 and 1, and supply the (genuinely valid) inclusion
+    // proof for index 1 while the entry and its signed timestamp name log
+    // index 0. Before the index-binding check, every other check passes:
+    // same body, same UUID leaf hash, proof recomputes to the root.
+    const bodyBytes = new Uint8Array(
+      Buffer.from(receipt.rekor.body_b64!, "base64")
+    );
+    const leaf = rfc6962LeafHash(bodyBytes);
+    const leaves = [leaf, leaf];
+    const root = merkleRoot(leaves);
+    const proofForIndexOne = inclusionProof(1, leaves);
+    // Sanity: the forged proof is real Merkle arithmetic for index 1.
+    const recomputed = rootFromInclusionProof({
+      leafHash: leaf,
+      leafIndex: 1,
+      treeSize: 2,
+      proofHashes: proofForIndexOne,
+    });
+    expect(Buffer.from(recomputed!).toString("hex")).toBe(
+      Buffer.from(root).toString("hex")
+    );
+    receipt.rekor.log_index = 0;
+    receipt.rekor.verification = {
+      inclusionProof: {
+        checkpoint: `rekor.fixture.test - 1066\n2\n${Buffer.from(root).toString("base64")}\n\n\u2014 rekor.fixture.test ${Buffer.from("notasig!").toString("base64")}\n`,
+        hashes: proofForIndexOne.map((h) => Buffer.from(h).toString("hex")),
+        logIndex: 1,
+        rootHash: Buffer.from(root).toString("hex"),
+        treeSize: 2,
+      },
+    };
+    const result = verifyAnchorEvidence(records, tampered, {});
+    expect(
+      result.findings.some(
+        (f) =>
+          f.kind === "anchor_inclusion_proof_invalid" &&
+          f.counter === 1 &&
+          f.message.includes("leaf index 1") &&
+          f.message.includes("log index 0")
+      )
+    ).toBe(true);
+    expect(result.coverage.invalid).toBe(1);
+    expect(result.coverage.verified).toBe(0);
+    expect(result.coverage.consistent).toBe(0);
+  });
+
+  it("an entry log index at or beyond the proof's claimed tree size is rejected", async () => {
+    const { records, anchorsDoc, log } = await buildScenario(1);
+    const tampered = clone(anchorsDoc);
+    const receipt = anchoredReceipt(tampered, 1);
+    const proof = (
+      receipt.rekor.verification as {
+        inclusionProof: { logIndex: number; treeSize: number };
+      }
+    ).inclusionProof;
+    // Keep the two indices EQUAL so only the range check can refuse it.
+    receipt.rekor.log_index = proof.treeSize;
+    proof.logIndex = proof.treeSize;
+    const result = verifyAnchorEvidence(records, tampered, {
+      rekorPublicKeyPem: log.publicKeyPem(),
+    });
+    expect(
+      result.findings.some(
+        (f) =>
+          f.kind === "anchor_inclusion_proof_invalid" &&
+          f.counter === 1 &&
+          f.message.includes("not inside the inclusion proof's claimed tree")
+      )
+    ).toBe(true);
+    expect(result.coverage.invalid).toBe(1);
+    expect(result.coverage.verified).toBe(0);
+  });
+
   it("a swapped signed entry timestamp fails under the pinned log key and only then", async () => {
     const { records, anchorsDoc, log } = await buildScenario(2);
     const tampered = clone(anchorsDoc);
@@ -354,6 +445,8 @@ describe("anchor evidence verification (real anchoring pipeline)", () => {
     const unpinned = verifyAnchorEvidence(records, tampered, {});
     expect(unpinned.findings).toEqual([]);
     expect(unpinned.coverage.log_signature_basis).toBe("none");
+    expect(unpinned.coverage.verified).toBe(0);
+    expect(unpinned.coverage.consistent).toBe(2);
   });
 
   it("an entry from a different log (wrong logID) is caught under the pinned key", async () => {

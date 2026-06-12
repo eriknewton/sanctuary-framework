@@ -252,7 +252,8 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
     const text = verify.out.text();
     expect(text).toContain("Verdict: PASS");
     expect(text).toContain("Anchor coverage (log signatures: verified under pinned log key)");
-    expect(text).toContain("2 verified, 0 unverified, 0 invalid");
+    expect(text).toContain("2 verified, 0 consistent, 0 unverified, 0 invalid");
+    expect(text).not.toContain("internal consistency only");
 
     // The standalone offline artifact reaches the same verdict with the
     // same files and no Sanctuary install semantics.
@@ -281,6 +282,64 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
     expect(payload.verdict).toBe("PASS");
     expect(payload.anchors.verified).toBe(2);
     expect(payload.anchors.log_signature_basis).toBe("pinned-rekor-key");
+  });
+
+  it("no pinned log key: anchors report consistent (never verified) and the trust level is stated", async () => {
+    const scenario = await operatorScenario(2);
+    const verify = run([
+      "verify",
+      "--input",
+      scenario.bundlePath,
+      "--public-key-file",
+      scenario.pinnedKeyPath,
+      "--check-anchors",
+      scenario.anchorsPath,
+    ]);
+    // PASS is still possible: everything that CAN be verified at this
+    // trust level passed. But nothing is counted "verified", and the
+    // report says exactly what was and was not established.
+    expect(await verify.code).toBe(0);
+    const text = verify.out.text();
+    expect(text).toContain("Verdict: PASS");
+    expect(text).toContain(
+      "Anchor coverage (log signatures: NOT verified, no pinned log key)"
+    );
+    expect(text).toContain("0 verified, 2 consistent, 0 unverified, 0 invalid");
+    expect(text).toContain(
+      "anchors checked for internal consistency only (operator-supplied evidence); supply --rekor-public-key-file for log-attested verification"
+    );
+
+    // Same pin on the standalone artifact's JSON report.
+    const out = new Capture();
+    const err = new Capture();
+    const code = await runStandaloneTransparencyVerifier({
+      argv: [
+        "--input",
+        scenario.bundlePath,
+        "--public-key-file",
+        scenario.pinnedKeyPath,
+        "--check-anchors",
+        scenario.anchorsPath,
+        "--json",
+      ],
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const payload = JSON.parse(out.text()) as {
+      anchors: {
+        verified: number;
+        consistent: number;
+        log_signature_basis: string;
+        statuses: Array<{ status: string }>;
+      };
+    };
+    expect(payload.anchors.verified).toBe(0);
+    expect(payload.anchors.consistent).toBe(2);
+    expect(payload.anchors.log_signature_basis).toBe("none");
+    expect(
+      payload.anchors.statuses.every((s) => s.status !== "verified")
+    ).toBe(true);
   });
 
   it("D2 stale bundle caught by --expect-fresh against log-attested time", async () => {
@@ -472,7 +531,7 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
       scenario.rekorKeyPath,
     ]);
     expect(await offline.code).toBe(0);
-    expect(offline.out.text()).toContain("0 verified, 2 unverified");
+    expect(offline.out.text()).toContain("0 verified, 0 consistent, 2 unverified");
 
     // With --fetch-anchors the entries come back from the log and verify.
     const fetched = run(
@@ -491,7 +550,7 @@ describe("PR-3 anchor verification CLI + drill fixtures", () => {
       { fetchFn: scenario.log.fetchLike() }
     );
     expect(await fetched.code).toBe(0);
-    expect(fetched.out.text()).toContain("2 verified, 0 unverified");
+    expect(fetched.out.text()).toContain("2 verified, 0 consistent, 0 unverified");
 
     // SSRF guard reuse: a loopback log URL in the anchors file is refused
     // fail-closed without the explicit unsafe override.

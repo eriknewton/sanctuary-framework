@@ -157,12 +157,20 @@ Auditor steps:
    Per anchored checkpoint this recomputes the salted commitment against the
    bundle's actual checkpoint, rebinds the Rekor entry body (digest, the
    fortress anchoring key, its P-256 signature, the RFC 6962 leaf hash),
-   recomputes the Merkle inclusion proof, and verifies the signed entry
-   timestamp and checkpoint-note signature under your pinned log key. The
-   report states anchor coverage plainly; missing evidence is "unverified",
-   never silently passed. Without `--rekor-public-key-file` the log-signature
-   checks are honestly listed under `not_checked` and freshness cannot be
-   asserted.
+   requires the inclusion proof's leaf index to match the entry's signed log
+   index and to lie inside the claimed tree, recomputes the Merkle inclusion
+   proof, and verifies the signed entry timestamp and checkpoint-note
+   signature under your pinned log key. The report states anchor coverage
+   plainly; missing evidence is "unverified", never silently passed.
+
+   The pinned log key is what makes verification log-attested. Without
+   `--rekor-public-key-file` the tool checks internal consistency only:
+   every input it has (salt, anchoring key, entry bodies, proofs, roots,
+   notes, timestamps) comes from the operator-supplied files and could have
+   been fabricated together. Such anchors are reported "consistent", never
+   "verified", the log-signature checks are honestly listed under
+   `not_checked`, the report says so on its trust-level line, and freshness
+   cannot be asserted.
 
 3. Apply the freshness policy you require:
 
