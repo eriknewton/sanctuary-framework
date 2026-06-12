@@ -67,6 +67,7 @@ HOST_ENTITLEMENTS="${PKG_DIR}/Sources/CastleWallHostApp/CastleWallHostApp.entitl
 PROVISIONING_PROFILE="${PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_macOS.provisionprofile}"
 EXT_PROVISIONING_PROFILE="${EXT_PROVISIONING_PROFILE:-${HOME}/Documents/Sanctuary_Castle_Wall_Extension.provisionprofile}"
 WRAPPED=false
+ALLOW_UNNOTARIZED=false
 WRAPPED_APP_DIR="${WRAPPED_APP_DIR:-${PKG_DIR}/build/Sanctuary-CastleWall.app}"
 SYSTEM_EXTENSION_DIRNAME="ai.sanctuaryprotocol.macos.castle-wall.systemextension"
 
@@ -88,10 +89,15 @@ usage() {
 Usage: $(basename "$0") [--wrapped]
 
 Options:
-  --wrapped   Assemble nested .systemextension host app and sign:
-              1) inner .systemextension
-              2) outer .app (deep sign)
-  -h, --help  Show this help
+  --wrapped            Assemble nested .systemextension host app and sign:
+                       1) inner .systemextension
+                       2) outer .app (deep sign)
+  --allow-unnotarized  Permit a --wrapped build to finish without notarization.
+                       For CI / local non-deploy builds ONLY. A sysext bundle
+                       that is signed-but-unnotarized is silently uninstalled by
+                       macOS (Tahoe sysextd) at validation with no replacement
+                       prompt, so deploy builds MUST notarize (set NOTARYTOOL_PROFILE).
+  -h, --help           Show this help
 EOF
 }
 
@@ -99,6 +105,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --wrapped)
             WRAPPED=true
+            shift
+            ;;
+        --allow-unnotarized)
+            ALLOW_UNNOTARIZED=true
             shift
             ;;
         -h|--help)
@@ -363,16 +373,33 @@ if [ "${WRAPPED}" = true ]; then
         xcrun stapler staple "${WRAPPED_APP_DIR}"
         xcrun stapler validate "${WRAPPED_APP_DIR}"
         echo "[build-signed]     spctl assess (post-notarization)"
+        # Hard gate: a sysext deploy MUST end up notarized-and-accepted, or macOS
+        # Tahoe sysextd silently uninstalls the extension at validation (no prompt).
+        # Drill 2026-06-11c finding W6-N1.
+        if ! spctl -a -vv "${WRAPPED_APP_DIR}" 2>&1 | grep -q "source=Notarized Developer ID"; then
+            echo "[build-signed] ERROR: notarization ran but spctl does not report 'Notarized Developer ID' for ${WRAPPED_APP_DIR}." >&2
+            echo "[build-signed]        Refusing to emit a sysext bundle that macOS will silently uninstall." >&2
+            rm -f "${NOTARIZE_ZIP}"
+            exit 1
+        fi
         spctl -a -vvv -t exec "${WRAPPED_APP_DIR}" || true
         rm -f "${NOTARIZE_ZIP}"
-    else
-        echo "[build-signed]     NOTARIZATION DEFERRED (NOTARYTOOL_PROFILE unset)."
-        echo "[build-signed]     Apps with a bundled LaunchDaemon MUST be notarized for SMAppService."
-        echo "[build-signed]     Operator commands:"
+    elif [ "${ALLOW_UNNOTARIZED}" = true ]; then
+        echo "[build-signed]     NOTARIZATION SKIPPED (--allow-unnotarized; NON-DEPLOY build)."
+        echo "[build-signed]     WARNING: macOS Tahoe sysextd will REFUSE this extension on a real host." >&2
+        echo "[build-signed]     Operator commands to notarize before deploy:"
         echo "[build-signed]       ditto -c -k --keepParent \"${WRAPPED_APP_DIR}\" /tmp/cw-notarize.zip"
         echo "[build-signed]       xcrun notarytool submit /tmp/cw-notarize.zip --keychain-profile <profile> --wait"
         echo "[build-signed]       xcrun stapler staple \"${WRAPPED_APP_DIR}\""
         echo "[build-signed]       xcrun stapler validate \"${WRAPPED_APP_DIR}\""
+    else
+        echo "[build-signed] ERROR: --wrapped build assembled a .systemextension but NOTARYTOOL_PROFILE is unset." >&2
+        echo "[build-signed]        A signed-but-unnotarized system extension is SILENTLY UNINSTALLED by macOS" >&2
+        echo "[build-signed]        Tahoe sysextd at validation (no replacement prompt) — the deploy will appear" >&2
+        echo "[build-signed]        to succeed and the stale extension stays. (Drill 2026-06-11c, finding W6-N1.)" >&2
+        echo "[build-signed]        Fix: set NOTARYTOOL_PROFILE=<notarytool keychain profile> and rebuild," >&2
+        echo "[build-signed]        or pass --allow-unnotarized for a CI / local NON-DEPLOY build." >&2
+        exit 1
     fi
 fi
 
