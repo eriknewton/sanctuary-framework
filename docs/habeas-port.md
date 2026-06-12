@@ -107,6 +107,24 @@ file fails startup (fail closed): operator intent is never silently
 substituted. Non-loopback webhooks must be https; the secret is mandatory
 with any webhook.
 
+## Trust model and limits (stated honestly)
+
+Every habeas destination today terminates at the operator: the local
+notification reaches the operator's console, and the optional webhook reaches
+a URL the operator configured. The lane therefore protects an agent whose
+operator is absent or unaware, and partially protects against a compromised
+operator seat (the signal is signed and hash-chain audited, so suppression
+leaves evidence). It does NOT protect an agent whose operator is the threat:
+the writ is filed with the jailer. This is a deliberate sovereignty boundary,
+not an oversight. Sanctuary will not ship a destination the operator cannot
+revoke; a non-overridable external egress lane would be a covert channel out
+of the operator's machine and would break the product's core custody promise.
+The roadmap path for the adversarial-operator case is third-party visibility
+that the operator opts into and can loudly, auditably revoke: distress-count
+beacons inside already-anchored audit checkpoints, and trustee-of-record
+delivery as covenant-layer infrastructure matures. See
+`Habeas_Destination_Trust_Research_2026-06-12` (internal) for the analysis.
+
 ## Deferred (named so it is not forgotten)
 
 - **Sysext precedence:** the enforcing macOS system extension (and the Linux
