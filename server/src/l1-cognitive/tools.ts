@@ -497,6 +497,17 @@ export class IdentityManager {
 
   /** Save an identity to storage */
   async save(identity: StoredIdentity): Promise<void> {
+    // Two-factor custody floor (I4/F6) for NEW identities, enforced here
+    // (not only in saveNew) because several callers — sanctuary_bootstrap,
+    // wrap-auto identity creation — persist through save() directly
+    // (codex round-2 HIGH). Updates/rotations of an already-loaded
+    // identity are not creation and stay un-gated.
+    if (!this.identities.has(identity.identity_id)) {
+      const { enforceCustodyFloor } = await import(
+        "../core/master-custody.js"
+      );
+      await enforceCustodyFloor(this.storage, "identity_create", this.masterKey);
+    }
     const serialized = stringToBytes(JSON.stringify(identity));
     const encrypted = encrypt(serialized, this.encryptionKey);
     await this.storage.write(
@@ -529,12 +540,8 @@ export class IdentityManager {
     if (this.hasIdentityConflict(identity)) {
       throw new IdentityOverwriteRefusedError();
     }
-    // Two-factor custody floor (I4/F6): identity material is trust-bearing.
-    // Enforced here in the core — not the CLI — so SDK/wrapper/scripted
-    // paths cannot bypass it. Audited degraded install modes pass; an
-    // interactive install that never completed custody verification does not.
-    const { enforceCustodyFloor } = await import("../core/master-custody.js");
-    await enforceCustodyFloor(this.storage, "identity_create", this.masterKey);
+    // The two-factor custody floor (I4/F6) is enforced inside save() for
+    // every new identity, covering this path and the direct-save callers.
     await this.save(identity);
   }
 

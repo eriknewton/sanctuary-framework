@@ -284,15 +284,18 @@ describe("Standalone Dashboard", () => {
 
     const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
     const { FilesystemStorage } = await import("../src/storage/filesystem.js");
-    const { deriveMasterKey, derivePurposeKey } = await import(
-      "../src/core/key-derivation.js"
-    );
+    const { derivePurposeKey } = await import("../src/core/key-derivation.js");
     const { createIdentity } = await import("../src/core/identity.js");
-    const { bytesToString } = await import("../src/core/encoding.js");
+    // Sovereign-custody build: unlock through the unified path — a local
+    // Argon2id re-derivation from key-params would produce a DIFFERENT
+    // master than the envelope holds (the exact divergence class the
+    // custody envelope ended; its MAC check catches the attempt).
+    const { establishMaster } = await import("../src/core/master-custody.js");
     const storage = new FilesystemStorage(`${tempDir}/state`);
-    const rawParams = await storage.read("_meta", "key-params");
-    const params = rawParams ? JSON.parse(bytesToString(rawParams)) : undefined;
-    const { key: mk } = await deriveMasterKey("autoauth-tenant-passphrase", params);
+    const { masterKey: mk } = await establishMaster({
+      storage,
+      passphrase: "autoauth-tenant-passphrase",
+    });
     const idEncKey = derivePurposeKey(mk, "identity-encryption");
     const idMgr = new IdentityManager(storage, mk);
     await idMgr.load();

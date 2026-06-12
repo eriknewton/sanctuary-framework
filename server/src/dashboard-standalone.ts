@@ -274,9 +274,14 @@ export async function startStandaloneDashboard(
       storage,
       ...(passphrase ? { passphrase } : {}),
       ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+      // The standalone dashboard is a service boot, not a custody-setup
+      // ceremony (no re-entry verification flow) — first runs here are the
+      // audited degraded install mode, same as the MCP stdio boot. A fresh
+      // recovery key (a wrap of the one true master) is minted and
+      // disclosed below regardless of credential mode.
       firstRun: {
-        installMode: options.noConfirm ? "headless" : "interactive",
-        mintRecoveryKey: !passphrase && !envRecoveryKey,
+        installMode: options.noConfirm ? "headless" : "stdio-server",
+        mintRecoveryKey: true,
       },
       storagePathHint: config.storage_path,
     });
@@ -324,7 +329,11 @@ export async function startStandaloneDashboard(
       await discloseRecoveryKey({
         recoveryKey: custody.mintedRecoveryKey,
         storagePath: config.storage_path,
-        mode: options.noConfirm ? "no-confirm" : "interactive",
+        mode: options.noConfirm
+          ? "no-confirm"
+          : process.stdin.isTTY === true
+            ? "interactive"
+            : "stdio-server", // service boot without a TTY: banner + file
       });
     } catch (err) {
       if (
@@ -341,6 +350,38 @@ export async function startStandaloneDashboard(
 
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5pre. Custody audit trail (mirrors the MCP server boot): record
+  // envelope creation / migration / deferral — wrap types and install mode
+  // only, never key material.
+  if (custody.origin !== "envelope") {
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation:
+        custody.origin === "first-run"
+          ? "custody_envelope_created"
+          : custody.origin === "legacy-deferred"
+            ? "custody_migration_deferred"
+            : "custody_legacy_migrated",
+      identity_id: fortressIdFromStoragePath(config.storage_path),
+      result: "success",
+      details: custody.envelope
+        ? {
+            install_mode: custody.envelope.install_mode,
+            wrap_types: custody.envelope.wraps.map((w) => w.type),
+            verified_wraps: custody.envelope.wraps.filter((w) => w.verified)
+              .length,
+            origin: custody.origin,
+            source: "dashboard-standalone",
+          }
+        : {
+            origin: custody.origin,
+            source: "dashboard-standalone",
+            reason:
+              "existing data could not be evidence-checked against this master; envelope not written",
+          },
+    });
+  }
 
   // 5a. Reset-history continuity (v1.0.2 item a). Same one-shot marker
   // consumption as the MCP server boot path (server/src/index.ts) so the

@@ -380,15 +380,18 @@ describe("establishMaster — legacy migration", () => {
     expect(b64(migrated.masterKey)).toBe(b64(passphraseMaster));
 
     // The orphaned init-time recovery key cannot capture the fortress: its
-    // hash verifies but the data evidence contradicts it.
+    // hash verifies but the data evidence contradicts it. Model the
+    // PRE-migration dual fortress (copy legacy markers + data only — no
+    // envelope, no sentinel).
     const fresh = new MemoryStorage();
-    for (const ns of ["_meta", "_identities"]) {
-      for (const entry of await storage.list(ns)) {
-        const v = await storage.read(ns, entry.key);
-        if (v) await fresh.write(ns, entry.key, v);
-      }
+    for (const key of ["key-params", "recovery-key-hash"]) {
+      const v = await storage.read("_meta", key);
+      if (v) await fresh.write("_meta", key, v);
     }
-    await fresh.delete("_meta", CUSTODY_ENVELOPE_KEY, false);
+    for (const entry of await storage.list("_identities")) {
+      const v = await storage.read("_identities", entry.key);
+      if (v) await fresh.write("_identities", entry.key, v);
+    }
     await expect(
       establishMaster({ storage: fresh, recoveryKey: b64(orphanMaster) })
     ).rejects.toThrow(CustodyMigrationRefusedError);
@@ -562,6 +565,77 @@ describe("two-factor custody floor", () => {
       "passphrase"
     );
     await expect(mgr.saveNew(storedIdentity)).rejects.toThrow(CustodyFloorError);
+  });
+
+  it("DIRECT IdentityManager.save() of a NEW identity also hits the floor (codex round-2: sanctuary_bootstrap path)", async () => {
+    const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "interactive", 1);
+
+    const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
+    const { createIdentity } = await import("../../src/core/identity.js");
+    const mgr = new IdentityManager(storage, master);
+    const { storedIdentity } = createIdentity(
+      "blocked-direct",
+      derivePurposeKey(master, "identity-encryption"),
+      "passphrase"
+    );
+    await expect(mgr.save(storedIdentity)).rejects.toThrow(CustodyFloorError);
+  });
+
+  it("UPDATING an already-loaded identity is not creation and stays un-gated", async () => {
+    const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "headless", 1);
+
+    const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
+    const { createIdentity } = await import("../../src/core/identity.js");
+    const mgr = new IdentityManager(storage, master);
+    const { storedIdentity } = createIdentity(
+      "rotatable",
+      derivePurposeKey(master, "identity-encryption"),
+      "passphrase"
+    );
+    await mgr.save(storedIdentity); // headless mode: creation allowed, audited
+
+    // Demote the fortress to a state where CREATION would be refused…
+    const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    const envelope = JSON.parse(bytesToString(raw!));
+    envelope.install_mode = "interactive";
+    const { writeCustodyEnvelope: rewrite } = await import(
+      "../../src/core/master-custody.js"
+    );
+    await rewrite(storage, envelope, master);
+
+    // …an UPDATE of the existing identity still goes through.
+    await expect(mgr.save(storedIdentity)).resolves.toBeUndefined();
+  });
+
+  it("floor fails closed when the envelope is missing but the sentinel remains (codex round-2 H2)", async () => {
+    const storage = new MemoryStorage();
+    const master = await envelopeWith(storage, "interactive", 0);
+    await storage.delete("_meta", CUSTODY_ENVELOPE_KEY, false);
+    await expect(enforceCustodyFloor(storage, "test", master)).rejects.toThrow(
+      CustodyEnvelopeIntegrityError
+    );
+  });
+
+  it("establishMaster refuses the legacy-downgrade path when the sentinel remains (codex round-2)", async () => {
+    const storage = new MemoryStorage();
+    // Migrated fortress: legacy markers + envelope + sentinel.
+    const { params } = await deriveMasterKey("legacy-pass");
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(params))
+    );
+    const migrated = await establishMaster({ storage, passphrase: "legacy-pass" });
+    expect(migrated.origin).toBe("migrated-passphrase");
+
+    // Attacker deletes the envelope; legacy markers remain. Re-migration
+    // must NOT mint fresh one-wrap custody — the sentinel says no.
+    await storage.delete("_meta", CUSTODY_ENVELOPE_KEY, false);
+    await expect(
+      establishMaster({ storage, passphrase: "legacy-pass" })
+    ).rejects.toThrow(CustodyEnvelopeIntegrityError);
   });
 
   it("ReputationStore.importBundle enforces the floor in the core", async () => {

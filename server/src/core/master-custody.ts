@@ -214,16 +214,28 @@ export class SilentCustodyRefusedError extends Error {
  * it belongs to a different fortress. Always fail closed.
  */
 export class CustodyEnvelopeIntegrityError extends Error {
-  constructor() {
+  constructor(detail?: string) {
     super(
-      "Sanctuary: custody envelope failed its integrity check.\n" +
-        "The envelope's policy metadata (install mode, enrolled factors) does not\n" +
-        "verify under this fortress's master key — it may have been tampered with\n" +
-        "or replaced. Refusing to proceed. Restore _meta/custody-envelope from a\n" +
-        "trusted backup."
+      detail ??
+        "Sanctuary: custody envelope failed its integrity check.\n" +
+          "The envelope's policy metadata (install mode, enrolled factors) does not\n" +
+          "verify under this fortress's master key — it may have been tampered with\n" +
+          "or replaced. Refusing to proceed. Restore _meta/custody-envelope from a\n" +
+          "trusted backup."
     );
     this.name = "CustodyEnvelopeIntegrityError";
   }
+}
+
+/** Message for "the sentinel proves an envelope existed, but it is gone". */
+function envelopeMissingButSentinelPresent(): CustodyEnvelopeIntegrityError {
+  return new CustodyEnvelopeIntegrityError(
+    "Sanctuary: this fortress's custody sentinel exists but its custody envelope\n" +
+      "is missing or unreadable. The envelope was deleted, hidden, or corrupted —\n" +
+      "refusing to fall back to legacy custody or re-create the envelope (that\n" +
+      "would strip enrolled factors and policy). Restore _meta/custody-envelope\n" +
+      "from a trusted backup."
+  );
 }
 
 /**
@@ -469,12 +481,10 @@ export function verifyEnvelopeMac(
 export async function readCustodyEnvelope(
   storage: StorageBackend
 ): Promise<CustodyEnvelope | null> {
-  let raw: Uint8Array | null;
-  try {
-    raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
-  } catch {
-    return null;
-  }
+  // A storage READ ERROR propagates (fail closed): treating an unreadable
+  // envelope as "absent" let an attacker who could make the file unreadable
+  // demote the fortress to floor-exempt legacy custody (codex round-2 H2).
+  const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
   if (!raw) return null;
   let parsed: unknown;
   try {
@@ -589,7 +599,15 @@ export async function enforceCustodyFloor(
   masterKey: Uint8Array
 ): Promise<void> {
   const envelope = await readCustodyEnvelope(storage);
-  if (!envelope) return; // pre-envelope legacy fortress
+  if (!envelope) {
+    // The sentinel proves envelope-format custody existed: an absent
+    // envelope is then tampering, not legacy (codex round-2 H2). Only a
+    // fortress with NEITHER artifact is genuine pre-envelope legacy.
+    if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
+      throw envelopeMissingButSentinelPresent();
+    }
+    return;
+  }
   verifyEnvelopeMac(envelope, masterKey);
   if (countVerifiedWraps(envelope) >= CUSTODY_FLOOR_WRAPS) return;
   if (envelope.install_mode !== "interactive") return;
@@ -852,7 +870,15 @@ export async function establishMaster(
     return { masterKey, envelope, origin: "envelope", keyProtection };
   }
 
-  // No envelope — inspect legacy markers.
+  // No envelope. If the custody sentinel exists, an envelope existed before
+  // — refuse the legacy/first-run paths entirely (codex round-2: deleting
+  // the envelope while legacy markers remain must not downgrade a migrated
+  // fortress to fresh one-wrap custody).
+  if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
+    throw envelopeMissingButSentinelPresent();
+  }
+
+  // Inspect legacy markers.
   const legacyParamsRaw = await storage.read("_meta", "key-params");
   const legacyHashRaw = await storage.read("_meta", "recovery-key-hash");
 
