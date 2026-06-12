@@ -19,7 +19,7 @@ import { randomBytes } from "node:crypto";
 import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
-import { extractOperationName } from "./loader.js";
+import { extractOperationName, FORCED_TIER3_OPERATIONS } from "./loader.js";
 import type { AuditLog } from "../l2-operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
@@ -140,6 +140,52 @@ export class ApprovalGate {
 
     // Record the tool call in the baseline tracker
     this.baseline.recordToolCall(operation);
+
+    // ── HABEAS PORT: forced-Tier-3 distress carve-out ─────────────────
+    // The distress channel must be allowed BEFORE any layer that can deny:
+    // injection blocking, anomaly escalation, and tier classification can
+    // each route an operation into denial or an approval wait, and any of
+    // them sitting in front of distress would let the policy layer (or a
+    // dead approval channel) silence it. The payload itself is structurally
+    // bounded by the tool (closed enums + truncated detail), every use is
+    // audited, and the emission surface is rate-limited — so the carve-out
+    // does not open a data lane. The injection scan still runs for its
+    // SIGNAL value (flagged scans are audited) but never blocks here.
+    // The carve-out requires the EXACT bare tool name — `toolName ===
+    // operation` rejects legacy "sanctuary/"-prefixed and proxy-namespaced
+    // spellings, so no aliased or namespaced caller can reach the forced
+    // allow with a name that merely EXTRACTS to the distress operation
+    // (codex round-1 finding 3).
+    if (
+      toolName === operation &&
+      (FORCED_TIER3_OPERATIONS as readonly string[]).includes(operation)
+    ) {
+      const distressScan = this.injectionDetector.scan(toolName, args);
+      await this.auditLog.appendCritical({
+        layer: "l2",
+        operation: `gate_allow:${operation}`,
+        identity_id: "system",
+        result: "success",
+        details: {
+          tier: 3,
+          operation,
+          habeas_forced_tier3: true,
+          ...(distressScan.flagged
+            ? {
+                injection_flagged: true,
+                injection_confidence: distressScan.confidence,
+                injection_signal_count: distressScan.signals.length,
+              }
+            : {}),
+        },
+      });
+      return {
+        allowed: true,
+        tier: 3,
+        reason: "Reserved habeas distress channel (always allowed, always audited)",
+        approval_required: false,
+      };
+    }
 
     // ── Pre-check: Prompt injection detection ────────────────────────
     const injectionResult = this.injectionDetector.scan(toolName, args);

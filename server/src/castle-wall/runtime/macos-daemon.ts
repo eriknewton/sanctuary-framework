@@ -9,7 +9,8 @@ import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.j
 import type { AuditLog } from "../../l2-operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
-import { deriveDnsRuleForHostnameRules } from "../allowlist/dns-derivation.js";
+import { composeEffectiveRules } from "../allowlist/habeas-port.js";
+import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
@@ -687,22 +688,23 @@ async function loadManifestState(input: {
     }
     rules.push(parsed);
   }
-  // Auto-derive a scoped DNS allow (#380) when hostname allow-rules exist, so
-  // agents can resolve names without an operator-authored any-resolver port-53
-  // grant. The rule scopes to the system resolvers ONLY (dns.getServers(),
-  // verified to match `scutil --dns`); absent when no hostname rules exist.
-  const derivedDns = deriveDnsRuleForHostnameRules({
-    rules,
+  // Compose the effective ruleset: HABEAS PORT reserved distress rules are
+  // ALWAYS injected (a conflicting operator ruleset throws — fail closed,
+  // never a wall that can silence distress), then the scoped DNS allow
+  // (#380) is derived when hostname allow-rules exist. The rule scopes to
+  // the system resolvers ONLY (dns.getServers(), verified to match
+  // `scutil --dns`); absent when no hostname rules exist.
+  const distressConfig = await readDistressConfig(input.fortressPath);
+  const effectiveRules = composeEffectiveRules({
+    operatorRules: rules,
     resolvers: getServers(),
+    distressWebhook: distressConfig.webhook_target,
     createdAt: new Date().toISOString(),
   });
-  if (derivedDns) {
-    rules.push(derivedDns);
-  }
   const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,
     issuedAt: new Date().toISOString(),
-    rules,
+    rules: effectiveRules,
     signer: {
       signingKeyId: input.signer.signingKeyId,
       sign: (bytes) => input.signer.signManifest(bytes),
@@ -714,7 +716,7 @@ async function loadManifestState(input: {
   if (!verifyResult.ok) {
     throw new Error(`manifest signature verification failed: ${verifyResult.error}`);
   }
-  return { signed, rules };
+  return { signed, rules: effectiveRules };
 }
 
 async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<void> {

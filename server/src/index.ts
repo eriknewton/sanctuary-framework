@@ -11,7 +11,9 @@ import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
-import { createL1Tools } from "./l1-cognitive/tools.js";
+import { createL1Tools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
+import { createDistressTools } from "./distress/tools.js";
+import { readDistressConfig } from "./distress/config.js";
 import { AuditLog, type AuditEntry } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
@@ -1162,6 +1164,24 @@ export async function createSanctuaryServer(options?: {
     approvalProofStore,
   });
 
+  // 16c. HABEAS PORT distress emission surface (agent-side sovereignty,
+  // ratified 2026-06-12). The lane config is operator-owned and loaded once,
+  // frozen — like the Principal Policy. A present-but-invalid distress.json
+  // aborts startup (fail closed) rather than silently running a different
+  // lane shape than the operator configured.
+  const distressLaneConfig = await readDistressConfig(config.storage_path);
+  const { tools: distressTools } = createDistressTools({
+    auditLog,
+    signingHelpers: createInternalIdentitySigningHelpers(
+      identityManager,
+      masterKey,
+      auditLog
+    ),
+    config: distressLaneConfig,
+    fortressPath: config.storage_path,
+    currentActorId: () => currentSessionBinding()?.identity_id,
+  });
+
   // 17. Assemble all tools
   let allTools: ToolDefinition[] = [
     ...l1Tools,
@@ -1183,6 +1203,7 @@ export async function createSanctuaryServer(options?: {
     ...complianceTools,
     ...erc8004Tools,
     ...agentNativeTools,
+    ...distressTools,
     manifestTool,
   ];
 
