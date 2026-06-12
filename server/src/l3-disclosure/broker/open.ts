@@ -16,8 +16,7 @@ import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { FilesystemStorage } from "../../storage/filesystem.js";
 import { loadConfig } from "../../config.js";
-import { deriveMasterKey, type KeyDerivationParams } from "../../core/key-derivation.js";
-import { stringToBytes, bytesToString } from "../../core/encoding.js";
+import { resolveCliMasterKey } from "../../core/master-custody.js";
 import { AuditLog } from "../../l2-operational/audit-log.js";
 import { getOrCreatePassphrase } from "../../wrap/passphrase.js";
 import { KeychainBackend } from "./keychain-backend.js";
@@ -52,24 +51,13 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
     passphrase = resolved.value;
   }
 
-  // 3. Derive master key.
-  let existingParams: KeyDerivationParams | undefined;
-  try {
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) {
-      existingParams = JSON.parse(bytesToString(raw));
-    }
-  } catch {
-    /* first run — params not yet persisted */
-  }
-  const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
-  if (!existingParams) {
-    await storage.write(
-      "_meta",
-      "key-params",
-      stringToBytes(JSON.stringify(params))
-    );
-  }
+  // 3. Resolve master key.
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+  const masterKey = await resolveCliMasterKey(storage, {
+    passphrase,
+    bootstrap: true,
+    storagePathHint: storagePath,
+  });
 
   // 4. Audit log — shares storage with the main server so `sanctuary audit`
   //    sees broker entries alongside L1/L2/L4 entries.

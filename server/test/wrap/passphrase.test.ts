@@ -20,6 +20,7 @@ import {
   PassphraseUnreadableError,
   type ExecResult,
 } from "../../src/wrap/passphrase.js";
+import { SilentCustodyRefusedError } from "../../src/core/master-custody.js";
 
 /**
  * Deterministic key deriver with a caller-chosen seed — used by the SEC-062
@@ -118,23 +119,34 @@ describe("passphrase", () => {
     expect(second.location).toBe("macOS Keychain");
   });
 
-  it("falls back to the encrypted file on non-darwin platforms", async () => {
+  it("F3: refuses to silently generate into the fallback file when no OS keyring is usable", async () => {
     const { exec } = makeExec();
 
-    const first = await getOrCreatePassphrase({
+    // The keyring write fails on this mock (no secret-tool); the old code
+    // silently wrote a machine-bound fallback secret the user never saw — a
+    // lockout generator. Now it fails closed.
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
+
+    // A USER-SUPPLIED passphrase may still be persisted to the fallback
+    // file (the user holds it) and read back.
+    const persisted = await persistUserProvidedPassphrase("user-held-value", {
       home,
       platformOverride: "linux",
       exec,
     });
-    expect(first.source).toBe("generated");
-    expect(first.location).toBe(fallbackFilePath(home));
+    expect(persisted.source).toBe("fallback-file");
 
-    // File exists, has restricted mode (best-effort — vitest runs as user).
     const fallbackPath = fallbackFilePath(home);
     await access(fallbackPath);
     const raw = await readFile(fallbackPath);
     // Must NOT contain the plaintext passphrase.
-    expect(raw.toString("utf-8")).not.toContain(first.value);
+    expect(raw.toString("utf-8")).not.toContain("user-held-value");
 
     const second = await getOrCreatePassphrase({
       home,
@@ -142,10 +154,10 @@ describe("passphrase", () => {
       exec,
     });
     expect(second.source).toBe("fallback-file");
-    expect(second.value).toBe(first.value);
+    expect(second.value).toBe("user-held-value");
   });
 
-  it("falls back to file if Keychain write fails on darwin", async () => {
+  it("F3: refuses to silently generate when the Keychain write fails on darwin", async () => {
     const exec = async (
       cmd: string,
       args: string[]
@@ -157,13 +169,13 @@ describe("passphrase", () => {
       return { stdout: "", stderr: "keychain unreachable", code: 1 };
     };
 
-    const result = await getOrCreatePassphrase({
-      home,
-      platformOverride: "darwin",
-      exec,
-    });
-    expect(result.source).toBe("generated");
-    expect(result.location).toBe(fallbackFilePath(home));
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "darwin",
+        exec,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
   });
 
   it("readStoredPassphrase returns null when nothing is stored", async () => {
@@ -178,7 +190,7 @@ describe("passphrase", () => {
 
   it("readStoredPassphrase returns the stored value after wrap", async () => {
     const { exec } = makeExec();
-    const created = await getOrCreatePassphrase({
+    await persistUserProvidedPassphrase("persisted-by-wrap", {
       home,
       platformOverride: "linux",
       exec,
@@ -189,7 +201,7 @@ describe("passphrase", () => {
       exec,
     });
     expect(read).not.toBeNull();
-    expect(read!.value).toBe(created.value);
+    expect(read!.value).toBe("persisted-by-wrap");
     expect(read!.source).toBe("fallback-file");
   });
 });
@@ -213,14 +225,14 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
     const originalDeriver = makeDeterministicDeriver("original-machine-key");
     const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
 
-    // Seed the fallback file under the ORIGINAL deriver.
-    const first = await getOrCreatePassphrase({
+    // Seed the fallback file under the ORIGINAL deriver (user-supplied
+    // persistence — the silent generate path now fails closed per F3).
+    await persistUserProvidedPassphrase("sec062-original-value", {
       home,
       platformOverride: "linux",
       exec,
       deriveMachineKey: originalDeriver,
     });
-    expect(first.source).toBe("generated");
     const fallback = fallbackFilePath(home);
     const originalBytes = await readFile(fallback);
 
@@ -244,7 +256,7 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
     const originalDeriver = makeDeterministicDeriver("original-machine-key");
     const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
 
-    await getOrCreatePassphrase({
+    await persistUserProvidedPassphrase("sec062-original-value", {
       home,
       platformOverride: "linux",
       exec,
@@ -261,17 +273,26 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
     ).rejects.toThrow(PassphraseUnreadableError);
   });
 
-  it("generates fresh passphrase only when fallback file does not exist; a second call reads it back without regenerating", async () => {
+  it("F3: refuses generation when no fallback file exists; a persisted value reads back without regenerating", async () => {
     const { exec } = makeExec();
     const deriver = makeDeterministicDeriver("stable-machine-key");
 
-    const first = await getOrCreatePassphrase({
+    // No keyring + no fallback file: fail closed, never invent a secret.
+    await expect(
+      getOrCreatePassphrase({
+        home,
+        platformOverride: "linux",
+        exec,
+        deriveMachineKey: deriver,
+      })
+    ).rejects.toThrow(SilentCustodyRefusedError);
+
+    await persistUserProvidedPassphrase("stable-user-value", {
       home,
       platformOverride: "linux",
       exec,
       deriveMachineKey: deriver,
     });
-    expect(first.source).toBe("generated");
 
     const second = await getOrCreatePassphrase({
       home,
@@ -280,7 +301,7 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
       deriveMachineKey: deriver,
     });
     expect(second.source).toBe("fallback-file");
-    expect(second.value).toBe(first.value);
+    expect(second.value).toBe("stable-user-value");
   });
 
   it("PassphraseUnreadableError message names the file path and lists recovery options", async () => {
@@ -288,7 +309,7 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
     const originalDeriver = makeDeterministicDeriver("original-machine-key");
     const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
 
-    await getOrCreatePassphrase({
+    await persistUserProvidedPassphrase("sec062-original-value", {
       home,
       platformOverride: "linux",
       exec,
@@ -323,7 +344,7 @@ describe("passphrase — SEC-062 unreadable-file handling", () => {
     const migratedDeriver = makeDeterministicDeriver("migrated-machine-key");
 
     // Seed fallback file too (to exercise the "both present" branch).
-    await getOrCreatePassphrase({
+    await persistUserProvidedPassphrase("fallback-seed-value", {
       home,
       platformOverride: "linux",
       exec,

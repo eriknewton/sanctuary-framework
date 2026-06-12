@@ -383,6 +383,11 @@ export class ReputationStore {
     verifySignatures: boolean,
     publicKeys: Map<string, Uint8Array>
   ): Promise<{ imported: number; invalid: number; contexts: string[] }> {
+    // Two-factor custody floor (I4/F6): reputation is trust-bearing state.
+    // Enforced in the core so no CLI/SDK path can bypass it.
+    const { enforceCustodyFloor } = await import("../core/master-custody.js");
+    await enforceCustodyFloor(this.storage, "reputation_import");
+
     let imported = 0;
     let invalid = 0;
     const contexts = new Set<string>();

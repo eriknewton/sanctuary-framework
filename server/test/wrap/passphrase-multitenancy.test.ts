@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   getOrCreatePassphrase,
+  persistUserProvidedPassphrase,
   fallbackFilePath,
   keychainServiceFor,
   type ExecResult,
@@ -172,16 +173,18 @@ describe("getOrCreatePassphrase — per-tenant isolation", () => {
     expect(reReadB.source).toBe("keychain");
   });
 
-  it("writes two isolated fallback files on linux", async () => {
+  it("writes two isolated fallback files on linux (user-supplied persistence)", async () => {
     const { exec } = makeExec();
 
-    const first = await getOrCreatePassphrase({
+    // F3: silent generation into the fallback file fails closed; user-
+    // supplied passphrases are the supported fallback-file path.
+    const first = await persistUserProvidedPassphrase("tenant-a-value", {
       home,
       storagePath: tenantA,
       platformOverride: "linux",
       exec,
     });
-    const second = await getOrCreatePassphrase({
+    const second = await persistUserProvidedPassphrase("tenant-b-value", {
       home,
       storagePath: tenantB,
       platformOverride: "linux",
@@ -197,23 +200,37 @@ describe("getOrCreatePassphrase — per-tenant isolation", () => {
     // sibling's.
     const rawA = await readFile(first.location);
     const rawB = await readFile(second.location);
-    expect(rawA.toString("utf-8")).not.toContain(first.value);
-    expect(rawB.toString("utf-8")).not.toContain(second.value);
+    expect(rawA.toString("utf-8")).not.toContain("tenant-a-value");
+    expect(rawB.toString("utf-8")).not.toContain("tenant-b-value");
     expect(Buffer.compare(rawA, rawB)).not.toBe(0);
 
-    expect(first.value).not.toBe(second.value);
-  });
-
-  it("rejects a fallback ciphertext copied into another tenant path before identity decrypt", async () => {
-    const { exec } = makeExec();
-
-    const first = await getOrCreatePassphrase({
+    const readA = await getOrCreatePassphrase({
       home,
       storagePath: tenantA,
       platformOverride: "linux",
       exec,
     });
-    await getOrCreatePassphrase({
+    const readB = await getOrCreatePassphrase({
+      home,
+      storagePath: tenantB,
+      platformOverride: "linux",
+      exec,
+    });
+    expect(readA.value).toBe("tenant-a-value");
+    expect(readB.value).toBe("tenant-b-value");
+    expect(readA.value).not.toBe(readB.value);
+  });
+
+  it("rejects a fallback ciphertext copied into another tenant path before identity decrypt", async () => {
+    const { exec } = makeExec();
+
+    const first = await persistUserProvidedPassphrase("tenant-a-value", {
+      home,
+      storagePath: tenantA,
+      platformOverride: "linux",
+      exec,
+    });
+    await persistUserProvidedPassphrase("tenant-b-value", {
       home,
       storagePath: tenantB,
       platformOverride: "linux",

@@ -4,12 +4,8 @@ import { Writable } from "node:stream";
 import { readTenantRuntime } from "./agents/runtime.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { loadConfig } from "../config.js";
-import { bytesToString, fromBase64url } from "../core/encoding.js";
-import {
-  deriveMasterKey,
-  derivePurposeKey,
-  type KeyDerivationParams,
-} from "../core/key-derivation.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
 import { StateStore } from "../l1-cognitive/state-store.js";
 import { AuditLog } from "../l2-operational/audit-log.js";
@@ -208,18 +204,12 @@ async function resolveMasterKey(
   storage: FilesystemStorage,
   env: NodeJS.ProcessEnv,
 ): Promise<Uint8Array> {
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (env.SANCTUARY_PASSPHRASE) {
-    let existingParams: KeyDerivationParams | undefined;
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-    return (await deriveMasterKey(env.SANCTUARY_PASSPHRASE, existingParams)).key;
+    return resolveCliMasterKey(storage, { passphrase: env.SANCTUARY_PASSPHRASE });
   }
   if (env.SANCTUARY_RECOVERY_KEY) {
-    const key = fromBase64url(env.SANCTUARY_RECOVERY_KEY);
-    if (key.length !== 32) {
-      throw new ConciergeReadError("SANCTUARY_RECOVERY_KEY must decode to 32 bytes");
-    }
-    return key;
+    return resolveCliMasterKey(storage, { recoveryKey: env.SANCTUARY_RECOVERY_KEY });
   }
   throw new ConciergeReadError(
     "local concierge reads require SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY",

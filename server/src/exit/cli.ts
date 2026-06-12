@@ -16,8 +16,7 @@ import { IdentityManager } from "../l1-cognitive/tools.js";
 import { ReputationStore } from "../l4-reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
-import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { bytesToString, fromBase64url, stringToBytes } from "../core/encoding.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
 import type { ExitBundleDidWebBinding } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
@@ -118,25 +117,20 @@ async function openExitContext(
 
   let masterKey: Uint8Array;
   let keySource: ExitContext["keySource"];
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (passphrase) {
-    let existingParams: KeyDerivationParams | undefined;
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-    const derived = await deriveMasterKey(passphrase, existingParams);
-    masterKey = derived.key;
-    if (!existingParams) {
-      await storage.write(
-        "_meta",
-        "key-params",
-        stringToBytes(JSON.stringify(derived.params))
-      );
-    }
+    masterKey = await resolveCliMasterKey(storage, {
+      passphrase,
+      bootstrap: true,
+      storagePathHint: config.storage_path,
+    });
     keySource = "passphrase";
   } else if (recoveryKey) {
-    masterKey = fromBase64url(recoveryKey);
-    if (masterKey.length !== 32) {
-      throw new Error("SANCTUARY_RECOVERY_KEY must decode to 32 bytes.");
-    }
+    masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      bootstrap: true,
+      storagePathHint: config.storage_path,
+    });
     keySource = "recovery-key";
   } else {
     throw new Error(

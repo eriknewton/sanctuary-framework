@@ -34,11 +34,7 @@ import { parsePolicy } from "../../principal-policy/loader.js";
 import { readLockdownStatus } from "../../lockdown/status.js";
 import { AuditLog } from "../../l2-operational/audit-log.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
-import {
-  deriveMasterKey,
-  type KeyDerivationParams,
-} from "../../core/key-derivation.js";
-import { stringToBytes, bytesToString } from "../../core/encoding.js";
+import { resolveCliMasterKey } from "../../core/master-custody.js";
 import { readStoredPassphrase } from "../../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../../dashboard/v1_1/wiring.js";
 
@@ -490,15 +486,12 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
       if (stored) passphrase = stored.value;
     }
     if (passphrase) {
-      let existingParams: KeyDerivationParams | undefined;
-      try {
-        const raw = await storage.read("_meta", "key-params");
-        if (raw) existingParams = JSON.parse(bytesToString(raw));
-      } catch { /* no key-params yet */ }
-      const { key: masterKey, params } = await deriveMasterKey(passphrase, existingParams);
-      if (!existingParams) {
-        await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
-      }
+      // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase,
+        bootstrap: true,
+        storagePathHint: tenant.storage_path,
+      });
       const auditLog = new AuditLog(storage, masterKey);
       await auditLog.append("l2", "agents.config", `fortress:${fortressId}`, {
         tenant: tenant.name,

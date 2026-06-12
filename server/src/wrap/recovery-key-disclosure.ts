@@ -139,6 +139,75 @@ export class RecoveryKeyConfirmationNonInteractiveError extends Error {
 }
 
 /**
+ * Sovereign-custody build (F13): operator failed re-entry verification of
+ * the recovery key. Callers treat this as a hard refusal, like the declined
+ * error: the fortress holds nothing trust-bearing yet (the custody floor
+ * guarantees it), so the operator can safely re-run init.
+ */
+export class RecoveryKeyReentryMismatchError extends Error {
+  constructor() {
+    super(
+      "Recovery key re-entry did not match. " +
+        "The key you save must be the exact key shown above — it is the only " +
+        "thing that can recover this fortress. Save it, then re-run init."
+    );
+    this.name = "RecoveryKeyReentryMismatchError";
+  }
+}
+
+const RECOVERY_KEY_REENTRY_ATTEMPTS = 3;
+
+/**
+ * Force capture verification: prompt the operator to re-enter the recovery
+ * key. The caller supplies the check — typically "does the entered key
+ * actually unwrap the master?" (an end-to-end proof, not a string compare).
+ * Throws {@link RecoveryKeyReentryMismatchError} after the attempts run out
+ * and {@link RecoveryKeyConfirmationNonInteractiveError} on a non-TTY stdin.
+ */
+export async function verifyRecoveryKeyReentry(opts: {
+  check: (entered: string) => Promise<boolean>;
+  io?: DisclosureIo;
+  attempts?: number;
+}): Promise<void> {
+  const input = opts.io?.input ?? process.stdin;
+  const output = opts.io?.output ?? process.stderr;
+  const attempts = opts.attempts ?? RECOVERY_KEY_REENTRY_ATTEMPTS;
+
+  const realStdin = !opts.io && process.stdin.isTTY !== true;
+  if (realStdin) {
+    throw new RecoveryKeyConfirmationNonInteractiveError();
+  }
+
+  const rl = createInterface({ input, output });
+  try {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let answer: string;
+      try {
+        answer = (
+          await rl.question("Re-enter the recovery key to verify you saved it: ")
+        ).trim();
+      } catch {
+        // Input closed mid-verification (EOF) — treat as a failed capture,
+        // never as success.
+        break;
+      }
+      if (await opts.check(answer)) {
+        output.write("Recovery key verified.\n");
+        return;
+      }
+      output.write(
+        attempt < attempts
+          ? "That does not match. Check what you saved and try again.\n"
+          : ""
+      );
+    }
+  } finally {
+    rl.close();
+  }
+  throw new RecoveryKeyReentryMismatchError();
+}
+
+/**
  * v1.1.3 (Finding X) error: operator answered "n" to the passphrase
  * confirmation prompt. Mirrors the recovery-key declined error shape so
  * callers can roll back fortress state and exit non-zero.

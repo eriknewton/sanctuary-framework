@@ -5,13 +5,14 @@
  *   - macOS: Keychain (via `security add-generic-password`)
  *   - Linux: Secret Service via `secret-tool(1)` (D-Bus; GNOME Keyring,
  *     KDE Wallet 6, KeePassXC, and any libsecret-compatible backend)
- *   - Windows / no-OS-keyring fallback: <storage_path>/passphrase.enc
- *     (AES-256-GCM, key derived from hostname + uid via HKDF-SHA256)
  *
- * The Linux branch falls through to the fallback file when `secret-tool` is
- * absent, when no D-Bus session bus is running, or when the keyring refuses
- * the write; production behavior on those hosts matches the pre-existing
- * Linux path so upgrades are never downgrades.
+ * F3 (sovereign-custody build, 2026-06-12): when no OS keyring is usable,
+ * generation FAILS CLOSED (SilentCustodyRefusedError) instead of silently
+ * writing a machine-bound fallback file the user never sees — that was a
+ * lockout generator. The encrypted fallback file remains supported for
+ *   - READING passphrases persisted by earlier versions, and
+ *   - USER-SUPPLIED passphrases (persistUserProvidedPassphrase) — the user
+ *     holds the secret, so machine loss is not custody loss.
  *
  * On subsequent runs, reads back from the same source. The goal is that a
  * user who ran `sanctuary wrap` once should never have to think about
@@ -215,8 +216,20 @@ export async function getOrCreatePassphrase(
     }
   }
 
-  await writeToFallbackFile(fallback, value, home, derive);
-  return { value, source: "generated", location: fallback };
+  // F3 (sovereign-custody build): NEVER silently generate a custody secret
+  // the user never sees into a machine-bound fallback file. That was a
+  // lockout generator — lose or wipe the machine and the fortress is gone,
+  // with the user holding no factor at all. Fail closed with remediation
+  // instead. (A USER-SUPPLIED passphrase may still be persisted to the
+  // fallback file via persistUserProvidedPassphrase — the user holds it.)
+  const { SilentCustodyRefusedError } = await import(
+    "../core/master-custody.js"
+  );
+  throw new SilentCustodyRefusedError(
+    plat === "darwin" || plat === "linux"
+      ? "OS keyring unavailable or refused the write"
+      : `no OS keyring integration on platform '${plat}'`
+  );
 }
 
 /**

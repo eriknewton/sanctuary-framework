@@ -113,8 +113,8 @@ Replace `<service-name>` with `sanctuary-passphrase` for the default tenant
 or `sanctuary-passphrase-<16hex>` for a sub-tenant. `sanctuary agents` prints
 the right service name for every discovered tenant, same as on macOS.
 
-Sanctuary falls through to the encrypted fallback file (described below)
-when:
+Sanctuary falls through to *reading* the encrypted fallback file (described
+below) when:
 
 - `secret-tool` is not installed (`ENOENT` on spawn),
 - no D-Bus session bus is running (typical in headless CI and minimal
@@ -125,12 +125,22 @@ when:
 This mirrors the macOS behavior of falling through to the fallback file when
 `/usr/bin/security` writes fail.
 
+> **Sovereign-custody change (2026-06-12, F3).** Sanctuary no longer
+> *generates* a passphrase into the fallback file when the keyring is
+> unusable — a machine-bound secret the user never saw was a lockout
+> generator (lose the machine, lose the fortress). Generation now fails
+> closed (`SilentCustodyRefusedError`) with remediation options. The
+> fallback file remains fully supported for **reading** passphrases
+> persisted by earlier versions and for **user-supplied** passphrases
+> (`--passphrase` / `SANCTUARY_PASSPHRASE`), where the user holds the
+> secret.
+
 ### Windows or no-OS-keyring fallback: encrypted file
 
 When no supported OS keyring is available (Windows currently, headless
 Linux, older Linux desktops without Secret Service, or any platform where
-the keyring write fails at runtime) Sanctuary writes the passphrase to an
-encrypted fallback file:
+the keyring write fails at runtime) Sanctuary writes a **user-supplied**
+passphrase to an encrypted fallback file:
 
 | Tenant type   | Path                                            |
 |---------------|-------------------------------------------------|

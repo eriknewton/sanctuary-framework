@@ -27,10 +27,7 @@ import {
   AuditIntegrityError,
   AuditLog,
 } from "../l2-operational/audit-log.js";
-import {
-  deriveMasterKey,
-  type KeyDerivationParams,
-} from "../core/key-derivation.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -1088,12 +1085,11 @@ async function resolveMasterKey(
   passphraseFlag: string | undefined,
   env: NodeJS.ProcessEnv
 ): Promise<Uint8Array> {
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   if (env.SANCTUARY_RECOVERY_KEY) {
-    const key = fromBase64url(env.SANCTUARY_RECOVERY_KEY);
-    if (key.length !== 32) {
-      throw new Error("SANCTUARY_RECOVERY_KEY must decode to 32 bytes");
-    }
-    return key;
+    return resolveCliMasterKey(storage, {
+      recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    });
   }
   const passphrase = passphraseFlag ?? env.SANCTUARY_PASSPHRASE;
   if (!passphrase) {
@@ -1101,13 +1097,7 @@ async function resolveMasterKey(
       "requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY"
     );
   }
-  let existingParams: KeyDerivationParams | undefined;
-  const raw = await storage.read("_meta", "key-params");
-  if (raw) {
-    existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-  }
-  const derived = await deriveMasterKey(passphrase, existingParams);
-  return derived.key;
+  return resolveCliMasterKey(storage, { passphrase });
 }
 
 function reportError(err: Writable, context: string, error: unknown): number {

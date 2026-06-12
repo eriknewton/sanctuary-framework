@@ -6,8 +6,8 @@ import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
-import { deriveMasterKey, type KeyDerivationParams } from "../core/key-derivation.js";
-import { bytesToString, fromBase64url, stringToBytes, toBase64url } from "../core/encoding.js";
+import { establishMaster } from "../core/master-custody.js";
+import { stringToBytes, toBase64url } from "../core/encoding.js";
 import { encrypt, type EncryptedPayload } from "../core/encryption.js";
 import { sign as identitySign, type RotationEvent } from "../core/identity.js";
 import { randomBytes } from "../core/random.js";
@@ -178,39 +178,35 @@ async function resolveMasterKey(
   storagePath: string,
   env: NodeJS.ProcessEnv
 ): Promise<Uint8Array> {
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+
+  // Unified custody path (master-custody.ts): envelope-first, legacy markers
+  // migrated in place, first runs recorded as a headless establishment. This
+  // is the same path the MCP server boots through — the CLI can no longer
+  // derive a *different* master for the same fortress (the 2026-06-12
+  // incident class). SANCTUARY_RECOVERY_KEY keeps its historical precedence
+  // over the passphrase for this CLI.
   if (env.SANCTUARY_RECOVERY_KEY) {
-    const key = fromBase64url(env.SANCTUARY_RECOVERY_KEY);
-    if (key.length !== 32) {
-      throw new Error("SANCTUARY_RECOVERY_KEY must decode to 32 bytes.");
-    }
-    return key;
+    const result = await establishMaster({
+      storage,
+      recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+      storagePathHint: storagePath,
+    });
+    return result.masterKey;
   }
 
-  const storage = new FilesystemStorage(join(storagePath, "state"));
   const passphrase =
     env.SANCTUARY_PASSPHRASE ??
     (await getOrCreatePassphrase({ storagePath })).value;
 
-  let existingParams: KeyDerivationParams | undefined;
-  try {
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) existingParams = JSON.parse(bytesToString(raw));
-  } catch {
-    // first run
-  }
-
-  const { key: masterKey, params } = await deriveMasterKey(
+  const result = await establishMaster({
+    storage,
     passphrase,
-    existingParams
-  );
-  if (!existingParams) {
-    await storage.write(
-      "_meta",
-      "key-params",
-      stringToBytes(JSON.stringify(params))
-    );
-  }
-  return masterKey;
+    firstRun: { installMode: "headless", mintRecoveryKey: false },
+    storagePathHint: storagePath,
+  });
+  return result.masterKey;
 }
 
 /**
@@ -386,6 +382,16 @@ export async function runProvisionPin(
     }
 
     const masterKey = await resolveMasterKey(storagePath, env);
+
+    // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
+    // material. Enforced in the core verb — not the wrapping CLI — so
+    // scripted provisioning hits it too.
+    const { enforceCustodyFloor } = await import("../core/master-custody.js");
+    await enforceCustodyFloor(
+      new FilesystemStorage(join(storagePath, "state")),
+      "castle_pin_provision"
+    );
+
     const privateSeed = randomBytes(32);
     const publicKey = ed25519.getPublicKey(privateSeed);
     const encryptedPrivateKey = encrypt(privateSeed, masterKey);
@@ -825,23 +831,27 @@ export async function runDaemon(
     passphrase = resolved.value;
   }
 
-  // Require existing key-derivation params (an already-provisioned fortress).
+  // Require an already-provisioned fortress (custody envelope or legacy
+  // key-params); never establish a fresh master from the daemon verb — a
+  // fresh key could not match the pin and arming with it would fail-closed
+  // the whole machine.
   const storage = new FilesystemStorage(join(storagePath, "state"));
-  let existingParams: KeyDerivationParams | undefined;
+  let derived: { key: Uint8Array };
   try {
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) {
-      existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-    }
-  } catch {
-    // none
-  }
-  if (!existingParams) {
-    write(err, "Refusing to start: no existing key-params under the fortress (nothing provisioned to bring up).\n");
+    const custodyResult = await establishMaster({
+      storage,
+      passphrase,
+      storagePathHint: storagePath,
+    });
+    derived = { key: custodyResult.masterKey };
+  } catch (error) {
+    write(
+      err,
+      `Refusing to start: ${error instanceof Error ? error.message : String(error)}\n` +
+        "(nothing provisioned to bring up, or the credential does not unlock this fortress).\n",
+    );
     return 1;
   }
-
-  const derived = await deriveMasterKey(passphrase, existingParams);
   const auditLog = await buildAuditLogForPrivilegedAction({
     storage,
     masterKey: derived.key,

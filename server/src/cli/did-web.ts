@@ -29,11 +29,8 @@ import { Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../l1-cognitive/tools.js";
 import { AuditLog } from "../l2-operational/audit-log.js";
-import {
-  deriveMasterKey,
-  type KeyDerivationParams,
-} from "../core/key-derivation.js";
-import { bytesToString, fromBase64url } from "../core/encoding.js";
+import { resolveCliMasterKey } from "../core/master-custody.js";
+import { fromBase64url } from "../core/encoding.js";
 import { loadConfig } from "../config.js";
 import {
   applyDidWebRotationToRecord,
@@ -245,18 +242,19 @@ async function loadFortressIdentity(
   const stateStoragePath = join(config.storage_path, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
+  if (!passphrase && !recoveryKey) {
+    return null;
+  }
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   let masterKey: Uint8Array;
-  if (passphrase) {
-    let existingParams: KeyDerivationParams | undefined;
-    const raw = await storage.read("_meta", "key-params");
-    if (raw) {
-      existingParams = JSON.parse(bytesToString(raw)) as KeyDerivationParams;
-    }
-    const derivation = await deriveMasterKey(passphrase, existingParams);
-    masterKey = derivation.key;
-  } else if (recoveryKey) {
-    masterKey = fromBase64url(recoveryKey);
-  } else {
+  try {
+    masterKey = await resolveCliMasterKey(storage, {
+      ...(passphrase !== undefined ? { passphrase } : {}),
+      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
+      storagePathHint: config.storage_path,
+    });
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return null;
   }
 

@@ -34,9 +34,14 @@ import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
-import { deriveMasterKey, derivePurposeKey, type KeyDerivationParams } from "./core/key-derivation.js";
-import { generateRandomKey } from "./core/random.js";
-import { toBase64url } from "./core/encoding.js";
+import { derivePurposeKey } from "./core/key-derivation.js";
+import {
+  establishMaster,
+  readCustodyEnvelope,
+  CustodyUnlockError,
+  CustodyMigrationRefusedError,
+  type EstablishMasterResult,
+} from "./core/master-custody.js";
 import { IdentityManager } from "./l1-cognitive/tools.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
 import { createIdentity } from "./core/identity.js";
@@ -200,7 +205,6 @@ export async function startStandaloneDashboard(
   // already persisted. Multi-tenant hosts with N per-tenant Keychain items
   // (service `sanctuary-passphrase-<12hex>`) no longer require a single
   // `SANCTUARY_PASSPHRASE` that can only unlock one tenant.
-  let masterKey: Uint8Array;
   let passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
   let passphraseSource: "option" | "env" | "keychain" | "fallback-file" | null = null;
   if (passphrase) {
@@ -228,150 +232,110 @@ export async function startStandaloneDashboard(
     }
   }
 
-  if (passphrase) {
-    // Passphrase path: derive master key via Argon2id
-    let existingParams: KeyDerivationParams | undefined;
-    try {
-      const raw = await storage.read("_meta", "key-params");
-      if (raw) {
-        const { bytesToString } = await import("./core/encoding.js");
-        existingParams = JSON.parse(bytesToString(raw));
-      }
-    } catch {
-      // No existing params
-    }
+  // Unified custody path (core/master-custody.ts): envelope-first, legacy
+  // markers migrated in place, first runs create the envelope. The dashboard
+  // can no longer derive a different master than the MCP server or the
+  // castle-wall CLI for the same fortress.
+  //
+  // v0.10.4 hints preserved: before failing against a tenant we cannot
+  // unlock, surface discoverable sub-tenants — the common Mini1 failure mode
+  // is `sanctuary dashboard` run against a default root while sub-tenants
+  // hold their own keychain entries.
+  const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+  const isFirstRun =
+    (await readCustodyEnvelope(storage)) === null &&
+    (await storage.read("_meta", "key-params")) === null &&
+    (await storage.read("_meta", "recovery-key-hash")) === null;
 
-    const result = await deriveMasterKey(passphrase, existingParams);
-    masterKey = result.key;
-
-    // v0.10.2: persist derivation params on first run, matching the MCP
-    // server (index.ts) and broker (l3-disclosure/broker/open.ts) paths.
-    // The standalone dashboard used to assume the MCP server would write
-    // `_meta/key-params` first, so it only ever READ them. With the new
-    // Keychain-autoload boot path `sanctuary dashboard` can now be the
-    // first component to run on a machine — if it derives against a
-    // random salt without persisting, the next boot will derive a
-    // DIFFERENT master key from the same passphrase and fail to decrypt
-    // everything this boot just wrote.
-    if (!existingParams) {
-      const { stringToBytes } = await import("./core/encoding.js");
-      await storage.write(
-        "_meta",
-        "key-params",
-        stringToBytes(JSON.stringify(result.params))
-      );
-    }
-  } else {
-    // Recovery key path
-    const { hashToString } = await import("./core/hashing.js");
-    const { stringToBytes, bytesToString, fromBase64url, constantTimeEqual } =
-      await import("./core/encoding.js");
-
-    // v0.10.4: before falling into recovery-key handling against a tenant we
-    // could not unlock, check whether the operator probably meant a different
-    // tenant. The most common Mini1 failure mode is `sanctuary dashboard`
-    // run with no flag against a default root that has orphan state but no
-    // resolvable passphrase, while sub-tenants exist with their own keychain
-    // entries. Surface those sub-tenants instead of the misleading
-    // "set SANCTUARY_PASSPHRASE" hint that v0.10.1–v0.10.3 produced.
+  if (isFirstRun && !passphrase && !envRecoveryKey) {
+    // v0.10.4: refuse to silently fresh-install over a host that already
+    // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
+    // recovery key in the default root, which made the operator think they
+    // had just lost access to N other tenants.
     const otherTenants = await discoverableSubTenants(config.storage_path);
-
-    const existingHash = await storage.read("_meta", "recovery-key-hash");
-    if (existingHash) {
-      // Recovery key path: existing installation with recovery key
-      const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
-      if (!envRecoveryKey) {
-        throw new Error(
-          `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} but no credentials provided.\n` +
-          `Provide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to start the dashboard against this storage path.\n\n` +
-          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
-          `See server/docs/keychain-schema.md for the keychain layout.`
-        );
-      }
-
-      let recoveryKeyBytes: Uint8Array;
-      try {
-        recoveryKeyBytes = fromBase64url(envRecoveryKey);
-      } catch {
-        throw new Error(
-          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY is not valid base64url."
-        );
-      }
-
-      if (recoveryKeyBytes.length !== 32) {
-        throw new Error(
-          "Sanctuary Dashboard: SANCTUARY_RECOVERY_KEY has incorrect length."
-        );
-      }
-
-      const providedHash = hashToString(recoveryKeyBytes);
-      const storedHash = bytesToString(existingHash);
-      const providedHashBytes = stringToBytes(providedHash);
-      const storedHashBytes = stringToBytes(storedHash);
-
-      if (!constantTimeEqual(providedHashBytes, storedHashBytes)) {
-        throw new Error(
-          "Sanctuary Dashboard: Recovery key does not match. Use the exact recovery key from first run."
-        );
-      }
-
-      masterKey = recoveryKeyBytes;
-    } else {
-      // Check if a passphrase was previously used (key-params exist without recovery-key-hash)
-      const existingNamespaces = await storage.list("_meta");
-      const hasKeyParams = existingNamespaces.some(e => e.key === "key-params");
-      if (hasKeyParams) {
-        throw new Error(
-          `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} (passphrase-protected).\n` +
-          `No passphrase was supplied via --passphrase, SANCTUARY_PASSPHRASE,\n` +
-          `or the per-tenant Keychain item ${keychainServiceFor(config.storage_path, homedir())}.\n\n` +
-          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
-          `See server/docs/keychain-schema.md for the keychain layout and recovery options.`
-        );
-      }
-
-      // v0.10.4: refuse to silently fresh-install over a host that already
-      // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
-      // recovery key in the default root, which made the operator think they
-      // had just lost access to N other tenants.
-      if (otherTenants.length > 0) {
-        throw new Error(
-          `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
-          `Refusing to generate a new recovery key over the default root — that would obscure the existing tenants.\n\n` +
-          renderTenantDiscoveryHint(otherTenants)
-        );
-      }
-
-      // No existing data — first run. Generate a key, but warn that this is unusual
-      // for standalone dashboard (normally you'd run the MCP server first).
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        "Warning: No existing Sanctuary data found. The standalone dashboard\n" +
-        "is typically started after the MCP server has been run at least once.\n" +
-        "Generating a new master key for this installation.\n"
+    if (otherTenants.length > 0) {
+      throw new Error(
+        `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
+        `Refusing to generate a new recovery key over the default root — that would obscure the existing tenants.\n\n` +
+        renderTenantDiscoveryHint(otherTenants)
       );
-      masterKey = generateRandomKey();
-      const recoveryKey = toBase64url(masterKey);
-      const keyHash = hashToString(masterKey);
-      await storage.write("_meta", "recovery-key-hash", stringToBytes(keyHash));
+    }
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      "Warning: No existing Sanctuary data found. The standalone dashboard\n" +
+      "is typically started after the MCP server has been run at least once.\n" +
+      "Generating a new master key for this installation.\n"
+    );
+  }
 
-      try {
-        await discloseRecoveryKey({
-          recoveryKey,
-          storagePath: config.storage_path,
-          mode: options.noConfirm ? "no-confirm" : "interactive",
-        });
-      } catch (err) {
-        if (
-          err instanceof RecoveryKeyConfirmationDeclinedError ||
-          err instanceof RecoveryKeyConfirmationNonInteractiveError
-        ) {
-          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-          console.error(`\nSanctuary Dashboard: ${err.message}\n`);
-          process.exit(2);
-        }
-        throw err;
+  let custody: EstablishMasterResult;
+  try {
+    custody = await establishMaster({
+      storage,
+      ...(passphrase ? { passphrase } : {}),
+      ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+      firstRun: {
+        installMode: options.noConfirm ? "headless" : "interactive",
+        mintRecoveryKey: !passphrase && !envRecoveryKey,
+      },
+      storagePathHint: config.storage_path,
+    });
+  } catch (err) {
+    // A SUPPLIED credential that fails to verify stays fail-closed (no boot
+    // with a wrong master — that silently splits state). Carry the v0.10.4
+    // diagnostics in the error: the per-tenant Keychain service name and the
+    // canonical schema doc, never a bare SANCTUARY_PASSPHRASE=<your-passphrase>
+    // hint (misleading on multi-tenant hosts).
+    if (
+      (err instanceof CustodyUnlockError ||
+        err instanceof CustodyMigrationRefusedError) &&
+      (passphrase || envRecoveryKey)
+    ) {
+      throw new Error(
+        `Sanctuary Dashboard: Encrypted identities found but NONE loaded — the supplied\n` +
+        `credential does not unlock the fortress at ${config.storage_path}.\n` +
+        `Refusing to start with a wrong master key (that would split state, not recover it).\n\n` +
+        `This tenant's Keychain service: ${keychainServiceFor(config.storage_path, homedir())}\n` +
+        `Retrieve the stored passphrase with:\n` +
+        `  security find-generic-password -s ${keychainServiceFor(config.storage_path, homedir())} -w\n\n` +
+        `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
+        { cause: err }
+      );
+    }
+    // Re-shape credential-missing failures with the dashboard's tenant
+    // discovery hints (v0.10.4 behavior).
+    if (err instanceof CustodyUnlockError && !passphrase && !envRecoveryKey) {
+      const otherTenants = await discoverableSubTenants(config.storage_path);
+      throw new Error(
+        `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} but no credentials provided.\n` +
+        `Provide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY (or the per-tenant Keychain item\n` +
+        `${keychainServiceFor(config.storage_path, homedir())}) to start the dashboard against this storage path.\n\n` +
+        (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+        `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
+        { cause: err }
+      );
+    }
+    throw err;
+  }
+  const masterKey = custody.masterKey;
+
+  if (custody.mintedRecoveryKey) {
+    try {
+      await discloseRecoveryKey({
+        recoveryKey: custody.mintedRecoveryKey,
+        storagePath: config.storage_path,
+        mode: options.noConfirm ? "no-confirm" : "interactive",
+      });
+    } catch (err) {
+      if (
+        err instanceof RecoveryKeyConfirmationDeclinedError ||
+        err instanceof RecoveryKeyConfirmationNonInteractiveError
+      ) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\nSanctuary Dashboard: ${err.message}\n`);
+        process.exit(2);
       }
+      throw err;
     }
   }
 
