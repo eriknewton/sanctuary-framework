@@ -52,6 +52,13 @@ BUILD_DIR="${BUILD_DIR:-${PKG_DIR}/build/CastleWallExtension.app}"
 SWIFT_BUILD_CONFIG="${SWIFT_BUILD_CONFIG:-release}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Erik Newton (YFQSWQ9BJN)}"
 CASTLE_WALL_GIT_SHA="${CASTLE_WALL_GIT_SHA:-$(git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+# CFBundleVersion MUST increase whenever the extension code changes, or macOS
+# treats a rebuilt sysext as the same version and KEEPS the already-activated
+# (stale) extension binary — silently shipping the old enforcement code. The
+# git commit count is monotonic per commit, so every merged fix bumps it.
+# (Root-caused on the 2026-06-11b W5 drill: a W5-fixed app deployed but the
+# pre-W5 extension stayed active because the hardcoded version 10 never moved.)
+CASTLE_WALL_BUNDLE_VERSION="${CASTLE_WALL_BUNDLE_VERSION:-$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || echo 10)}"
 CASTLE_WALL_HEADLESS_CONTRACT_VERSION="${CASTLE_WALL_HEADLESS_CONTRACT_VERSION:-2}"
 EXECUTABLE_NAME="CastleWallExtension"
 INFO_PLIST="${PKG_DIR}/Sources/CastleWallExtension/Info.plist"
@@ -198,6 +205,12 @@ cp "${INFO_PLIST}" "${BUILD_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallGitSHA ${CASTLE_WALL_GIT_SHA}" \
     "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
     /usr/libexec/PlistBuddy -c "Add :SanctuaryCastleWallGitSHA string ${CASTLE_WALL_GIT_SHA}" \
+        "${BUILD_DIR}/Contents/Info.plist" >/dev/null
+# Monotonic CFBundleVersion so macOS sees a rebuilt extension as an update and
+# replaces the activated binary (see CASTLE_WALL_BUNDLE_VERSION rationale above).
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${CASTLE_WALL_BUNDLE_VERSION}" \
+    "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
+    /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${CASTLE_WALL_BUNDLE_VERSION}" \
         "${BUILD_DIR}/Contents/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :SanctuaryCastleWallHeadlessContractVersion ${CASTLE_WALL_HEADLESS_CONTRACT_VERSION}" \
     "${BUILD_DIR}/Contents/Info.plist" >/dev/null 2>&1 || \
