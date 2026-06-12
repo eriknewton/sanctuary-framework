@@ -158,7 +158,7 @@ export async function runHoneypotCli(
       operator_id: deps.operatorId,
       observed_at: now().toISOString(),
     };
-    deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DRAFTED, deps.operatorId, {
+    await deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DRAFTED, deps.operatorId, {
       fortress_id: deps.fortressId,
       english_hash: hashOfEnglishDraft(englishText),
     });
@@ -166,7 +166,7 @@ export async function runHoneypotCli(
       ...(deps.selector !== undefined ? { selector: deps.selector } : {}),
       now,
     });
-    deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.COMPILED, deps.operatorId, {
+    await deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.COMPILED, deps.operatorId, {
       fortress_id: deps.fortressId,
       trap_id: result.spec.trap_id,
       source: result.source,
@@ -215,7 +215,7 @@ export async function runHoneypotCli(
       return 1;
     }
     const wasNew = deps.registry.deploy(spec);
-    deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
+    await deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
       fortress_id: deps.fortressId,
       trap_id: spec.trap_id,
       trap_class: spec.trap_class,
@@ -328,7 +328,7 @@ export async function runHoneypotCli(
     }
     const removed = deps.registry.undeploy(trapId);
     if (removed) {
-      deps.auditLog.append(
+      await deps.auditLog.append(
         "l2",
         HONEYPOT_AUDIT_OPS.UNDEPLOYED,
         deps.operatorId,

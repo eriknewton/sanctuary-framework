@@ -66,7 +66,7 @@ export function createFederationTools(
               active_only: args.active_only as boolean | undefined,
             });
 
-            auditLog.append("l4", "federation_peers_list", "system", {
+            void auditLog.append("l4", "federation_peers_list", "system", {
               peer_count: peers.length,
             });
 
@@ -153,7 +153,7 @@ export function createFederationTools(
 
             const peer = registry.registerFromHandshake(hsResult, peerDid);
 
-            auditLog.append("l4", "federation_peer_register", "system", {
+            void auditLog.append("l4", "federation_peer_register", "system", {
               peer_id: peerId,
               peer_did: peerDid,
               trust_tier: peer.trust_tier,
@@ -177,7 +177,7 @@ export function createFederationTools(
 
             const removed = registry.removePeer(peerId);
 
-            auditLog.append("l4", "federation_peer_remove", "system", {
+            void auditLog.append("l4", "federation_peer_remove", "system", {
               peer_id: peerId,
               removed,
             });
@@ -227,7 +227,7 @@ export function createFederationTools(
 
         const evaluation = registry.evaluateTrust(peerId, mutualCount, repScore);
 
-        auditLog.append("l4", "federation_trust_evaluate", "system", {
+        void auditLog.append("l4", "federation_trust_evaluate", "system", {
           peer_id: peerId,
           trust_level: evaluation.trust_level,
           sovereignty_tier: evaluation.sovereignty_tier,
@@ -270,7 +270,7 @@ export function createFederationTools(
           encrypted_channel: activePeers.filter((p) => p.capabilities.encrypted_channel).length,
         };
 
-        auditLog.append("l4", "federation_status", "system", {
+        void auditLog.append("l4", "federation_status", "system", {
           total_peers: allPeers.length,
           active_peers: activePeers.length,
         });

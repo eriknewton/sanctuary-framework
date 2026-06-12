@@ -179,8 +179,10 @@ export class CompositionService {
       },
       onReady: () => {
         this.degradeMonitor.reportSuccess();
-        // Replay queued events
-        this.replayQueuedEvents();
+        // Replay queued events. Fire and forget from this sync callback:
+        // replayQueuedEvents catches per-event failures internally (failed
+        // events re-queue via packReceipt) and never rejects.
+        void this.replayQueuedEvents();
       },
       onMessageSizeCapExceeded: (record) => {
         this.sizeCapAuditRecords.push(record);

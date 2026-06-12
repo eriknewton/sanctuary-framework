@@ -224,7 +224,7 @@ export class CredentialTrapRuntime {
       fortress_id: this.fortressId,
     };
     await this.findingStore.saveFinding(finding).catch(() => undefined);
-    this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
+    void this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
       fortress_id: this.fortressId,
       trap_id: spec.trap_id,
       trap_class: spec.trap_class,
@@ -238,7 +238,7 @@ export class CredentialTrapRuntime {
       usage_attempted: true,
       castle_wall_decision: "blocked",
     });
-    this.auditLog.append("l1", "egress_blocked", this.fortressId, {
+    void this.auditLog.append("l1", "egress_blocked", this.fortressId, {
       event_type: "egress_blocked",
       fortress_id: this.fortressId,
       agent_id: input.callerIdentity,
@@ -353,7 +353,7 @@ export class CredentialTrapRuntime {
       fortress_id: this.fortressId,
     };
     await this.findingStore.saveFinding(finding).catch(() => undefined);
-    this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
+    void this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
       fortress_id: this.fortressId,
       trap_id: spec.trap_id,
       trap_class: spec.trap_class,

@@ -185,7 +185,7 @@ export async function handleAnomalyRoute(
 
   try {
     if (method === "GET" && path === `${ANOMALY_API_PREFIX}/detectors`) {
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         ANOMALY_UX_AUDIT_OPS.VIEW_OPENED,
         deps.identityId,
@@ -320,7 +320,7 @@ export async function handleAnomalyRoute(
         });
         return true;
       }
-      deps.auditLog.append(
+      void deps.auditLog.append(
         "l2",
         ANOMALY_UX_AUDIT_OPS.FINDING_DRILLED,
         deps.identityId,

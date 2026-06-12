@@ -455,7 +455,7 @@ export class HubService {
             status,
             "operator_lockdown",
           );
-          this.deps.activitySources.auditLog.append(
+          void this.deps.activitySources.auditLog.append(
             "l2",
             "agent_unwrap_engaged",
             this.deps.identityId,
@@ -476,7 +476,7 @@ export class HubService {
             status,
             "operator_lockdown",
           );
-          this.deps.activitySources.auditLog.append(
+          void this.deps.activitySources.auditLog.append(
             "l2",
             "agent_lockdown_engaged",
             this.deps.identityId,
@@ -534,7 +534,7 @@ export class HubService {
       if (decision === "deny") return;
       await this.deps.agentController.bindPolicy(record.agent_id, policyId);
       this.deps.agentRegistry.updatePolicyBinding(record.agent_id, policyId);
-      this.deps.activitySources.auditLog.append(
+      void this.deps.activitySources.auditLog.append(
         "l2",
         "agent_policy_change_engaged",
         this.deps.identityId,
@@ -598,7 +598,7 @@ export class HubService {
 
     this.inboxStore.enqueueTier1(item, async (_approvedItem, decision) => {
       if (decision === "deny") {
-        this.deps.activitySources.auditLog.append(
+        void this.deps.activitySources.auditLog.append(
           "l2",
           "agent_policy_change_denied",
           this.deps.identityId,
@@ -616,7 +616,7 @@ export class HubService {
       this.deps.agentRegistry.updateChannelTemplateBinding(record.agent_id, templateId);
       this.deps.agentRegistry.updatePolicyBinding(record.agent_id, compiledPolicyId);
       this.deps.writePersistedLocalAgents?.(this.deps.agentRegistry.list());
-      this.deps.activitySources.auditLog.append(
+      void this.deps.activitySources.auditLog.append(
         "l2",
         "agent_policy_change_engaged",
         this.deps.identityId,
@@ -696,7 +696,7 @@ export class HubService {
       // One fortress-level activity entry, regardless of partial-failure
       // count. Per-agent failures surface as individual agent_error items
       // below.
-      this.deps.activitySources.auditLog.append(
+      void this.deps.activitySources.auditLog.append(
         "l2",
         "fortress_lockdown_engaged",
         this.deps.identityId,
@@ -783,7 +783,7 @@ export class HubService {
       const result: HubFortressExportResult = await fortressExportBundle(
         itemId,
       );
-      this.deps.activitySources.auditLog.append(
+      void this.deps.activitySources.auditLog.append(
         "l2",
         "exit_bundle_exported",
         this.deps.identityId,
@@ -985,7 +985,7 @@ export class HubService {
         : null;
 
     const openedAt = this.nowIso();
-    this.deps.activitySources.auditLog.append(
+    void this.deps.activitySources.auditLog.append(
       "l2",
       "agent_inspect_panel_opened",
       this.deps.identityId,

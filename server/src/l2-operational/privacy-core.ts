@@ -712,7 +712,7 @@ export function emitPrivacyAuditEvent(
   payload: PrivacyAuditPayload,
   result: "success" | "failure" = "success"
 ): void {
-  auditLog?.append(
+  void auditLog?.append(
     "l2",
     PRIVACY_AUDIT_OPERATION,
     payload.identity_id,

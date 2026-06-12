@@ -248,7 +248,7 @@ export class ContextGateEnforcer {
     if (deniedFields.length > 0) {
       if (this.config.on_deny === "block") {
         this.stats.calls_blocked++;
-        this.auditLog.append(
+        void this.auditLog.append(
           "l2",
           "context_gate_enforcer_block",
           "system",
@@ -281,7 +281,7 @@ export class ContextGateEnforcer {
 
     if (this.config.log_only) {
       // Log but pass original args
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         "context_gate_enforcer_log_only",
         "system",
@@ -307,7 +307,7 @@ export class ContextGateEnforcer {
     }
 
     // Execute handler with filtered arguments
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       "context_gate_enforcer_filter",
       "system",
@@ -364,7 +364,7 @@ export class ContextGateEnforcer {
         );
 
         if (this.config.log_only) {
-          this.auditLog.append(
+          void this.auditLog.append(
             "l2",
             "context_gate_enforcer_builtin_privacy_log_only",
             "system",
@@ -379,7 +379,7 @@ export class ContextGateEnforcer {
           return originalHandler(args);
         }
 
-        this.auditLog.append(
+        void this.auditLog.append(
           "l2",
           "context_gate_enforcer_builtin_privacy_filter",
           "system",
@@ -396,7 +396,7 @@ export class ContextGateEnforcer {
     }
 
       // No sensitive fields detected — pass through
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         "context_gate_enforcer_builtin_pass",
         "system",
@@ -427,7 +427,7 @@ export class ContextGateEnforcer {
     );
 
     if (this.config.log_only) {
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         "context_gate_enforcer_builtin_log_only",
         "system",
@@ -446,7 +446,7 @@ export class ContextGateEnforcer {
     }
 
     // Execute handler with filtered arguments
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       "context_gate_enforcer_builtin_filter",
       "system",

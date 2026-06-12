@@ -141,7 +141,7 @@ export class NotifyOperatorAction implements ActionClass {
   ) {}
 
   async fire(finding: SentinelFinding): Promise<boolean> {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
       this.identityId,
@@ -179,7 +179,7 @@ abstract class AuditBackedAction implements ActionClass {
     finding: SentinelFinding,
     context?: ActionClassContext,
   ): Promise<boolean> {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_FIRED,
       this.identityId,
@@ -204,7 +204,7 @@ abstract class AuditBackedAction implements ActionClass {
     finding: SentinelFinding,
     context?: ActionClassContext,
   ): Promise<boolean> {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_CLASS_REVOKED,
       this.identityId,
@@ -472,7 +472,7 @@ export class ActionDispatcher {
   ): void {
     const windowMs = Math.max(1, config.cancel_window_seconds) * 1000;
     const pendingUntil = new Date(this.now().getTime() + windowMs);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_PENDING,
       this.identityId,
@@ -548,7 +548,7 @@ export class ActionDispatcher {
       action_type: actionType,
       fortress_id: this.fortressId,
     });
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_PROCEEDED,
       this.identityId,
@@ -586,7 +586,7 @@ export class ActionDispatcher {
     if (!pending) return false;
     pending.cancel();
     this.pending.delete(findingId);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_CANCELED,
       this.identityId,
@@ -656,7 +656,7 @@ export class ActionDispatcher {
       action_type: entry.action_type,
       fortress_id: this.fortressId,
     });
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.ACTION_REVOKED,
       this.identityId,
@@ -686,7 +686,7 @@ export class ActionDispatcher {
   ): Promise<RuleThresholdConfig> {
     const before = await this.store.getOrInit(ruleId, ruleType);
     const after = await this.store.promote(ruleId, ruleType);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.RULE_PROMOTED,
       this.identityId,
@@ -707,7 +707,7 @@ export class ActionDispatcher {
   ): Promise<RuleThresholdConfig> {
     const before = await this.store.getOrInit(ruleId, ruleType);
     const after = await this.store.demote(ruleId, ruleType);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.RULE_DEMOTED,
       this.identityId,
@@ -731,7 +731,7 @@ export class ActionDispatcher {
     },
   ): Promise<RuleThresholdConfig> {
     const after = await this.store.updateConfig(ruleId, ruleType, patch);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.THRESHOLD_UPDATED,
       this.identityId,

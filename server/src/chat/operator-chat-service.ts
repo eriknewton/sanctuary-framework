@@ -1233,7 +1233,7 @@ export class OperatorChatService {
     payload: OperatorChatAuditPayload,
     result: "success" | "failure",
   ): void {
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       operation,
       this.identityId,

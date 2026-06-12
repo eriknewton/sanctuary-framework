@@ -105,7 +105,7 @@ export function createHandshakeTools(
         const { challenge, session } = initiateHandshake(shr);
         sessions.set(session.session_id, session);
 
-        auditLog.append("l4", "handshake_initiate", shr.body.instance_id);
+        void auditLog.append("l4", "handshake_initiate", shr.body.instance_id);
         auditHandshakeInitiated(auditLog, {
           session_id: session.session_id,
           role: "initiator",
@@ -160,7 +160,7 @@ export function createHandshakeTools(
         );
 
         if ("error" in result) {
-          auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
+          void auditLog.append("l4", "handshake_respond", shr.body.instance_id, undefined, "failure");
           auditHandshakeFailed(auditLog, {
             session_id: "unknown",
             role: "responder",
@@ -173,7 +173,7 @@ export function createHandshakeTools(
 
         sessions.set(result.session.session_id, result.session);
 
-        auditLog.append("l4", "handshake_respond", shr.body.instance_id);
+        void auditLog.append("l4", "handshake_respond", shr.body.instance_id);
         auditHandshakeInitiated(auditLog, {
           session_id: result.session.session_id,
           role: "responder",
@@ -212,7 +212,7 @@ export function createHandshakeTools(
               if (!responderIdentity) {
                 autoPublishResult.error =
                   `responder identity ${shr.body.instance_id} not found; skipping auto-publish`;
-                auditLog.append(
+                void auditLog.append(
                   "l4",
                   "handshake_auto_publish",
                   shr.body.instance_id,
@@ -246,7 +246,7 @@ export function createHandshakeTools(
                 );
                 autoPublishResult.ok = resp.ok;
                 autoPublishResult.status = resp.status;
-                auditLog.append(
+                void auditLog.append(
                   "l4",
                   "handshake_auto_publish",
                   shr.body.instance_id,
@@ -262,7 +262,7 @@ export function createHandshakeTools(
           } catch (err) {
             autoPublishResult.error =
               err instanceof Error ? err.message : String(err);
-            auditLog.append(
+            void auditLog.append(
               "l4",
               "handshake_auto_publish",
               shr.body.instance_id,
@@ -356,7 +356,7 @@ export function createHandshakeTools(
 
         if ("error" in result) {
           session.state = "failed";
-          auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id, undefined, "failure");
+          void auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id, undefined, "failure");
           auditHandshakeFailed(auditLog, {
             session_id: sessionId,
             role: "initiator",
@@ -375,7 +375,7 @@ export function createHandshakeTools(
         // Store completed result for tier resolution
         handshakeResults.set(result.result.counterparty_id, result.result);
 
-        auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
+        void auditLog.append("l4", "handshake_complete", session.our_shr.body.instance_id);
         auditHandshakeCompleted(auditLog, {
           session_id: sessionId,
           role: "initiator",
@@ -460,7 +460,7 @@ export function createHandshakeTools(
             handshakeResults.set(result.counterparty_id, result);
           }
 
-          auditLog.append(
+          void auditLog.append(
             "l4",
             "handshake_verify_completion",
             session.our_shr.body.instance_id,
@@ -550,7 +550,7 @@ export function createHandshakeTools(
         });
 
         if ("error" in attestation) {
-          auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id, undefined, "failure");
+          void auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id, undefined, "failure");
           return toolResult({ error: attestation.error });
         }
 
@@ -595,7 +595,7 @@ export function createHandshakeTools(
           }
         }
 
-        auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);
+        void auditLog.append("l4", "handshake_exchange", ourSHR.body.instance_id);
 
         return toolResult({
           attestation,
@@ -644,7 +644,7 @@ export function createHandshakeTools(
 
         const result = verifyAttestation(attestation);
 
-        auditLog.append(
+        void auditLog.append(
           "l4",
           "handshake_verify_attestation",
           result.attester_id,

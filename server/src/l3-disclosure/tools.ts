@@ -119,7 +119,7 @@ export function createL3Tools(
 
         const valid = verifyCommitment(commitment, value, blindingFactor);
 
-        auditLog.append("l3", "proof_reveal", "system", {
+        void auditLog.append("l3", "proof_reveal", "system", {
           commitment_hash: commitment,
           valid,
         });
@@ -284,7 +284,7 @@ export function createL3Tools(
           (d) => d.action === "ask-principal"
         ).length;
 
-        auditLog.append("l3", "disclosure_evaluate", "system", {
+        void auditLog.append("l3", "disclosure_evaluate", "system", {
           policy_id: policy.policy_id,
           context,
           fields_requested: requestedFields.length,
@@ -398,7 +398,7 @@ export function createL3Tools(
 
         const proof = createProofOfKnowledge(value, blindingFactor, commitment);
 
-        auditLog.append("l3", "zk_prove", "system", {
+        void auditLog.append("l3", "zk_prove", "system", {
           proof_type: proof.type,
           commitment: commitment.slice(0, 16) + "...",
         });
@@ -430,7 +430,7 @@ export function createL3Tools(
 
         const valid = verifyProofOfKnowledge(proof);
 
-        auditLog.append("l3", "zk_verify", "system", {
+        void auditLog.append("l3", "zk_verify", "system", {
           proof_type: proof.type,
           valid,
         });
@@ -489,7 +489,7 @@ export function createL3Tools(
           return toolResult({ error: proof.error });
         }
 
-        auditLog.append("l3", "zk_range_prove", "system", {
+        void auditLog.append("l3", "zk_range_prove", "system", {
           proof_type: proof.type,
           range: `[${min}, ${max}]`,
           bits: proof.bit_commitments.length,
@@ -522,7 +522,7 @@ export function createL3Tools(
 
         const valid = verifyRangeProof(proof);
 
-        auditLog.append("l3", "zk_range_verify", "system", {
+        void auditLog.append("l3", "zk_range_verify", "system", {
           proof_type: proof.type,
           valid,
           range: `[${proof.min}, ${proof.max}]`,

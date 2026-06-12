@@ -60,7 +60,7 @@ export function createPrincipalPolicyTools(
             "Pass include_defaults: true to see the full tier3_always_allow list";
         }
 
-        auditLog.append("l2", "principal_policy_view", "system", {
+        void auditLog.append("l2", "principal_policy_view", "system", {
           include_defaults: includeDefaults,
         });
 
@@ -81,7 +81,7 @@ export function createPrincipalPolicyTools(
       handler: async () => {
         const profile = baseline.getProfile();
 
-        auditLog.append("l2", "principal_baseline_view", "system");
+        void auditLog.append("l2", "principal_baseline_view", "system");
 
         return toolResult({
           is_first_session: profile.is_first_session,

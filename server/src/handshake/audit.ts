@@ -74,7 +74,7 @@ export function auditHandshakeInitiated(
   auditLog: AuditLog,
   ctx: HandshakeLifecycleContext
 ): void {
-  auditLog.append(
+  void auditLog.append(
     "l4",
     HANDSHAKE_LIFECYCLE_OPS.INITIATED,
     ctx.identity_id,
@@ -99,7 +99,7 @@ export function auditHandshakeCompleted(
   if (ctx.trust_tier !== undefined) {
     details.trust_tier = ctx.trust_tier;
   }
-  auditLog.append(
+  void auditLog.append(
     "l4",
     HANDSHAKE_LIFECYCLE_OPS.COMPLETED,
     ctx.identity_id,
@@ -125,7 +125,7 @@ export function auditHandshakeFailed(
   if (ctx.error !== undefined) {
     details.error = ctx.error;
   }
-  auditLog.append(
+  void auditLog.append(
     "l4",
     HANDSHAKE_LIFECYCLE_OPS.FAILED,
     ctx.identity_id,
@@ -147,7 +147,7 @@ export function auditHandshakeAborted(
 ): void {
   const details = detailsFromContext(ctx);
   details.reason = ctx.reason;
-  auditLog.append(
+  void auditLog.append(
     "l4",
     HANDSHAKE_LIFECYCLE_OPS.ABORTED,
     ctx.identity_id,

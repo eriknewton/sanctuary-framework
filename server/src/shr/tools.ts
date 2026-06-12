@@ -127,7 +127,7 @@ export function createSHRTools(
           return toolResult({ error: result });
         }
 
-        auditLog.append("l2", "shr_generate", result.body.instance_id);
+        void auditLog.append("l2", "shr_generate", result.body.instance_id);
 
         return toolResult(result);
       },
@@ -152,7 +152,7 @@ export function createSHRTools(
         const shr = args.shr as unknown as SignedSHR;
         const result = verifySHR(shr);
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "shr_verify",
           result.counterparty_id,
@@ -219,7 +219,7 @@ export function createSHRTools(
           context = transformSHRForGateway(shrResult);
         }
 
-        auditLog.append(
+        void auditLog.append(
           "l2",
           "shr_gateway_export",
           shrResult.body.instance_id,

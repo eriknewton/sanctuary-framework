@@ -39,7 +39,7 @@ export function createGovernorTools(
       handler: async () => {
         const status = governor.getStatus();
 
-        auditLog.append("l2", "governor_status", "system", {
+        void auditLog.append("l2", "governor_status", "system", {
           volume_current: status.volume_current,
           volume_limit: status.volume_limit,
           lifetime_current: status.lifetime_current,
@@ -134,7 +134,7 @@ export function createGovernorTools(
 
         const postResetStatus = governor.getStatus();
 
-        auditLog.append("l2", "governor_reset", "system", {
+        void auditLog.append("l2", "governor_reset", "system", {
           pre_reset: {
             volume_current: preResetStatus.volume_current,
             lifetime_current: preResetStatus.lifetime_current,

@@ -170,7 +170,7 @@ export class Broker {
 
   grant(g: SkillSecretGrant): void {
     this.issuer.setGrant(g);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l3",
       BROKER_OPS.SECRET_GRANTED,
       this.principalIdentityId,
@@ -180,7 +180,7 @@ export class Broker {
 
   revoke(skill: string, secret: string): void {
     this.issuer.revokeGrant(skill, secret);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l3",
       BROKER_OPS.SECRET_REVOKED,
       this.principalIdentityId,

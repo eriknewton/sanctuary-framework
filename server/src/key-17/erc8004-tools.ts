@@ -118,7 +118,7 @@ export async function handleErc8004Request(
   const now = new Date().toISOString();
 
   // Audit: request received
-  deps.auditLog.append("l2", ERC8004_AUDIT_OPS.REQUESTED, deps.identityId, {
+  void deps.auditLog.append("l2", ERC8004_AUDIT_OPS.REQUESTED, deps.identityId, {
     request_id: requestId,
     registry: registration.registry,
     chain_id: registration.chain_id,
@@ -175,7 +175,7 @@ export async function handleErc8004Request(
         inbox_id: inboxId,
       });
 
-      deps.auditLog.append(
+      await deps.auditLog.append(
         "l2",
         ERC8004_AUDIT_OPS.PENDING_APPROVAL,
         deps.identityId,
@@ -197,7 +197,7 @@ export async function handleErc8004Request(
       // (fall through to signing below)
     } else {
       // Tier 3: denied by policy
-      deps.auditLog.append(
+      await deps.auditLog.append(
         "l2",
         ERC8004_AUDIT_OPS.DENIED,
         deps.identityId,
@@ -229,7 +229,7 @@ export async function handleErc8004Request(
     success: true,
   });
 
-  deps.auditLog.append("l2", ERC8004_AUDIT_OPS.SIGNED, deps.identityId, {
+  await deps.auditLog.append("l2", ERC8004_AUDIT_OPS.SIGNED, deps.identityId, {
     request_id: requestId,
     registry: registration.registry,
     chain_id: registration.chain_id,
@@ -249,7 +249,7 @@ export async function handleErc8004Request(
 /**
  * Resolve a pending ERC-8004 request (called from inbox approve callback).
  */
-export function resolvePendingRequest(
+export async function resolvePendingRequest(
   pendingStore: Erc8004PendingStore,
   auditLog: AuditLog,
   identityId: string,
@@ -257,7 +257,7 @@ export function resolvePendingRequest(
   approved: boolean,
   fortressId: string,
   reason?: string,
-): Erc8004ToolResponse | null {
+): Promise<Erc8004ToolResponse | null> {
   const pending = pendingStore.get(requestId);
   if (!pending || pending.status !== "pending_approval") return null;
 
@@ -269,7 +269,7 @@ export function resolvePendingRequest(
     pending.resolved_at = now;
     pendingStore.set(pending);
 
-    auditLog.append("l2", ERC8004_AUDIT_OPS.DENIED, identityId, {
+    await auditLog.append("l2", ERC8004_AUDIT_OPS.DENIED, identityId, {
       request_id: requestId,
       reason: pending.deny_reason,
       fortress_id: fortressId,
@@ -294,7 +294,7 @@ export function resolvePendingRequest(
   pending.resolved_at = now;
   pendingStore.set(pending);
 
-  auditLog.append("l2", ERC8004_AUDIT_OPS.SIGNED, identityId, {
+  await auditLog.append("l2", ERC8004_AUDIT_OPS.SIGNED, identityId, {
     request_id: requestId,
     registry: pending.registration.registry,
     chain_id: pending.registration.chain_id,

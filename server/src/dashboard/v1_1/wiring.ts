@@ -194,7 +194,7 @@ async function pruneExpiredDidWebKeysOnUnlock(
   await writeFile(join(persistDir, "did.json"), artifact.artifact, { mode: 0o644 });
 
   for (const dropped of pruned.dropped) {
-    inputs.auditLog.append("l1", DID_WEB_AUDIT_OPS.OLD_KEY_DROPPED, inputs.identityId, {
+    void inputs.auditLog.append("l1", DID_WEB_AUDIT_OPS.OLD_KEY_DROPPED, inputs.identityId, {
       did: record.identifier.did,
       verification_method_id: dropped.verification_method_id,
       public_key_b64u: dropped.public_key_b64u,

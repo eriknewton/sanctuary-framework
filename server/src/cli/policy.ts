@@ -339,7 +339,7 @@ async function cmdDraftsActivate(
     auditLog = new AuditLog(storage, masterKey);
     const fortressId = fortressIdFromStoragePath(storagePath);
     auditIdentityId = `fortress:${fortressId}`;
-    auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+    await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
       draft_id: parsed.draftId,
       api_base: base,
       acknowledge_conflicts: parsed.acknowledgeConflicts,
@@ -368,12 +368,18 @@ async function cmdDraftsActivate(
   };
   if (!res.ok || !body.ok) {
     if (auditLog) {
-      auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
-        draft_id: parsed.draftId,
-        api_base: base,
-        http_status: res.status,
-        error: body.error ?? res.statusText,
-      }, "failure");
+      // Awaited so the entry is durable before the CLI exits, but kept
+      // best-effort to match the intent-audit above: an audit-storage error
+      // (e.g. lock contention with a live daemon) must not mask the
+      // activation failure being reported to the operator.
+      try {
+        await auditLog.append("l2", "policy.drafts.activate", auditIdentityId, {
+          draft_id: parsed.draftId,
+          api_base: base,
+          http_status: res.status,
+          error: body.error ?? res.statusText,
+        }, "failure");
+      } catch { /* audit best-effort */ }
     }
     ctx.err.write(`activation failed: ${body.error ?? res.statusText}\n`);
     if (body.detail) ctx.err.write(`${body.detail}\n`);

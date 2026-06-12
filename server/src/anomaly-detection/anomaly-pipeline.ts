@@ -150,7 +150,7 @@ export class AnomalyPipelineDispatcher {
     };
     await detector.subscribe(context);
     this.detectors.set(detector.detectorId, detector);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED,
       this.identityId,
@@ -171,7 +171,7 @@ export class AnomalyPipelineDispatcher {
     } finally {
       this.detectors.delete(detectorId);
     }
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.DETECTOR_UNREGISTERED,
       this.identityId,
@@ -207,7 +207,7 @@ export class AnomalyPipelineDispatcher {
           for (const classifier of detector.getAllClassifiers()) {
             try {
               const trainingResult = await classifier.train();
-              this.auditLog.append(
+              void this.auditLog.append(
                 "l2",
                 ANOMALY_AUDIT_OPS.TRAINING_COMPLETED,
                 this.identityId,
@@ -225,7 +225,7 @@ export class AnomalyPipelineDispatcher {
                 trainErr instanceof Error
                   ? trainErr.message
                   : String(trainErr);
-              this.auditLog.append(
+              void this.auditLog.append(
                 "l2",
                 ANOMALY_AUDIT_OPS.TRAINING_FAILED,
                 this.identityId,
@@ -242,7 +242,7 @@ export class AnomalyPipelineDispatcher {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           const observedAt = this.now().toISOString();
-          this.auditLog.append(
+          void this.auditLog.append(
             "l2",
             ANOMALY_AUDIT_OPS.EVALUATION_FAILED,
             this.identityId,
@@ -311,7 +311,7 @@ export class AnomalyPipelineDispatcher {
     const classifierId = (
       stamped.details["classifier_id"] as string | undefined
     ) ?? null;
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.FINDING_EMITTED,
       this.identityId,
@@ -331,7 +331,7 @@ export class AnomalyPipelineDispatcher {
     // walking finding details.
     const specificOp = classifierSpecificAuditOp(classifierId);
     if (specificOp !== null) {
-      this.auditLog.append("l2", specificOp, this.identityId, {
+      void this.auditLog.append("l2", specificOp, this.identityId, {
         detector_id: detectorId,
         finding_id: stamped.finding_id,
         severity: stamped.severity,
@@ -370,7 +370,7 @@ export class AnomalyPipelineDispatcher {
     const classifier = factory(context);
     const added = detector.addClassifier(classifier);
     if (!added) return false;
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.CLASSIFIER_SUBSCRIBED,
       this.identityId,
@@ -396,7 +396,7 @@ export class AnomalyPipelineDispatcher {
     if (!detector) return false;
     const removed = detector.removeClassifier(classifierId);
     if (!removed) return false;
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       ANOMALY_AUDIT_OPS.CLASSIFIER_UNSUBSCRIBED,
       this.identityId,

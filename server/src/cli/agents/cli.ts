@@ -500,7 +500,7 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
         await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(params)));
       }
       const auditLog = new AuditLog(storage, masterKey);
-      auditLog.append("l2", "agents.config", `fortress:${fortressId}`, {
+      await auditLog.append("l2", "agents.config", `fortress:${fortressId}`, {
         tenant: tenant.name,
         approval_redirect: next,
         previous: current,

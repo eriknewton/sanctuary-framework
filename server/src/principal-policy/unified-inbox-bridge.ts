@@ -553,7 +553,7 @@ export class UnifiedInboxBridge {
       resolved_by: resolvedBy,
     };
     this.entriesByKey.set(key, updated);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       UNIFIED_INBOX_AUDIT_OPS.RESOLVED,
       this.identityId,
@@ -652,7 +652,7 @@ export class UnifiedInboxBridge {
     const batchCorrelationId = randomUUID();
     const missing: string[] = [];
     let affected = 0;
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       UNIFIED_INBOX_AUDIT_OPS.BATCH_ACTION,
       this.identityId,
@@ -750,7 +750,7 @@ export class UnifiedInboxBridge {
     entry: UnifiedInboxEntry,
     extra?: Record<string, unknown>,
   ): void {
-    this.auditLog.append("l2", operation, this.identityId, {
+    void this.auditLog.append("l2", operation, this.identityId, {
       inbox_id: entry.inbox_id,
       source_class: entry.source_class,
       source_event_id: entry.source_event_id,
@@ -798,7 +798,7 @@ export class UnifiedInboxBridge {
     const dedupKey = `${input.source_class}|${input.source_event_id}`;
     const existing = this.entriesByKey.get(dedupKey);
     if (existing !== undefined) {
-      this.auditLog.append(
+      void this.auditLog.append(
         "l2",
         UNIFIED_INBOX_AUDIT_OPS.DEDUPED,
         this.identityId,
@@ -843,7 +843,7 @@ export class UnifiedInboxBridge {
     if (this.store) {
       this.trackStoreWrite(this.store.upsert(entry));
     }
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       UNIFIED_INBOX_AUDIT_OPS.AGGREGATED,
       this.identityId,

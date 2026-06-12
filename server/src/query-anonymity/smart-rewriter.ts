@@ -115,7 +115,7 @@ export function emitSmartRewriteAudit(opts: {
   queryId: string;
   result: SmartRewriteResult;
 }): void {
-  opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.INTENT_CLASSIFIED, opts.identityId, {
+  void opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.INTENT_CLASSIFIED, opts.identityId, {
     fortress_id: opts.fortressId,
     query_id: opts.queryId,
     intent_category: opts.result.intent.intent_category,
@@ -123,7 +123,7 @@ export function emitSmartRewriteAudit(opts: {
     preserve_pii_classes: opts.result.intent.preserve_pii_classes,
     reasoning: opts.result.intent.reasoning,
   });
-  opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.SMART_REWRITE_APPLIED, opts.identityId, {
+  void opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.SMART_REWRITE_APPLIED, opts.identityId, {
     fortress_id: opts.fortressId,
     query_id: opts.queryId,
     anonymized_classes: opts.result.anonymized_classes,
@@ -139,7 +139,7 @@ export function emitSmartModeFallbackAudit(opts: {
   queryId: string;
   reason: "classifier_failed" | "low_confidence";
 }): void {
-  opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.SMART_MODE_FALLBACK, opts.identityId, {
+  void opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.SMART_MODE_FALLBACK, opts.identityId, {
     fortress_id: opts.fortressId,
     query_id: opts.queryId,
     reason: opts.reason,
@@ -154,7 +154,7 @@ export function emitReverseMappingUsedAudit(opts: {
   replacements: number;
   fallbackNotice: boolean;
 }): void {
-  opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.REVERSE_MAPPING_USED, opts.identityId, {
+  void opts.auditLog.append("l2", SMART_REWRITE_AUDIT_OPS.REVERSE_MAPPING_USED, opts.identityId, {
     fortress_id: opts.fortressId,
     query_id: opts.queryId,
     replacements: opts.replacements,

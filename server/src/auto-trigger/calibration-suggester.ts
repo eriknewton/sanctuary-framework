@@ -93,7 +93,7 @@ export class CalibrationSuggester {
         includeNoChange: false,
       });
       for (const rec of recommendations) {
-        this.auditLog.append(
+        void this.auditLog.append(
           "l2",
           AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_GENERATED,
           this.identityId,
@@ -161,7 +161,7 @@ export class CalibrationSuggester {
         ? await this.dispatcher.promoteRule(ruleId, rec.rule_type)
         : await this.dispatcher.demoteRule(ruleId, rec.rule_type);
     await this.store.suppressRecommendation(ruleId, rec.rule_type, null);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_ACCEPTED,
       this.identityId,
@@ -187,7 +187,7 @@ export class CalibrationSuggester {
       this.now().getTime() + Math.max(1, cooldownHours) * 3_600_000,
     ).toISOString();
     await this.store.suppressRecommendation(ruleId, config.rule_type, until);
-    this.auditLog.append(
+    void this.auditLog.append(
       "l2",
       AUTO_TRIGGER_AUDIT_OPS.RECOMMENDATION_REJECTED,
       this.identityId,

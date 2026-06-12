@@ -208,7 +208,7 @@ export class MacOSFlowEventConsumer {
     const reason = validateFlowDecisionRecorded(notification);
     if (reason !== null) {
       this.stats.decisionsRejected += 1;
-      this.auditSink.append(
+      await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "flow_decision_rejected",
         notification.agent?.id ?? "unknown",
@@ -234,7 +234,7 @@ export class MacOSFlowEventConsumer {
     // never return raw details. So an agent that can query audit entries still
     // cannot learn which rules matched and map the essentials list by probing.
     // The operator reads the unredacted entry via the Castle Wall CLI / dashboard.
-    this.auditSink.append(
+    await this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       eventType,
       notification.agent.id,
@@ -265,7 +265,7 @@ export class MacOSFlowEventConsumer {
     const reason = validateFlowPendingApproval(notification);
     if (reason !== null) {
       this.stats.pendingApprovalsRejected += 1;
-      this.auditSink.append(
+      await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "flow_pending_approval_rejected",
         notification.agent?.id ?? "unknown",
@@ -303,7 +303,7 @@ export class MacOSFlowEventConsumer {
       event.fortress_id.length === 0
     ) {
       this.stats.extensionDiagnosticsRejected += 1;
-      this.auditSink.append(
+      await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "extension_diagnostic_rejected",
         event?.fortress_id ?? "unknown",
@@ -316,7 +316,7 @@ export class MacOSFlowEventConsumer {
       await this.auditSink.flush();
       return;
     }
-    this.auditSink.append(
+    await this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       event.event_type,
       event.fortress_id,

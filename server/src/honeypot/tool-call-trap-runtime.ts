@@ -154,7 +154,7 @@ export class ToolCallTrapRuntime {
       fortress_id: this.fortressId,
     };
     await this.findingStore.saveFinding(finding).catch(() => undefined);
-    this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
+    void this.auditLog.append("l2", HONEYPOT_AUDIT_OPS.TRIGGERED, this.operatorId, {
       fortress_id: this.fortressId,
       trap_id: spec.trap_id,
       trap_class: spec.trap_class,
@@ -192,7 +192,7 @@ export class ToolCallTrapRuntime {
           called_at: now.toISOString(),
         };
         activation.follow_up_tool_calls.push(followUp);
-        this.auditLog.append(
+        void this.auditLog.append(
           "l2",
           HONEYPOT_AUDIT_OPS.FOLLOW_UP_CORRELATED,
           this.operatorId,

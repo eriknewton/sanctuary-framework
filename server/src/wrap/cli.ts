@@ -835,7 +835,7 @@ export async function runWrap(
             "passphrase",
           );
           await identityMgr.save(storedIdentity);
-          ndAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
+          await ndAuditLog.append("l1", "identity_create", publicIdentity.identity_id, {
             label: "default",
             source: "wrap-auto",
           });

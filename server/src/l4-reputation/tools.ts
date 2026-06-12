@@ -192,7 +192,7 @@ export function createL4Tools(
           counterparty_did: args.counterparty_did as string | undefined,
         });
 
-        auditLog.append("l4", "reputation_query", "system", {
+        void auditLog.append("l4", "reputation_query", "system", {
           total_interactions: summary.total_interactions,
           contexts: summary.contexts,
         });
@@ -410,7 +410,7 @@ export function createL4Tools(
         );
         const dist = tierDistribution(tiers);
 
-        auditLog.append("l4", "reputation_query_weighted", "system", {
+        void auditLog.append("l4", "reputation_query_weighted", "system", {
           metric,
           attestation_count: tieredAttestations.length,
           weighted_score: weightedScore,

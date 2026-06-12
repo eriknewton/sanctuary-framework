@@ -192,7 +192,7 @@ export class ProxyRouter {
 
         if (injectionResult.flagged && injectionResult.recommendation === "escalate") {
           // Log the escalation — the gate will handle approval
-          this.auditLog.append("l2", `proxy_injection_escalated:${proxyName}`, "system", {
+          void this.auditLog.append("l2", `proxy_injection_escalated:${proxyName}`, "system", {
             server: serverName,
             tool: toolName,
             tier,
@@ -240,7 +240,7 @@ export class ProxyRouter {
 
           // Duplicate cached — return cached result without forwarding
           if (govResult.reason === "duplicate_cached" && govResult.cached_result !== undefined) {
-            this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
+            void this.auditLog.append("l2", `proxy_governor_cached:${proxyName}`, "system", {
               server: serverName,
               tool: toolName,
               tier,

@@ -180,7 +180,7 @@ export async function sweepUnifiedInboxRetention(opts: {
     archived_deleted: archivedDeleted,
     dismissed_deleted: dismissedDeleted,
   };
-  opts.auditLog.append(
+  void opts.auditLog.append(
     "l2",
     INBOX_RETENTION_AUDIT_OPS.SWEPT,
     opts.identityId,

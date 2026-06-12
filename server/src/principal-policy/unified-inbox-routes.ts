@@ -353,7 +353,7 @@ export async function handleUnifiedInboxRoute(
       };
       policy.set(updated);
       await deps.retentionPolicyStore?.save(policy);
-      deps.auditLog?.append(
+      void deps.auditLog?.append(
         "l2",
         INBOX_RETENTION_AUDIT_OPS.POLICY_UPDATED,
         deps.identityId ?? "operator",
