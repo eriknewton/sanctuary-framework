@@ -81,7 +81,9 @@ async function withRegistryLock<T>(
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw err;
       if (Date.now() - started > LOCK_TIMEOUT_MS) {
-        throw new Error(`timed out waiting for tenant registry lock at ${lock}`);
+        throw new Error(`timed out waiting for tenant registry lock at ${lock}`, {
+          cause: err,
+        });
       }
       await sleep(LOCK_RETRY_MS);
     }

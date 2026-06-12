@@ -147,12 +147,12 @@ async function askViaHub(
     method: "POST",
     body: JSON.stringify(payload),
   }, ctx);
-  return body.data?.response ?? body.data ?? body;
+  return (body.data?.response ?? body.data ?? body) as ConciergeAskResponse;
 }
 
 async function statusViaHub(ctx: ConciergeCliContext): Promise<ConciergeStatus> {
   const body = await request("/api/hub/concierge/status", undefined, ctx);
-  return body.data?.status ?? body.data ?? body;
+  return (body.data?.status ?? body.data ?? body) as ConciergeStatus;
 }
 
 async function askLocal(
@@ -226,11 +226,18 @@ async function resolveMasterKey(
   );
 }
 
+interface ConciergeHubBody {
+  ok?: boolean;
+  error?: unknown;
+  detail?: unknown;
+  data?: { response?: unknown; status?: unknown };
+}
+
 async function request(
   path: string,
   init?: RequestInit,
   ctx?: ConciergeCliContext,
-): Promise<any> {
+): Promise<ConciergeHubBody> {
   const base = (ctx?.dashboardUrl ?? process.env.SANCTUARY_DASHBOARD_URL ?? DEFAULT_DASHBOARD_URL).replace(/\/$/, "");
   const token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN ?? "";
   const headers = new Headers(init?.headers);

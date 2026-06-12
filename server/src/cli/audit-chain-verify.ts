@@ -454,7 +454,9 @@ export function parseJsonl(content: string): ExportRecord[] {
       try {
         return JSON.parse(line) as ExportRecord;
       } catch (err) {
-        throw new Error(`JSONL parse error on line ${index + 1}: ${String(err)}`);
+        throw new Error(`JSONL parse error on line ${index + 1}: ${String(err)}`, {
+          cause: err,
+        });
       }
     });
 }

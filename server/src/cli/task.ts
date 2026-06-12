@@ -3,6 +3,7 @@ import { dashboardRequest } from "./dashboard-request.js";
 import {
   TASK_STATUSES,
   type Task,
+  type TaskStatus,
 } from "../l2-operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
@@ -108,7 +109,7 @@ async function list(
   ctx: TaskCliContext,
 ): Promise<number> {
   const status = flagValue(argv, "--status");
-  if (status && !TASK_STATUSES.includes(status as any)) {
+  if (status && !TASK_STATUSES.includes(status as TaskStatus)) {
     err.write(`task list --status must be one of: ${TASK_STATUSES.join(", ")}\n`);
     return 2;
   }
@@ -164,7 +165,7 @@ async function update(
     err.write("task update requires <id> --status <new-status>\n");
     return 2;
   }
-  if (!TASK_STATUSES.includes(status as any)) {
+  if (!TASK_STATUSES.includes(status as TaskStatus)) {
     err.write(`task update --status must be one of: ${TASK_STATUSES.join(", ")}\n`);
     return 2;
   }

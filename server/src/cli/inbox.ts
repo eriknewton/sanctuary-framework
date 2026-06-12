@@ -327,11 +327,34 @@ async function resolveContext(
   };
 }
 
-function isPendingApproval(item: any): boolean {
+/**
+ * Hub inbox item fields consumed by the approvals table. The payload shape
+ * is hub-defined; every field is optional and rendering falls back to "-".
+ */
+interface ApprovalInboxItem {
+  kind?: string;
+  resolved?: boolean;
+  item_id?: string;
+  requester_id?: string;
+  identity_id?: string;
+  target_id?: string;
+  agent_id?: string;
+  operation_category?: string;
+  display_template_id?: string;
+  display_template_args?: ApprovalTemplateArg[];
+  created_at?: string;
+}
+
+interface ApprovalTemplateArg {
+  kind?: string;
+  value?: unknown;
+}
+
+function isPendingApproval(item: ApprovalInboxItem): boolean {
   return item?.kind === "approval_pending" && item?.resolved !== true;
 }
 
-function writeApprovalTable(out: NodeJS.WritableStream, items: any[]): void {
+function writeApprovalTable(out: NodeJS.WritableStream, items: ApprovalInboxItem[]): void {
   const rows = items.map((item) => [
     item.item_id ?? "-",
     requesterLabel(item),
@@ -353,19 +376,22 @@ function writeApprovalTable(out: NodeJS.WritableStream, items: any[]): void {
   }
 }
 
-function requesterLabel(item: any): string {
+function requesterLabel(item: ApprovalInboxItem): string {
   return item.requester_id ?? argValue(item, "identity_id") ?? item.identity_id ?? "-";
 }
 
-function targetLabel(item: any): string {
+function targetLabel(item: ApprovalInboxItem): string {
   return item.target_id ?? item.agent_id ?? argValue(item, "agent_id") ?? "fortress";
 }
 
-function argValue(item: any, kind: string): string | null {
+function argValue(item: ApprovalInboxItem, kind: string): string | null {
   const args = Array.isArray(item?.display_template_args)
     ? item.display_template_args
     : [];
-  const found = args.find((arg: any) => arg?.kind === kind && typeof arg.value === "string");
+  const found = args.find(
+    (arg): arg is ApprovalTemplateArg & { value: string } =>
+      arg?.kind === kind && typeof arg.value === "string",
+  );
   return found?.value ?? null;
 }
 

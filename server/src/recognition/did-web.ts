@@ -1043,6 +1043,7 @@ export async function loadFortressDidWebRecord(
     const message = e instanceof Error ? e.message : String(e);
     throw new Error(
       `did-web: fortress-config record at ${persistPath} is not valid JSON: ${message}`,
+      { cause: e },
     );
   }
   if (!isFortressDidWebRecord(parsed)) {

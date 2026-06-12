@@ -858,7 +858,7 @@ function checkAnchoredReceipt(input: {
           });
         }
         if (entryPoint) {
-          let signatureOk = false;
+          let signatureOk: boolean;
           try {
             if (typeof signature?.content !== "string") {
               throw new Error("no signature content");
@@ -1023,7 +1023,7 @@ function checkAnchoredReceipt(input: {
     if (!setB64 || material.body_b64 === undefined) {
       incomplete ??= `no signed entry timestamp available (${materialSource} material); the log-attested integration time is unverified`;
     } else {
-      let setOk = false;
+      let setOk: boolean;
       try {
         const payload = canonicalJson({
           body: material.body_b64,

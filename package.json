@@ -3,6 +3,7 @@
   "private": true,
   "description": "Sanctuary repository root. Delegation surface for the menubar workspace. The canonical published package lives in server/.",
   "scripts": {
+    "lint": "npm --prefix server run lint",
     "check:release-dependency-pins": "node scripts/check-release-dependency-pins.mjs",
     "synthetic-coverage": "server/node_modules/.bin/tsx scripts/synthetic-coverage/run.ts",
     "synthetic-coverage:parity": "server/node_modules/.bin/tsx scripts/synthetic-coverage/parity-cli.ts",

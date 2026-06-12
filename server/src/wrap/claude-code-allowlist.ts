@@ -170,6 +170,7 @@ function parseSettings(text: string, settingsPath: string): SettingsShape {
   } catch (e) {
     throw new Error(
       `Sanctuary: ${settingsPath} is not valid JSON (${(e as Error).message}). Repair manually and retry sanctuary wrap.`,
+      { cause: e },
     );
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {

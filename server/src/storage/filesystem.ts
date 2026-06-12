@@ -44,7 +44,7 @@ import type {
   StorageEntryMeta,
 } from "./interface.js";
 
-const SAFE_CHARS = /[^A-Za-z0-9_.\-]/g;
+const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 
 function bijectiveEncode(name: string): string {
   return name.replace(SAFE_CHARS, (ch) =>
