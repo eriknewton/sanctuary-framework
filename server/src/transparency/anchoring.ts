@@ -61,12 +61,22 @@ import {
   type FailedAnchorReceipt,
 } from "./anchor.js";
 import {
+  TRANSPARENCY_ANCHORS_EXPORT_FORMAT,
+  type ExportedAnchorReceipt,
+  type TransparencyAnchorsExport,
+} from "./anchor-verify.js";
+import {
   checkpointPayloadOf,
   computeCheckpointHash,
   type EnforcementCheckpointRecord,
 } from "./checkpoint.js";
 import { readPersistedCheckpoints } from "./emitter.js";
-import { HttpRekorClient, type FetchLike, type RekorClient } from "./rekor-client.js";
+import {
+  HttpRekorClient,
+  RekorEntryNotFoundError,
+  type FetchLike,
+  type RekorClient,
+} from "./rekor-client.js";
 
 export const TRANSPARENCY_ANCHOR_NAMESPACE = "_transparency_anchors";
 export const TRANSPARENCY_ANCHOR_RECEIPT_PREFIX = "anchor-";
@@ -731,6 +741,100 @@ export async function anchorPendingCheckpoints(
     else if (outcome.status === "failed") result.failed++;
   }
   return result;
+}
+
+// ---- Anchors evidence export (PR-3 auditor handoff) -------------------------------
+
+export interface BuildAnchorsExportInput extends AnchorKeyInput {
+  fortressId: string;
+  now?: () => Date;
+}
+
+/**
+ * Build the SANCTUARY_TRANSPARENCY_ANCHORS_V1 evidence file an auditor
+ * needs to verify anchors (`verify-transparency --check-anchors`). It is
+ * assembled ENTIRELY from local state: the MAC-authenticated config (salt,
+ * log URL), the derived anchoring public key, and the local receipts.
+ * Nothing here performs network I/O, and the salt never travels to the
+ * log; it travels only inside this file, when the operator deliberately
+ * hands it to an auditor. Handing the file out links the pseudonymous
+ * public anchors to this fortress's checkpoint history for the recipient;
+ * that is its purpose, and the CLI says so on export.
+ *
+ * Works with anchoring currently DISABLED too (the salt and receipts are
+ * preserved across disable), so historical anchors stay auditable.
+ */
+export async function buildAnchorsExport(
+  input: BuildAnchorsExportInput
+): Promise<TransparencyAnchorsExport> {
+  const state = await readAnchorConfig(input);
+  if (state.status === "absent") {
+    throw new TransparencyAnchorError(
+      "anchoring was never enabled on this fortress; there is no anchor evidence to export"
+    );
+  }
+  const receipts = await readAnchorReceipts(input.storage);
+  const key = deriveAnchorSigningKey(input.masterKey);
+  let publicKeyPem: string;
+  try {
+    publicKeyPem = anchorPublicKeyPem(key.publicKey);
+  } finally {
+    key.privateKey.fill(0);
+  }
+  return {
+    format: TRANSPARENCY_ANCHORS_EXPORT_FORMAT,
+    exported_at: (input.now?.() ?? new Date()).toISOString(),
+    fortress_id: input.fortressId,
+    salt: state.config.salt,
+    anchor_public_key_pem: publicKeyPem,
+    rekor_url: state.config.rekor_url,
+    receipts,
+  };
+}
+
+/** Outcome of one live entry fetch in `--fetch-anchors` mode. */
+export type AnchorEntryFetchOutcome =
+  | { counter: number; status: "fetched"; entry: import("./anchor.js").RekorEntryRef }
+  | { counter: number; status: "not_found"; uuid: string; message: string }
+  | { counter: number; status: "unreachable"; message: string };
+
+/**
+ * Fetch fresh entry material from the log for every anchored receipt
+ * (`verify-transparency --check-anchors --fetch-anchors`). The caller
+ * validates the log URL with validateRekorUrl BEFORE constructing the
+ * client (same SSRF posture as anchoring itself). Outcomes are explicit:
+ * "not_found" is verification-grade evidence (the log denies the entry);
+ * "unreachable" is an outage the auditor can retry, reported, never
+ * silently treated as either verified or refuted.
+ */
+export async function fetchAnchorEntries(input: {
+  receipts: ExportedAnchorReceipt[];
+  client: RekorClient;
+}): Promise<AnchorEntryFetchOutcome[]> {
+  const outcomes: AnchorEntryFetchOutcome[] = [];
+  for (const receipt of input.receipts) {
+    if (receipt.status !== "anchored") continue;
+    try {
+      const entry = await input.client.fetchEntry(receipt.rekor.uuid);
+      outcomes.push({ counter: receipt.counter, status: "fetched", entry });
+    } catch (err) {
+      if (err instanceof RekorEntryNotFoundError) {
+        outcomes.push({
+          counter: receipt.counter,
+          status: "not_found",
+          uuid: receipt.rekor.uuid,
+          message: err.message,
+        });
+      } else {
+        outcomes.push({
+          counter: receipt.counter,
+          status: "unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+  return outcomes;
 }
 
 // ---- Small helpers ----------------------------------------------------------------

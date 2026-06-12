@@ -40,6 +40,18 @@ export class RekorClientError extends Error {
   }
 }
 
+/**
+ * The log answered authoritatively that the entry does NOT exist (HTTP
+ * 404). Distinct from transport failure: a receipt claiming an anchor the
+ * log denies is verification-grade evidence, not an outage.
+ */
+export class RekorEntryNotFoundError extends RekorClientError {
+  constructor(message: string) {
+    super(message);
+    this.name = "RekorEntryNotFoundError";
+  }
+}
+
 export interface RekorSubmitResult {
   entry: RekorEntryRef;
   /** True when Rekor reported the entry already existed (HTTP 409). */
@@ -49,6 +61,8 @@ export interface RekorSubmitResult {
 export interface RekorClient {
   readonly baseUrl: string;
   submit(proposal: HashedRekordProposal): Promise<RekorSubmitResult>;
+  /** GET one existing entry by UUID (fresh inclusion proof + body). */
+  fetchEntry(uuid: string): Promise<RekorEntryRef>;
 }
 
 export interface HttpRekorClientOptions {
@@ -144,6 +158,67 @@ export class HttpRekorClient implements RekorClient {
       throw new RekorClientError(
         `Rekor rejected the anchor (HTTP ${response.status})${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`
       );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Fetch one existing log entry by UUID. Used by the verifier's
+   * --fetch-anchors mode to obtain a fresh inclusion proof (and the entry
+   * body) directly from the log instead of trusting receipt-embedded
+   * material. Strict parsing as everywhere: an off-shape response is a
+   * failure, never silently usable evidence. A 404 raises the dedicated
+   * RekorEntryNotFoundError because "the log denies this entry exists" is
+   * itself a finding for the caller, not a retryable outage.
+   */
+  async fetchEntry(uuid: string): Promise<RekorEntryRef> {
+    if (!/^[0-9a-f]{64,80}$/.test(uuid)) {
+      throw new RekorClientError(
+        `refusing to fetch a malformed Rekor entry UUID: ${uuid.slice(0, 96)}`
+      );
+    }
+    const url = `${this.baseUrl}${REKOR_ENTRIES_PATH}/${uuid}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    try {
+      let response: Awaited<ReturnType<FetchLike>>;
+      try {
+        response = await this.fetchFn(url, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+      } catch (err) {
+        throw new RekorClientError(
+          `Rekor unreachable (${url}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      if (response.status === 404) {
+        throw new RekorEntryNotFoundError(
+          `Rekor reports no entry with UUID ${uuid} (HTTP 404)`
+        );
+      }
+      if (response.status !== 200) {
+        throw new RekorClientError(
+          `Rekor entry lookup returned HTTP ${response.status}`
+        );
+      }
+      const { entry } = await parseEntryBody(response);
+      // The log must answer about the UUID we asked for. Sharded logs may
+      // prepend a tree ID to the bare leaf-hash form, so suffix/prefix
+      // relations are accepted; anything else is a wrong answer.
+      if (
+        entry.uuid !== uuid &&
+        !entry.uuid.endsWith(uuid) &&
+        !uuid.endsWith(entry.uuid)
+      ) {
+        throw new RekorClientError(
+          `Rekor answered with entry ${entry.uuid} when asked for ${uuid}`
+        );
+      }
+      return entry;
     } finally {
       clearTimeout(timer);
     }
@@ -284,6 +359,10 @@ async function parseEntryBody(
       log_index: logIndex,
       log_id: logId,
       integrated_time: integratedTime,
+      // The body and verification blob are kept VERBATIM on the entry (and
+      // therefore in the persisted receipt) so the PR-3 offline verifier
+      // can rebind and Merkle-check the anchor with no network access.
+      ...(typeof candidate.body === "string" ? { body_b64: candidate.body } : {}),
       ...(verification && typeof verification === "object" && !Array.isArray(verification)
         ? { verification: verification as Record<string, unknown> }
         : {}),
