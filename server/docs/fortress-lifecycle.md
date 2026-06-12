@@ -7,6 +7,14 @@ A Sanctuary fortress is the operator-controlled state directory that holds princ
 - `sanctuary init` creates a fortress at the default path (`~/.sanctuary` unless `SANCTUARY_FORTRESS_PATH` is set).
 - `sanctuary wrap` creates a fortress as a side effect of wrapping a harness, if no fortress exists at the resolved path.
 
+### Castle Wall pin provisioning at init
+
+By default `sanctuary init` also provisions the machine-wide Castle Wall pin, the host-wide enforcement anchor at `/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin`. This is correct for the primary fortress on a machine, but a test or side-by-side isolated fortress should not touch that host-wide anchor.
+
+- `sanctuary init --no-pin` provisions **no** global pin. It records an audited `castle_pin_provision_skipped` entry and prints a reminder to run `sanctuary castle-wall provision-pin` against that fortress when you are ready.
+- For non-interactive harnesses, set `SANCTUARY_INIT_NO_PIN` to an explicit opt-in value (`1`, `true`, `yes`, or `on`, case-insensitive) for the same effect. Any other value (including a typo or an inherited shell value) is ignored, so the global pin is still provisioned by default.
+- Default behavior (no flag, env unset) is unchanged: the global pin is provisioned exactly as before.
+
 ## Resolving the fortress path
 
 In order of precedence:

@@ -23,6 +23,7 @@ import {
   parseInitArgs,
   printInitHelp,
   resolveFortressPath,
+  resolveNoPin,
   runInit,
 } from "../../src/wrap/init.js";
 import { RECOVERY_KEY_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
@@ -87,7 +88,9 @@ describe("runInit", () => {
   afterEach(async () => {
     try {
       await rm(tmp, { recursive: true, force: true });
-    } catch {}
+    } catch {
+      // best-effort temp cleanup
+    }
   });
 
   it("creates the fortress at --fortress <path>, NOT ~/.sanctuary", async () => {
@@ -231,17 +234,192 @@ describe("runInit", () => {
   });
 });
 
+describe("--no-pin (Castle Wall global-pin skip)", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-init-nopin-test-"));
+  });
+
+  afterEach(async () => {
+    delete process.env.SANCTUARY_INIT_NO_PIN;
+    try {
+      await rm(tmp, { recursive: true, force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
+  });
+
+  async function readSkipAudit(
+    fortressPath: string,
+    recoveryKeyDisclosurePath: string,
+  ): Promise<Array<{ operation: string; details?: Record<string, unknown> }>> {
+    const recoveryFile = await readFile(recoveryKeyDisclosurePath, "utf-8");
+    const recoveryKey = recoveryFile
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => /^[A-Za-z0-9_-]{43}$/.test(l))!;
+    const { FilesystemStorage } = await import(
+      "../../src/storage/filesystem.js"
+    );
+    const { establishMaster } = await import(
+      "../../src/core/master-custody.js"
+    );
+    const { AuditLog } = await import(
+      "../../src/l2-operational/audit-log.js"
+    );
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, recoveryKey });
+    const reader = new AuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const result = await reader.query({ limit: 1000 });
+    return result.entries as Array<{
+      operation: string;
+      details?: Record<string, unknown>;
+    }>;
+  }
+
+  it("--no-pin NEVER invokes provision-pin (the global-anchor write path)", async () => {
+    // Directly prove the invariant: the provision-pin call (which is what
+    // writes the machine-wide /Library/Application Support/Sanctuary anchor)
+    // is never reached. A spy is more robust than checking a per-fortress
+    // file path, since it pins the actual code path that touches the anchor.
+    const fortressPath = join(tmp, "no-pin-spy-fortress");
+    let calls = 0;
+    await runInit(
+      { fortress: fortressPath, noConfirm: true, noPin: true },
+      {
+        provisionPin: async () => {
+          calls++;
+          return 0;
+        },
+      },
+    );
+    expect(calls).toBe(0);
+
+    // And no per-fortress pinned key is written either.
+    await expect(
+      stat(join(fortressPath, "castle-pinned-pubkey.bin")),
+    ).rejects.toThrow();
+  });
+
+  it("default init (no flag) DOES invoke provision-pin and writes the per-fortress key", async () => {
+    const fortressPath = join(tmp, "default-pin-spy-fortress");
+    let calls = 0;
+    let sawStoragePath: string | undefined;
+    await runInit(
+      { fortress: fortressPath, noConfirm: true },
+      {
+        provisionPin: async (ctx) => {
+          calls++;
+          sawStoragePath = ctx?.env?.SANCTUARY_STORAGE_PATH;
+          return 0;
+        },
+      },
+    );
+    expect(calls).toBe(1);
+    expect(sawStoragePath).toBe(fortressPath);
+  });
+
+  it("default init with the REAL provision-pin writes the per-fortress pinned key", async () => {
+    const fortressPath = join(tmp, "default-pin-real-fortress");
+    await runInit({ fortress: fortressPath, noConfirm: true });
+
+    const st = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
+    expect(st.isFile()).toBe(true);
+    expect(st.size).toBe(32);
+  });
+
+  it("--no-pin records an audited castle_pin_provision_skipped entry", async () => {
+    const fortressPath = join(tmp, "no-pin-audit-fortress");
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+
+    const entries = await readSkipAudit(
+      fortressPath,
+      result.recoveryKeyDisclosurePath,
+    );
+    const skip = entries.find(
+      (e) => e.operation === "castle_pin_provision_skipped",
+    );
+    expect(skip).toBeDefined();
+    expect(skip!.details?.reason).toBe("--no-pin");
+  });
+
+  it("default init does NOT record a skip entry", async () => {
+    const fortressPath = join(tmp, "default-no-skip-fortress");
+    const result = await runInit({ fortress: fortressPath, noConfirm: true });
+
+    const entries = await readSkipAudit(
+      fortressPath,
+      result.recoveryKeyDisclosurePath,
+    );
+    expect(
+      entries.find((e) => e.operation === "castle_pin_provision_skipped"),
+    ).toBeUndefined();
+  });
+
+  it("SANCTUARY_INIT_NO_PIN=1 skips provision-pin for non-interactive harnesses", async () => {
+    const fortressPath = join(tmp, "env-no-pin-fortress");
+    process.env.SANCTUARY_INIT_NO_PIN = "1";
+    const result = await runInit({ fortress: fortressPath, noConfirm: true });
+
+    await expect(
+      stat(join(fortressPath, "castle-pinned-pubkey.bin")),
+    ).rejects.toThrow();
+
+    const entries = await readSkipAudit(
+      fortressPath,
+      result.recoveryKeyDisclosurePath,
+    );
+    const skip = entries.find(
+      (e) => e.operation === "castle_pin_provision_skipped",
+    );
+    expect(skip).toBeDefined();
+    expect(skip!.details?.reason).toBe("SANCTUARY_INIT_NO_PIN");
+  });
+
+  it("resolveNoPin uses an allowlist for the env var, not 'anything truthy'", () => {
+    expect(resolveNoPin({ noPin: true }, {})).toBe(true);
+    expect(resolveNoPin({}, {})).toBe(false);
+    // Explicit opt-in values (case-insensitive, trimmed).
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "1" })).toBe(true);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "true" })).toBe(true);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "TRUE" })).toBe(true);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "yes" })).toBe(true);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: " on " })).toBe(true);
+    // Anything NOT on the allowlist does NOT opt out (downgrade safety):
+    // typos, inherited values, and ambiguous words are all ignored.
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "0" })).toBe(false);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "false" })).toBe(false);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "" })).toBe(false);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "no" })).toBe(false);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "off" })).toBe(false);
+    expect(resolveNoPin({}, { SANCTUARY_INIT_NO_PIN: "flase" })).toBe(false);
+    // Flag wins regardless of env.
+    expect(resolveNoPin({ noPin: true }, { SANCTUARY_INIT_NO_PIN: "0" })).toBe(
+      true,
+    );
+  });
+});
+
 describe("parseInitArgs", () => {
-  it("recognizes --fortress, --force, --no-confirm, --help", () => {
+  it("recognizes --fortress, --force, --no-confirm, --no-pin, --help", () => {
     const opts = parseInitArgs([
       "--fortress",
       "/tmp/x",
       "--force",
       "--no-confirm",
+      "--no-pin",
     ]);
     expect(opts.fortress).toBe("/tmp/x");
     expect(opts.force).toBe(true);
     expect(opts.noConfirm).toBe(true);
+    expect(opts.noPin).toBe(true);
 
     const helpOpts = parseInitArgs(["--help"]);
     expect(helpOpts.helpRequested).toBe(true);

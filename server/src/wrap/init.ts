@@ -50,6 +50,15 @@ import {
 import { DEFAULT_STORAGE_DIR } from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
+/**
+ * Operator-facing display path of the machine-wide Castle Wall enforcement
+ * anchor that default init provisions (and --no-pin skips). Kept in sync with
+ * server/src/cli/castle-wall.ts CASTLE_GLOBAL_PINNED_PUBKEY_PATH; used only
+ * for the --no-pin notice, never for I/O here.
+ */
+const GLOBAL_CASTLE_PIN_PATH =
+  "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
+
 export interface InitOptions {
   /** Operator-supplied fortress path. Wins over env + default. */
   fortress?: string;
@@ -57,6 +66,46 @@ export interface InitOptions {
   noConfirm?: boolean;
   /** Allow init against a non-empty directory. Refuses without this flag. */
   force?: boolean;
+  /**
+   * Skip the Castle Wall global-pin provisioning step. Default init writes
+   * the machine-wide enforcement anchor at
+   * /Library/Application Support/Sanctuary/castle-pinned-pubkey, so a
+   * test/isolated fortress would silently touch the host-wide trust anchor.
+   * With this flag set, init provisions NO global pin and prints a notice
+   * telling the operator to run `sanctuary castle-wall provision-pin`
+   * explicitly when ready. Also settable via SANCTUARY_INIT_NO_PIN=1 for
+   * non-interactive harnesses. Default behavior (no flag) is unchanged.
+   */
+  noPin?: boolean;
+}
+
+/**
+ * Explicit opt-in values for SANCTUARY_INIT_NO_PIN. Skipping the host-wide
+ * Castle Wall pin is a security-relevant downgrade, so the env var is an
+ * allowlist (NOT "anything truthy"): only these exact values opt out. A
+ * typo, an inherited shell value, or `no`/`off` therefore does NOT silently
+ * disable global-pin provisioning.
+ */
+const NO_PIN_ENV_OPT_IN = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Resolve whether the Castle Wall global-pin step should be skipped.
+ * Precedence: the --no-pin CLI flag wins; otherwise SANCTUARY_INIT_NO_PIN
+ * opts out only when set to an explicit allowlisted value (1/true/yes/on,
+ * case-insensitive). Default is to provision the pin exactly as before.
+ */
+export function resolveNoPin(
+  options: { noPin?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (options.noPin) {
+    return true;
+  }
+  const raw = env.SANCTUARY_INIT_NO_PIN;
+  if (raw === undefined) {
+    return false;
+  }
+  return NO_PIN_ENV_OPT_IN.has(raw.trim().toLowerCase());
 }
 
 export interface InitResult {
@@ -107,7 +156,20 @@ async function isDirectoryEmpty(path: string): Promise<boolean> {
   }
 }
 
-export async function runInit(options: InitOptions): Promise<InitResult> {
+/**
+ * Test seam: lets tests observe/replace the global-pin provisioning call so
+ * they can prove `--no-pin` never invokes it (and default init does), without
+ * writing to the real machine-wide anchor. Not part of the CLI surface.
+ */
+export interface RunInitDeps {
+  provisionPin?: typeof runProvisionPin;
+}
+
+export async function runInit(
+  options: InitOptions,
+  deps: RunInitDeps = {},
+): Promise<InitResult> {
+  const provisionPin = deps.provisionPin ?? runProvisionPin;
   const fortressPath = resolveFortressPath(options);
 
   if (!options.force) {
@@ -263,19 +325,47 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
       },
     });
   }
+  // Castle Wall global-pin provisioning. By default init writes the
+  // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
+  // skips it so a test/isolated fortress never silently touches the
+  // host-wide trust anchor. The skip is audited, not silent.
+  const skipPin = resolveNoPin(options);
+  if (skipPin) {
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation: "castle_pin_provision_skipped",
+      identity_id: fortressIdFromStoragePath(fortressPath),
+      result: "success",
+      details: {
+        source: "sanctuary-init",
+        reason: options.noPin ? "--no-pin" : "SANCTUARY_INIT_NO_PIN",
+      },
+    });
+  }
   await auditLog.flush();
   masterKey.fill(0);
 
-  const pinResult = await runProvisionPin({
-    out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-    env: {
-      ...process.env,
-      SANCTUARY_STORAGE_PATH: fortressPath,
-      SANCTUARY_RECOVERY_KEY: recoveryKey,
-    },
-  });
-  if (pinResult !== 0) {
-    throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+  if (skipPin) {
+    const skipSource = options.noPin ? "--no-pin" : "SANCTUARY_INIT_NO_PIN";
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: global Castle Wall pin NOT provisioned (${skipSource}).\n` +
+        `  This fortress did NOT touch the machine-wide enforcement anchor at\n` +
+        `    ${GLOBAL_CASTLE_PIN_PATH}\n` +
+        `  Run \`sanctuary castle-wall provision-pin\` against this fortress when ready.\n`,
+    );
+  } else {
+    const pinResult = await provisionPin({
+      out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
+      env: {
+        ...process.env,
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+    if (pinResult !== 0) {
+      throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+    }
   }
 
   return {
@@ -301,6 +391,9 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-confirm":
         opts.noConfirm = true;
         break;
+      case "--no-pin":
+        opts.noPin = true;
+        break;
       case "--help":
       case "-h":
         opts.helpRequested = true;
@@ -325,6 +418,15 @@ Options:
   --force              Allow init against a non-empty directory.
   --no-confirm         Skip the recovery-key Y/N confirmation. Required
                        for non-TTY callers (CI, launchd, systemd).
+  --no-pin             Do NOT provision the machine-wide Castle Wall pin.
+                       Default init writes the host-wide enforcement anchor
+                       at /Library/Application Support/Sanctuary/; use this
+                       for a test or side-by-side isolated fortress so it
+                       never touches that anchor. The skip is audited, and
+                       init prints a reminder to run
+                       \`sanctuary castle-wall provision-pin\` when ready.
+                       Also settable via SANCTUARY_INIT_NO_PIN=1 for
+                       non-interactive harnesses.
   --help, -h           Show this help.
 
 What init does:
@@ -342,6 +444,10 @@ What init does:
   5. With --no-confirm: records an explicit, audited headless install
      (custody_headless_install in the audit log) instead of the
      re-entry verification.
+  6. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
+     anchor) unless --no-pin (or SANCTUARY_INIT_NO_PIN) is set, in which
+     case it records an audited castle_pin_provision_skipped entry and
+     prints a reminder to provision the pin explicitly when ready.
 
 After init:
   - Run \`sanctuary wrap --fortress <path>\` to bind the fortress to an
