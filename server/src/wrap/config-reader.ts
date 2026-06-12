@@ -213,7 +213,8 @@ export async function writeFileNoFollow(
     if ((err as NodeJS.ErrnoException).code === "ELOOP") {
       throw new Error(
         `${path} is a symlink; refusing to write through it. ` +
-          `Replace the symlink with a regular file and re-run.`
+          `Replace the symlink with a regular file and re-run.`,
+        { cause: err }
       );
     }
     throw err;

@@ -357,7 +357,7 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
  * itself; an absent path is fine (the write creates it).
  */
 async function refuseSymlinkTarget(path: string, surface: string): Promise<void> {
-  let isLink = false;
+  let isLink: boolean;
   try {
     isLink = (await lstat(path)).isSymbolicLink();
   } catch {
