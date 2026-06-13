@@ -353,5 +353,323 @@ class ScanIntegrationTests(unittest.TestCase):
         )
 
 
+class RawStringLiteralTests(unittest.TestCase):
+    """Regression cases for the raw-string-aware line scanner (PR #500 bug).
+
+    Before the fix, `find_test_mod_lines` counted bare `{`/`}` characters that
+    appeared inside a multi-line raw-string fixture, which desynced the brace
+    depth, ended the `#[cfg(test)] mod` region early, and false-flagged a
+    test-code `println!` below the fixture as a production site.
+    """
+
+    def test_multiline_raw_string_braces_do_not_end_test_region(self):
+        # The exact shape that broke tonight: a multi-line `r#"{...}"#` JSON
+        # fixture inside #[cfg(test)] mod, with bare braces in the content.
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let json = r#"{
+                        "key": "value",
+                        "nested": { "a": 1 },
+                        "closing": }
+                    }"#;
+                    println!("diagnostic: {}", json);
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        flags = GATE.find_test_mod_lines(body)
+        for idx, line in enumerate(body):
+            if "println!" in line:
+                self.assertTrue(
+                    flags[idx],
+                    "println below a multi-line raw-string fixture must stay "
+                    "inside the test region",
+                )
+                break
+        else:
+            self.fail("println! line not found")
+        sites = GATE.find_println_eprintln_sites("dummy.rs", body)
+        self.assertEqual(
+            sites,
+            [],
+            "test-mod println below a raw-string fixture must be exempt",
+        )
+
+    def test_unbalanced_closing_braces_in_raw_string(self):
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let payload = r#"
+                        allow }
+                        deny }
+                    "#;
+                    eprintln!("diag: {}", payload);
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", body)
+        self.assertEqual(
+            sites,
+            [],
+            "eprintln after an unbalanced-brace raw string is test code",
+        )
+
+    def test_single_line_raw_string_with_println_text(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn label() {
+                let _s = r#"call println! here"#;
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "println! inside a single-line raw string is not a call site",
+        )
+
+    def test_raw_string_with_nested_quotes_and_braces(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn build() {
+                let _doc = r#"{ "msg": "println! \\" still inside" }"#;
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "nested quotes inside a raw string must not end it early",
+        )
+
+    def test_production_println_after_raw_string_still_caught(self):
+        # FALSE-NEGATIVE guard: a real production println that follows a
+        # multi-line raw string must still be reported.
+        lines = textwrap.dedent(
+            '''
+            pub fn announce() {
+                let _doc = r#"
+                    { "a": 1 }
+                "#;
+                println!("residual debug output");
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "a production println after a raw string must remain visible",
+        )
+        self.assertIn("println!", sites[0].text)
+
+    def test_multiline_normal_string_brace_tracking(self):
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let s = "line one with } \\
+            still in string }";
+                    println!("diag: {}", s);
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", body)
+        self.assertEqual(
+            sites, [], "println after a continued normal string is test code"
+        )
+
+    def test_unterminated_raw_string_does_not_crash(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn announce() {
+                let _doc = r#"
+                    unterminated { content }
+                    println!("inside")
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "text inside an unterminated raw string is not a call site",
+        )
+
+    def test_char_literal_double_quote_does_not_hide_later_sites(self):
+        # FALSE-NEGATIVE guard (codex review): a char literal containing a
+        # double quote, `let c = '"';`, must NOT put the scrubber into a
+        # persistent string state that blanks the rest of the file and hides a
+        # real production println below it.
+        lines = textwrap.dedent(
+            """
+            pub fn announce() {
+                let _c = '"';
+                println!("residual debug output");
+            }
+            """
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "a char literal '\"' must not hide a real println below it",
+        )
+        self.assertIn("println!", sites[0].text)
+
+    def test_escaped_char_literals_do_not_break_scan(self):
+        lines = textwrap.dedent(
+            r"""
+            pub fn announce() {
+                let _q = '\'';
+                let _b = '\\';
+                println!("residual debug output");
+            }
+            """
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(len(sites), 1)
+        self.assertIn("println!", sites[0].text)
+
+    def test_lifetime_tick_not_misread_as_char_literal(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn label() -> &'static str {
+                let _s = "called println! somewhere";
+                ""
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "lifetime tick must not desync string masking on the line",
+        )
+
+    def test_block_comment_lone_quote_does_not_hide_later_sites(self):
+        # FALSE-NEGATIVE guard (codex review round 2): a lone `"` inside a
+        # multi-line `/* ... */` block comment must NOT open a persistent
+        # string state that masks a real println below the test mod.
+        lines = textwrap.dedent(
+            '''
+            #[cfg(test)]
+            mod tests {
+                /*
+                   lone quote in a valid block comment: "
+                */
+            }
+
+            pub fn prod() {
+                println!("residual debug output");
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "block-comment quote must not hide prod println below the test mod",
+        )
+        self.assertIn("println!", sites[0].text)
+
+    def test_block_comment_braces_excluded_from_depth(self):
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                /* spurious braces in comment: } } { */
+                #[test]
+                fn t() {
+                    println!("test diag");
+                }
+            }
+
+            pub fn after() {
+                println!("prod residual");
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", body)
+        self.assertEqual(len(sites), 1)
+        self.assertTrue(
+            any("prod residual" in s.text for s in sites),
+            "production println after the test mod must be the reported site",
+        )
+
+    def test_nested_block_comment(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn prod() {
+                /* outer /* inner "unbalanced */ still comment */
+                println!("residual debug output");
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "nested block comment must close fully and expose the println",
+        )
+        self.assertIn("println!", sites[0].text)
+
+    def test_prefixed_raw_strings_cr_br(self):
+        # FALSE-NEGATIVE guard (codex review round 3): cr#"..."# and br#"..."#
+        # raw forms must be recognized so a `"` inside them does not leave a
+        # dangling normal-string state masking a later production println.
+        lines = textwrap.dedent(
+            '''
+            pub fn prod() {
+                let _c = cr#"
+                    c-string with a " quote and } brace
+                "#;
+                let _b = br#"bytes with " and }"#;
+                println!("residual debug output");
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "cr#/br# raw strings must not leave dangling state hiding println",
+        )
+        self.assertIn("println!", sites[0].text)
+
+    def test_cr_raw_string_masks_inner_println(self):
+        lines = textwrap.dedent(
+            '''
+            pub fn build() {
+                let _c = cr#"text println! inside"#;
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_println_eprintln_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites, [], "println! inside a cr#-raw string is not a call site"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
