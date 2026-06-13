@@ -56,8 +56,10 @@ export interface CastleWallCommandContext {
    */
   signerClientCandidates?: string[];
   /**
-   * Override the file-exists-and-executable probe used by signer-client
-   * auto-discovery (tests). Defaults to a real `stat`-based check.
+   * Override the candidate-trust probe used by signer-client auto-discovery
+   * (tests). Defaults to the `isOwnerTrustedExecutable` owner-trust check (the
+   * same check the host-app arming surface uses): a real `stat`-based predicate
+   * that requires a regular file owned by root or the current uid.
    */
   fileExistsFn?: (path: string) => Promise<boolean>;
   /**
@@ -536,17 +538,6 @@ function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
   ];
 }
 
-/** True iff `path` is an existing regular file with an executable bit set. */
-async function isExecutableFile(path: string): Promise<boolean> {
-  try {
-    const info = await stat(path);
-    // 0o111 = any of owner/group/other execute. A bundled shim is 0755.
-    return info.isFile() && (info.mode & 0o111) !== 0;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Resolve the signer-client shim path used by `re-pin` and the daemon path.
  * Precedence: explicit `ctx.signerClientPath` → `SANCTUARY_CASTLE_SIGNER_CLIENT`
@@ -554,6 +545,16 @@ async function isExecutableFile(path: string): Promise<boolean> {
  * is test-injectable via `ctx.signerClientCandidates` / `ctx.fileExistsFn`,
  * mirroring the host-app `hostAppCandidates` seam, so tests never depend on a
  * real `/Applications` install.
+ *
+ * The DEFAULT discovery predicate is `isOwnerTrustedExecutable` (the same
+ * owner-trust check `resolveHostAppBinary` uses to guard the arming surface):
+ * a probed candidate must be a regular file owned by root or the current uid,
+ * so a binary an attacker dropped at a user-writable probed path is rejected.
+ * This brings the signer-client surface to PARITY with the host-app surface.
+ * NOTE: stronger same-UID hardening (designated-requirement / codesign
+ * validation) is a broader follow-up that, if pursued, must apply UNIFORMLY to
+ * BOTH the host-app and signer-client surfaces — deliberately out of scope here
+ * to stay consistent with the established owner-trust model.
  */
 async function resolveSignerClientPath(
   env: NodeJS.ProcessEnv,
@@ -565,7 +566,9 @@ async function resolveSignerClientPath(
     return env.SANCTUARY_CASTLE_SIGNER_CLIENT;
   }
   if (platform !== "darwin") return undefined;
-  const exists = ctx.fileExistsFn ?? isExecutableFile;
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const exists =
+    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid));
   const candidates = ctx.signerClientCandidates ?? defaultSignerClientCandidates(env);
   for (const candidate of candidates) {
     if (await exists(candidate)) return candidate;
@@ -661,6 +664,13 @@ export async function runRePin(
   // telling the operator the migration failed when the anchor actually moved is
   // the more dangerous lie. Degrade to a loud warning and still return 0,
   // printing the migrated fingerprint.
+  //
+  // FIX 3 — `masterKey` (decrypted fortress secret) is hoisted so a `finally`
+  // zeroes it on EVERY exit from this block: success returns, the
+  // AuditIntegrityError exit-1 path, and the F2b degraded-warning exit-0 path.
+  // A throw between resolveMasterKey() and a return must never leave the
+  // plaintext key resident in memory.
+  let masterKey: Uint8Array | null = null;
   try {
     // Read the retiring K_old (the passphrase-derived key provision-pin minted).
     // Its presence lets us emit the old-signs-new rotation proof for audit
@@ -679,7 +689,7 @@ export async function runRePin(
     }
 
     const storage = new FilesystemStorage(join(storagePath, "state"));
-    const masterKey = await resolveMasterKey(storagePath, env);
+    masterKey = await resolveMasterKey(storagePath, env);
     const auditLog = await buildAuditLogForPrivilegedAction({
       storage,
       masterKey,
@@ -698,7 +708,6 @@ export async function runRePin(
         // no-op re-assert.
         write(out, `${helperFingerprint}\n`);
         write(out, "Pin already holds the helper key; re-asserted (no rotation).\n");
-        masterKey.fill(0);
         return 0;
       }
       const proof = buildPinRotationProof({
@@ -726,7 +735,6 @@ export async function runRePin(
         out,
         `Trust anchor migrated to the signer helper (was ${oldFingerprint}). Rotation proof recorded in the audit log.\n`,
       );
-      masterKey.fill(0);
       return 0;
     }
 
@@ -743,7 +751,6 @@ export async function runRePin(
       "success",
     );
     await auditLog.flush();
-    masterKey.fill(0);
     write(out, `${helperFingerprint}\n`);
     write(out, "Pin re-asserted to the helper key (no retiring key to rotate).\n");
     return 0;
@@ -768,6 +775,11 @@ export async function runRePin(
         `proof in the audit log failed: ${reason}. The pin migration itself succeeded.\n`,
     );
     return 0;
+  } finally {
+    // FIX 3 — zero the decrypted fortress key on every exit (success,
+    // AuditIntegrityError exit-1, F2b degraded exit-0, or any throw between
+    // resolveMasterKey() and a return). No-op when resolveMasterKey() never ran.
+    masterKey?.fill(0);
   }
 }
 
@@ -919,7 +931,13 @@ export async function runStatus(
         "No pinned key provisioned. Run: sanctuary castle-wall provision-pin\n"
       );
     } else {
-      throw error;
+      // DEGRADE, never throw: `status` is the diagnostic an operator runs WHEN
+      // the anchor is broken (e.g. a malformed-length local pin). Throwing out
+      // here would defeat the F3 global-pin verdict below — the very thing
+      // needed to diagnose the break. Warn, leave localFingerprint = null, and
+      // fall through to global-pin reporting. (ENOENT keeps its message above.)
+      const reason = error instanceof Error ? error.message : String(error);
+      write(out, `Local fortress key: unreadable (${reason})\n`);
     }
   }
 

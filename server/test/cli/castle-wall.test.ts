@@ -1118,4 +1118,136 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       "Global pin (enforcement anchor): unreadable (root-owned; re-run with elevation to inspect)",
     );
   });
+
+  // ── FIX 1: signer-client discovery uses the owner-trust check (parity) ─────
+
+  it("FIX 1: owner-trusted candidate (owned by current uid) is accepted and used", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const helper = makeMockHelper();
+    // A real on-disk candidate owned by the current uid passes the DEFAULT
+    // owner-trust predicate (no fileExistsFn injected — the production
+    // isOwnerTrustedExecutable check runs). Re-pin must NOT hit the
+    // "path unknown" wall; signerClientInvoke completes the migration.
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-bundle-"));
+    tempDirs.push(bundleDir);
+    const candidate = join(bundleDir, "castle-wall-signer-client");
+    await writeFile(candidate, "#!/bin/sh\n", { mode: 0o755 });
+    const currentUid = process.getuid?.();
+    const err = new CaptureStream();
+    const out = new CaptureStream();
+    const code = await runRePin([], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      getuid: () => currentUid ?? 0,
+      signerClientCandidates: [candidate],
+      signerClientInvoke: helper.invoke,
+    });
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("signer-client shim path unknown");
+    expect(out.text()).toContain(fingerprint(helper.pub));
+  });
+
+  it("FIX 1: candidate owned by a DIFFERENT uid is rejected (not root, not us)", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    // The candidate exists and is executable, but getuid reports a uid that is
+    // NEITHER the file owner NOR root, so the owner-trust check rejects it and
+    // discovery falls through to the fail-closed "path unknown" wall (exit 1).
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-bundle-"));
+    tempDirs.push(bundleDir);
+    const candidate = join(bundleDir, "castle-wall-signer-client");
+    await writeFile(candidate, "#!/bin/sh\n", { mode: 0o755 });
+    const ownerUid = (await stat(candidate)).uid;
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      // A uid that is not the file owner and not root → owner-trust fails.
+      getuid: () => ownerUid + 99999,
+      signerClientCandidates: [candidate],
+      // No signerClientInvoke: discovery must be the deciding factor.
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain("signer-client shim path unknown");
+  });
+
+  // ── FIX 4: the DISCOVERED path actually reaches the spawned client ────────
+
+  it("FIX 4: with no signerClientInvoke, the discovered owner-trusted path is what the client spawns", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    // No signerClientInvoke → the default HelperSignerClient spawn runner runs.
+    // The owner-trusted discovered candidate is a real (owner==us) file but not
+    // a working shim, so the spawn fails — and the failure message echoes the
+    // EXACT discovered path, proving the resolved candidate is what gets spawned
+    // (host-independent: never touches a real /Applications install).
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-bundle-"));
+    tempDirs.push(bundleDir);
+    const candidate = join(bundleDir, "castle-wall-signer-client");
+    // 0o644 (no exec bit): isOwnerTrustedExecutable accepts it (owner==us, regular
+    // file), but spawn fails — proving discovery, not invocation, picked the path.
+    await writeFile(candidate, "not-a-real-shim\n", { mode: 0o644 });
+    const currentUid = process.getuid?.();
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      getuid: () => currentUid ?? 0,
+      signerClientCandidates: [candidate],
+    });
+    // Not the "path unknown" wall — discovery resolved the candidate.
+    expect(err.text()).not.toContain("signer-client shim path unknown");
+    // The spawn failure surfaces the resolved discovered path verbatim.
+    expect(err.text()).toContain(candidate);
+    expect(code).toBe(1);
+  });
+
+  // ── FIX 2: status degrades (never throws) on a malformed-length local pin ──
+
+  it("FIX 2: malformed-length local pin still prints the global-pin verdict and returns 0", async () => {
+    const { fortressPath } = await makeFortress();
+    const helper = makeMockHelper();
+    // Write a local pinned-pubkey file with the WRONG length (not 32 bytes).
+    // The old code re-threw on this, aborting status BEFORE the F3 global-pin
+    // verdict. It must now degrade to a warning and fall through.
+    await writeFile(
+      join(fortressPath, "castle-pinned-pubkey.bin"),
+      new Uint8Array([1, 2, 3]),
+    );
+    const out = new CaptureStream();
+    let code: number | undefined;
+    await expect(
+      (async () => {
+        code = await runStatus({
+          out,
+          env: { SANCTUARY_STORAGE_PATH: fortressPath },
+          platform: "darwin",
+          execSyncFn: () => "com.sanctuary.castle-wall [activated enabled]",
+          hostAppCandidates: [],
+          globalPinReader: async () => helper.pub,
+          signerClientInvoke: helper.invoke,
+        });
+      })(),
+    ).resolves.toBeUndefined(); // status must NEVER throw
+    expect(code).toBe(0);
+    // Degraded local-key warning is printed instead of throwing.
+    expect(out.text()).toContain("Local fortress key: unreadable");
+    // F3 global-pin verdict still prints (the whole point of degrading).
+    expect(out.text()).toContain(
+      `Global pin (enforcement anchor): ${fingerprint(helper.pub)}`,
+    );
+  });
 });
