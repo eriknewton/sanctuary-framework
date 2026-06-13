@@ -48,6 +48,10 @@ import {
   type EmitLifecycleParams,
 } from "../lifecycle.js";
 import {
+  sealLifecycleEmission,
+  type LifecycleSealContext,
+} from "../../workload-lifecycle/seal.js";
+import {
   enforceCapability,
   InMemoryCapabilityCounter,
   type CapabilityCounter,
@@ -115,6 +119,26 @@ export interface TierBAdapterParams {
   /** Optional HTTP proxy URL — injected into harness child env. Caller responsible for the proxy actually running. */
   http_proxy_url?: string;
   https_proxy_url?: string;
+  /**
+   * Optional workload-lifecycle audit seal. When present, every successful
+   * lifecycle emission ALSO writes a critical, chain-bound workload-lifecycle
+   * audit entry (binding the mesh SignedEvent to the audit chain by
+   * `signed_event_hash`), closing the deferred audit-log seal named in
+   * `agent-contract/lifecycle.ts`. Absent by default so existing callers and
+   * unit tests are unaffected; a `checkpointed` transition writes no audit
+   * entry (review M5 — the one deliberately-unmirrored transition).
+   *
+   * `workload_class` should be the HONEST declared classification (e.g.
+   * "stateful-agent" for a wrapped harness session — the operator's workload,
+   * never an unearned mind-class claim).
+   */
+  lifecycle_seal?: {
+    context: LifecycleSealContext;
+    /** Stable registry id; defaults to the agent_id when omitted. */
+    workload_id?: string;
+    /** Running instance id; defaults to the agent_id when omitted. */
+    instance_id?: string;
+  };
 }
 
 /**
@@ -146,6 +170,11 @@ export abstract class TierBAdapter {
   protected counter: CapabilityCounter;
   /** Agent Card for this session — set after calling `launch`. */
   protected card?: AgentCard;
+  /** Per-instance ordinal of sealed (audit-recorded) lifecycle events, keyed by
+   * agent_id. Drives `prev_lifecycle_seq` on the next sealed event. Only used
+   * when `lifecycle_seal` is configured. See `emitLifecycle` for the honesty
+   * note on why this is an adapter-local ordinal, not the chain sequence. */
+  private readonly recordedLifecycleOrdinal = new Map<string, number>();
 
   constructor(protected params: TierBAdapterParams) {
     this.seq = params.initial_monotonic_seq ?? 0;
@@ -267,7 +296,7 @@ export abstract class TierBAdapter {
     };
     const cardOut = issueAgentCard(issue);
     this.card = cardOut.card;
-    const lifecycleOut = this.emitLifecycle({
+    const lifecycleOut = await this.emitLifecycle({
       from_state: "uninstantiated",
       to_state: "launched",
       reason: `adapter=${this.harnessId} launched for agent=${this.params.agent_id}`,
@@ -281,14 +310,25 @@ export abstract class TierBAdapter {
     };
   }
 
-  /** Emit a lifecycle event with the adapter's emitter context pre-filled. */
-  emitLifecycle(args: {
+  /**
+   * Emit a lifecycle event with the adapter's emitter context pre-filled.
+   *
+   * If a `lifecycle_seal` was configured, the mesh emission is ALSO sealed into
+   * the audit chain (critical, durability-verified, bound by
+   * `signed_event_hash`) before this resolves — closing the deferred
+   * audit-log seal in `agent-contract/lifecycle.ts`. The mesh event is always
+   * built first (pure, never fails on audit state); the seal write is awaited
+   * so a completeness guarantee actually holds — a failed seal rejects here
+   * rather than silently dropping the audit record. A `checkpointed`
+   * transition is intentionally not mirrored to the chain (review M5).
+   */
+  async emitLifecycle(args: {
     from_state: LifecycleState | "uninstantiated";
     to_state: LifecycleState;
     reason: string;
     checkpoint_hash?: string;
     guardian_quorum?: EmitLifecycleParams["guardian_quorum"];
-  }): AdapterEmission<LifecycleEvent> {
+  }): Promise<AdapterEmission<LifecycleEvent>> {
     const out = emitLifecycleEvent({
       agent_id: this.params.agent_id,
       fortress_id: this.params.fortress_id,
@@ -303,6 +343,41 @@ export abstract class TierBAdapter {
       principal_private_key: this.params.principal_private_key,
       monotonic_seq: this.seq++,
     });
+    const seal = this.params.lifecycle_seal;
+    if (seal) {
+      // Per-instance ordinal of this adapter's RECORDED lifecycle events.
+      // NOTE on honesty (H2): this is the adapter's own count of events it has
+      // sealed for this instance, NOT the global audit-chain sequence (the
+      // `appendCritical` contract returns void, so the chain position is not
+      // surfaced back here). It still gives an auditor a per-instance
+      // linked-list ordinal that detects a dropped RECORD in this adapter's
+      // emission stream; it does not detect an unrecorded real-world
+      // transition, and it is not the chain sequence number. A later build
+      // item that surfaces the chain sequence can populate the true value.
+      const prevOrdinal = this.recordedLifecycleOrdinal.get(
+        this.params.agent_id
+      );
+      const payload = await sealLifecycleEmission(seal.context, {
+        event: out.event,
+        signed_event: out.signed_event,
+        workload_id: seal.workload_id ?? this.params.agent_id,
+        instance_id: seal.instance_id ?? this.params.agent_id,
+        ...(prevOrdinal !== undefined
+          ? { prev_lifecycle_seq: prevOrdinal }
+          : {}),
+        ...(out.event.checkpoint_hash
+          ? { state_commitment: out.event.checkpoint_hash }
+          : {}),
+      });
+      // A `checkpointed` transition returns null (no audit op) and does not
+      // advance the ordinal — honest: it was not recorded.
+      if (payload !== null) {
+        this.recordedLifecycleOrdinal.set(
+          this.params.agent_id,
+          (prevOrdinal ?? 0) + 1
+        );
+      }
+    }
     return { signed_event: out.signed_event, body: out.event };
   }
 
