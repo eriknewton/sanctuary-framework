@@ -108,7 +108,7 @@ export const UNDECLARED_REASON =
  * record's id.) Distinguished from {@link UNDECLARED_REASON} so the finding is
  * precise. */
 export const UNDECLARED_REASON_TERMINAL_DECLARATION =
-  "live workload matches only a terminated or dormant (deleted/slept) declared record — running without a current declaration" as const;
+  "live workload matches only a terminated or dormant (deleted/slept) declared record; it is running without a current declaration" as const;
 
 /** The reason a live workload was flagged. */
 export type UndeclaredReason =
