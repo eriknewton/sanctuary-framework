@@ -13,6 +13,19 @@ export const CASTLE_WALL_SCHEMA_VERSION_V1 = 1 as const;
 /** Audit-log layer for every Castle Wall event. Layer 1 per the Castle Architecture ADR. */
 export const CASTLE_WALL_AUDIT_LAYER = "l1" as const;
 
+/**
+ * Provenance marker stamped into the `details` of every audit entry the Castle
+ * Wall audit consumer writes. It is set AFTER the event's own `details` are
+ * spread, so a forged event cannot fake it. Consumers that reason about
+ * "actual enforcement" (e.g. the sovereignty posture dashboard's
+ * enforcement-evidenced ARMED determination) MUST require this marker so a
+ * different L1 producer reusing an operation name like `egress_blocked` can
+ * never be mistaken for real Castle Wall extension evidence.
+ */
+export const CASTLE_WALL_AUDIT_PROVENANCE_KEY = "cw_source" as const;
+export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
+  "castle_wall_audit_consumer" as const;
+
 /** Ed25519 signature scheme tag used in manifest envelopes (matches federation v0.1). */
 export const CASTLE_WALL_SIGNATURE_SCHEME_V1 = "ed25519-v1" as const;
 
