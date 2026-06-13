@@ -51,4 +51,38 @@ describe("cli/agents/tenant-registry", () => {
     const registry = await readHostTenantRegistry({ home });
     expect(registry.tenants.map((t) => t.storage_path).sort()).toEqual(paths.sort());
   });
+
+  // F4 (drill 2026-06-13): an isolated run with a non-default storage root
+  // must write the tenant row under THAT root, never into the operator's
+  // default ~/.sanctuary/tenants.json.
+  it("writes the registry under an explicit non-default root and not the default root", async () => {
+    const isoRoot = await mkdtemp(join(tmpdir(), "sanctuary-iso-root-"));
+    try {
+      const fortress = join(isoRoot, "fortress-iso");
+      await registerHostTenant(fortress, {
+        home,
+        root: isoRoot,
+        now: new Date("2026-06-13T00:00:00.000Z"),
+      });
+
+      // Row landed under the isolated root.
+      const isoRegistry = await readHostTenantRegistry({ home, root: isoRoot });
+      expect(isoRegistry.tenants.map((t) => t.storage_path)).toEqual([fortress]);
+
+      // Default root was NOT polluted.
+      const defaultRegistry = await readHostTenantRegistry({ home });
+      expect(defaultRegistry.tenants).toHaveLength(0);
+    } finally {
+      await rm(isoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves default-root behavior when no root override is passed", async () => {
+    const fortress = join(home, "fortress-default");
+    await registerHostTenant(fortress, { home });
+
+    // Unset-root callers still write to <home>/.sanctuary/tenants.json.
+    const registry = await readHostTenantRegistry({ home });
+    expect(registry.tenants.map((t) => t.storage_path)).toEqual([fortress]);
+  });
 });

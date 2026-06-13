@@ -112,7 +112,9 @@ describe("formatWrapSuccessNoDashboard", () => {
       passphraseSource: "generated",
     });
     expect(out).toContain("Your agent is protected");
-    expect(out).toContain("L1 Full");
+    expect(out).toContain("Castle Wall Full");
+    // L1-L4 numbering was MANDATORY-retired 2026-05-24.
+    expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
   it("pluralizes 'server' correctly", () => {

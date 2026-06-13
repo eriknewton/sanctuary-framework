@@ -138,10 +138,12 @@ describe("formatWrapSuccess", () => {
   it("includes the agent-protected summary line", () => {
     const out = formatWrapSuccess(baseInfo);
     expect(out).toContain("Your agent is protected");
-    expect(out).toContain("L1 Full");
-    expect(out).toContain("L2 Degraded (no TEE)");
-    expect(out).toContain("L3 Full");
-    expect(out).toContain("L4 Full");
+    expect(out).toContain("Castle Wall Full");
+    expect(out).toContain("Sentinels Degraded (no TEE)");
+    expect(out).toContain("Charter Full");
+    expect(out).toContain("Heralds Full");
+    // L1-L4 numbering was MANDATORY-retired 2026-05-24; it must not reappear.
+    expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
   it("includes the dashboard URL with the token", () => {

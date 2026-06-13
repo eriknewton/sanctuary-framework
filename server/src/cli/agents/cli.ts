@@ -24,6 +24,7 @@
 import { readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
 
+import { resolveStoragePath } from "../../paths.js";
 import {
   discoverTenants,
   findTenant,
@@ -69,7 +70,17 @@ function resolveCtx(args: AgentsCommandArgs): ResolvedCtx {
     env,
   };
   if (args.home !== undefined) discoverOpts.home = args.home;
-  if (args.root !== undefined) discoverOpts.root = args.root;
+  // Discovery root precedence: an explicit `--fortress <path>` (args.root) wins;
+  // otherwise honor SANCTUARY_STORAGE_PATH so `agents list` reads the same root
+  // that `wrap` wrote the tenant registry under. When the env var is unset,
+  // resolveStoragePath returns `<home>/.sanctuary`, which is identical to
+  // discovery's own default — so default-root behavior is unchanged, and read
+  // and write stay in agreement on the registry location.
+  if (args.root !== undefined) {
+    discoverOpts.root = args.root;
+  } else if (env.SANCTUARY_STORAGE_PATH && env.SANCTUARY_STORAGE_PATH.length > 0) {
+    discoverOpts.root = resolveStoragePath(env, args.home);
+  }
   return {
     out: args.out ?? process.stdout,
     err: args.err ?? process.stderr,

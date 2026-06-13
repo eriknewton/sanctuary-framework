@@ -15,6 +15,7 @@ import { runAgentsCommand } from "../../../src/cli/agents/cli.js";
 import type { HealthProbeResult } from "../../../src/cli/agents/health.js";
 import type { TenantDescriptor } from "../../../src/cli/agents/discovery.js";
 import { writeTenantRuntime } from "../../../src/cli/agents/runtime.js";
+import { registerHostTenant } from "../../../src/cli/agents/tenant-registry.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -159,6 +160,53 @@ describe("sanctuary agents CLI", () => {
     const bravo = parsed.find((p: { name: string }) => p.name === "bravo");
     expect(bravo.dashboard_port).toBeNull();
     expect(err.text).toBe("");
+  });
+
+  // F4 (drill 2026-06-13): `agents list` must read the tenant registry from
+  // the SAME root that `wrap` wrote it under. When SANCTUARY_STORAGE_PATH
+  // points at an isolated fortress, the read side honors it (so a wrap +
+  // list under the same env agree), and a default (env-unset) list does NOT
+  // see the isolated registry — proving the operator fortress stays clean.
+  it("list honors SANCTUARY_STORAGE_PATH for the registry root (read/write agree)", async () => {
+    const isoRoot = await mkdtemp(join(tmpdir(), "sanctuary-agents-iso-"));
+    try {
+      const fortress = await makeTenant(isoRoot, "iso-fortress");
+      // Write side: registry under the isolated root, mirroring wrap with
+      // SANCTUARY_STORAGE_PATH=isoRoot (registry root === resolved storage root).
+      await registerHostTenant(fortress, { root: isoRoot });
+
+      // Read side WITH the env var set: list discovers the registered fortress.
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runAgentsCommand({
+        argv: ["list", "--json"],
+        out,
+        err,
+        home,
+        env: { SANCTUARY_STORAGE_PATH: isoRoot },
+        probe: fakeProbe(false),
+      });
+      expect(code).toBe(0);
+      const parsed = JSON.parse(out.text) as Array<{ name: string; storage_path: string }>;
+      expect(parsed.some((p) => p.storage_path === fortress)).toBe(true);
+
+      // Read side WITHOUT the env var: the default-root list does not pick up
+      // the isolated registry (the operator's ~/.sanctuary view is unpolluted).
+      const out2 = new StringWritable();
+      const code2 = await runAgentsCommand({
+        argv: ["list", "--json"],
+        out: out2,
+        err: new StringWritable(),
+        home,
+        env: {},
+        probe: fakeProbe(false),
+      });
+      expect(code2).toBe(0);
+      const parsed2 = JSON.parse(out2.text) as Array<{ storage_path: string }>;
+      expect(parsed2.some((p) => p.storage_path === fortress)).toBe(false);
+    } finally {
+      await rm(isoRoot, { recursive: true, force: true });
+    }
   });
 
   it("show prints detailed info for a named tenant", async () => {
