@@ -53,3 +53,33 @@ export {
   type LifecycleSealContext,
   type LifecycleSealInput,
 } from "./seal.js";
+
+export {
+  WorkloadRegistry,
+  type WorkloadRecord,
+  type WorkloadLifecycleState,
+} from "./registry.js";
+
+export {
+  buildHostWorkloadAttestation,
+  classifyConsent,
+  hostAttestationSigningBytes,
+  hostAttestationBundleHash,
+  verifyHostWorkloadAttestation,
+  HostWorkloadAttestationError,
+  WORKLOAD_HOST_ATTESTATION_SCHEMA,
+  WORKLOAD_HOST_ATTESTATION_DOMAIN,
+  WORKLOAD_HOST_ATTESTATION_SCOPE_TEXT,
+  WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM,
+  WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING,
+  type AttestedWorkload,
+  type HostWorkloadAttestationBody,
+  type SignedHostWorkloadAttestation,
+  type WorkloadAttestationSigner,
+  type BuildHostWorkloadAttestationParams,
+} from "./host-attestation.js";
+
+export {
+  sealHostAttestation,
+  type HostAttestationSealContext,
+} from "./host-attestation-seal.js";
