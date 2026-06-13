@@ -31,13 +31,126 @@ pub enum RuleDisposition {
 }
 
 /// Match conditions for a rule.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `ip` / `cidr` mirror the TS schema's destination-IP axes (#380): a rule may
+/// pin a flow to a concrete address set or subnet. The evaluator
+/// ([`RuleMatch::matches`]) enforces them against the raw destination IP, and
+/// the HABEAS PORT conflict gate (`crate::habeas`) reasons over them — so the
+/// genuine local distress rule's loopback `ip` pin is honoured end-to-end (it
+/// is NOT silently flattened to "any host", and a cidr/ip-only deny is scoped
+/// to its addresses rather than shadowing every host on the port).
+///
+/// `deny_unknown_fields` (codex round-4 MEDIUM): every field inside `match`
+/// is a constraint axis with enforcement semantics. The TS composer's match
+/// surface (host / host_pattern / ip / cidr / port / protocol) is fully
+/// modeled here, so an unknown match field can only mean a NEWER axis this
+/// daemon does not know how to enforce — silently ignoring it would enforce
+/// a broader rule than the operator signed. Fail closed: the rule file fails
+/// to parse, snapshot construction aborts, and the daemon keeps the prior
+/// good policy (loud `RuleParse` error on the reload response).
+/// Scalar-or-array deserialization shim (codex round-5 MEDIUM): the TS schema
+/// types every list axis as `T | T[]` (`host?: string | string[]`, etc.), and
+/// the TS validator + composer sign scalar-form operator rules AS-IS. The
+/// daemon must therefore parse the scalar spelling too — a TS-valid signed
+/// manifest must never be refused over an equivalent JSON shape. A scalar
+/// normalizes to a one-element vec, which is semantics-identical everywhere
+/// (evaluator, habeas gates, validators).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+fn de_one_or_many<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<OneOrMany<T>>::deserialize(deserializer)?.map(|v| match v {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    }))
+}
+
+/// Port axis deserializer (codex round-7): JSON has ONE number type, so the
+/// tokens `443`, `443.0`, and `4.43e2` all denote the number 443 — and the TS
+/// side (`JSON.parse` + validateRule's `Number.isInteger`) accepts all three
+/// spellings in a signed rule file. A plain `u16` field would refuse the
+/// float-token spellings, leaving a TS-valid signed manifest Linux-refused.
+/// Accept any JSON number with an exactly-integral value in [1, 65535];
+/// reject everything else (range parity with the TS validator).
+fn de_one_or_many_port<'de, D>(deserializer: D) -> Result<Option<Vec<u16>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<OneOrMany<f64>>::deserialize(deserializer)?;
+    raw.map(|v| {
+        let nums = match v {
+            OneOrMany::One(one) => vec![one],
+            OneOrMany::Many(many) => many,
+        };
+        nums.into_iter()
+            .map(|n| {
+                if n.is_finite() && n.fract() == 0.0 && (1.0..=65535.0).contains(&n) {
+                    Ok(n as u16)
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "port {n} must be an integer in [1, 65535]"
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .transpose()
+}
+
+/// `schema_version` deserializer: same JSON-number-token parity as ports
+/// (`1.0` denotes 1; the TS `===` check passes it, so serde must too).
+fn de_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let n = f64::deserialize(deserializer)?;
+    if n.is_finite() && n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n) {
+        Ok(n as u32)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "schema_version {n} must be a non-negative integer"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuleMatch {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_one_or_many",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_pattern: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Exact destination-IP literals (IPv4 or IPv6). Mirrors TS `match.ip`.
+    #[serde(
+        default,
+        deserialize_with = "de_one_or_many",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ip: Option<Vec<String>>,
+    /// Destination CIDR blocks (`addr/prefix`). Mirrors TS `match.cidr`.
+    #[serde(
+        default,
+        deserialize_with = "de_one_or_many",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cidr: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "de_one_or_many_port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub port: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
@@ -56,10 +169,25 @@ impl RuleMatch {
     ///   matches if EITHER hits. When both are absent the host axis is
     ///   not constraining (any host satisfies it, including the no-host
     ///   case where dest is a raw IP).
+    /// - `ip` / `cidr`: family-aware exact / subnet match against the raw
+    ///   destination IP (`dest_ip`). Match a DNS/raw-IP flow that has no
+    ///   hostname. Absent = not constraining.
     /// - `port`: exact match against any entry. Absent = "any port."
     /// - `protocol`: case-insensitive exact match. Absent = "any protocol."
-    pub fn matches(&self, dest_host: Option<&str>, dest_port: u16, dest_protocol: &str) -> bool {
-        if !self.matches_host(dest_host) {
+    ///
+    /// Destination axes (host / host_pattern / ip / cidr) compose as an OR
+    /// (parity with the TS egress-proxy and Swift evaluators): when NONE is
+    /// specified the destination is "match any"; when any is specified, at
+    /// least one must match. This is why the habeas conflict gate
+    /// (`crate::habeas`) can reason over ip/cidr — the evaluator honours them.
+    pub fn matches(
+        &self,
+        dest_host: Option<&str>,
+        dest_ip: Option<&str>,
+        dest_port: u16,
+        dest_protocol: &str,
+    ) -> bool {
+        if !self.matches_destination(dest_host, dest_ip) {
             return false;
         }
         if let Some(ports) = self.port.as_ref() {
@@ -68,49 +196,125 @@ impl RuleMatch {
             }
         }
         if let Some(protocol) = self.protocol.as_ref() {
-            if !protocol.eq_ignore_ascii_case(dest_protocol) {
+            // TS schema parity: `tcp+udp` (the protocol the composer stamps
+            // on the derived DNS rule, dns-derivation.ts) matches EITHER
+            // transport. Exact-matching it would silently never fire — an
+            // allow that does nothing and, worse, a deny that never blocks.
+            let matches_protocol = if protocol.eq_ignore_ascii_case("tcp+udp") {
+                dest_protocol.eq_ignore_ascii_case("tcp")
+                    || dest_protocol.eq_ignore_ascii_case("udp")
+            } else {
+                protocol.eq_ignore_ascii_case(dest_protocol)
+            };
+            if !matches_protocol {
                 return false;
             }
         }
         true
     }
 
-    fn matches_host(&self, dest_host: Option<&str>) -> bool {
+    fn matches_destination(&self, dest_host: Option<&str>, dest_ip: Option<&str>) -> bool {
         let exact_present = self.host.as_ref().map(|h| !h.is_empty()).unwrap_or(false);
         let pattern_present = self
             .host_pattern
             .as_ref()
             .map(|p| !p.is_empty())
             .unwrap_or(false);
+        let ip_present = self.ip.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let cidr_present = self.cidr.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
 
-        // No host-axis constraints means the rule matches regardless of dest_host.
-        if !exact_present && !pattern_present {
+        // No destination-axis constraints means the rule matches any destination.
+        if !exact_present && !pattern_present && !ip_present && !cidr_present {
             return true;
         }
 
-        let host = match dest_host {
-            Some(h) if !h.is_empty() => h,
-            // The rule constrains by host but the attempt has no host
-            // (raw-IP destination); cannot match.
-            _ => return false,
-        };
-        let host_lower = host.to_ascii_lowercase();
-
-        if exact_present {
-            if let Some(hosts) = self.host.as_ref() {
-                if hosts.iter().any(|h| h.to_ascii_lowercase() == host_lower) {
-                    return true;
+        // Host / host_pattern axes (need a hostname destination).
+        if let Some(host) = dest_host.filter(|h| !h.is_empty()) {
+            let host_lower = host.to_ascii_lowercase();
+            if exact_present {
+                if let Some(hosts) = self.host.as_ref() {
+                    if hosts.iter().any(|h| h.to_ascii_lowercase() == host_lower) {
+                        return true;
+                    }
+                }
+            }
+            if pattern_present {
+                if let Some(pattern) = self.host_pattern.as_ref() {
+                    if matches_suffix_pattern(pattern, &host_lower) {
+                        return true;
+                    }
                 }
             }
         }
-        if pattern_present {
-            if let Some(pattern) = self.host_pattern.as_ref() {
-                if matches_suffix_pattern(pattern, &host_lower) {
-                    return true;
-                }
+
+        // ip / cidr axes (need a raw-IP destination; the host literal itself may
+        // be an IP, so fall back to dest_host when dest_ip is absent).
+        let ip_literal = dest_ip
+            .filter(|s| !s.is_empty())
+            .or(dest_host)
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+        if let Some(addr) = ip_literal {
+            if ip_present && ip_axis_matches(self.ip.as_ref(), &addr) {
+                return true;
+            }
+            if cidr_present && cidr_axis_matches(self.cidr.as_ref(), &addr) {
+                return true;
             }
         }
         false
+    }
+}
+
+/// Family-aware exact match of `addr` against an `ip` axis.
+fn ip_axis_matches(spec: Option<&Vec<String>>, addr: &std::net::IpAddr) -> bool {
+    let Some(ips) = spec else { return false };
+    ips.iter().any(|candidate| {
+        candidate
+            .parse::<std::net::IpAddr>()
+            .map(|c| &c == addr)
+            .unwrap_or(false)
+    })
+}
+
+/// Family-aware subnet containment of `addr` against a `cidr` axis.
+fn cidr_axis_matches(spec: Option<&Vec<String>>, addr: &std::net::IpAddr) -> bool {
+    let Some(cidrs) = spec else { return false };
+    cidrs.iter().any(|cidr| cidr_contains(cidr, addr))
+}
+
+/// True iff `cidr` (`addr/prefix`) contains `target`, family-aware. Malformed
+/// input returns false.
+fn cidr_contains(cidr: &str, target: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let Some((base_str, prefix_str)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return false;
+    };
+    let Ok(base) = base_str.parse::<IpAddr>() else {
+        return false;
+    };
+    match (base, target) {
+        (IpAddr::V4(base), IpAddr::V4(target)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            (u32::from(base) & mask) == (u32::from(*target) & mask)
+        }
+        (IpAddr::V6(base), IpAddr::V6(target)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let mask: u128 = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(base) & mask) == (u128::from(*target) & mask)
+        }
+        _ => false,
     }
 }
 
@@ -130,7 +334,13 @@ fn matches_suffix_pattern(pattern: &str, host_lower: &str) -> bool {
 }
 
 /// Scope describes which wrapped agents the rule applies to.
+///
+/// `deny_unknown_fields`: scope fields carry enforcement semantics too — an
+/// ignored (unmodeled) scope axis would apply a rule to MORE agents than the
+/// operator intended. The TS scope surface (agent_ids / template_ids) is
+/// fully modeled, so unknown fields are rejected (fail closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuleScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_ids: Vec<String>,
@@ -157,19 +367,55 @@ impl RuleScope {
     }
 }
 
-/// A single allowlist rule loaded from the manifest.
+/// Time-of-day window where a rule is active (HH:MM, fortress-local).
+/// Mirrors the TS `RuleTimeWindow`. The Linux daemon does NOT implement
+/// time-window enforcement; a rule carrying this axis is REJECTED at
+/// snapshot-build time (see [`PolicySnapshot::from_loaded_manifest`]) rather
+/// than silently enforced without its time bound — an allow rule the
+/// operator scoped to working hours must not become a 24/7 allow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuleTimeWindow {
+    pub start: String,
+    pub end: String,
+}
+
+/// A single allowlist rule loaded from the manifest.
+///
+/// `deny_unknown_fields` (codex round-4 MEDIUM, deliberate choice): the TS
+/// rule surface (id / schema_version / created_at / description / match /
+/// scope / disposition / time_window / derived) is fully modeled here, so an
+/// unknown rule-level field can only come from a NEWER server schema. The
+/// daemon and server ship together; the W-series lesson is that silently
+/// accepting partially-understood policy produces cross-language enforcement
+/// drift. Refusing the manifest is loud (reload responds `ok: false` with a
+/// `RuleParse` reason and keeps the prior good policy), mis-enforcing it is
+/// silent — so we fail closed on unknown fields at every level of the rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowlistRule {
     pub id: String,
+    #[serde(deserialize_with = "de_schema_version")]
     pub schema_version: u32,
     pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "match")]
     pub match_clause: RuleMatch,
     #[serde(default)]
     pub scope: RuleScope,
     pub disposition: RuleDisposition,
+    /// Time-of-day activation window (TS parity field). MODELED so it parses,
+    /// but UNENFORCEABLE on this daemon — snapshot construction rejects any
+    /// rule that carries it (fail closed; see `RuleTimeWindow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<RuleTimeWindow>,
+    /// True when the rule was auto-derived by the composer (habeas lane, DNS
+    /// derivation). Informational metadata only: the habeas gate verifies
+    /// derived-rule genuineness by exact SHAPE (`crate::habeas`), never by
+    /// trusting this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<bool>,
 }
 
 /// One agent's outbound attempt as presented to the evaluator.
@@ -257,6 +503,33 @@ pub enum PolicySnapshotError {
         found: u32,
         expected: u32,
     },
+    /// A rule's `match.ip` / `match.cidr` axis contains a malformed entry.
+    /// Fail closed (codex round-4 HIGH): a malformed entry would silently
+    /// become a non-match at evaluation time, which flips a deny/prompt rule
+    /// into "never fires" — so the manifest is rejected at snapshot-build
+    /// time instead, mirroring the TS build-time `isValidIp`/`isValidCidr`
+    /// gate (`ip-cidr.ts`).
+    #[error("rule {rule_id} has a malformed {axis} entry {value:?}: {message}")]
+    InvalidMatchAxis {
+        rule_id: String,
+        axis: &'static str,
+        value: String,
+        message: &'static str,
+    },
+    /// The rule carries an axis this daemon cannot enforce (`time_window`).
+    /// Fail closed: enforcing the rule WITHOUT its time bound would make an
+    /// allow broader than the operator signed, so the manifest is refused
+    /// (loud reload error, prior good policy kept) until the daemon grows
+    /// time-window enforcement.
+    #[error(
+        "rule {rule_id} carries the {axis} axis, which this daemon cannot \
+         enforce; refusing the manifest rather than enforcing the rule \
+         without its {axis} bound"
+    )]
+    UnenforceableRuleAxis {
+        rule_id: String,
+        axis: &'static str,
+    },
     #[error(
         "agent ids {left_agent_id} and {right_agent_id} collide for {resource_kind} identity {resource_name}"
     )]
@@ -266,6 +539,19 @@ pub enum PolicySnapshotError {
         left_agent_id: String,
         right_agent_id: String,
     },
+    /// The manifest would silence the reserved habeas distress lane (an
+    /// operator rule claims a reserved id, or a deny/prompt rule could shadow
+    /// the loopback lane or the configured webhook target). Fail closed:
+    /// snapshot construction aborts so the daemon keeps the prior good policy
+    /// rather than putting a distress-silencing wall into force. Parity with
+    /// the TS `HabeasConflictError` (`habeas-port.ts`).
+    #[error(
+        "manifest rejected: it would silence the reserved habeas distress lane ({}). \
+         The habeas lane is the guaranteed distress channel and cannot be removed or \
+         shadowed by policy.",
+        issues.join("; ")
+    )]
+    HabeasConflict { issues: Vec<String> },
 }
 
 impl PolicySnapshot {
@@ -301,9 +587,21 @@ impl PolicySnapshot {
                     expected: SCHEMA_VERSION_V1,
                 });
             }
+            validate_rule_axes(&rule)?;
             rules.push(rule);
         }
         validate_agent_identity_collisions(&rules)?;
+        // HABEAS PORT conflict gate (parity with TS findHabeasConflicts): refuse
+        // to put a policy into force that would silence the reserved distress
+        // lane. Runs over the composed manifest, exempting the genuine derived
+        // reserved rules. Fail closed: a conflict aborts snapshot construction
+        // and the caller (reload) keeps the prior good policy.
+        let habeas_issues = crate::habeas::find_habeas_conflicts_in_composed(&rules);
+        if !habeas_issues.is_empty() {
+            return Err(PolicySnapshotError::HabeasConflict {
+                issues: habeas_issues,
+            });
+        }
         Ok(Self {
             rules,
             manifest_signature_b64url: Some(loaded.manifest_signature_b64url.clone()),
@@ -326,6 +624,7 @@ impl PolicySnapshot {
             }
             if !rule.match_clause.matches(
                 request.dest_host.as_deref(),
+                request.dest_ip.as_deref(),
                 request.dest_port,
                 &request.dest_protocol,
             ) {
@@ -349,6 +648,80 @@ impl PolicySnapshot {
             reason: DeniedReason::DefaultDeny,
         }
     }
+}
+
+/// Validate a parsed rule's match axes at snapshot-build time (codex round-4
+/// HIGH + MEDIUM). Mirrors the TS build-time gate (`ip-cidr.ts` `isValidIp` /
+/// `parseCidr`):
+///
+///   - every `match.ip` entry must be a syntactically valid IPv4/IPv6 literal;
+///   - every `match.cidr` entry must be `addr/prefix` with a valid IP base, an
+///     all-digits prefix, and the prefix within the family's legal range
+///     ([0,32] v4, [0,128] v6);
+///   - `time_window` must be absent (the daemon cannot enforce it — see
+///     [`PolicySnapshotError::UnenforceableRuleAxis`]).
+///
+/// REJECTING the manifest (rather than letting malformed entries silently
+/// never-match at evaluation time) is the fail-closed disposition: a deny rule
+/// with a typo'd CIDR must not quietly stop firing.
+fn validate_rule_axes(rule: &AllowlistRule) -> Result<(), PolicySnapshotError> {
+    if rule.time_window.is_some() {
+        return Err(PolicySnapshotError::UnenforceableRuleAxis {
+            rule_id: rule.id.clone(),
+            axis: "time_window",
+        });
+    }
+    if let Some(ips) = rule.match_clause.ip.as_ref() {
+        for entry in ips {
+            if entry.parse::<std::net::IpAddr>().is_err() {
+                return Err(PolicySnapshotError::InvalidMatchAxis {
+                    rule_id: rule.id.clone(),
+                    axis: "match.ip",
+                    value: entry.clone(),
+                    message: "not a valid IPv4/IPv6 literal",
+                });
+            }
+        }
+    }
+    if let Some(cidrs) = rule.match_clause.cidr.as_ref() {
+        for entry in cidrs {
+            validate_cidr_literal(entry).map_err(|message| {
+                PolicySnapshotError::InvalidMatchAxis {
+                    rule_id: rule.id.clone(),
+                    axis: "match.cidr",
+                    value: entry.clone(),
+                    message,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Syntactic CIDR validation, parity with TS `parseCidr`: `addr/prefix`,
+/// valid IP base, all-digits prefix, prefix within the family's legal range.
+fn validate_cidr_literal(cidr: &str) -> Result<(), &'static str> {
+    use std::net::IpAddr;
+    let Some((base_str, prefix_str)) = cidr.split_once('/') else {
+        return Err("missing '/prefix'");
+    };
+    let Ok(base) = base_str.parse::<IpAddr>() else {
+        return Err("base address is not a valid IPv4/IPv6 literal");
+    };
+    if prefix_str.is_empty() || !prefix_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("prefix is not a non-negative integer");
+    }
+    let Ok(prefix) = prefix_str.parse::<u32>() else {
+        return Err("prefix is not a non-negative integer");
+    };
+    let max = match base {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max {
+        return Err("prefix exceeds the address family's maximum");
+    }
+    Ok(())
 }
 
 fn validate_agent_identity_collisions(rules: &[AllowlistRule]) -> Result<(), PolicySnapshotError> {
@@ -561,6 +934,8 @@ mod tests {
             match_clause,
             scope,
             disposition,
+            time_window: None,
+            derived: None,
         }
     }
 
@@ -594,11 +969,15 @@ mod tests {
             match_clause: RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
             scope: RuleScope::default(),
             disposition: RuleDisposition::Allow,
+            time_window: None,
+            derived: None,
         };
         let body = serde_json::to_value(&r).unwrap();
         assert_eq!(body["disposition"], json!("allow"));
@@ -613,12 +992,14 @@ mod tests {
         let m = RuleMatch {
             host: Some(vec!["API.example.COM".to_string()]),
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(m.matches(Some("API.EXAMPLE.COM"), 443, "tcp"));
-        assert!(!m.matches(Some("other.example.com"), 443, "tcp"));
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(Some("API.EXAMPLE.COM"), None, 443, "tcp"));
+        assert!(!m.matches(Some("other.example.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -626,15 +1007,17 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: Some(".example.com".to_string()),
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(m.matches(Some("a.b.c.example.com"), 443, "tcp"));
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(Some("a.b.c.example.com"), None, 443, "tcp"));
         // Apex does NOT match the leading-dot suffix glob.
-        assert!(!m.matches(Some("example.com"), 443, "tcp"));
+        assert!(!m.matches(Some("example.com"), None, 443, "tcp"));
         // Different domain.
-        assert!(!m.matches(Some("api.evil.com"), 443, "tcp"));
+        assert!(!m.matches(Some("api.evil.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -644,11 +1027,13 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: Some("example.com".to_string()),
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(!m.matches(Some("api.example.com"), 443, "tcp"));
-        assert!(!m.matches(Some("example.com"), 443, "tcp"));
+        assert!(!m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(!m.matches(Some("example.com"), None, 443, "tcp"));
     }
 
     #[test]
@@ -656,11 +1041,13 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: Some(vec![443]),
             protocol: Some("tcp".to_string()),
         };
-        assert!(m.matches(Some("anything.example.com"), 443, "tcp"));
-        assert!(m.matches(None, 443, "tcp"));
+        assert!(m.matches(Some("anything.example.com"), None, 443, "tcp"));
+        assert!(m.matches(None, None, 443, "tcp"));
     }
 
     #[test]
@@ -669,10 +1056,12 @@ mod tests {
         let m = RuleMatch {
             host: Some(vec!["api.example.com".to_string()]),
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: None,
         };
-        assert!(!m.matches(None, 443, "tcp"));
+        assert!(!m.matches(None, None, 443, "tcp"));
     }
 
     #[test]
@@ -680,12 +1069,14 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: Some(vec![443, 8443]),
             protocol: None,
         };
-        assert!(m.matches(Some("x"), 443, "tcp"));
-        assert!(m.matches(Some("x"), 8443, "tcp"));
-        assert!(!m.matches(Some("x"), 80, "tcp"));
+        assert!(m.matches(Some("x"), None, 443, "tcp"));
+        assert!(m.matches(Some("x"), None, 8443, "tcp"));
+        assert!(!m.matches(Some("x"), None, 80, "tcp"));
     }
 
     #[test]
@@ -693,12 +1084,80 @@ mod tests {
         let m = RuleMatch {
             host: None,
             host_pattern: None,
+            ip: None,
+            cidr: None,
             port: None,
             protocol: Some("TCP".to_string()),
         };
-        assert!(m.matches(Some("x"), 443, "tcp"));
-        assert!(m.matches(Some("x"), 443, "TCP"));
-        assert!(!m.matches(Some("x"), 443, "udp"));
+        assert!(m.matches(Some("x"), None, 443, "tcp"));
+        assert!(m.matches(Some("x"), None, 443, "TCP"));
+        assert!(!m.matches(Some("x"), None, 443, "udp"));
+    }
+
+    #[test]
+    fn match_protocol_tcp_plus_udp_matches_either_transport() {
+        // TS schema parity: the composer's derived DNS rule uses
+        // protocol "tcp+udp"; it must match both transports (and nothing
+        // else), never silently fail to fire.
+        let m = RuleMatch {
+            protocol: Some("tcp+udp".to_string()),
+            ..Default::default()
+        };
+        assert!(m.matches(Some("x"), None, 53, "tcp"));
+        assert!(m.matches(Some("x"), None, 53, "udp"));
+        assert!(m.matches(Some("x"), None, 53, "UDP"));
+        assert!(!m.matches(Some("x"), None, 53, "icmp"));
+    }
+
+    #[test]
+    fn match_ip_axis_family_aware_exact() {
+        let m = RuleMatch {
+            ip: Some(vec!["127.0.0.1".to_string(), "::1".to_string()]),
+            port: Some(vec![8741]),
+            protocol: Some("tcp".to_string()),
+            ..Default::default()
+        };
+        // dest_ip path.
+        assert!(m.matches(None, Some("127.0.0.1"), 8741, "tcp"));
+        assert!(m.matches(None, Some("0:0:0:0:0:0:0:1"), 8741, "tcp")); // ::1 normalized
+        // dest_host carrying an IP literal also matches the ip axis.
+        assert!(m.matches(Some("127.0.0.1"), None, 8741, "tcp"));
+        // A non-loopback IP does NOT match (the key regression fix: an ip-only
+        // rule is no longer "any host").
+        assert!(!m.matches(None, Some("8.8.8.8"), 8741, "tcp"));
+        // A hostname destination cannot satisfy an ip-only rule.
+        assert!(!m.matches(Some("api.example.com"), None, 8741, "tcp"));
+        // Wrong port misses.
+        assert!(!m.matches(None, Some("127.0.0.1"), 80, "tcp"));
+    }
+
+    #[test]
+    fn match_cidr_axis_family_aware_containment() {
+        let m = RuleMatch {
+            cidr: Some(vec!["10.0.0.0/8".to_string(), "::1/128".to_string()]),
+            ..Default::default()
+        };
+        assert!(m.matches(None, Some("10.1.2.3"), 443, "tcp"));
+        assert!(m.matches(None, Some("::1"), 443, "tcp"));
+        // In-range v4 matches.
+        assert!(m.matches(None, Some("10.0.0.1"), 443, "tcp"));
+        // Outside the subnet.
+        assert!(!m.matches(None, Some("11.0.0.1"), 443, "tcp"));
+        // Family mismatch / outside v6 prefix never matches.
+        assert!(!m.matches(None, Some("2001:db8::1"), 443, "tcp"));
+    }
+
+    #[test]
+    fn match_destination_axes_compose_as_or() {
+        // host OR ip: a flow matching EITHER axis matches.
+        let m = RuleMatch {
+            host: Some(vec!["api.example.com".to_string()]),
+            ip: Some(vec!["203.0.113.7".to_string()]),
+            ..Default::default()
+        };
+        assert!(m.matches(Some("api.example.com"), None, 443, "tcp"));
+        assert!(m.matches(None, Some("203.0.113.7"), 443, "tcp"));
+        assert!(!m.matches(Some("other.example.com"), Some("203.0.113.8"), 443, "tcp"));
     }
 
     // ---- RuleScope ---------------------------------------------------------
@@ -764,6 +1223,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -786,6 +1247,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -808,6 +1271,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["pastebin.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -831,6 +1296,8 @@ mod tests {
             "r-prompt",
             RuleMatch {
                 host_pattern: Some(".example.com".to_string()),
+                ip: None,
+                cidr: None,
                 host: None,
                 port: None,
                 protocol: None,
@@ -855,6 +1322,8 @@ mod tests {
                 RuleMatch {
                     host: Some(vec!["api.anthropic.com".to_string()]),
                     host_pattern: None,
+                    ip: None,
+                    cidr: None,
                     port: None,
                     protocol: None,
                 },
@@ -866,6 +1335,8 @@ mod tests {
                 RuleMatch {
                     host: Some(vec!["api.anthropic.com".to_string()]),
                     host_pattern: None,
+                    ip: None,
+                    cidr: None,
                     port: Some(vec![443]),
                     protocol: Some("tcp".to_string()),
                 },
@@ -891,6 +1362,8 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -922,6 +1395,26 @@ mod tests {
             let _ = write!(s, "{:02x}", b);
         }
         s
+    }
+
+    /// The genuine derived habeas local rule. Every composed manifest must
+    /// carry exactly one (the always-on-lane gate), so happy-path snapshot
+    /// fixtures include it.
+    fn habeas_local_rule() -> AllowlistRule {
+        rule(
+            crate::habeas::HABEAS_LOCAL_RULE_ID,
+            RuleMatch {
+                ip: Some(vec!["127.0.0.1".to_string(), "::1".to_string()]),
+                port: Some(vec![crate::habeas::HABEAS_DISTRESS_PORT]),
+                protocol: Some("tcp".to_string()),
+                ..Default::default()
+            },
+            RuleScope {
+                agent_ids: vec!["sanctuary:habeas-distress-emitter".to_string()],
+                template_ids: Vec::new(),
+            },
+            RuleDisposition::Allow,
+        )
     }
 
     fn synthetic_loaded(rules_for_files: Vec<(String, AllowlistRule)>) -> LoadedManifest {
@@ -969,15 +1462,20 @@ mod tests {
             RuleMatch {
                 host: Some(vec!["api.anthropic.com".to_string()]),
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
             RuleScope::default(),
             RuleDisposition::Allow,
         );
-        let loaded = synthetic_loaded(vec![("rule-0.json".to_string(), r1.clone())]);
+        let loaded = synthetic_loaded(vec![
+            ("rule-0.json".to_string(), r1.clone()),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ]);
         let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
-        assert_eq!(snap.rules.len(), 1);
+        assert_eq!(snap.rules.len(), 2);
         assert_eq!(snap.rules[0], r1);
         assert_eq!(snap.fortress_id, "deadbeef");
     }
@@ -989,6 +1487,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -1003,6 +1503,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: Some(vec![8443]),
                 protocol: Some("tcp".to_string()),
             },
@@ -1015,11 +1517,12 @@ mod tests {
         let loaded = synthetic_loaded(vec![
             ("rule-0.json".to_string(), r1.clone()),
             ("rule-1.json".to_string(), r2.clone()),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
         ]);
 
         let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
 
-        assert_eq!(snap.rules, vec![r1, r2]);
+        assert_eq!(snap.rules, vec![r1, r2, habeas_local_rule()]);
     }
 
     #[test]
@@ -1029,6 +1532,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -1075,6 +1580,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -1097,6 +1604,8 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
+                ip: None,
+                cidr: None,
                 port: None,
                 protocol: None,
             },
@@ -1132,6 +1641,206 @@ mod tests {
         };
         let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
         assert!(matches!(err, PolicySnapshotError::RuleParse { .. }));
+    }
+
+    // ---- codex round-4 HIGH: malformed ip/cidr fail closed -----------------
+
+    fn loaded_with_single_match(match_clause: RuleMatch) -> LoadedManifest {
+        synthetic_loaded(vec![
+            (
+                "rule-0.json".to_string(),
+                // Allow disposition: these tests target axis validation, which
+                // runs BEFORE the habeas conflict gate; an allow rule cannot
+                // trip the gate's deny/prompt loopback-shadow scan.
+                rule("uuid-1", match_clause, RuleScope::default(), RuleDisposition::Allow),
+            ),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ])
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_ip_entries() {
+        for bad in ["999.0.0.1", "not-an-ip", "::g", "127.0.0.1/8", ""] {
+            let loaded = loaded_with_single_match(RuleMatch {
+                ip: Some(vec![bad.to_string()]),
+                ..Default::default()
+            });
+            let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PolicySnapshotError::InvalidMatchAxis { axis: "match.ip", .. }
+                ),
+                "ip entry {bad:?} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_malformed_cidr_entries() {
+        for bad in [
+            "10.0.0.0",      // missing prefix
+            "10.0.0.0/33",   // v4 prefix out of range
+            "::1/129",       // v6 prefix out of range
+            "10.0.0.0/abc",  // non-numeric prefix
+            "10.0.0.0/-1",   // negative prefix
+            "10.0.0.0/",     // empty prefix
+            "999.0.0.0/8",   // malformed base
+            "evil.com/8",    // hostname base
+        ] {
+            let loaded = loaded_with_single_match(RuleMatch {
+                cidr: Some(vec![bad.to_string()]),
+                ..Default::default()
+            });
+            let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PolicySnapshotError::InvalidMatchAxis { axis: "match.cidr", .. }
+                ),
+                "cidr entry {bad:?} must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_accepts_wellformed_ip_and_cidr() {
+        let loaded = loaded_with_single_match(RuleMatch {
+            ip: Some(vec!["192.0.2.1".to_string(), "2001:db8::1".to_string()]),
+            cidr: Some(vec!["10.0.0.0/8".to_string(), "::1/128".to_string()]),
+            ..Default::default()
+        });
+        PolicySnapshot::from_loaded_manifest(&loaded).expect("well-formed axes accepted");
+    }
+
+    // ---- codex round-4 MEDIUM: unmodeled / unenforceable axes fail closed --
+
+    #[test]
+    fn snapshot_rejects_rule_with_time_window() {
+        // The daemon cannot enforce time windows; a rule carrying one must be
+        // refused rather than enforced without its time bound.
+        let mut r = rule(
+            "uuid-1",
+            RuleMatch {
+                host: Some(vec!["api.example.com".to_string()]),
+                ..Default::default()
+            },
+            RuleScope::default(),
+            RuleDisposition::Allow,
+        );
+        r.time_window = Some(RuleTimeWindow {
+            start: "09:00".to_string(),
+            end: "17:00".to_string(),
+        });
+        let loaded = synthetic_loaded(vec![
+            ("rule-0.json".to_string(), r),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ]);
+        let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+        assert!(matches!(
+            err,
+            PolicySnapshotError::UnenforceableRuleAxis { axis: "time_window", .. }
+        ));
+    }
+
+    #[test]
+    fn scalar_axis_forms_parse_as_one_element_vecs() {
+        // codex round-5 MEDIUM: the TS schema types list axes as `T | T[]`
+        // and signs scalar-form rules as-is; the daemon must accept them.
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": "api.example.com", "ip": "203.0.113.7", "cidr": "10.0.0.0/8", "port": 443 }, "scope": {}, "disposition": "allow" }"#;
+        let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("scalar forms parse");
+        assert_eq!(parsed.match_clause.host.as_deref(), Some(&["api.example.com".to_string()][..]));
+        assert_eq!(parsed.match_clause.ip.as_deref(), Some(&["203.0.113.7".to_string()][..]));
+        assert_eq!(parsed.match_clause.cidr.as_deref(), Some(&["10.0.0.0/8".to_string()][..]));
+        assert_eq!(parsed.match_clause.port.as_deref(), Some(&[443u16][..]));
+        // Array forms still parse identically.
+        let raw_arrays = raw
+            .replace("\"api.example.com\"", "[\"api.example.com\"]")
+            .replace("\"203.0.113.7\"", "[\"203.0.113.7\"]")
+            .replace("\"10.0.0.0/8\"", "[\"10.0.0.0/8\"]")
+            .replace(": 443", ": [443]");
+        let parsed_arrays =
+            serde_json::from_str::<AllowlistRule>(&raw_arrays).expect("array forms parse");
+        assert_eq!(parsed, parsed_arrays);
+    }
+
+    #[test]
+    fn json_number_token_spellings_parse_for_port_and_schema_version() {
+        // codex round-7: JSON has one number type — `443.0` and `4.43e2`
+        // denote 443, and the TS parser/validator accepts those spellings in
+        // a signed rule file. serde must agree.
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1.0, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "port": [443.0, 4.43e2, 80] }, "scope": {}, "disposition": "allow" }"#;
+        let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("number tokens parse");
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.match_clause.port.as_deref(), Some(&[443u16, 443, 80][..]));
+    }
+
+    #[test]
+    fn non_integral_or_out_of_range_ports_fail_to_parse() {
+        for bad in ["443.5", "0", "70000", "-1", "1e9"] {
+            let raw = format!(
+                "{{\"id\":\"uuid-1\",\"schema_version\":1,\
+                 \"created_at\":\"2026-05-05T00:00:00Z\",\
+                 \"match\":{{\"port\":[{bad}]}},\"scope\":{{}},\
+                 \"disposition\":\"allow\"}}"
+            );
+            assert!(
+                serde_json::from_str::<AllowlistRule>(&raw).is_err(),
+                "port token {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_with_unknown_match_axis_fails_to_parse() {
+        // deny_unknown_fields on RuleMatch: an unmodeled match axis (a newer
+        // constraint this daemon cannot enforce) must reject the rule, not be
+        // silently ignored.
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "future_axis": ["x"] }, "scope": {}, "disposition": "deny" }"#;
+        let parsed = serde_json::from_str::<AllowlistRule>(raw);
+        assert!(parsed.is_err(), "unknown match axis must fail deserialization");
+        assert!(parsed.unwrap_err().to_string().contains("future_axis"));
+    }
+
+    #[test]
+    fn rule_with_unknown_top_level_field_fails_to_parse() {
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"] }, "scope": {}, "disposition": "deny", "novel_field": true }"#;
+        assert!(serde_json::from_str::<AllowlistRule>(raw).is_err());
+    }
+
+    #[test]
+    fn rule_with_derived_flag_and_time_window_field_parses() {
+        // The full TS rule surface is modeled: `derived` and `time_window`
+        // parse (time_window is then rejected by the snapshot gate, not the
+        // parser).
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"] }, "scope": {}, "disposition": "allow", "derived": true, "time_window": { "start": "09:00", "end": "17:00" } }"#;
+        let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("modeled fields parse");
+        assert_eq!(parsed.derived, Some(true));
+        assert!(parsed.time_window.is_some());
+    }
+
+    // ---- codex round-4 HIGH: always-on lane required in every manifest -----
+
+    #[test]
+    fn snapshot_rejects_manifest_without_habeas_local_lane() {
+        let r1 = rule(
+            "uuid-1",
+            RuleMatch {
+                host: Some(vec!["api.example.com".to_string()]),
+                port: Some(vec![443]),
+                ..Default::default()
+            },
+            RuleScope::default(),
+            RuleDisposition::Allow,
+        );
+        let loaded = synthetic_loaded(vec![("rule-0.json".to_string(), r1)]);
+        let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+        match err {
+            PolicySnapshotError::HabeasConflict { issues } => {
+                assert!(issues.iter().any(|i| i.contains("exactly one")));
+            }
+            other => panic!("expected HabeasConflict, got: {other}"),
+        }
     }
 
     // ---- build_audit_event_canonical_json ---------------------------------

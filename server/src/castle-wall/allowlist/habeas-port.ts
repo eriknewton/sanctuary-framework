@@ -181,10 +181,19 @@ function hostEquals(a: string, b: string): boolean {
 }
 
 function hostPatternCovers(pattern: string, host: string): boolean {
+  const lower = host.toLowerCase();
+  // `*.suffix` form (allowlist/gate spelling).
   if (pattern.startsWith("*.")) {
     const suffix = pattern.slice(2).toLowerCase();
-    const lower = host.toLowerCase();
     return lower.endsWith(`.${suffix}`) && lower !== suffix;
+  }
+  // `.suffix` form (the Linux kernel evaluator's suffix-glob spelling). The
+  // gate must reject a deny rule that the enforcing evaluator would actually
+  // match against the lane, regardless of which suffix spelling the operator
+  // used (cross-language parity with the Rust gate; codex round-2 HIGH).
+  if (pattern.startsWith(".")) {
+    const patternLower = pattern.toLowerCase();
+    return lower.endsWith(patternLower) && lower.length > patternLower.length;
   }
   return hostEquals(pattern, host);
 }
@@ -283,6 +292,144 @@ export function findHabeasConflicts(
   return issues;
 }
 
+/**
+ * True iff `rule` is a GENUINE derived reserved habeas rule, validated by
+ * EXACT shape — never by trusting the `derived` flag. Parity mirror of the
+ * Rust `is_derived_habeas_rule` (castle-wall-daemon/src/habeas.rs), kept in
+ * lockstep via the shared fixture's `composed_cases`:
+ *
+ *   local:   ip exactly ["127.0.0.1", "::1"], port exactly [8741],
+ *            protocol tcp, NO host/host_pattern/cidr axes, no time_window,
+ *            emitter-only scope, allow.
+ *   webhook: exactly one host, exactly one port, protocol tcp, NO
+ *            ip/cidr/host_pattern axes, no time_window, emitter-only scope,
+ *            allow.
+ */
+export function isGenuineDerivedHabeasRule(rule: AllowlistRule): boolean {
+  if (rule.disposition !== "allow") return false;
+  if (rule.time_window !== undefined) return false;
+  const scope = rule.scope ?? {};
+  const emitterScoped =
+    Array.isArray(scope.agent_ids) &&
+    scope.agent_ids.length === 1 &&
+    scope.agent_ids[0] === HABEAS_EMITTER_AGENT_ID &&
+    (scope.template_ids === undefined || scope.template_ids.length === 0);
+  if (!emitterScoped) return false;
+  const m = rule.match;
+  const protocolIsTcp =
+    typeof m.protocol === "string" && m.protocol.toLowerCase() === "tcp";
+
+  // Scalar tolerance: the schema types list axes as `T | T[]`, and the Rust
+  // daemon normalizes a scalar to a one-element list at parse time — so the
+  // shape comparison here must see the normalized (array) view too, or the
+  // two recognizers would disagree on a scalar-form reserved rule.
+  if (rule.id === HABEAS_LOCAL_RULE_ID) {
+    const ip = m.ip === undefined ? [] : toArray(m.ip);
+    const ipOk =
+      ip.length === 2 &&
+      ip[0] === HABEAS_LOOPBACK_IPS[0] &&
+      ip[1] === HABEAS_LOOPBACK_IPS[1];
+    const port = m.port === undefined ? [] : toArray(m.port);
+    const portOk = port.length === 1 && port[0] === HABEAS_DISTRESS_PORT;
+    return (
+      ipOk &&
+      portOk &&
+      protocolIsTcp &&
+      m.host === undefined &&
+      m.host_pattern === undefined &&
+      m.cidr === undefined
+    );
+  }
+
+  if (rule.id === HABEAS_WEBHOOK_RULE_ID) {
+    const hostOk = m.host !== undefined && toArray(m.host).length === 1;
+    const portOk = m.port !== undefined && toArray(m.port).length === 1;
+    return (
+      hostOk &&
+      portOk &&
+      protocolIsTcp &&
+      m.host_pattern === undefined &&
+      m.ip === undefined &&
+      m.cidr === undefined
+    );
+  }
+
+  return false;
+}
+
+/**
+ * Run the conflict gate over an already-COMPOSED manifest's rules. Parity
+ * mirror of the Rust `find_habeas_conflicts_in_composed`
+ * (castle-wall-daemon/src/habeas.rs), asserted from both languages via the
+ * shared fixture's `composed_cases` — so the TS and Linux gates accept and
+ * reject identical composed manifests.
+ *
+ * Structural invariants, then the operator-remainder scan:
+ *   - Any rule carrying a reserved id that is NOT a genuine derived rule
+ *     (exact shape, see {@link isGenuineDerivedHabeasRule}) is rejected.
+ *   - EXACTLY one genuine local reserved rule in EVERY manifest: the composer
+ *     ({@link composeEffectiveRules}) always injects the lane, so a composed
+ *     manifest without it is stale, hand-edited, or produced by a
+ *     non-conforming toolchain. No legacy allowance — there is no manifest
+ *     version field that could prove pre-habeas provenance.
+ *   - At most ONE genuine webhook reserved rule (a duplicate could redefine
+ *     the protected webhook target).
+ *   - The (provably unique, provably genuine) derived rules are exempted, the
+ *     webhook target is recovered from the genuine webhook rule, and the
+ *     operator remainder is scanned with {@link findHabeasConflicts}.
+ */
+export function findHabeasConflictsInComposed(
+  rules: readonly AllowlistRule[],
+): string[] {
+  const issues: string[] = [];
+  let localCount = 0;
+  let webhookCount = 0;
+  for (const rule of rules) {
+    if (typeof rule.id !== "string" || !rule.id.startsWith(HABEAS_RULE_ID_PREFIX)) {
+      continue;
+    }
+    if (!isGenuineDerivedHabeasRule(rule)) {
+      issues.push(
+        `rule "${rule.id}" claims the reserved habeas distress id prefix ` +
+          `"${HABEAS_RULE_ID_PREFIX}" but is not a genuine derived reserved ` +
+          "rule; reserved rules are derived, never authored",
+      );
+      continue;
+    }
+    if (rule.id === HABEAS_LOCAL_RULE_ID) localCount += 1;
+    else if (rule.id === HABEAS_WEBHOOK_RULE_ID) webhookCount += 1;
+  }
+  if (localCount !== 1) {
+    issues.push(
+      `manifest has ${localCount} genuine "${HABEAS_LOCAL_RULE_ID}" rules; ` +
+        "exactly one must be present in every composed manifest (the local " +
+        "distress lane is always-on: the composer always injects it, and a " +
+        "manifest without it cannot be put into force)",
+    );
+  }
+  if (webhookCount > 1) {
+    issues.push(
+      `more than one "${HABEAS_WEBHOOK_RULE_ID}" rule in the manifest; the ` +
+        "reserved distress webhook rule must be unique",
+    );
+  }
+  if (issues.length > 0) return issues;
+
+  const webhookRule = rules.find(
+    (r) => r.id === HABEAS_WEBHOOK_RULE_ID && isGenuineDerivedHabeasRule(r),
+  );
+  let webhook: HabeasWebhookTarget | undefined;
+  if (webhookRule !== undefined) {
+    const host = toArray(webhookRule.match.host)[0];
+    const port = toArray(webhookRule.match.port)[0];
+    if (typeof host === "string" && typeof port === "number") {
+      webhook = { host, port };
+    }
+  }
+  const operator = rules.filter((r) => !isGenuineDerivedHabeasRule(r));
+  return findHabeasConflicts(operator, webhook);
+}
+
 /** Thrown when an operator ruleset conflicts with the habeas lane. */
 export class HabeasConflictError extends Error {
   readonly issues: readonly string[];
@@ -339,6 +486,17 @@ export function composeEffectiveRules(input: ComposeEffectiveRulesInput): Allowl
   });
   if (derivedDns) {
     rules.push(derivedDns);
+  }
+  // Self-check: the composed output must pass the same composed-manifest gate
+  // the Linux daemon applies before putting a manifest into force
+  // ({@link findHabeasConflictsInComposed} / Rust
+  // `find_habeas_conflicts_in_composed`). This can only fire on a composer
+  // bug (e.g. the lane derivation regressing), and failing HERE — before the
+  // manifest is signed — is strictly better than shipping a manifest every
+  // conforming daemon will refuse.
+  const composedIssues = findHabeasConflictsInComposed(rules);
+  if (composedIssues.length > 0) {
+    throw new HabeasConflictError(composedIssues);
   }
   return rules;
 }

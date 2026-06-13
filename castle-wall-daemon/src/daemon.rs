@@ -430,9 +430,23 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         pinned_key_array,
     )));
     if let Ok(mut store) = manifest_store.lock() {
-        // Best-effort first load; ignore errors here so a missing manifest
-        // at boot does not block the IPC layer from coming up.
-        let _ = store.reload();
+        // Best-effort first load: a missing manifest at boot does not block
+        // the IPC layer from coming up (the daemon stays deny-by-default
+        // until the first successful policy.reload). But the failure must be
+        // LOUD (codex round-4 HIGH): a manifest the snapshot gate refuses —
+        // e.g. one missing the always-on habeas distress lane — must leave an
+        // unmissable trace, never a silent no-policy boot.
+        if let Err(err) = store.reload() {
+            // SAFETY: boot-time refusal fires before any logging/journal
+            // sink is guaranteed up; raw stderr is the only channel that
+            // reliably reaches the operator console (and systemd captures
+            // it), so the loud-refusal contract is stderr at this site.
+            eprintln!(
+                "castle-wall-daemon: boot-time manifest load failed; running \
+                 deny-by-default with NO policy until a valid manifest is \
+                 reloaded: {err}"
+            );
+        }
     }
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -676,15 +690,31 @@ mod tests {
         let body_bytes = body.into_bytes();
         let file = "rule-0.json";
         fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
+        // Every composed manifest must carry the genuine habeas local lane
+        // (always-on-lane gate); include it so the snapshot builds.
+        let habeas_bytes = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let habeas_file = "rule-habeas.json";
+        fs::write(
+            policy_dir.join(RULES_SUBDIR).join(habeas_file),
+            &habeas_bytes,
+        )
+        .unwrap();
         let manifest = AllowlistManifest {
             schema_version: 1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
-            rules: vec![ManifestRuleEntry {
-                rule_id: rule_id.to_string(),
-                file: file.to_string(),
-                sha256: sha256_hex(&body_bytes),
-            }],
+            rules: vec![
+                ManifestRuleEntry {
+                    rule_id: rule_id.to_string(),
+                    file: file.to_string(),
+                    sha256: sha256_hex(&body_bytes),
+                },
+                ManifestRuleEntry {
+                    rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
+                    file: habeas_file.to_string(),
+                    sha256: sha256_hex(&habeas_bytes),
+                },
+            ],
         };
         let canonical =
             canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();

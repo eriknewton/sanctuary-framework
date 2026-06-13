@@ -23,6 +23,7 @@ pub mod cgroup;
 pub mod config;
 pub mod daemon;
 pub mod failure;
+pub mod habeas;
 pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;

@@ -118,16 +118,27 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
     let body_bytes = body.into_bytes();
     let file = "rule-0.json";
     fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
+    // Every composed manifest must carry the genuine habeas local lane
+    // (always-on-lane gate); the daemon refuses a lane-less manifest.
+    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-habeas.json"), habeas_body).unwrap();
 
     let manifest = AllowlistManifest {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
-        rules: vec![ManifestRuleEntry {
-            rule_id: "rule-allow-example".to_string(),
-            file: file.to_string(),
-            sha256: sha256_hex(&body_bytes),
-        }],
+        rules: vec![
+            ManifestRuleEntry {
+                rule_id: "rule-allow-example".to_string(),
+                file: file.to_string(),
+                sha256: sha256_hex(&body_bytes),
+            },
+            ManifestRuleEntry {
+                rule_id: "reserved_habeas_distress_local".to_string(),
+                file: "rule-habeas.json".to_string(),
+                sha256: sha256_hex(habeas_body),
+            },
+        ],
     };
     let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
     let sig = signing.sign(&canonical);

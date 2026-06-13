@@ -1,0 +1,266 @@
+{
+  "_comment": "HABEAS PORT conflict-gate cross-language parity vector. Consumed by both the TS suite (server/test/castle-wall/allowlist/habeas-conflict-parity.test.ts) and the Rust daemon suite (castle-wall-daemon/tests/integration_habeas_parity.rs). `cases` feed the OPERATOR gate (findHabeasConflicts / find_habeas_conflicts): each is an operator ruleset (pre-derivation) plus an optional webhook target. `composed_cases` feed the COMPOSED-manifest gate (findHabeasConflictsInComposed / find_habeas_conflicts_in_composed): each is a full composed ruleset, covering duplicate reserved ids and the always-on-local-lane requirement (every composed manifest must carry exactly one genuine local distress rule). Both languages must agree on conflict (true) vs clean (false) for every case in both arrays. The habeas distress port is 8741.",
+  "habeas_distress_port": 8741,
+  "composed_cases": [
+    {
+      "name": "composed_genuine_local_only_is_clean",
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "composed_local_webhook_and_operator_allow_is_clean",
+      "rules": [
+        { "id": "r1", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["api.example.com"], "port": [443] }, "scope": {}, "disposition": "allow" },
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "composed_manifest_missing_local_lane_is_rejected",
+      "rules": [
+        { "id": "r1", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["api.example.com"], "port": [443] }, "scope": {}, "disposition": "allow" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_webhook_without_local_lane_is_rejected",
+      "rules": [
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_duplicate_local_reserved_rule_is_rejected",
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_duplicate_webhook_reserved_rule_cannot_redefine_target",
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["evil.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_forged_reserved_id_with_nonloopback_ip_is_rejected",
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["8.8.8.8"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_operator_deny_shadowing_recovered_webhook_is_rejected",
+      "rules": [
+        { "id": "silence-webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443] }, "scope": {}, "disposition": "deny" },
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "composed_scalar_form_webhook_rule_is_genuine_in_both_languages",
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": "ops.example.com", "port": 443, "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "composed_operator_deny_scoped_away_from_lanes_is_clean",
+      "rules": [
+        { "id": "block-elsewhere", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["other.example.com"], "port": [8080] }, "scope": {}, "disposition": "deny" },
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1", "::1"], "port": [8741], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true },
+        { "id": "reserved_habeas_distress_webhook", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443], "protocol": "tcp" }, "scope": { "agent_ids": ["sanctuary:habeas-distress-emitter"] }, "disposition": "allow", "derived": true }
+      ],
+      "expect_conflict": false
+    }
+  ],
+  "cases": [
+    {
+      "name": "clean_allowlist",
+      "webhook": null,
+      "rules": [
+        { "id": "r1", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["api.example.com"] }, "scope": {}, "disposition": "allow" },
+        { "id": "r2", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "port": [443] }, "scope": {}, "disposition": "allow" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "reserved_id_claim_local",
+      "webhook": null,
+      "rules": [
+        { "id": "reserved_habeas_distress_local", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["x"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "reserved_id_claim_prefix_imposter",
+      "webhook": null,
+      "rules": [
+        { "id": "reserved_habeas_distress_imposter", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["x"] }, "scope": {}, "disposition": "allow" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_loopback_scalar_host_and_port_at_habeas_port",
+      "webhook": null,
+      "rules": [
+        { "id": "block-loopback-scalar", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": "127.0.0.1", "port": 8741 }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_loopback_host_at_habeas_port",
+      "webhook": null,
+      "rules": [
+        { "id": "block-loopback", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["127.0.0.1"], "port": [8741] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_any_dest_port_covers_habeas",
+      "webhook": null,
+      "rules": [
+        { "id": "block-port-range", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "port": [80, 8741] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_any_dest_no_port_axis",
+      "webhook": null,
+      "rules": [
+        { "id": "block-all", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": {}, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "prompt_loopback_v6_at_habeas_port",
+      "webhook": null,
+      "rules": [
+        { "id": "prompt-loopback", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["::1"], "port": [8741] }, "scope": {}, "disposition": "prompt" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_scoped_away_from_lane",
+      "webhook": null,
+      "rules": [
+        { "id": "block-other-port", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["127.0.0.1"], "port": [8742] }, "scope": {}, "disposition": "deny" },
+        { "id": "block-external", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["evil.example.com"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "webhook_deny_by_host",
+      "webhook": { "host": "ops.example.com", "port": 443 },
+      "rules": [
+        { "id": "h", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["OPS.example.com"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "webhook_deny_by_pattern_star_prefix",
+      "webhook": { "host": "ops.example.com", "port": 443 },
+      "rules": [
+        { "id": "p", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host_pattern": "*.example.com" }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "webhook_deny_by_pattern_dot_prefix_linux_evaluator_spelling",
+      "webhook": { "host": "ops.example.com", "port": 443 },
+      "rules": [
+        { "id": "pd", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host_pattern": ".example.com" }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "webhook_clean_when_pattern_excludes_apex",
+      "webhook": { "host": "example.com", "port": 443 },
+      "rules": [
+        { "id": "apex", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host_pattern": ".example.com" }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "webhook_deny_by_any_dest_port",
+      "webhook": { "host": "ops.example.com", "port": 443 },
+      "rules": [
+        { "id": "q", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "port": [443] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "webhook_host_deny_without_webhook_configured",
+      "webhook": null,
+      "rules": [
+        { "id": "h", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [443] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "webhook_deny_scoped_to_different_port",
+      "webhook": { "host": "ops.example.com", "port": 443 },
+      "rules": [
+        { "id": "other-port", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "host": ["ops.example.com"], "port": [8080] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "deny_loopback_ip_axis_at_habeas_port",
+      "webhook": null,
+      "rules": [
+        { "id": "block-loopback-ip", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "ip": ["127.0.0.1"], "port": [8741] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_loopback_cidr_any_port",
+      "webhook": null,
+      "rules": [
+        { "id": "block-loopback-cidr", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "cidr": ["127.0.0.0/8"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_v6_loopback_cidr_any_port",
+      "webhook": null,
+      "rules": [
+        { "id": "block-v6-loopback", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "cidr": ["::1/128"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "deny_cidr_excluding_loopback_is_clean",
+      "webhook": null,
+      "rules": [
+        { "id": "block-external-subnet", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "cidr": ["203.0.113.0/24"] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    },
+    {
+      "name": "webhook_ip_literal_target_caught_by_cidr_deny",
+      "webhook": { "host": "203.0.113.7", "port": 443 },
+      "rules": [
+        { "id": "block-subnet", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "cidr": ["203.0.113.0/24"], "port": [443] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": true
+    },
+    {
+      "name": "webhook_ip_literal_target_clean_when_subnet_excludes",
+      "webhook": { "host": "203.0.113.7", "port": 443 },
+      "rules": [
+        { "id": "block-other-subnet", "schema_version": 1, "created_at": "2026-06-12T00:00:00.000Z", "match": { "cidr": ["198.51.100.0/24"], "port": [443] }, "scope": {}, "disposition": "deny" }
+      ],
+      "expect_conflict": false
+    }
+  ]
+}

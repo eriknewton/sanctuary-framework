@@ -11,6 +11,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "concierge",
   "dashboard",
   "did-web",
+  "distress",
   "doctor",
   "erc8004",
   "exit",

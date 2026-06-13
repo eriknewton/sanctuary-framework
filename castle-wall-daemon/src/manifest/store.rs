@@ -348,6 +348,21 @@ mod tests {
                 sha256: sha256_hex(&body),
             });
         }
+        // Every composed manifest must carry the genuine habeas local lane
+        // (always-on-lane gate, codex round-4 HIGH); the snapshot the store
+        // builds on reload refuses a lane-less manifest.
+        let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let habeas_file = "rule-habeas.json".to_string();
+        fs::write(
+            policy_dir.join(RULES_SUBDIR).join(&habeas_file),
+            &habeas_body,
+        )
+        .unwrap();
+        entries.push(ManifestRuleEntry {
+            rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
+            file: habeas_file,
+            sha256: sha256_hex(&habeas_body),
+        });
 
         let manifest = AllowlistManifest {
             schema_version: SCHEMA_VERSION_V1,
@@ -385,8 +400,9 @@ mod tests {
         let policy = write_valid_policy(2);
         let loaded = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key)
             .expect("load");
-        assert_eq!(loaded.rule_count, 2);
-        assert_eq!(loaded.rule_files.len(), 2);
+        // 2 synthetic rules + the always-present habeas local lane.
+        assert_eq!(loaded.rule_count, 3);
+        assert_eq!(loaded.rule_files.len(), 3);
         assert!(loaded.rule_files.contains_key("rule-0.json"));
     }
 
@@ -455,7 +471,8 @@ mod tests {
         );
         assert!(store.current().is_none());
         let loaded = store.reload().expect("reload");
-        assert_eq!(loaded.rule_count, 1);
+        // 1 synthetic rule + the habeas local lane.
+        assert_eq!(loaded.rule_count, 2);
         assert!(store.current().is_some());
     }
 
@@ -472,11 +489,13 @@ mod tests {
         assert!(store.current_snapshot().is_none());
         store.reload().expect("reload");
         let snap = store.current_snapshot().expect("snapshot");
-        assert_eq!(snap.rules.len(), 2);
+        // 2 synthetic rules + the habeas local lane.
+        assert_eq!(snap.rules.len(), 3);
         assert_eq!(snap.fortress_id, "deadbeef");
-        // Rule ids derived from rule_body_for("uuid-N").
+        // Rule ids derived from rule_body_for("uuid-N"), then the lane.
         assert_eq!(snap.rules[0].id, "uuid-0");
         assert_eq!(snap.rules[1].id, "uuid-1");
+        assert_eq!(snap.rules[2].id, crate::habeas::HABEAS_LOCAL_RULE_ID);
     }
 
     #[test]

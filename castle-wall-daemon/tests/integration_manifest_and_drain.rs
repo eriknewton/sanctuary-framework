@@ -16,6 +16,7 @@
 
 use base64::Engine;
 use castle_wall_daemon::audit::WalWriter;
+use castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::boot;
 use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
@@ -108,6 +109,16 @@ fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_count: us
             sha256: sha256_hex(&body),
         });
     }
+    // Every composed manifest must carry the genuine habeas local lane
+    // (always-on-lane gate); the daemon refuses a lane-less manifest.
+    let habeas_body = HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+    let habeas_file = "rule-habeas.json".to_string();
+    fs::write(policy_dir.join(RULES_SUBDIR).join(&habeas_file), &habeas_body).unwrap();
+    entries.push(ManifestRuleEntry {
+        rule_id: "reserved_habeas_distress_local".to_string(),
+        file: habeas_file,
+        sha256: sha256_hex(&habeas_body),
+    });
     let manifest = AllowlistManifest {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
@@ -262,7 +273,8 @@ fn boot_then_policy_reload_succeeds_with_real_manifest_on_disk() {
         } => {
             assert_eq!(request_id, "policy-1");
             assert!(ok, "expected ok=true; error={:?}", error);
-            assert_eq!(loaded_rule_count, 2);
+            // 2 synthetic rules + the habeas local lane.
+            assert_eq!(loaded_rule_count, 3);
             assert!(error.is_none(), "expected no error; got {:?}", error);
         }
         other => panic!("unexpected reply {:?}", other),
@@ -305,9 +317,9 @@ fn policy_reload_keeps_prior_on_signature_failure() {
             ..
         } => {
             assert!(!ok, "expected ok=false on tampered rule");
-            // Prior policy was loaded at boot (1 rule); tampered reload should
-            // keep the prior count + signature in the response.
-            assert_eq!(loaded_rule_count, 1);
+            // Prior policy was loaded at boot (1 rule + habeas lane);
+            // tampered reload should keep the prior count + signature.
+            assert_eq!(loaded_rule_count, 2);
             assert!(loaded_manifest_signature_b64url.is_some());
             let err = error.expect("error string for tampered reload");
             assert!(

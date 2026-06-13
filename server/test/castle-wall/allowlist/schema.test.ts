@@ -108,4 +108,100 @@ describe("castle-wall/allowlist/schema/validateRule", () => {
     const r = { ...validRule(), match: { ip: [1234] } } as unknown as AllowlistRule;
     expect(validateRule(r).some((s) => s.includes("ip"))).toBe(true);
   });
+
+  // ---- codex round-6: type-level axis validation (Rust serde parity) ------
+
+  it("rejects null axis values (Rust reads null as axis-absent => any-destination)", () => {
+    for (const match of [{ host: null }, { ip: null }, { cidr: null }, { port: null }]) {
+      const r = { ...validRule(), match } as unknown as AllowlistRule;
+      expect(validateRule(r).length, JSON.stringify(match)).toBeGreaterThan(0);
+    }
+  });
+
+  it("rejects wrong-typed axis scalars and members", () => {
+    for (const match of [
+      { host: 123 },
+      { host: ["ok.example.com", 7] },
+      { host: "" },
+      { port: "8741" },
+      { port: 70000 },
+      { port: 0 },
+      { port: 443.5 },
+      { port: [443, "80"] },
+      { host_pattern: "" },
+      { host_pattern: 9 },
+    ]) {
+      const r = { ...validRule(), match } as unknown as AllowlistRule;
+      expect(validateRule(r).length, JSON.stringify(match)).toBeGreaterThan(0);
+    }
+  });
+
+  it("rejects empty axis arrays (present-but-empty differs across evaluators)", () => {
+    for (const match of [{ host: [] }, { ip: [] }, { cidr: [] }, { port: [] }]) {
+      const r = { ...validRule(), match } as unknown as AllowlistRule;
+      expect(validateRule(r).length, JSON.stringify(match)).toBeGreaterThan(0);
+    }
+  });
+
+  it("rejects an invalid protocol value", () => {
+    const r = {
+      ...validRule(),
+      match: { host: "x.example.com", protocol: "quic" },
+    } as unknown as AllowlistRule;
+    expect(validateRule(r).length).toBeGreaterThan(0);
+  });
+
+  it("accepts all three protocol spellings", () => {
+    for (const protocol of ["tcp", "udp", "tcp+udp"]) {
+      const r = {
+        ...validRule(),
+        match: { host: "x.example.com", protocol },
+      } as unknown as AllowlistRule;
+      expect(validateRule(r)).toEqual([]);
+    }
+  });
+
+  it("rejects unknown fields at rule, match, and scope level (daemon serde parity)", () => {
+    const base = validRule();
+    const cases: AllowlistRule[] = [
+      { ...base, novel_field: true } as unknown as AllowlistRule,
+      { ...base, match: { ...base.match, future_axis: ["x"] } } as unknown as AllowlistRule,
+      { ...base, scope: { ...base.scope, group_ids: ["g"] } } as unknown as AllowlistRule,
+    ];
+    for (const r of cases) {
+      const issues = validateRule(r);
+      expect(issues.length).toBeGreaterThan(0);
+      expect(issues.some((i) => i.includes("unknown field"))).toBe(true);
+    }
+  });
+
+  it("accepts the modeled optional fields (derived, time_window)", () => {
+    const r = {
+      ...validRule(),
+      derived: true,
+      time_window: { start: "09:00", end: "17:00" },
+    } as AllowlistRule;
+    expect(validateRule(r)).toEqual([]);
+  });
+
+  it("rejects array-valued match/scope/time_window (Rust refuses arrays for structs)", () => {
+    for (const r of [
+      { ...validRule(), match: [] },
+      { ...validRule(), scope: [] },
+      { ...validRule(), time_window: [] },
+    ] as unknown as AllowlistRule[]) {
+      expect(validateRule(r).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("rejects malformed scope id lists", () => {
+    for (const scope of [
+      { agent_ids: "not-an-array" },
+      { agent_ids: [""] },
+      { template_ids: [42] },
+    ]) {
+      const r = { ...validRule(), scope } as unknown as AllowlistRule;
+      expect(validateRule(r).length, JSON.stringify(scope)).toBeGreaterThan(0);
+    }
+  });
 });
