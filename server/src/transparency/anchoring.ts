@@ -491,6 +491,33 @@ export function anchorReceiptStorageKey(counter: number): string {
   return `${TRANSPARENCY_ANCHOR_RECEIPT_PREFIX}${String(counter).padStart(20, "0")}`;
 }
 
+/**
+ * Whether ANY anchor receipt is present on disk (anti-rollback Stage 2 FIX 1).
+ * A cheap listing that does NOT parse the receipts: it answers only
+ * "present vs genuinely absent". A present-but-MALFORMED store is reported as
+ * present (true) here — the malformed-store freeze is the caller's job via the
+ * parsing path (computeHighestVerifiedAnchoredCounter / readAnchorReceipts),
+ * which fails toward freeze. An unlistable namespace is treated as PRESENT
+ * (true): we cannot prove the store is empty, so Stage 2 should apply (fail
+ * toward running the check, never toward skipping it). A genuinely empty/absent
+ * namespace returns false → Stage 2 does not apply on that basis alone.
+ */
+export async function anchorReceiptsPresentOnDisk(
+  storage: StorageBackend
+): Promise<boolean> {
+  try {
+    const metas = await storage.list(
+      TRANSPARENCY_ANCHOR_NAMESPACE,
+      TRANSPARENCY_ANCHOR_RECEIPT_PREFIX
+    );
+    return metas.length > 0;
+  } catch {
+    // Cannot list the store → cannot prove it is empty → treat as present so
+    // Stage 2 still applies (the parsing path then fails toward freeze).
+    return true;
+  }
+}
+
 /** Read every persisted anchor receipt, sorted by counter ascending. */
 export async function readAnchorReceipts(
   storage: StorageBackend

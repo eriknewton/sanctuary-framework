@@ -68,7 +68,7 @@ const REKOR_URL = "https://rekor.fixture.test";
 
 function inputs(over: Partial<RekorFloorInputs> = {}): RekorFloorInputs {
   return {
-    transparencyEnabled: true,
+    stage2Applies: true,
     onDiskFloor: { status: "valid", highest_counter: 3 },
     highestAnchoredCounter: 3,
     unverifiableAnchorPresent: false,
@@ -78,8 +78,8 @@ function inputs(over: Partial<RekorFloorInputs> = {}): RekorFloorInputs {
 }
 
 describe("evaluateRekorCounterFloor (pure verdict)", () => {
-  it("is NOT-APPLICABLE when transparency anchoring is disabled (clean, never freeze)", () => {
-    const v = evaluateRekorCounterFloor(inputs({ transparencyEnabled: false }));
+  it("is NOT-APPLICABLE when Stage 2 does not apply (no receipts + config not enabled): clean, never freeze", () => {
+    const v = evaluateRekorCounterFloor(inputs({ stage2Applies: false }));
     expect(v.kind).toBe("not-applicable");
   });
 
@@ -373,24 +373,51 @@ describe("evaluateAndEnforceRekorCounterFloor (boot / on-demand)", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("is NOT-APPLICABLE (clean PASS, never freezes) when transparency is disabled", async () => {
+  it("FIX 1: disabled-after-anchoring WITH a rolled-back floor + receipts on disk is SUSPECTED (the spoof), not not-applicable", async () => {
     const a = await anchorN(2);
-    // Disable anchoring after the fact; Stage 2 must not apply even though
-    // anchored receipts + a floor exist on disk.
+    // Disable anchoring after the fact (config status=disabled, receipts +
+    // floor preserved). A disk-write attacker dodging Stage 2 by flipping the
+    // config off must NOT escape: receipts on disk prove anchoring happened, so
+    // Stage 2 still applies and a rolled-back floor (0 < anchored 2) freezes.
     await disableAnchoring({
       storage: a.storage,
       masterKey: a.masterKey,
       auditLog: a.auditLog,
       fortressId: FORTRESS_ID,
     });
-    // Even with a (now-irrelevant) rolled-back floor, disabled = clean.
     await forceFloorTo(a.storage, a.masterKey, 0);
     const r = await evaluateAndEnforceRekorCounterFloor({
       storage: a.storage,
       master: a.masterKey,
       fortressId: FORTRESS_ID,
     });
-    expect(r.verdict.kind).toBe("not-applicable");
+    expect(r.verdict.kind).toBe("rollback-suspected");
+    if (r.verdict.kind === "rollback-suspected") {
+      expect(r.verdict.onDiskFloor).toBe(0);
+      expect(r.verdict.highestAnchoredCounter).toBe(2);
+    }
+    expect(r.frozen).toBe(true);
+    expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(true);
+  });
+
+  it("FIX 1: disabled-after-anchoring WITH a current (un-rolled-back) floor is CONSISTENT, no false positive", async () => {
+    const a = await anchorN(2);
+    // Legitimate disable-after-anchoring: the floor is still >= the highest
+    // anchored counter, so even though Stage 2 now APPLIES (receipts present),
+    // the verdict is CONSISTENT — no freeze. This is the case FIX 1 must NOT
+    // false-positive on.
+    await disableAnchoring({
+      storage: a.storage,
+      masterKey: a.masterKey,
+      auditLog: a.auditLog,
+      fortressId: FORTRESS_ID,
+    });
+    const r = await evaluateAndEnforceRekorCounterFloor({
+      storage: a.storage,
+      master: a.masterKey,
+      fortressId: FORTRESS_ID,
+    });
+    expect(r.verdict.kind).toBe("consistent");
     expect(r.frozen).toBe(false);
     expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(false);
   });
@@ -442,5 +469,89 @@ describe("evaluateAndEnforceRekorCounterFloor (boot / on-demand)", () => {
     });
     expect(r.verdict.kind).toBe("rollback-suspected");
     expect(r.frozen).toBe(true);
+  });
+
+  it("FIX 2: an EXISTING-but-corrupt receipt store FREEZES (suspected), boot not refused", async () => {
+    const a = await anchorN(2);
+    // Replace receipt 2 with non-JSON garbage: the store is PRESENT but
+    // unreadable/malformed. readAnchorReceipts throws on it; the Stage-2
+    // orchestrator must catch that → unverifiableAnchorPresent → suspected +
+    // freeze, NOT let the exception escape and silently skip the check.
+    const key = anchorReceiptStorageKey(2);
+    await a.storage.write(
+      TRANSPARENCY_ANCHOR_NAMESPACE,
+      key,
+      stringToBytes("{ this is not valid receipt json")
+    );
+    // Sanity: the store is genuinely unreadable now.
+    await expect(readAnchorReceipts(a.storage)).rejects.toThrow();
+    const r = await evaluateAndEnforceRekorCounterFloor({
+      storage: a.storage,
+      master: a.masterKey,
+      fortressId: FORTRESS_ID,
+    });
+    expect(r.verdict.kind).toBe("rollback-suspected");
+    expect(r.frozen).toBe(true);
+    expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(true);
+    // No exception thrown out of the orchestrator — boot is never refused.
+  });
+
+  it("FIX 2: a genuinely-ABSENT receipt store with transparency on is CONSISTENT (nothing anchored), never a freeze", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = randomBytes(32);
+    const auditLog = new AuditLog(storage, masterKey);
+    // Enable anchoring but anchor NOTHING (no receipts dir / empty store).
+    await enableAnchoring({
+      storage,
+      masterKey,
+      auditLog,
+      fortressId: FORTRESS_ID,
+      rekorUrl: REKOR_URL,
+    });
+    const r = await evaluateAndEnforceRekorCounterFloor({
+      storage,
+      master: masterKey,
+      fortressId: FORTRESS_ID,
+    });
+    expect(r.verdict.kind).toBe("consistent");
+    expect(r.frozen).toBe(false);
+  });
+
+  it("FIX 4: deleting the Stage-2 freeze marker STILL blocks enforceCustodyFloor (recompute re-derives the suspected verdict)", async () => {
+    const a = await anchorN(3);
+    // Detect a Stage-2 rollback: floor reverts to 1, external receipts remember 3.
+    await forceFloorTo(a.storage, a.masterKey, 1);
+    await evaluateAndEnforceRekorCounterFloor({
+      storage: a.storage,
+      master: a.masterKey,
+      fortressId: FORTRESS_ID,
+    });
+    expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(true);
+
+    // The attacker deletes ONLY the Stage-2 freeze marker (the cache), trying to
+    // lift the freeze mid-session without a boot.
+    await a.storage.delete("_meta", ROLLBACK_FREEZE_META_KEY);
+    expect(await a.storage.read("_meta", ROLLBACK_FREEZE_META_KEY)).toBeNull();
+
+    // enforceCustodyFloor must STILL block: the marker-absent recompute now
+    // re-derives the Stage-2 verdict (parity with Stage 1) and re-freezes.
+    const { enforceCustodyFloor } = await import("../../src/core/master-custody.js");
+    await expect(
+      enforceCustodyFloor(a.storage, "identity_create", a.masterKey)
+    ).rejects.toBeInstanceOf(CustodyRollbackFrozenError);
+    // The recompute re-established the marker.
+    expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(true);
+  });
+
+  it("FIX 4: the legitimate CONSISTENT case still allows writes after a marker delete (no false freeze in recompute)", async () => {
+    const a = await anchorN(2);
+    // No rollback: floor matches anchored. Even with no freeze marker present,
+    // the Stage-2 recompute must return consistent and allow the write.
+    await a.storage.delete("_meta", ROLLBACK_FREEZE_META_KEY); // no-op (none set)
+    const { enforceCustodyFloor } = await import("../../src/core/master-custody.js");
+    await expect(
+      enforceCustodyFloor(a.storage, "identity_create", a.masterKey)
+    ).resolves.toBeUndefined();
+    expect((await isRollbackFrozen(a.storage, a.masterKey)).frozen).toBe(false);
   });
 });

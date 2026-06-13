@@ -184,9 +184,9 @@ describe("verify-transparency --check-counter-floor (anti-rollback Stage 2)", ()
     ]);
     const code = await v.code;
     const text = v.out.text();
-    expect(text).toContain("Anti-rollback Stage 2 (external Rekor counter-floor): CONSISTENT");
+    expect(text).toContain("Anti-rollback Stage 2 (Rekor counter-floor): CONSISTENT");
     expect(text).toContain("on-disk transparency floor: 2");
-    expect(text).toContain("highest externally-anchored checkpoint: 2");
+    expect(text).toContain("highest locally-recorded anchored checkpoint: 2");
     expect(code).toBe(0);
     const master = await masterKeyOf(fortress);
     expect((await isRollbackFrozen(new FilesystemStorage(join(fortress, "state")), master)).frozen).toBe(false);
@@ -206,9 +206,9 @@ describe("verify-transparency --check-counter-floor (anti-rollback Stage 2)", ()
     ]);
     const code = await v.code;
     const text = v.out.text();
-    expect(text).toContain("Anti-rollback Stage 2 (external Rekor counter-floor): SUSPECTED-ROLLBACK");
+    expect(text).toContain("Anti-rollback Stage 2 (Rekor counter-floor): SUSPECTED-ROLLBACK");
     expect(text).toContain("on-disk transparency floor: 1");
-    expect(text).toContain("highest externally-anchored checkpoint: 3");
+    expect(text).toContain("highest locally-recorded anchored checkpoint: 3");
     expect(text).toContain("Verdict: FAIL");
     expect(code).toBe(1);
 
@@ -246,7 +246,7 @@ describe("verify-transparency --check-counter-floor (anti-rollback Stage 2)", ()
     ]);
     const code = await v.code;
     expect(v.out.text()).toContain(
-      "Anti-rollback Stage 2 (external Rekor counter-floor): NOT APPLICABLE"
+      "Anti-rollback Stage 2 (Rekor counter-floor): NOT APPLICABLE"
     );
     expect(code).toBe(0);
     const master = await masterKeyOf(fortress);

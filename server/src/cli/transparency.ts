@@ -772,13 +772,18 @@ export async function runVerifyTransparencyCommand(
     }
 
     // ---- --check-counter-floor: anti-rollback Stage 2 (host-side) -----------
-    // The external Rekor counter-floor cross-check. Unlike the auditor-side
+    // The Rekor counter-floor cross-check. Unlike the auditor-side
     // --check-anchors (which verifies an operator-supplied EXPORT file), this
     // reads the fortress's OWN local state (the MAC'd transparency counter
     // floor and the local anchor receipts) and compares the on-disk floor
-    // against the highest externally-anchored counter. It runs on the HOST
-    // (needs the master key) and, on a regression, freezes trust-bearing
-    // writes via the same Stage-1 chokepoint (restore-attest clears it).
+    // against the highest LOCALLY-RECORDED anchored counter (the highest counter
+    // for which a valid local anchor receipt — whose counter the external Rekor
+    // log also remembers — survives on disk). It runs on the HOST (needs the
+    // master key) and, on a regression, freezes trust-bearing writes via the
+    // same Stage-1 chokepoint (restore-attest clears it). OFFLINE-ONLY: it
+    // catches a floor rollback that PRESERVES the receipts; a coordinated
+    // rollback that also deletes the higher receipts needs online Rekor
+    // enumeration (Stage 2b) or the hardware counter (Stage 4).
     let counterFloorSummary:
       | {
           verdict: "CONSISTENT" | "SUSPECTED-ROLLBACK" | "NOT-APPLICABLE";
@@ -823,7 +828,7 @@ export async function runVerifyTransparencyCommand(
           frozen: floorResult.frozen,
         };
         report.not_checked.push(
-          "anti-rollback Stage 2 (external Rekor counter-floor): transparency anchoring is not enabled on this fortress, so Stage 2 does not apply (a fortress that never opted into anchoring is not externally anchored)"
+          "anti-rollback Stage 2 (Rekor counter-floor): no anchor receipts are present and transparency anchoring is not enabled on this fortress, so Stage 2 does not apply (nothing has been anchored to compare a floor against)"
         );
       } else {
         counterFloorSummary = {
@@ -841,9 +846,10 @@ export async function runVerifyTransparencyCommand(
             actual: `on-disk transparency floor ${v.onDiskFloor}`,
             message:
               `anti-rollback Stage 2: the on-disk transparency counter floor (${v.onDiskFloor}) is below the ` +
-              `highest checkpoint this fortress externally anchored (${v.highestAnchoredCounter}); ` +
-              "the external Rekor log remembers an anchoring the on-disk checkpoint store no longer reflects " +
-              "(suspected full-snapshot rollback of an anchored fortress). " +
+              `highest checkpoint this fortress holds a valid local anchor receipt for (${v.highestAnchoredCounter}); ` +
+              "the local anchor receipts (whose counters the external Rekor log also remembers) prove an anchoring " +
+              "the on-disk checkpoint store no longer reflects (suspected transparency-floor rollback of an anchored " +
+              "fortress that preserved those receipts). " +
               (v.notes[0] ?? "") +
               " Trust-bearing writes are now FROZEN; run `sanctuary restore-attest` to acknowledge and unfreeze.",
           });
@@ -1123,14 +1129,14 @@ function printHumanReport(
     if (cf.verdict === "NOT-APPLICABLE") {
       write(
         out,
-        `Anti-rollback Stage 2 (external Rekor counter-floor): NOT APPLICABLE (transparency anchoring is not enabled)\n`
+        `Anti-rollback Stage 2 (Rekor counter-floor): NOT APPLICABLE (no anchor receipts present and transparency anchoring is not enabled)\n`
       );
     } else {
       write(
         out,
-        `Anti-rollback Stage 2 (external Rekor counter-floor): ${cf.verdict}\n` +
+        `Anti-rollback Stage 2 (Rekor counter-floor): ${cf.verdict}\n` +
           `  on-disk transparency floor: ${cf.on_disk_transparency_floor}\n` +
-          `  highest externally-anchored checkpoint: ${cf.highest_externally_anchored_counter}\n` +
+          `  highest locally-recorded anchored checkpoint: ${cf.highest_externally_anchored_counter}\n` +
           (cf.verdict === "SUSPECTED-ROLLBACK"
             ? `  trust-bearing writes FROZEN; run "sanctuary restore-attest" to acknowledge and unfreeze\n`
             : "")
@@ -1399,14 +1405,19 @@ Options:
   --check-counter-floor     Anti-rollback Stage 2 (HOST mode, needs the master
                             key): compare the on-disk transparency counter
                             floor against the highest checkpoint this fortress
-                            externally anchored (resolved offline from local
-                            receipts). A floor below that highest anchored
-                            counter is the full-snapshot-rollback signature for
-                            an anchored fortress: it FREEZES trust-bearing
-                            writes (cleared by "sanctuary restore-attest"),
-                            never refuses anything. Reports CONSISTENT /
+                            holds a valid local anchor receipt for (whose
+                            counter the external Rekor log also remembers;
+                            resolved offline). A floor below it is a
+                            transparency-floor rollback of an anchored fortress
+                            that preserved its receipts: it FREEZES trust-bearing
+                            writes (cleared by "sanctuary restore-attest"), never
+                            refuses anything. OFFLINE-ONLY: a coordinated
+                            rollback that also deletes the higher receipts needs
+                            online Rekor enumeration (Stage 2b) or the hardware
+                            counter (Stage 4). Reports CONSISTENT /
                             SUSPECTED-ROLLBACK with both counters. A fortress
-                            without anchoring enabled reports NOT-APPLICABLE.
+                            with no receipts and anchoring not enabled reports
+                            NOT-APPLICABLE.
   --expect-fresh <window>   FAIL unless the newest log-attested anchor is
                             within the window (e.g. 36h, 7d). Requires
                             --check-anchors and a pinned Rekor key.

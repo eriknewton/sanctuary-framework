@@ -431,6 +431,38 @@ export async function readTransparencyCounterFloor(
   }
 }
 
+/**
+ * Re-baseline the on-disk transparency counter floor to `targetCounter`
+ * (anti-rollback Stage 2, restore-attest). This is the Stage-2 analogue of
+ * Stage 1's epoch-witness re-baseline: after an operator attests a legitimate
+ * restore, the floor is raised so it is ≥ the highest locally-recorded anchored
+ * counter, making the attested state internally consistent (otherwise the
+ * Stage-2 recompute in enforceCustodyFloor would correctly re-detect the floor
+ * regression and re-freeze). It NEVER lowers a higher current floor (monotonic;
+ * a re-baseline below the present floor is a no-op). Returns the floor value in
+ * effect after the call. Derives + zeroes the floor MAC key like the emitter.
+ */
+export async function rebaselineTransparencyCounterFloor(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  targetCounter: number
+): Promise<number> {
+  const floorMacKey = derivePurposeKey(masterKey, "transparency-counter-floor");
+  try {
+    const current = await readCounterFloor(storage, floorMacKey);
+    const currentValue = current.status === "valid" ? current.highest_counter : 0;
+    // Only raise (monotonic). A tampered floor (invalid) is treated as 0 here,
+    // so the re-baseline writes a fresh authenticated floor at the target.
+    const next = Math.max(currentValue, targetCounter);
+    if (next <= 0) return currentValue; // nothing to anchor to; leave as-is
+    if (current.status === "valid" && next === currentValue) return currentValue;
+    await writeCounterFloor(storage, floorMacKey, next);
+    return next;
+  } finally {
+    floorMacKey.fill(0);
+  }
+}
+
 async function readCounterFloor(
   storage: StorageBackend,
   macKey: Uint8Array

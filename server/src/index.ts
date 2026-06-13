@@ -313,16 +313,21 @@ export async function createSanctuaryServer(options?: {
     );
   }
 
-  // 5rb2. Anti-rollback Stage 2 boot cross-check (external Rekor counter-floor).
-  // Only applies when transparency anchoring is ENABLED. Compares the on-disk
-  // transparency counter floor against the highest checkpoint this fortress
-  // externally anchored (resolved OFFLINE from local receipts — no network).
-  // A floor below the highest anchored counter is the full-snapshot-rollback
-  // signature for an anchored fortress; it WARNS LOUD, emits the same P1-shaped
-  // `custody_rollback_suspected` finding, and FREEZES trust-bearing writes via
-  // the SAME marker Stage 1 uses (cleared by `restore-attest`). Boot is NEVER
-  // refused. Composes with the Stage 1 cross-check above; either freeze gates
-  // enforceCustodyFloor.
+  // 5rb2. Anti-rollback Stage 2 boot cross-check (Rekor counter-floor).
+  // Applies when transparency anchoring is ENABLED *or* anchor receipts are
+  // present on disk (so a disk-write attacker cannot dodge Stage 2 by deleting
+  // or rolling back the config while preserving receipts). Compares the on-disk
+  // transparency counter floor against the highest LOCALLY-RECORDED anchored
+  // counter (the highest counter for which a valid local anchor receipt — whose
+  // counter the external Rekor log also remembers — survives on disk; resolved
+  // OFFLINE, no network). A floor below it is a transparency-floor rollback of
+  // an anchored fortress that preserved its receipts; it WARNS LOUD, emits the
+  // same P1-shaped `custody_rollback_suspected` finding, and FREEZES
+  // trust-bearing writes via the SAME marker Stage 1 uses (cleared by
+  // `restore-attest`). Boot is NEVER refused. OFFLINE-ONLY: a coordinated
+  // rollback that also deletes the higher receipts needs online Rekor
+  // enumeration (Stage 2b) or Stage-4 hardware. Composes with the Stage 1
+  // cross-check above; either freeze gates enforceCustodyFloor.
   try {
     const rekorFloor = await evaluateAndEnforceRekorCounterFloor({
       storage,
