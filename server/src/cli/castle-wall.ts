@@ -18,7 +18,11 @@ import {
 import { resolveStoragePath } from "../paths.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { AuditLog, type AuditEntry } from "../l2-operational/audit-log.js";
+import {
+  AuditLog,
+  AuditIntegrityError,
+  type AuditEntry,
+} from "../l2-operational/audit-log.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
@@ -45,6 +49,22 @@ export interface CastleWallCommandContext {
   signerClientPath?: string;
   /** Override the shim runner (tests drive re-pin without a real helper). */
   signerClientInvoke?: ShimInvoker;
+  /**
+   * Override the auto-discovery candidate list for the signer-client shim
+   * (tests drive bundle auto-discovery without a real /Applications install).
+   * Mirrors the `hostAppCandidates` seam.
+   */
+  signerClientCandidates?: string[];
+  /**
+   * Override the file-exists-and-executable probe used by signer-client
+   * auto-discovery (tests). Defaults to a real `stat`-based check.
+   */
+  fileExistsFn?: (path: string) => Promise<boolean>;
+  /**
+   * Override the global-pin reader used by `status` (tests inject a present /
+   * absent / unreadable global pin without touching the root-owned path).
+   */
+  globalPinReader?: () => Promise<Uint8Array>;
   /** Override the host-app headless runner (tests drive enable/disable without the real app). */
   hostAppInvoke?: HostAppInvoker;
   /** Override the host-app binary probe list (tests). */
@@ -498,6 +518,61 @@ export function buildPinRotationProof(opts: {
   };
 }
 
+/** Bundled path of the signer-client shim inside the installed host app. */
+const SIGNER_CLIENT_RELATIVE_BINARY =
+  "Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client";
+
+/**
+ * Known on-disk locations of the bundled signer-client shim, in probe order.
+ * The shim ships inside the installed host app, so a normally-installed box
+ * always has it even when SANCTUARY_CASTLE_SIGNER_CLIENT is unset (the
+ * operability gap from the 2026-06-13 Mini1 arming-path drill).
+ */
+function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
+  const home = env.HOME ?? homedir();
+  return [
+    `/Applications/${SIGNER_CLIENT_RELATIVE_BINARY}`,
+    `${home}/Applications/${SIGNER_CLIENT_RELATIVE_BINARY}`,
+  ];
+}
+
+/** True iff `path` is an existing regular file with an executable bit set. */
+async function isExecutableFile(path: string): Promise<boolean> {
+  try {
+    const info = await stat(path);
+    // 0o111 = any of owner/group/other execute. A bundled shim is 0755.
+    return info.isFile() && (info.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the signer-client shim path used by `re-pin` and the daemon path.
+ * Precedence: explicit `ctx.signerClientPath` → `SANCTUARY_CASTLE_SIGNER_CLIENT`
+ * env → (darwin only) auto-discovered bundled shim → `undefined`. Auto-discovery
+ * is test-injectable via `ctx.signerClientCandidates` / `ctx.fileExistsFn`,
+ * mirroring the host-app `hostAppCandidates` seam, so tests never depend on a
+ * real `/Applications` install.
+ */
+async function resolveSignerClientPath(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  ctx: CastleWallCommandContext,
+): Promise<string | undefined> {
+  if (ctx.signerClientPath) return ctx.signerClientPath;
+  if (env.SANCTUARY_CASTLE_SIGNER_CLIENT) {
+    return env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+  }
+  if (platform !== "darwin") return undefined;
+  const exists = ctx.fileExistsFn ?? isExecutableFile;
+  const candidates = ctx.signerClientCandidates ?? defaultSignerClientCandidates(env);
+  for (const candidate of candidates) {
+    if (await exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 /**
  * One-time, operator-approved trust-anchor migration (A2/B2 re-pin). Tells the
  * root signer helper to (re)write the global pin with ITS key (K_helper), then
@@ -525,7 +600,30 @@ export async function runRePin(
   }
 
   const storagePath = resolveStoragePath(env);
-  const clientBinaryPath = ctx.signerClientPath ?? env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+
+  // F2a — loud target-fortress announcement (visibility, NOT a gating change).
+  // `resolveStoragePath` silently defaults to ~/.sanctuary when
+  // SANCTUARY_STORAGE_PATH is unset; the 2026-06-13 drill pain was an UNSCOPED
+  // invocation touching the real default fortress's audit lock with no signal.
+  // Print the resolved target before any state-touching work, and call out the
+  // default-fortress case. NOTE: a stricter opt-in confirm/refuse gate on the
+  // DEFAULT fortress was considered and deliberately DEFERRED to Erik — re-pinning
+  // the real default fortress is the legitimate operator path, so this stays a
+  // pure-visibility change with no gating effect.
+  const usingDefaultFortress = !env.SANCTUARY_STORAGE_PATH;
+  write(
+    err,
+    `Re-pinning trust anchor for fortress: ${storagePath}` +
+      (usingDefaultFortress
+        ? " (default fortress; set SANCTUARY_STORAGE_PATH to target another)"
+        : "") +
+      "\n",
+  );
+
+  const clientBinaryPath =
+    (await resolveSignerClientPath(env, platform, ctx)) ??
+    ctx.signerClientPath ??
+    env.SANCTUARY_CASTLE_SIGNER_CLIENT;
   if (!clientBinaryPath && !ctx.signerClientInvoke) {
     write(
       err,
@@ -539,15 +637,31 @@ export async function runRePin(
     ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
   });
 
+  // PRE-MIGRATION phase: any failure here (shim unreachable, bad key length,
+  // etc.) means the trust anchor did NOT move — report failure and return 1.
+  let helperPub: Uint8Array;
   try {
     // Ask the helper to (re)write the root-owned pin with K_helper and return it.
-    const helperPub = await client.installPin();
-    if (helperPub.length !== 32) {
-      write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
-      return 1;
-    }
-    const helperFingerprint = fingerprintFromPublicKey(helperPub);
+    helperPub = await client.installPin();
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  if (helperPub.length !== 32) {
+    write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
+    return 1;
+  }
+  const helperFingerprint = fingerprintFromPublicKey(helperPub);
 
+  // POST-MIGRATION phase: `installPin()` succeeded, so the trust anchor IS
+  // migrated to the helper key. Everything below is audit bookkeeping (reading
+  // the retiring key, deriving the master key, recording the rotation proof).
+  // F2b — a failure HERE (e.g. `aes/gcm: invalid ghash tag` when the fortress
+  // material can't be decrypted) must NOT be reported as a re-pin failure:
+  // telling the operator the migration failed when the anchor actually moved is
+  // the more dangerous lie. Degrade to a loud warning and still return 0,
+  // printing the migrated fingerprint.
+  try {
     // Read the retiring K_old (the passphrase-derived key provision-pin minted).
     // Its presence lets us emit the old-signs-new rotation proof for audit
     // continuity. If it is already gone (a prior re-pin retired it), treat this
@@ -584,6 +698,7 @@ export async function runRePin(
         // no-op re-assert.
         write(out, `${helperFingerprint}\n`);
         write(out, "Pin already holds the helper key; re-asserted (no rotation).\n");
+        masterKey.fill(0);
         return 0;
       }
       const proof = buildPinRotationProof({
@@ -633,9 +748,138 @@ export async function runRePin(
     write(out, "Pin re-asserted to the helper key (no retiring key to rotate).\n");
     return 0;
   } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
+    // The broken-audit-chain refusal (no --accept-broken-chain) is a DELIBERATE
+    // fail-closed gate, not an incidental bookkeeping error. Preserve it exactly
+    // as before: surface it and return 1. F2b must not weaken this gating.
+    if (error instanceof AuditIntegrityError) {
+      write(err, `Error: ${error.message}\n`);
+      return 1;
+    }
+    // F2b — the pin migrated, but recording the rotation proof failed for an
+    // incidental reason (e.g. `aes/gcm: invalid ghash tag` when fortress
+    // material can't be decrypted). Do NOT report re-pin failure: emit a
+    // warning, print the migrated fingerprint, and return 0. The anchor IS
+    // migrated; claiming failure would be the more dangerous lie.
+    const reason = error instanceof Error ? error.message : String(error);
+    write(out, `${helperFingerprint}\n`);
+    write(
+      err,
+      `Trust anchor migrated to ${helperFingerprint}, but recording the rotation ` +
+        `proof in the audit log failed: ${reason}. The pin migration itself succeeded.\n`,
+    );
+    return 0;
   }
+}
+
+/**
+ * Read the global enforcement pin without ever throwing out of `status`.
+ * Returns the 32-byte key on success, `"none"` when no global pin is
+ * provisioned (ENOENT), or `"unreadable"` when it exists but is root-owned and
+ * not readable without elevation (EACCES/EPERM). Any other error also degrades
+ * to `"unreadable"` rather than throwing — status is a diagnostic, not a gate.
+ * Test-injectable via `ctx.globalPinReader`.
+ */
+async function readGlobalPinForStatus(
+  ctx: CastleWallCommandContext,
+): Promise<Uint8Array | "none" | "unreadable"> {
+  const reader =
+    ctx.globalPinReader ?? (() => readFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH));
+  try {
+    const key = await reader();
+    if (key.length !== 32) return "unreadable";
+    return key;
+  } catch (error) {
+    const code =
+      error instanceof Error && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") return "none";
+    if (code === "EACCES" || code === "EPERM") return "unreadable";
+    return "unreadable";
+  }
+}
+
+/**
+ * F3 — print the global enforcement pin and a trust-anchor consistency verdict.
+ * AUTHORITATIVE approach: the signer helper exposes a non-mutating `get-pubkey`
+ * query (`HelperSignerClient.getPublicKey`), so when a signer-client shim is
+ * resolvable we compare the global pin against the live helper key and print
+ * CONSISTENT / BROKEN. If no helper query is reachable (no shim resolvable, or
+ * the query fails), we fall back to comparing the global pin against the local
+ * fortress key and note that the authoritative pin==helper check needs the
+ * running daemon/helper. Never throws out of status.
+ */
+async function reportGlobalPinAndVerdict(
+  out: Writable,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  ctx: CastleWallCommandContext,
+  localFingerprint: string | null,
+): Promise<void> {
+  const global = await readGlobalPinForStatus(ctx);
+  if (global === "none") {
+    write(out, "Global pin (enforcement anchor): none (no global pin provisioned)\n");
+    write(
+      out,
+      "Trust anchor: no global pin provisioned (run 'sanctuary castle-wall re-pin' to install it)\n",
+    );
+    return;
+  }
+  if (global === "unreadable") {
+    write(
+      out,
+      "Global pin (enforcement anchor): unreadable (root-owned; re-run with elevation to inspect)\n",
+    );
+    return;
+  }
+
+  const globalFingerprint = fingerprintFromPublicKey(global);
+  write(out, `Global pin (enforcement anchor): ${globalFingerprint}\n`);
+
+  // Try the AUTHORITATIVE read-only helper query first.
+  const shimPath = await resolveSignerClientPath(env, platform, ctx);
+  if (shimPath || ctx.signerClientInvoke) {
+    try {
+      const client = new HelperSignerClient({
+        clientBinaryPath: shimPath ?? "castle-wall-signer-client",
+        ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
+      });
+      const helperPub = await client.getPublicKey();
+      const helperFingerprint = fingerprintFromPublicKey(helperPub);
+      if (helperFingerprint === globalFingerprint) {
+        write(out, "Trust anchor: CONSISTENT (global pin == signer-helper key)\n");
+      } else {
+        write(
+          out,
+          "Trust anchor: BROKEN (global pin != signer-helper key; box cannot arm until re-pinned)\n",
+        );
+      }
+      return;
+    } catch {
+      // Helper query unreachable — fall through to the softer local comparison.
+    }
+  }
+
+  // Fallback: compare global pin vs local fortress key (softer, non-authoritative).
+  if (localFingerprint === null) {
+    write(
+      out,
+      "Trust anchor: cannot verify (no local fortress key on disk; the authoritative pin==signer-helper check needs the running daemon/signer helper)\n",
+    );
+    return;
+  }
+  if (localFingerprint === globalFingerprint) {
+    write(out, "Trust anchor: global pin matches local fortress key\n");
+  } else {
+    write(
+      out,
+      "Trust anchor: global pin DIFFERS from local fortress key (run re-pin or check the signer helper)\n",
+    );
+  }
+  write(
+    out,
+    "Note: the authoritative pin==signer-helper check needs the running daemon/signer helper.\n",
+  );
 }
 
 export async function runStatus(
@@ -654,6 +898,7 @@ export async function runStatus(
   const storagePath = resolveStoragePath(env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
 
+  let localFingerprint: string | null = null;
   try {
     const publicKey = await readFile(pubPath);
     if (publicKey.length !== 32) {
@@ -661,7 +906,8 @@ export async function runStatus(
         `Pinned public key at ${pubPath} must be 32 bytes (found ${publicKey.length}).`
       );
     }
-    write(out, `Pinned key fingerprint: ${fingerprintFromPublicKey(publicKey)}\n`);
+    localFingerprint = fingerprintFromPublicKey(publicKey);
+    write(out, `Pinned key fingerprint: ${localFingerprint}\n`);
   } catch (error) {
     if (
       error instanceof Error &&
@@ -681,6 +927,17 @@ export async function runStatus(
     write(out, "Castle Wall sysext: not applicable (non-macOS)\n");
     return 0;
   }
+
+  // F3 — surface the GLOBAL pin (the actual enforcement anchor) and a
+  // trust-anchor consistency verdict. A box can sit un-armable for days with no
+  // signal when the global pin diverges from the signer-helper key (the
+  // 06-11b→06-13 situation). Reading the global pin NEVER throws out of status:
+  // ENOENT = no global pin provisioned; EACCES/EPERM = root-owned and
+  // unreadable without elevation. The consistency check is AUTHORITATIVE: the
+  // signer helper exposes a non-mutating `get-pubkey` query (HelperSignerClient
+  // .getPublicKey — NOT installPin(), which would MUTATE the pin), so we compare
+  // the global pin against the live helper key directly.
+  await reportGlobalPinAndVerdict(out, env, platform, ctx, localFingerprint);
 
   let sysextState: SysextState;
   try {
@@ -862,6 +1119,14 @@ export async function runDaemon(
     err,
   });
 
+  // F1 — resolve the signer-client shim the same way `re-pin` does: explicit
+  // ctx → env → auto-discovered bundled shim. Lets a normally-installed box arm
+  // without the operator having to set SANCTUARY_CASTLE_SIGNER_CLIENT by hand
+  // (the 2026-06-13 drill operability gap). Only used in helper-sign mode.
+  const resolvedSignerClient = localSign
+    ? undefined
+    : await resolveSignerClientPath(env, platform, ctx);
+
   const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
   let daemon: { socketPath: string; stop: () => Promise<void> };
   try {
@@ -871,8 +1136,8 @@ export async function runDaemon(
       masterKey: derived.key,
       auditLog,
       ...(localSign ? { localSign: true } : {}),
-      ...(env.SANCTUARY_CASTLE_SIGNER_CLIENT
-        ? { signerClientPath: env.SANCTUARY_CASTLE_SIGNER_CLIENT }
+      ...(resolvedSignerClient
+        ? { signerClientPath: resolvedSignerClient }
         : {}),
     });
   } catch (error) {

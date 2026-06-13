@@ -177,13 +177,18 @@ describe("castle-wall re-pin : runRePin", () => {
     }
   });
 
-  it("fails when no signer-client is configured", async () => {
+  it("fails when no signer-client is configured and none auto-discovered", async () => {
     const err = capture();
     const rc = await runRePin([], {
       out: silent,
       err: err.stream,
       env: { SANCTUARY_STORAGE_PATH: "/tmp/does-not-matter" },
       platform: "darwin",
+      // F1 (drill 06-13): re-pin now auto-discovers the bundled shim on darwin.
+      // Pin the discovery seam to "nothing found" so this fail-closed test is
+      // independent of whether the build host has the Castle Wall app installed.
+      signerClientCandidates: [],
+      fileExistsFn: async () => false,
     });
     expect(rc).toBe(1);
     expect(err.text()).toMatch(/signer-client shim path unknown/);

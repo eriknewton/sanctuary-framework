@@ -840,3 +840,282 @@ describe("castle-wall audit-chain operator override", () => {
     expect(parseCastleWallArgs([]).acceptBrokenChain).toBeUndefined();
   });
 });
+
+describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function makeFortress() {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-ops-"));
+    tempDirs.push(fortressPath);
+    const masterKey = generateRandomKey();
+    const recoveryKey = toBase64url(masterKey);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    await storage.write(
+      "_meta",
+      "recovery-key-hash",
+      stringToBytes(hashToString(masterKey)),
+    );
+    return { fortressPath, masterKey, recoveryKey };
+  }
+
+  function fingerprint(pub: Uint8Array): string {
+    return createHash("sha256").update(pub).digest("hex").slice(0, 16);
+  }
+
+  function makeMockHelper() {
+    const seed = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(seed);
+    const invoke: ShimInvoker = async (args, stdin) => {
+      const mode = args[0];
+      if (mode === "get-pubkey" || mode === "re-pin") {
+        return { stdout: toBase64url(pub), stderr: "", code: 0 };
+      }
+      const sig = ed25519.sign(stdin ?? new Uint8Array(0), seed);
+      return { stdout: toBase64url(sig), stderr: "", code: 0 };
+    };
+    return { pub, invoke };
+  }
+
+  // ── F1: signer-client shim auto-discovery ────────────────────────────────
+
+  it("F1: SANCTUARY_CASTLE_SIGNER_CLIENT env var still wins over auto-discovery", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const helper = makeMockHelper();
+    // An env path is set; auto-discovery candidates would also resolve, but the
+    // env var takes precedence — and because signerClientInvoke is injected the
+    // bundle probe is never the deciding factor. Assert success + no shim error.
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+        SANCTUARY_CASTLE_SIGNER_CLIENT: "/some/env/shim",
+      },
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+      // Auto-discovery would also find this, proving env still wins (no error).
+      signerClientCandidates: ["/Applications/whatever/castle-wall-signer-client"],
+      fileExistsFn: async () => true,
+    });
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("signer-client shim path unknown");
+  });
+
+  it("F1: auto-discovery resolves an injected bundle candidate when env is unset", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const helper = makeMockHelper();
+    // No env var, no ctx.signerClientPath. Auto-discovery finds the injected
+    // executable candidate, so re-pin does NOT hit the "path unknown" wall.
+    const err = new CaptureStream();
+    const out = new CaptureStream();
+    const code = await runRePin([], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+      signerClientCandidates: [
+        "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
+      ],
+      fileExistsFn: async (p) => p.endsWith("castle-wall-signer-client"),
+    });
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("signer-client shim path unknown");
+    expect(out.text()).toContain(fingerprint(helper.pub));
+  });
+
+  it("F1: falls through to the 'path unknown' error when nothing resolves", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    // No env, no ctx path, no signerClientInvoke, and auto-discovery finds
+    // nothing executable → the original fail-closed error fires (exit 1).
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      signerClientCandidates: ["/Applications/missing/castle-wall-signer-client"],
+      fileExistsFn: async () => false,
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain("signer-client shim path unknown");
+  });
+
+  // ── F2a: loud target-fortress announcement ───────────────────────────────
+
+  it("F2a: announces the resolved target fortress before state-touching work", async () => {
+    const { fortressPath, recoveryKey } = await makeFortress();
+    const helper = makeMockHelper();
+    const err = new CaptureStream();
+    await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+    });
+    expect(err.text()).toContain(
+      `Re-pinning trust anchor for fortress: ${fortressPath}`,
+    );
+    // Explicit storage path → NOT flagged as the default fortress.
+    expect(err.text()).not.toContain("default fortress; set SANCTUARY_STORAGE_PATH");
+  });
+
+  it("F2a: flags the DEFAULT fortress note when SANCTUARY_STORAGE_PATH is unset", async () => {
+    // No SANCTUARY_STORAGE_PATH → resolveStoragePath defaults to ~/.sanctuary.
+    // We don't let it proceed to real state (no shim resolvable, no invoke), so
+    // it returns 1 at the shim-resolution wall — but the announcement (which
+    // runs FIRST) must already carry the default-fortress note.
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out: new CaptureStream(),
+      err,
+      env: {},
+      platform: "darwin",
+      signerClientCandidates: [],
+      fileExistsFn: async () => false,
+    });
+    expect(code).toBe(1); // hit the shim-unknown wall, no state touched
+    expect(err.text()).toContain("Re-pinning trust anchor for fortress:");
+    expect(err.text()).toContain(
+      "(default fortress; set SANCTUARY_STORAGE_PATH to target another)",
+    );
+  });
+
+  // ── F2b: don't mask a successful migration behind a post-migration error ──
+
+  it("F2b: post-migration audit failure degrades to a warning, prints fp, exits 0", async () => {
+    const { fortressPath } = await makeFortress();
+    const helper = makeMockHelper();
+    // installPin() succeeds (mock helper), but resolveMasterKey FAILS because the
+    // supplied recovery key does not match the fortress's recovery-key-hash
+    // marker. That throw lands in the POST-migration audit-bookkeeping phase, so
+    // the migration must NOT be reported as a failure.
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runRePin([], {
+      out,
+      err,
+      env: {
+        SANCTUARY_STORAGE_PATH: fortressPath,
+        // Wrong recovery key → establishMaster rejects it (post-installPin throw).
+        SANCTUARY_RECOVERY_KEY: toBase64url(generateRandomKey()),
+      },
+      platform: "darwin",
+      signerClientInvoke: helper.invoke,
+    });
+    expect(code).toBe(0);
+    // The migrated fingerprint is still printed to stdout.
+    expect(out.text()).toContain(fingerprint(helper.pub));
+    // The warning explains the audit-record failure but affirms the migration.
+    expect(err.text()).toContain("Trust anchor migrated to");
+    expect(err.text()).toContain("The pin migration itself succeeded.");
+  });
+
+  // ── F3: status reports the global pin + a consistency verdict ─────────────
+
+  it("F3: status reports CONSISTENT when global pin == signer-helper key", async () => {
+    const { fortressPath } = await makeFortress();
+    const helper = makeMockHelper();
+    const out = new CaptureStream();
+    const code = await runStatus({
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: "darwin",
+      execSyncFn: () => "com.sanctuary.castle-wall [activated enabled]",
+      hostAppCandidates: [],
+      // Global pin equals the mock helper's key → authoritative CONSISTENT.
+      globalPinReader: async () => helper.pub,
+      signerClientInvoke: helper.invoke,
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain(
+      `Global pin (enforcement anchor): ${fingerprint(helper.pub)}`,
+    );
+    expect(out.text()).toContain(
+      "Trust anchor: CONSISTENT (global pin == signer-helper key)",
+    );
+  });
+
+  it("F3: status reports BROKEN when global pin != signer-helper key", async () => {
+    const { fortressPath } = await makeFortress();
+    const helper = makeMockHelper();
+    const otherPin = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
+    const out = new CaptureStream();
+    const code = await runStatus({
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: "darwin",
+      execSyncFn: () => "com.sanctuary.castle-wall [activated enabled]",
+      hostAppCandidates: [],
+      // Global pin differs from the helper key → authoritative BROKEN.
+      globalPinReader: async () => otherPin,
+      signerClientInvoke: helper.invoke,
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain(
+      `Global pin (enforcement anchor): ${fingerprint(otherPin)}`,
+    );
+    expect(out.text()).toContain(
+      "Trust anchor: BROKEN (global pin != signer-helper key; box cannot arm until re-pinned)",
+    );
+  });
+
+  it("F3: status reports 'none' gracefully when no global pin is provisioned", async () => {
+    const { fortressPath } = await makeFortress();
+    const out = new CaptureStream();
+    const enoent = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    const code = await runStatus({
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: "darwin",
+      execSyncFn: () => "com.sanctuary.castle-wall [activated enabled]",
+      hostAppCandidates: [],
+      globalPinReader: async () => {
+        throw enoent;
+      },
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain(
+      "Global pin (enforcement anchor): none (no global pin provisioned)",
+    );
+    expect(out.text()).toContain("Trust anchor: no global pin provisioned");
+  });
+
+  it("F3: status reports 'unreadable' gracefully on EACCES (root-owned global pin)", async () => {
+    const { fortressPath } = await makeFortress();
+    const out = new CaptureStream();
+    const eacces = Object.assign(new Error("EACCES"), { code: "EACCES" });
+    const code = await runStatus({
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: "darwin",
+      execSyncFn: () => "com.sanctuary.castle-wall [activated enabled]",
+      hostAppCandidates: [],
+      globalPinReader: async () => {
+        throw eacces;
+      },
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain(
+      "Global pin (enforcement anchor): unreadable (root-owned; re-run with elevation to inspect)",
+    );
+  });
+});
