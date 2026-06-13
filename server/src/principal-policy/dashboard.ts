@@ -282,6 +282,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private readonly _federationRoster = new Set<string>();
   private readonly _federationNodes = new Map<string, FederationNodeView>();
   private readonly _federationEventLog: FederationEvent[] = [];
+  /**
+   * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
+   * highest envelope high-water accepted per sender node id (whole-envelope
+   * rollback guard); `_federationOutboundHighWater` is the monotonic counter
+   * this daemon stamps on the reciprocal envelopes it returns.
+   */
+  private readonly _federationAcceptedHighWater = new Map<string, number>();
+  private _federationOutboundHighWater = 0;
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -1046,6 +1054,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       listNodes: () => [...this._federationNodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
       appendFederationEvents: (events) => this.appendFederationEvents(events),
+      acceptedHighWaterFor: (senderNodeId) =>
+        this._federationAcceptedHighWater.get(senderNodeId) ?? null,
+      recordAcceptedHighWater: (senderNodeId, highWater) => {
+        const prior = this._federationAcceptedHighWater.get(senderNodeId) ?? 0;
+        // Defensive: only ever advance (the handler already gates rollback).
+        if (highWater > prior) {
+          this._federationAcceptedHighWater.set(senderNodeId, highWater);
+        }
+        this.upsertFederationNode(senderNodeId, {
+          attestation_status: "verified",
+        });
+      },
+      nextOutboundHighWater: () => ++this._federationOutboundHighWater,
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -1079,6 +1100,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     };
     this._federationNodes.set(nodeId, node);
     return node;
+  }
+
+  /**
+   * PR-A5: emit a portable `agent.identity` federation event for an agent
+   * attested on THIS node. The event rides the hash-chained log and, once a
+   * peer accepts the envelope that carries it (cert-chain verified), the agent
+   * is RECOGNIZED across the operator's machines without re-minting its
+   * identity — the "identity survives a substrate move" property. Called by the
+   * agent-protect path (and by the marquee integration test) when a fortress
+   * node admits an agent. Returns the appended event for the caller to surface.
+   */
+  recordLocalAgentIdentity(agentId: string, agentPubkey?: string): FederationEvent {
+    const payload: Record<string, unknown> = { agent_id: agentId };
+    if (agentPubkey !== undefined) payload.agent_pubkey = agentPubkey;
+    return this.appendLocalFederationEvent("agent.identity", payload);
   }
 
   private appendLocalFederationEvent(kind: string, payload: Record<string, unknown>): FederationEvent {
