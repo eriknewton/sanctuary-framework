@@ -221,6 +221,14 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "rotate-master") {
+    const { runRotateMasterCommand } = await import(
+      "./cli/rotate-master.js"
+    );
+    const code = await runRotateMasterCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "intelligence") {
     const { runIntelligenceCommand } = await import(
       "./cli/intelligence.js"
@@ -678,6 +686,8 @@ Subcommands:
                        Use "sanctuary castle-wall --help" for options.
 
   reset-passphrase     Recover a fortress whose passphrase has been lost
+  rotate-master        Rotate the fortress master key (re-encrypts all data;
+                       interactive-only; "sanctuary rotate-master --help")
                        or corrupted. Three modes: shares (M-of-N
                        reconstruction), guardian (federation quorum), or
                        nuke (destroys all state, fresh start).

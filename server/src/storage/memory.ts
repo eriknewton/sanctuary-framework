@@ -10,6 +10,10 @@ import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 
 export class MemoryStorage implements StorageBackend {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
+  // Composite store keys are `${namespace}/${key}` and a namespace may itself
+  // contain "/", so live namespaces are tracked explicitly (entry counts)
+  // rather than re-parsed out of composite keys.
+  private namespaceCounts = new Map<string, number>();
 
   private storageKey(namespace: string, key: string): string {
     return `${namespace}/${key}`;
@@ -21,7 +25,14 @@ export class MemoryStorage implements StorageBackend {
     data: Uint8Array
   ): Promise<void> {
     const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    this.store.set(this.storageKey(namespace, key), {
+    const storageKey = this.storageKey(namespace, key);
+    if (!this.store.has(storageKey)) {
+      this.namespaceCounts.set(
+        namespace,
+        (this.namespaceCounts.get(namespace) ?? 0) + 1
+      );
+    }
+    this.store.set(storageKey, {
       data: checkedData,
       modified_at: new Date().toISOString(),
     });
@@ -38,7 +49,16 @@ export class MemoryStorage implements StorageBackend {
     key: string,
     _secureOverwrite?: boolean
   ): Promise<boolean> {
-    return this.store.delete(this.storageKey(namespace, key));
+    const deleted = this.store.delete(this.storageKey(namespace, key));
+    if (deleted) {
+      const count = (this.namespaceCounts.get(namespace) ?? 1) - 1;
+      if (count <= 0) {
+        this.namespaceCounts.delete(namespace);
+      } else {
+        this.namespaceCounts.set(namespace, count);
+      }
+    }
+    return deleted;
   }
 
   async list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
@@ -73,8 +93,13 @@ export class MemoryStorage implements StorageBackend {
     return total;
   }
 
+  async listNamespaces(): Promise<string[]> {
+    return [...this.namespaceCounts.keys()].sort();
+  }
+
   /** Clear all stored data (useful in tests) */
   clear(): void {
     this.store.clear();
+    this.namespaceCounts.clear();
   }
 }

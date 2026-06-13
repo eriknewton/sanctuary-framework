@@ -111,6 +111,20 @@ const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
 /** `_meta` key holding the envelope. */
 export const CUSTODY_ENVELOPE_KEY = "custody-envelope";
 
+/**
+ * `_meta` key holding the master-rotation journal (core/master-rotation.ts).
+ * Its PRESENCE means a rotation is in flight: some fortress data may be under
+ * the old master and some under the new. Every establishment path refuses to
+ * proceed until the rotation is resumed to completion (or rolled back from
+ * the staging phase) — booting half-keyed is exactly the split-state lockout
+ * the custody work exists to kill.
+ */
+export const ROTATION_JOURNAL_KEY = "rotation-journal";
+
+/** `_meta` keys staged by an in-flight rotation (promoted at finalize). */
+export const STAGED_CUSTODY_ENVELOPE_KEY = "custody-envelope-next";
+export const STAGED_CUSTODY_SENTINEL_KEY = "custody-sentinel-next";
+
 /** Verified-wrap count required before trust-bearing state may persist. */
 export const CUSTODY_FLOOR_WRAPS = 2;
 
@@ -224,6 +238,25 @@ export class CustodyEnvelopeIntegrityError extends Error {
           "trusted backup."
     );
     this.name = "CustodyEnvelopeIntegrityError";
+  }
+}
+
+/**
+ * A master rotation is in flight (the rotation journal exists). Normal
+ * establishment refuses: the fortress may hold a mix of old-master and
+ * new-master ciphertext until the rotation completes.
+ */
+export class CustodyRotationInProgressError extends Error {
+  constructor() {
+    super(
+      "Sanctuary: a master-key rotation is in progress on this fortress.\n" +
+        "Some data may still be encrypted under the previous master. Refusing to\n" +
+        "start until the rotation completes. Run:\n" +
+        "  sanctuary rotate-master --resume\n" +
+        "to finish it (or `sanctuary rotate-master --abort` if it never left the\n" +
+        "staging phase). Both require the fortress passphrase."
+    );
+    this.name = "CustodyRotationInProgressError";
   }
 }
 
@@ -502,12 +535,16 @@ export function verifyEnvelopeMac(
 // ── Envelope persistence ────────────────────────────────────────────
 
 export async function readCustodyEnvelope(
-  storage: StorageBackend
+  storage: StorageBackend,
+  opts?: { envelopeKey?: string }
 ): Promise<CustodyEnvelope | null> {
   // A storage READ ERROR propagates (fail closed): treating an unreadable
   // envelope as "absent" let an attacker who could make the file unreadable
   // demote the fortress to floor-exempt legacy custody (codex round-2 H2).
-  const raw = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+  const raw = await storage.read(
+    "_meta",
+    opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY
+  );
   if (!raw) return null;
   let parsed: unknown;
   try {
@@ -544,7 +581,7 @@ export async function readCustodyEnvelope(
 }
 
 /** Plaintext + purpose label for the custody sentinel (see write below). */
-const CUSTODY_SENTINEL_KEY = "custody-sentinel";
+export const CUSTODY_SENTINEL_KEY = "custody-sentinel";
 const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
 
 /**
@@ -557,7 +594,17 @@ const CUSTODY_SENTINEL_PLAINTEXT = "sanctuary-custody-sentinel-v1";
 export async function writeCustodyEnvelope(
   storage: StorageBackend,
   envelope: Omit<CustodyEnvelope, "mac"> | CustodyEnvelope,
-  master: Uint8Array
+  master: Uint8Array,
+  opts?: {
+    /**
+     * Alternate `_meta` keys for the envelope + sentinel. Used ONLY by the
+     * master-rotation engine to STAGE the next custody envelope at
+     * `custody-envelope-next` while the live envelope stays authoritative;
+     * the staged pair is promoted to the real keys at finalize.
+     */
+    envelopeKey?: string;
+    sentinelKey?: string;
+  }
 ): Promise<CustodyEnvelope> {
   assertMaster(master);
   const stamped: CustodyEnvelope = {
@@ -569,7 +616,7 @@ export async function writeCustodyEnvelope(
   };
   await storage.write(
     "_meta",
-    CUSTODY_ENVELOPE_KEY,
+    opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
     stringToBytes(JSON.stringify(stamped))
   );
   const sentinelKey = derivePurposeKey(master, "custody-sentinel");
@@ -581,7 +628,7 @@ export async function writeCustodyEnvelope(
   sentinelKey.fill(0);
   await storage.write(
     "_meta",
-    CUSTODY_SENTINEL_KEY,
+    opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
     stringToBytes(JSON.stringify(sentinel))
   );
   return stamped;
@@ -866,6 +913,15 @@ export async function establishMaster(
 ): Promise<EstablishMasterResult> {
   const { storage } = opts;
   const now = new Date().toISOString();
+
+  // Master-rotation guard: while the rotation journal exists, fortress data
+  // may be split between the old and new masters. NO establishment path may
+  // proceed — not even with a valid credential — until the rotation is
+  // resumed to completion. (The rotation engine itself unwraps the envelopes
+  // directly and never goes through establishMaster.)
+  if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+    throw new CustodyRotationInProgressError();
+  }
 
   const envelope = await readCustodyEnvelope(storage);
   if (envelope) {
@@ -1169,7 +1225,8 @@ export async function resolveCliMasterKey(
 export async function verifyRecoveryWrapByReentry(
   storage: StorageBackend,
   envelope: CustodyEnvelope,
-  reenteredKey: string
+  reenteredKey: string,
+  opts?: { envelopeKey?: string; sentinelKey?: string }
 ): Promise<CustodyEnvelope> {
   const match = await unwrapMatchingWrap(
     envelope.wraps,
@@ -1186,7 +1243,8 @@ export async function verifyRecoveryWrapByReentry(
           w.id === match.wrapId ? { ...w, verified: true } : w
         ),
       },
-      match.master
+      match.master,
+      opts
     );
     return updated;
   } finally {

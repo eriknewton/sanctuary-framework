@@ -139,6 +139,165 @@ const AUDIT_HEAD_ANCHOR_MARKER = "__sanctuary_audit_head_anchor_v1";
 // optional Ed25519 checkpoint signer, which may be null.
 const AUDIT_ROTATION_ANCHOR_MAC_DOMAIN = "sanctuary.audit-rotation-anchor.v1\n";
 const AUDIT_HEAD_ANCHOR_MAC_DOMAIN = "sanctuary.audit-head-anchor.v1\n";
+
+// ── Master-rotation custody epochs (F7) ─────────────────────────────
+//
+// A MASTER rotation (core/master-rotation.ts) deliberately does NOT
+// re-encrypt audit entry ciphertext: every entry_hash in the tamper-evident
+// chain — and every externally anchorable checkpoint root built from those
+// hashes — covers `encrypted_payload_bytes`, so rewriting the ciphertext
+// would invalidate the entire verification history and turn rotation into an
+// undetectable history-rewrite window. Instead the rotation engine stores
+// the retiring epoch's audit purpose key, wrapped under the NEW master, in a
+// MAC-authenticated record; decryption is key-id-scoped (try the current
+// epoch key, then prior epochs), while chain verification is untouched and
+// verifies seamlessly ACROSS the rotation boundary.
+//
+// Residual (documented): pre-rotation audit payloads remain encrypted under
+// the old-master-derived audit key, so an adversary who holds BOTH the old
+// master AND the ciphertext can still read pre-rotation audit metadata
+// (operation names/results — never key material, per CLAUDE.md #6). That is
+// the price of keeping the chain externally verifiable across rotation.
+export const AUDIT_EPOCH_KEYS_KEY = "__custody_epoch_keys";
+const AUDIT_EPOCH_KEYS_MARKER = "__sanctuary_audit_epoch_keys_v1";
+const AUDIT_EPOCH_MAC_DOMAIN = "sanctuary.audit-epoch-keys.v1\n";
+const AUDIT_EPOCH_WRAP_PURPOSE = "audit-epoch-wrap";
+const AUDIT_EPOCH_MAC_PURPOSE = "audit-epoch-record-mac";
+
+export interface AuditEpochEntry {
+  rotation_id: string;
+  rotated_at: string;
+  /** The retiring epoch's audit purpose key, AES-256-GCM wrapped under
+   * HKDF(current master, "audit-epoch-wrap"). Never plaintext at rest. */
+  wrapped_key: EncryptedPayload;
+}
+
+function epochRecordMacBytes(
+  macKey: Uint8Array,
+  data: { epochs: AuditEpochEntry[] }
+): Uint8Array {
+  return hmacSha256(
+    macKey,
+    stringToBytes(AUDIT_EPOCH_MAC_DOMAIN + canonicalJson(data))
+  );
+}
+
+/**
+ * Read + authenticate the custody-epoch record and unwrap the prior epoch
+ * audit keys. Returns [] when the record is absent. A present-but-invalid
+ * record (malformed, marker stripped, MAC mismatch, unwrap failure) returns
+ * [] as well: the prior-epoch entries then fail decryption and surface as
+ * `entry_decrypt_failed` integrity findings — fail closed, never a silent
+ * downgrade to "those entries don't exist".
+ */
+export async function readAuditEpochKeys(
+  storage: StorageBackend,
+  keys: { epochWrapKey: Uint8Array; epochMacKey: Uint8Array }
+): Promise<Uint8Array[]> {
+  let raw: Uint8Array | null;
+  try {
+    raw = await storage.read(AUDIT_CHECKPOINT_NAMESPACE, AUDIT_EPOCH_KEYS_KEY);
+  } catch {
+    return [];
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+    if (parsed?.[AUDIT_EPOCH_KEYS_MARKER] !== true) return [];
+    const data = parsed.data as { epochs: AuditEpochEntry[] };
+    const mac = parsed.mac;
+    if (typeof mac !== "string" || !Array.isArray(data?.epochs)) return [];
+    const provided = fromBase64url(mac);
+    if (
+      !constantTimeEqual(provided, epochRecordMacBytes(keys.epochMacKey, data))
+    ) {
+      return [];
+    }
+    const out: Uint8Array[] = [];
+    for (const epoch of data.epochs) {
+      out.push(decrypt(epoch.wrapped_key, keys.epochWrapKey));
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read the epoch record's raw entries (authenticated) for the rotation
+ * engine, which must re-wrap every prior epoch key under the next master.
+ */
+export async function readAuditEpochEntries(
+  storage: StorageBackend,
+  keys: { epochWrapKey: Uint8Array; epochMacKey: Uint8Array }
+): Promise<Array<{ entry: AuditEpochEntry; key: Uint8Array }>> {
+  const raw = await storage.read(
+    AUDIT_CHECKPOINT_NAMESPACE,
+    AUDIT_EPOCH_KEYS_KEY
+  );
+  if (!raw) return [];
+  const parsed = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+  if (parsed?.[AUDIT_EPOCH_KEYS_MARKER] !== true) {
+    throw new Error(
+      "Sanctuary: audit custody-epoch record is malformed (marker missing)."
+    );
+  }
+  const data = parsed.data as { epochs: AuditEpochEntry[] };
+  const mac = parsed.mac;
+  if (
+    typeof mac !== "string" ||
+    !Array.isArray(data?.epochs) ||
+    !constantTimeEqual(
+      fromBase64url(mac),
+      epochRecordMacBytes(keys.epochMacKey, data)
+    )
+  ) {
+    throw new Error(
+      "Sanctuary: audit custody-epoch record failed authentication " +
+        "(tampered, forged, or wrong key). Refusing to rotate over it."
+    );
+  }
+  return data.epochs.map((entry) => ({
+    entry,
+    key: decrypt(entry.wrapped_key, keys.epochWrapKey),
+  }));
+}
+
+/** Write the authenticated custody-epoch record (rotation engine only). */
+export async function writeAuditEpochRecord(
+  storage: StorageBackend,
+  keys: { epochWrapKey: Uint8Array; epochMacKey: Uint8Array },
+  epochs: Array<{ rotation_id: string; rotated_at: string; key: Uint8Array }>
+): Promise<void> {
+  const data = {
+    epochs: epochs.map((e) => ({
+      rotation_id: e.rotation_id,
+      rotated_at: e.rotated_at,
+      wrapped_key: encrypt(e.key, keys.epochWrapKey),
+    })),
+  };
+  const record = {
+    [AUDIT_EPOCH_KEYS_MARKER]: true,
+    data,
+    mac: toBase64url(epochRecordMacBytes(keys.epochMacKey, data)),
+  };
+  await storage.write(
+    AUDIT_CHECKPOINT_NAMESPACE,
+    AUDIT_EPOCH_KEYS_KEY,
+    stringToBytes(JSON.stringify(record))
+  );
+}
+
+/** Derive the epoch wrap + MAC keys for a given master (rotation engine). */
+export function deriveAuditEpochKeys(masterKey: Uint8Array): {
+  epochWrapKey: Uint8Array;
+  epochMacKey: Uint8Array;
+} {
+  return {
+    epochWrapKey: derivePurposeKey(masterKey, AUDIT_EPOCH_WRAP_PURPOSE),
+    epochMacKey: derivePurposeKey(masterKey, AUDIT_EPOCH_MAC_PURPOSE),
+  };
+}
 const AUDIT_INTEGRITY_ALERT_NAMESPACE = "_audit_integrity_alert";
 const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
@@ -256,6 +415,10 @@ export class AuditLog {
   private encryptionKey: Uint8Array;
   private rotationAnchorMacKey: Uint8Array;
   private headAnchorMacKey: Uint8Array;
+  private epochWrapKey: Uint8Array;
+  private epochMacKey: Uint8Array;
+  /** Lazily-loaded prior-epoch audit keys (master rotations); null = not yet loaded. */
+  private epochKeysCache: Uint8Array[] | null = null;
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
@@ -293,6 +456,11 @@ export class AuditLog {
     // master key (mirrors how encryptionKey is derived here, per F1's pattern).
     this.rotationAnchorMacKey = derivePurposeKey(masterKey, "audit-rotation-anchor");
     this.headAnchorMacKey = derivePurposeKey(masterKey, "audit-head-anchor");
+    // F7: keys for the custody-epoch record (pre-rotation entry decryption).
+    // Derived up front so the raw master is never retained on the instance.
+    const epochKeys = deriveAuditEpochKeys(masterKey);
+    this.epochWrapKey = epochKeys.epochWrapKey;
+    this.epochMacKey = epochKeys.epochMacKey;
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.integrityMode = config?.integrityMode ?? "strict";
@@ -1473,6 +1641,37 @@ export class AuditLog {
     await this.storage.write(AUDIT_NAMESPACE, key, persistedBytes);
   }
 
+  /**
+   * Decrypt an audit entry payload: current epoch key first, then prior
+   * custody-epoch keys (master rotations, F7). GCM authentication decides;
+   * the original failure propagates when nothing matches — never a weaker
+   * path (#5). The epoch list is loaded at most once per instance; a
+   * missing/invalid epoch record yields no keys, so prior-epoch entries
+   * surface as `entry_decrypt_failed` findings (fail closed).
+   */
+  private async decryptEntryPayload(
+    encrypted: EncryptedPayload
+  ): Promise<Uint8Array> {
+    try {
+      return decrypt(encrypted, this.encryptionKey);
+    } catch (primaryErr) {
+      if (this.epochKeysCache === null) {
+        this.epochKeysCache = await readAuditEpochKeys(this.storage, {
+          epochWrapKey: this.epochWrapKey,
+          epochMacKey: this.epochMacKey,
+        });
+      }
+      for (const epochKey of this.epochKeysCache) {
+        try {
+          return decrypt(encrypted, epochKey);
+        } catch {
+          // Try the next epoch; GCM authentication decides.
+        }
+      }
+      throw primaryErr;
+    }
+  }
+
   private async loadPersistedEntries(): Promise<void> {
     const findings: AuditIntegrityFinding[] = [];
     const legacyRawEntries: Array<{ key: string; raw: Uint8Array; entry: AuditEntry }> = [];
@@ -1539,7 +1738,7 @@ export class AuditLog {
           try {
             const encryptedBytes = fromBase64url(parsed.encrypted_payload_bytes);
             const encrypted: EncryptedPayload = JSON.parse(bytesToString(encryptedBytes));
-            const decrypted = decrypt(encrypted, this.encryptionKey);
+            const decrypted = await this.decryptEntryPayload(encrypted);
             const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
             chainedEntries.push({ key: meta.key, envelope: parsed, entry });
           } catch {
@@ -1555,7 +1754,7 @@ export class AuditLog {
 
         try {
           const encrypted = parsed as EncryptedPayload;
-          const decrypted = decrypt(encrypted, this.encryptionKey);
+          const decrypted = await this.decryptEntryPayload(encrypted);
           const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
           legacyRawEntries.push({ key: meta.key, raw, entry });
         } catch {

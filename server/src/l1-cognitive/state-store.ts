@@ -1509,3 +1509,278 @@ export class StateStore {
     };
   }
 }
+
+// ── Master-rotation helpers (core/master-rotation.ts) ────────────────
+//
+// State entries cryptographically bind their CIPHERTEXT to the writer
+// identity (the v2 envelope signs nonce/tag/ciphertext; the legacy v1 `sig`
+// signs the raw ciphertext), so a master rotation cannot simply re-encrypt a
+// state entry — it must re-sign with the original writer's resident private
+// key. These helpers keep the canonical envelope/signature construction in
+// this module (single source of truth) while the rotation engine drives the
+// walk. They never relax verification: the OLD entry's signatures are
+// verified BEFORE re-signing (a rotation must not launder a tampered entry
+// into a freshly-signed one), and a missing writer identity fails closed.
+
+/** Writer material the rotation engine resolved for a state entry's kid. */
+export interface RotationWriterMaterial {
+  /** The writer's encrypted private key (under `identityEncryptionKey`). */
+  encryptedPrivateKey: EncPayload;
+  /** The identity-encryption purpose key that decrypts it. */
+  identityEncryptionKey: Uint8Array;
+  /** The writer's Ed25519 public key (for verifying the OLD signatures). */
+  publicKey: Uint8Array;
+}
+
+export class RotationStateEntryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RotationStateEntryError";
+  }
+}
+
+export type RotateStateEntryResult =
+  | { status: "already-new" }
+  | { status: "verified-old" }
+  | { status: "converted"; bytes: Uint8Array };
+
+/**
+ * Verify (and, unless `verifyOnly`, re-encrypt + re-sign) one persisted
+ * state entry for a master rotation.
+ *
+ *  - Decrypts under the NEW namespace key first → "already-new" (idempotent
+ *    resume; GCM authentication decides).
+ *  - Otherwise decrypts under the OLD namespace key (failure throws — the
+ *    rotation preflight aborts; nothing is mutated on an undecryptable
+ *    fortress).
+ *  - Verifies the OLD entry's signature(s) against the writer's public key
+ *    before producing anything (no laundering).
+ *  - Re-encrypts the plaintext under the new key and re-signs with the
+ *    writer's resident private key. Version, integrity_hash (plaintext
+ *    hash), metadata, and kid are all preserved — only the ciphertext block
+ *    and the signatures over it change.
+ */
+export async function rotateStateEntryBytes(args: {
+  raw: Uint8Array;
+  namespace: string;
+  key: string;
+  oldNamespaceKey: Uint8Array;
+  newNamespaceKey: Uint8Array;
+  resolveWriter: (kid: string) => Promise<RotationWriterMaterial | null>;
+  verifyOnly?: boolean;
+}): Promise<RotateStateEntryResult> {
+  const { namespace, key } = args;
+  let entry: StateEntry;
+  try {
+    entry = JSON.parse(bytesToString(args.raw)) as StateEntry;
+  } catch {
+    throw new RotationStateEntryError(
+      `state entry ${namespace}/${key} is not valid JSON`
+    );
+  }
+  if (!entry || typeof entry !== "object" || !entry.payload) {
+    throw new RotationStateEntryError(
+      `state entry ${namespace}/${key} has no encrypted payload`
+    );
+  }
+
+  // Idempotent resume: an entry that already authenticates under the new
+  // namespace key was converted before the crash.
+  try {
+    decrypt(entry.payload, args.newNamespaceKey).fill(0);
+    return { status: "already-new" };
+  } catch {
+    // Not yet converted — proceed with the old key.
+  }
+
+  let plaintext: Uint8Array;
+  try {
+    plaintext = decrypt(entry.payload, args.oldNamespaceKey);
+  } catch {
+    throw new RotationStateEntryError(
+      `state entry ${namespace}/${key} does not decrypt under either the old or the new master`
+    );
+  }
+
+  try {
+    const writer = await args.resolveWriter(entry.kid);
+    if (!writer) {
+      throw new RotationStateEntryError(
+        `state entry ${namespace}/${key} was written by identity "${entry.kid}", ` +
+          `which is not resident in this fortress. Rotation re-signs every state ` +
+          `entry with its writer's key and cannot proceed without it. ` +
+          `Re-import the identity, or delete the orphaned entry, then retry.`
+      );
+    }
+
+    // Verify the OLD signatures before re-signing anything.
+    if (entry.v === 1) {
+      if (
+        typeof entry.sig !== "string" ||
+        !verify(fromBase64url(entry.payload.ct), fromBase64url(entry.sig), writer.publicKey)
+      ) {
+        throw new RotationStateEntryError(
+          `state entry ${namespace}/${key} failed legacy signature verification; refusing to re-sign it`
+        );
+      }
+    } else {
+      if (!entry.envelope || typeof entry.envelope_sig !== "string") {
+        throw new RotationStateEntryError(
+          `state entry ${namespace}/${key} is schema ${entry.v} but is missing its signed envelope`
+        );
+      }
+      const expected = buildSignedEnvelope({
+        namespace,
+        key,
+        version: entry.ver,
+        kid: entry.kid,
+        metadata: entry.metadata,
+        integrityHash: entry.integrity_hash,
+        payload: entry.payload,
+      });
+      if (canonicalJson(entry.envelope) !== canonicalJson(expected)) {
+        throw new RotationStateEntryError(
+          `state entry ${namespace}/${key} envelope metadata mismatch; refusing to re-sign it`
+        );
+      }
+      if (
+        !verify(
+          stateEnvelopeSigningBytes(entry.envelope),
+          fromBase64url(entry.envelope_sig),
+          writer.publicKey
+        ) ||
+        typeof entry.sig !== "string" ||
+        !verify(fromBase64url(entry.payload.ct), fromBase64url(entry.sig), writer.publicKey)
+      ) {
+        throw new RotationStateEntryError(
+          `state entry ${namespace}/${key} failed signature verification; refusing to re-sign it`
+        );
+      }
+    }
+
+    if (args.verifyOnly) {
+      return { status: "verified-old" };
+    }
+
+    const newPayload = encrypt(plaintext, args.newNamespaceKey);
+    const legacySig = sign(
+      fromBase64url(newPayload.ct),
+      writer.encryptedPrivateKey,
+      writer.identityEncryptionKey
+    );
+
+    let rotated: StateEntry;
+    if (entry.v === 1) {
+      rotated = { ...entry, payload: newPayload, sig: toBase64url(legacySig) };
+    } else {
+      const envelope = buildSignedEnvelope({
+        namespace,
+        key,
+        version: entry.ver,
+        kid: entry.kid,
+        metadata: entry.metadata,
+        integrityHash: entry.integrity_hash,
+        payload: newPayload,
+      });
+      const envelopeSig = sign(
+        stateEnvelopeSigningBytes(envelope),
+        writer.encryptedPrivateKey,
+        writer.identityEncryptionKey
+      );
+      rotated = {
+        ...entry,
+        envelope,
+        payload: newPayload,
+        sig: toBase64url(legacySig),
+        envelope_sig: toBase64url(envelopeSig),
+      };
+    }
+    return {
+      status: "converted",
+      bytes: stringToBytes(JSON.stringify(rotated)),
+    };
+  } finally {
+    plaintext.fill(0);
+  }
+}
+
+/** `_meta` keys owned by the state store (for the rotation walker). */
+export const STATE_META_PUBLIC_KEYS_KEY = STATE_ENVELOPE_PUBLIC_KEYS_KEY;
+export const STATE_META_VERSION_ANCHORS_KEY = STATE_ENVELOPE_VERSION_ANCHORS_KEY;
+
+/**
+ * Re-MAC the version-anchor `_meta` record for a master rotation.
+ *
+ * Returns:
+ *  - null            — record is bare/legacy (no MAC marker): untrusted today
+ *    and left untouched; the floor re-derives from authenticated entries.
+ *  - "already-new"   — MAC already verifies under the new master (resume).
+ *  - bytes           — restamped record, after the OLD MAC verified.
+ *
+ * Throws when the record carries the marker but its MAC verifies under
+ * NEITHER master — that is tampering, and a rotation must not launder it
+ * into a freshly-authenticated record.
+ */
+export function rotateStateMetaRecordBytes(args: {
+  raw: Uint8Array;
+  metaKey: string;
+  oldMasterKey: Uint8Array;
+  newMasterKey: Uint8Array;
+}): Uint8Array | "already-new" | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(args.raw));
+  } catch {
+    throw new RotationStateEntryError(
+      `state meta record _meta/${args.metaKey} is not valid JSON`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new RotationStateEntryError(
+      `state meta record _meta/${args.metaKey} is malformed`
+    );
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj[STATE_META_MAC_MARKER] !== true) {
+    return null; // Bare/legacy record: untrusted, leave as-is.
+  }
+  const data = obj.data;
+  const mac = obj.mac;
+  if (!data || typeof data !== "object" || Array.isArray(data) || typeof mac !== "string") {
+    throw new RotationStateEntryError(
+      `state meta record _meta/${args.metaKey} is malformed`
+    );
+  }
+  const record = data as Record<string, unknown>;
+  const macFor = (master: Uint8Array): Uint8Array => {
+    const macKey = derivePurposeKey(master, "state-meta-mac");
+    const out = hmacSha256(
+      macKey,
+      stringToBytes(STATE_META_MAC_DOMAIN + args.metaKey + "\n" + canonicalJson(record))
+    );
+    macKey.fill(0);
+    return out;
+  };
+  let provided: Uint8Array;
+  try {
+    provided = fromBase64url(mac);
+  } catch {
+    throw new RotationStateEntryError(
+      `state meta record _meta/${args.metaKey} MAC is malformed`
+    );
+  }
+  if (constantTimeEqual(provided, macFor(args.newMasterKey))) {
+    return "already-new";
+  }
+  if (!constantTimeEqual(provided, macFor(args.oldMasterKey))) {
+    throw new RotationStateEntryError(
+      `state meta record _meta/${args.metaKey} failed authentication under both masters (tampered); refusing to restamp it`
+    );
+  }
+  const restamped = {
+    [STATE_META_MAC_MARKER]: true,
+    data: record,
+    mac: toBase64url(macFor(args.newMasterKey)),
+  };
+  return stringToBytes(JSON.stringify(restamped));
+}

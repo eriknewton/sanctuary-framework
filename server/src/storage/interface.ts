@@ -56,6 +56,15 @@ export interface StorageBackend {
    * Get the total size of all stored data.
    */
   totalSize(): Promise<number>;
+
+  /**
+   * Enumerate every namespace that currently holds at least one entry.
+   * OPTIONAL capability: master-key rotation requires it (the rotation
+   * walker must be able to prove it visited the WHOLE fortress and fails
+   * closed on backends that cannot enumerate). Implemented by the
+   * filesystem and in-memory backends.
+   */
+  listNamespaces?(): Promise<string[]>;
 }
 
 /** Optional filesystem capabilities used by code that must coordinate across processes. */
