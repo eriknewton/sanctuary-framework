@@ -41,7 +41,7 @@
 import { canonicalJson, sha256Hex } from "../audit/chain.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../core/encoding.js";
 import { verify as verifyEd25519 } from "../core/identity.js";
-import type { ConsentStatus } from "./payload.js";
+import type { ConsentStatus, LifecycleLineage } from "./payload.js";
 import type { WorkloadLifecycleState, WorkloadRegistry } from "./registry.js";
 
 /** Domain-string version for the host-attestation payload. */
@@ -85,6 +85,12 @@ export interface AttestedWorkload {
   manufactured_preference_caveat: boolean;
 }
 
+/** The only accepted signature algorithm for a v1 attestation. */
+export const WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM = "Ed25519" as const;
+/** The only accepted payload encoding for a v1 attestation. */
+export const WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING =
+  "domain-separated-canonical-json-v1" as const;
+
 /** The signable attestation body (the bytes under signature). */
 export interface HostWorkloadAttestationBody {
   schema: typeof WORKLOAD_HOST_ATTESTATION_SCHEMA;
@@ -98,15 +104,28 @@ export interface HostWorkloadAttestationBody {
   /** Always true in v1: the whole consent channel is operator-authorization,
    * not agent preference. Propagated, never laundered. */
   manufactured_preference_caveat: boolean;
+  /**
+   * Signer identity + crypto descriptors bound INTO the signed bytes (FIX 3).
+   * The envelope carries verbatim copies of these for transport, but binding
+   * them here means an offline reader (holding only the public key, NOT the
+   * chain seal) cannot swap the envelope's `signer_kid` / `signature_algorithm`
+   * / `payload_encoding` without invalidating the signature. The verifier
+   * cross-checks the envelope copies against these and rejects any mismatch.
+   */
+  signer_kid: string;
+  signature_algorithm: typeof WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM;
+  payload_encoding: typeof WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING;
 }
 
-/** Signed envelope: the body plus an offline-verifiable Ed25519 signature. */
+/** Signed envelope: the body plus an offline-verifiable Ed25519 signature.
+ * `signer_kid` / `signature_algorithm` / `payload_encoding` are transport copies
+ * of the same fields now bound inside `body`; the verifier cross-checks them. */
 export interface SignedHostWorkloadAttestation {
   body: HostWorkloadAttestationBody;
   signer_kid: string;
   signature: string;
-  signature_algorithm: "Ed25519";
-  payload_encoding: "domain-separated-canonical-json-v1";
+  signature_algorithm: typeof WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM;
+  payload_encoding: typeof WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING;
   /** Base64url raw 32-byte Ed25519 public key the body verifies under. */
   public_key: string;
 }
@@ -133,13 +152,60 @@ export class HostWorkloadAttestationError extends Error {
 }
 
 /**
+ * True iff an `inherited` consent is ANCHORED — i.e. it actually points back to
+ * a real consent it could inherit from. Anchoring is either:
+ *   - a non-empty `consent_ref` (an explicit reference to a consent record), OR
+ *   - a resolvable #504 `LifecycleLineage` link (a fork/merge parent or a
+ *     `lineage_root`), which names the upstream workload the consent came from.
+ *
+ * An `inherited` carrying NEITHER anchor is a laundering vector: a payload could
+ * claim "inherited" with `consent_ref: null` and no lineage, manufacturing
+ * consent from nothing. Such an `inherited` is treated as unconsented (FIX 2).
+ */
+function isInheritedConsentAnchored(input: {
+  consent_ref: string | null;
+  lineage?: LifecycleLineage;
+}): boolean {
+  if (typeof input.consent_ref === "string" && input.consent_ref.length > 0) {
+    return true;
+  }
+  const lineage = input.lineage;
+  if (lineage !== undefined) {
+    if (
+      Array.isArray(lineage.parents) &&
+      lineage.parents.some((p) => typeof p === "string" && p.length > 0)
+    ) {
+      return true;
+    }
+    if (
+      typeof lineage.lineage_root === "string" &&
+      lineage.lineage_root.length > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Consent classification rule (composes with #504's recorded fields, relaxes
  * nothing):
  *
- *   consented  iff  consent_status ∈ {present, inherited}
+ *   consented  iff  consent_status === "present"
+ *               OR  (consent_status === "inherited" AND it is ANCHORED — a
+ *                    non-empty consent_ref OR a resolvable lineage link)
  *               OR  (state === "deleted" AND a valid override block carrying a
  *                    non-empty approval_record_id is present)
- *   unconsented otherwise (notably `consent_status: "absent"` with no override).
+ *   unconsented otherwise — notably `consent_status: "absent"` with no override,
+ *               AND an `inherited` with no anchor (FIX 2: an unanchored
+ *               "inherited" is treated like `absent`, flips compliant:false, and
+ *               is still listed truthfully).
+ *
+ * Anchored-inherited rule (FIX 2): `inherited` previously counted as consented
+ * unconditionally, which let an upstream payload manufacture consent by claiming
+ * `inherited` with `consent_ref: null` and no lineage. `inherited` now consents
+ * ONLY when it is anchored to a real upstream consent it could have inherited
+ * (see {@link isInheritedConsentAnchored}).
  *
  * The delete-with-override carve-out exists because #504 records an exceptional
  * gated destruction with `consent_status: "absent"` + an `override` (the
@@ -151,10 +217,19 @@ export class HostWorkloadAttestationError extends Error {
 export function classifyConsent(input: {
   consent_status: ConsentStatus;
   state: WorkloadLifecycleState;
+  consent_ref?: string | null;
+  lineage?: LifecycleLineage;
   override?: { approval_record_id: string };
 }): boolean {
-  if (input.consent_status === "present" || input.consent_status === "inherited") {
+  if (input.consent_status === "present") {
     return true;
+  }
+  if (input.consent_status === "inherited") {
+    // Anchored-inherited only: an unanchored "inherited" is unconsented.
+    return isInheritedConsentAnchored({
+      consent_ref: input.consent_ref ?? null,
+      ...(input.lineage ? { lineage: input.lineage } : {}),
+    });
   }
   // consent_status === "absent": consented ONLY via a valid delete override.
   if (
@@ -216,6 +291,8 @@ export async function buildHostWorkloadAttestation(
     const consented = classifyConsent({
       consent_status: r.consent_status,
       state: r.state,
+      consent_ref: r.consent_ref,
+      ...(r.lineage ? { lineage: r.lineage } : {}),
       ...(r.override ? { override: r.override } : {}),
     });
     return {
@@ -234,6 +311,13 @@ export async function buildHostWorkloadAttestation(
   const compliant =
     workloads.length === 0 ? true : workloads.every((w) => w.consented);
 
+  // Signer public key must be well-formed before we bind its kid into the body.
+  if (params.signer.publicKey.length !== 32) {
+    throw new HostWorkloadAttestationError(
+      `attestation signer public key must be 32 bytes, got ${params.signer.publicKey.length}`
+    );
+  }
+
   const body: HostWorkloadAttestationBody = {
     schema: WORKLOAD_HOST_ATTESTATION_SCHEMA,
     fortress_id: params.fortressId,
@@ -245,6 +329,12 @@ export async function buildHostWorkloadAttestation(
     // preference. Propagated at the bundle level so a reader cannot mistake any
     // `consented: true` line for an agent's own preference.
     manufactured_preference_caveat: true,
+    // FIX 3: bind signer identity + crypto descriptors INTO the signed bytes so
+    // an offline reader cannot swap the envelope's copies without breaking the
+    // signature.
+    signer_kid: params.signer.signer_kid,
+    signature_algorithm: WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM,
+    payload_encoding: WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING,
   };
 
   let signature: Uint8Array;
@@ -263,18 +353,14 @@ export async function buildHostWorkloadAttestation(
         `(expected 64); nothing was produced`
     );
   }
-  if (params.signer.publicKey.length !== 32) {
-    throw new HostWorkloadAttestationError(
-      `attestation signer public key must be 32 bytes, got ${params.signer.publicKey.length}`
-    );
-  }
-
   const attestation: SignedHostWorkloadAttestation = {
     body,
+    // Envelope copies of the signer descriptors now also bound inside `body`.
+    // The verifier cross-checks these against the signed-body copies.
     signer_kid: params.signer.signer_kid,
     signature: toBase64url(signature),
-    signature_algorithm: "Ed25519",
-    payload_encoding: "domain-separated-canonical-json-v1",
+    signature_algorithm: WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM,
+    payload_encoding: WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING,
     public_key: toBase64url(params.signer.publicKey),
   };
 
@@ -291,17 +377,51 @@ export async function buildHostWorkloadAttestation(
 /**
  * Offline-verify a signed host attestation against an explicit public key.
  * Returns false (never throws) on any malformed input or signature mismatch.
+ *
+ * FIX 3 — signer-identity binding. Before the Ed25519 check this:
+ *   (a) rejects an unexpected `signature_algorithm` or `payload_encoding` on
+ *       either the envelope or the signed body (only the v1 values are accepted);
+ *   (b) cross-checks the envelope's `signer_kid` / `signature_algorithm` /
+ *       `payload_encoding` against the copies bound INSIDE the signed body, and
+ *       rejects any mismatch. Because the body copies are under the signature, an
+ *       offline tamperer who swaps the envelope `signer_kid` (without re-signing,
+ *       which they cannot do without the private key) now fails this cross-check
+ *       AND the signature recomputation — closing the offline-swap gap the chain
+ *       seal alone covered.
  */
 export function verifyHostWorkloadAttestation(
   attestation: SignedHostWorkloadAttestation,
   publicKey: string | Uint8Array
 ): boolean {
   try {
+    const body = attestation.body;
+    // (a) Reject an unexpected algorithm / encoding on the body or envelope.
+    if (
+      body.signature_algorithm !==
+        WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM ||
+      attestation.signature_algorithm !==
+        WORKLOAD_HOST_ATTESTATION_SIGNATURE_ALGORITHM
+    ) {
+      return false;
+    }
+    if (
+      body.payload_encoding !== WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING ||
+      attestation.payload_encoding !== WORKLOAD_HOST_ATTESTATION_PAYLOAD_ENCODING
+    ) {
+      return false;
+    }
+    // (b) Envelope copies MUST match the signed-body copies (offline-swap guard).
+    if (attestation.signer_kid !== body.signer_kid) return false;
+    if (attestation.signature_algorithm !== body.signature_algorithm) {
+      return false;
+    }
+    if (attestation.payload_encoding !== body.payload_encoding) return false;
+
     const keyBytes =
       typeof publicKey === "string" ? fromBase64url(publicKey) : publicKey;
     if (keyBytes.length !== 32) return false;
     return verifyEd25519(
-      hostAttestationSigningBytes(attestation.body),
+      hostAttestationSigningBytes(body),
       fromBase64url(attestation.signature),
       keyBytes
     );

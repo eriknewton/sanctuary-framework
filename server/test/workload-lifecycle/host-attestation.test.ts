@@ -268,13 +268,116 @@ describe("WorkloadRegistry — projection from the audit chain", () => {
   });
 });
 
+describe("WorkloadRegistry — authenticated chain-sequence replay (FIX 1)", () => {
+  it("replays by chain sequence, NOT wall-clock: a newer-in-chain absent with an EARLIER timestamp wins over an older-in-chain present", async () => {
+    const auditLog = newAuditLog();
+
+    // Record 1 (FIRST in chain): consent PRESENT, with a LATER wall-clock
+    // timestamp (skewed/forged forward).
+    await emitWorkloadLifecycle({
+      auditLog,
+      operation: WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
+      identity_id: "fortress-1",
+      payload: base({
+        workload_id: "wl-skew",
+        instance_id: "wli-skew",
+        consent_status: "present",
+        consent_ref: "consent://wl-skew",
+      }),
+      // LATER timestamp than the deletion recorded after it in the chain.
+      timestamp: new Date(1_700_000_500_000).toISOString(),
+    });
+
+    // Record 2 (LATER in chain): consent ABSENT + workload DELETED, but carrying
+    // an EARLIER wall-clock timestamp than record 1. The old timestamp sort would
+    // order this BEFORE the present record and let the stale `present` win,
+    // masking the unconsented deletion (false compliant:true). Chain-order replay
+    // applies it LAST, so `absent`/`deleted` correctly wins.
+    await emitWorkloadLifecycle({
+      auditLog,
+      operation: WORKLOAD_LIFECYCLE_OPS.DELETED,
+      identity_id: "fortress-1",
+      payload: base({
+        workload_id: "wl-skew",
+        instance_id: "wli-skew",
+        consent_status: "absent",
+        consent_ref: null,
+        state_disposition: "destroyed",
+      }),
+      // EARLIER timestamp than record 1 (inverted relative to chain order).
+      timestamp: new Date(1_700_000_100_000).toISOString(),
+    });
+
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const rec = registry.get("wl-skew")!;
+    // Chain-latest state is the deletion, NOT the earlier-in-chain instantiate.
+    expect(rec.state).toBe("deleted");
+    expect(rec.consent_status).toBe("absent");
+
+    // And the attestation marks it unconsented / compliant:false (the bug, fixed).
+    const att = await buildHostWorkloadAttestation({
+      registry,
+      signer: makeTestSigner(),
+      fortressId: "fortress-1",
+      now: new Date(1_700_000_900_000).toISOString(),
+    });
+    expect(att.body.compliant).toBe(false);
+    const wl = att.body.workloads.find((w) => w.workload_id === "wl-skew")!;
+    expect(wl.consented).toBe(false);
+    expect(wl.consent_status).toBe("absent");
+  });
+});
+
 describe("consent classification", () => {
-  it("present/inherited are consented", () => {
+  it("present is consented; ANCHORED inherited is consented", () => {
     expect(
       classifyConsent({ consent_status: "present", state: "instantiated" })
     ).toBe(true);
+    // inherited counts only when anchored (FIX 2): a consent_ref anchor here.
     expect(
-      classifyConsent({ consent_status: "inherited", state: "forked" })
+      classifyConsent({
+        consent_status: "inherited",
+        state: "forked",
+        consent_ref: "consent://wl-1",
+      })
+    ).toBe(true);
+    // ...or a resolvable lineage parent.
+    expect(
+      classifyConsent({
+        consent_status: "inherited",
+        state: "forked",
+        consent_ref: null,
+        lineage: { parents: ["wli-1"] },
+      })
+    ).toBe(true);
+  });
+
+  it("UNANCHORED inherited (no consent_ref, no lineage) is unconsented (FIX 2)", () => {
+    // The laundering vector: claim "inherited" with nothing to inherit from.
+    expect(
+      classifyConsent({
+        consent_status: "inherited",
+        state: "instantiated",
+        consent_ref: null,
+      })
+    ).toBe(false);
+    // An empty lineage (no parents, no root) is NOT an anchor.
+    expect(
+      classifyConsent({
+        consent_status: "inherited",
+        state: "instantiated",
+        consent_ref: null,
+        lineage: { parents: [] },
+      })
+    ).toBe(false);
+    // A lineage_root alone IS an anchor.
+    expect(
+      classifyConsent({
+        consent_status: "inherited",
+        state: "instantiated",
+        consent_ref: null,
+        lineage: { parents: [], lineage_root: "root://wl-0" },
+      })
     ).toBe(true);
   });
 
@@ -374,6 +477,57 @@ describe("buildHostWorkloadAttestation — mixed consent, fail-closed but honest
     expect(att.body.workloads).toHaveLength(2);
   });
 
+  it("an UNANCHORED inherited workload is unconsented + compliant:false, still listed (FIX 2)", async () => {
+    const auditLog = newAuditLog();
+    let ts = 0;
+    const at = () => new Date(1_700_000_000_000 + ts++ * 1000).toISOString();
+    // A legitimate anchored-inherited workload (lineage parent).
+    await emitWorkloadLifecycle({
+      auditLog,
+      operation: WORKLOAD_LIFECYCLE_OPS.FORKED,
+      identity_id: "fortress-1",
+      payload: base({
+        workload_id: "wl-anchored",
+        instance_id: "wli-anchored",
+        consent_status: "inherited",
+        consent_ref: null,
+        state_disposition: "preserved",
+        lineage: { parents: ["wli-parent"] },
+      }),
+      timestamp: at(),
+    });
+    // The laundering case: "inherited" with NO consent_ref and NO lineage.
+    await emitWorkloadLifecycle({
+      auditLog,
+      operation: WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
+      identity_id: "fortress-1",
+      payload: base({
+        workload_id: "wl-laundered",
+        instance_id: "wli-laundered",
+        consent_status: "inherited",
+        consent_ref: null,
+      }),
+      timestamp: at(),
+    });
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const att = await buildHostWorkloadAttestation({
+      registry,
+      signer: makeTestSigner(),
+      fortressId: "fortress-1",
+      now: new Date(1_700_000_900_000).toISOString(),
+    });
+    const byId = Object.fromEntries(
+      att.body.workloads.map((w) => [w.workload_id, w])
+    );
+    // Anchored inherited consents; unanchored inherited does NOT.
+    expect(byId["wl-anchored"]!.consented).toBe(true);
+    expect(byId["wl-laundered"]!.consented).toBe(false);
+    // The unanchored one is NOT hidden — listed truthfully with its status.
+    expect(byId["wl-laundered"]!.consent_status).toBe("inherited");
+    // One unconsented workload flips compliance.
+    expect(att.body.compliant).toBe(false);
+  });
+
   it("an empty host (no declared workloads) is vacuously compliant", async () => {
     const auditLog = newAuditLog();
     const registry = await WorkloadRegistry.fromAuditLog(auditLog);
@@ -444,6 +598,35 @@ describe("attestation signature — offline-verifiable, tamper-evident", () => {
       },
     };
     expect(verifyHostWorkloadAttestation(tampered, signer.publicKey)).toBe(false);
+  });
+
+  it("binds signer_kid into the signed body and rejects an envelope-only signer_kid swap (FIX 3)", async () => {
+    const auditLog = newAuditLog();
+    await buildMixedChain(auditLog);
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const signer = makeTestSigner();
+    const att = await buildHostWorkloadAttestation({
+      registry,
+      signer,
+      fortressId: "fortress-1",
+      now: new Date(1_700_000_900_000).toISOString(),
+    });
+    // signer_kid is now bound INSIDE the signed body, with a matching envelope copy.
+    expect(att.body.signer_kid).toBe("test-fortress-signer");
+    expect(att.signer_kid).toBe(att.body.signer_kid);
+    expect(att.body.signature_algorithm).toBe("Ed25519");
+    expect(att.body.payload_encoding).toBe("domain-separated-canonical-json-v1");
+
+    // Swap ONLY the envelope's signer_kid (no re-sign — an offline tamperer can't
+    // re-sign). The body copy is under signature, so the cross-check rejects it.
+    const tampered = { ...att, signer_kid: "attacker-controlled-kid" };
+    expect(verifyHostWorkloadAttestation(tampered, signer.publicKey)).toBe(false);
+
+    // Likewise an unexpected envelope algorithm/encoding is rejected.
+    const badAlg = { ...att, signature_algorithm: "RSA" as never };
+    expect(verifyHostWorkloadAttestation(badAlg, signer.publicKey)).toBe(false);
+    const badEnc = { ...att, payload_encoding: "raw-json" as never };
+    expect(verifyHostWorkloadAttestation(badEnc, signer.publicKey)).toBe(false);
   });
 });
 

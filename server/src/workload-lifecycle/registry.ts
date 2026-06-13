@@ -36,6 +36,7 @@ import {
   validateWorkloadLifecyclePayload,
   type ConsentStatus,
   type DeleteOverride,
+  type LifecycleLineage,
   type WorkloadLifecyclePayload,
 } from "./payload.js";
 
@@ -81,6 +82,9 @@ export interface WorkloadRecord {
   consent_status: ConsentStatus;
   /** Latest recorded consent reference (never the body), or null. */
   consent_ref: string | null;
+  /** Latest recorded lineage link (fork/merge parents + optional root), if any.
+   * Carried so an `inherited` consent can be checked for an anchor (FIX 2). */
+  lineage?: LifecycleLineage;
   /** Exceptional-delete account from the latest record carrying one, if any. */
   override?: DeleteOverride;
   /** Honest-insufficiency flag carried verbatim from the latest record:
@@ -103,7 +107,25 @@ export class WorkloadRegistry {
 
   /**
    * Build the projection by replaying the audit chain's workload-lifecycle
-   * entries in chain order.
+   * entries in AUTHENTICATED CHAIN-SEQUENCE order.
+   *
+   * Ordering integrity (codex FIX 1): replay walks `auditLog.verifiedChainView()`,
+   * which returns each surviving chained entry paired with its authenticated
+   * `sequence` (the hash-chain position), in ascending sequence order, AND with
+   * the decrypted `entry` carrying the full `details` payload. That method runs
+   * strict-mode chain verification (it throws `AuditIntegrityError` if the chain
+   * does not verify), so the order we fold over is the cryptographically
+   * authenticated append order — NOT a wall-clock timestamp that an emitter can
+   * skew, tie, or invert. "Latest applied transition wins" therefore means
+   * latest CHAIN SEQUENCE, closing the bug where a stale `present` record with a
+   * later/equal timestamp could override a newer chain-recorded `absent`/
+   * `deleted` and mask an unconsented workload (false `compliant: true`).
+   *
+   * We still filter to the run-state lifecycle ops (`OP_TO_STATE`); non-lifecycle
+   * and non-state entries on the same chain are ignored by `apply`. The #504
+   * `prev_lifecycle_seq` linked-list (H2 drop-detection) is carried through
+   * verbatim per workload as a secondary integrity signal, but the PRIMARY
+   * ordering authority is always the authenticated chain sequence above.
    *
    * Fail-closed: each lifecycle entry's `details` is run through
    * `validateWorkloadLifecyclePayload`; a malformed/unknown-version entry throws
@@ -113,27 +135,27 @@ export class WorkloadRegistry {
    */
   static async fromAuditLog(auditLog: AuditLog): Promise<WorkloadRegistry> {
     const registry = new WorkloadRegistry();
-    // Replay every workload-lifecycle op. `query` filters by a single operation
-    // type, so fold each run-state op in turn, then sort the union by chain
-    // timestamp to apply transitions in recorded order. We pull a generous
-    // limit so the projection sees the whole declared history, not a tail.
-    const REPLAY_LIMIT = 1_000_000;
-    const collected: AuditEntry[] = [];
-    for (const opString of Object.keys(OP_TO_STATE)) {
-      const { entries } = await auditLog.query({
-        operation_type: opString,
-        limit: REPLAY_LIMIT,
-      });
-      for (const e of entries) collected.push(e);
+    // Authenticated chain order: verifiedChainView() returns the surviving
+    // chained entries paired with their hash-chain `sequence`, in ascending
+    // sequence order, each carrying its decrypted `entry` (with `details`). It
+    // strict-verifies the chain (throws on a break), so this is the
+    // cryptographically authenticated append order, not a skewable timestamp.
+    const chainView = await auditLog.verifiedChainView();
+    for (const { entry } of chainView) {
+      registry.apply(entry);
     }
-    // Apply in recorded order. Timestamps are ISO-8601 (lexicographically
-    // ordered); ties keep query order, which is chain order within an op.
-    collected.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    for (const entry of collected) registry.apply(entry);
     return registry;
   }
 
-  /** Fold one workload-lifecycle audit entry into the projection. */
+  /**
+   * Fold one workload-lifecycle audit entry into the projection.
+   *
+   * The caller MUST invoke `apply` in ascending authenticated chain-sequence
+   * order, so the last `apply` for a workload is its chain-latest record
+   * ("latest applied transition wins" = latest chain sequence, never wall-clock).
+   *
+   * @param entry the decrypted audit entry (carries the lifecycle `details`)
+   */
   private apply(entry: AuditEntry): void {
     if (!isWorkloadLifecycleOp(entry.operation)) return;
     const op = entry.operation as WorkloadLifecycleOp;
@@ -156,13 +178,16 @@ export class WorkloadRegistry {
 
     const record: WorkloadRecord = {
       workload_id: payload.workload_id,
-      // The latest applied transition wins (collected is in recorded order).
+      // The latest applied transition wins. Because the caller folds in ascending
+      // authenticated chain-sequence order, this overwrite is the chain-latest
+      // record — never a wall-clock-latest one.
       state,
       instance_ids: instanceIds,
       consent_status: payload.consent_status,
       consent_ref: payload.consent_ref,
       manufactured_preference_caveat:
         payload.manufactured_preference_caveat ?? false,
+      ...(payload.lineage ? { lineage: payload.lineage } : {}),
       ...(payload.override ? { override: payload.override } : {}),
       ...(payload.prev_lifecycle_seq !== undefined
         ? { last_prev_lifecycle_seq: payload.prev_lifecycle_seq }
