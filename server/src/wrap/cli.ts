@@ -1075,13 +1075,22 @@ export async function runWrap(
   // record is a UX degradation, not a security one). The error is
   // surfaced on stderr so operators can re-run later if needed.
   try {
-    await registerHostTenant(storagePath);
+    // The host tenant registry must live under the *resolved* storage root,
+    // not the hardcoded ~/.sanctuary default. When SANCTUARY_STORAGE_PATH is
+    // set (an isolated/drill fortress), `storagePath` is that override and the
+    // registry row lands in `<override>/tenants.json` — it must never pollute
+    // the real operator fortress's `~/.sanctuary/tenants.json`. When the env
+    // var is unset, `storagePath` already equals `~/.sanctuary`, so default
+    // behavior (and the existing host-level cross-fortress index) is unchanged.
+    // The read side (`sanctuary agents list`) resolves the same root from the
+    // same env var, so read and write always agree.
+    await registerHostTenant(storagePath, { root: storagePath });
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Note: host tenant registry not updated ` +
         `(${(err as Error).message}). ` +
-        `Re-run \`sanctuary wrap\` to retry, or check permissions on ~/.sanctuary/${TENANTS_REGISTRY_FILE_NAME}.`,
+        `Re-run \`sanctuary wrap\` to retry, or check permissions on ${storagePath}/${TENANTS_REGISTRY_FILE_NAME}.`,
     );
   }
 
@@ -1560,14 +1569,21 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     lines.push(`  ${d("(browser auto-open suppressed)")}`);
   }
   lines.push("");
-  const l2Status = info.intelligenceHealthy === false
-    ? "L2 Degraded (intelligence disabled)"
-    : "L2 Degraded (no TEE)";
-  lines.push(`  ${b("Your agent is protected.")} L1 Full / ${l2Status} / L3 Full / L4 Full.`);
+  // Named enforcement layers (L1-L4 numbering retired 2026-05-24). Mapping
+  // matches the Castle Architecture surface in server/README.md and the
+  // sovereignty manifesto: Castle Wall (OS-level egress), Sentinels (internal
+  // observation / intelligence \u2014 the TEE/intelligence-dependent slot), Charter
+  // (Cooperative MCP), Heralds (receipts + cross-castle reputation).
+  const sentinelsStatus = info.intelligenceHealthy === false
+    ? "Sentinels Degraded (intelligence disabled)"
+    : "Sentinels Degraded (no TEE)";
+  lines.push(
+    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+  );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
     lines.push("");
-    lines.push(`  ${w("\u26A0")} L2 intelligence disabled: ${info.intelligenceError}`);
+    lines.push(`  ${w("\u26A0")} Sentinels intelligence disabled: ${info.intelligenceError}`);
     lines.push(`    Concierge chat and substrate-driven explanations will not work until this is resolved.`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
@@ -1618,16 +1634,18 @@ export function formatWrapSuccessNoDashboard(
     `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
   );
   lines.push("");
-  const l2Status = info.intelligenceHealthy === false
-    ? "L2 Degraded (intelligence disabled)"
-    : "L2 Degraded (no TEE)";
+  // Named enforcement layers (L1-L4 numbering retired 2026-05-24). See the
+  // mapping note in formatWrapSuccess above; both surfaces must agree.
+  const sentinelsStatus = info.intelligenceHealthy === false
+    ? "Sentinels Degraded (intelligence disabled)"
+    : "Sentinels Degraded (no TEE)";
   lines.push(
-    `  ${b("Your agent is protected.")} L1 Full / ${l2Status} / L3 Full / L4 Full.`,
+    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
     lines.push("");
-    lines.push(`  ${w("\u26A0")} L2 intelligence disabled: ${info.intelligenceError}`);
+    lines.push(`  ${w("\u26A0")} Sentinels intelligence disabled: ${info.intelligenceError}`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
   lines.push("");
