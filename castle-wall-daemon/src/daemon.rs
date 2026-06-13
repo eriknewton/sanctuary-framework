@@ -437,6 +437,10 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         // e.g. one missing the always-on habeas distress lane — must leave an
         // unmissable trace, never a silent no-policy boot.
         if let Err(err) = store.reload() {
+            // SAFETY: boot-time refusal fires before any logging/journal
+            // sink is guaranteed up; raw stderr is the only channel that
+            // reliably reaches the operator console (and systemd captures
+            // it), so the loud-refusal contract is stderr at this site.
             eprintln!(
                 "castle-wall-daemon: boot-time manifest load failed; running \
                  deny-by-default with NO policy until a valid manifest is \
