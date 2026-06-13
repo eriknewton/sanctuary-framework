@@ -56,6 +56,11 @@ import type {
 import type { V1SessionClaims } from "./session-service.js";
 import { canonicalJson, verifyOperatorSignature } from "./operator-signed.js";
 import { writeJson, readJsonBody, denyUnauthorized, denyForbidden } from "./http.js";
+import {
+  verifySyncEnvelope,
+  signSyncEnvelope,
+  type FederationSyncEnvelope,
+} from "./federation-sync-envelope.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -71,6 +76,7 @@ export function isFederationPath(pathname: string): boolean {
     pathname === "/v1/federation/status" ||
     pathname === "/v1/federation/authorize/init" ||
     pathname === "/v1/federation/sync" ||
+    pathname === "/v1/federation/sync/peer" ||
     pathname === "/v1/nodes"
   );
 }
@@ -101,6 +107,16 @@ export interface FederationContext {
   getFortressMasterSecret(): Uint8Array;
   /** Transient fortress-master private key, when this node holds it (cert master sig). */
   getMasterPrivateKey?(): Uint8Array | undefined;
+  /**
+   * This daemon's OWN node identity certificate (issued when it joined the
+   * fortress), used to wrap the reciprocal outbound slice in a peer-verifiable
+   * sync envelope. Optional: when absent, a peer-sync still ACCEPTS inbound
+   * (the inbound verification needs only the pinned master), but the response
+   * carries bare events the peer cannot cryptographically attribute.
+   */
+  localNodeCert?: NodeIdentityCertificate;
+  /** Transient private key matching `localNodeCert.node_pubkey` (signs the reciprocal envelope). */
+  getLocalNodePrivateKey?(): Uint8Array | undefined;
   /**
    * Operator approval gate. Defaults to issuing a certificate for any
    * request that already passed cryptographic verification (the bootstrap
@@ -281,6 +297,16 @@ export interface V1FederationDeps {
   listFederationEvents(since?: FederationSyncCursor): FederationEvent[];
   /** Validate and append remote sync events. */
   appendFederationEvents(events: FederationEvent[]): FederationAppendResult;
+  /**
+   * Highest peer-sync high-water already accepted from `senderNodeId`, or null
+   * if none. Gates whole-envelope rollback on the cross-node `/sync/peer` path
+   * (PR-A5). Per-sender; advances only on a successful accept.
+   */
+  acceptedHighWaterFor(senderNodeId: string): number | null;
+  /** Record a newly-accepted peer-sync high-water for `senderNodeId`. */
+  recordAcceptedHighWater(senderNodeId: string, highWater: number): void;
+  /** Monotonic outbound high-water this daemon stamps on reciprocal envelopes. */
+  nextOutboundHighWater(): number;
 }
 
 export interface FederationNodeView {
@@ -353,6 +379,10 @@ export async function handleFederationRequest(
   }
   if (method === "POST" && url.pathname === "/v1/federation/sync") {
     await handleSync(deps, req, res, claims);
+    return true;
+  }
+  if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
+    await handlePeerSync(deps, req, res, claims);
     return true;
   }
   // Wrong method on an owned path: not found to an authenticated caller.
@@ -623,6 +653,169 @@ async function handleSync(
     events: outbound,
     nodes: deps.listNodes(),
   });
+}
+
+/**
+ * Cross-MACHINE peer sync (PR-A5 — the federation marquee). Unlike `/sync`,
+ * which authorizes the request with THIS fortress's own operator signature
+ * (correct only when the caller is the same operator process — the A4
+ * "loopback position-only" path), `/sync/peer` accepts a sync from ANOTHER of
+ * the operator's machines. The session token still gates network access, but
+ * trust in the EVENTS comes from the {@link FederationSyncEnvelope}: the peer
+ * presents its node identity certificate, which the recipient verifies chains
+ * to its OWN pinned fortress-master (`verifySyncEnvelope` → `verifyCertChain`).
+ *
+ * This is the "no implicit trust across the boundary" rule (CLAUDE.md
+ * constraint 4) realized for the cross-machine case: a node whose certificate
+ * does NOT chain to this fortress's master — a different operator — is rejected
+ * with the generic 403 even with a valid session. The hash-chained log defeats
+ * per-event tampering/replay; the envelope high-water defeats whole-envelope
+ * rollback. No private key crosses the wire (constraint 6).
+ *
+ * On accept, the recipient appends the verified slice, records the new
+ * per-sender high-water, and answers with its OWN outbound slice wrapped in a
+ * reciprocal peer-verifiable envelope (when this daemon holds its node cert +
+ * key), so the exchange is symmetric and the originating node can verify the
+ * response the same way.
+ */
+async function handlePeerSync(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+): Promise<void> {
+  const operation = "v1_federation_sync_peer";
+  const ctx = deps.getContext();
+
+  // Federation must be enabled and provisioned (we need the pinned master to
+  // verify the peer's chain). Honest authenticated 503 — the session already
+  // proved /v1 access, so this is not an auth oracle.
+  if (!deps.isEnabled() || ctx === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: "peer",
+      details: { reason: "federation_disabled" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+
+  // Verify the peer's envelope against THIS fortress's pinned master. Every
+  // structural/crypto defect collapses to the generic 403 (no per-reason
+  // oracle for a probing peer); the audit entry records the precise reason.
+  const verification = verifySyncEnvelope({
+    envelope: body,
+    pinnedMaster: ctx.pinnedMasterPubkey,
+    recipientNodeId: ctx.nodeId,
+    acceptedHighWaterFor: (senderNodeId) => deps.acceptedHighWaterFor(senderNodeId),
+  });
+  if (!verification.ok) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: peerSenderNodeId(body),
+      details: { reason: verification.reason },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  // The peer is a verified member of THIS fortress. Append its slice through
+  // the same hash-chain validator the self-operator path uses. Advance the
+  // per-sender high-water ONLY when the WHOLE slice appended cleanly AND it
+  // actually carried new work (>=1 accepted event):
+  //   - a partial append (sequence gap / previous_hash mismatch) must NOT burn
+  //     the high-water, or a future correct lower-water resend from that sender
+  //     would be wrongly rejected as a rollback;
+  //   - an EMPTY / no-op envelope must NOT advance the high-water either, or a
+  //     verified-but-careless (or hostile) peer could "burn" its own high-water
+  //     to a huge value with a content-free envelope and self-DoS every future
+  //     legitimate sync (codex PR-A5 r2 MEDIUM). High-water is a property of
+  //     committed work, never of an empty signed envelope.
+  const append = deps.appendFederationEvents(verification.events);
+  if (append.rejected.length === 0 && append.accepted.length > 0) {
+    deps.recordAcceptedHighWater(verification.senderNodeId, verification.syncHighWater);
+  }
+
+  // The reciprocal envelope is signed by THIS node and therefore may only carry
+  // THIS node's OWN events (origin == this node id) — the same origin-binding
+  // invariant the inbound path enforces. A node never forwards another node's
+  // events inside its own signed envelope; multi-hop propagation happens through
+  // pairwise syncs, not delegated forwarding (which would need its own proof).
+  // The cursor still scopes which of this node's own events to return.
+  const outbound = deps
+    .listFederationEvents(verification.cursor ?? undefined)
+    .filter((event) => event.origin_node_id === ctx.nodeId);
+  const responseEnvelope = buildReciprocalEnvelope(deps, ctx, verification.senderNodeId, outbound);
+
+  await deps.audit({
+    operation,
+    result: append.rejected.length === 0 ? "success" : "failure",
+    identityId: verification.senderNodeId,
+    details: {
+      accepted: append.accepted.length,
+      rejected: append.rejected.length,
+      high_water: verification.syncHighWater,
+    },
+  });
+
+  writeJson(res, 200, {
+    accepted: append.accepted.map((event) => event.event_id),
+    rejected: append.rejected,
+    // The reciprocal slice, peer-verifiable when this daemon holds its node
+    // identity; otherwise the bare events (the peer keeps its own log honest
+    // via the per-event hash chain it already validates on append).
+    ...(responseEnvelope ? { envelope: responseEnvelope } : { events: outbound }),
+    nodes: deps.listNodes(),
+  });
+}
+
+/**
+ * Wrap this daemon's outbound slice in a reciprocal {@link FederationSyncEnvelope}
+ * the peer can verify the same way the daemon just verified the inbound one.
+ * Returns null when this daemon does not hold its own node identity (cert +
+ * private key) — in that case the response degrades to bare events rather than
+ * forging an attribution. The node private key is transient and never logged.
+ */
+function buildReciprocalEnvelope(
+  deps: V1FederationDeps,
+  ctx: FederationContext,
+  recipientNodeId: string,
+  outbound: FederationEvent[],
+): FederationSyncEnvelope | null {
+  const nodeCert = ctx.localNodeCert;
+  const nodePrivateKey = ctx.getLocalNodePrivateKey?.();
+  if (!nodeCert || !nodePrivateKey) return null;
+  try {
+    return signSyncEnvelope({
+      fortressId: ctx.fortressId,
+      senderNodeId: ctx.nodeId,
+      recipientNodeId,
+      syncHighWater: deps.nextOutboundHighWater(),
+      events: outbound,
+      senderNodeCert: nodeCert,
+      issuingPrincipalCert: ctx.issuingPrincipalCert,
+      nodePrivateKey,
+    });
+  } finally {
+    nodePrivateKey.fill(0);
+  }
+}
+
+/** Best-effort sender node id for an audit entry on a rejected peer envelope. */
+function peerSenderNodeId(body: unknown): string {
+  if (typeof body === "object" && body !== null) {
+    const id = (body as Record<string, unknown>).sender_node_id;
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return "unknown";
 }
 
 /**
