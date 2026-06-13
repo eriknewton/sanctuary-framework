@@ -141,9 +141,91 @@ delivery as covenant-layer infrastructure matures. See
   network leg of the lane is not yet drill-proven end-to-end. Per the
   thesis-gate rule, no external claim of "guaranteed network egress for
   distress" may be made until that drill exists.
-- **Local listener:** nothing binds port 8741 yet; the local lane today is
-  in-process (stderr + audit). The reserved port keeps the network identity
-  of the lane stable for when a local distress listener (menubar/unified
-  inbox) lands.
 - **CLI verb:** operator-side `sanctuary distress` test verb (emission is
   agent-side via MCP today).
+
+## Local distress listener (shipped 2026-06-12)
+
+The reserved port now has a network surface. A local listener binds
+`127.0.0.1:8741` and receives distress deliveries from the in-process emitter,
+persists them to an operator-readable inbox, and surfaces them in the
+dashboard.
+
+**Where it lives, and why.** The listener runs inside the **standalone
+dashboard** process (`server/src/dashboard-standalone.ts`), not the MCP server.
+The standalone dashboard is the long-lived operator service on the machine
+(launchd/systemd); the MCP server is launched on-demand via stdio and is not
+reliably up when an agent emits distress. So the listener belongs with the
+process that is actually running when the operator is away. The **emitter** is
+still the server-side `sanctuary_distress` tool — agents never make raw TCP
+connections (the anti-exfiltration property is unchanged).
+
+**Lifecycle.** On dashboard boot: construct the encrypted distress inbox
+(reserved `_distress` namespace, purpose-derived key off the fortress master),
+load or mint the operator-uid-only listener secret, bind the listener, and
+mount the read-only `/api/distress/*` route behind the dashboard's existing
+auth. On shutdown the listener is closed alongside the tenant runtime cleanup.
+
+**Sender authentication + mutual auth (the anti-spoof core).** Any local
+process — including the wrapped agent's own process tree — can open a TCP
+connection to `127.0.0.1:8741`. Loopback is therefore NOT trust. Both ends
+prove possession of a 256-bit secret stored 0600 in the operator-owned policy
+dir (`policy/egress/distress-local-secret`):
+
+- The emitter speaks first with a **hello** carrying a fresh client nonce.
+- The listener replies with a **challenge**: its own per-connection server
+  nonce plus an HMAC over `(client_nonce || server_nonce)` proving IT holds the
+  secret. Binding the emitter's fresh client nonce is what stops a
+  **port-squatter** from harvesting a valid challenge off the real listener and
+  replaying it: the emitter only accepts a proof computed over the client nonce
+  it just generated. The emitter verifies the proof BEFORE sending the
+  envelope, so a squatter that lacks the secret never receives the (bounded)
+  distress content.
+- The emitter then sends a frame whose HMAC is over `(domain || server_nonce ||
+  canonical envelope)`. The listener recomputes it with the secret; a
+  wrong/absent/foreign-secret HMAC is rejected with nothing written to the
+  inbox, and the rejection is audited.
+
+The wrapped agent cannot read the secret file through any MCP surface (same
+boundary that protects `distress.json`'s webhook secret), so it can neither
+forge a frame nor impersonate the listener. A group/world-readable secret file
+is rejected (fail closed) rather than trusted.
+
+**Anti-replay.** The frame HMAC is bound to the listener's per-connection
+nonce, so a captured frame is valid only for the one connection that issued its
+nonce; the nonce is single-use. Across connections, an already-accepted
+`event_id` is rejected (bounded seen-set). A replayed/foreign-nonce frame is
+rejected before any storage write.
+
+**No information leak.** The listener's reply is a bare ack/nack status (it
+echoes only the `event_id` the peer itself sent — never any stored inbox
+content). Reading the inbox goes through the dashboard's `/api/distress/inbox`
+route, gated by the dashboard's existing `checkAuth` — the SAME gate the
+`/api/audit-log` route uses (which already serves every distress envelope), so
+the inbox shares one auth posture with the rest of the dashboard rather than a
+second, weaker one.
+
+**Bounded.** Same closed envelope shape (validated independently of the HMAC),
+an 8 KB frame-size cap, a 2-second per-connection read timeout (a stalling peer
+is dropped so it cannot hold the port), a concurrent-connection cap, and a
+200-entry inbox ring (oldest dropped first). The audit log remains the complete
+system of record; the inbox is the convenience surface.
+
+**Emission ordering unchanged.** The emitter's local notification (stderr) and
+critical audit entry happen exactly as before. Local-listener delivery runs
+AFTER the audit append, best-effort; a delivery failure (no listener, refused,
+nack) is audited (`sanctuary_distress_local_delivery_failed`) and is never
+fatal — it is the webhook lane's resilience model applied to the local leg.
+
+**When the listener is NOT running.** Emission is unchanged: stderr
+notification + critical audit, exactly as shipped before this listener
+existed. The listener is purely additive; it is never a new failure mode for
+emission. If the port is already held at dashboard boot, the listener logs a
+loud warning and the dashboard keeps running (no crash loop) — only the local
+network leg of the lane is unavailable, and the in-process lane still holds.
+
+**Still deferred.** The emitter→listener flow is in-process loopback today; the
+extension-side emitter flow attribution (above) is what an armed default-deny
+wall needs to let the daemon's own delivery flows through, and that drill is
+not yet captured. The dashboard UI panel that renders `/api/distress/inbox` is
+the next presentation-layer step.

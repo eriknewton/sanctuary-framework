@@ -75,6 +75,11 @@ import {
   SENTINEL_API_PREFIX,
   handleSentinelRoute,
 } from "../sentinel/sentinel-routes.js";
+import type { DistressInbox } from "../distress/inbox.js";
+import {
+  DISTRESS_API_PREFIX,
+  handleDistressRoute,
+} from "../distress/inbox-route.js";
 import type { HandoffLog } from "../coordination/handoff-log.js";
 import {
   COORDINATION_API_PREFIX,
@@ -289,6 +294,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private sentinelDispatcher: SentinelDispatcher | null = null;
 
   /**
+   * HABEAS PORT distress inbox. Mounted additively at `/api/distress/*`
+   * when set; read-only against the operator-readable distress inbox the
+   * local listener (127.0.0.1:8741) populates. No write/delete surface.
+   */
+  private distressInbox: DistressInbox | null = null;
+
+  /**
    * v1.3 WP-V1.3-3 Omega-1 Coordination Handoff Visualization.
    * Mounted additively at `/api/coordination/*` when set. Read-only
    * against the audit log; the only writes are operator-action audit
@@ -437,6 +449,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * HABEAS PORT: bind the distress inbox. Once set, requests to
+   * `/api/distress/*` route through `handleDistressRoute` (read-only).
+   * Pass `null` to detach.
+   */
+  setDistressInbox(inbox: DistressInbox | null): void {
+    this.distressInbox = inbox;
+  }
+
+  /**
    * v1.3 WP-V1.3-3 Omega-1: bind the Coordination handoff log +
    * event bridge + audit log + operator id. Once set, requests to
    * `/api/coordination/*` route through `handleCoordinationRoute`.
@@ -576,6 +597,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * requests through the sentinel router when a dispatcher has been
    * bound. Returns true when served.
    */
+  /**
+   * HABEAS PORT dispatch entry point. Routes `/api/distress/*` requests
+   * through the distress inbox router when an inbox has been bound.
+   * Returns true when served.
+   */
+  private async dispatchDistress(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<boolean> {
+    if (!this.distressInbox) return false;
+    // SECURITY (codex round-1 HIGH): authenticate through the dashboard's own
+    // checkAuth — the SAME gate the `/api/audit-log` route uses, which already
+    // serves every distress envelope. This honors bearer token AND the login
+    // session cookie (the route-helper's authMiddleware checks neither cookie),
+    // so the operator's browser works and a tokenless non-browser caller is
+    // 401'd. checkAuth writes the 401 itself when it fails.
+    const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+    if (!this.checkAuth(req, url, res)) return true;
+    return handleDistressRoute({ inbox: this.distressInbox }, req, res);
+  }
+
   private async dispatchSentinel(
     req: IncomingMessage,
     res: ServerResponse,
@@ -1696,6 +1738,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname.startsWith(SENTINEL_API_PREFIX)
     ) {
       this.dispatchSentinel(req, res)
+        .then((handled) => {
+          if (handled) return;
+          this.handleLegacyRequest(req, res, url, method);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
+
+    // HABEAS PORT: distress inbox surface at `/api/distress/*`. Read-only
+    // against the operator-readable inbox the local listener populates.
+    if (
+      this.distressInbox &&
+      url.pathname.startsWith(DISTRESS_API_PREFIX)
+    ) {
+      this.dispatchDistress(req, res)
         .then((handled) => {
           if (handled) return;
           this.handleLegacyRequest(req, res, url, method);
