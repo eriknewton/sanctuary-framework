@@ -80,12 +80,55 @@
  * externally by Stage 2 (transparency floor / Rekor) and eliminated only by
  * Stage 4 hardware.
  *
+ * ── STAGE 2 — REKOR COUNTER-FLOOR (built; the anchored-fortress defense) ────
+ * For a fortress that has anchored, the external Rekor log holds counters
+ * outside the attacker's disk. Stage 2 requires the on-disk transparency
+ * counter floor ≥ the HIGHEST LOCALLY-RECORDED ANCHORED COUNTER (the highest
+ * counter for which this fortress holds a cryptographically valid local anchor
+ * receipt — resolved OFFLINE, no live network query). A floor BELOW that
+ * highest locally-recorded anchored counter means the checkpoint store was
+ * rolled back to before an anchoring the local receipts (and, behind them, the
+ * external log) still remember: same posture as Stage 1 (warn-loud + the
+ * `custody_rollback_suspected` finding + FREEZE via the SAME marker, never
+ * refuse boot, `restore-attest` clears it).
+ *
+ * Stage 2 APPLIES when anchoring config reads ENABLED *or* any anchor receipt
+ * is present on disk (codex FIX 1): a disk-write attacker WITHOUT the master
+ * can delete or roll the config back to a validly-MAC'd `disabled` state while
+ * PRESERVING the receipts, so "config not enabled" alone must not switch the
+ * check off when receipts prove anchoring happened. A legitimately
+ * disabled-after-anchoring fortress is NOT a false positive: its on-disk floor
+ * is still ≥ its highest locally-recorded anchored counter, so the verdict is
+ * CONSISTENT, not suspected — only a rolled-back floor trips the freeze. Only a
+ * fortress with NO receipts AND a not-enabled config is genuinely
+ * NOT-APPLICABLE.
+ *
+ * Exposed both at boot (composed with the Stage 1 witness cross-check when
+ * Stage 2 applies) and on demand via `verify-transparency --check-anchors` /
+ * `--check-counter-floor`.
+ *
+ * ── HONEST RESIDUAL — what offline Stage 2 does and does NOT catch ──────────
+ * The "highest anchored counter" is derived from the LOCAL anchor receipts. A
+ * disk-write attacker can DELETE those receipts. So offline Stage 2:
+ *   - DOES catch a transparency-floor rollback that PRESERVES the local anchor
+ *     receipts — the splice / tampered-floor / disabled-while-anchored cases
+ *     (the floor regresses below receipts that are still on disk), plus a
+ *     tampered/unreadable receipt store (fails toward freeze).
+ *   - does NOT, by itself, catch a COORDINATED rollback that also DELETES the
+ *     higher local receipts: with both the floor and the higher receipts gone,
+ *     the offline witness is gone too. Catching that requires ONLINE Rekor log
+ *     enumeration (a future "Stage 2b" that asks the external log directly what
+ *     this anchoring key committed), or the Stage-4 hardware monotonic counter.
+ * Stage 2 is a real INCREMENTAL defense on an anchored fortress, not a complete
+ * one; the unanchored full-disk-rollback residual (above) also stays for Stage
+ * 2b / Stage 4. See {@link STAGE_2_REKOR_COUNTER_FLOOR}.
+ *
  * ── DEFERRED STAGES (named, not built) ─────────────────────────────────────
- *   Stage 2 — Rekor counter-floor: when transparency anchoring is on, require
- *     the on-disk counter floor ≥ the highest externally-anchored counter, and
- *     wire it into `verify-transparency --check-anchors`. The only defense that
- *     survives a full-snapshot rollback for an anchored fortress. See
- *     {@link STAGE_2_REKOR_COUNTER_FLOOR}.
+ *   Stage 2b — ONLINE Rekor log enumeration: ask the external log directly
+ *     what this fortress's anchoring key committed, so a coordinated rollback
+ *     that ALSO deletes the higher local receipts cannot hide the anchoring
+ *     from the offline witness. Closes the residual that offline Stage 2 leaves
+ *     open. Not built (network query is out of scope; Erik decides).
  *   Stage 3 — OS keychain stamp: an advisory second witness outside the
  *     fortress tree, never boot-blocking. See {@link STAGE_3_KEYCHAIN_STAMP}.
  *   Stage 4 — hardware monotonic counter (SE post-login / TPM): the only thing
@@ -105,9 +148,14 @@ import {
   constantTimeEqual,
 } from "./encoding.js";
 
-// ── Deferred-stage name stubs (Stage 2/3/4 are NOT implemented here) ────────
+// ── Stage identifiers (Stage 2 implemented below; Stage 3/4 deferred) ───────
 
-/** Stage 2: Rekor counter-floor cross-check. NOT in scope for Stage 1. */
+/**
+ * Stage 2: Rekor counter-floor cross-check (implemented below). Used as the
+ * `witness_source` identifier on a Stage-2 freeze and in the operator-facing
+ * verdict. Stage 2 reuses Stage 1's freeze marker + finding chokepoint; it
+ * does NOT introduce a parallel freeze path.
+ */
 export const STAGE_2_REKOR_COUNTER_FLOOR =
   "anti-rollback-stage-2-rekor-counter-floor" as const;
 /** Stage 3: OS keychain advisory stamp. NOT in scope for Stage 1. */
@@ -354,17 +402,29 @@ export async function isRollbackFrozen(
  * codex r2 MEDIUM: the freeze marker is a CACHE, not the boundary. If a
  * filesystem attacker DELETES the marker (making isRollbackFrozen read
  * "absent" → not frozen), this RECOMPUTES the rollback verdict from the same
- * witness set the boot detector uses (epoch witness + #501 epoch record + audit
- * head anchor splice probe vs the on-disk envelope epoch). On a re-detected
- * rollback it re-writes the freeze and reports frozen — so a marker deletion
- * cannot unfreeze trust-bearing writes even within a single running process.
+ * witness set the boot detector uses and re-writes the freeze on a re-detected
+ * rollback — so a marker deletion cannot unfreeze trust-bearing writes even
+ * within a single running process.
  *
- * A present marker short-circuits to {@link isRollbackFrozen} (fail-closed on
- * tamper). Only an ABSENT marker triggers the (slightly costlier) recompute.
+ * STAGE 1 + STAGE 2 PARITY (codex FIX 4): the recompute re-derives BOTH the
+ * Stage-1 epoch verdict (epoch witness + #501 epoch record + audit head anchor
+ * splice probe vs the on-disk envelope epoch) AND, when Stage 2 applies
+ * (config enabled OR receipts present), the Stage-2 floor-vs-local-anchored
+ * verdict from surviving on-disk evidence. Either suspected verdict re-freezes.
+ * This closes the mid-session bypass where deleting ONLY the Stage-2 freeze
+ * marker would otherwise lift a Stage-2 freeze until the next boot.
+ *
+ * NEVER-REFUSE-BOOT / NEVER-THROW: a Stage-2 recompute I/O error fails TOWARD
+ * frozen (consistent with FIX 2), never escapes this function. A present marker
+ * short-circuits to {@link isRollbackFrozen} (fail-closed on tamper); only an
+ * ABSENT marker triggers the (slightly costlier) recompute.
  */
 export async function isRollbackFrozenWithRecompute(
   storage: StorageBackend,
-  master: Uint8Array
+  master: Uint8Array,
+  /** fortressId for the Stage-2 recompute. When absent it is derived from the
+   * surviving checkpoint records, so callers without it still get parity. */
+  fortressId?: string
 ): Promise<{ frozen: boolean; data?: FreezeData }> {
   const marker = await isRollbackFrozen(storage, master);
   let rawMarker: Uint8Array | null;
@@ -417,7 +477,94 @@ export async function isRollbackFrozenWithRecompute(
     await writeFreeze(storage, master, data);
     return { frozen: true, data };
   }
-  return { frozen: false };
+
+  // FIX 4: Stage-2 parity. Re-derive the Stage-2 verdict from surviving on-disk
+  // evidence so a deleted Stage-2 freeze marker is reconstructed here too, not
+  // only at the next boot. The orchestrator itself re-writes the freeze marker
+  // on a suspected verdict, so this just reports its result. Fail TOWARD frozen
+  // on any recompute I/O error; never throw out of the enforcement path.
+  return recomputeStage2Freeze(storage, master, fortressId);
+}
+
+/**
+ * Re-derive a Stage-2 freeze (FIX 4) from surviving on-disk evidence, for the
+ * marker-absent recompute in {@link isRollbackFrozenWithRecompute}. Mirrors
+ * Stage 1's reconstruction: it reads the witnesses fresh and, via the same
+ * {@link evaluateAndEnforceRekorCounterFloor} orchestrator, RE-WRITES the
+ * Stage-2 freeze marker on a suspected verdict (so the deleted marker is
+ * reconstructed). Fail-toward-frozen on any I/O error — it NEVER throws, so the
+ * enforcement path stays never-refuse-boot.
+ *
+ * A consistent or not-applicable Stage-2 verdict returns `{ frozen: false }`.
+ */
+async function recomputeStage2Freeze(
+  storage: StorageBackend,
+  master: Uint8Array,
+  fortressId?: string
+): Promise<{ frozen: boolean; data?: FreezeData }> {
+  try {
+    const resolvedFortressId =
+      fortressId ?? (await deriveFortressIdFromCheckpoints(storage));
+    const result = await evaluateAndEnforceRekorCounterFloor({
+      storage,
+      master,
+      fortressId: resolvedFortressId,
+    });
+    if (result.verdict.kind === "rollback-suspected") {
+      // The orchestrator already wrote the freeze marker; report it frozen.
+      return {
+        frozen: true,
+        data: {
+          witnessed_epoch: result.verdict.highestAnchoredCounter,
+          observed_epoch: result.verdict.onDiskFloor,
+          witness_source: REKOR_COUNTER_FLOOR_WITNESS_SOURCE,
+          frozen_at: new Date().toISOString(),
+        },
+      };
+    }
+    return { frozen: false };
+  } catch {
+    // Recompute I/O error: fail toward frozen (consistent with FIX 2's
+    // unreadable-store posture). Persist a synthetic, honest freeze record so
+    // the freeze survives subsequent checks too.
+    const data: FreezeData = {
+      witnessed_epoch: 0,
+      observed_epoch: 0,
+      witness_source:
+        REKOR_COUNTER_FLOOR_WITNESS_SOURCE +
+        " (recompute I/O error — failing toward frozen)",
+      frozen_at: new Date().toISOString(),
+    };
+    try {
+      await writeFreeze(storage, master, data);
+    } catch {
+      // Even the freeze write failed; still report frozen (fail-closed). The
+      // in-memory verdict is enough to block this write attempt.
+    }
+    return { frozen: true, data };
+  }
+}
+
+/**
+ * Best-effort fortressId for the Stage-2 recompute when the caller does not
+ * pass one: the persisted checkpoints carry their own fortress_id, and the
+ * Stage-2 anchor verification compares the anchors-export fortress_id against
+ * the checkpoint records' own id — so deriving it FROM the records keeps them
+ * consistent. Returns "" when there is nothing to derive from (no checkpoints
+ * → nothing anchored → Stage 2 will resolve not-applicable/consistent anyway).
+ */
+async function deriveFortressIdFromCheckpoints(
+  storage: StorageBackend
+): Promise<string> {
+  const { readPersistedCheckpoints } = await import(
+    "../transparency/emitter.js"
+  );
+  const records = await readPersistedCheckpoints(storage);
+  for (const record of records) {
+    const id = (record as { fortress_id?: unknown }).fortress_id;
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return "";
 }
 
 async function writeFreeze(
@@ -781,6 +928,9 @@ export async function restoreAttest(args: {
     willUnfreeze: boolean;
     priorFreeze?: FreezeData;
   }) => Promise<void>;
+  /** fortressId for the Stage-2 floor re-baseline (FIX 4). Optional — when
+   * absent it is derived from the surviving checkpoint records. */
+  fortressId?: string;
   now?: () => Date;
 }): Promise<RestoreAttestResult> {
   const now = args.now ?? (() => new Date());
@@ -824,5 +974,468 @@ export async function restoreAttest(args: {
   if (unfroze) {
     await clearFreeze(args.storage);
   }
+
+  // STAGE-2 RE-BASELINE (codex FIX 4 consequence): clearing the freeze marker
+  // is not enough when the freeze was a Stage-2 floor regression — the FIX-4
+  // recompute in enforceCustodyFloor would re-detect the same floor-below-
+  // anchored condition and re-freeze. So, as the Stage-2 analogue of the epoch
+  // re-baseline above, raise the on-disk transparency floor to ≥ the highest
+  // locally-recorded anchored counter, making the attested state internally
+  // consistent. Only raises (monotonic), only when Stage 2 applies, best-effort
+  // and NEVER throws out of restore-attest (a re-baseline failure leaves the
+  // freeze cleared but the floor as-is; the next recompute simply re-freezes,
+  // which is the safe direction — it never silently launders a real rollback).
+  await rebaselineStage2FloorBestEffort(args.storage, args.master, args.fortressId);
+
   return { attestedEpoch: args.currentEpoch, unfroze };
+}
+
+/**
+ * Best-effort Stage-2 floor re-baseline for {@link restoreAttest}. Resolves the
+ * highest locally-recorded anchored counter offline and raises the on-disk
+ * floor to it (monotonic; never lowers). Swallows all errors — restore-attest
+ * must never throw because the transparency stack hiccuped, and failing to
+ * raise the floor only means the next recompute re-freezes (safe direction).
+ */
+async function rebaselineStage2FloorBestEffort(
+  storage: StorageBackend,
+  master: Uint8Array,
+  fortressId?: string
+): Promise<void> {
+  try {
+    const { readAnchorConfig, anchorReceiptsPresentOnDisk } = await import(
+      "../transparency/anchoring.js"
+    );
+    // Only re-baseline when Stage 2 applies (config enabled OR receipts present).
+    let applies = false;
+    try {
+      const state = await readAnchorConfig({ storage, masterKey: master });
+      applies = state.status === "enabled";
+    } catch {
+      applies = true; // tampered/unreadable config → treat as applies
+    }
+    if (!applies) applies = await anchorReceiptsPresentOnDisk(storage);
+    if (!applies) return;
+
+    const resolvedFortressId =
+      fortressId ?? (await deriveFortressIdFromCheckpoints(storage));
+    const { computeHighestVerifiedAnchoredCounter } = await import(
+      "../transparency/anchoring.js"
+    );
+    const anchored = await computeHighestVerifiedAnchoredCounter({
+      storage,
+      masterKey: master,
+      fortressId: resolvedFortressId,
+    });
+    if (anchored.highestAnchoredCounter <= 0) return;
+    const { rebaselineTransparencyCounterFloor } = await import(
+      "../transparency/emitter.js"
+    );
+    await rebaselineTransparencyCounterFloor(
+      storage,
+      master,
+      anchored.highestAnchoredCounter
+    );
+  } catch {
+    // Swallow: never throw out of restore-attest.
+  }
+}
+
+// ── Stage 2 — Rekor counter-floor cross-check ───────────────────────────────
+
+/**
+ * The operator-facing source label on a Stage-2 freeze and verdict. It is
+ * distinct from Stage 1's witness sources so the banner and audit finding name
+ * the LOCALLY-RECORDED Rekor anchor receipts (whose counters the external log
+ * also remembers), not an epoch witness, as what exposed the regression.
+ */
+export const REKOR_COUNTER_FLOOR_WITNESS_SOURCE =
+  "transparency counter floor vs locally-recorded Rekor anchor receipts (Stage 2)";
+
+export type RekorFloorVerdict =
+  /** Stage 2 does not apply: no receipts on disk AND config not enabled. */
+  | { kind: "not-applicable"; reason: string }
+  /** Floor ≥ highest locally-recorded anchored counter (or nothing anchored). */
+  | {
+      kind: "consistent";
+      onDiskFloor: number;
+      highestAnchoredCounter: number;
+    }
+  /** Floor < highest locally-recorded anchored counter, or an unverifiable
+   * anchor while Stage 2 applies → suspected rollback (FREEZE direction). */
+  | {
+      kind: "rollback-suspected";
+      onDiskFloor: number;
+      highestAnchoredCounter: number;
+      notes: string[];
+    };
+
+/**
+ * Inputs for the Stage-2 verdict, all already read by the caller so this is a
+ * pure, side-effect-free function (mirrors {@link evaluateRollback}).
+ */
+export interface RekorFloorInputs {
+  /**
+   * Whether Stage 2 APPLIES to this fortress (codex FIX 1). True when anchoring
+   * config reads ENABLED *or* any anchor receipt is present on disk — a
+   * disk-write attacker without the master can roll the config back to a
+   * validly-MAC'd `disabled` (or delete it) while preserving receipts, so the
+   * config bit alone must not switch Stage 2 off when receipts prove anchoring
+   * happened. When false (no receipts AND config not enabled) Stage 2 does not
+   * apply: a clean not-applicable verdict, never a freeze.
+   */
+  stage2Applies: boolean;
+  /**
+   * The authenticated on-disk transparency counter floor:
+   *  - "valid": a trustworthy on-disk lower bound on emitted checkpoints.
+   *  - "absent": no floor record — no checkpoint emitted yet (floor 0).
+   *  - "invalid": present but tampered/forged → fail toward FREEZE.
+   */
+  onDiskFloor:
+    | { status: "valid"; highest_counter: number }
+    | { status: "absent" }
+    | { status: "invalid" };
+  /** Highest counter for which this fortress holds a cryptographically valid
+   * LOCAL anchor receipt, resolved OFFLINE (0 = nothing locally recorded as
+   * anchored yet). This is a LOCAL witness: a coordinated rollback that also
+   * deletes the higher receipts lowers it (see module HONEST RESIDUAL). */
+  highestAnchoredCounter: number;
+  /** True when an anchored receipt was present but failed its offline checks
+   * (tampered receipt, divergent history, anchor-beyond-bundle) OR the receipt
+   * store was present-but-unreadable/malformed. */
+  unverifiableAnchorPresent: boolean;
+  /** Carried into the finding/banner. Never key material. */
+  notes: string[];
+}
+
+/**
+ * Pure Stage-2 verdict. Fail DIRECTION matches Stage 1 exactly:
+ *  - Stage 2 does not apply (no receipts + config not enabled)
+ *                                          → not-applicable (clean, no freeze)
+ *  - floor invalid (tampered)              → suspected (FREEZE)
+ *  - an anchored receipt is unverifiable   → suspected (FREEZE)
+ *  - floor < highest locally-recorded anchored counter → suspected (FREEZE)
+ *  - floor absent but something IS anchored→ suspected (floor 0 < anchored)
+ *  - floor ≥ highest locally-recorded anchored counter → consistent (PASS)
+ *  - nothing locally anchored (highest==0) → consistent (PASS; no witness)
+ *
+ * The comparison value is the highest LOCALLY-RECORDED anchored counter, not an
+ * external query result; see the module HONEST RESIDUAL for what a coordinated
+ * receipt-deletion can still hide from this offline check.
+ *
+ * INFLATION (FIX 3): a forged self-consistent `consistent` receipt at a high
+ * counter raises highestAnchoredCounter and can trip a false freeze. That is a
+ * DELIBERATE, recoverable false-positive direction under the fail-toward-freeze
+ * posture (the operator clears it with `restore-attest`), not a bug — it is
+ * strictly safer than reading a forged receipt as "no witness".
+ *
+ * It NEVER returns "refuse boot": the only postures are not-applicable,
+ * consistent, and suspected (which the caller turns into warn + freeze).
+ */
+export function evaluateRekorCounterFloor(
+  input: RekorFloorInputs
+): RekorFloorVerdict {
+  if (!input.stage2Applies) {
+    return {
+      kind: "not-applicable",
+      reason:
+        "no anchor receipts are present and transparency anchoring is not " +
+        "enabled on this fortress; Stage 2 (Rekor counter-floor) does not apply",
+    };
+  }
+  const floorValue =
+    input.onDiskFloor.status === "valid" ? input.onDiskFloor.highest_counter : 0;
+  const notes = [...input.notes];
+
+  // A tampered floor cannot be trusted as a number; fail toward freeze.
+  if (input.onDiskFloor.status === "invalid") {
+    notes.unshift(
+      "the on-disk transparency counter floor is present but failed " +
+        "authentication (tampered, forged, or wrong key); treating as a " +
+        "suspected rollback of the checkpoint store"
+    );
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+
+  // An anchored receipt that does not verify offline, with transparency on,
+  // must not silently read as "no external witness".
+  if (input.unverifiableAnchorPresent) {
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+
+  // The core comparison. floorValue is 0 when the floor is absent; if
+  // anything is externally anchored (highest > 0) that is itself a
+  // regression (the floor that anchored it is gone). If nothing is anchored
+  // (highest == 0) this is a clean PASS — no external witness exists yet.
+  if (input.highestAnchoredCounter > floorValue) {
+    notes.unshift(
+      `the on-disk transparency counter floor (${floorValue}) is BELOW the ` +
+        `highest checkpoint this fortress holds a valid local anchor receipt ` +
+        `for (${input.highestAnchoredCounter}); the local anchor receipts ` +
+        "(whose counters the external Rekor log also remembers) prove an " +
+        "anchoring the on-disk checkpoint store no longer reflects — a " +
+        "transparency-floor rollback of an anchored fortress that preserved " +
+        "those receipts"
+    );
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+  return {
+    kind: "consistent",
+    onDiskFloor: floorValue,
+    highestAnchoredCounter: input.highestAnchoredCounter,
+  };
+}
+
+export interface RekorFloorCheckResult {
+  verdict: RekorFloorVerdict;
+  /** True when a freeze marker is now in effect (this check or a prior one). */
+  frozen: boolean;
+  /** Operator-facing banner when suspected; undefined otherwise. */
+  banner?: string;
+}
+
+/**
+ * The Stage-2 entry point (boot AND `verify-transparency --check-counter-floor`).
+ * Determines whether Stage 2 applies (config enabled OR receipts on disk —
+ * codex FIX 1), then reads the on-disk floor and the highest LOCALLY-RECORDED
+ * anchored counter (all offline), runs {@link evaluateRekorCounterFloor}, and
+ * on a suspected verdict raises the SAME freeze marker Stage 1 uses
+ * ({@link writeFreeze} → ROLLBACK_FREEZE_META_KEY), so the existing
+ * `enforceCustodyFloor` chokepoint freezes trust-bearing writes and
+ * `restore-attest` clears it — NO new freeze path, NO new finding type.
+ *
+ * BOOT IS NEVER REFUSED. The dependency reads are injected so this stays
+ * testable without a live transparency stack; defaults wire the real
+ * transparency modules via lazy import (avoids a static cycle and keeps the
+ * core module free of a hard transparency dependency).
+ *
+ * FAIL-TOWARD-FREEZE on an UNREADABLE existing receipt store (codex FIX 2): the
+ * `readHighestAnchoredCounter` default catches a present-but-malformed/
+ * unreadable receipt store and resolves it to `unverifiableAnchorPresent`
+ * (→ suspected → freeze) instead of letting the exception escape to the boot
+ * catch and silently skip the check. A genuinely-ABSENT store (no receipts dir
+ * / empty) stays "nothing anchored" (counter 0), not a freeze.
+ *
+ * HONEST RESIDUAL (do not over-claim): the freeze marker is a CACHE. A Stage-2
+ * freeze whose marker an attacker deletes is re-derived BOTH at the next boot/
+ * `--check-counter-floor` run AND inside `enforceCustodyFloor` (codex FIX 4 now
+ * re-runs this Stage-2 verdict in the marker-absent recompute, with parity to
+ * Stage 1). Offline Stage 2 catches a floor rollback that PRESERVES the local
+ * receipts; a coordinated rollback that also DELETES the higher receipts needs
+ * online Rekor enumeration (Stage 2b) or Stage-4 hardware (see module comment).
+ */
+export async function evaluateAndEnforceRekorCounterFloor(args: {
+  storage: StorageBackend;
+  master: Uint8Array;
+  fortressId: string;
+  /** Override the dependency reads (tests). Defaults to the real modules. */
+  deps?: RekorFloorDeps;
+  now?: () => Date;
+}): Promise<RekorFloorCheckResult> {
+  const now = args.now ?? (() => new Date());
+  const deps = args.deps ?? defaultRekorFloorDeps(args);
+
+  const stage2Applies = await deps.readStage2Applies();
+  if (!stage2Applies) {
+    // Stage 2 does not apply (no receipts AND config not enabled). Preserve any
+    // standing Stage-1 freeze, but never create one here.
+    const prior = await isRollbackFrozen(args.storage, args.master);
+    return {
+      verdict: {
+        kind: "not-applicable",
+        reason:
+          "no anchor receipts are present and transparency anchoring is not " +
+          "enabled; Stage 2 does not apply",
+      },
+      frozen: prior.frozen,
+      ...(prior.frozen
+        ? {
+            banner: prior.data
+              ? staleFreezeBanner(prior.data)
+              : tamperedFreezeBanner(),
+          }
+        : {}),
+    };
+  }
+
+  const onDiskFloor = await deps.readOnDiskFloor();
+  const anchored = await deps.readHighestAnchoredCounter();
+  const verdict = evaluateRekorCounterFloor({
+    stage2Applies,
+    onDiskFloor,
+    highestAnchoredCounter: anchored.highestAnchoredCounter,
+    unverifiableAnchorPresent: anchored.unverifiableAnchorPresent,
+    notes: anchored.notes,
+  });
+
+  const priorFreeze = await isRollbackFrozen(args.storage, args.master);
+
+  if (verdict.kind === "rollback-suspected") {
+    // Reuse Stage 1's freeze marker. witnessed_epoch/observed_epoch carry the
+    // two counters so the operator banner + audit finding show them; the
+    // distinct witness_source names the external log as the exposing witness.
+    if (!priorFreeze.frozen || !priorFreeze.data) {
+      const freezeData: FreezeData = {
+        witnessed_epoch: verdict.highestAnchoredCounter,
+        observed_epoch: verdict.onDiskFloor,
+        witness_source: REKOR_COUNTER_FLOOR_WITNESS_SOURCE,
+        frozen_at: now().toISOString(),
+      };
+      await writeFreeze(args.storage, args.master, freezeData);
+    }
+    return {
+      verdict,
+      frozen: true,
+      banner: rekorFloorBanner(verdict),
+    };
+  }
+
+  // Consistent. Like Stage 1's OK path, a clean Stage-2 verdict does NOT
+  // auto-clear a standing freeze — only restore-attest does.
+  if (priorFreeze.frozen) {
+    return {
+      verdict,
+      frozen: true,
+      banner: priorFreeze.data
+        ? staleFreezeBanner(priorFreeze.data)
+        : tamperedFreezeBanner(),
+    };
+  }
+  return { verdict, frozen: false };
+}
+
+/** The injectable Stage-2 dependency reads (real modules by default). */
+export interface RekorFloorDeps {
+  /** Stage 2 applies when config==enabled OR any receipt is on disk (FIX 1). */
+  readStage2Applies: () => Promise<boolean>;
+  readOnDiskFloor: () => Promise<RekorFloorInputs["onDiskFloor"]>;
+  readHighestAnchoredCounter: () => Promise<{
+    highestAnchoredCounter: number;
+    unverifiableAnchorPresent: boolean;
+    notes: string[];
+  }>;
+}
+
+/** Default dependency reads: wire the real transparency modules (lazy). */
+function defaultRekorFloorDeps(args: {
+  storage: StorageBackend;
+  master: Uint8Array;
+  fortressId: string;
+}): RekorFloorDeps {
+  return {
+    // FIX 1: Stage 2 applies if the config reads enabled OR any anchor receipt
+    // is present on disk. A disk-write attacker without the master can delete /
+    // roll the config back to a validly-MAC'd `disabled` while preserving the
+    // receipts; the receipts prove anchoring happened, so the check still runs.
+    // A tampered config that THROWS is treated as "applies" (fail toward the
+    // check, never toward silently skipping Stage 2). receiptsPresentOnDisk is
+    // a cheap listing that does NOT parse the receipts — a malformed store is
+    // still "present" and is surfaced later by readHighestAnchoredCounter.
+    readStage2Applies: async () => {
+      const { readAnchorConfig, anchorReceiptsPresentOnDisk } = await import(
+        "../transparency/anchoring.js"
+      );
+      let configEnabled = false;
+      try {
+        const state = await readAnchorConfig({
+          storage: args.storage,
+          masterKey: args.master,
+        });
+        configEnabled = state.status === "enabled";
+      } catch {
+        // Tampered/unreadable config: cannot prove "not enabled". Fall through
+        // to the receipts probe; if receipts exist OR we cannot rule the config
+        // out, Stage 2 applies. Treat the throw as "applies".
+        return true;
+      }
+      if (configEnabled) return true;
+      return anchorReceiptsPresentOnDisk(args.storage);
+    },
+    readOnDiskFloor: async () => {
+      const { readTransparencyCounterFloor } = await import(
+        "../transparency/emitter.js"
+      );
+      return readTransparencyCounterFloor(args.storage, args.master);
+    },
+    // FIX 2: an EXISTING-but-unreadable/malformed receipt store must FREEZE,
+    // not let the exception escape to the boot catch (which only logs → no
+    // freeze). computeHighestVerifiedAnchoredCounter throws on a malformed
+    // store (readAnchorReceipts / buildAnchorsExport); catch it here and
+    // resolve to unverifiableAnchorPresent → suspected → freeze. A genuinely
+    // ABSENT store yields counter 0 (nothing anchored), never a freeze.
+    readHighestAnchoredCounter: async () => {
+      const { computeHighestVerifiedAnchoredCounter } = await import(
+        "../transparency/anchoring.js"
+      );
+      try {
+        const result = await computeHighestVerifiedAnchoredCounter({
+          storage: args.storage,
+          masterKey: args.master,
+          fortressId: args.fortressId,
+        });
+        return {
+          highestAnchoredCounter: result.highestAnchoredCounter,
+          unverifiableAnchorPresent: result.unverifiableAnchorPresent,
+          notes: result.notes,
+        };
+      } catch (err) {
+        // Present-but-unreadable receipt store (or config/export read error):
+        // fail toward freeze. We cannot read the witness, so we must not read
+        // it as "no witness". highestAnchoredCounter stays 0 but the
+        // unverifiable flag forces the suspected verdict regardless of the
+        // floor numbers.
+        return {
+          highestAnchoredCounter: 0,
+          unverifiableAnchorPresent: true,
+          notes: [
+            "the anchor receipt store is present but could not be read or " +
+              "parsed (corrupt, tampered, or otherwise unverifiable); treating " +
+              "as a suspected rollback (fail toward freeze): " +
+              (err instanceof Error ? err.message : String(err)),
+          ],
+        };
+      }
+    },
+  };
+}
+
+function rekorFloorBanner(
+  verdict: Extract<RekorFloorVerdict, { kind: "rollback-suspected" }>
+): string {
+  return (
+    "\nSanctuary: WARNING — SUSPECTED CUSTODY ROLLBACK (transparency anchors).\n" +
+    `  on-disk transparency counter floor: ${verdict.onDiskFloor}\n` +
+    `  highest locally-recorded anchored checkpoint: ${verdict.highestAnchoredCounter}\n` +
+    "\n" +
+    "This fortress holds a valid anchor receipt (whose counter the public Rekor\n" +
+    "transparency log also remembers) for a checkpoint the on-disk checkpoint\n" +
+    "store no longer reflects. That is the signature of a rollback of an ANCHORED\n" +
+    "fortress that left the receipts behind: the floor regressed below an\n" +
+    "anchoring still proven on disk.\n" +
+    "\n" +
+    "Sanctuary is NOT refusing to boot. It HAS frozen trust-bearing writes\n" +
+    "until you acknowledge what happened:\n" +
+    "\n" +
+    "  sanctuary restore-attest   (requires the fortress passphrase)\n" +
+    "\n" +
+    "If you did NOT restore anything, treat this as a possible attack: rotate\n" +
+    "the master before attesting. Note: a coordinated rollback that ALSO deletes\n" +
+    "the higher anchor receipts cannot be caught offline — that needs online\n" +
+    "Rekor enumeration or the hardware counter (future stages).\n"
+  );
 }

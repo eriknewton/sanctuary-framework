@@ -62,6 +62,7 @@ import {
 } from "./anchor.js";
 import {
   TRANSPARENCY_ANCHORS_EXPORT_FORMAT,
+  verifyAnchorEvidence,
   type ExportedAnchorReceipt,
   type TransparencyAnchorsExport,
 } from "./anchor-verify.js";
@@ -71,6 +72,7 @@ import {
   type EnforcementCheckpointRecord,
 } from "./checkpoint.js";
 import { readPersistedCheckpoints } from "./emitter.js";
+import { isVerifierCheckpointRecord } from "./verify.js";
 import {
   HttpRekorClient,
   RekorEntryNotFoundError,
@@ -489,6 +491,33 @@ export function anchorReceiptStorageKey(counter: number): string {
   return `${TRANSPARENCY_ANCHOR_RECEIPT_PREFIX}${String(counter).padStart(20, "0")}`;
 }
 
+/**
+ * Whether ANY anchor receipt is present on disk (anti-rollback Stage 2 FIX 1).
+ * A cheap listing that does NOT parse the receipts: it answers only
+ * "present vs genuinely absent". A present-but-MALFORMED store is reported as
+ * present (true) here — the malformed-store freeze is the caller's job via the
+ * parsing path (computeHighestVerifiedAnchoredCounter / readAnchorReceipts),
+ * which fails toward freeze. An unlistable namespace is treated as PRESENT
+ * (true): we cannot prove the store is empty, so Stage 2 should apply (fail
+ * toward running the check, never toward skipping it). A genuinely empty/absent
+ * namespace returns false → Stage 2 does not apply on that basis alone.
+ */
+export async function anchorReceiptsPresentOnDisk(
+  storage: StorageBackend
+): Promise<boolean> {
+  try {
+    const metas = await storage.list(
+      TRANSPARENCY_ANCHOR_NAMESPACE,
+      TRANSPARENCY_ANCHOR_RECEIPT_PREFIX
+    );
+    return metas.length > 0;
+  } catch {
+    // Cannot list the store → cannot prove it is empty → treat as present so
+    // Stage 2 still applies (the parsing path then fails toward freeze).
+    return true;
+  }
+}
+
 /** Read every persisted anchor receipt, sorted by counter ascending. */
 export async function readAnchorReceipts(
   storage: StorageBackend
@@ -789,6 +818,114 @@ export async function buildAnchorsExport(
     anchor_public_key_pem: publicKeyPem,
     rekor_url: state.config.rekor_url,
     receipts,
+  };
+}
+
+// ---- Highest externally-anchored counter (anti-rollback Stage 2) ------------------
+
+/**
+ * The result of resolving the highest counter that is BOTH locally present
+ * AND cryptographically tied to an external Rekor anchor, offline.
+ */
+export interface HighestAnchoredCounterResult {
+  /**
+   * Highest checkpoint counter whose local anchor receipt passes every
+   * OFFLINE anchor check (commitment binding to the bundle's checkpoint,
+   * entry binding, RFC 6962 inclusion arithmetic). 0 when nothing is
+   * verifiably anchored yet (transparency on but no anchor confirmed) — a
+   * clean state, NOT suspicious.
+   */
+  highestAnchoredCounter: number;
+  /**
+   * True when an anchored receipt was present but did NOT pass its offline
+   * checks (tampered receipt, commitment mismatch, malformed entry/proof,
+   * or an anchor for a divergent checkpoint history). Forces the FREEZE
+   * direction in Stage 2: an unverifiable anchor with transparency on must
+   * never silently read as "no external witness".
+   */
+  unverifiableAnchorPresent: boolean;
+  /** Number of anchored receipts that verified (verified or consistent). */
+  verifiedAnchorCount: number;
+  /** Operator-facing notes (never key material). */
+  notes: string[];
+}
+
+/**
+ * Anti-rollback Stage 2 witness resolver: compute the HIGHEST EXTERNALLY-
+ * ANCHORED COUNTER from the fortress's own locally-stored anchor receipts,
+ * verified OFFLINE against the local checkpoint store.
+ *
+ * The external Rekor log is outside the attacker's disk, so the highest
+ * counter the fortress anchored there is a freshness witness a full-snapshot
+ * rollback cannot roll back. This resolves what that counter is using only
+ * local evidence (the MAC-authenticated config salt, the master-derived
+ * anchoring public key, and the local receipts) cross-checked against the
+ * local persisted checkpoints — the SAME offline arithmetic the auditor-side
+ * `verify-transparency --check-anchors` runs (verifyAnchorEvidence), so the
+ * fail-direction matches: a receipt that does not bind to a real local
+ * checkpoint is unverifiable, never a silent witness.
+ *
+ * NO NETWORK: this never queries the log. The receipt-embedded entry body +
+ * inclusion proof carry everything the offline checks need. A receipt that
+ * is "consistent" (all offline checks pass, no pinned log key) counts as an
+ * external witness for the floor comparison — its commitment is bound to a
+ * real local checkpoint counter and a real Rekor leaf, which is exactly the
+ * witness the floor must not regress below. (Full "verified" status would
+ * additionally require a pinned log key; the floor comparison does not need
+ * log-attested time, only that the counter was anchored.)
+ */
+export async function computeHighestVerifiedAnchoredCounter(
+  input: AnchorKeyInput & { fortressId: string }
+): Promise<HighestAnchoredCounterResult> {
+  const records = (await readPersistedCheckpoints(input.storage)).filter(
+    isVerifierCheckpointRecord
+  );
+  const anchorsDoc = await buildAnchorsExport(input);
+  const result = verifyAnchorEvidence(records, anchorsDoc);
+  let highestAnchoredCounter = 0;
+  let verifiedAnchorCount = 0;
+  let unverifiableAnchorPresent = false;
+  const notes: string[] = [];
+  for (const status of result.coverage.statuses) {
+    if (status.status === "verified" || status.status === "consistent") {
+      verifiedAnchorCount++;
+      if (status.counter > highestAnchoredCounter) {
+        highestAnchoredCounter = status.counter;
+      }
+    } else if (status.status === "invalid") {
+      unverifiableAnchorPresent = true;
+      notes.push(
+        `anchor receipt for checkpoint ${status.counter} did not pass offline ` +
+          `verification (${status.detail}); cannot trust it as an external witness`
+      );
+    }
+    // "unverified" (receipt lacks an embedded body/proof) and "unanchored"
+    // (no receipt for that checkpoint) are NOT failures: a fortress simply
+    // has not anchored every checkpoint. They never lower the floor and
+    // never force freeze on their own.
+  }
+  // A receipt that names a counter BEYOND the local checkpoint bundle is the
+  // withheld-suffix signature (verifyAnchorEvidence surfaces it as an
+  // anchor_beyond_bundle finding): the fortress anchored a checkpoint it no
+  // longer holds on disk — exactly a rolled-back checkpoint store.
+  for (const finding of result.findings) {
+    if (finding.kind === "anchor_beyond_bundle") {
+      unverifiableAnchorPresent = true;
+      if (typeof finding.counter === "number" && finding.counter > highestAnchoredCounter) {
+        highestAnchoredCounter = finding.counter;
+      }
+      notes.push(
+        `an anchor proves checkpoint ${finding.counter ?? "?"} was externally ` +
+          "anchored, but the local checkpoint store does not contain it: the " +
+          "newest checkpoints appear to have been rolled back off disk"
+      );
+    }
+  }
+  return {
+    highestAnchoredCounter,
+    unverifiableAnchorPresent,
+    verifiedAnchorCount,
+    notes,
   };
 }
 

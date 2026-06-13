@@ -228,6 +228,7 @@ export async function runRestoreAttestCommand(
       master,
       currentEpoch,
       epochId,
+      fortressId,
       recordAttestation: async (ctx) => {
         await auditLog.appendCritical({
           layer: "l2",
