@@ -400,5 +400,356 @@ class ScanIntegrationTests(unittest.TestCase):
         )
 
 
+class RawStringLiteralTests(unittest.TestCase):
+    """Regression cases for the raw-string-aware line scanner (PR #500 bug).
+
+    Before the fix, `find_test_mod_lines` counted bare `{`/`}` characters that
+    appeared inside a multi-line raw-string fixture, which desynced the brace
+    depth, ended the `#[cfg(test)] mod` region early, and false-flagged a
+    test-code `.unwrap()` below the fixture as a production site.
+    """
+
+    def test_multiline_raw_string_braces_do_not_end_test_region(self):
+        # The exact shape that broke tonight: a multi-line `r#"{...}"#` JSON
+        # fixture inside #[cfg(test)] mod, with bare braces in the content.
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let json = r#"{
+                        "key": "value",
+                        "nested": { "a": 1 },
+                        "closing": }
+                    }"#;
+                    let v: Option<i32> = None;
+                    let _y = v.unwrap();
+                    let _ = json;
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        flags = GATE.find_test_mod_lines(body)
+        # The test-mod region must extend through the unwrap below the fixture.
+        for idx, line in enumerate(body):
+            if "v.unwrap()" in line:
+                self.assertTrue(
+                    flags[idx],
+                    "unwrap below a multi-line raw-string fixture must stay "
+                    "inside the test region",
+                )
+                break
+        else:
+            self.fail("v.unwrap() line not found")
+        # And that unwrap must NOT be reported as a production site.
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", body)
+        self.assertEqual(
+            sites,
+            [],
+            "test-mod unwrap below a raw-string fixture must be exempt",
+        )
+
+    def test_unbalanced_closing_braces_in_raw_string(self):
+        # Raw content with MORE `}` than `{`: previously drove depth below the
+        # start and closed the region on the first net-zero crossing.
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let payload = r#"
+                        allow }
+                        deny }
+                    "#;
+                    let v: Option<i32> = None;
+                    let _y = v.unwrap();
+                    let _ = payload;
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", body)
+        self.assertEqual(
+            sites, [], "unwrap after an unbalanced-brace raw string is test code"
+        )
+
+    def test_single_line_raw_string_with_unwrap_text(self):
+        # A single-line raw string containing `.unwrap()` text is not a call.
+        lines = textwrap.dedent(
+            '''
+            pub fn label() -> &'static str {
+                let s = r#"call .unwrap() here"#;
+                s
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            ".unwrap() inside a single-line raw string is not a call site",
+        )
+
+    def test_raw_string_with_nested_quotes_and_braces(self):
+        # Nested `"` inside r#"..."# must not terminate the raw string early,
+        # so the unwrap-looking text inside stays masked.
+        lines = textwrap.dedent(
+            '''
+            pub fn build() -> i32 {
+                let _doc = r#"{ "msg": "x.unwrap() \\" still inside" }"#;
+                42
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "nested quotes inside a raw string must not end it early",
+        )
+
+    def test_production_unwrap_after_raw_string_still_caught(self):
+        # FALSE-NEGATIVE guard: a real production unwrap that follows a
+        # multi-line raw string must still be reported.
+        lines = textwrap.dedent(
+            '''
+            pub fn boom() -> i32 {
+                let _doc = r#"
+                    { "a": 1 }
+                "#;
+                let x: Option<i32> = None;
+                x.unwrap()
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "a production unwrap after a raw string must remain visible",
+        )
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_multiline_normal_string_brace_tracking(self):
+        # A normal (non-raw) string continued across lines via backslash also
+        # must not leak braces into the depth counter.
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn fixture_test() {
+                    let s = "line one with } \\
+            still in string }";
+                    let v: Option<i32> = None;
+                    let _y = v.unwrap();
+                    let _ = s;
+                }
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", body)
+        self.assertEqual(
+            sites, [], "unwrap after a continued normal string is test code"
+        )
+
+    def test_unterminated_raw_string_does_not_crash(self):
+        # Edge: an unterminated raw string (e.g. truncated file) must scan
+        # without raising; remaining lines are treated as in-string content.
+        lines = textwrap.dedent(
+            '''
+            pub fn boom() -> i32 {
+                let _doc = r#"
+                    unterminated { content }
+                    x.unwrap()
+            '''
+        ).strip().splitlines(keepends=True)
+        # Should not raise, and the unwrap text inside the open raw string is
+        # masked (no production site recorded).
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "text inside an unterminated raw string is not a call site",
+        )
+
+    def test_char_literal_double_quote_does_not_hide_later_sites(self):
+        # FALSE-NEGATIVE guard (codex review): a char literal containing a
+        # double quote, `let c = '"';`, must NOT put the scrubber into a
+        # persistent string state that blanks the rest of the file and hides a
+        # real production unwrap below it.
+        lines = textwrap.dedent(
+            """
+            pub fn boom(x: Option<i32>) -> i32 {
+                let _c = '"';
+                x.unwrap()
+            }
+            """
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "a char literal '\"' must not hide a real unwrap below it",
+        )
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_escaped_char_literals_do_not_break_scan(self):
+        # `'\''` and `'\\'` contain a quote/backslash but are complete char
+        # literals; a real unwrap after them must remain visible.
+        lines = textwrap.dedent(
+            r"""
+            pub fn boom(x: Option<i32>) -> i32 {
+                let _q = '\'';
+                let _b = '\\';
+                x.unwrap()
+            }
+            """
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(len(sites), 1)
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_lifetime_tick_not_misread_as_char_literal(self):
+        # Lifetimes (`'static`, `'a`) must not be consumed as char literals,
+        # and a string literal on the same line must still mask correctly.
+        lines = textwrap.dedent(
+            '''
+            pub fn label() -> &'static str {
+                "called .unwrap() somewhere"
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites,
+            [],
+            "lifetime tick must not desync string masking on the line",
+        )
+
+    def test_block_comment_lone_quote_does_not_hide_later_sites(self):
+        # FALSE-NEGATIVE guard (codex review round 2): a lone `"` inside a
+        # multi-line `/* ... */` block comment must NOT open a persistent
+        # string state that masks the rest of the file. Here the unbalanced
+        # quote previously extended the test region over `prod`'s unwrap.
+        lines = textwrap.dedent(
+            '''
+            #[cfg(test)]
+            mod tests {
+                /*
+                   lone quote in a valid block comment: "
+                */
+            }
+
+            pub fn prod(x: Option<i32>) -> i32 {
+                x.unwrap()
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "block-comment quote must not hide prod unwrap below the test mod",
+        )
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_block_comment_braces_excluded_from_depth(self):
+        # Braces inside a block comment must not count toward the test-mod
+        # brace depth, so the region ends at the real closing brace.
+        body = textwrap.dedent(
+            '''
+            pub fn ok() {}
+
+            #[cfg(test)]
+            mod tests {
+                /* spurious braces in comment: } } { */
+                #[test]
+                fn t() {
+                    let v: Option<i32> = None;
+                    let _y = v.unwrap();
+                }
+            }
+
+            pub fn after(x: Option<i32>) -> i32 {
+                x.unwrap()
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", body)
+        # Only `after`'s unwrap is production; the test-mod one is exempt.
+        self.assertEqual(len(sites), 1)
+        self.assertTrue(
+            any("x.unwrap()" in s.text for s in sites),
+            "production unwrap after the test mod must be the reported site",
+        )
+
+    def test_nested_block_comment(self):
+        # Rust block comments nest; the region must reopen only at the outer
+        # `*/`, after which production code is visible again.
+        lines = textwrap.dedent(
+            '''
+            pub fn prod(x: Option<i32>) -> i32 {
+                /* outer /* inner "unbalanced */ still comment */
+                x.unwrap()
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "nested block comment must close fully and expose the unwrap",
+        )
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_prefixed_raw_strings_cr_br(self):
+        # FALSE-NEGATIVE guard (codex review round 3): the C-string raw form
+        # `cr#"..."#` and byte-string raw form `br#"..."#` must be recognized
+        # as raw strings. A multi-line one containing a `"` previously left a
+        # dangling normal-string state that could mask later production code.
+        lines = textwrap.dedent(
+            '''
+            pub fn prod(x: Option<i32>) -> i32 {
+                let _c = cr#"
+                    c-string with a " quote and } brace
+                "#;
+                let _b = br#"bytes with " and }"#;
+                x.unwrap()
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            len(sites),
+            1,
+            "cr#/br# raw strings must not leave dangling state hiding unwrap",
+        )
+        self.assertIn("unwrap", sites[0].text)
+
+    def test_cr_raw_string_masks_inner_unwrap(self):
+        # An `.unwrap()` literal inside a cr#"..."# raw string is not a call.
+        lines = textwrap.dedent(
+            '''
+            pub fn build() -> i32 {
+                let _c = cr#"text .unwrap() inside"#;
+                42
+            }
+            '''
+        ).strip().splitlines(keepends=True)
+        sites = GATE.find_unwrap_expect_sites("dummy.rs", lines)
+        self.assertEqual(
+            sites, [], ".unwrap() inside a cr#-raw string is not a call site"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
