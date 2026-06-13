@@ -55,6 +55,19 @@ pub const HABEAS_DISTRESS_PORT: u16 = 8741;
 /// `host` axis (there is no ip axis).
 pub const HABEAS_LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "::1", "localhost"];
 
+/// Canonical JSON body of the genuine derived local distress rule — the exact
+/// shape `deriveHabeasDistressRules` (habeas-port.ts) emits and
+/// [`is_derived_habeas_rule`] recognizes. Every composed manifest must carry
+/// exactly one rule with this shape (the always-on-lane gate); manifest
+/// fixtures across the daemon's unit and integration suites embed this body.
+/// A unit test asserts it parses to a rule the gate recognizes as genuine, so
+/// the constant cannot drift from the recognizer.
+pub const HABEAS_LOCAL_RULE_BODY: &str = "{\"id\":\"reserved_habeas_distress_local\",\
+\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\
+\"match\":{\"ip\":[\"127.0.0.1\",\"::1\"],\"port\":[8741],\"protocol\":\"tcp\"},\
+\"scope\":{\"agent_ids\":[\"sanctuary:habeas-distress-emitter\"]},\
+\"disposition\":\"allow\",\"derived\":true}";
+
 /// The distress webhook destination the lane allows, parsed from operator
 /// config. Mirrors `HabeasWebhookTarget` in `habeas-port.ts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +357,11 @@ pub fn is_derived_habeas_rule(rule: &AllowlistRule) -> bool {
     if rule.disposition != RuleDisposition::Allow {
         return false;
     }
+    // The composer never stamps a time window on a derived rule; one here is
+    // a forgery marker (and unenforceable on this daemon anyway).
+    if rule.time_window.is_some() {
+        return false;
+    }
     // Emitter-only scope: exactly the reserved synthetic emitter id, never
     // all-agents. (Kept in sync with HABEAS_EMITTER_AGENT_ID in habeas-port.ts.)
     let emitter_scoped = rule.scope.template_ids.is_empty()
@@ -399,9 +417,12 @@ pub fn is_derived_habeas_rule(rule: &AllowlistRule) -> bool {
 ///     (exact shape, see [`is_derived_habeas_rule`]) is a prefix claim →
 ///     reject. This is also caught by [`find_habeas_conflicts`], but checking
 ///     it here lets the exemption be precise.
-///   - At most ONE genuine local reserved rule and at most ONE genuine webhook
-///     reserved rule. A duplicate reserved id is rejected so a second "webhook"
-///     rule cannot redefine the target the operator-shadow scan protects.
+///   - EXACTLY one genuine local reserved rule in EVERY manifest (the
+///     always-on lane gate, codex round-4 HIGH: a signed manifest that drops
+///     the local distress lane is refused — no legacy allowance, see the
+///     inline rationale), and at most ONE genuine webhook reserved rule. A
+///     duplicate reserved id is rejected so a second "webhook" rule cannot
+///     redefine the target the operator-shadow scan protects.
 ///
 /// Then: exempt the (now provably-unique, provably-genuine) derived reserved
 /// rules, recover the webhook target from the genuine webhook rule, and scan
@@ -435,20 +456,24 @@ pub fn find_habeas_conflicts_in_composed(rules: &[AllowlistRule]) -> Vec<String>
             webhook_count += 1;
         }
     }
-    // A habeas-aware manifest (one that declares ANY reserved rule — i.e. the
-    // TS composer injected the lane) MUST carry exactly one genuine local rule.
-    // Zero genuine-local-but-some-reserved means the local lane was dropped or
-    // corrupted while another reserved rule survived → silenced lane → reject
-    // (codex round-3 HIGH). A manifest with NO reserved rules at all is a
-    // legacy / not-yet-composed manifest: the gate stays silent on it (the
-    // always-on guarantee is the composer's job and is governed by the
-    // platform thesis-gate), preserving back-compat with pre-habeas manifests.
-    let any_reserved = local_count > 0 || webhook_count > 0;
-    if any_reserved && local_count != 1 {
+    // EVERY composed manifest MUST carry exactly one genuine local distress
+    // rule (codex round-4 HIGH; supersedes the round-3 "habeas-aware only"
+    // gate). The TS composer (post-#497) unconditionally injects the lane,
+    // the daemon and server ship together, and the manifest schema carries no
+    // version field that could prove pre-habeas provenance — so a signed
+    // manifest WITHOUT the lane is either stale, hand-edited, or composed by
+    // a non-conforming toolchain, and the W-series lesson is that such a
+    // ruleset must never out-rank the always-on lane. There is deliberately
+    // NO legacy allowance: a lane-less manifest is refused loudly
+    // (PolicySnapshotError::HabeasConflict → reload responds ok:false and the
+    // daemon keeps the prior good policy / stays deny-by-default), never
+    // quietly enforced without the lane.
+    if local_count != 1 {
         issues.push(format!(
-            "habeas-aware manifest has {local_count} genuine \"{HABEAS_LOCAL_RULE_ID}\" \
-             rules; exactly one must be present (the local distress lane is always-on \
-             and cannot be dropped while other reserved rules are composed)"
+            "manifest has {local_count} genuine \"{HABEAS_LOCAL_RULE_ID}\" rules; \
+             exactly one must be present in every composed manifest (the local \
+             distress lane is always-on: the composer always injects it, and a \
+             manifest without it cannot be put into force)"
         ));
     }
     if webhook_count > 1 {
@@ -495,6 +520,8 @@ mod tests {
             match_clause: m,
             scope: RuleScope::default(),
             disposition,
+            time_window: None,
+            derived: None,
         }
     }
 
@@ -696,6 +723,16 @@ mod tests {
     }
 
     #[test]
+    fn canonical_local_rule_body_parses_as_genuine() {
+        // Pins HABEAS_LOCAL_RULE_BODY (used by manifest fixtures across the
+        // suites) to the recognizer: if either drifts, this fails.
+        let rule: AllowlistRule =
+            serde_json::from_str(HABEAS_LOCAL_RULE_BODY).expect("canonical body parses");
+        assert!(is_derived_habeas_rule(&rule));
+        assert!(find_habeas_conflicts_in_composed(&[rule]).is_empty());
+    }
+
+    #[test]
     fn composed_gate_exempts_genuine_derived_rules() {
         let operator = op(
             "r1",
@@ -735,8 +772,9 @@ mod tests {
         // genuine derived rule; it must be rejected as an id claim.
         let imposter = op(HABEAS_LOCAL_RULE_ID, RuleDisposition::Deny, m(None, None, None));
         let issues = find_habeas_conflicts_in_composed(&[imposter]);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains(HABEAS_RULE_ID_PREFIX));
+        // Two issues: the id claim AND the missing genuine local lane.
+        assert!(issues.iter().any(|i| i.contains(HABEAS_RULE_ID_PREFIX)));
+        assert!(issues.iter().any(|i| i.contains("exactly one")));
     }
 
     // ---- codex round-1 HIGH: forged reserved rules are NOT exempted --------
@@ -767,8 +805,10 @@ mod tests {
         forged.scope = emitter_scope();
         assert!(!is_derived_habeas_rule(&forged));
         let issues = find_habeas_conflicts_in_composed(&[forged]);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains(HABEAS_RULE_ID_PREFIX));
+        assert!(issues.iter().any(|i| i.contains(HABEAS_RULE_ID_PREFIX)));
+        // The forged rule is not a genuine local rule either, so the
+        // always-on-lane gate fires too.
+        assert!(issues.iter().any(|i| i.contains("exactly one")));
     }
 
     #[test]
@@ -783,8 +823,7 @@ mod tests {
         forged.scope = emitter_scope();
         assert!(!is_derived_habeas_rule(&forged));
         let issues = find_habeas_conflicts_in_composed(&[forged]);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains(HABEAS_RULE_ID_PREFIX));
+        assert!(issues.iter().any(|i| i.contains(HABEAS_RULE_ID_PREFIX)));
     }
 
     #[test]
@@ -828,7 +867,7 @@ mod tests {
         ); // op() uses RuleScope::default() == all-agents
         assert!(!is_derived_habeas_rule(&forged));
         let issues = find_habeas_conflicts_in_composed(&[forged]);
-        assert_eq!(issues.len(), 1);
+        assert!(issues.iter().any(|i| i.contains(HABEAS_RULE_ID_PREFIX)));
     }
 
     #[test]
@@ -953,15 +992,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_with_no_reserved_rules_is_clean() {
-        // Back-compat: a pre-habeas manifest (no reserved rules at all) is not
-        // forced to carry the lane by this gate.
+    fn manifest_with_no_reserved_rules_is_rejected_for_missing_lane() {
+        // Codex round-4 HIGH: there is NO legacy allowance. A signed manifest
+        // with no reserved rules at all (the composer always injects the
+        // lane, and there is no manifest-version field proving pre-habeas
+        // provenance) is refused so a stale or hand-edited ruleset can never
+        // run without the always-on local distress lane.
         let composed = vec![op(
             "r1",
             RuleDisposition::Allow,
             m(Some(vec!["api.example.com"]), None, Some(vec![443])),
         )];
-        assert!(find_habeas_conflicts_in_composed(&composed).is_empty());
+        let issues = find_habeas_conflicts_in_composed(&composed);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("exactly one"));
+        assert!(issues[0].contains(HABEAS_LOCAL_RULE_ID));
     }
 
     #[test]

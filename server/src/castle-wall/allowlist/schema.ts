@@ -92,9 +92,79 @@ export interface AllowlistRule {
  * string array for validation. Non-string members survive as-is so the
  * downstream `isValidIp`/`isValidCidr` check rejects them.
  */
-function toStringArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value as string[];
-  return [value as string];
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isValidPortNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+/**
+ * Validate a `T | T[]` axis: present means a single valid scalar or a
+ * NON-EMPTY array of valid scalars. `null`, wrong-typed scalars, empty
+ * arrays, and wrong-typed array members all reject. This is load-bearing
+ * cross-language parity (codex round-6): the Rust daemon's serde layer
+ * refuses wrong-typed values outright, and reads an explicit JSON `null` as
+ * "axis absent" — so a TS-side validator that accepted `host: null` by mere
+ * key presence would sign a rule one side reads as constrained and the other
+ * as any-destination. The validator must reject everything serde would
+ * refuse or reinterpret.
+ */
+function validateAxisValues(
+  axis: string,
+  value: unknown,
+  isValid: (entry: unknown) => boolean,
+  expected: string,
+  issues: string[],
+): void {
+  if (Array.isArray(value) && value.length === 0) {
+    issues.push(`${axis} must not be an empty array (omit the axis instead)`);
+    return;
+  }
+  const entries = Array.isArray(value) ? value : [value];
+  for (const entry of entries) {
+    if (!isValid(entry)) {
+      issues.push(`${axis} contains invalid entry (expected ${expected}): ${String(entry)}`);
+    }
+  }
+}
+
+const KNOWN_RULE_KEYS = new Set([
+  "id",
+  "schema_version",
+  "created_at",
+  "description",
+  "match",
+  "scope",
+  "disposition",
+  "time_window",
+  "derived",
+]);
+const KNOWN_MATCH_KEYS = new Set(["host", "host_pattern", "ip", "cidr", "port", "protocol"]);
+const KNOWN_SCOPE_KEYS = new Set(["agent_ids", "template_ids"]);
+const KNOWN_TIME_WINDOW_KEYS = new Set(["start", "end"]);
+
+/**
+ * Reject unknown fields, mirroring the Rust daemon's
+ * `#[serde(deny_unknown_fields)]` on AllowlistRule / RuleMatch / RuleScope:
+ * an unmodeled field can only come from a newer (or non-conforming) schema,
+ * and the enforcing daemon will refuse the manifest — so the build-time
+ * validator must refuse it FIRST, before it gets signed.
+ */
+function rejectUnknownKeys(
+  label: string,
+  value: object,
+  known: Set<string>,
+  issues: string[],
+): void {
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      issues.push(
+        `${label} has unknown field "${key}" (fail closed: the enforcing daemons reject unmodeled fields)`
+      );
+    }
+  }
 }
 
 export function validateRule(rule: AllowlistRule): string[] {
@@ -110,9 +180,31 @@ export function validateRule(rule: AllowlistRule): string[] {
   if (!rule.created_at || typeof rule.created_at !== "string") {
     issues.push("rule.created_at missing or not a string");
   }
-  if (!rule.match || typeof rule.match !== "object") {
-    issues.push("rule.match missing");
+  if (rule.description !== undefined && typeof rule.description !== "string") {
+    issues.push("rule.description must be a string when present");
+  }
+  if (rule.derived !== undefined && typeof rule.derived !== "boolean") {
+    issues.push("rule.derived must be a boolean when present");
+  }
+  if (rule.time_window !== undefined) {
+    const tw = rule.time_window;
+    if (!tw || typeof tw !== "object" || Array.isArray(tw)) {
+      issues.push("rule.time_window must be an object when present");
+    } else {
+      rejectUnknownKeys("rule.time_window", tw, KNOWN_TIME_WINDOW_KEYS, issues);
+      if (!isNonEmptyString(tw.start) || !isNonEmptyString(tw.end)) {
+        issues.push("rule.time_window.start/end must be non-empty strings");
+      }
+    }
+  }
+  rejectUnknownKeys("rule", rule, KNOWN_RULE_KEYS, issues);
+  // Array.isArray guards (codex round-7): a JSON array satisfies
+  // `typeof x === "object"`, but Rust serde refuses an array where a struct
+  // is expected — so `match: []` / `scope: []` must be TS-invalid too.
+  if (!rule.match || typeof rule.match !== "object" || Array.isArray(rule.match)) {
+    issues.push("rule.match missing or not an object");
   } else {
+    rejectUnknownKeys("rule.match", rule.match, KNOWN_MATCH_KEYS, issues);
     const hasHost = rule.match.host !== undefined;
     const hasHostPattern = rule.match.host_pattern !== undefined;
     const hasIp = rule.match.ip !== undefined;
@@ -123,26 +215,60 @@ export function validateRule(rule: AllowlistRule): string[] {
         "rule.match must specify at least one of host, host_pattern, ip, cidr, or port"
       );
     }
+    if (hasHost) {
+      validateAxisValues(
+        "rule.match.host",
+        rule.match.host,
+        isNonEmptyString,
+        "non-empty string",
+        issues,
+      );
+    }
+    if (hasHostPattern && !isNonEmptyString(rule.match.host_pattern)) {
+      issues.push("rule.match.host_pattern must be a non-empty string");
+    }
     // Fail closed on malformed IP/CIDR: a rule that cannot be matched safely
     // must be rejected at build time, never silently dropped (which would leave
     // an unintended any-destination grant) or shipped to the evaluator.
     if (hasIp) {
-      for (const value of toStringArray(rule.match.ip)) {
-        if (!isValidIp(value)) {
-          issues.push(`rule.match.ip contains invalid IP literal: ${String(value)}`);
-        }
-      }
+      validateAxisValues("rule.match.ip", rule.match.ip, isValidIp, "IP literal", issues);
     }
     if (hasCidr) {
-      for (const value of toStringArray(rule.match.cidr)) {
-        if (!isValidCidr(value)) {
-          issues.push(`rule.match.cidr contains invalid CIDR: ${String(value)}`);
-        }
+      validateAxisValues(
+        "rule.match.cidr",
+        rule.match.cidr,
+        (v) => typeof v === "string" && isValidCidr(v),
+        "CIDR",
+        issues,
+      );
+    }
+    if (hasPort) {
+      validateAxisValues(
+        "rule.match.port",
+        rule.match.port,
+        isValidPortNumber,
+        "integer in [1, 65535]",
+        issues,
+      );
+    }
+    if (rule.match.protocol !== undefined) {
+      const p = rule.match.protocol;
+      if (p !== "tcp" && p !== "udp" && p !== "tcp+udp") {
+        issues.push(`rule.match.protocol must be tcp, udp, or tcp+udp (got ${String(p)})`);
       }
     }
   }
-  if (!rule.scope || typeof rule.scope !== "object") {
-    issues.push("rule.scope missing");
+  if (!rule.scope || typeof rule.scope !== "object" || Array.isArray(rule.scope)) {
+    issues.push("rule.scope missing or not an object");
+  } else {
+    rejectUnknownKeys("rule.scope", rule.scope, KNOWN_SCOPE_KEYS, issues);
+    for (const key of ["agent_ids", "template_ids"] as const) {
+      const ids = rule.scope[key];
+      if (ids === undefined) continue;
+      if (!Array.isArray(ids) || ids.some((id) => !isNonEmptyString(id))) {
+        issues.push(`rule.scope.${key} must be an array of non-empty strings when present`);
+      }
+    }
   }
   if (rule.disposition !== "allow" && rule.disposition !== "prompt" && rule.disposition !== "deny") {
     issues.push(`rule.disposition must be allow, prompt, or deny (got ${String(rule.disposition)})`);

@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use castle_wall_daemon::habeas::{find_habeas_conflicts, HabeasWebhookTarget};
+use castle_wall_daemon::habeas::{
+    find_habeas_conflicts, find_habeas_conflicts_in_composed, HabeasWebhookTarget,
+};
 use castle_wall_daemon::policy::AllowlistRule;
 use serde::Deserialize;
 
@@ -28,8 +30,16 @@ struct ParityCase {
 }
 
 #[derive(Debug, Deserialize)]
+struct ComposedParityCase {
+    name: String,
+    rules: Vec<AllowlistRule>,
+    expect_conflict: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct ParityFixture {
     cases: Vec<ParityCase>,
+    composed_cases: Vec<ComposedParityCase>,
 }
 
 fn fixture_path() -> PathBuf {
@@ -66,6 +76,33 @@ fn rust_gate_agrees_with_shared_parity_fixture() {
         assert_eq!(
             conflicted, case.expect_conflict,
             "case \"{}\": rust verdict {} != expected {} (issues: {:?})",
+            case.name, conflicted, case.expect_conflict, issues
+        );
+    }
+}
+
+#[test]
+fn rust_composed_gate_agrees_with_shared_parity_fixture() {
+    // Composed-manifest gate parity (codex round-4 finding 4): duplicate
+    // reserved ids and the always-on-local-lane requirement must produce the
+    // same accept/reject verdict in both languages.
+    let path = fixture_path();
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let fixture: ParityFixture =
+        serde_json::from_str(&raw).expect("parse habeas-conflict-parity.json");
+
+    assert!(
+        !fixture.composed_cases.is_empty(),
+        "fixture has no composed_cases"
+    );
+
+    for case in &fixture.composed_cases {
+        let issues = find_habeas_conflicts_in_composed(&case.rules);
+        let conflicted = !issues.is_empty();
+        assert_eq!(
+            conflicted, case.expect_conflict,
+            "composed case \"{}\": rust verdict {} != expected {} (issues: {:?})",
             case.name, conflicted, case.expect_conflict, issues
         );
     }

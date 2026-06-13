@@ -19,6 +19,7 @@ import { dirname, join } from "node:path";
 
 import {
   findHabeasConflicts,
+  findHabeasConflictsInComposed,
   type HabeasWebhookTarget,
 } from "../../../src/castle-wall/allowlist/habeas-port.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
@@ -30,9 +31,16 @@ interface ParityCase {
   expect_conflict: boolean;
 }
 
+interface ComposedParityCase {
+  name: string;
+  rules: AllowlistRule[];
+  expect_conflict: boolean;
+}
+
 interface ParityFixture {
   habeas_distress_port: number;
   cases: ParityCase[];
+  composed_cases: ComposedParityCase[];
 }
 
 async function loadFixture(): Promise<ParityFixture> {
@@ -52,6 +60,21 @@ describe("habeas conflict gate — cross-language parity vector", () => {
       );
       const conflicted = issues.length > 0;
       expect(conflicted, `case "${testCase.name}"`).toBe(testCase.expect_conflict);
+    }
+  });
+
+  it("agrees with the shared fixture on every composed case (TS side)", async () => {
+    // Composed-manifest gate parity (codex round-4 finding 4): duplicate
+    // reserved ids and the always-on-local-lane requirement must produce the
+    // same accept/reject verdict in both languages.
+    const fixture = await loadFixture();
+    expect(fixture.composed_cases.length).toBeGreaterThan(0);
+    for (const testCase of fixture.composed_cases) {
+      const issues = findHabeasConflictsInComposed(testCase.rules);
+      const conflicted = issues.length > 0;
+      expect(conflicted, `composed case "${testCase.name}"`).toBe(
+        testCase.expect_conflict,
+      );
     }
   });
 });

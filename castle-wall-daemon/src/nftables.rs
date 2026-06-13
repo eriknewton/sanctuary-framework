@@ -699,6 +699,8 @@ mod tests {
             },
             scope: RuleScope::default(),
             disposition,
+            time_window: None,
+            derived: None,
         }
     }
 

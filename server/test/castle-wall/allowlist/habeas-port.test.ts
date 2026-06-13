@@ -22,6 +22,8 @@ import {
   parseHabeasWebhookTarget,
   deriveHabeasDistressRules,
   findHabeasConflicts,
+  findHabeasConflictsInComposed,
+  isGenuineDerivedHabeasRule,
   composeEffectiveRules,
   HabeasConflictError,
 } from "../../../src/castle-wall/allowlist/habeas-port.js";
@@ -301,5 +303,75 @@ describe("composeEffectiveRules", () => {
         createdAt: CREATED_AT,
       }),
     ).toThrow(HabeasConflictError);
+  });
+});
+
+describe("composed-manifest gate (Rust parity mirror)", () => {
+  const RESOLVERS = ["1.1.1.1"];
+  // Verdict-level parity with the Rust gate is asserted from the shared
+  // fixture (habeas-conflict-parity.test.ts); these tests pin the TS-side
+  // genuineness recognizer's load-bearing edges.
+
+  function derivedRules(): AllowlistRule[] {
+    return deriveHabeasDistressRules({
+      webhook: { host: "ops.example.com", port: 443 },
+      createdAt: CREATED_AT,
+    });
+  }
+
+  it("recognizes the composer's own derived rules as genuine", () => {
+    for (const rule of derivedRules()) {
+      expect(isGenuineDerivedHabeasRule(rule), rule.id).toBe(true);
+    }
+  });
+
+  it("does not trust the derived flag: a flag-only reserved rule is not genuine", () => {
+    const forged = operatorRule({
+      id: HABEAS_LOCAL_RULE_ID,
+      match: { host: "evil.example.com" },
+      derived: true,
+    });
+    expect(isGenuineDerivedHabeasRule(forged)).toBe(false);
+    const issues = findHabeasConflictsInComposed([forged]);
+    expect(issues.some((i) => i.includes(HABEAS_RULE_ID_PREFIX))).toBe(true);
+  });
+
+  it("a time_window on a reserved-id rule breaks genuineness", () => {
+    const [local] = derivedRules();
+    const withWindow: AllowlistRule = {
+      ...local,
+      time_window: { start: "09:00", end: "17:00" },
+    };
+    expect(isGenuineDerivedHabeasRule(withWindow)).toBe(false);
+  });
+
+  it("composeEffectiveRules output always passes the composed gate", () => {
+    const composed = composeEffectiveRules({
+      operatorRules: [operatorRule({ id: "r1" })],
+      resolvers: RESOLVERS,
+      distressWebhook: { host: "ops.example.com", port: 443 },
+      createdAt: CREATED_AT,
+    });
+    expect(findHabeasConflictsInComposed(composed)).toEqual([]);
+  });
+
+  it("rejects a composed manifest missing the always-on local lane", () => {
+    const issues = findHabeasConflictsInComposed([operatorRule({ id: "r1" })]);
+    expect(issues.length).toBe(1);
+    expect(issues[0]).toContain("exactly one");
+    expect(issues[0]).toContain(HABEAS_LOCAL_RULE_ID);
+  });
+
+  it("rejects duplicate reserved webhook rules (no target redefinition)", () => {
+    const rules = deriveHabeasDistressRules({
+      webhook: { host: "ops.example.com", port: 443 },
+      createdAt: CREATED_AT,
+    });
+    const evilTwin = deriveHabeasDistressRules({
+      webhook: { host: "evil.example.com", port: 443 },
+      createdAt: CREATED_AT,
+    }).find((r) => r.id === HABEAS_WEBHOOK_RULE_ID)!;
+    const issues = findHabeasConflictsInComposed([...rules, evilTwin]);
+    expect(issues.some((i) => i.includes("must be unique"))).toBe(true);
   });
 });

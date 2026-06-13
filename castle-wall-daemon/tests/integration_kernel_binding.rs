@@ -583,15 +583,30 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     sha_hasher.update(&rule_bytes);
     let sha_hex = format!("{:x}", sha_hasher.finalize());
 
+    // Every composed manifest must carry the genuine habeas local lane
+    // (always-on-lane gate); the daemon refuses a lane-less manifest.
+    let habeas_bytes = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-habeas.json"), habeas_bytes).unwrap();
+    let mut habeas_hasher = Sha256::new();
+    habeas_hasher.update(habeas_bytes);
+    let habeas_sha = format!("{:x}", habeas_hasher.finalize());
+
     let manifest = AllowlistManifest {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
-        rules: vec![ManifestRuleEntry {
-            rule_id: "rule-allow-test".to_string(),
-            file: "rule-0.json".to_string(),
-            sha256: sha_hex,
-        }],
+        rules: vec![
+            ManifestRuleEntry {
+                rule_id: "rule-allow-test".to_string(),
+                file: "rule-0.json".to_string(),
+                sha256: sha_hex,
+            },
+            ManifestRuleEntry {
+                rule_id: "reserved_habeas_distress_local".to_string(),
+                file: "rule-habeas.json".to_string(),
+                sha256: habeas_sha,
+            },
+        ],
     };
     let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
     let sig = signing.sign(&canonical);
@@ -643,6 +658,8 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         },
         scope: RuleScope::default(),
         disposition: RuleDisposition::Allow,
+        time_window: None,
+        derived: None,
     };
     let frags = rule_to_nft_expr(&test_rule);
     assert!(
