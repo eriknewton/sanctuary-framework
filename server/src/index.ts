@@ -107,7 +107,17 @@ import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import {
   establishMaster,
   checkCastlePinCustody,
+  readEnvelopeEpoch,
 } from "./core/master-custody.js";
+import {
+  observeWitnessEpoch,
+  evaluateAndEnforceRollback,
+} from "./core/anti-rollback.js";
+import {
+  readCustodyEpochCount,
+  probeAuditHeadAnchor,
+  deriveAuditEpochKeys,
+} from "./l2-operational/audit-log.js";
 import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
 import {
   buildV11Bindings,
@@ -227,6 +237,80 @@ export async function createSanctuaryServer(options?: {
 
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5rb. Anti-rollback Stage 1 boot cross-check. Compare the on-disk custody
+  // epoch against the surviving on-disk witnesses (the #501 rotation epoch
+  // record + the authenticated epoch witness). A regression — or any tampered
+  // witness — WARNS LOUD, emits a P1-shaped `custody_rollback_suspected` audit
+  // finding, and FREEZES trust-bearing writes (enforced at enforceCustodyFloor)
+  // until an audited `restore-attest`. Boot is NEVER refused (F3: a false-
+  // positive rollback detector that bricks legitimate restores is worse than
+  // the attack). An OK verdict advances the monotonic witness forward.
+  try {
+    const epochKeys = deriveAuditEpochKeys(masterKey);
+    let rotationEpochCount = 0;
+    let rotationEpochTampered = false;
+    try {
+      const epochRecord = await readCustodyEpochCount(storage, {
+        epochMacKey: epochKeys.epochMacKey,
+      });
+      if (epochRecord.status === "present") {
+        rotationEpochCount = epochRecord.count;
+      } else if (epochRecord.status === "tampered") {
+        rotationEpochTampered = true;
+      }
+    } finally {
+      epochKeys.epochWrapKey.fill(0);
+      epochKeys.epochMacKey.fill(0);
+    }
+    // SPLICE witness: the audit head anchor probed under the unlocked master.
+    // A present-but-unauthenticated head anchor is the custody-files-only
+    // splice signature (it survives even if the attacker deleted the epoch
+    // witnesses) — codex r1 HIGH fix.
+    const headAnchorProbe = await probeAuditHeadAnchor(storage, masterKey);
+    const observation = await observeWitnessEpoch({
+      storage,
+      master: masterKey,
+      rotationEpochCount,
+      rotationEpochTampered,
+      headAnchor: { status: headAnchorProbe.status },
+    });
+    const envelopeEpoch = await readEnvelopeEpoch(storage);
+    const rollback = await evaluateAndEnforceRollback({
+      storage,
+      master: masterKey,
+      envelopeEpoch,
+      observation,
+    });
+    if (rollback.verdict.kind === "rollback-suspected") {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "custody_rollback_suspected",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          observed_epoch: rollback.verdict.observedEpoch,
+          witnessed_epoch: rollback.verdict.witnessedEpoch,
+          witness_source: rollback.verdict.witnessSource,
+          notes: rollback.verdict.notes,
+          trust_bearing_writes_frozen: true,
+          remediation: "sanctuary restore-attest (fortress passphrase required)",
+        },
+      });
+    }
+    if (rollback.banner) {
+      // SAFETY: stderr is the operator-facing channel for boot diagnostics.
+      console.error(rollback.banner);
+    }
+  } catch (err) {
+    // The detector must never block boot. A failure to RUN the cross-check is
+    // logged (it does not by itself freeze writes — only a positive detection
+    // does), so a detector bug cannot become a lockout generator.
+    console.error(
+      "Sanctuary: anti-rollback boot cross-check could not complete: " +
+        (err instanceof Error ? err.message : String(err))
+    );
+  }
 
   // 5pre. Custody audit trail: record envelope creation/migration (never key
   // material — wrap types and install mode only), and surface the dual-path

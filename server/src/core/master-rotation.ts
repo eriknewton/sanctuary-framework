@@ -100,6 +100,7 @@ import {
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
   CUSTODY_FLOOR_WRAPS,
+  envelopeEpochOf,
 } from "./master-custody.js";
 import { canonicalJson } from "../audit/chain.js";
 import {
@@ -109,6 +110,7 @@ import {
   writeAuditEpochRecord,
   AUDIT_EPOCH_KEYS_KEY,
 } from "../l2-operational/audit-log.js";
+import { writeEpochWitness } from "./anti-rollback.js";
 import {
   rotateStateEntryBytes,
   rotateStateMetaRecordBytes,
@@ -416,7 +418,9 @@ type MetaKeyClass =
   | "plaintext-keep" // positively identified non-secret record
   | "state-meta-mac" // master-MAC'd record → restamp
   | "transparency-anchor-config" // master-MAC'd record → restamp
-  | "transparency-counter-floor"; // master-MAC'd record → restamp
+  | "transparency-counter-floor" // master-MAC'd record → restamp
+  | "epoch-witness" // anti-rollback witness → finalize re-stamps (advanced)
+  | "rollback-freeze"; // anti-rollback freeze marker → restamp under new master
 
 // Duplicated marker/MAC constants (see the recipe-table drift note above —
 // the verify-before-write rule makes drift refuse, never corrupt).
@@ -434,6 +438,17 @@ const TRANSPARENCY_FLOOR_MAC_DOMAIN = "sanctuary.transparency-counter-floor.v1\n
 
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 const PRIMARY_IDENTITY_META_KEY = "primary_identity_id";
+
+// Anti-rollback Stage 1 (duplicated from core/anti-rollback.ts; the
+// verify-before-write rule makes drift refuse, never corrupt). The witness is
+// re-stamped (with the ADVANCED epoch) by finalize, so convertMeta only needs
+// to recognize the key and leave it alone during the convert pass. The freeze
+// marker is restamped under the new master like the transparency floor.
+const EPOCH_WITNESS_META_KEY = "custody-epoch-witness-v1";
+const ROLLBACK_FREEZE_META_KEY = "custody-rollback-freeze-v1";
+const ROLLBACK_FREEZE_MARKER = "__sanctuary_custody_rollback_freeze_v1";
+const ROLLBACK_FREEZE_MAC_PURPOSE = "custody-rollback-freeze-mac";
+const ROLLBACK_FREEZE_MAC_DOMAIN = "sanctuary.custody-rollback-freeze.v1\n";
 
 function classifyMetaKey(key: string): MetaKeyClass | null {
   switch (key) {
@@ -457,6 +472,10 @@ function classifyMetaKey(key: string): MetaKeyClass | null {
       return "transparency-anchor-config";
     case TRANSPARENCY_FLOOR_META_KEY:
       return "transparency-counter-floor";
+    case EPOCH_WITNESS_META_KEY:
+      return "epoch-witness";
+    case ROLLBACK_FREEZE_META_KEY:
+      return "rollback-freeze";
     default:
       return null; // Unknown → preflight aborts (fail closed).
   }
@@ -922,7 +941,13 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
       cls === "legacy-marker" ||
       cls === "custody" ||
       cls === "rotation" ||
-      cls === "plaintext-keep"
+      cls === "plaintext-keep" ||
+      // The epoch witness is re-stamped with the ADVANCED epoch by finalize
+      // (writeEpochWitness force), so the convert pass leaves it alone — like
+      // the custody envelope. Re-stamping the OLD epoch here would just be
+      // overwritten, and could briefly under-report the epoch mid-rotation;
+      // boot is blocked while the journal exists anyway.
+      cls === "epoch-witness"
     ) {
       continue;
     }
@@ -938,19 +963,28 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
       });
       next = result === null ? "leave" : result;
     } else {
-      const isAnchor = cls === "transparency-anchor-config";
+      const restampParams =
+        cls === "transparency-anchor-config"
+          ? {
+              marker: TRANSPARENCY_ANCHOR_CONFIG_MARKER,
+              macPurpose: TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE,
+              macDomain: TRANSPARENCY_ANCHOR_CONFIG_MAC_DOMAIN,
+            }
+          : cls === "rollback-freeze"
+            ? {
+                marker: ROLLBACK_FREEZE_MARKER,
+                macPurpose: ROLLBACK_FREEZE_MAC_PURPOSE,
+                macDomain: ROLLBACK_FREEZE_MAC_DOMAIN,
+              }
+            : {
+                marker: TRANSPARENCY_FLOOR_MARKER,
+                macPurpose: TRANSPARENCY_FLOOR_MAC_PURPOSE,
+                macDomain: TRANSPARENCY_FLOOR_MAC_DOMAIN,
+              };
       next = restampMacRecord({
         raw,
         where: `_meta/${key}`,
-        marker: isAnchor
-          ? TRANSPARENCY_ANCHOR_CONFIG_MARKER
-          : TRANSPARENCY_FLOOR_MARKER,
-        macPurpose: isAnchor
-          ? TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE
-          : TRANSPARENCY_FLOOR_MAC_PURPOSE,
-        macDomain: isAnchor
-          ? TRANSPARENCY_ANCHOR_CONFIG_MAC_DOMAIN
-          : TRANSPARENCY_FLOOR_MAC_DOMAIN,
+        ...restampParams,
         oldMaster: ctx.oldMaster,
         newMaster: ctx.newMaster,
       });
@@ -1234,6 +1268,33 @@ async function walkFortress(
 
 // ── Finalize ────────────────────────────────────────────────────────
 
+/**
+ * Anti-rollback Stage 1: the new custody epoch after this rotation = the number
+ * of entries in the post-conversion custody-epoch record (convertAuditEpochs
+ * has appended this rotation's epoch entry under the new master). Read under the
+ * new master; defaults to 1 if the record is unexpectedly unreadable here (a
+ * rotation has, by definition, advanced the epoch to at least 1). Reads only the
+ * count — every unwrapped key is zeroed.
+ */
+async function readNewEpochCount(ctx: Ctx): Promise<number> {
+  const newEpochKeys = deriveAuditEpochKeys(ctx.newMaster);
+  try {
+    const entries = await readAuditEpochEntries(ctx.storage, newEpochKeys);
+    for (const e of entries) e.key.fill(0);
+    return Math.max(1, entries.length);
+  } catch {
+    // The record must authenticate under the new master at finalize (it was
+    // just written by convertAuditEpochs); if it does not, a rotation still
+    // advanced the epoch — never report 0 (that would falsely read as "no
+    // rotation" and let the boot detector treat the rotated fortress as the
+    // pre-rotation one). Minimum advanced epoch is 1.
+    return 1;
+  } finally {
+    newEpochKeys.epochWrapKey.fill(0);
+    newEpochKeys.epochMacKey.fill(0);
+  }
+}
+
 async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   if (journal.phase !== "finalizing") {
     await writeJournal(
@@ -1244,19 +1305,61 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
     ctx.failpoint("journal-finalizing-written");
   }
 
+  // Anti-rollback Stage 1: this rotation ADVANCES the epoch. The new epoch =
+  // the count of entries in the post-conversion custody-epoch record
+  // (convertAuditEpochs has already appended this rotation's entry, so the
+  // count includes it). Computed here (not at staging) so it is correct after
+  // a resume and idempotent: re-running finalize recomputes the same count and
+  // re-stamps the same epoch. A monotonic rotation can never LOWER the epoch,
+  // so the boot detector sees the rotated fortress as fresher, never rolled
+  // back. (epoch_id = this rotation's id.)
+  const newEpoch = await readNewEpochCount(ctx);
+
   // Promote the staged envelope (idempotent: if the staged copy is gone, a
-  // prior resume already promoted it).
+  // prior resume already promoted it), stamping the advanced epoch into it so
+  // the on-disk custody epoch matches the witness.
   const staged = await readCustodyEnvelope(ctx.storage, {
     envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
   });
   if (staged) {
     verifyEnvelopeMac(staged, ctx.newMaster);
-    await writeCustodyEnvelope(ctx.storage, staged, ctx.newMaster);
+    await writeCustodyEnvelope(
+      ctx.storage,
+      { ...staged, epoch: newEpoch, epoch_id: ctx.rotationId },
+      ctx.newMaster
+    );
     ctx.failpoint("envelope-promoted");
     await ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
     await ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
     ctx.failpoint("staged-deleted");
+  } else {
+    // Late-finalize resume: the live envelope is already promoted but may
+    // predate this epoch stamp. Re-stamp it idempotently so a crash between
+    // promotion and witness-write still lands a consistent epoch.
+    const live = await readCustodyEnvelope(ctx.storage);
+    if (live && envelopeEpochOf(live) < newEpoch) {
+      await writeCustodyEnvelope(
+        ctx.storage,
+        { ...live, epoch: newEpoch, epoch_id: ctx.rotationId },
+        ctx.newMaster
+      );
+    }
   }
+
+  // Advance the monotonic epoch witness to the new epoch (force: the rotation
+  // is the authority on its own epoch; a concurrent stale witness must not
+  // block a legitimate rotation from raising the floor).
+  await writeEpochWitness(
+    ctx.storage,
+    ctx.newMaster,
+    {
+      epoch: newEpoch,
+      epoch_id: ctx.rotationId,
+      witnessed_at: new Date().toISOString(),
+    },
+    { force: true }
+  );
+  ctx.failpoint("epoch-witness-advanced");
 
   // Legacy markers would re-derive the OLD master — the dual-path divergence
   // generator this lane exists to kill. Delete them (audited below).

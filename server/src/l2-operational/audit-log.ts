@@ -224,6 +224,194 @@ export async function readAuditEpochKeys(
 }
 
 /**
+ * Anti-rollback Stage 1 witness: how many master rotations this fortress has
+ * recorded (the #501 custody-epoch count), distinguishing the three states the
+ * rollback detector must treat differently:
+ *  - "absent": no epoch record → 0 rotations (epoch 0). Not suspicious.
+ *  - "present": record authenticates → `count` rotations have happened. The
+ *    epoch floor is `count`.
+ *  - "tampered": record is PRESENT but malformed / marker-stripped / MAC
+ *    mismatch → fail closed toward the freeze direction (the caller treats this
+ *    as suspected rollback, never as absent).
+ *
+ * Unlike {@link readAuditEpochKeys} (which collapses tampered→[] because the
+ * downstream entry decryption surfaces the tamper as integrity findings), this
+ * reader makes "tampered" explicit so the rollback detector can freeze on it.
+ * It does NOT unwrap any epoch key (no key material touched).
+ */
+export async function readCustodyEpochCount(
+  storage: StorageBackend,
+  keys: { epochMacKey: Uint8Array }
+): Promise<
+  | { status: "absent" }
+  | { status: "present"; count: number }
+  | { status: "tampered" }
+> {
+  let raw: Uint8Array | null;
+  try {
+    raw = await storage.read(AUDIT_CHECKPOINT_NAMESPACE, AUDIT_EPOCH_KEYS_KEY);
+  } catch {
+    // Cannot read the record → cannot prove it is absent → suspected.
+    return { status: "tampered" };
+  }
+  if (!raw) return { status: "absent" };
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+  } catch {
+    return { status: "tampered" };
+  }
+  if (parsed?.[AUDIT_EPOCH_KEYS_MARKER] !== true) return { status: "tampered" };
+  const data = parsed.data as { epochs?: AuditEpochEntry[] } | undefined;
+  const mac = parsed.mac;
+  if (typeof mac !== "string" || !Array.isArray(data?.epochs)) {
+    return { status: "tampered" };
+  }
+  let provided: Uint8Array;
+  try {
+    provided = fromBase64url(mac);
+  } catch {
+    return { status: "tampered" };
+  }
+  if (
+    !constantTimeEqual(
+      provided,
+      epochRecordMacBytes(keys.epochMacKey, { epochs: data.epochs })
+    )
+  ) {
+    return { status: "tampered" };
+  }
+  return { status: "present", count: data.epochs.length };
+}
+
+/**
+ * Anti-rollback Stage 1 SPLICE witness: probe the audit head anchor under a
+ * candidate master. The head anchor is master-MAC'd over the highest chained
+ * sequence; it survives a CUSTODY-FILES-ONLY rollback (an attacker who restores
+ * only `_meta/custody-*` to resurrect a retired credential leaves the current
+ * audit head in place). The signatures:
+ *  - "absent": no head anchor AND no established marker → a genuinely brand-new
+ *    or never-audited fortress. Neutral (no false positive on first boot).
+ *  - "valid": authenticates under THIS master → the audit head belongs to this
+ *    master; `highest_sequence` is real work this master did.
+ *  - "tampered": PRESENT but does NOT authenticate under this master (the splice
+ *    signature — old custody envelope grafted onto a newer audit head), OR
+ *    DELETED/marker-stripped while the `audit-head-anchor-established-v1` marker
+ *    in `_meta` proves the fortress once had a head anchor. Deleting the head
+ *    anchor to dodge the splice check (codex r2 HIGH) now reads as tampered, not
+ *    absent — the attacker would also have to delete the established marker, and
+ *    that marker's own disappearance is itself the established→gone signature.
+ *
+ * Read-only; touches no key material beyond the head-anchor MAC key (zeroed).
+ */
+export async function probeAuditHeadAnchor(
+  storage: StorageBackend,
+  masterKey: Uint8Array
+): Promise<
+  | { status: "absent" }
+  | { status: "valid"; highest_sequence: number }
+  | { status: "tampered" }
+> {
+  // Was a head anchor EVER established? Two independent signals, OR'd so that
+  // deleting either does NOT erase the detector's memory (codex r3 HIGH):
+  //  (1) the plaintext `audit-head-anchor-established-v1` marker in _meta, and
+  //  (2) the presence of ANY audit entries / checkpoint records — a head anchor
+  //      is written once the chain reaches its checkpoint interval, so surviving
+  //      `_audit` or `_audit_checkpoints` content is itself evidence the
+  //      fortress did audited work and SHOULD have a head anchor.
+  // To make a deleted/stripped head anchor read as "absent" (neutral), an
+  // attacker must delete the marker AND wipe the entire audit chain + all
+  // checkpoint records — i.e. destroy the audit trail wholesale, which is the
+  // glaring, separately-detectable full-wipe residual, not a quiet splice.
+  let established = false;
+  try {
+    if ((await storage.read("_meta", AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY)) !== null) {
+      established = true;
+    }
+  } catch {
+    // Cannot read the marker → cannot prove it absent → lean suspect.
+    established = true;
+  }
+  if (!established) {
+    try {
+      if ((await storage.list(AUDIT_NAMESPACE)).length > 0) established = true;
+    } catch {
+      established = true; // cannot enumerate → lean suspect
+    }
+  }
+  if (!established) {
+    try {
+      // Any checkpoint/anchor/epoch record beyond a clean empty store.
+      if ((await storage.list(AUDIT_CHECKPOINT_NAMESPACE)).length > 0) {
+        established = true;
+      }
+    } catch {
+      established = true;
+    }
+  }
+
+  let raw: Uint8Array | null;
+  try {
+    raw = await storage.read(AUDIT_CHECKPOINT_NAMESPACE, AUDIT_HEAD_ANCHOR_KEY);
+  } catch {
+    // Cannot read it → cannot prove absence → treat as suspect (tampered).
+    return { status: "tampered" };
+  }
+  // Absent head anchor: suspect IFF it was once established (deletion), else a
+  // genuine never-audited fortress (neutral — no first-boot false positive).
+  if (!raw) return established ? { status: "tampered" } : { status: "absent" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch {
+    return { status: "tampered" };
+  }
+  if (!isRecord(parsed) || parsed[AUDIT_HEAD_ANCHOR_MARKER] !== true) {
+    // Marker-stripped record: suspect IFF a head anchor was once established
+    // (an attacker stripping the marker to look "absent"), else neutral.
+    return established ? { status: "tampered" } : { status: "absent" };
+  }
+  const data = parsed.data;
+  const mac = parsed.mac;
+  if (
+    !isRecord(data) ||
+    typeof mac !== "string" ||
+    typeof data.highest_sequence !== "number" ||
+    !Number.isSafeInteger(data.highest_sequence) ||
+    data.highest_sequence <= 0 ||
+    typeof data.head_hash !== "string" ||
+    !/^[0-9a-f]{64}$/.test(data.head_hash)
+  ) {
+    return { status: "tampered" };
+  }
+  const macKey = derivePurposeKey(masterKey, "audit-head-anchor");
+  try {
+    const expected = hmacSha256(
+      macKey,
+      stringToBytes(
+        AUDIT_HEAD_ANCHOR_MAC_DOMAIN +
+          canonicalJson({
+            highest_sequence: data.highest_sequence,
+            head_hash: data.head_hash,
+          })
+      )
+    );
+    let provided: Uint8Array;
+    try {
+      provided = fromBase64url(mac);
+    } catch {
+      return { status: "tampered" };
+    }
+    if (!constantTimeEqual(provided, expected)) {
+      return { status: "tampered" };
+    }
+    return { status: "valid", highest_sequence: data.highest_sequence };
+  } finally {
+    macKey.fill(0);
+  }
+}
+
+/**
  * Read the epoch record's raw entries (authenticated) for the rotation
  * engine, which must re-wrap every prior epoch key under the next master.
  */

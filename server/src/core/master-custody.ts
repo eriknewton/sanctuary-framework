@@ -92,13 +92,48 @@ export interface CustodyEnvelope {
   wraps: CustodyWrap[];
   created_at: string;
   /**
+   * Anti-rollback epoch (Stage 1): the #501 master-rotation count, 0 at
+   * creation. ADDITIVE and version-tolerant — absent reads as epoch 0 for
+   * pre-Stage-1 fortresses. Bound into the envelope MAC ONLY WHEN PRESENT
+   * (see {@link envelopeCanonicalMetadata}), so an existing fortress's MAC
+   * does not change until it next acquires an epoch. A boot-time cross-check
+   * (core/anti-rollback.ts) compares this against the on-disk witnesses; a
+   * regression freezes trust-bearing writes (never bricks boot). See
+   * {@link readEnvelopeEpoch}.
+   */
+  epoch?: number;
+  /** Last rotation_id (or a creation nonce at epoch 0). Bound into the MAC
+   * only when `epoch` is present. Advisory provenance for the operator. */
+  epoch_id?: string;
+  /**
    * HMAC-SHA256 over the envelope's policy-bearing metadata (install_mode,
-   * wrap ids/types/verified flags, wrap-ciphertext digests), keyed from
-   * HKDF(master, "custody-envelope-mac"). An attacker with bare write
-   * access to `_meta` cannot flip install_mode or verified flags, nor
-   * splice wraps in or out, without the master (codex finding H2/M2).
+   * wrap ids/types/verified flags, wrap-ciphertext digests, and the epoch
+   * when present), keyed from HKDF(master, "custody-envelope-mac"). An
+   * attacker with bare write access to `_meta` cannot flip install_mode or
+   * verified flags, nor splice wraps in or out, nor lower the epoch, without
+   * the master (codex finding H2/M2; anti-rollback Stage 1).
    */
   mac: string;
+}
+
+/**
+ * The on-disk custody epoch for the anti-rollback cross-check (Stage 1).
+ * Absent `epoch` reads as 0 — a pre-Stage-1 fortress is "epoch 0" and trips
+ * nothing until a rotation or an explicit witness raises the floor. Reads the
+ * persisted envelope directly so callers that only have a `StorageBackend`
+ * (the boot detector) do not need the unwrapped envelope object.
+ */
+export async function readEnvelopeEpoch(
+  storage: StorageBackend
+): Promise<number> {
+  const envelope = await readCustodyEnvelope(storage);
+  return envelopeEpochOf(envelope);
+}
+
+/** The epoch of a read envelope (absent → 0). */
+export function envelopeEpochOf(envelope: CustodyEnvelope | null): number {
+  if (!envelope || typeof envelope.epoch !== "number") return 0;
+  return envelope.epoch;
 }
 
 const CUSTODY_INSTALL_MODES: ReadonlySet<string> = new Set([
@@ -200,6 +235,29 @@ export class CustodyFloorError extends Error {
         "this fortress holds nothing precious, so re-initializing it is safe."
     );
     this.name = "CustodyFloorError";
+  }
+}
+
+/**
+ * A suspected custody rollback has FROZEN trust-bearing writes (anti-rollback
+ * Stage 1). Raised from the same `enforceCustodyFloor` chokepoint as the
+ * two-factor floor so identity creation / reputation import / Castle-pin
+ * provisioning all refuse uniformly until the operator runs an audited
+ * `restore-attest`. Boot is NEVER refused — only trust-bearing writes are.
+ */
+export class CustodyRollbackFrozenError extends Error {
+  constructor(action: string) {
+    super(
+      `Sanctuary: refusing to persist trust-bearing state (${action}).\n` +
+        "A SUSPECTED CUSTODY ROLLBACK has frozen trust-bearing writes on this\n" +
+        "fortress: its on-disk custody epoch is older than a surviving witness, so\n" +
+        "a snapshot may have been restored (legitimately) or rolled back by an\n" +
+        "attacker to resurrect a retired credential. Reads and boot are unaffected.\n" +
+        "Acknowledge and unfreeze with an audited attestation:\n" +
+        "  sanctuary restore-attest   (requires the fortress passphrase)\n" +
+        "If you did not restore anything, rotate the master before attesting."
+    );
+    this.name = "CustodyRollbackFrozenError";
   }
 }
 
@@ -491,7 +549,7 @@ function envelopeCanonicalMetadata(
 ): string {
   // Field order is fixed by construction; ciphertext digests bind the wrap
   // payloads without putting key-derived bytes in the MAC input.
-  return JSON.stringify({
+  const base: Record<string, unknown> = {
     v: envelope.v,
     install_mode: envelope.install_mode,
     wraps: envelope.wraps.map((w) => ({
@@ -500,7 +558,16 @@ function envelopeCanonicalMetadata(
       verified: w.verified,
       ct: hashToString(stringToBytes(w.payload.ct)),
     })),
-  });
+  };
+  // Anti-rollback Stage 1: bind the epoch into the MAC ONLY WHEN PRESENT, so a
+  // pre-Stage-1 envelope (no epoch) verifies under its existing MAC unchanged.
+  // Once an envelope carries an epoch, the epoch + epoch_id are authenticated,
+  // so an attacker cannot lower the epoch on disk without the master.
+  if (typeof envelope.epoch === "number") {
+    base.epoch = envelope.epoch;
+    base.epoch_id = envelope.epoch_id ?? "";
+  }
+  return JSON.stringify(base);
 }
 
 function computeEnvelopeMac(
@@ -564,6 +631,15 @@ export async function readCustodyEnvelope(
     !Array.isArray(envelope.wraps) ||
     typeof envelope.mac !== "string" ||
     !CUSTODY_INSTALL_MODES.has(envelope.install_mode) ||
+    // Anti-rollback Stage 1: when present, epoch must be a non-negative safe
+    // integer and epoch_id a string — a malformed epoch fails closed (the MAC
+    // would not verify anyway, but reject early so the boot detector never
+    // sees a garbage epoch). Absent epoch is the pre-Stage-1 shape: allowed.
+    (envelope.epoch !== undefined &&
+      (typeof envelope.epoch !== "number" ||
+        !Number.isSafeInteger(envelope.epoch) ||
+        envelope.epoch < 0)) ||
+    (envelope.epoch_id !== undefined && typeof envelope.epoch_id !== "string") ||
     envelope.wraps.some(
       (w) =>
         typeof w?.id !== "string" ||
@@ -612,6 +688,10 @@ export async function writeCustodyEnvelope(
     install_mode: envelope.install_mode,
     wraps: envelope.wraps,
     created_at: envelope.created_at,
+    // Anti-rollback Stage 1: carry the epoch through when present (additive).
+    ...(typeof envelope.epoch === "number"
+      ? { epoch: envelope.epoch, epoch_id: envelope.epoch_id ?? "" }
+      : {}),
     mac: computeEnvelopeMac(envelope, master),
   };
   await storage.write(
@@ -668,6 +748,16 @@ export async function enforceCustodyFloor(
   action: string,
   masterKey: Uint8Array
 ): Promise<void> {
+  // Anti-rollback Stage 1: a suspected rollback freezes trust-bearing writes at
+  // this same chokepoint. Checked FIRST. `isRollbackFrozenWithRecompute` is
+  // fail-closed on a tampered freeze marker AND re-derives the verdict from the
+  // witness set when the marker is ABSENT (codex r2 MEDIUM) — so deleting the
+  // freeze cache cannot unfreeze trust-bearing writes. Lazy import avoids a
+  // static cycle (anti-rollback dynamically reads back into this module).
+  const { isRollbackFrozenWithRecompute } = await import("./anti-rollback.js");
+  if ((await isRollbackFrozenWithRecompute(storage, masterKey)).frozen) {
+    throw new CustodyRollbackFrozenError(action);
+  }
   const envelope = await readCustodyEnvelope(storage);
   if (!envelope) {
     // The sentinel proves envelope-format custody existed: an absent
