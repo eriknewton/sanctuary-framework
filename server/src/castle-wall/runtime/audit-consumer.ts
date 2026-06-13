@@ -14,7 +14,11 @@
 
 import { createHash } from "node:crypto";
 
-import { CASTLE_WALL_AUDIT_LAYER } from "../constants.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+} from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
   CastleWallAuditEvent,
@@ -413,6 +417,10 @@ function buildDetailsForEvent(event: CastleWallAuditEvent): Record<string, unkno
   if (event.destination !== null) out.destination = event.destination;
   if (event.decision !== null) out.decision = event.decision;
   if (event.rule_id !== null) out.rule_id = event.rule_id;
+  // Provenance LAST, so a forged `event.details.cw_source` cannot survive into
+  // the stored entry. Consumers reasoning about "actual enforcement" require
+  // this marker (see CASTLE_WALL_AUDIT_PROVENANCE_KEY).
+  out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
   return out;
 }
 

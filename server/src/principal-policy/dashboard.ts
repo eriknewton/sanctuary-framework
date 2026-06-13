@@ -49,6 +49,12 @@ import {
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
+  handlePostureRoute,
+  POSTURE_API_PREFIX,
+  POSTURE_HOME_PATH,
+  type PostureRouteDeps,
+} from "./posture-routes.js";
+import {
   V1IdempotencyStore,
   type V1AgentsDeps,
   type UnprotectOutcome,
@@ -186,7 +192,8 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/dashboard" ||
     path === "/v1.0" ||
     path === "/fortress" ||
-    path === "/events"
+    path === "/events" ||
+    path === POSTURE_HOME_PATH
   );
 }
 
@@ -849,6 +856,39 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url,
       method,
     );
+  }
+
+  /**
+   * Sovereignty Posture Dashboard (Phase 1) dispatch entry point. Serves the
+   * posture-home HTML at `/posture` and the four gap endpoints under
+   * `/api/posture/*` (G1 unwrapped roster, G2 today's-story digest, G4
+   * enforcement-evidenced Castle Wall arm state, G5 per-agent effective reach).
+   *
+   * Auth: the JSON routes and the HTML page run through `checkAuth` — the SAME
+   * gate `/api/audit-log` uses — before this dispatcher is reached (the caller
+   * checks it). Returns true when served, false to fall through to legacy.
+   *
+   * Dependencies are resolved lazily per request so post-unlock wiring (the
+   * hub binding, the operator identity) is always observed. The origin-machine
+   * attribution is the fortress id so the `/v1`-compatible payloads merge into
+   * a multi-machine console later without a schema break.
+   */
+  private async dispatchPosture(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): Promise<boolean> {
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    const deps: PostureRouteDeps = {
+      auditLog: this.auditLog ?? null,
+      originMachine,
+      listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+    };
+    return handlePostureRoute(deps, req, res, url, method);
   }
 
   /**
@@ -1860,6 +1900,38 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Authenticate all other non-OPTIONS requests
     if (!this.checkAuth(req, url, res)) return;
+
+    // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
+    // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER
+    // checkAuth (same gate as `/api/audit-log`) and before the legacy route
+    // table. The dispatch is async; when it serves the request it returns
+    // true, otherwise we fall through to the legacy table below.
+    if (
+      url.pathname === POSTURE_HOME_PATH ||
+      url.pathname === POSTURE_API_PREFIX ||
+      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`)
+    ) {
+      // JSON posture routes get the general rate limit; the HTML view is
+      // exempt (it is a dashboard view route, like `/` and `/fortress`).
+      if (!isDashboardViewRoute(method, url.pathname)) {
+        if (!this.checkRateLimit(req, res, "general")) return;
+      }
+      this.dispatchPosture(req, res, url, method)
+        .then((handled) => {
+          if (handled) return;
+          if (!res.headersSent) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Not found" }));
+          }
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+      return;
+    }
 
     // Rate limiting: apply general limit to authenticated API requests only.
     // HTML view routes (`/`, `/dashboard`, `/fortress`) and the long-lived SSE
