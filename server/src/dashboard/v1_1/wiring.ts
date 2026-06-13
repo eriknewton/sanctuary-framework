@@ -388,6 +388,10 @@ export function buildV11Bindings(
               config,
               stateStoragePath: join(storagePath, "state"),
               keySource: "unknown",
+              // Operator-driven full-fortress export (dashboard exit endpoint):
+              // the exit-machinery Slice 1 ownership partition is deliberately
+              // not applied. Named acknowledgement, not a silent skip.
+              unpartitionedLegacyExport: true,
               ...(approvalAuditId !== undefined
                 ? { exportApprovalAuditId: approvalAuditId }
                 : {}),

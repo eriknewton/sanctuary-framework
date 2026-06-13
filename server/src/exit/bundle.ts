@@ -64,6 +64,12 @@ import {
   type ReputationBundle,
 } from "../l4-reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
+import {
+  partitionByMemoryClass,
+  type PartitionConsentRelease,
+  type PartitionResult,
+  type SealedProvenanceStamp,
+} from "./memory-class.js";
 
 const ARTIFACT_DIR = "artifacts";
 
@@ -279,6 +285,45 @@ export interface ExportExitBundleOptions {
    * `source_key_derivation` path).
    */
   mintStateRekeyKey?: boolean;
+  /**
+   * Exit machinery Slice 1: ownership partition. When supplied, the encrypted-
+   * state export applies the CONSERVATIVE memory-class partition: an entry is
+   * included in the outbound (agent) bundle ONLY when the caller supplies a
+   * sealed `agent_owned` stamp BOUND to its `namespace/key` (or an audited
+   * consent receipt releases its `shared_entangled` lineage). Every other entry
+   * — unsealed, binding-mismatched, operator-owned, or shared-entangled without
+   * consent — is EXCLUDED and fails toward "stays with the operator," never
+   * `agent_owned`.
+   *
+   * `stampsByEntryKey` keys are `"<namespace>/<key>"`; each stamp must have been
+   * minted with `entry_binding` equal to that same `"<namespace>/<key>"`. Only
+   * the live, in-process sealed stamp object is trusted; a deserialized stamp is
+   * not sealed and the entry is conservatively excluded.
+   */
+  memoryClassPartition?: {
+    readonly stampsByEntryKey: ReadonlyMap<string, SealedProvenanceStamp>;
+    readonly consentReleases?: readonly PartitionConsentRelease[];
+  };
+  /**
+   * Codex HIGH (06-13) reconciliation: backward compatibility requires the
+   * pre-Slice-1 single-operator export (every non-`_` namespace, no ownership
+   * partition) to remain the behavior when no partition is supplied — the
+   * shipped CLI, hub, dashboard, and drill paths all rely on it, and Slice 1 is
+   * explicitly scoped as an OPT-IN ownership axis.
+   *
+   * To keep that compatibility WITHOUT silently masking the absence, an
+   * unpartitioned export now requires the caller to acknowledge it explicitly
+   * with `unpartitionedLegacyExport: true`. An export that supplies neither
+   * `memoryClassPartition` nor this flag throws — so an *agent-exit* caller
+   * (which must partition) cannot accidentally fall through to "export
+   * everything." Operator-driven full-fortress exports pass this flag; agent
+   * exit flows pass `memoryClassPartition`.
+   *
+   * This is NOT a clean-exit guarantee: the unpartitioned path exports all
+   * state by design. It is the named, auditable acknowledgement that the
+   * ownership partition was deliberately not applied.
+   */
+  unpartitionedLegacyExport?: boolean;
 }
 
 export interface ExportExitBundleResult {
@@ -294,6 +339,19 @@ export interface ExportExitBundleResult {
    * the importing operator supplies it as `--source-recovery-key`.
    */
   state_rekey_key?: string;
+  /**
+   * Exit machinery Slice 1: ownership-partition summary, present only when
+   * `memoryClassPartition` was supplied. `included` entries traveled in the
+   * outbound bundle; `excluded` entries were withheld under the conservative
+   * default (unsealed, operator-owned, or shared-entangled without consent).
+   * This is telemetry for the operator's review, NOT a non-leakage proof: the
+   * cleanliness claim is only as strong as the sealed-minter coverage (Slice 2).
+   */
+  state_partition?: {
+    included: number;
+    excluded: number;
+    excluded_unsealed: number;
+  };
 }
 
 export interface ImportExitBundleOptions {
@@ -502,12 +560,16 @@ async function discoverFilesystemStateNamespaces(
 
 async function exportEncryptedState(
   opts: ExportExitBundleOptions
-): Promise<{ bundle: ExitEncryptedStateBundle; rekeyKey?: string }> {
+): Promise<{
+  bundle: ExitEncryptedStateBundle;
+  rekeyKey?: string;
+  partition?: PartitionResult;
+}> {
   const namespaceSet = new Set(
     opts.stateNamespaces ??
       (await discoverFilesystemStateNamespaces(opts.stateStoragePath))
   );
-  const entries: ExitEncryptedStateBundle["entries"] = [];
+  const collected: ExitEncryptedStateBundle["entries"] = [];
   for (const namespace of [...namespaceSet].sort()) {
     // F6: never export internal `_`-prefixed namespaces — the rekey/import path
     // rejects them, so exporting one (e.g. an explicit `--state-namespace _x`)
@@ -518,7 +580,7 @@ async function exportEncryptedState(
       const raw = await opts.storage.read(namespace, meta.key);
       if (!raw) continue;
       try {
-        entries.push({
+        collected.push({
           namespace,
           key: meta.key,
           entry: JSON.parse(bytesToString(raw)) as StateEntry,
@@ -527,6 +589,50 @@ async function exportEncryptedState(
         // Corrupt state is omitted rather than trusted into the exit bundle.
       }
     }
+  }
+
+  // Exit machinery Slice 1: apply the conservative ownership partition. The
+  // caller MUST make an explicit choice (codex HIGH): supply
+  // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
+  // (loud, named full-export opt-out). Supplying neither — or both — throws, so
+  // an agent-exit caller cannot silently fall through to "export everything."
+  const hasPartition = opts.memoryClassPartition !== undefined;
+  const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
+  if (hasPartition === hasLegacyOptOut) {
+    throw new Error(
+      "exit-bundle: exactly one of memoryClassPartition or " +
+        "unpartitionedLegacyExport must be supplied. The ownership partition is " +
+        "not silently skippable; pass memoryClassPartition for an ownership-classed " +
+        "exit, or unpartitionedLegacyExport: true to deliberately export all state.",
+    );
+  }
+
+  // An entry travels in the outbound bundle ONLY when it carries a live sealed
+  // `agent_owned` stamp bound to its entry key (or its lineage was released by
+  // an audited consent receipt). Everything else fails toward "stays with the
+  // operator." The legacy opt-out exports all collected entries unchanged.
+  let partition: PartitionResult | undefined;
+  let entries = collected;
+  if (opts.memoryClassPartition !== undefined) {
+    const stamps = opts.memoryClassPartition.stampsByEntryKey;
+    partition = partitionByMemoryClass(
+      collected.map((entry) => {
+        const stamp = stamps.get(`${entry.namespace}/${entry.key}`);
+        return {
+          id: `${entry.namespace}/${entry.key}`,
+          ...(stamp !== undefined ? { sealedStamp: stamp } : {}),
+        };
+      }),
+      {
+        consentReleases: opts.memoryClassPartition.consentReleases,
+      },
+    );
+    const includableIds = new Set(
+      partition.includable.map((decision) => decision.id),
+    );
+    entries = collected.filter((entry) =>
+      includableIds.has(`${entry.namespace}/${entry.key}`),
+    );
   }
 
   // Mint the bundle re-key key only when requested AND there is state to
@@ -550,6 +656,7 @@ async function exportEncryptedState(
       entries,
     },
     ...(minted !== undefined ? { rekeyKey: minted.rekeyKey } : {}),
+    ...(partition !== undefined ? { partition } : {}),
   };
 }
 
@@ -871,6 +978,20 @@ export async function exportExitBundle(
     ],
     ...(encryptedStateExport.rekeyKey !== undefined
       ? { state_rekey_key: encryptedStateExport.rekeyKey }
+      : {}),
+    ...(encryptedStateExport.partition !== undefined
+      ? {
+          state_partition: {
+            included: encryptedStateExport.partition.includable.length,
+            excluded: encryptedStateExport.partition.excluded.length,
+            excluded_unsealed: encryptedStateExport.partition.excluded.filter(
+              (decision) =>
+                decision.reason === "unsealed_stamp_defaulted_operator_owned" ||
+                decision.reason ===
+                  "stamp_binding_mismatch_defaulted_operator_owned",
+            ).length,
+          },
+        }
       : {}),
   };
 }

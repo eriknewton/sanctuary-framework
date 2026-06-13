@@ -91,6 +91,7 @@ describe("Finding RRR: identity overwrite guard for mismatched identities", () =
     const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-rrr-"));
     tempDirs.push(bundleDir);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir,
       storage: fortressA.storage,
       masterKey: fortressA.masterKey,

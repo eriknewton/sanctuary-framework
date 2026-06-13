@@ -153,6 +153,7 @@ async function exportBundle(
   opts?: { mint?: boolean }
 ): Promise<ExportExitBundleResult> {
   return exportExitBundle({
+      unpartitionedLegacyExport: true,
     bundleDir,
     storage: source.storage,
     masterKey: source.masterKey,

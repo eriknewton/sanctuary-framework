@@ -546,6 +546,7 @@ describe("Fortress exit-bundle export happy path (Test 5)", () => {
       );
       tempDirs.push(bundleDir);
       const exported = await exportExitBundle({
+      unpartitionedLegacyExport: true,
         bundleDir,
         storage: bundleStorage,
         masterKey: bundleMasterKey,

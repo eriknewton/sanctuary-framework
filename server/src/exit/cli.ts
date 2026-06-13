@@ -446,6 +446,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         // The CLI is an operator terminal: safe to mint + display the
         // bundle re-key key (it is never written into the bundle).
         mintStateRekeyKey: true,
+        // Operator-driven full-fortress export: the ownership partition (exit
+        // machinery Slice 1) is deliberately not applied here. Named, auditable
+        // acknowledgement, not a silent skip.
+        unpartitionedLegacyExport: true,
         ...(exportDidWeb !== undefined ? { didWeb: exportDidWeb } : {}),
       });
       if (json) {

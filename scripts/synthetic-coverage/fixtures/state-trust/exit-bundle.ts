@@ -105,6 +105,9 @@ async function exportSeededBundle(bundleDir: string) {
     config: defaultConfig(),
     stateNamespaces: ["agent-memory"],
     keySource: "recovery-key",
+    // Full-fortress export fixture: ownership partition (exit Slice 1)
+    // deliberately not applied. Named acknowledgement, not a silent skip.
+    unpartitionedLegacyExport: true,
   });
   return { source, identityId };
 }

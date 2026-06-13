@@ -114,6 +114,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-bundle-"));
     tempDirs.push(bundleDir);
     const exported = await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir,
       storage: source.storage,
       masterKey: source.masterKey,
@@ -278,6 +279,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-repeat-"));
     tempDirs.push(bundleDir);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir,
       storage: source.storage,
       masterKey: source.masterKey,
