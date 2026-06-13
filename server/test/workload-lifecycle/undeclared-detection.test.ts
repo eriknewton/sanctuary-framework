@@ -39,6 +39,7 @@ import type { WorkloadAttestationSigner } from "../../src/workload-lifecycle/hos
 import {
   detectUndeclaredWorkloads,
   UNDECLARED_REASON,
+  UNDECLARED_REASON_TERMINAL_DECLARATION,
   type LiveSupervisedWorkload,
 } from "../../src/workload-lifecycle/undeclared-detection.js";
 import {
@@ -111,6 +112,32 @@ async function declare(
     operation: WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
     identity_id: "fortress-1",
     payload: base({ workload_id, instance_id, consent_ref: `consent://${workload_id}` }),
+    timestamp: new Date(1_700_000_000_000 + ts * 1000).toISOString(),
+  });
+}
+
+/** Declare one workload with an EXPLICIT lifecycle op (so the registry record's
+ * folded `state` is e.g. `deleted` or `slept`), keyed by the given ids. */
+async function declareOp(
+  auditLog: AuditLog,
+  operation: (typeof WORKLOAD_LIFECYCLE_OPS)[keyof typeof WORKLOAD_LIFECYCLE_OPS],
+  workload_id: string,
+  instance_id: string,
+  ts: number,
+): Promise<void> {
+  // A workload_deleted record must record state_disposition "destroyed" (the
+  // op↔payload internal-consistency check); other ops preserve state ("running").
+  const isDelete = operation === WORKLOAD_LIFECYCLE_OPS.DELETED;
+  await emitWorkloadLifecycle({
+    auditLog,
+    operation,
+    identity_id: "fortress-1",
+    payload: base({
+      workload_id,
+      instance_id,
+      consent_ref: `consent://${workload_id}`,
+      ...(isDelete ? { state_disposition: "destroyed" as const } : {}),
+    }),
     timestamp: new Date(1_700_000_000_000 + ts * 1000).toISOString(),
   });
 }
@@ -189,6 +216,132 @@ describe("detectUndeclaredWorkloads — live vs declared cross-check", () => {
       "mike",
       "zeta",
     ]);
+  });
+});
+
+describe("detectUndeclaredWorkloads — only ACTIVE declared records clear (codex follow-up)", () => {
+  it("FLAGS a live workload matching only a workload_deleted record (deleted id reuse — codex repro)", async () => {
+    const auditLog = newAuditLog();
+    // The exact codex repro: agent_x was deleted, then a NEW live agent_x is
+    // running with no fresh declaration. The old flat-union code (every declared
+    // id clears, regardless of state) silently CLEARED this — a missed detection.
+    // Only-active-records-clear must FLAG it with the terminal-record reason.
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.DELETED,
+      "agent_x",
+      "agent_x",
+      0,
+    );
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    // Sanity: the record exists but in terminal `deleted` state.
+    expect(
+      registry.listDeclared().map((r) => [r.workload_id, r.state]),
+    ).toEqual([["agent_x", "deleted"]]);
+
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("agent_x")],
+      registry,
+    });
+    expect(detection.undeclared.map((u) => u.agent_id)).toEqual(["agent_x"]);
+    expect(detection.undeclared[0]!.reason).toBe(
+      UNDECLARED_REASON_TERMINAL_DECLARATION,
+    );
+    expect(detection.declared_count).toBe(1);
+  });
+
+  it("FLAGS a live workload matching only a workload_slept (dormant) record", async () => {
+    const auditLog = newAuditLog();
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.SLEPT,
+      "agent_y",
+      "agent_y",
+      0,
+    );
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    expect(registry.listDeclared()[0]!.state).toBe("slept");
+
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("agent_y")],
+      registry,
+    });
+    expect(detection.undeclared.map((u) => u.agent_id)).toEqual(["agent_y"]);
+    expect(detection.undeclared[0]!.reason).toBe(
+      UNDECLARED_REASON_TERMINAL_DECLARATION,
+    );
+  });
+
+  it("does NOT flag a live workload matching an ACTIVE (instantiated/resumed) record (still cleared)", async () => {
+    const auditLog = newAuditLog();
+    // instantiated (active), then resumed (also active) — last state is `resumed`.
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
+      "agent_z",
+      "agent_z",
+      0,
+    );
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.RESUMED,
+      "agent_z",
+      "agent_z",
+      1,
+    );
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    expect(registry.listDeclared()[0]!.state).toBe("resumed");
+
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("agent_z")],
+      registry,
+    });
+    expect(detection.undeclared).toEqual([]);
+  });
+
+  it("an ACTIVE record carrying agent_id as an instance_id still clears (no regression to the false-alarm fix)", async () => {
+    const auditLog = newAuditLog();
+    // Active record whose workload_id != agent_id, but instance_id == agent_id.
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
+      "custom-workload-name",
+      "agent_inst",
+      0,
+    );
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("agent_inst")],
+      registry,
+    });
+    expect(detection.undeclared).toEqual([]);
+    expect(detection.declared_count).toBe(1);
+  });
+
+  it("an ACTIVE record for a reused id wins over a terminal record sharing that id (cleared)", async () => {
+    const auditLog = newAuditLog();
+    // Same id appears on two distinct workload_ids: one terminal (deleted), one
+    // active (instantiated). The active match must clear the live workload.
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.DELETED,
+      "wl-old",
+      "shared-inst",
+      0,
+    );
+    await declareOp(
+      auditLog,
+      WORKLOAD_LIFECYCLE_OPS.INSTANTIATED,
+      "wl-new",
+      "shared-inst",
+      1,
+    );
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("shared-inst")],
+      registry,
+    });
+    expect(detection.undeclared).toEqual([]);
   });
 });
 
@@ -387,6 +540,22 @@ describe("honesty scoping — supervisor-view + custom-mapping disclaimer", () =
       /overrode BOTH its workload_id AND its instance_id/i,
     );
     expect(finding.body.scope).toMatch(/not\s+definitive/i);
+    // Discloses that ONLY active records clear, and a deleted/slept-only match
+    // is flagged as running without a current declaration (FIX 1 disclosure).
+    expect(finding.body.scope).toMatch(/Only ACTIVE declared records clear/i);
+    expect(finding.body.scope).toMatch(
+      /running without a current declaration/i,
+    );
+    // Discloses the false-CLEAR residual: ids not guaranteed unique/non-reused,
+    // so an unrelated active record sharing an id could clear a live workload;
+    // full precision needs per-instance identity disambiguation (FIX 2).
+    expect(finding.body.scope).toMatch(/unique or non-reused/i);
+    expect(finding.body.scope).toMatch(
+      /UNRELATED active declared record that happens to share/i,
+    );
+    expect(finding.body.scope).toMatch(
+      /per-instance identity disambiguation/i,
+    );
     // No consciousness/sentience/welfare verdict.
     expect(finding.body.scope).toMatch(
       /NOT a consciousness, sentience, or welfare verdict/i,

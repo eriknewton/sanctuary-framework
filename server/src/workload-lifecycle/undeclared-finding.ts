@@ -34,7 +34,13 @@
  *       `instance_id` away from its `agent_id` (a documented limitation — such a
  *       workload could appear undeclared even though it was declared under
  *       different ids), so the undeclared list is not definitive beyond that
- *       boundary.
+ *       boundary;
+ *     - clears a live workload ONLY against an ACTIVE declared record; a match to
+ *       a `deleted`/`slept` record is flagged as running without a current
+ *       declaration, and — because ids are not guaranteed unique/non-reused — a
+ *       live workload could in principle be cleared by an UNRELATED active record
+ *       sharing its id (the false-CLEAR residual; full precision needs
+ *       per-instance identity disambiguation, a later refinement).
  *   No consciousness / sentience / welfare claim appears anywhere. Neutral
  *   "workload" language only (CISO-safe).
  */
@@ -79,7 +85,14 @@ export const WORKLOAD_UNDECLARED_FINDING_SCOPE_TEXT =
   "whose adapter overrode BOTH its workload_id AND its instance_id away from " +
   "its agent_id; such a workload may appear in the undeclared list even though " +
   "it was declared under different identifiers, so the undeclared list is not " +
-  "definitive beyond the workload_id-or-instance_id match. This is a detection " +
+  "definitive beyond the workload_id-or-instance_id match. Only ACTIVE declared " +
+  "records clear a live workload: a live workload matching only a terminated " +
+  "(deleted) or dormant (slept) declared record is flagged as running without a " +
+  "current declaration. Conversely, because the schema does not guarantee " +
+  "identifiers are globally unique or non-reused, a live workload could in " +
+  "principle be cleared by an UNRELATED active declared record that happens to " +
+  "share its workload_id or instance_id; fully precise detection requires " +
+  "per-instance identity disambiguation, a later refinement. This is a detection " +
   "of declaration gaps in the supervised set, NOT a consciousness, sentience, " +
   "or welfare verdict of any kind.";
 

@@ -31,10 +31,20 @@
  *   workload_ids" diff would FALSE-FLAG a custom-mapped, fully-declared workload
  *   as "undeclared" — a false security alarm, which is WORSE than no detection.
  *
- *   Therefore a live `agent_id` counts as DECLARED iff SOME declared record has
- *   `workload_id === agent_id` OR `agent_id ∈ that record's instance_ids`. This
- *   resolves the default wiring AND the instance-id-carries-agent-id case.
- *   UNDECLARED = live `agent_id`s with no such match.
+ *   Therefore a live `agent_id` counts as DECLARED (cleared) iff SOME ACTIVE
+ *   declared record has `workload_id === agent_id` OR `agent_id ∈ that record's
+ *   instance_ids`. This resolves the default wiring AND the
+ *   instance-id-carries-agent-id case. UNDECLARED = live `agent_id`s with no such
+ *   ACTIVE match.
+ *
+ *   ONLY ACTIVE RECORDS CLEAR (codex follow-up — the worse error direction): a
+ *   `deleted` (destroyed) or `slept` (dormant, not running) declared record does
+ *   NOT clear a live workload. A live workload that matches ONLY such a terminal/
+ *   dormant record is itself flagged with a DISTINCT reason
+ *   (`UNDECLARED_REASON_TERMINAL_DECLARATION`) — it is running without a current
+ *   declaration. This closes the missed detection where a `workload_deleted`
+ *   record's (possibly reused) id silently cleared a genuinely-undeclared new
+ *   live workload.
  *
  *   HONEST LIMITATION (rung-c.1): a workload whose adapter overrode BOTH
  *   `workload_id` AND `instance_id` away from its `agent_id` cannot be resolved
@@ -50,7 +60,29 @@
  */
 
 import type { SupervisedAgentState } from "../supervisor/protocol.js";
-import type { WorkloadRegistry } from "./registry.js";
+import type {
+  WorkloadLifecycleState,
+  WorkloadRegistry,
+} from "./registry.js";
+
+/**
+ * The declared lifecycle states whose record is currently EXTANT (the workload
+ * is, per its last recorded transition, either standing or runnable) and may
+ * therefore CLEAR a matching live workload. `deleted` (destroyed) and `slept`
+ * (dormant — not running; a live one that resumed without recording it) are
+ * deliberately EXCLUDED: a live workload that matches only such a record is
+ * running without a current declaration, so it must still be flagged rather than
+ * silently cleared by a stale terminal/dormant record (which could also be a
+ * REUSED id, since the schema does not guarantee ids are unique or non-reused).
+ */
+const ACTIVE_CLEARING_STATES: ReadonlySet<WorkloadLifecycleState> = new Set([
+  "registered",
+  "instantiated",
+  "paused",
+  "resumed",
+  "forked",
+  "merged",
+]);
 
 /** Minimal live-status shape the detector needs. Structurally a subset of the
  * supervisor's `SupervisedAgentStatus`, named locally so the detector does not
@@ -62,18 +94,34 @@ export interface LiveSupervisedWorkload {
   state: SupervisedAgentState;
 }
 
-/** The single canonical reason string for an undeclared flag. Bound into the
- * finding so a reader sees WHY a workload was flagged and on what match rule. */
+/** Reason: the live workload matched NO declared record at all (by either
+ * `workload_id` or `instance_id`). Bound into the finding so a reader sees WHY a
+ * workload was flagged and on what match rule. */
 export const UNDECLARED_REASON =
   "no matching declared lifecycle record (by workload_id or instance_id)" as const;
 
-/** One flagged live workload with no matching declared lifecycle record. */
+/** Reason: the live workload matched ONLY a `deleted`/`slept` declared record —
+ * a terminated or dormant declaration. The workload is observed running, but its
+ * last recorded declaration says it should be destroyed (`deleted`) or not
+ * running (`slept`), so it is running without a current declaration. (This also
+ * covers a REUSED id: a new live workload colliding with a stale terminal
+ * record's id.) Distinguished from {@link UNDECLARED_REASON} so the finding is
+ * precise. */
+export const UNDECLARED_REASON_TERMINAL_DECLARATION =
+  "live workload matches only a terminated or dormant (deleted/slept) declared record — running without a current declaration" as const;
+
+/** The reason a live workload was flagged. */
+export type UndeclaredReason =
+  | typeof UNDECLARED_REASON
+  | typeof UNDECLARED_REASON_TERMINAL_DECLARATION;
+
+/** One flagged live workload with no matching ACTIVE declared lifecycle record. */
 export interface UndeclaredWorkload {
   agent_id: string;
   harness: string;
   /** The supervisor's lifecycle state for this live workload (verbatim). */
   supervisor_state: SupervisedAgentState;
-  reason: typeof UNDECLARED_REASON;
+  reason: UndeclaredReason;
 }
 
 /** Result of a detection pass. Counts let a reader see the comparison size
@@ -99,10 +147,14 @@ export interface DetectUndeclaredWorkloadsParams {
  * Cross-check the live supervised set against the declared set and return the
  * undeclared workloads.
  *
- * A live `agent_id` is DECLARED iff some declared record matches it by
- * `workload_id === agent_id` OR `agent_id ∈ instance_ids` (THE SEAM RULE — this
- * is what prevents the false alarm on custom-mapped / instance-id-carried
- * declared workloads). Everything else live is UNDECLARED.
+ * A live `agent_id` is DECLARED (cleared) iff some ACTIVE declared record (state
+ * in {@link ACTIVE_CLEARING_STATES}) matches it by `workload_id === agent_id` OR
+ * `agent_id ∈ instance_ids` (THE SEAM RULE — this is what prevents the false
+ * alarm on custom-mapped / instance-id-carried declared workloads). A `deleted`
+ * or `slept` record does NOT clear: a live workload matching only such a
+ * terminal/dormant record is flagged with
+ * {@link UNDECLARED_REASON_TERMINAL_DECLARATION}; one matching no declared record
+ * at all is flagged with {@link UNDECLARED_REASON}.
  *
  * Deterministic: the undeclared list is sorted by `agent_id`. Pure + injectable:
  * no supervisor/daemon/socket and no chain access beyond `registry.listDeclared()`.
@@ -112,26 +164,41 @@ export function detectUndeclaredWorkloads(
 ): UndeclaredDetection {
   const declared = params.registry.listDeclared();
 
-  // Build the set of identifiers that count as "declared" for the seam match:
-  // every declared workload_id AND every declared instance_id. A live agent_id
-  // matching ANY of these is declared (resolves both the default wiring and the
-  // instance-id-carries-agent-id case).
-  const declaredIdentifiers = new Set<string>();
+  // Build TWO identifier sets for the seam match, split by record state:
+  //   - activeIdentifiers: ids of ACTIVE/extant records — these CLEAR a live
+  //     workload (resolves the default wiring and the instance-id-carries-
+  //     agent-id case).
+  //   - terminalIdentifiers: ids of `deleted`/`slept` records — these do NOT
+  //     clear, but let us flag a live match with the precise terminal reason
+  //     rather than the no-record-at-all reason. (A live id present in BOTH —
+  //     e.g. a reused id active again elsewhere — is cleared: an active record
+  //     wins, so activeIdentifiers is checked first.)
+  const activeIdentifiers = new Set<string>();
+  const terminalIdentifiers = new Set<string>();
   for (const record of declared) {
-    declaredIdentifiers.add(record.workload_id);
+    const target = ACTIVE_CLEARING_STATES.has(record.state)
+      ? activeIdentifiers
+      : terminalIdentifiers;
+    target.add(record.workload_id);
     for (const instanceId of record.instance_ids) {
-      declaredIdentifiers.add(instanceId);
+      target.add(instanceId);
     }
   }
 
   const undeclared: UndeclaredWorkload[] = [];
   for (const live of params.liveStatuses) {
-    if (declaredIdentifiers.has(live.agent_id)) continue; // declared — no alarm.
+    // An ACTIVE declared record clears the live workload — no alarm.
+    if (activeIdentifiers.has(live.agent_id)) continue;
+    // No active match. If it matches ONLY a terminal/dormant record, flag it
+    // with the distinct terminal reason; otherwise it matches nothing declared.
+    const reason: UndeclaredReason = terminalIdentifiers.has(live.agent_id)
+      ? UNDECLARED_REASON_TERMINAL_DECLARATION
+      : UNDECLARED_REASON;
     undeclared.push({
       agent_id: live.agent_id,
       harness: live.harness,
       supervisor_state: live.state,
-      reason: UNDECLARED_REASON,
+      reason,
     });
   }
 
