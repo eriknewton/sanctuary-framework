@@ -26,6 +26,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "policy",
   "protect",
   "reset-passphrase",
+  "rotate-master",
   "secrets",
   "sentinel",
   "status",

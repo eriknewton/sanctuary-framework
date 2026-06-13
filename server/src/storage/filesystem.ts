@@ -295,6 +295,39 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     }
   }
 
+  async listNamespaces(): Promise<string[]> {
+    let dirNames: string[];
+    try {
+      dirNames = await readdir(this.basePath);
+    } catch {
+      return []; // Base path does not exist yet — empty fortress.
+    }
+    const namespaces: string[] = [];
+    for (const dirName of dirNames) {
+      try {
+        const s = await stat(join(this.basePath, dirName));
+        if (!s.isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      // Skip empty namespace directories: a namespace with no entries holds
+      // nothing to rotate, and surfacing it would only trip the rotation
+      // walker's unknown-namespace abort for leftover empty dirs.
+      try {
+        const files = await readdir(join(this.basePath, dirName));
+        if (!files.some((f) => f.endsWith(".enc"))) continue;
+      } catch {
+        continue;
+      }
+      // bijectiveDecode is total (unmatched bytes pass through), so legacy
+      // pre-#41 sanitized directory names still surface — as their raw names
+      // — and the rotation walker's unknown-namespace abort catches them
+      // (fail closed) instead of silently skipping a namespace.
+      namespaces.push(bijectiveDecode(dirName));
+    }
+    return namespaces.sort();
+  }
+
   async totalSize(): Promise<number> {
     let total = 0;
 
