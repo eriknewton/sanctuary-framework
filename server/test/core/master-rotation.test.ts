@@ -22,11 +22,29 @@ import {
   establishMaster,
   readCustodyEnvelope,
   countVerifiedWraps,
+  envelopeEpochOf,
+  readEnvelopeEpoch,
   CustodyUnlockError,
   CustodyRotationInProgressError,
   ROTATION_JOURNAL_KEY,
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
+} from "../../src/core/master-custody.js";
+import {
+  readEpochWitness,
+  observeWitnessEpoch,
+  evaluateRollback,
+  EPOCH_WITNESS_META_KEY,
+} from "../../src/core/anti-rollback.js";
+import {
+  readCustodyEpochCount,
+  probeAuditHeadAnchor,
+  deriveAuditEpochKeys,
+  AUDIT_EPOCH_KEYS_KEY,
+} from "../../src/l2-operational/audit-log.js";
+import {
+  CUSTODY_ENVELOPE_KEY,
+  CUSTODY_SENTINEL_KEY,
 } from "../../src/core/master-custody.js";
 import {
   rotateMaster,
@@ -810,5 +828,185 @@ describe("master rotation — custody floor on the rotated fortress", () => {
     expect(toBase64url(viaKeychain.masterKey)).toBe(
       toBase64url(viaPassphrase.masterKey)
     );
+  });
+});
+
+describe("master rotation — anti-rollback epoch advance (Stage 1)", () => {
+  it("a fresh fortress is epoch 0 with no witness yet", async () => {
+    const fortress = await buildFortress();
+    expect(await readEnvelopeEpoch(fortress.storage)).toBe(0);
+    const witness = await readEpochWitness(fortress.storage, fortress.master);
+    expect(witness.status).toBe("absent");
+  });
+
+  it("a single rotation advances the on-disk epoch and witness to 1", async () => {
+    const fortress = await buildFortress();
+    await rotateMaster(rotateOpts(fortress));
+
+    const newEnvelope = await readCustodyEnvelope(fortress.storage);
+    expect(envelopeEpochOf(newEnvelope)).toBe(1);
+
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status === "valid") {
+      expect(witness.data.epoch).toBe(1);
+      expect(witness.data.epoch_id).toBe(newEnvelope!.epoch_id);
+    }
+  });
+
+  it("two rotations advance the epoch to 2 and the rotation count agrees", async () => {
+    const fortress = await buildFortress();
+    await rotateMaster(rotateOpts(fortress));
+    await rotateMaster(rotateOpts(fortress));
+
+    expect(await readEnvelopeEpoch(fortress.storage)).toBe(2);
+
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const epochKeys = deriveAuditEpochKeys(est.masterKey);
+    const count = await readCustodyEpochCount(fortress.storage, {
+      epochMacKey: epochKeys.epochMacKey,
+    });
+    epochKeys.epochWrapKey.fill(0);
+    epochKeys.epochMacKey.fill(0);
+    expect(count.status).toBe("present");
+    if (count.status === "present") expect(count.count).toBe(2);
+  });
+
+  it("a legitimate rotation does NOT trip the boot detector (the #501 interaction)", async () => {
+    const fortress = await buildFortress();
+    await rotateMaster(rotateOpts(fortress));
+
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    // Re-run the exact boot cross-check the server runs: observe the witnesses,
+    // compare against the on-disk envelope epoch. The rotation advanced BOTH the
+    // envelope epoch and the witness in lockstep, so the verdict is OK.
+    const epochKeys = deriveAuditEpochKeys(est.masterKey);
+    const epochRecord = await readCustodyEpochCount(fortress.storage, {
+      epochMacKey: epochKeys.epochMacKey,
+    });
+    epochKeys.epochWrapKey.fill(0);
+    epochKeys.epochMacKey.fill(0);
+    const rotationEpochCount =
+      epochRecord.status === "present" ? epochRecord.count : 0;
+    const observation = await observeWitnessEpoch({
+      storage: fortress.storage,
+      master: est.masterKey,
+      rotationEpochCount,
+      rotationEpochTampered: epochRecord.status === "tampered",
+    });
+    const envelopeEpoch = await readEnvelopeEpoch(fortress.storage);
+    const verdict = evaluateRollback({ envelopeEpoch, observation });
+    expect(verdict.kind).toBe("ok");
+  });
+
+  it("DETECTS a custody-only splice that resurrects the retired credential even with both epoch witnesses deleted (codex r1 HIGH)", async () => {
+    const fortress = await buildFortress();
+    const { storage } = fortress;
+
+    // Capture the PRE-rotation custody artifacts (old master). These are what an
+    // attacker with disk write would restore to swap the old (leaked) master
+    // back in after the operator rotated it away.
+    const oldEnvelope = await storage.read("_meta", CUSTODY_ENVELOPE_KEY);
+    const oldSentinel = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    expect(oldEnvelope).not.toBeNull();
+
+    // Operator rotates (the remedy for the leak): new master, epoch advances,
+    // the audit head anchor is restamped under the NEW master.
+    await rotateMaster(rotateOpts(fortress));
+    const newMaster = (
+      await establishMaster({ storage, passphrase: PASSPHRASE })
+    ).masterKey;
+
+    // ── The attack: restore ONLY the old custody files (swap the master back),
+    // and DELETE both epoch witnesses (the cheapest move to avoid the obvious
+    // epoch mismatch). State + audit stay current.
+    await storage.write("_meta", CUSTODY_ENVELOPE_KEY, oldEnvelope!);
+    if (oldSentinel) await storage.write("_meta", CUSTODY_SENTINEL_KEY, oldSentinel);
+    await storage.delete("_meta", EPOCH_WITNESS_META_KEY);
+    await storage.delete("_audit_checkpoints", AUDIT_EPOCH_KEYS_KEY);
+
+    // Boot now establishes the OLD (retired) master from the restored envelope.
+    const spliced = await establishMaster({ storage, passphrase: PASSPHRASE });
+    expect(toBase64url(spliced.masterKey)).toBe(toBase64url(fortress.master));
+    expect(toBase64url(spliced.masterKey)).not.toBe(toBase64url(newMaster));
+
+    // The boot cross-check, run under the spliced-in OLD master: the epoch
+    // record + witness are gone (deleted), so a naive epoch comparison reads
+    // epoch 0 / floor 0 = OK. But the audit head anchor — restamped under the
+    // NEW master during rotation — does NOT authenticate under the old master,
+    // exposing the splice.
+    const headProbe = await probeAuditHeadAnchor(storage, spliced.masterKey);
+    expect(headProbe.status).toBe("tampered");
+
+    const epochKeys = deriveAuditEpochKeys(spliced.masterKey);
+    const epochRecord = await readCustodyEpochCount(storage, {
+      epochMacKey: epochKeys.epochMacKey,
+    });
+    epochKeys.epochWrapKey.fill(0);
+    epochKeys.epochMacKey.fill(0);
+    const observation = await observeWitnessEpoch({
+      storage,
+      master: spliced.masterKey,
+      rotationEpochCount: epochRecord.status === "present" ? epochRecord.count : 0,
+      rotationEpochTampered: epochRecord.status === "tampered",
+      headAnchor: { status: headProbe.status },
+    });
+    expect(observation.suspect).toBe(true);
+
+    const verdict = evaluateRollback({
+      envelopeEpoch: await readEnvelopeEpoch(storage),
+      observation,
+    });
+    expect(verdict.kind).toBe("rollback-suspected");
+  });
+
+  it("head-anchor probe treats a DELETED head anchor as tampered when it was once established (codex r2)", async () => {
+    const fortress = await buildFortress();
+    const { storage } = fortress;
+    // buildFortress writes an audit chain → a head anchor + established marker.
+    const probeBefore = await probeAuditHeadAnchor(storage, fortress.master);
+    expect(probeBefore.status).toBe("valid");
+
+    // Attacker deletes the head anchor to dodge the splice check, but the
+    // plaintext `audit-head-anchor-established-v1` marker remains → tampered.
+    await storage.delete("_audit_checkpoints", "__head_anchor");
+    const probeAfter = await probeAuditHeadAnchor(storage, fortress.master);
+    expect(probeAfter.status).toBe("tampered");
+  });
+
+  it("head-anchor probe stays tampered even after deleting the established MARKER, while audit entries survive (codex r3 HIGH)", async () => {
+    const fortress = await buildFortress();
+    const { storage } = fortress;
+    // Attacker deletes BOTH the head anchor and its plaintext established marker
+    // to erase the detector's memory — but the audit chain itself survives (the
+    // splice attacker keeps the current audit). The audit entries are the second
+    // independent "was established" signal, so the probe stays tampered.
+    await storage.delete("_audit_checkpoints", "__head_anchor");
+    await storage.delete("_meta", "audit-head-anchor-established-v1");
+    expect((await storage.list("_audit")).length).toBeGreaterThan(0);
+    const probe = await probeAuditHeadAnchor(storage, fortress.master);
+    expect(probe.status).toBe("tampered");
+  });
+
+  it("head-anchor probe is absent (neutral) on a genuinely never-audited fortress", async () => {
+    const storage = new MemoryStorage();
+    const est = await establishMaster({
+      storage,
+      passphrase: PASSPHRASE,
+      firstRun: { installMode: "interactive", mintRecoveryKey: false },
+    });
+    // No audit chain written → no head anchor, no established marker.
+    const probe = await probeAuditHeadAnchor(storage, est.masterKey);
+    expect(probe.status).toBe("absent");
   });
 });

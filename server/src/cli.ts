@@ -229,6 +229,14 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "restore-attest") {
+    const { runRestoreAttestCommand } = await import(
+      "./cli/restore-attest.js"
+    );
+    const code = await runRestoreAttestCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "intelligence") {
     const { runIntelligenceCommand } = await import(
       "./cli/intelligence.js"

@@ -1716,6 +1716,21 @@ export async function importExitBundle(
     ? publicKeysFromIdentityArtifact(identityArtifact.json)
     : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
 
+  // Anti-rollback Stage 1 (#506) interaction: the activation path above emits
+  // its audit entries fire-and-forget (`void opts.auditLog.append(...)`), so a
+  // head-anchor write for the first such entry can still be in flight when the
+  // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
+  // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
+  // "audit entries exist on disk but no head anchor file yet" as the custody
+  // SPLICE signature — a FALSE rollback freeze that fails a LEGITIMATE import
+  // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
+  // queue here makes the gate observe a settled, self-consistent audit state
+  // (entry on disk ⟹ its head anchor on disk), so a genuine import is never
+  // mistaken for a credential-resurrecting splice. This weakens nothing: a real
+  // splice (old custody envelope grafted onto an audit chain written under a
+  // different master) still fails the head-anchor MAC after the flush.
+  await opts.auditLog.flush();
+
   let reputationResult = {
     imported_attestations: 0,
     invalid_attestations: 0,
