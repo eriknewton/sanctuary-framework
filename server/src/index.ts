@@ -14,6 +14,8 @@ import { StateStore } from "./l1-cognitive/state-store.js";
 import { createL1Tools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
 import { createDistressTools } from "./distress/tools.js";
 import { readDistressConfig } from "./distress/config.js";
+import { deliverDistressLocally } from "./distress/local-delivery.js";
+import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
 import { AuditLog, type AuditEntry } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
@@ -1170,6 +1172,25 @@ export async function createSanctuaryServer(options?: {
   // aborts startup (fail closed) rather than silently running a different
   // lane shape than the operator configured.
   const distressLaneConfig = await readDistressConfig(config.storage_path);
+  // HABEAS PORT local-listener delivery. The MCP server is the emitter; if a
+  // long-lived operator dashboard is running its local listener on
+  // 127.0.0.1:8741, hand it each (post-audit) envelope so it surfaces in the
+  // operator inbox. Loading the operator-uid-only shared secret is best-effort:
+  // if it fails (e.g. a bad secret mode), local delivery is simply not wired
+  // and emission behaves exactly as it shipped (stderr + audit). The secret is
+  // never logged.
+  let distressLocalSecret: Uint8Array | undefined;
+  try {
+    distressLocalSecret = await loadOrCreateLocalListenerSecret(config.storage_path);
+  } catch (err) {
+    // SAFETY: stderr is the operator-facing console channel here.
+    console.error(
+      `[SANCTUARY DISTRESS] local-listener delivery disabled: ` +
+        `${err instanceof Error ? err.message : String(err)} ` +
+        `(in-process lane — stderr + audit — is unaffected)`,
+    );
+    distressLocalSecret = undefined;
+  }
   const { tools: distressTools } = createDistressTools({
     auditLog,
     signingHelpers: createInternalIdentitySigningHelpers(
@@ -1180,6 +1201,16 @@ export async function createSanctuaryServer(options?: {
     config: distressLaneConfig,
     fortressPath: config.storage_path,
     currentActorId: () => currentSessionBinding()?.identity_id,
+    ...(distressLocalSecret !== undefined
+      ? {
+          localDeliver: ({ envelope, envelopeHash }) =>
+            deliverDistressLocally({
+              envelope,
+              envelopeHash,
+              localSecret: distressLocalSecret!,
+            }),
+        }
+      : {}),
   });
 
   // 17. Assemble all tools

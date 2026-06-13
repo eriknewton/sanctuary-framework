@@ -93,6 +93,10 @@ describe("sanctuary_distress tool", () => {
     signing?: "sign" | "throw";
     now?: () => number;
     fetchImpl?: typeof fetch;
+    localDeliver?: (args: {
+      envelope: unknown;
+      envelopeHash: string;
+    }) => Promise<{ delivered: boolean; reason?: string }>;
   }) {
     const { tools } = createDistressTools({
       auditLog,
@@ -103,6 +107,14 @@ describe("sanctuary_distress tool", () => {
       now: overrides?.now,
       fetchImpl: overrides?.fetchImpl,
       notify: (line) => notifications.push(line),
+      ...(overrides?.localDeliver
+        ? {
+            localDeliver: overrides.localDeliver as (args: {
+              envelope: import("../../src/distress/tools.js").DistressEnvelope;
+              envelopeHash: string;
+            }) => Promise<{ delivered: boolean; reason?: string }>,
+          }
+        : {}),
     });
     expect(tools).toHaveLength(1);
     expect(tools[0]!.name).toBe(SANCTUARY_DISTRESS_OPERATION);
@@ -130,6 +142,7 @@ describe("sanctuary_distress tool", () => {
     expect(result.delivered).toEqual({
       audit: true,
       operator_notification: true,
+      local_listener: "not_wired",
       webhook: "not_configured",
     });
 
@@ -328,6 +341,55 @@ describe("sanctuary_distress tool", () => {
 
     const { entries } = await auditLog.query({
       operation_type: "sanctuary_distress_webhook_failed",
+    });
+    expect(entries).toHaveLength(1);
+  });
+
+  it("calls localDeliver AFTER audit + notify; success reports local_listener=delivered", async () => {
+    const order: string[] = [];
+    const tool = makeTool({
+      localDeliver: async () => {
+        // The audit entry and notification must already exist when local
+        // delivery runs (constraint: delivery is after audit, best-effort).
+        const { entries } = await auditLog.query({
+          operation_type: SANCTUARY_DISTRESS_OPERATION,
+        });
+        order.push(`audit=${entries.length}`, `notify=${notifications.length}`);
+        return { delivered: true };
+      },
+    });
+    const result = await call(tool, { reason: "other", severity: "notice" });
+    expect(result.ok).toBe(true);
+    expect((result.delivered as Record<string, unknown>).local_listener).toBe("delivered");
+    expect(order).toEqual(["audit=1", "notify=1"]);
+  });
+
+  it("a localDeliver failure is audited and never fatal", async () => {
+    const tool = makeTool({
+      localDeliver: async () => ({ delivered: false, reason: "ECONNREFUSED" }),
+    });
+    const result = await call(tool, { reason: "other", severity: "notice" });
+    // Emission still succeeds; the local lane (audit + notify) already landed.
+    expect(result.ok).toBe(true);
+    expect((result.delivered as Record<string, unknown>).local_listener).toBe("failed");
+    const { entries } = await auditLog.query({
+      operation_type: "sanctuary_distress_local_delivery_failed",
+    });
+    expect(entries).toHaveLength(1);
+    expect((entries[0]!.details as Record<string, unknown>).reason).toBe("ECONNREFUSED");
+  });
+
+  it("a localDeliver that throws is caught, audited, and never fatal", async () => {
+    const tool = makeTool({
+      localDeliver: async () => {
+        throw new Error("listener boom");
+      },
+    });
+    const result = await call(tool, { reason: "other", severity: "notice" });
+    expect(result.ok).toBe(true);
+    expect((result.delivered as Record<string, unknown>).local_listener).toBe("failed");
+    const { entries } = await auditLog.query({
+      operation_type: "sanctuary_distress_local_delivery_failed",
     });
     expect(entries).toHaveLength(1);
   });

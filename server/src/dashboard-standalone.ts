@@ -71,6 +71,12 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+import { DistressInbox } from "./distress/inbox.js";
+import { DistressListener } from "./distress/listener.js";
+import {
+  loadOrCreateLocalListenerSecret,
+  DistressLocalSecretError,
+} from "./distress/local-secret.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -565,6 +571,49 @@ export async function startStandaloneDashboard(
     dashboard.setAutoAuthLocalhost(true);
   }
 
+  // HABEAS PORT local distress lane. The standalone dashboard is the
+  // long-lived operator process on the machine (launchd/systemd), so it is
+  // where the local listener belongs — the MCP server is launched on-demand
+  // via stdio and is not reliably up when an agent emits distress. The
+  // listener binds 127.0.0.1:8741 (the reserved habeas port), authenticates
+  // deliveries against an operator-uid-only secret, and persists received
+  // signals to the encrypted, operator-readable distress inbox. The dashboard
+  // surfaces that inbox read-only at /api/distress/* behind its existing auth.
+  //
+  // Everything here is additive and best-effort: a secret-mode error or a port
+  // conflict logs loudly and leaves the dashboard running. The in-process
+  // distress lane (stderr + audit, emitted server-side) is never affected.
+  const distressInbox = new DistressInbox(storage, masterKey);
+  await distressInbox.load();
+  dashboard.setDistressInbox(distressInbox);
+
+  let distressListener: DistressListener | undefined;
+  try {
+    const localSecret = await loadOrCreateLocalListenerSecret(config.storage_path);
+    distressListener = new DistressListener({
+      inbox: distressInbox,
+      auditLog,
+      localSecret,
+      identityId: fortressIdFromStoragePath(config.storage_path),
+    });
+    await distressListener.start();
+  } catch (err) {
+    // A bad secret mode (group/world-readable) or any setup failure must not
+    // stop the dashboard; the in-process lane still holds.
+    const detail =
+      err instanceof DistressLocalSecretError
+        ? err.message
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    // SAFETY: stderr is the operator-facing console for this service boot.
+    console.error(
+      `[SANCTUARY DISTRESS] local listener not started: ${detail}\n` +
+        `  The in-process distress lane (stderr + audit) is unaffected.`,
+    );
+    distressListener = undefined;
+  }
+
   await dashboard.start();
 
   // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
@@ -585,6 +634,7 @@ export async function startStandaloneDashboard(
   });
   const clearRuntime = () => {
     clearTenantRuntime(config.storage_path).catch(() => {});
+    distressListener?.stop().catch(() => {});
   };
   process.once("SIGINT", clearRuntime);
   process.once("SIGTERM", clearRuntime);

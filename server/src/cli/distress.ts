@@ -264,6 +264,7 @@ async function cmdSend(
       delivered?: {
         audit: boolean;
         operator_notification: boolean;
+        local_listener?: "not_wired" | "delivered" | "failed";
         webhook: "not_configured" | "delivered" | "failed";
       };
     };

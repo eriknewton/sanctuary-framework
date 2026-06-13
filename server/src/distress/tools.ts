@@ -94,6 +94,19 @@ export interface CreateDistressToolsOptions {
   fetchImpl?: typeof fetch;
   /** Injectable local notification sink (defaults to stderr). */
   notify?: (line: string) => void;
+  /**
+   * Optional best-effort delivery to the local distress listener on
+   * 127.0.0.1:8741. Called AFTER the critical audit append and the local
+   * stderr notification, so a failure here is never a new failure mode for
+   * emission. Resolves to whether delivery landed; a false/throw is audited
+   * (like the webhook lane) and otherwise ignored. Omitted when no local
+   * listener surface is wired (e.g. the MCP server boots without a known
+   * listener) — emission then behaves exactly as it shipped: stderr + audit.
+   */
+  localDeliver?: (args: {
+    envelope: DistressEnvelope;
+    envelopeHash: string;
+  }) => Promise<{ delivered: boolean; reason?: string }>;
 }
 
 /** Strip control characters and hard-truncate the free-text detail. */
@@ -348,6 +361,42 @@ export function createDistressTools(options: CreateDistressToolsOptions): {
           ` (${envelope.event_id}, audited)`,
       );
 
+      // ── Optional local listener delivery (best-effort, after audit) ──
+      // The local notification + audit above are the shipped guarantee; this
+      // hands the same bounded envelope to a long-lived local listener
+      // (127.0.0.1:8741, the operator dashboard process) so it can surface in
+      // the operator inbox. A failure (no listener running, refused, nack) is
+      // audited and otherwise ignored — never fatal, never a new failure mode.
+      let localListenerDelivery: "not_wired" | "delivered" | "failed" = "not_wired";
+      if (options.localDeliver !== undefined) {
+        let result: { delivered: boolean; reason?: string };
+        try {
+          result = await options.localDeliver({ envelope, envelopeHash });
+        } catch (err) {
+          result = {
+            delivered: false,
+            reason: err instanceof Error ? err.message : "error",
+          };
+        }
+        localListenerDelivery = result.delivered ? "delivered" : "failed";
+        if (!result.delivered) {
+          try {
+            await audit(
+              "sanctuary_distress_local_delivery_failed",
+              {
+                event_id: envelope.event_id,
+                ...(result.reason !== undefined ? { reason: result.reason } : {}),
+              },
+              "failure",
+            );
+          } catch {
+            // The local lane (audit + notification) already delivered above;
+            // a failure auditing the best-effort local-listener leg must NOT
+            // turn into a new failure mode for emission (codex round-1 LOW).
+          }
+        }
+      }
+
       // ── Optional operator-configured webhook ─────────────────────────
       let webhookDelivery: "not_configured" | "delivered" | "failed" = "not_configured";
       if (options.config.webhook_url !== undefined && options.config.webhook_secret !== undefined) {
@@ -400,6 +449,7 @@ export function createDistressTools(options: CreateDistressToolsOptions): {
         delivered: {
           audit: true,
           operator_notification: true,
+          local_listener: localListenerDelivery,
           webhook: webhookDelivery,
         },
         signed: signature !== null,
