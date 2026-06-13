@@ -1747,15 +1747,7 @@ mod tests {
     fn scalar_axis_forms_parse_as_one_element_vecs() {
         // codex round-5 MEDIUM: the TS schema types list axes as `T | T[]`
         // and signs scalar-form rules as-is; the daemon must accept them.
-        let raw = r#"{
-            "id": "uuid-1",
-            "schema_version": 1,
-            "created_at": "2026-05-05T00:00:00Z",
-            "match": { "host": "api.example.com", "ip": "203.0.113.7",
-                       "cidr": "10.0.0.0/8", "port": 443 },
-            "scope": {},
-            "disposition": "allow"
-        }"#;
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": "api.example.com", "ip": "203.0.113.7", "cidr": "10.0.0.0/8", "port": 443 }, "scope": {}, "disposition": "allow" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("scalar forms parse");
         assert_eq!(parsed.match_clause.host.as_deref(), Some(&["api.example.com".to_string()][..]));
         assert_eq!(parsed.match_clause.ip.as_deref(), Some(&["203.0.113.7".to_string()][..]));
@@ -1777,14 +1769,7 @@ mod tests {
         // codex round-7: JSON has one number type — `443.0` and `4.43e2`
         // denote 443, and the TS parser/validator accepts those spellings in
         // a signed rule file. serde must agree.
-        let raw = r#"{
-            "id": "uuid-1",
-            "schema_version": 1.0,
-            "created_at": "2026-05-05T00:00:00Z",
-            "match": { "host": ["api.example.com"], "port": [443.0, 4.43e2, 80] },
-            "scope": {},
-            "disposition": "allow"
-        }"#;
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1.0, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "port": [443.0, 4.43e2, 80] }, "scope": {}, "disposition": "allow" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("number tokens parse");
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.match_clause.port.as_deref(), Some(&[443u16, 443, 80][..]));
@@ -1811,14 +1796,7 @@ mod tests {
         // deny_unknown_fields on RuleMatch: an unmodeled match axis (a newer
         // constraint this daemon cannot enforce) must reject the rule, not be
         // silently ignored.
-        let raw = r#"{
-            "id": "uuid-1",
-            "schema_version": 1,
-            "created_at": "2026-05-05T00:00:00Z",
-            "match": { "host": ["api.example.com"], "future_axis": ["x"] },
-            "scope": {},
-            "disposition": "deny"
-        }"#;
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "future_axis": ["x"] }, "scope": {}, "disposition": "deny" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw);
         assert!(parsed.is_err(), "unknown match axis must fail deserialization");
         assert!(parsed.unwrap_err().to_string().contains("future_axis"));
@@ -1826,15 +1804,7 @@ mod tests {
 
     #[test]
     fn rule_with_unknown_top_level_field_fails_to_parse() {
-        let raw = r#"{
-            "id": "uuid-1",
-            "schema_version": 1,
-            "created_at": "2026-05-05T00:00:00Z",
-            "match": { "host": ["api.example.com"] },
-            "scope": {},
-            "disposition": "deny",
-            "novel_field": true
-        }"#;
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"] }, "scope": {}, "disposition": "deny", "novel_field": true }"#;
         assert!(serde_json::from_str::<AllowlistRule>(raw).is_err());
     }
 
@@ -1843,16 +1813,7 @@ mod tests {
         // The full TS rule surface is modeled: `derived` and `time_window`
         // parse (time_window is then rejected by the snapshot gate, not the
         // parser).
-        let raw = r#"{
-            "id": "uuid-1",
-            "schema_version": 1,
-            "created_at": "2026-05-05T00:00:00Z",
-            "match": { "host": ["api.example.com"] },
-            "scope": {},
-            "disposition": "allow",
-            "derived": true,
-            "time_window": { "start": "09:00", "end": "17:00" }
-        }"#;
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"] }, "scope": {}, "disposition": "allow", "derived": true, "time_window": { "start": "09:00", "end": "17:00" } }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("modeled fields parse");
         assert_eq!(parsed.derived, Some(true));
         assert!(parsed.time_window.is_some());
