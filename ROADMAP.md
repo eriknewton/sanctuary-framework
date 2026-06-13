@@ -134,6 +134,12 @@ Your agent's working data, query history, document corpus, and intermediate stat
 
 *Status: core shipped (#420, #421, #422, #435, #436, #438, #440, #449): working-state, query-history, and document-corpus stores; enforced cannot-persist-secrets write gate; provenance-derived taint; blind query-history timestamps; approval-bound signed export/import. Remaining: the OSS memory-engine backend adapter (Letta first) and the PAM conformance profile.*
 
+#### Query-layer anonymity Tier 3
+
+Mix-network or zero-knowledge-proof network-layer anonymity on top of the shipped Tier 1 + Tier 2 query-layer privacy. Closes the last sovereignty principle (opacity at the query layer) at full strength: even the network path of an agent's queries stops being a deanonymizing side channel. **Why it matters:** Tiers 1+2 strip identifying headers and blind timestamps, but the network layer can still correlate; Tier 3 closes that. Research-grade, now pulled onto the near-term path (Erik, 2026-06-13).
+
+*Status: forwarded to coming-next 2026-06-13; design pass owed.*
+
 #### Agent-side sovereignty foundations
 
 Operator sovereignty is shipped and proven; agent-side sovereignty is roadmap, built deliberately, and these are its first concrete pieces. They are sequenced behind the security and data-sovereignty surfaces above, never ahead of them.
@@ -151,7 +157,6 @@ Scoped and acknowledged, but without a near-term timeline. Each item ships when 
 
 - **Recognition layer expansions (ERC-8004 + DIF KYA-OS).** Path C `did:web` builds 1-4 shipped; Paths A and B planning. Composable adapter surfaces for on-chain reputation registries and decentralized-identity verifiable credentials.
 - **PWA mobile companion.** Your phone as approval surface, alert surface, emergency brake. Install on home screen; push notifications via Web Push; biometric unlock via WebAuthn / passkeys; QR pairing from the desktop dashboard.
-- **Query-layer anonymity Tier 3.** Mix-network or zero-knowledge-proof network-layer anonymity on top of the existing Tier 1 + Tier 2 query-layer privacy. Closes the last sovereignty principle (opacity at the query layer) at strength. Research-grade.
 - **Post-quantum cryptography migration.** Hybrid Ed25519 + ML-DSA / FIPS 204 signing for the audit chain. Audit entries already embed a scheme identifier so the migration lands without breaking historical receipts.
 - **EU AI Act compliance pack and NIST AI RMF alignment.** Article 50 transparency primitives surfaced to the operator; operator-facing compliance generator; documentation aligning Sanctuary to NIST AI RMF controls. First-mile (signed audit, signed receipts, signed-event envelopes) AND the bundle generator with coverage matrix and CLI are shipped (`server/src/compliance/eu_ai_act/`); the full productized pack and NIST alignment docs ship when regulated-industry pilot demand materializes.
 - **Operator-cloud deployment mode.** Sanctuary running in the operator's own GCP / Azure / AWS account. Same code, same keys, on rented hardware the operator controls. Prosumer / small-business deployment path.
