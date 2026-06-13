@@ -62,7 +62,12 @@ describe("workload-lifecycle vocabulary", () => {
     // Additive (rung b): host attestation joins the lifecycle vocabulary so an
     // auditor folding the ops sees attestation events in the same set.
     expect(WORKLOAD_LIFECYCLE_OPS.HOST_ATTESTED).toBe("workload_host_attestation");
-    expect(WORKLOAD_LIFECYCLE_OP_VALUES.length).toBe(10);
+    // Additive (rung c): undeclared-workload detection joins the vocabulary so an
+    // auditor folding the ops sees detection findings in the same set.
+    expect(WORKLOAD_LIFECYCLE_OPS.UNDECLARED_DETECTED).toBe(
+      "workload_undeclared_detected"
+    );
+    expect(WORKLOAD_LIFECYCLE_OP_VALUES.length).toBe(11);
   });
 
   it("reuses the CANONICAL distress operation — no second distress vocabulary", () => {

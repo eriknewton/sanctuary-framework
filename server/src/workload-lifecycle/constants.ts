@@ -77,6 +77,20 @@ export const WORKLOAD_LIFECYCLE_OPS = {
    * suppresses a lifecycle event.
    */
   HOST_ATTESTED: "workload_host_attestation",
+  /**
+   * Undeclared-workload detection finding emitted (rung c). A signed statement
+   * cross-checking the supervisor's LIVE supervised set against the DECLARED
+   * (audit-chain-recorded) set, flagging live workloads with no matching declared
+   * lifecycle record (matched by `workload_id` OR `instance_id`). Sealed as a
+   * chain-bound critical entry. Like `HOST_ATTESTED` this is a HOST-LEVEL summary
+   * event, NOT a per-workload state transition, so it is excluded from the
+   * registry's per-workload state fold (`OP_TO_STATE`). Scope is bounded to the
+   * supervisor's view and the id-or-instance-id match — it does NOT enumerate all
+   * host processes (that is the separate host-wide enumeration frontier, rung d).
+   * Additive: it records THAT a detection ran; it never gates or suppresses a
+   * lifecycle event.
+   */
+  UNDECLARED_DETECTED: "workload_undeclared_detected",
   /** Distress channel exercised — reuses the canonical distress operation. */
   DISTRESS_SIGNALED: SANCTUARY_DISTRESS_OPERATION,
 } as const;
