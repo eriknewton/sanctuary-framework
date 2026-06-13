@@ -112,6 +112,7 @@ import {
 import {
   observeWitnessEpoch,
   evaluateAndEnforceRollback,
+  evaluateAndEnforceRekorCounterFloor,
 } from "./core/anti-rollback.js";
 import {
   readCustodyEpochCount,
@@ -308,6 +309,53 @@ export async function createSanctuaryServer(options?: {
     // does), so a detector bug cannot become a lockout generator.
     console.error(
       "Sanctuary: anti-rollback boot cross-check could not complete: " +
+        (err instanceof Error ? err.message : String(err))
+    );
+  }
+
+  // 5rb2. Anti-rollback Stage 2 boot cross-check (external Rekor counter-floor).
+  // Only applies when transparency anchoring is ENABLED. Compares the on-disk
+  // transparency counter floor against the highest checkpoint this fortress
+  // externally anchored (resolved OFFLINE from local receipts — no network).
+  // A floor below the highest anchored counter is the full-snapshot-rollback
+  // signature for an anchored fortress; it WARNS LOUD, emits the same P1-shaped
+  // `custody_rollback_suspected` finding, and FREEZES trust-bearing writes via
+  // the SAME marker Stage 1 uses (cleared by `restore-attest`). Boot is NEVER
+  // refused. Composes with the Stage 1 cross-check above; either freeze gates
+  // enforceCustodyFloor.
+  try {
+    const rekorFloor = await evaluateAndEnforceRekorCounterFloor({
+      storage,
+      master: masterKey,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+    });
+    if (rekorFloor.verdict.kind === "rollback-suspected") {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "custody_rollback_suspected",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          stage: 2,
+          witness_source: "external Rekor transparency counter floor",
+          on_disk_transparency_floor: rekorFloor.verdict.onDiskFloor,
+          highest_externally_anchored_counter:
+            rekorFloor.verdict.highestAnchoredCounter,
+          notes: rekorFloor.verdict.notes,
+          trust_bearing_writes_frozen: true,
+          remediation: "sanctuary restore-attest (fortress passphrase required)",
+        },
+      });
+      // SAFETY: stderr is the operator-facing channel for boot diagnostics.
+      if (rekorFloor.banner) console.error(rekorFloor.banner);
+    }
+  } catch (err) {
+    // Same fail-safe as Stage 1: a failure to RUN the Stage 2 cross-check must
+    // never block boot (it does not by itself freeze writes — only a positive
+    // detection does).
+    console.error(
+      "Sanctuary: anti-rollback Stage 2 (Rekor counter-floor) boot cross-check " +
+        "could not complete: " +
         (err instanceof Error ? err.message : String(err))
     );
   }

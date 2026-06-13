@@ -593,6 +593,7 @@ export async function runVerifyTransparencyCommand(
         "--json",
         "--fetch-anchors",
         "--allow-unsafe-rekor-url",
+        "--check-counter-floor",
       ]
     );
     const inputPath = opts.values["--input"];
@@ -770,6 +771,102 @@ export async function runVerifyTransparencyCommand(
       anchorsCoverage = anchorResult.coverage;
     }
 
+    // ---- --check-counter-floor: anti-rollback Stage 2 (host-side) -----------
+    // The external Rekor counter-floor cross-check. Unlike the auditor-side
+    // --check-anchors (which verifies an operator-supplied EXPORT file), this
+    // reads the fortress's OWN local state (the MAC'd transparency counter
+    // floor and the local anchor receipts) and compares the on-disk floor
+    // against the highest externally-anchored counter. It runs on the HOST
+    // (needs the master key) and, on a regression, freezes trust-bearing
+    // writes via the same Stage-1 chokepoint (restore-attest clears it).
+    let counterFloorSummary:
+      | {
+          verdict: "CONSISTENT" | "SUSPECTED-ROLLBACK" | "NOT-APPLICABLE";
+          on_disk_transparency_floor: number | null;
+          highest_externally_anchored_counter: number | null;
+          frozen: boolean;
+        }
+      | null = null;
+    if (opts.flags["--check-counter-floor"]) {
+      const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+      const storage = new FilesystemStorage(join(storagePath, "state"));
+      try {
+        masterKey =
+          masterKey ??
+          (await resolveMasterKey(storage, opts.values["--passphrase"], env));
+      } catch (error) {
+        write(
+          err,
+          `Error: --check-counter-floor runs on the fortress host and needs the master key ` +
+            `(SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY): ` +
+            `${error instanceof Error ? error.message : String(error)}\n`
+        );
+        return 1;
+      }
+      const fortressId = fortressIdFromStoragePath(storagePath);
+      const auditLog = new AuditLog(storage, masterKey);
+      const { evaluateAndEnforceRekorCounterFloor } = await import(
+        "../core/anti-rollback.js"
+      );
+      const floorResult = await evaluateAndEnforceRekorCounterFloor({
+        storage,
+        master: masterKey,
+        fortressId,
+        ...(args.now ? { now: args.now } : {}),
+      });
+      const v = floorResult.verdict;
+      if (v.kind === "not-applicable") {
+        counterFloorSummary = {
+          verdict: "NOT-APPLICABLE",
+          on_disk_transparency_floor: null,
+          highest_externally_anchored_counter: null,
+          frozen: floorResult.frozen,
+        };
+        report.not_checked.push(
+          "anti-rollback Stage 2 (external Rekor counter-floor): transparency anchoring is not enabled on this fortress, so Stage 2 does not apply (a fortress that never opted into anchoring is not externally anchored)"
+        );
+      } else {
+        counterFloorSummary = {
+          verdict:
+            v.kind === "consistent" ? "CONSISTENT" : "SUSPECTED-ROLLBACK",
+          on_disk_transparency_floor: v.onDiskFloor,
+          highest_externally_anchored_counter: v.highestAnchoredCounter,
+          frozen: floorResult.frozen,
+        };
+        if (v.kind === "rollback-suspected") {
+          report.findings.push({
+            kind: "counter_rollback",
+            counter: v.highestAnchoredCounter,
+            expected: `on-disk transparency floor >= ${v.highestAnchoredCounter}`,
+            actual: `on-disk transparency floor ${v.onDiskFloor}`,
+            message:
+              `anti-rollback Stage 2: the on-disk transparency counter floor (${v.onDiskFloor}) is below the ` +
+              `highest checkpoint this fortress externally anchored (${v.highestAnchoredCounter}); ` +
+              "the external Rekor log remembers an anchoring the on-disk checkpoint store no longer reflects " +
+              "(suspected full-snapshot rollback of an anchored fortress). " +
+              (v.notes[0] ?? "") +
+              " Trust-bearing writes are now FROZEN; run `sanctuary restore-attest` to acknowledge and unfreeze.",
+          });
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "custody_rollback_suspected",
+            identity_id: fortressId,
+            result: "failure",
+            details: {
+              stage: 2,
+              witness_source: "external Rekor transparency counter floor",
+              on_disk_transparency_floor: v.onDiskFloor,
+              highest_externally_anchored_counter: v.highestAnchoredCounter,
+              notes: v.notes,
+              trust_bearing_writes_frozen: true,
+              remediation:
+                "sanctuary restore-attest (fortress passphrase required)",
+            },
+          });
+        }
+      }
+    }
+
     // ---- --compare: multi-bundle split-view detection ------------------------
     let compareSummary:
       | (Pick<CompareChainsResult, "relation" | "divergent_counter" | "overlap"> & {
@@ -835,6 +932,7 @@ export async function runVerifyTransparencyCommand(
           }
         : {}),
       ...(anchorsCoverage ? { anchors: anchorsCoverage } : {}),
+      ...(counterFloorSummary ? { counter_floor: counterFloorSummary } : {}),
       ...(compareSummary ? { compare: compareSummary } : {}),
     };
     if (opts.flags["--json"]) {
@@ -962,6 +1060,12 @@ function printHumanReport(
       counters_recomputed: boolean;
     };
     anchors?: AnchorCoverage;
+    counter_floor?: {
+      verdict: "CONSISTENT" | "SUSPECTED-ROLLBACK" | "NOT-APPLICABLE";
+      on_disk_transparency_floor: number | null;
+      highest_externally_anchored_counter: number | null;
+      frozen: boolean;
+    };
     compare?: {
       input: string;
       other_verdict: TransparencyVerifyReport["verdict"];
@@ -1011,6 +1115,25 @@ function printHumanReport(
       write(
         out,
         `  newest log-attested anchor: ${new Date(coverage.newest_verified_integrated_time * 1000).toISOString()}\n`
+      );
+    }
+  }
+  if (report.counter_floor) {
+    const cf = report.counter_floor;
+    if (cf.verdict === "NOT-APPLICABLE") {
+      write(
+        out,
+        `Anti-rollback Stage 2 (external Rekor counter-floor): NOT APPLICABLE (transparency anchoring is not enabled)\n`
+      );
+    } else {
+      write(
+        out,
+        `Anti-rollback Stage 2 (external Rekor counter-floor): ${cf.verdict}\n` +
+          `  on-disk transparency floor: ${cf.on_disk_transparency_floor}\n` +
+          `  highest externally-anchored checkpoint: ${cf.highest_externally_anchored_counter}\n` +
+          (cf.verdict === "SUSPECTED-ROLLBACK"
+            ? `  trust-bearing writes FROZEN; run "sanctuary restore-attest" to acknowledge and unfreeze\n`
+            : "")
       );
     }
   }
@@ -1273,6 +1396,17 @@ Options:
                             trusting receipt-embedded material. The log URL
                             passes the same SSRF guard as anchoring
                             (--allow-unsafe-rekor-url for local/dev logs).
+  --check-counter-floor     Anti-rollback Stage 2 (HOST mode, needs the master
+                            key): compare the on-disk transparency counter
+                            floor against the highest checkpoint this fortress
+                            externally anchored (resolved offline from local
+                            receipts). A floor below that highest anchored
+                            counter is the full-snapshot-rollback signature for
+                            an anchored fortress: it FREEZES trust-bearing
+                            writes (cleared by "sanctuary restore-attest"),
+                            never refuses anything. Reports CONSISTENT /
+                            SUSPECTED-ROLLBACK with both counters. A fortress
+                            without anchoring enabled reports NOT-APPLICABLE.
   --expect-fresh <window>   FAIL unless the newest log-attested anchor is
                             within the window (e.g. 36h, 7d). Requires
                             --check-anchors and a pinned Rekor key.

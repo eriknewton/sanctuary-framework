@@ -80,12 +80,24 @@
  * externally by Stage 2 (transparency floor / Rekor) and eliminated only by
  * Stage 4 hardware.
  *
+ * ── STAGE 2 — REKOR COUNTER-FLOOR (built; the anchored-fortress defense) ────
+ * For a fortress with transparency anchoring ENABLED, the external Rekor log
+ * holds counters outside the attacker's disk. Stage 2 requires the on-disk
+ * transparency counter floor ≥ the highest counter the fortress externally
+ * anchored (resolved offline from the locally-stored, cryptographically
+ * verified anchor receipts — no live network query). A floor BELOW that
+ * highest anchored counter means the checkpoint store was rolled back to
+ * before an anchoring the external log still remembers: same posture as
+ * Stage 1 (warn-loud + the `custody_rollback_suspected` finding + FREEZE via
+ * the SAME marker, never refuse boot, `restore-attest` clears it). Exposed
+ * both at boot (composed with the Stage 1 witness cross-check when
+ * transparency is on) and on demand via `verify-transparency --check-anchors`.
+ * SCOPE, honestly bounded: Stage 2 only protects an ANCHORED fortress. A
+ * fortress that never opted into transparency is a clean PASS — Stage 2 does
+ * not apply, and the full-disk-rollback residual on an unanchored fortress
+ * (above) stays for Stage 4 hardware. See {@link STAGE_2_REKOR_COUNTER_FLOOR}.
+ *
  * ── DEFERRED STAGES (named, not built) ─────────────────────────────────────
- *   Stage 2 — Rekor counter-floor: when transparency anchoring is on, require
- *     the on-disk counter floor ≥ the highest externally-anchored counter, and
- *     wire it into `verify-transparency --check-anchors`. The only defense that
- *     survives a full-snapshot rollback for an anchored fortress. See
- *     {@link STAGE_2_REKOR_COUNTER_FLOOR}.
  *   Stage 3 — OS keychain stamp: an advisory second witness outside the
  *     fortress tree, never boot-blocking. See {@link STAGE_3_KEYCHAIN_STAMP}.
  *   Stage 4 — hardware monotonic counter (SE post-login / TPM): the only thing
@@ -105,9 +117,14 @@ import {
   constantTimeEqual,
 } from "./encoding.js";
 
-// ── Deferred-stage name stubs (Stage 2/3/4 are NOT implemented here) ────────
+// ── Stage identifiers (Stage 2 implemented below; Stage 3/4 deferred) ───────
 
-/** Stage 2: Rekor counter-floor cross-check. NOT in scope for Stage 1. */
+/**
+ * Stage 2: Rekor counter-floor cross-check (implemented below). Used as the
+ * `witness_source` identifier on a Stage-2 freeze and in the operator-facing
+ * verdict. Stage 2 reuses Stage 1's freeze marker + finding chokepoint; it
+ * does NOT introduce a parallel freeze path.
+ */
 export const STAGE_2_REKOR_COUNTER_FLOOR =
   "anti-rollback-stage-2-rekor-counter-floor" as const;
 /** Stage 3: OS keychain advisory stamp. NOT in scope for Stage 1. */
@@ -825,4 +842,324 @@ export async function restoreAttest(args: {
     await clearFreeze(args.storage);
   }
   return { attestedEpoch: args.currentEpoch, unfroze };
+}
+
+// ── Stage 2 — Rekor counter-floor cross-check ───────────────────────────────
+
+/**
+ * The operator-facing source label on a Stage-2 freeze and verdict. It is
+ * distinct from Stage 1's witness sources so the banner and audit finding say
+ * plainly that the EXTERNAL transparency log, not an on-disk witness, exposed
+ * the regression.
+ */
+export const REKOR_COUNTER_FLOOR_WITNESS_SOURCE =
+  "transparency counter floor vs external Rekor anchors (Stage 2)";
+
+export type RekorFloorVerdict =
+  /** Transparency anchoring is not enabled → Stage 2 does not apply. */
+  | { kind: "not-applicable"; reason: string }
+  /** Floor ≥ highest externally-anchored counter (or nothing anchored yet). */
+  | {
+      kind: "consistent";
+      onDiskFloor: number;
+      highestAnchoredCounter: number;
+    }
+  /** Floor < highest anchored counter, or an unverifiable anchor with
+   * transparency on → suspected rollback (FREEZE direction). */
+  | {
+      kind: "rollback-suspected";
+      onDiskFloor: number;
+      highestAnchoredCounter: number;
+      notes: string[];
+    };
+
+/**
+ * Inputs for the Stage-2 verdict, all already read by the caller so this is a
+ * pure, side-effect-free function (mirrors {@link evaluateRollback}).
+ */
+export interface RekorFloorInputs {
+  /** Whether transparency anchoring is enabled for this fortress. When
+   * false, Stage 2 does not apply: a clean not-applicable verdict, never a
+   * freeze — a fortress that never opted in is not anchored. */
+  transparencyEnabled: boolean;
+  /**
+   * The authenticated on-disk transparency counter floor:
+   *  - "valid": a trustworthy on-disk lower bound on emitted checkpoints.
+   *  - "absent": no floor record — no checkpoint emitted yet (floor 0).
+   *  - "invalid": present but tampered/forged → fail toward FREEZE.
+   */
+  onDiskFloor:
+    | { status: "valid"; highest_counter: number }
+    | { status: "absent" }
+    | { status: "invalid" };
+  /** Highest counter cryptographically tied to an external Rekor anchor,
+   * resolved OFFLINE from the local receipts (0 = nothing anchored yet). */
+  highestAnchoredCounter: number;
+  /** True when an anchored receipt was present but failed its offline checks
+   * (tampered receipt, divergent history, anchor-beyond-bundle). */
+  unverifiableAnchorPresent: boolean;
+  /** Carried into the finding/banner. Never key material. */
+  notes: string[];
+}
+
+/**
+ * Pure Stage-2 verdict. Fail DIRECTION matches Stage 1 exactly:
+ *  - anchoring off                         → not-applicable (clean, no freeze)
+ *  - floor invalid (tampered)              → suspected (FREEZE)
+ *  - an anchored receipt is unverifiable   → suspected (FREEZE)
+ *  - floor < highest anchored counter      → suspected (FREEZE)
+ *  - floor absent but something IS anchored→ suspected (floor 0 < anchored)
+ *  - floor ≥ highest anchored counter      → consistent (PASS)
+ *  - nothing anchored yet (highest == 0)   → consistent (PASS; no witness)
+ *
+ * It NEVER returns "refuse boot": the only postures are not-applicable,
+ * consistent, and suspected (which the caller turns into warn + freeze).
+ */
+export function evaluateRekorCounterFloor(
+  input: RekorFloorInputs
+): RekorFloorVerdict {
+  if (!input.transparencyEnabled) {
+    return {
+      kind: "not-applicable",
+      reason:
+        "transparency anchoring is not enabled on this fortress; Stage 2 " +
+        "(external Rekor counter-floor) does not apply",
+    };
+  }
+  const floorValue =
+    input.onDiskFloor.status === "valid" ? input.onDiskFloor.highest_counter : 0;
+  const notes = [...input.notes];
+
+  // A tampered floor cannot be trusted as a number; fail toward freeze.
+  if (input.onDiskFloor.status === "invalid") {
+    notes.unshift(
+      "the on-disk transparency counter floor is present but failed " +
+        "authentication (tampered, forged, or wrong key); treating as a " +
+        "suspected rollback of the checkpoint store"
+    );
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+
+  // An anchored receipt that does not verify offline, with transparency on,
+  // must not silently read as "no external witness".
+  if (input.unverifiableAnchorPresent) {
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+
+  // The core comparison. floorValue is 0 when the floor is absent; if
+  // anything is externally anchored (highest > 0) that is itself a
+  // regression (the floor that anchored it is gone). If nothing is anchored
+  // (highest == 0) this is a clean PASS — no external witness exists yet.
+  if (input.highestAnchoredCounter > floorValue) {
+    notes.unshift(
+      `the on-disk transparency counter floor (${floorValue}) is BELOW the ` +
+        `highest checkpoint this fortress externally anchored ` +
+        `(${input.highestAnchoredCounter}); the external Rekor log remembers ` +
+        "an anchoring that the on-disk checkpoint store no longer reflects — " +
+        "a full-snapshot rollback of an anchored fortress"
+    );
+    return {
+      kind: "rollback-suspected",
+      onDiskFloor: floorValue,
+      highestAnchoredCounter: input.highestAnchoredCounter,
+      notes,
+    };
+  }
+  return {
+    kind: "consistent",
+    onDiskFloor: floorValue,
+    highestAnchoredCounter: input.highestAnchoredCounter,
+  };
+}
+
+export interface RekorFloorCheckResult {
+  verdict: RekorFloorVerdict;
+  /** True when a freeze marker is now in effect (this check or a prior one). */
+  frozen: boolean;
+  /** Operator-facing banner when suspected; undefined otherwise. */
+  banner?: string;
+}
+
+/**
+ * The Stage-2 entry point (boot AND `verify-transparency --check-anchors`).
+ * Reads the anchoring config, the on-disk floor, and the highest externally-
+ * anchored counter (all offline), runs {@link evaluateRekorCounterFloor}, and
+ * on a suspected verdict raises the SAME freeze marker Stage 1 uses
+ * ({@link writeFreeze} → ROLLBACK_FREEZE_META_KEY), so the existing
+ * `enforceCustodyFloor` chokepoint freezes trust-bearing writes and
+ * `restore-attest` clears it — NO new freeze path, NO new finding type.
+ *
+ * BOOT IS NEVER REFUSED. The dependency reads are injected so this stays
+ * testable without a live transparency stack; defaults wire the real
+ * transparency modules via lazy import (avoids a static cycle and keeps the
+ * core module free of a hard transparency dependency).
+ *
+ * HONEST RESIDUAL (do not over-claim): the freeze marker is a CACHE. Stage 1's
+ * marker-absent recompute in `enforceCustodyFloor` re-derives only the Stage-1
+ * epoch verdict, not Stage 2. A Stage-2 freeze whose marker an attacker
+ * deletes is therefore re-established at the next boot or `--check-anchors`
+ * run (the witness is the external log, re-read each time), not inside
+ * `enforceCustodyFloor`. Stage 2 still only protects an ANCHORED fortress; the
+ * unanchored full-disk-rollback residual remains for Stage 4 hardware.
+ */
+export async function evaluateAndEnforceRekorCounterFloor(args: {
+  storage: StorageBackend;
+  master: Uint8Array;
+  fortressId: string;
+  /** Override the dependency reads (tests). Defaults to the real modules. */
+  deps?: {
+    readTransparencyEnabled: () => Promise<boolean>;
+    readOnDiskFloor: () => Promise<RekorFloorInputs["onDiskFloor"]>;
+    readHighestAnchoredCounter: () => Promise<{
+      highestAnchoredCounter: number;
+      unverifiableAnchorPresent: boolean;
+      notes: string[];
+    }>;
+  };
+  now?: () => Date;
+}): Promise<RekorFloorCheckResult> {
+  const now = args.now ?? (() => new Date());
+  const deps = args.deps ?? defaultRekorFloorDeps(args);
+
+  const transparencyEnabled = await deps.readTransparencyEnabled();
+  if (!transparencyEnabled) {
+    // Stage 2 does not apply. Preserve any standing Stage-1 freeze, but never
+    // create one here.
+    const prior = await isRollbackFrozen(args.storage, args.master);
+    return {
+      verdict: {
+        kind: "not-applicable",
+        reason:
+          "transparency anchoring is not enabled; Stage 2 does not apply",
+      },
+      frozen: prior.frozen,
+      ...(prior.frozen
+        ? {
+            banner: prior.data
+              ? staleFreezeBanner(prior.data)
+              : tamperedFreezeBanner(),
+          }
+        : {}),
+    };
+  }
+
+  const onDiskFloor = await deps.readOnDiskFloor();
+  const anchored = await deps.readHighestAnchoredCounter();
+  const verdict = evaluateRekorCounterFloor({
+    transparencyEnabled,
+    onDiskFloor,
+    highestAnchoredCounter: anchored.highestAnchoredCounter,
+    unverifiableAnchorPresent: anchored.unverifiableAnchorPresent,
+    notes: anchored.notes,
+  });
+
+  const priorFreeze = await isRollbackFrozen(args.storage, args.master);
+
+  if (verdict.kind === "rollback-suspected") {
+    // Reuse Stage 1's freeze marker. witnessed_epoch/observed_epoch carry the
+    // two counters so the operator banner + audit finding show them; the
+    // distinct witness_source names the external log as the exposing witness.
+    if (!priorFreeze.frozen || !priorFreeze.data) {
+      const freezeData: FreezeData = {
+        witnessed_epoch: verdict.highestAnchoredCounter,
+        observed_epoch: verdict.onDiskFloor,
+        witness_source: REKOR_COUNTER_FLOOR_WITNESS_SOURCE,
+        frozen_at: now().toISOString(),
+      };
+      await writeFreeze(args.storage, args.master, freezeData);
+    }
+    return {
+      verdict,
+      frozen: true,
+      banner: rekorFloorBanner(verdict),
+    };
+  }
+
+  // Consistent. Like Stage 1's OK path, a clean Stage-2 verdict does NOT
+  // auto-clear a standing freeze — only restore-attest does.
+  if (priorFreeze.frozen) {
+    return {
+      verdict,
+      frozen: true,
+      banner: priorFreeze.data
+        ? staleFreezeBanner(priorFreeze.data)
+        : tamperedFreezeBanner(),
+    };
+  }
+  return { verdict, frozen: false };
+}
+
+/** Default dependency reads: wire the real transparency modules (lazy). */
+function defaultRekorFloorDeps(args: {
+  storage: StorageBackend;
+  master: Uint8Array;
+  fortressId: string;
+}): NonNullable<
+  Parameters<typeof evaluateAndEnforceRekorCounterFloor>[0]["deps"]
+> {
+  return {
+    readTransparencyEnabled: async () => {
+      const { readAnchorConfig } = await import("../transparency/anchoring.js");
+      const state = await readAnchorConfig({
+        storage: args.storage,
+        masterKey: args.master,
+      });
+      return state.status === "enabled";
+    },
+    readOnDiskFloor: async () => {
+      const { readTransparencyCounterFloor } = await import(
+        "../transparency/emitter.js"
+      );
+      return readTransparencyCounterFloor(args.storage, args.master);
+    },
+    readHighestAnchoredCounter: async () => {
+      const { computeHighestVerifiedAnchoredCounter } = await import(
+        "../transparency/anchoring.js"
+      );
+      const result = await computeHighestVerifiedAnchoredCounter({
+        storage: args.storage,
+        masterKey: args.master,
+        fortressId: args.fortressId,
+      });
+      return {
+        highestAnchoredCounter: result.highestAnchoredCounter,
+        unverifiableAnchorPresent: result.unverifiableAnchorPresent,
+        notes: result.notes,
+      };
+    },
+  };
+}
+
+function rekorFloorBanner(
+  verdict: Extract<RekorFloorVerdict, { kind: "rollback-suspected" }>
+): string {
+  return (
+    "\nSanctuary: WARNING — SUSPECTED CUSTODY ROLLBACK (external transparency).\n" +
+    `  on-disk transparency counter floor: ${verdict.onDiskFloor}\n` +
+    `  highest externally-anchored checkpoint: ${verdict.highestAnchoredCounter}\n` +
+    "\n" +
+    "The public transparency log (Rekor) remembers this fortress anchoring a\n" +
+    "checkpoint that the on-disk checkpoint store no longer reflects. That is\n" +
+    "the signature of a full-snapshot rollback of an ANCHORED fortress: the\n" +
+    "external log is outside this machine's disk, so it cannot be rolled back\n" +
+    "with the rest of the snapshot.\n" +
+    "\n" +
+    "Sanctuary is NOT refusing to boot. It HAS frozen trust-bearing writes\n" +
+    "until you acknowledge what happened:\n" +
+    "\n" +
+    "  sanctuary restore-attest   (requires the fortress passphrase)\n" +
+    "\n" +
+    "If you did NOT restore anything, treat this as a possible attack: rotate\n" +
+    "the master before attesting.\n"
+  );
 }
