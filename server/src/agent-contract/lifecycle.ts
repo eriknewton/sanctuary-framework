@@ -18,9 +18,14 @@
  * `revoked` is guardian-initiated (§2.8, Walkthrough Key 13). The caller
  * MUST provide a guardian_quorum; absent quorum is a transition error.
  *
- * The audit-log seal on `retired` is NOT implemented here — it is a
- * downstream consumer concern (the audit log subsystem watches for the
- * event). This module only emits.
+ * The audit-log seal is NOT implemented in this module — it remains a
+ * downstream consumer concern, because this builder runs in contexts with no
+ * `AuditLog` instance. The seal itself now EXISTS:
+ * `workload-lifecycle/seal.ts` (`sealLifecycleEmission`) turns an emitted
+ * lifecycle event + its packed mesh `SignedEvent` into a critical, chain-bound
+ * workload-lifecycle audit entry, and the Tier-B adapter
+ * (`adapters/tier-b-sdk.ts`, the only production caller of this builder) wires
+ * it in via its optional `lifecycle_seal` param. This module still only emits.
  */
 
 import {
