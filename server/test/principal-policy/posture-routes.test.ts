@@ -126,6 +126,39 @@ describe("posture route layer", () => {
     expect(body.origin_machine).toBe(FORTRESS);
   });
 
+  it("serves the feature-health panel and includes it in the home payload", async () => {
+    const log = newLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "success",
+      details: { cw_source: "castle_wall_audit_consumer" },
+      timestamp: new Date(now - 30_000).toISOString(),
+    });
+    const base = await serve(baseDeps(log, []));
+
+    const panelRes = await fetch(`${base}${POSTURE_API_PREFIX}/feature-health`);
+    expect(panelRes.status).toBe(200);
+    const panel = await panelRes.json();
+    const cw = panel.rows.find(
+      (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+    );
+    expect(cw.status).toBe("active");
+    // Event-driven features with no activity are non-green unconfirmed.
+    const broker = panel.rows.find(
+      (r: { feature_id: string }) => r.feature_id === "secret_broker",
+    );
+    expect(broker.status).toBe("unconfirmed");
+    expect(panel.disclosure.broken_zero_undetectable_for_event_driven).toBe(true);
+
+    // The home payload carries the same panel.
+    const homeRes = await fetch(`${base}${POSTURE_API_PREFIX}/home`);
+    const home = await homeRes.json();
+    expect(home.feature_health.rows.length).toBe(panel.rows.length);
+  });
+
   it("serves per-agent reach (G5) and 404s an unknown agent", async () => {
     const base = await serve(baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]));
     const ok = await fetch(`${base}${POSTURE_API_PREFIX}/reach/a1`);
