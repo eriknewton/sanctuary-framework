@@ -56,9 +56,10 @@ export type WorkloadLifecycleState =
   | "deleted";
 
 /** The audit ops that are RUN-STATE transitions the registry folds over. The
- * host-attestation op (`HOST_ATTESTED`) and the distress op are lifecycle-
- * vocabulary members but are NOT per-workload state transitions, so they are
- * deliberately excluded from the state fold below. */
+ * host-attestation op (`HOST_ATTESTED`), the undeclared-detection op
+ * (`UNDECLARED_DETECTED`), and the distress op are lifecycle-vocabulary members
+ * but are NOT per-workload state transitions (they are host-level summary or
+ * signal events), so they are deliberately excluded from the state fold below. */
 const OP_TO_STATE: Readonly<Record<string, WorkloadLifecycleState>> =
   Object.freeze({
     [WORKLOAD_LIFECYCLE_OPS.REGISTERED]: "registered",
