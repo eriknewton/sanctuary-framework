@@ -234,9 +234,18 @@ describe("/v1/agents over HTTP — operator-signed writes with an operator ident
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
-  it("reaches the protect 501 stub for a valid operator signature", async () => {
+  it("a valid signed protect reaches the supervisor path and fails closed 503 when no supervisor is wired (Phase S1; NOT a 501 oracle)", async () => {
     const token = await openSession(rig);
-    const payload = { harness: "claude_code", idempotency_key: "k1" };
+    // Phase S1 protect requires a config_path + agent_id (it launches a
+    // supervised process). This rig binds no supervisor bridge, so a fully
+    // formed, validly-signed protect lands on the fail-closed 503 path —
+    // never a silent success, and never the old 501 not_implemented oracle.
+    const payload = {
+      harness: "claude_code",
+      agent_id: "agent-x",
+      config_path: "/conf/agent-x.json",
+      idempotency_key: "k1",
+    };
     const res = await fetch(`${rig.baseUrl}/v1/agents/protect`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -247,7 +256,23 @@ describe("/v1/agents over HTTP — operator-signed writes with an operator ident
         ),
       }),
     });
-    expect(res.status).toBe(501);
-    expect((await res.json() as { error: string }).error).toBe("not_implemented");
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "unavailable" });
+  });
+
+  it("denies an unsigned protect with 403 (no execution oracle without a signature)", async () => {
+    const token = await openSession(rig);
+    const res = await fetch(`${rig.baseUrl}/v1/agents/protect`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        harness: "claude_code",
+        agent_id: "agent-x",
+        config_path: "/conf/agent-x.json",
+        idempotency_key: "k1",
+      }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
   });
 });

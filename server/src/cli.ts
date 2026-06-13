@@ -17,6 +17,7 @@ import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
+import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
 export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
@@ -85,6 +86,39 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "protect" || args[0] === "wrap") {
+    // Phase S1 supervisor handoff (codex R3-H1): when launched BY the
+    // split-process supervisor, the transient master key arrives on an
+    // inherited one-shot fd (never env/argv). Consume + close it at the
+    // earliest point so it cannot linger for a same-uid `/proc/<pid>/fd` race,
+    // and FAIL CLOSED in supervisor mode — never silently fall through to the
+    // passphrase/keychain path. Threading the raw master into wrap custody
+    // (`establishWrapCustody`) is the drill-gated last mile (S1 acceptance is
+    // Erik-present on the signing host); until that lands, supervisor mode
+    // refuses rather than running an unintended custody path.
+    if (process.env[SUPERVISOR_KEY_FD_ENV] !== undefined) {
+      const { readSupervisorTransientKey } = await import("./supervisor/spawn-launcher.js");
+      let transientKey: Uint8Array | null = null;
+      try {
+        transientKey = readSupervisorTransientKey();
+      } catch (err) {
+        // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+        console.error(`\n  Sanctuary wrap: supervisor key handoff failed`);
+        console.error(`  ${(err as Error).message}\n`);
+        process.exit(2);
+      }
+      // Drain succeeded: zero our copy immediately (the master-unlock wiring is
+      // the drill last mile; we do NOT proceed on a half-wired custody path).
+      if (transientKey) transientKey.fill(0);
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary wrap: supervised launch detected (${SUPERVISOR_KEY_FD_ENV}).` +
+          `\n  Transient-key custody establishment is the Erik-present S1 acceptance` +
+          `\n  drill's last mile and is not yet wired into wrap custody. Refusing to` +
+          `\n  boot on a fallback credential path. (Build: split-process supervisor,` +
+          `\n  socket auth, idempotency, and rotation guards are complete + tested.)\n`,
+      );
+      process.exit(2);
+    }
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
     await runWrap(opts);
