@@ -58,7 +58,9 @@ import {
   V1IdempotencyStore,
   type V1AgentsDeps,
   type UnprotectOutcome,
+  type ProtectLaunchOutcome,
 } from "../v1/agents.js";
+import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
   federationEventHash,
   validateFederationEventHash,
@@ -267,6 +269,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * first result instead of enqueuing a second approval.
    */
   private v1Idempotency = new V1IdempotencyStore();
+
+  /**
+   * Phase S1: split-process supervisor bridge. Set by the standalone process
+   * once the supervisor socket path + per-boot auth secret are known (it owns
+   * the in-memory master for the transient-key handoff). When null, protect
+   * fails closed with 503 `unavailable` — never a silent success, never the
+   * old 501 oracle.
+   */
+  private supervisorBridge: SupervisorBridge | null = null;
 
   /**
    * Federation PR-A3 state. `_federationContext` carries the fortress
@@ -972,8 +983,32 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           return { ok: false, reason: "not_found" };
         }
       },
+      // Phase S1: protect execution routes to the split-process supervisor.
+      // When no bridge is wired, the dep is omitted and protect fails closed
+      // with 503 (the handler's no-supervisor path), never a 501 oracle.
+      ...(this.supervisorBridge
+        ? {
+            launchProtect: (spec: {
+              agentId: string;
+              harness: string;
+              configPath: string;
+            }): Promise<ProtectLaunchOutcome> =>
+              this.supervisorBridge!.launchProtect(spec),
+          }
+        : {}),
       idempotency: this.v1Idempotency,
     };
+  }
+
+  /**
+   * Phase S1: bind (or detach with `null`) the split-process supervisor
+   * bridge. The standalone process calls this once the supervisor socket is up
+   * and the fortress master is resident, so the dashboard can hand the
+   * supervisor a transient key over the authenticated local socket at protect
+   * time. Detaching reverts protect to the fail-closed 503 path.
+   */
+  setSupervisorBridge(bridge: SupervisorBridge | null): void {
+    this.supervisorBridge = bridge;
   }
 
   /**

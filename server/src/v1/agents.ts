@@ -22,14 +22,18 @@
  * - Unprotect routes through the existing HubService Tier 1 approval queue
  *   (`controlAgent(..., "unwrap")`); it enqueues an approval-pending item
  *   and returns its id, it does NOT tear down synchronously.
- * - Protect (wrapping a NOT-yet-running harness) is NOT a HubService Tier 1
- *   control action: `sanctuary wrap` IS the long-running daemon process, so
- *   "protect over an existing daemon's HTTP API" depends on a daemon-
- *   lifecycle / wrap-as-API decision that is out of PR-A2 scope. This module
- *   ships the full auth+signature+validation shell for the endpoint and a
- *   clearly-marked 501 execution stub (see PROTECT-EXEC-TODO below) so the
- *   contract is locked and tested now; execution lands in a follow-on once
- *   the supervised-daemon model is decided.
+ * - Protect (launching a NOT-yet-running harness) is NOT a HubService Tier 1
+ *   control action. Phase S1 (split-process supervised-daemon, Erik-confirmed
+ *   2026-06-13) wires execution through a SEPARATE supervisor process: the
+ *   dashboard hands the supervisor a launch request over an authenticated
+ *   local socket (`deps.launchProtect`); the supervisor owns spawning the
+ *   wrapped agent and holds only a transient key. Protect is idempotent at
+ *   both the request level (replay the 202) and the resource level (an
+ *   already-up agent is a 200 no-op) so a double-click never double-launches.
+ *   When no supervisor is wired, protect fails closed with 503 `unavailable`
+ *   (never a silent success; never an auth oracle once a signature verified).
+ *   Tier A+ (keychain-at-login) and Tier B (headless/unattended) are deferred
+ *   behind their own Erik sign-off.
  *
  * Capability note (catalog Q2, OPEN): the canonical Wave 1 capability
  * vocabulary is unratified. Reads here are gated by the SESSION_TOKEN alone
@@ -79,6 +83,21 @@ export type UnprotectOutcome =
   | { ok: true; result: HubTier1ApprovalEnqueuedResult }
   | { ok: false; reason: "not_found" | "unsupported" | "unavailable" };
 
+/**
+ * Outcome of asking the split-process supervisor to protect (launch +
+ * supervise) an agent. The dashboard adapter (Phase S1) translates the
+ * supervisor's socket response into one of these reasons so this module never
+ * depends on the supervisor protocol types directly. Security-sensitive
+ * reasons collapse into the generic 403 at the HTTP layer (no oracle).
+ */
+export type ProtectLaunchOutcome =
+  | { ok: true; status: "protecting"; agent_id: string; launch_id: string }
+  | { ok: true; status: "protected"; agent_id: string } // already up (no-op)
+  | {
+      ok: false;
+      reason: "rotation_in_progress" | "bad_request" | "unavailable" | "forbidden";
+    };
+
 export interface V1AgentsDeps {
   /** This daemon's node id, echoed into every AgentSummary. */
   nodeId: string;
@@ -98,6 +117,20 @@ export interface V1AgentsDeps {
    * hub errors into {@link UnprotectOutcome} reasons; they never throw.
    */
   enqueueUnprotect(agentId: string): Promise<UnprotectOutcome>;
+  /**
+   * Ask the split-process supervisor (Phase S1) to launch + supervise an
+   * agent. Implementations marshal a `protect` request over the authenticated
+   * local socket and translate the supervisor's response/socket failures into
+   * {@link ProtectLaunchOutcome} reasons; they never throw and never log the
+   * transient key. Optional: when the supervisor subsystem is not wired, omit
+   * this dep and protect fails closed with 503 `unavailable` (never a silent
+   * success, never the old 501 oracle once a signature verified).
+   */
+  launchProtect?(spec: {
+    agentId: string;
+    harness: string;
+    configPath: string;
+  }): Promise<ProtectLaunchOutcome>;
   /** Injectable clock (idempotency expiry); defaults to Date.now. */
   now?: () => number;
   /** Injectable idempotency store; defaults to a fresh bounded LRU. */
@@ -547,7 +580,13 @@ async function handleProtect(
   if (agent_id !== undefined) signedPayload.agent_id = agent_id;
   if (config_path !== undefined) signedPayload.config_path = config_path;
   if (node_id !== undefined) signedPayload.node_id = node_id;
-  if (!resolveAndVerifyOperator(deps, "/v1/agents/protect", signedPayload, operator_signature)) {
+  const operatorPublicKey = resolveAndVerifyOperator(
+    deps,
+    "/v1/agents/protect",
+    signedPayload,
+    operator_signature,
+  );
+  if (!operatorPublicKey) {
     denyForbidden(res);
     return;
   }
@@ -557,16 +596,92 @@ async function handleProtect(
     return;
   }
 
-  // PROTECT-EXEC-TODO (PR-A2): protecting a not-yet-running harness means
-  // launching `sanctuary wrap`, which IS the long-running daemon process —
-  // there is no persistent supervisor daemon to spawn-and-track it over an
-  // HTTP API yet. Wiring real execution here requires the supervised-daemon
-  // / wrap-as-API lifecycle decision (see PR body) and is intentionally NOT
-  // guessed in PR-A2. The endpoint above is fully auth + signature + shape
-  // validated and tested; only execution is deferred. Fail closed: report
-  // not-implemented rather than silently succeeding.
-  writeJson(res, 501, {
-    error: "not_implemented",
-    detail: "agent protect execution is not yet wired; unprotect is available",
-  });
+  // Protect launches a process via the split-process supervisor (Phase S1).
+  // It requires a config_path (the harness config to supervise) and a stable
+  // agent_id to key supervision + idempotency. A request without them is a
+  // shape error, not an auth oracle (the signature already verified).
+  if (typeof config_path !== "string" || config_path.length === 0) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const resolvedAgentId =
+    typeof agent_id === "string" && agent_id.length > 0 ? agent_id : undefined;
+  if (resolvedAgentId === undefined) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+
+  // Supervisor not wired ⇒ fail closed with a retryable 503 (NOT the old 501
+  // oracle, and NOT a silent success). The signature already verified above,
+  // so this is an honest "subsystem unavailable", not an auth signal.
+  if (!deps.launchProtect) {
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+  const launchProtect = deps.launchProtect;
+
+  // Idempotency (review M2): protect is the path that LAUNCHES a process, so a
+  // retried/raced double-click must launch exactly once. Key on the stable
+  // operator identity + action + client idempotency key + payload hash — the
+  // same session-independent composite the unprotect path uses — so a retry
+  // that opens a fresh /v1 session still replays instead of double-launching.
+  // The store also coalesces CONCURRENT duplicates onto one launch.
+  const nowMs = (deps.now ?? Date.now)();
+  const store = deps.idempotency;
+  const cacheKey = idempotencyKeyFor(
+    operatorPublicKey,
+    "/v1/agents/protect",
+    idempotency_key,
+    signedPayload,
+  );
+
+  // Launch is asynchronous (Argon2id unlock, daemon arm, harness boot can take
+  // seconds): success returns 202 Accepted with a distinct `launch_id` (L1:
+  // protect's id is a launch handle, NOT an approval-queue inbox id like
+  // unprotect's). "Already healthy" is a resource-level idempotent 200 no-op.
+  // Security-sensitive denials (rotation/forbidden) collapse into the generic
+  // 403 — no oracle, same fail-closed posture as the signature check. A
+  // transient `unavailable` is a retryable 503 and is NOT cached.
+  const produce = async (): Promise<IdempotentResult> => {
+    const outcome = await launchProtect({
+      agentId: resolvedAgentId,
+      harness,
+      configPath: config_path,
+    });
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case "rotation_in_progress":
+        case "forbidden":
+          // Collapse into the generic 403 (no oracle for WHY it was denied;
+          // the operator learns the reason from the audit log / dashboard).
+          return { status: 403, body: { error: "forbidden" }, cache: false };
+        case "bad_request":
+          return { status: 400, body: { error: "bad request" }, cache: false };
+        case "unavailable":
+          return { status: 503, body: { error: "unavailable" }, cache: false };
+      }
+    }
+    if (outcome.status === "protected") {
+      // Resource-level idempotent no-op: the agent is already up (M2/L?).
+      return {
+        status: 200,
+        body: { status: "protected", agent_id: outcome.agent_id },
+        cache: true,
+      };
+    }
+    return {
+      status: 202,
+      body: {
+        status: "protecting",
+        agent_id: outcome.agent_id,
+        launch_id: outcome.launch_id,
+      },
+      cache: true,
+    };
+  };
+
+  const result = store
+    ? await store.resolve(cacheKey, nowMs, produce)
+    : await produce();
+  writeJson(res, result.status, result.body);
 }

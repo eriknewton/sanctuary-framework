@@ -517,36 +517,79 @@ describe("POST /v1/agents/unprotect", () => {
   });
 });
 
-// ── POST /v1/agents/protect (auth-locked execution stub) ────────────────────
+// ── POST /v1/agents/protect (Phase S1: split-process supervised launch) ─────
 
 describe("POST /v1/agents/protect", () => {
-  it("reaches the 501 stub only for a validly-signed request", async () => {
+  function protectPayload(over?: Record<string, unknown>) {
+    return {
+      harness: "claude_code",
+      agent_id: "agent-1",
+      config_path: "/conf/a.json",
+      idempotency_key: "k1",
+      ...over,
+    };
+  }
+  function signProtect(privateKey: Uint8Array, payload: Record<string, unknown>): string {
+    return toBase64url(signOperatorPayload("/v1/agents/protect", payload, privateKey));
+  }
+
+  it("launches via the supervisor and returns 202 protecting for a signed request", async () => {
     const op = makeOperator();
-    const deps = baseDeps({ resolveOperatorPublicKey: () => op.publicKey });
-    const payload = { harness: "claude_code", idempotency_key: "k1" };
-    const sig = toBase64url(
-      signOperatorPayload("/v1/agents/protect", payload, op.privateKey),
-    );
+    const calls: Array<{ agentId: string; harness: string; configPath: string }> = [];
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async (spec) => {
+        calls.push(spec);
+        return { ok: true, status: "protecting", agent_id: spec.agentId, launch_id: "L1" };
+      },
+    });
+    const payload = protectPayload();
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ ...payload, operator_signature: sig }),
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
       CLAIMS,
     );
-    expect(captured.status).toBe(501);
-    expect((captured.body as { error: string }).error).toBe("not_implemented");
+    expect(captured.status).toBe(202);
+    expect(captured.body).toEqual({ status: "protecting", agent_id: "agent-1", launch_id: "L1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({ agentId: "agent-1", harness: "claude_code", configPath: "/conf/a.json" });
   });
 
-  it("denies an unsigned protect with 403 (no 501 oracle without a signature)", async () => {
+  it("returns 200 no-op when the agent is already protected (resource-level idempotent)", async () => {
     const op = makeOperator();
-    const deps = baseDeps({ resolveOperatorPublicKey: () => op.publicKey });
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async (spec) => ({ ok: true, status: "protected", agent_id: spec.agentId }),
+    });
+    const payload = protectPayload();
     const { res, captured } = mockRes();
     await handleAgentsRequest(
       deps,
-      mockReq({ harness: "claude_code", idempotency_key: "k1" }),
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(200);
+    expect(captured.body).toEqual({ status: "protected", agent_id: "agent-1" });
+  });
+
+  it("collapses a rotation-in-progress refusal into the generic 403 (no oracle)", async () => {
+    const op = makeOperator();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async () => ({ ok: false, reason: "rotation_in_progress" }),
+    });
+    const payload = protectPayload();
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
       res,
       new URL("http://x/v1/agents/protect"),
       "POST",
@@ -554,6 +597,68 @@ describe("POST /v1/agents/protect", () => {
     );
     expect(captured.status).toBe(403);
     expect(captured.body).toEqual({ error: "forbidden" });
+  });
+
+  it("collapses a locked-fortress (forbidden) refusal into the generic 403", async () => {
+    const op = makeOperator();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async () => ({ ok: false, reason: "forbidden" }),
+    });
+    const payload = protectPayload();
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(403);
+    expect(captured.body).toEqual({ error: "forbidden" });
+  });
+
+  it("returns a retryable 503 when no supervisor is wired (fail-closed, NOT a 501 oracle)", async () => {
+    const op = makeOperator();
+    // No launchProtect dep ⇒ supervisor subsystem absent.
+    const deps = baseDeps({ resolveOperatorPublicKey: () => op.publicKey });
+    const payload = protectPayload();
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(503);
+    expect(captured.body).toEqual({ error: "unavailable" });
+  });
+
+  it("denies an unsigned protect with 403 (no execution oracle without a signature)", async () => {
+    const op = makeOperator();
+    let launched = false;
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async () => {
+        launched = true;
+        return { ok: true, status: "protecting", agent_id: "a", launch_id: "L" };
+      },
+    });
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq(protectPayload()),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(403);
+    expect(captured.body).toEqual({ error: "forbidden" });
+    expect(launched).toBe(false); // never reaches execution
   });
 
   it("rejects a missing harness with 400", async () => {
@@ -568,6 +673,133 @@ describe("POST /v1/agents/protect", () => {
       CLAIMS,
     );
     expect(captured.status).toBe(400);
+  });
+
+  it("rejects a missing config_path with 400 (after the signature verifies)", async () => {
+    const op = makeOperator();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      launchProtect: async () => ({ ok: true, status: "protecting", agent_id: "a", launch_id: "L" }),
+    });
+    const payload = { harness: "claude_code", agent_id: "agent-1", idempotency_key: "k1" };
+    const { res, captured } = mockRes();
+    await handleAgentsRequest(
+      deps,
+      mockReq({ ...payload, operator_signature: signProtect(op.privateKey, payload) }),
+      res,
+      new URL("http://x/v1/agents/protect"),
+      "POST",
+      CLAIMS,
+    );
+    expect(captured.status).toBe(400);
+  });
+
+  it("replays a retried protect from the idempotency cache — launches EXACTLY once (M2)", async () => {
+    const op = makeOperator();
+    let launchCount = 0;
+    const store = new V1IdempotencyStore();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      idempotency: store,
+      launchProtect: async (spec) => {
+        launchCount++;
+        return { ok: true, status: "protecting", agent_id: spec.agentId, launch_id: `L${launchCount}` };
+      },
+    });
+    const payload = protectPayload();
+    const sig = signProtect(op.privateKey, payload);
+    const run = async () => {
+      const { res, captured } = mockRes();
+      await handleAgentsRequest(
+        deps,
+        mockReq({ ...payload, operator_signature: sig }),
+        res,
+        new URL("http://x/v1/agents/protect"),
+        "POST",
+        CLAIMS,
+      );
+      return captured;
+    };
+    const first = await run();
+    const second = await run();
+    expect(launchCount).toBe(1); // double-click does NOT double-launch
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(second.body).toEqual(first.body); // same launch_id replayed
+  });
+
+  it("coalesces CONCURRENT duplicate protects onto one launch (M2 race)", async () => {
+    const op = makeOperator();
+    let launchCount = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const store = new V1IdempotencyStore();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      idempotency: store,
+      launchProtect: async (spec) => {
+        launchCount++;
+        await gate; // hold the first launch in-flight
+        return { ok: true, status: "protecting", agent_id: spec.agentId, launch_id: "L1" };
+      },
+    });
+    const payload = protectPayload();
+    const sig = signProtect(op.privateKey, payload);
+    const fire = () => {
+      const { res, captured } = mockRes();
+      return handleAgentsRequest(
+        deps,
+        mockReq({ ...payload, operator_signature: sig }),
+        res,
+        new URL("http://x/v1/agents/protect"),
+        "POST",
+        CLAIMS,
+      ).then(() => captured);
+    };
+    const p1 = fire();
+    const p2 = fire();
+    await Promise.resolve();
+    release();
+    const [c1, c2] = await Promise.all([p1, p2]);
+    expect(launchCount).toBe(1); // concurrent duplicates coalesce
+    expect(c1.status).toBe(202);
+    expect(c2.status).toBe(202);
+  });
+
+  it("does NOT cache a transient unavailable launch failure (retryable)", async () => {
+    const op = makeOperator();
+    let attempts = 0;
+    const store = new V1IdempotencyStore();
+    const deps = baseDeps({
+      resolveOperatorPublicKey: () => op.publicKey,
+      idempotency: store,
+      launchProtect: async (spec) => {
+        attempts++;
+        if (attempts === 1) return { ok: false, reason: "unavailable" };
+        return { ok: true, status: "protecting", agent_id: spec.agentId, launch_id: "L2" };
+      },
+    });
+    const payload = protectPayload();
+    const sig = signProtect(op.privateKey, payload);
+    const run = async () => {
+      const { res, captured } = mockRes();
+      await handleAgentsRequest(
+        deps,
+        mockReq({ ...payload, operator_signature: sig }),
+        res,
+        new URL("http://x/v1/agents/protect"),
+        "POST",
+        CLAIMS,
+      );
+      return captured;
+    };
+    const first = await run();
+    const second = await run();
+    expect(first.status).toBe(503); // transient failure
+    expect(second.status).toBe(202); // retry is not blocked by a cached failure
+    expect(attempts).toBe(2);
   });
 });
 
