@@ -67,6 +67,16 @@ export const WORKLOAD_LIFECYCLE_OPS = {
   DELETED: "workload_deleted",
   /** Registry entry created/updated without a run-state change. */
   REGISTERED: "workload_registered",
+  /**
+   * Host-level workload attestation emitted (rung b). A signed statement over
+   * the DECLARED/recorded workload set and its consent disposition, sealed as a
+   * chain-bound critical entry. Scope is declared-workloads-only — it does NOT
+   * assert host-wide process completeness (that is the separate registry-
+   * attestation / undeclared-workload frontier, a later item). Additive: the
+   * attestation event records THAT an attestation was made; it never gates or
+   * suppresses a lifecycle event.
+   */
+  HOST_ATTESTED: "workload_host_attestation",
   /** Distress channel exercised — reuses the canonical distress operation. */
   DISTRESS_SIGNALED: SANCTUARY_DISTRESS_OPERATION,
 } as const;

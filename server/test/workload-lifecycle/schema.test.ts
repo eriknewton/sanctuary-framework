@@ -55,11 +55,14 @@ async function newAuditLog(): Promise<AuditLog> {
 }
 
 describe("workload-lifecycle vocabulary", () => {
-  it("exposes the nine lifecycle operation strings", () => {
+  it("exposes the lifecycle operation strings", () => {
     expect(WORKLOAD_LIFECYCLE_OPS.INSTANTIATED).toBe("workload_instantiated");
     expect(WORKLOAD_LIFECYCLE_OPS.SLEPT).toBe("workload_slept");
     expect(WORKLOAD_LIFECYCLE_OPS.DELETED).toBe("workload_deleted");
-    expect(WORKLOAD_LIFECYCLE_OP_VALUES.length).toBe(9);
+    // Additive (rung b): host attestation joins the lifecycle vocabulary so an
+    // auditor folding the ops sees attestation events in the same set.
+    expect(WORKLOAD_LIFECYCLE_OPS.HOST_ATTESTED).toBe("workload_host_attestation");
+    expect(WORKLOAD_LIFECYCLE_OP_VALUES.length).toBe(10);
   });
 
   it("reuses the CANONICAL distress operation — no second distress vocabulary", () => {
