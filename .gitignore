@@ -58,3 +58,7 @@ castle-wall-vmm/Package.resolved
 
 # Per-machine Claude Code permissions; never commit
 .claude/settings.local.json
+
+# dev-scratch PR-prep notes do not belong in the repo root (professionalization 2026-06-14)
+/*_HANDOFF.md
+/*_PR_BODY.md
