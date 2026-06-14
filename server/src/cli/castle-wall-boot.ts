@@ -63,7 +63,7 @@
 
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile, rename, rm, stat, writeFile, chmod } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execPath } from "node:process";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -112,6 +112,11 @@ export interface CastleWallBootContext {
   globalPinPath?: string;
   /** Override the boot-token custody path (tests). */
   bootTokenPath?: string;
+  /**
+   * Sleep used by the post-bootstrap stability check (tests inject a no-op so
+   * they don't actually wait). Defaults to a real timer.
+   */
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 function write(stream: Writable, text: string): void {
@@ -156,6 +161,17 @@ export interface BootPlistOptions {
   signerClientPath: string;
   /** Log directory; defaults to <fortressPath>/logs. */
   logDir?: string;
+  /**
+   * Absolute directory of the Node interpreter that will run the daemon
+   * (typically `dirname(process.execPath)`). Prepended to the daemon's PATH so a
+   * `#!/usr/bin/env node` CLI shim can resolve `node` under launchd's minimal
+   * PATH. Without this, a Homebrew-installed node (`/opt/homebrew/bin/node`) is
+   * not on launchd's `/usr/bin:/bin:/usr/sbin:/sbin` default and the daemon
+   * crash-loops with `env: node: No such file or directory` — it never starts,
+   * so the box stays bricked at boot (the exact F1 failure). Omitted only in
+   * dev/test where the program path is already an absolute interpreter.
+   */
+  nodeBinDir?: string;
 }
 
 /**
@@ -209,8 +225,25 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   }
   assertNoControlChars(logDir, "log dir");
 
+  // launchd hands a minimal PATH to LaunchDaemons. If the daemon program is a
+  // `#!/usr/bin/env node` CLI shim and node lives outside the standard dirs
+  // (e.g. Homebrew's /opt/homebrew/bin), `env` cannot find it and the daemon
+  // crash-loops, never starting — the box stays bricked at boot. Prepend the
+  // interpreter's directory so the shim resolves its node. Fail-closed at render
+  // time if a bad value is passed.
+  const basePathDirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  let pathDirs = basePathDirs;
+  if (opts.nodeBinDir !== undefined) {
+    if (!isAbsolute(opts.nodeBinDir)) {
+      throw new Error(`Node interpreter dir must be absolute (got: ${opts.nodeBinDir}).`);
+    }
+    assertNoControlChars(opts.nodeBinDir, "node interpreter dir");
+    if (!basePathDirs.includes(opts.nodeBinDir)) {
+      pathDirs = [opts.nodeBinDir, ...basePathDirs];
+    }
+  }
   const envEntries: Array<[string, string]> = [
-    ["PATH", "/usr/bin:/bin:/usr/sbin:/sbin"],
+    ["PATH", pathDirs.join(":")],
     ["SANCTUARY_STORAGE_PATH", opts.fortressPath],
     ["SANCTUARY_CASTLE_SIGNER_CLIENT", opts.signerClientPath],
   ];
@@ -468,6 +501,37 @@ function serviceRunningPid(
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+/**
+ * Confirm the boot service is STABLY running, not transiently alive. A single
+ * `launchctl print` read after bootstrap can catch a doomed process in the
+ * milliseconds before it exits non-zero (e.g. `env: node: No such file or
+ * directory` exiting 127), then launchd throttle-restarts it on a new pid — a
+ * crash loop that a one-shot check would certify as "running" (the codex-(a)
+ * false-PASS observed on the 2026-06-14 drill).
+ *
+ * Sample the pid across a window longer than the plist's ThrottleInterval (5s):
+ * tolerate a slow start (initial nulls), then require the SAME positive pid to
+ * persist to the end with no restart (a restart shows a different pid or a null
+ * gap). Returns the stable pid, or null if the service never stabilizes.
+ */
+async function awaitStableServicePid(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult,
+  sleepFn: (ms: number) => Promise<void>,
+): Promise<number | null> {
+  const SAMPLES = 6;
+  const INTERVAL_MS = 1500; // 6 samples * 1.5s = ~7.5s > ThrottleInterval (5s)
+  const seen: Array<number | null> = [];
+  for (let i = 0; i < SAMPLES; i++) {
+    if (i > 0) await sleepFn(INTERVAL_MS);
+    seen.push(serviceRunningPid(execFileFn));
+  }
+  const last = seen[seen.length - 1];
+  if (last === null) return null; // not running at the end of the window
+  const distinctLivePids = new Set(seen.filter((p): p is number => p !== null));
+  // Exactly one live pid across the whole window == no crash-restart happened.
+  return distinctLivePids.size === 1 ? last : null;
+}
+
 export async function runInstallBoot(
   argv: string[] = [],
   ctx: CastleWallBootContext = {},
@@ -481,6 +545,8 @@ export async function runInstallBoot(
   const plistPath = ctx.plistPath ?? CASTLE_WALL_BOOT_PLIST_PATH;
   const globalPinPath = ctx.globalPinPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
   const bootTokenPath = ctx.bootTokenPath ?? CASTLE_BOOT_TOKEN_PATH;
+  const sleepFn =
+    ctx.sleepFn ?? ((ms: number) => new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms)));
   const parsed = parseBootArgs(argv);
 
   if (platform !== "darwin") {
@@ -577,6 +643,9 @@ export async function runInstallBoot(
       programArguments,
       fortressPath,
       signerClientPath: signerClient,
+      // Put the running interpreter's dir on the daemon PATH so a
+      // `#!/usr/bin/env node` shim resolves node under launchd's minimal PATH.
+      nodeBinDir: dirname(execPath),
     });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -598,7 +667,12 @@ export async function runInstallBoot(
   }
 
   const existing = await readFile(plistPath, "utf8").catch(() => null);
-  if (existing === plist && serviceRunningPid(execFileFn) !== null) {
+  // Idempotent shortcut: only when the plist already matches AND the service is
+  // STABLY running. Use the same stability check as the install path — a
+  // one-shot read here would re-introduce the false-PASS on a preexisting
+  // crash-looping unit whose plist happens to match. If it is not stable, fall
+  // through to re-bootstrap + re-verify rather than certify the brick.
+  if (existing === plist && (await awaitStableServicePid(execFileFn, sleepFn)) !== null) {
     write(out, `Castle Wall boot service already installed and running (${plistPath}).\n`);
     return 0;
   }
@@ -628,17 +702,22 @@ export async function runInstallBoot(
   execFileFn("launchctl", ["enable", `system/${CASTLE_WALL_BOOT_LABEL}`]);
 
   // Codex (a): bootstrap success only means "accepted." Certify nothing until
-  // we observe a live PID — otherwise install-boot reports F1 closed while a
-  // crash-looping or never-starting daemon leaves the brick alive.
-  const pid = serviceRunningPid(execFileFn);
+  // we observe a STABLY live PID — a single read can catch a doomed process in
+  // the moment before it exits (e.g. `env: node: not found` → 127) while launchd
+  // throttle-restarts it on a new pid. A one-shot check certifies that crash
+  // loop as "running" and leaves the brick alive (the 2026-06-14 drill false-PASS).
+  const pid = await awaitStableServicePid(execFileFn, sleepFn);
   if (pid === null) {
+    // Stop the throttled crash loop we just bootstrapped so it does not churn
+    // forever; the plist stays on disk for inspection and re-run.
+    execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
     write(
       err,
-      `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} has no running process.\n` +
-        `The daemon failed to start (likely the signer helper is unreachable, or the boot token is unreadable). Inspect:\n` +
+      `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} did not stay running.\n` +
+        `The daemon failed to start or is crash-looping (likely node is not resolvable on the daemon PATH, the signer helper is unreachable, or the boot token is unreadable). Inspect:\n` +
         `  sudo launchctl print system/${CASTLE_WALL_BOOT_LABEL}\n` +
         `  tail -n 50 ${join(logDir, "castle-wall-daemon.err.log")}\n` +
-        `Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+        `Booted the failed unit out. Not certifying the boot service; the brick condition is NOT yet closed.\n`,
     );
     return 1;
   }

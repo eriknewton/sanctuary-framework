@@ -147,6 +147,25 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(plist).not.toContain("SANCTUARY_CASTLE_LOCAL_SIGN");
     });
 
+    it("prepends the node interpreter dir to the daemon PATH (env-shebang shim resolves node)", () => {
+      // The 2026-06-14 drill brick: launchd's minimal PATH excludes Homebrew's
+      // /opt/homebrew/bin, so a `#!/usr/bin/env node` shim crash-loops with
+      // `env: node: No such file or directory`. The fix puts node's dir on PATH.
+      const plist = renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "/opt/homebrew/bin" });
+      expect(plist).toContain("<key>PATH</key>");
+      expect(plist).toContain(
+        "<string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+      );
+    });
+
+    it("does not duplicate a standard dir already on PATH, and rejects a relative node dir", () => {
+      const plist = renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "/usr/bin" });
+      expect(plist).toContain("<string>/usr/bin:/bin:/usr/sbin:/sbin</string>");
+      expect(() =>
+        renderBootLaunchDaemonPlist({ ...base, nodeBinDir: "opt/homebrew/bin" }),
+      ).toThrow(/absolute/);
+    });
+
     it("XML-escapes paths with special characters", () => {
       const plist = renderBootLaunchDaemonPlist({
         ...base,
@@ -346,6 +365,9 @@ describe("castle-wall boot service (F1 Option C)", () => {
         plistPath,
         globalPinPath: globalPin,
         bootTokenPath,
+        // No-op sleep: the post-bootstrap stability check samples the pid over a
+        // multi-second window in production; tests must not actually wait.
+        sleepFn: async () => {},
       };
       const argv = ["--fortress", fortress, "--binary", binary, "--signer-client", signerClient];
       return { fortress, plistPath, binary, signerClient, globalPin, bootTokenPath, fake, out, err, ctx, argv };
@@ -442,8 +464,31 @@ describe("castle-wall boot service (F1 Option C)", () => {
       };
       const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: noPidExec });
       expect(code).toBe(1);
-      expect(f.err.text()).toContain("no running process");
+      expect(f.err.text()).toContain("did not stay running");
       expect(f.err.text()).toContain("NOT yet closed");
+    });
+
+    it("does NOT certify a crash-looping service that flaps between pids (2026-06-14 false-PASS)", async () => {
+      const f = await makeInstallFixture();
+      // Bootstrap accepted; `print` returns a DIFFERENT pid each read, modelling a
+      // daemon that exits non-zero and is throttle-restarted on a new pid. A
+      // one-shot check would certify the first transient pid as "running".
+      let n = 0;
+      const flappingExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "print") {
+          return { code: 0, stdout: `\tstate = running\n\tpid = ${5000 + n++}\n`, stderr: "" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: flappingExec });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("did not stay running");
+      // The failed (churning) unit is booted out so it does not throttle forever
+      // (one pre-bootstrap bootout + one on the stability failure).
+      const bootouts = f.fake.calls.filter(
+        (c) => c.cmd === "launchctl" && c.args[0] === "bootout",
+      );
+      expect(bootouts.length).toBeGreaterThanOrEqual(2);
     });
 
     it("is idempotent: a second run with an identical plist and live job does not re-bootstrap", async () => {
