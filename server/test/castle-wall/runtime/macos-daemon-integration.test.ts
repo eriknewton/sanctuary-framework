@@ -28,10 +28,29 @@ const silent = new Writable({
 describe("Castle Wall macOS daemon integration", () => {
   const tempDirs: string[] = [];
   const liveSockets: Socket[] = [];
+  const liveServers: ReturnType<typeof createServer>[] = [];
+
+  // Stand up a REAL listener on `socketPath` so the daemon's liveness probe
+  // (socketHasLiveListener) sees a genuine live peer — used to exercise the
+  // collision guards (a stale config with NO live listener must NOT collide).
+  async function startLiveListener(socketPath: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const s = createServer();
+      s.once("error", reject);
+      // port-discipline: ignore - Unix domain socket path, not a TCP port.
+      s.listen(socketPath, () => {
+        liveServers.push(s);
+        resolve();
+      });
+    });
+  }
 
   afterEach(async () => {
     for (const socket of liveSockets.splice(0)) {
       socket.destroy();
+    }
+    for (const server of liveServers.splice(0)) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
     for (const dir of tempDirs.splice(0)) {
       await rm(dir, { recursive: true, force: true });
@@ -63,11 +82,29 @@ describe("Castle Wall macOS daemon integration", () => {
   }
 
   function fakeListenerFactory(options: MacOSCastleWallListenerOptions) {
+    // A REAL minimal listener: the daemon's collision guards decide liveness by
+    // CONNECTING to the socket (socketHasLiveListener), not by file-existence, so a
+    // started fake daemon must own a genuinely connectable socket (a plain file is
+    // treated as a dead/stale socket and would no longer register as "live").
+    let server: ReturnType<typeof createServer> | null = null;
     return {
       async start() {
-        await writeFile(options.socketPath, "");
+        await new Promise<void>((resolve, reject) => {
+          const s = createServer();
+          s.once("error", reject);
+          // port-discipline: ignore - Unix domain socket path, not a TCP port.
+          s.listen(options.socketPath, () => {
+            server = s;
+            resolve();
+          });
+        });
       },
       async stop() {
+        if (server) {
+          const s = server;
+          server = null;
+          await new Promise<void>((resolve) => s.close(() => resolve()));
+        }
         await unlink(options.socketPath).catch(() => {});
       },
       async broadcastManifestUpdate() {
@@ -299,11 +336,15 @@ describe("Castle Wall macOS daemon integration", () => {
   it("a full daemon colliding with a live SAFE-MODE boot daemon gets handoff guidance, not the Phase 3 message (#450 item 4)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     const configPath = activeConfigPath(fortressPath);
-    // Simulate a live root safe-mode boot daemon holding this fortress.
+    const sockPath = join(fortressPath, "castle.sock");
+    // Simulate a GENUINELY live root safe-mode boot daemon: a real listener on the
+    // recorded socket + an alive pid. (A stale config with no live listener must
+    // NOT collide — covered by the regression test below.)
+    await startLiveListener(sockPath);
     await writeFile(
       configPath,
       JSON.stringify({
-        socket_path: join(fortressPath, "castle.sock"),
+        socket_path: sockPath,
         fortress_id: "fortress-test",
         pid: process.pid,
         started_at: new Date().toISOString(),
@@ -334,13 +375,15 @@ describe("Castle Wall macOS daemon integration", () => {
     expect(caught!.message).not.toContain("Phase 3");
   });
 
-  it("rejects startup when active discovery config points at a live PID", async () => {
+  it("rejects startup when an active-config pid is alive AND its socket has a live listener", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     const configPath = activeConfigPath(fortressPath);
+    const otherSock = join(fortressPath, "other.sock");
+    await startLiveListener(otherSock); // a genuine live peer
     await writeFile(
       configPath,
       JSON.stringify({
-        socket_path: "/tmp/other.sock",
+        socket_path: otherSock,
         fortress_id: "other-fortress",
         pid: process.pid,
         started_at: new Date().toISOString(),
@@ -359,6 +402,39 @@ describe("Castle Wall macOS daemon integration", () => {
         listenerFactory: fakeListenerFactory,
       }),
     ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+  });
+
+  it("IGNORES a stale active-config whose recorded socket has NO live listener — reboot pid-reuse safe (#450 A1 rep-2 fix)", async () => {
+    // The 2026-06-14 A1 rep-2 bug: after a reboot the recorded pid (e.g. 541) is
+    // REUSED by an unrelated process, so isPidAlive() is true, but no daemon is
+    // actually listening. A pid-only check falsely collided and refused the new
+    // safe-mode daemon. With the liveness fix, no live listener => stale => start.
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const configPath = activeConfigPath(fortressPath);
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        socket_path: join(fortressPath, "castle.sock"), // no listener bound here
+        fortress_id: "fortress-test",
+        pid: process.pid, // ALIVE (stands in for a reused pid)
+        started_at: "2020-01-01T00:00:00.000Z",
+        mode: "safe",
+      }),
+    );
+
+    // Must START (not throw) — the stale config is ignored.
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: configPath,
+      listenerFactory: fakeListenerFactory,
+    });
+    expect(handle.socketPath).toBe(join(fortressPath, "castle.sock"));
+    await handle.stop();
   });
 
   it("unlinks a stale socket left by a crash/reboot and starts (Finding A)", async () => {

@@ -838,7 +838,19 @@ async function assertActiveConfigNotOwnedByLiveProcess(
 ): Promise<void> {
   const config = await readActiveConfig(configPath, legacyConfigPath);
   if (!config) return;
-  if (isPidAlive(config.pid)) {
+  // Liveness must be AUTHORITATIVE, not pid-only. A bare pid is unreliable across
+  // a reboot: low pids are frequently REUSED by unrelated processes early in boot,
+  // so `isPidAlive` alone yields a FALSE collision that refuses the freshly-booted
+  // daemon (2026-06-14 A1 rep-2: the recorded pid 541 was reassigned to a
+  // DriverKit dext while NO daemon was actually running, so the safe-mode daemon
+  // refused to start). Require BOTH the pid alive AND a live listener answering the
+  // recorded socket — the same authoritative liveness signal
+  // `assertSocketNotOwnedByLiveProcess` uses. With no live listener the config is
+  // stale: ignore it and let this daemon take over (the socket guard below then
+  // unlinks the stale socket). This also stops the item-4 handoff message from
+  // firing on a stale-config false positive — it now fires only on a genuinely
+  // live peer.
+  if (isPidAlive(config.pid) && (await socketHasLiveListener(config.socket_path))) {
     // #450 item 4: distinguish "a root safe-mode boot daemon is holding this
     // fortress" (the login-handoff case) from a generic full-vs-full collision,
     // so the operator gets actionable stand-down guidance instead of the
