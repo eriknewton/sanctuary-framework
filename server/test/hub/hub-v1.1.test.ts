@@ -581,6 +581,74 @@ describe("Hub inbox approve / deny (Test 2)", () => {
   });
 });
 
+// SECURITY (loopback-no-autoauth-for-approvals): even with loopback
+// auto-auth ON, the hub inbox approve/deny DECISION must require the
+// operator token, because the co-resident agent shares loopback. Inbox
+// dismiss (housekeeping) and read-only routes keep the auto-auth
+// convenience.
+describe("Hub inbox: loopback auto-auth does not gate approve/deny", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig({
+      authConfig: { loopbackAutoAuth: true, authToken: "operator-token" },
+    });
+    Object.assign(rig.inboxState, seedInboxState());
+  });
+  afterEach(async () => rig.stop());
+
+  it("rejects a tokenless loopback POST .../approve (401) even with auto-auth on", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/approval-1/approve`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+    // The approval must remain unresolved: the gate held.
+    const after = (await (
+      await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+        headers: withAuth({}, rig.authToken),
+      })
+    ).json()) as { data: { items: HubInboxItem[] } };
+    expect(
+      after.data.items.find((i) => i.item_id === "approval-1")?.resolved,
+    ).toBe(false);
+  });
+
+  it("rejects a tokenless loopback POST .../deny (401) even with auto-auth on", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/approval-1/deny`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts POST .../approve WITH the valid operator token (200)", async () => {
+    await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/approval-1/approve`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { item: HubInboxItem } };
+    expect(body.data.item.resolved).toBe(true);
+  });
+
+  it("still serves read-only GET /inbox under loopback auto-auth without a token", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/inbox`);
+    expect(res.status).toBe(200);
+  });
+
+  it("still allows tokenless inbox DISMISS under loopback auto-auth (housekeeping, not a decision)", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/egress-1/dismiss`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
 describe("Hub agent registry list (Test 3)", () => {
   let rig: TestRig;
 

@@ -9,7 +9,7 @@
 export * from "./constants.js";
 export * from "./types.js";
 export * from "./errors.js";
-export { enforceAuth, isLoopback, authMiddleware, type AuthConfig } from "./auth-middleware.js";
+export { enforceAuth, isLoopback, authMiddleware, type AuthConfig, type AuthOptions } from "./auth-middleware.js";
 export {
   aggregateHeader,
   aggregateFortressView,

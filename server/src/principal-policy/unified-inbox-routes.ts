@@ -137,6 +137,17 @@ function matchEntryPath(path: string): {
 }
 
 /**
+ * True when `path` targets `POST :id/resolve` - the operator's
+ * resolution of an approval entry (a Tier-1 approval decision). Reuses
+ * `matchEntryPath` so it stays in lockstep with the dispatcher's route
+ * parsing.
+ */
+function isApprovalResolvePath(path: string): boolean {
+  const match = matchEntryPath(path);
+  return match !== null && match.action === "resolve";
+}
+
+/**
  * Route handler. Returns true when served (including 4xx/5xx);
  * returns false to let the caller continue routing.
  */
@@ -159,7 +170,21 @@ export async function handleUnifiedInboxRoute(
     return false;
   }
 
-  const checkAuth = authMiddleware(deps.authConfig);
+  // SECURITY (loopback-no-autoauth-for-approvals): `POST :id/resolve`
+  // records the operator's resolution of an approval entry - a Tier-1
+  // approval decision. It must ALWAYS require the operator bearer token,
+  // even on loopback with `--auto-auth-localhost` on, so a co-resident
+  // agent sharing loopback cannot self-resolve its own approval. Other
+  // routes (list, get, archive/dismiss/snooze/delete inbox housekeeping,
+  // retention, prefs) keep loopback auto-auth for local-dashboard
+  // convenience. `requireToken` suppresses only the loopback shortcut;
+  // token validation is unchanged.
+  const isApprovalDecision =
+    method === "POST" && isApprovalResolvePath(path);
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    isApprovalDecision ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {

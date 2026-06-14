@@ -264,6 +264,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * discourage. Remote (non-loopback) callers still require the bearer
    * token, so this is a localhost-only ergonomics unlock, not a network
    * policy change.
+   *
+   * SCOPE LIMIT (loopback-no-autoauth-for-approvals): this unlock covers
+   * read-only and local-dashboard convenience routes ONLY. It does NOT
+   * cover the human-approval ACTION. Every state-changing approval-
+   * decision route always requires the operator bearer token (or a valid
+   * session) regardless of origin, even on loopback with auto-auth
+   * enabled. The covered decision routes are:
+   *   - POST `/api/approve/:id`, POST `/api/deny/:id` (legacy dashboard)
+   *   - POST `/api/hub/inbox/:id/{approve,deny}` (v1.1 hub inbox)
+   *   - POST `/api/approval-inbox/:id/{approve,deny}` (cross-harness)
+   *   - POST `/api/inbox/unified/:id/resolve` (unified inbox)
+   * In the MCP threat model the wrapped agent is co-resident with the
+   * operator and shares the loopback interface, so loopback origin is not
+   * a proxy for operator identity; without this carve-out a co-resident
+   * agent holding any loopback-HTTP primitive could self-approve its own
+   * Tier-1 operation and defeat the human approval gate. The router-level
+   * routes opt in via `authMiddleware(..., {requireToken:true})`; the
+   * legacy dashboard routes pass `requireToken` to {@link checkAuth}.
    */
   private _autoAuthLocalhost = false;
   /**
@@ -1506,11 +1524,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *
    * Returns true if auth passes, false if blocked (response already sent).
    */
-  private checkAuth(req: IncomingMessage, url: URL, res: ServerResponse): boolean {
+  private checkAuth(
+    req: IncomingMessage,
+    url: URL,
+    res: ServerResponse,
+    opts?: { requireToken?: boolean },
+  ): boolean {
     if (!this.authToken) return true; // Auth disabled
 
     // v0.10.2: loopback auto-auth — see _autoAuthLocalhost comment.
-    if (this._autoAuthLocalhost && this.isLoopbackRequest(req)) {
+    //
+    // SCOPE LIMIT (loopback-no-autoauth-for-approvals): `requireToken`
+    // suppresses this shortcut so a state-changing approval decision
+    // (POST /api/approve/:id, /api/deny/:id) always requires the operator
+    // bearer token (or a valid session), even on loopback with auto-auth
+    // on. The co-resident agent shares loopback, so origin is not a proxy
+    // for operator identity for a Tier-1 release. Header/session/cookie
+    // validation below is unchanged.
+    if (
+      !opts?.requireToken &&
+      this._autoAuthLocalhost &&
+      this.isLoopbackRequest(req)
+    ) {
       return true;
     }
 
@@ -2043,8 +2078,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
     }
 
-    // Authenticate all other non-OPTIONS requests
-    if (!this.checkAuth(req, url, res)) return;
+    // Authenticate all other non-OPTIONS requests.
+    //
+    // SECURITY (loopback-no-autoauth-for-approvals): the legacy approval
+    // DECISION routes (POST /api/approve/:id, POST /api/deny/:id) release
+    // a Tier-1 op, so they always require the operator token even on
+    // loopback with auto-auth on - a co-resident agent sharing loopback
+    // must not be able to self-approve. All other legacy routes keep the
+    // loopback auto-auth convenience.
+    const isLegacyApprovalDecision =
+      method === "POST" &&
+      (url.pathname.startsWith("/api/approve/") ||
+        url.pathname.startsWith("/api/deny/"));
+    if (
+      !this.checkAuth(
+        req,
+        url,
+        res,
+        isLegacyApprovalDecision ? { requireToken: true } : undefined,
+      )
+    )
+      return;
 
     // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
     // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER

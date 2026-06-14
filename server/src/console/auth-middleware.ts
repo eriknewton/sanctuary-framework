@@ -23,6 +23,33 @@ export interface AuthConfig {
 }
 
 /**
+ * Per-invocation auth options.
+ *
+ * `requireToken` forces the operator bearer token to be presented and
+ * validated REGARDLESS of origin, suppressing the `loopbackAutoAuth`
+ * shortcut for this request. Use it for routes whose effect must always
+ * trace to the operator's credential and never to mere network position.
+ *
+ * Rationale (MCP threat model): in Sanctuary the wrapped AI agent is
+ * co-resident with the operator and shares loopback. Treating
+ * loopback-origin as operator identity is therefore unsafe for any
+ * route that releases a human-approval decision (a Tier-1 gate). Such a
+ * route must require the operator token even on loopback, even with
+ * `--auto-auth-localhost` enabled, so a co-resident agent holding only a
+ * loopback-HTTP primitive cannot self-approve its own Tier-1 operation.
+ * Read-only/dashboard routes may keep loopback auto-auth for local
+ * convenience.
+ */
+export interface AuthOptions {
+  /**
+   * When true, the loopback auto-auth shortcut is suppressed for this
+   * request: a valid operator bearer token is required regardless of
+   * origin. Token-validation logic is otherwise unchanged.
+   */
+  requireToken?: boolean;
+}
+
+/**
  * Check whether a request originates from loopback.
  */
 export function isLoopback(req: IncomingMessage): boolean {
@@ -41,10 +68,18 @@ export function isLoopback(req: IncomingMessage): boolean {
 export function enforceAuth(
   config: AuthConfig,
   req: IncomingMessage,
-  url: URL
+  url: URL,
+  options?: AuthOptions
 ): true {
-  // Loopback auto-auth: localhost connections skip token check
-  if (config.loopbackAutoAuth && isLoopback(req)) {
+  // Loopback auto-auth: localhost connections skip token check.
+  // Suppressed when the route opts in to `requireToken` - a decision
+  // that releases a Tier-1 op must trace to the operator's credential,
+  // not to loopback network position (the co-resident agent shares it).
+  if (
+    !options?.requireToken &&
+    config.loopbackAutoAuth &&
+    isLoopback(req)
+  ) {
     return true;
   }
 
@@ -69,11 +104,12 @@ export function enforceAuth(
  * Express-style middleware wrapper. Attaches to every /api/console/* route.
  */
 export function authMiddleware(
-  config: AuthConfig
+  config: AuthConfig,
+  options?: AuthOptions
 ): (req: IncomingMessage, res: ServerResponse, url: URL) => boolean {
   return (req, res, url) => {
     try {
-      enforceAuth(config, req, url);
+      enforceAuth(config, req, url, options);
       return true;
     } catch (err) {
       if (err instanceof AuthGateError) {

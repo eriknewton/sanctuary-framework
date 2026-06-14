@@ -243,6 +243,19 @@ function isHubInboxAction(value: string): value is HubInboxAction {
   return (HUB_INBOX_ACTIONS as readonly string[]).includes(value);
 }
 
+/**
+ * State-changing approval DECISIONS on the hub inbox: approve / deny
+ * resolve a pending Tier-1 approval. `dismiss` is housekeeping, not a
+ * release, so it is excluded. Kept in lockstep with the dispatch table's
+ * `matchInboxRoute` so the auth gate cannot drift from routing.
+ */
+const HUB_APPROVAL_DECISION_ACTIONS = new Set(["approve", "deny"]);
+
+function isHubApprovalDecisionPath(path: string): boolean {
+  const match = matchInboxRoute(path);
+  return match !== null && HUB_APPROVAL_DECISION_ACTIONS.has(match.action);
+}
+
 function isHubAgentControlAction(
   value: string,
 ): value is HubAgentControlAction {
@@ -281,7 +294,21 @@ export async function handleHubRoute(
 
   // Auth gate: first middleware on every matched route. Reuses console
   // auth middleware verbatim. No new auth path.
-  const checkAuth = authMiddleware(deps.authConfig);
+  //
+  // SECURITY (loopback-no-autoauth-for-approvals): `POST /api/hub/inbox/
+  // :id/approve` and `.../deny` resolve a pending approval (a Tier-1
+  // human-approval decision). They must ALWAYS require the operator
+  // bearer token, even on loopback with auto-auth on, so a co-resident
+  // agent sharing loopback cannot self-approve. Other hub routes
+  // (read-only lists, inbox dismiss, task/agent dispatch) keep loopback
+  // auto-auth. `requireToken` only suppresses the loopback shortcut;
+  // token validation is unchanged.
+  const isApprovalDecision =
+    method === "POST" && isHubApprovalDecisionPath(path);
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    isApprovalDecision ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {

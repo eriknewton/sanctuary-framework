@@ -120,6 +120,29 @@ function matchEntryRoute(path: string): {
   };
 }
 
+/**
+ * State-changing approval actions on the aggregator surface. A POST to
+ * one of these releases (approve) or rejects (deny) a Tier-1 operation
+ * and is therefore the human-approval decision that must always require
+ * the operator token. Kept in lockstep with the dispatch table below
+ * (POST :id/approve, POST :id/deny).
+ */
+const STATE_CHANGING_APPROVAL_ACTIONS = new Set(["approve", "deny"]);
+
+/**
+ * True when `path` targets a state-changing approval decision route.
+ * Reuses `matchEntryRoute` so it cannot drift from the dispatcher's own
+ * route parsing.
+ */
+function isStateChangingApprovalPath(path: string): boolean {
+  const match = matchEntryRoute(path);
+  return (
+    match !== null &&
+    match.action !== null &&
+    STATE_CHANGING_APPROVAL_ACTIONS.has(match.action)
+  );
+}
+
 async function handleStream(
   deps: ApprovalInboxRouterDeps,
   res: ServerResponse,
@@ -185,7 +208,23 @@ export async function handleApprovalInboxRoute(
   }
 
   // Auth gate: shared with the hub + console surfaces.
-  const checkAuth = authMiddleware(deps.authConfig);
+  //
+  // SECURITY (loopback-no-autoauth-for-approvals): the state-changing
+  // approval decisions (POST :id/approve, POST :id/deny) release a
+  // Tier-1 operation, so they must ALWAYS require the operator bearer
+  // token - even on loopback, even with `--auto-auth-localhost` on. In
+  // the MCP threat model the wrapped agent is co-resident and shares
+  // loopback with the operator; treating loopback-origin as operator
+  // identity would let a co-resident agent self-approve its own Tier-1
+  // op. Read-only routes keep loopback auto-auth for local-dashboard
+  // convenience. `requireToken` only suppresses the loopback shortcut;
+  // token validation itself is unchanged.
+  const isApprovalDecision =
+    method === "POST" && isStateChangingApprovalPath(path);
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    isApprovalDecision ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {
