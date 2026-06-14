@@ -2,4 +2,4 @@
 # See README.md in this directory for how requirements.txt is generated + hash-pinned.
 # Regeneration command:
 #   .venv/bin/pip-compile --generate-hashes --output-file requirements.txt requirements.in
-concordia-protocol==0.4.0
+concordia-protocol==0.6.0
