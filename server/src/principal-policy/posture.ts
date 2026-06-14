@@ -49,6 +49,7 @@ import {
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  producerSignedDedupKey,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 
@@ -262,6 +263,9 @@ export async function buildCastleWallPosture(
   // entry, so the posture honestly reports whether the green light rests on a
   // re-verified producer signature or merely the channel basis.
   let latestEnforcementWasProducerSigned = false;
+  // Dedup of re-verified producer-signed tuples so a copied genuine entry counts
+  // at most once toward verdict_counts (codex round-4 HIGH: duplicate replay).
+  const seenSignedKeys = new Set<string>();
 
   for (const entry of entries) {
     const op = entry.operation;
@@ -334,7 +338,11 @@ export async function buildCastleWallPosture(
       const signedMs = reResult.signedCapturedAtMs;
       const inWindow =
         signedMs !== null && signedMs > now - digestWindowMs && signedMs <= now;
-      if (mapped === null || !inWindow) countThisEntry = false;
+      // Dedup: a copied genuine signed tuple (same seq + signature) counts once.
+      const dedupKey = producerSignedDedupKey(entry.details ?? {});
+      const isDuplicate = dedupKey !== null && seenSignedKeys.has(dedupKey);
+      if (dedupKey !== null) seenSignedKeys.add(dedupKey);
+      if (mapped === null || !inWindow || isDuplicate) countThisEntry = false;
       else countOp = mapped;
     }
     if (countThisEntry) {
@@ -583,6 +591,9 @@ export async function buildAuditDigest(
   let approvalsDenied = 0;
   const perAgent = new Map<string, number>();
   const windowEndMs = now;
+  // Dedup of re-verified producer-signed tuples so a copied genuine entry counts
+  // at most once toward kernel_blocks/allows (codex round-4 HIGH).
+  const seenSignedKeys = new Set<string>();
 
   for (const entry of entries) {
     // Bound the window's UPPER edge: the query only filters `since`, so a
@@ -633,7 +644,10 @@ export async function buildAuditDigest(
           entry.details ?? {},
           entry.operation,
         );
-        kernelCounts = kernelCounts && inWindow && opBound;
+        const dedupKey = producerSignedDedupKey(entry.details ?? {});
+        const isDuplicate = dedupKey !== null && seenSignedKeys.has(dedupKey);
+        if (dedupKey !== null) seenSignedKeys.add(dedupKey);
+        kernelCounts = kernelCounts && inWindow && opBound && !isDuplicate;
       }
     }
     if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_blocked")

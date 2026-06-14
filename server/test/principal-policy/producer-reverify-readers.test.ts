@@ -550,6 +550,97 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
   });
 });
 
+describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts at most once", () => {
+  // Append the SAME genuine signed tuple (same seq + signature) N times — what a
+  // copy-replay attacker does. Each copy re-verifies, but must be deduped.
+  async function appendDuplicateSigned(log: AuditLog, copies: number): Promise<void> {
+    const canonical = walBody(0);
+    const sig = toBase64url(
+      ed25519.sign(producerSigningBytes(canonical, FRESH_TS, 0), daemonPriv),
+    );
+    for (let i = 0; i < copies; i++) {
+      await log.appendCritical({
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: FORTRESS,
+        result: "success",
+        // distinct top-level timestamps, but identical signed tuple
+        timestamp: new Date(FRESH_TS + i).toISOString(),
+        details: {
+          seq: 0,
+          [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: sig,
+          [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+          [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+          [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
+          [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+          [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+        },
+      });
+    }
+  }
+
+  it("posture verdict_counts.blocked counts the duplicated tuple once", async () => {
+    const log = newLog();
+    await appendDuplicateSigned(log, 5);
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(posture.verdict_counts.blocked).toBe(1);
+    expect(posture.arm_state).toBe("armed"); // the genuine event still arms
+  });
+
+  it("digest kernel_blocks counts the duplicated tuple once", async () => {
+    const log = newLog();
+    await appendDuplicateSigned(log, 5);
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(digest.kernel_blocks).toBe(1);
+  });
+
+  it("feature-health invocation_count counts the duplicated tuple once", async () => {
+    const log = newLog();
+    await appendDuplicateSigned(log, 5);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
+    expect(cw!.status).toBe("active");
+    expect(cw!.invocation_count).toBe(1);
+  });
+
+  it("TWO DISTINCT signed events (different seq) both count — dedup does not over-collapse", async () => {
+    const log = newLog();
+    await appendGenuineSigned(log, 0);
+    await appendGenuineSigned(log, 1);
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(digest.kernel_blocks).toBe(2);
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(posture.verdict_counts.blocked).toBe(2);
+  });
+});
+
 describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and renders green", () => {
   it("posture: genuine signed entry arms with producer_signed authenticity", async () => {
     const log = newLog();

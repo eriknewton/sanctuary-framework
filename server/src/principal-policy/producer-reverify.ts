@@ -221,3 +221,28 @@ export function enforcementEntryCounts(
   if (keyPresent) return basis === "producer_signed_verified";
   return basis !== "producer_signed_rejected";
 }
+
+/**
+ * A stable dedup key for a re-verified producer-signed entry, used to count each
+ * genuine signed enforcement event AT MOST ONCE.
+ *
+ * Why this is needed (codex round-4 HIGH): re-verification proves a signed tuple
+ * is genuine and binds it to a seq/time/operation, but an in-process writer can
+ * COPY a still-fresh genuine signed entry N times — each copy re-verifies
+ * identically. Without dedup, the copies inflate verdict/kernel/invocation
+ * counts (and could manufacture fresh evidence from a single real event).
+ *
+ * The daemon's WAL `seq` is monotonic, so two genuine enforcement events never
+ * share a seq; the signature is unique per signed message. Keying on
+ * `seq | signature` therefore collapses exact replays without rejecting any
+ * legitimate distinct evidence. Returns null when the inputs aren't both present
+ * (the caller should not have reached here for a verified entry, but fail safe).
+ */
+export function producerSignedDedupKey(
+  details: Record<string, unknown>,
+): string | null {
+  const seq = details.seq;
+  const sig = details[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
+  if (typeof seq !== "number" || typeof sig !== "string") return null;
+  return `${seq} ${sig}`;
+}
