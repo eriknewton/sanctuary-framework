@@ -40,6 +40,10 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
 } from "./posture.js";
+import {
+  buildFeatureHealthPanel,
+  type FeatureHealthPanel,
+} from "./feature-health.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
@@ -135,6 +139,12 @@ export async function handlePostureRoute(
       return true;
     }
 
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
+      const panel = await buildFeatureHealth(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/unwrapped`) {
       const roster = await buildUnwrapped(deps);
       writeJSON(res, 200, roster);
@@ -205,6 +215,24 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
   });
 }
 
+/**
+ * Feature-usage health panel. Cache-invalidation rule (review must-fix #4): the
+ * panel is recomputed from the audit chain on every request via
+ * `buildFeatureHealthPanel`, which reads `AuditLog.query` fresh and re-scans for
+ * integrity findings each call. Because each response reflects the current
+ * chain head, a post-fault refresh can never show stale green — there is no
+ * cross-request cache to invalidate at this layer.
+ */
+async function buildFeatureHealth(
+  deps: PostureRouteDeps,
+): Promise<FeatureHealthPanel> {
+  return buildFeatureHealthPanel({
+    auditLog: deps.auditLog as AuditLog,
+    originMachine: deps.originMachine,
+    ...(deps.now ? { now: deps.now() } : {}),
+  });
+}
+
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
   const detected = deps.detectInstalledHarnesses
     ? await deps.detectInstalledHarnesses()
@@ -238,6 +266,8 @@ export interface PostureHome {
   castle_wall: CastleWallPosture;
   digest: AuditDigest;
   unwrapped: UnwrappedRoster;
+  /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
+  feature_health: FeatureHealthPanel;
   /** Protected-agent count for the banner. */
   protected_agent_count: number;
   /** Wrapped-agent roster (the green cards). */
@@ -245,10 +275,11 @@ export interface PostureHome {
 }
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
-  const [castleWall, digest, unwrapped] = await Promise.all([
+  const [castleWall, digest, unwrapped, featureHealth] = await Promise.all([
     buildWallPosture(deps),
     buildDigest(deps),
     buildUnwrapped(deps),
+    buildFeatureHealth(deps),
   ]);
   const agents = deps.listAgents();
   return {
@@ -256,6 +287,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     castle_wall: castleWall,
     digest,
     unwrapped,
+    feature_health: featureHealth,
     protected_agent_count: agents.length,
     agents,
   };
