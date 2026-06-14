@@ -38,6 +38,7 @@ import { yamux } from "@chainsafe/libp2p-yamux";
 import { tcp } from "@libp2p/tcp";
 import { mdns } from "@libp2p/mdns";
 import { kadDHT } from "@libp2p/kad-dht";
+import { ping } from "@libp2p/ping";
 import { identify } from "@libp2p/identify";
 import { gossipsub, type GossipSub } from "@chainsafe/libp2p-gossipsub";
 import { multiaddr, type Multiaddr } from "@multiformats/multiaddr";
@@ -155,6 +156,11 @@ export class Libp2pMeshTransport implements MeshTransport {
       identify: identify() as unknown as (components: unknown) => unknown,
     };
     if (cfg.dht) {
+      // kad-dht v16 split @libp2p/ping into a required service capability:
+      // the DHT uses it to probe peer liveness before adding routing-table
+      // entries. Register it alongside the DHT so node.start() resolves the
+      // dependency. Only wired when the DHT is enabled (opt-in, default off).
+      services.ping = ping() as unknown as (components: unknown) => unknown;
       services.dht = kadDHT({
         // v0.1 opt-in. Kademlia is off by default — see config.ts for
         // why (presence leak to the wider swarm).
