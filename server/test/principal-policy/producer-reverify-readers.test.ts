@@ -427,6 +427,86 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
     expect(digest.kernel_blocks).toBe(0);
   });
 
+  it("a signed 'allow' tuple stapled onto an 'egress_blocked' entry does NOT inflate posture verdict_counts.blocked", async () => {
+    const log = newLog();
+    const allowCanonical = JSON.stringify({
+      timestamp: new Date(FRESH_TS).toISOString(),
+      layer: "l1",
+      operation: "egress_approved",
+      identity_id: "agent-1",
+      result: "success",
+      details: { agent_id: "agent-1" },
+    });
+    const sig = ed25519.sign(producerSigningBytes(allowCanonical, FRESH_TS, 0), daemonPriv);
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked", // stapled onto the wrong slot
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: {
+        seq: 0,
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: allowCanonical,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    // The display count is bound to the SIGNED operation (an allow), so the
+    // stapled "block" entry does not inflate verdict_counts.blocked. It counts
+    // as the allow it actually was.
+    expect(posture.verdict_counts.blocked).toBe(0);
+    expect(posture.verdict_counts.allowed).toBe(1);
+  });
+
+  it("a stale producer-signed replay does NOT inflate posture verdict_counts", async () => {
+    const log = newLog();
+    const OLD_TS = NOW - 48 * 60 * 60 * 1000; // outside the 24h digest window
+    const canonical = JSON.stringify({
+      timestamp: new Date(OLD_TS).toISOString(),
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "agent-1",
+      result: "blocked",
+      details: { agent_id: "agent-1" },
+    });
+    const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: {
+        seq: 0,
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(posture.verdict_counts.blocked).toBe(0);
+    expect(posture.arm_state).not.toBe("armed");
+  });
+
   it("a signed 'allow' tuple stapled onto an 'egress_blocked' entry does NOT count as a kernel_block", async () => {
     const log = newLog();
     // Genuinely sign an egress_APPROVED (allow) WAL body, then file it under an

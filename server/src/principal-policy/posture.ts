@@ -319,9 +319,29 @@ export async function buildCastleWallPosture(
       continue;
     }
 
-    if (op === "egress_allowed") verdictCounts.allowed += 1;
-    else if (op === "egress_blocked") verdictCounts.blocked += 1;
-    else if (op === "operator_decision") verdictCounts.operator_decisions += 1;
+    // Display verdict counts over the digest window. For a re-verified
+    // producer-signed entry the count is bound to the SIGNATURE (same rule as
+    // the digest kernel counts — codex re-review): count by the SIGNED operation
+    // (so a signed "allow" tuple stapled onto a "block" entry cannot mis-count)
+    // and only when the signed capture time falls within the digest window (so a
+    // replayed old tuple in a fresh entry does not inflate the count). For
+    // channel-basis entries there is no signed op/time, so the entry op + the
+    // arm-eligibility already established is used (the honest no-key floor).
+    let countOp = op;
+    let countThisEntry = true;
+    if (reResult.basis === "producer_signed_verified") {
+      const mapped = signedOperationFor(entry.details ?? {});
+      const signedMs = reResult.signedCapturedAtMs;
+      const inWindow =
+        signedMs !== null && signedMs > now - digestWindowMs && signedMs <= now;
+      if (mapped === null || !inWindow) countThisEntry = false;
+      else countOp = mapped;
+    }
+    if (countThisEntry) {
+      if (countOp === "egress_allowed") verdictCounts.allowed += 1;
+      else if (countOp === "egress_blocked") verdictCounts.blocked += 1;
+      else if (countOp === "operator_decision") verdictCounts.operator_decisions += 1;
+    }
 
     // Freshness uses the SIGNATURE-BOUND capture time for a verified producer
     // signature (so a same-seq replay carrying an old signed timestamp cannot be
@@ -428,28 +448,39 @@ const SIGNED_WAL_OP_TO_ENTRY_OP: Readonly<Record<string, string>> = Object.freez
 });
 
 /**
+ * The read-side entry operation the persisted SIGNED canonical body attests to
+ * (mapped from WAL vocabulary), or null on any parse failure / unknown op (fail
+ * closed). The signed operation is authoritative for a re-verified entry, so
+ * counting by it — rather than the forgeable top-level `entry.operation` —
+ * defeats the staple-onto-wrong-slot attack. Only meaningful when the entry
+ * re-verified as `producer_signed_verified`.
+ */
+function signedOperationFor(details: Record<string, unknown>): string | null {
+  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  if (typeof canonical !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonical);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const signedOp = (parsed as Record<string, unknown>).operation;
+  if (typeof signedOp !== "string") return null;
+  return SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] ?? null;
+}
+
+/**
  * True iff the persisted signed canonical body's `operation` maps to the audit
- * entry's `operation`. Returns false on any parse failure or mismatch (fail
- * closed). Only meaningful for a re-verified producer-signed entry.
+ * entry's `operation`. Fail closed on parse failure / mismatch.
  */
 function signedOperationMatchesEntry(
   details: Record<string, unknown>,
   entryOperation: string,
 ): boolean {
-  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
-  if (typeof canonical !== "string") return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(canonical);
-  } catch {
-    return false;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return false;
-  }
-  const signedOp = (parsed as Record<string, unknown>).operation;
-  if (typeof signedOp !== "string") return false;
-  return SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] === entryOperation;
+  return signedOperationFor(details) === entryOperation;
 }
 
 // ── G2: today's audit story digest ──────────────────────────────────
