@@ -45,6 +45,8 @@
     "test:e2e:install": "playwright install chromium webkit",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
+    "refresh-reorg-evidence": "vite-node scripts/refresh-reorg-evidence.ts",
+    "check-import-cycles": "vite-node scripts/check-import-cycles.ts",
     "clean": "rm -rf dist",
     "install-hooks": "node scripts/install-hooks.js",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
