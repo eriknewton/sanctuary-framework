@@ -370,12 +370,24 @@ export class StateStore {
     if (cached && cached.expiresAt > now) {
       return cached.key;
     }
+    if (cached) {
+      // Best-effort: the entry is expired and is about to be replaced by a
+      // freshly derived key below; zero the stale bytes so they are not left
+      // on the V8 heap until GC (prior callers consumed the key synchronously).
+      cached.key.fill(0);
+    }
 
     // Evict expired or LRU entries if at capacity
     if (this.namespaceKeyCache.size >= StateStore.KEY_CACHE_MAX_ENTRIES) {
       // Remove oldest entry (Map iteration order = insertion order)
       const firstKey = this.namespaceKeyCache.keys().next().value;
-      if (firstKey !== undefined) this.namespaceKeyCache.delete(firstKey);
+      if (firstKey !== undefined) {
+        // Best-effort: zero the derived key bytes before dropping the entry so
+        // the material is not left on the V8 heap until GC (consistent with
+        // identity.ts / master-custody.ts / master-rotation.ts).
+        this.namespaceKeyCache.get(firstKey)?.key.fill(0);
+        this.namespaceKeyCache.delete(firstKey);
+      }
     }
 
     const derived = deriveNamespaceKey(this.masterKey, namespace);
@@ -388,6 +400,11 @@ export class StateStore {
 
   /** Invalidate all cached namespace keys (call on master key rotation). */
   invalidateKeyCache(): void {
+    // Best-effort: zero each derived key's bytes before clearing so the
+    // material is not left on the V8 heap until GC.
+    for (const cached of this.namespaceKeyCache.values()) {
+      cached.key.fill(0);
+    }
     this.namespaceKeyCache.clear();
   }
 
