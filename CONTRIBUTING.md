@@ -4,7 +4,7 @@ Thank you for your interest in Sanctuary. This document covers how to contribute
 
 ## How to Participate
 
-**Discussion first.** Before opening a pull request, start a conversation. Use GitHub Discussions for open-ended questions and ideas. Use Issues for specific problems — a gap in the spec, an ambiguity in an interface definition, a conflict with an existing standard.
+**Discussion first.** Before opening a pull request, start a conversation. Use GitHub Discussions for open-ended questions and ideas. Use Issues for specific problems - a gap in the spec, an ambiguity in an interface definition, a conflict with an existing standard.
 
 **Implementation experience is the most valuable contribution.** If you've built against Sanctuary's interfaces, we want to hear what worked, what didn't, and what was missing. Open an "Implementation Experience" issue with your findings.
 
@@ -23,11 +23,11 @@ RFCs are **not** needed for: clarifications that don't change requirements, typo
 
 ## Conventions
 
-The specification uses RFC 2119 language: MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL have their standard meanings. Be precise when proposing changes that use these terms — the difference between MUST and SHOULD is the difference between a compliance requirement and a best practice.
+The specification uses RFC 2119 language: MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL have their standard meanings. Be precise when proposing changes that use these terms - the difference between MUST and SHOULD is the difference between a compliance requirement and a best practice.
 
 ## The Dual Sovereignty Principle
 
-Every proposed change must serve both human sovereignty and agent sovereignty. This is not a preference — it is the central structural constraint of the framework. If a proposal improves protections for one constituency at the expense of the other, it needs reworking.
+Every proposed change must serve both human sovereignty and agent sovereignty. This is not a preference - it is the central structural constraint of the framework. If a proposal improves protections for one constituency at the expense of the other, it needs reworking.
 
 ## What We're Looking For
 
@@ -46,6 +46,7 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 
 ### Development Guidelines
 
+- New to the server? Start with the module map at `server/src/README.md` (the 54-module index + confusable-name disambiguations + frozen-surface list)
 - TypeScript with strict mode, ESM + CJS dual output
 - All MCP tools must include input validation via Zod schemas
 - Every new tool requires a corresponding test file
@@ -58,15 +59,15 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 
 1. Create a branch from `main`
 2. Make your changes with tests
-3. Run `npm test` and `npm run lint` — tests must pass and lint must report zero errors
+3. Run `npm test` and `npm run lint` - tests must pass and lint must report zero errors
 4. Submit PR with description of changes and motivation
 5. Address review feedback; maintainer merges after approval
 
 ### Review Tiers
 
-- **Tier 1 (routine):** Bug fixes, docs, test improvements — 72-hour review SLA
-- **Tier 2 (features):** New tools, integrations — RFC + 7-day comment period
-- **Tier 3 (architectural):** New layers, protocol changes, crypto algorithms — RFC + 14-day comment + security review
+- **Tier 1 (routine):** Bug fixes, docs, test improvements - 72-hour review SLA
+- **Tier 2 (features):** New tools, integrations - RFC + 7-day comment period
+- **Tier 3 (architectural):** New layers, protocol changes, crypto algorithms - RFC + 14-day comment + security review
 
 ### Security Reports
 
