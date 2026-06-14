@@ -116,6 +116,7 @@ async function exportWithDidWeb(
   didWebIdentifier?: string,
 ): Promise<void> {
   const result = await exportExitBundle({
+      unpartitionedLegacyExport: true,
     bundleDir,
     storage: h.storage,
     masterKey: h.masterKey,
@@ -231,6 +232,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     await exportWithDidWeb(h, dir, didUri);
 
     const result = await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: await makeTempDir(),
       storage: h.storage,
       masterKey: h.masterKey,
@@ -253,6 +255,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const h = await makeHarness();
     const dir = await makeTempDir();
     const result = await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -269,6 +272,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -292,6 +296,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const h = await makeHarness();
     const dir = await makeTempDir();
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -313,6 +318,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     await expect(
       exportExitBundle({
+      unpartitionedLegacyExport: true,
         bundleDir: dir,
         storage: h.storage,
         masterKey: h.masterKey,
@@ -380,6 +386,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -427,6 +434,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -469,6 +477,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -507,6 +516,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -543,6 +553,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -579,6 +590,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -620,6 +632,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     // Export WITHOUT didWeb opts (pre-did:web manifest shape).
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -665,6 +678,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -705,6 +719,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const expectedPubkey = identity.public_key;
     const identifier = `did:web:${TEST_AUTHORITY_HOST}:fortress:${TEST_FORTRESS_LABEL}:agent:default`;
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,
@@ -736,6 +751,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const didUri = manifestDidUri(fortressA);
 
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: fortressA.storage,
       masterKey: fortressA.masterKey,
@@ -773,6 +789,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
       now: () => new Date("2026-05-09T12:00:00.000Z"),
     });
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: source.storage,
       masterKey: source.masterKey,
@@ -816,6 +833,7 @@ describe("Recognition-Layer Path C primary build 2: exit-bundle did:web integrat
     const dir = await makeTempDir();
     const didUri = manifestDidUri(h);
     await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir: dir,
       storage: h.storage,
       masterKey: h.masterKey,

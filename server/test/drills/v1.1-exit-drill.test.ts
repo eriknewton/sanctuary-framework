@@ -231,6 +231,7 @@ async function startHubBundleRig(
   ): Promise<HubFortressExportResult> => {
     captured.approvalId = approvalAuditId;
     const exported = await exportExitBundle({
+      unpartitionedLegacyExport: true,
       bundleDir,
       storage: source.storage,
       masterKey: source.masterKey,

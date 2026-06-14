@@ -79,6 +79,7 @@ async function exportFromSource(
   stateNamespaces: string[] = []
 ) {
   return exportExitBundle({
+      unpartitionedLegacyExport: true,
     bundleDir,
     storage: source.storage,
     masterKey: source.masterKey,

@@ -129,6 +129,7 @@ async function exportFromSourceWithState(
   namespacesToInclude: string[]
 ) {
   return exportExitBundle({
+      unpartitionedLegacyExport: true,
     bundleDir,
     storage: source.storage,
     masterKey: source.masterKey,

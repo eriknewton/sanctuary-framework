@@ -31,3 +31,38 @@ export {
   printExitExportHelp,
   type ExitCommandArgs,
 } from "./cli.js";
+
+export {
+  mintProvenanceStamp,
+  classifyMemoryClass,
+  isSealedStamp,
+  assertSealedStamp,
+  serializeStamp,
+  partitionByMemoryClass,
+  MemoryClassError,
+  type MemoryClass,
+  type OriginActor,
+  type ProvenanceStamp,
+  type SealedProvenanceStamp,
+  type MintStampInput,
+  type DerivedFromEdge,
+  type PartitionCandidate,
+  type PartitionDecision,
+  type PartitionResult,
+  type PartitionExclusionReason,
+  type PartitionConsentRelease,
+} from "./memory-class.js";
+
+export {
+  recordConsentRelease,
+  writeExitTombstone,
+  isIntentToRemoveNotErasure,
+  EXIT_CONSENT_AUDIT_OPS,
+  type ConsentDisposition,
+  type ConsentReleaseInput,
+  type ConsentReleaseReceipt,
+  type ExitConsentAuditOp,
+  type ExitTombstone,
+  type ExitTombstoneReason,
+  type ExitTombstoneInput,
+} from "./consent.js";
