@@ -25,6 +25,15 @@ pub struct DaemonConfig {
     pub wal_path: PathBuf,
     /// Path containing the TOFU-pinned fortress public key (raw 32 bytes).
     pub pinned_public_key_path: PathBuf,
+    /// Path to the daemon-held audit-producer private key (raw 32-byte
+    /// Ed25519 seed, `0600`). Generated on first boot if absent. NEVER
+    /// transmitted over IPC and never written where the in-process TS server
+    /// reads — this separation is what makes the per-event producer signature
+    /// unforgeable by an in-process module (Slice L1).
+    pub producer_key_path: PathBuf,
+    /// Path to the published audit-producer public key (raw 32 bytes,
+    /// world-readable) the consumer TOFU-pins to verify producer signatures.
+    pub producer_pub_key_path: PathBuf,
     /// Operator-decision timeout for an open prompt.
     pub prompt_timeout: Duration,
     /// Bounded duration for the emergency `--no-wall` recovery mode.
@@ -48,6 +57,8 @@ impl DaemonConfig {
             policy_dir: state_dir.join("policy/egress"),
             wal_path: state_dir.join("filter-events.wal"),
             pinned_public_key_path: state_dir.join("policy/egress/pinned.key"),
+            producer_key_path: state_dir.join("policy/egress/audit-producer.key"),
+            producer_pub_key_path: state_dir.join("policy/egress/audit-producer.pub"),
             prompt_timeout: Duration::from_secs(DEFAULT_PROMPT_TIMEOUT_SECONDS as u64),
             no_wall_max_duration: Duration::from_secs(DEFAULT_NO_WALL_DURATION_SECONDS as u64),
             wal_ttl: Duration::from_secs(DEFAULT_WAL_TTL_SECONDS as u64),
@@ -61,6 +72,8 @@ impl DaemonConfig {
     ///   --policy-dir <path>
     ///   --wal-path <path>
     ///   --pinned-public-key <path>
+    ///   --producer-key <path>
+    ///   --producer-pub-key <path>
     ///
     /// Unrecognized flags return an error; callers print usage and exit 2.
     pub fn from_argv<I, S>(args: I) -> Result<Self, ConfigError>
@@ -74,6 +87,8 @@ impl DaemonConfig {
         let mut policy_dir: Option<PathBuf> = None;
         let mut wal_path: Option<PathBuf> = None;
         let mut pinned_public_key_path: Option<PathBuf> = None;
+        let mut producer_key_path: Option<PathBuf> = None;
+        let mut producer_pub_key_path: Option<PathBuf> = None;
 
         while let Some(arg) = iter.next() {
             match arg.as_ref() {
@@ -105,6 +120,18 @@ impl DaemonConfig {
                         .ok_or(ConfigError::MissingValue("--pinned-public-key"))?;
                     pinned_public_key_path = Some(PathBuf::from(v.as_ref()));
                 }
+                "--producer-key" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--producer-key"))?;
+                    producer_key_path = Some(PathBuf::from(v.as_ref()));
+                }
+                "--producer-pub-key" => {
+                    let v = iter
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--producer-pub-key"))?;
+                    producer_pub_key_path = Some(PathBuf::from(v.as_ref()));
+                }
                 "--help" | "-h" => return Err(ConfigError::HelpRequested),
                 other => return Err(ConfigError::Unknown(other.to_string())),
             }
@@ -123,6 +150,12 @@ impl DaemonConfig {
         }
         if let Some(p) = pinned_public_key_path {
             config.pinned_public_key_path = p;
+        }
+        if let Some(p) = producer_key_path {
+            config.producer_key_path = p;
+        }
+        if let Some(p) = producer_pub_key_path {
+            config.producer_pub_key_path = p;
         }
         Ok(config)
     }

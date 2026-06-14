@@ -75,4 +75,16 @@ pub mod constants {
 
     /// JSON-RPC method namespace for IPC messages.
     pub const IPC_NAMESPACE: &str = "castle-wall";
+
+    /// Domain-separation prefix for the per-event producer signature
+    /// (Slice L1). Mirrors `CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX` in
+    /// `server/src/castle-wall/constants.ts`. Binding the signature to a
+    /// distinct domain prevents a signature minted for any other purpose
+    /// (handshake nonce, manifest, transparency checkpoint) from ever
+    /// validating as an enforcement-event producer signature.
+    pub const PRODUCER_SIG_DOMAIN_PREFIX: &str = "sanctuary.castle-wall.audit-producer.v1\n";
+
+    /// Key id stamped on producer signatures so the reader can select the
+    /// right pinned producer public key. Mirrors the TS constant.
+    pub const PRODUCER_SIG_KEY_ID_V1: &str = "cw-audit-producer-v1";
 }

@@ -29,6 +29,18 @@ export interface StartCastleWallInput {
   transport: IpcTransport;
   key: ClientKeyMaterial;
   auditSink: AuditSink;
+  /**
+   * The TOFU-pinned audit-producer public key (base64url-no-pad, 32 raw
+   * verifying-key bytes) published by the Linux daemon at
+   * `<policy_dir>/audit-producer.pub`. When provided, the audit consumer
+   * REQUIRES enforcement-evidence events to carry a producer signature that
+   * verifies against this key (Slice L1 fail-closed). Load it with
+   * `loadPinnedProducerKeyB64url`. Omit on platforms/paths without a signing
+   * producer (macOS, legacy) to accept on the documented channel-authenticity
+   * basis. Threading this through is what makes L1 enforcement default-on for
+   * the runtime once the drain pull-loop (next slice) feeds the consumer.
+   */
+  pinnedProducerKeyB64url?: string | null;
   promptTimeoutMs?: number;
   strictMode?: boolean;
   /** Optional override for handshake timeout; defaults to 5s. */
@@ -63,7 +75,9 @@ export async function startCastleWall(
     setTimer: input.setTimer,
     clearTimer: input.clearTimer,
   });
-  const audit = new AuditConsumer(input.auditSink);
+  const audit = new AuditConsumer(input.auditSink, undefined, {
+    pinnedProducerKeyB64url: input.pinnedProducerKeyB64url ?? null,
+  });
   let state: CastleWallLifecycleState = "handshaking";
 
   const client = IpcClient.create(input.transport, input.key, {

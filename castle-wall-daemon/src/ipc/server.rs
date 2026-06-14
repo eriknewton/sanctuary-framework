@@ -29,6 +29,7 @@ use crate::ipc::auth::{
 };
 use crate::ipc::framing::{frame, parse_frame, ParseStep};
 use crate::ipc::messages::{AuditDrainEvent, IpcMessage, MessageEnvelope};
+use crate::ipc::producer_sig::ProducerSigner;
 use crate::manifest::ManifestStore;
 
 /// Socket file permissions (mode 0660 per scope-lock §5).
@@ -63,6 +64,14 @@ pub struct ServerConfig {
     /// dispatch. When absent, drain returns an empty batch and ack is a
     /// no-op so PR 2a tests remain green.
     pub wal_writer: Option<Arc<Mutex<WalWriter>>>,
+    /// Optional producer signer (Slice L1). When present, every drained
+    /// enforcement event is signed over `seq ‖ timestamp ‖ canonical-bytes`
+    /// with the daemon-held audit-producer key, and the consumer verifies the
+    /// signature against the pinned producer public key before accepting the
+    /// event as enforcement evidence. When absent (legacy/test boot), events
+    /// drain unsigned and the consumer falls back to the documented
+    /// channel-authenticity basis.
+    pub producer_signer: Option<Arc<ProducerSigner>>,
 }
 
 /// Errors emitted by the IPC server lifecycle.
@@ -128,6 +137,7 @@ impl IpcServer {
             pinned_public_key: config.pinned_public_key,
             manifest_store: config.manifest_store,
             wal_writer: config.wal_writer,
+            producer_signer: config.producer_signer,
         });
 
         let accept_thread = std::thread::Builder::new()
@@ -169,6 +179,7 @@ struct ServerState {
     pinned_public_key: Vec<u8>,
     manifest_store: Option<Arc<Mutex<ManifestStore>>>,
     wal_writer: Option<Arc<Mutex<WalWriter>>>,
+    producer_signer: Option<Arc<ProducerSigner>>,
 }
 
 impl ServerState {
@@ -468,12 +479,34 @@ fn handle_audit_drain(
     let next_after_seq = snapshot.last().map(|e| e.seq).or(after_seq);
     let events: Vec<AuditDrainEvent> = snapshot
         .into_iter()
-        .map(|e| AuditDrainEvent {
-            seq: e.seq,
-            captured_at_unix_ms: e.captured_at_unix_ms,
-            prior_sha256_hex: e.prior_sha256_hex,
-            event_canonical_json: e.event_canonical_json,
-            critical: e.critical,
+        .map(|e| {
+            // Slice L1: sign the event over `seq ‖ timestamp ‖ canonical-bytes`
+            // with the daemon-held producer key, so the consumer can prove the
+            // event came from the enforcing daemon (not an in-process forger)
+            // and reject replays of past signed events. When no signer is
+            // wired the fields stay None and the consumer falls back to the
+            // documented channel-authenticity basis.
+            let (producer_signature_b64url, producer_key_id) = match state.producer_signer.as_ref()
+            {
+                Some(signer) => (
+                    Some(signer.sign_event(
+                        &e.event_canonical_json,
+                        e.captured_at_unix_ms,
+                        e.seq,
+                    )),
+                    Some(crate::constants::PRODUCER_SIG_KEY_ID_V1.to_string()),
+                ),
+                None => (None, None),
+            };
+            AuditDrainEvent {
+                seq: e.seq,
+                captured_at_unix_ms: e.captured_at_unix_ms,
+                prior_sha256_hex: e.prior_sha256_hex,
+                event_canonical_json: e.event_canonical_json,
+                critical: e.critical,
+                producer_signature_b64url,
+                producer_key_id,
+            }
         })
         .collect();
     state.append_audit(
@@ -684,6 +717,7 @@ mod tests {
             pinned_public_key: pk,
             manifest_store: None,
             wal_writer: None,
+            producer_signer: None,
         })
     }
 
@@ -756,6 +790,7 @@ mod tests {
             fortress_id: "abc".to_string(),
             manifest_store: None,
             wal_writer: None,
+            producer_signer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         assert!(socket.exists());
@@ -788,6 +823,7 @@ mod tests {
             fortress_id: "abc".to_string(),
             manifest_store: None,
             wal_writer: None,
+            producer_signer: None,
         };
         let server = IpcServer::start(cfg).expect("start despite stale");
         server.stop_and_join();
@@ -812,6 +848,7 @@ mod tests {
             fortress_id: "fortress-x".to_string(),
             manifest_store: None,
             wal_writer: None,
+            producer_signer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         let client_handle =
@@ -870,6 +907,7 @@ mod tests {
             fortress_id: "f".to_string(),
             manifest_store: None,
             wal_writer: None,
+            producer_signer: None,
         };
         let server = IpcServer::start(cfg).expect("start");
         let client_handle =

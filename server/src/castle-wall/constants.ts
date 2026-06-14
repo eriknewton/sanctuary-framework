@@ -29,6 +29,43 @@ export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
 /** Ed25519 signature scheme tag used in manifest envelopes (matches federation v0.1). */
 export const CASTLE_WALL_SIGNATURE_SCHEME_V1 = "ed25519-v1" as const;
 
+/**
+ * Domain-separation prefix for the per-event producer signature (Slice L1).
+ * MUST byte-match `PRODUCER_SIG_DOMAIN_PREFIX` in the Rust daemon
+ * (`castle-wall-daemon/src/lib.rs`). The trailing newline is part of the
+ * prefix. Binding the signature to a distinct domain prevents a signature
+ * minted for any other purpose (handshake nonce, manifest, transparency
+ * checkpoint) from ever validating as an enforcement-event producer signature.
+ */
+export const CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX =
+  "sanctuary.castle-wall.audit-producer.v1\n" as const;
+
+/** Key id stamped on v1 producer signatures. Mirrors `PRODUCER_SIG_KEY_ID_V1`. */
+export const CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1 = "cw-audit-producer-v1" as const;
+
+/**
+ * `details` keys under which the verified producer signature and its key id
+ * are persisted into the audit entry, so read-side consumers (Slice R) can
+ * re-verify against the pinned producer public key rather than trusting the
+ * forgeable `cw_source` marker.
+ */
+export const CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY = "cw_producer_sig" as const;
+export const CASTLE_WALL_PRODUCER_KID_DETAIL_KEY = "cw_producer_kid" as const;
+
+/**
+ * `details` key recording the authenticity basis the consumer established for
+ * this entry. `producer_signed` means a producer signature was verified
+ * against the pinned key (the in-process forgery hole is closed for this
+ * entry). `channel_authenticated_unsigned` means the entry was accepted on the
+ * legacy basis (mutually-pinned IPC channel + tamper-evident chain) because no
+ * pinned producer key was configured — honest about NOT being per-producer
+ * authenticated. Slice R reads this to render the green light's true basis.
+ */
+export const CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY = "cw_evidence_basis" as const;
+export const CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED = "producer_signed" as const;
+export const CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED =
+  "channel_authenticated_unsigned" as const;
+
 /** IPC framing header per scope-lock section 5 (LSP-style). */
 export const CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER = "Content-Length" as const;
 
