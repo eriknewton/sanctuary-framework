@@ -81,3 +81,29 @@ jobs:
       - name: QLA performance budget gate
         working-directory: server
         run: npm run test:qla-perf-budget
+
+  lint:
+    # ESLint was wired and the floating-promise backlog driven to zero, but no
+    # workflow ran it, so an error-level regression could land silently. This
+    # lightweight job (no sidecar/build needed) locks in "zero eslint errors"
+    # on every PR. It fails on ERRORS only; warnings are reported, not blocking
+    # (3 deliberately-deferred warnings remain, incl. one in security-critical
+    # anti-rollback code). Tighten to --max-warnings 0 only after those clear.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: ESLint (src/)
+        working-directory: server
+        run: npm run lint
