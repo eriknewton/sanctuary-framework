@@ -1,0 +1,65 @@
+# Dependabot — automated dependency-update + security PRs.
+# Added 2026-06-14 (no automated dependency/CVE hygiene existed; the kad-dht CVE
+# #524 was caught and fixed by hand). Minor/patch updates are GROUPED per
+# ecosystem so routine bumps arrive as one PR, not dozens; security updates
+# always open individually and promptly.
+version: 2
+updates:
+  # The TypeScript MCP server — the product, and the main attack surface.
+  - package-ecosystem: "npm"
+    directory: "/server"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels: ["dependencies"]
+    groups:
+      server-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Repo root tooling.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    groups:
+      root-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Peripheral npm packages — monthly, grouped (lower churn).
+  - package-ecosystem: "npm"
+    directory: "/menubar"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    groups:
+      menubar-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directory: "/quickstart"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    groups:
+      quickstart-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # The Concordia Python sidecar.
+  - package-ecosystem: "pip"
+    directory: "/sidecars/concordia"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  # The GitHub Actions workflows themselves (pin/update action versions).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
