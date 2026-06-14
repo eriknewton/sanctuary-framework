@@ -4,7 +4,9 @@
  * Bridges the socket server's verified {@link SupervisorRequest}s to the
  * {@link Supervisor} lifecycle. This is where the transient key is decoded
  * from the protect frame into raw bytes and handed to the supervisor as a
- * {@link SupervisionSpec}; the supervisor zeroes it after launch.
+ * {@link SupervisionSpec}. Residency (honest — codex S1): the supervisor zeroes
+ * the key on a failed/refused launch, but RETAINS it for the agent lifetime on
+ * a successful launch (Tier A crash-restart), zeroing it on unprotect/shutdown.
  *
  * The handler is fail-closed and never leaks the key: a malformed transient
  * key is a `bad_request`, an unknown agent is `not_found`, and any unexpected
@@ -47,10 +49,15 @@ export function makeSupervisorHandler(
           return { ok: false, kind: "error", reason: "bad_request" };
         }
         // Buffer's base64 decode is lenient (it drops invalid chars rather
-        // than throwing), so a garbage string can yield non-empty bytes.
-        // Require a strict round-trip: the decoded bytes must re-encode to the
-        // exact input, rejecting any malformed transient key.
+        // than throwing), so a garbage string can yield non-empty bytes — in
+        // fact a VALID key plus a trailing junk char still decodes to the real
+        // key bytes. Require a strict round-trip: the decoded bytes must
+        // re-encode to the exact input, rejecting any malformed transient key.
         if (transientKey.length === 0 || toBase64url(transientKey) !== req.transient_key_b64) {
+          // Codex S1 R8: a malformed-but-decodable key already materialized real
+          // (possibly master-equivalent) bytes — zero them before rejecting so a
+          // rejected protect leaves NO key bytes resident (honest custody #7).
+          transientKey.fill(0);
           return { ok: false, kind: "error", reason: "bad_request" };
         }
         const spec: SupervisionSpec = {

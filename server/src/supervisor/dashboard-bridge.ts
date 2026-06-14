@@ -12,9 +12,27 @@
  * Custody note (Tier A): the bridge reuses the master ALREADY in the
  * dashboard's memory — no new credential is introduced and nothing extra is
  * written to disk. The transient key is base64url-encoded into a single
- * MAC-authenticated frame and dropped from the dashboard's heap as soon as the
- * frame is sent. If no master is resolvable (fortress locked), the bridge fails
- * closed with `forbidden` — it never launches an agent it cannot unlock.
+ * MAC-authenticated frame and sent over the local socket. If no master is
+ * resolvable (fortress locked), the bridge fails closed with `forbidden` — it
+ * never launches an agent it cannot unlock.
+ *
+ * HEAP-RESIDENCY HONESTY (codex S1 finding #3 — do NOT over-claim): this bridge
+ * does NOT and cannot zero the key from the dashboard's heap. Two reasons, both
+ * by design, not oversight:
+ *   1. The `key` returned by `resolveTransientKey()` IS the dashboard's own
+ *      resident master buffer (Tier A reuses it); the dashboard still needs it
+ *      to read the audit log / identities, so the bridge must NOT zero it.
+ *   2. The base64url encoding (`transientKeyB64`) is an immutable JS string and
+ *      cannot be wiped; it lingers until GC. This is the unavoidable cost of
+ *      marshalling a key through a string/JSON frame in a managed runtime.
+ * The blast-radius win this bridge delivers is SPLIT-PROCESS (the agent SPAWNER
+ * lives in a separate supervisor process — review H1), NOT "the dashboard heap
+ * holds no key material." The dashboard already holds the resident master for
+ * its read surface (dashboard-standalone.ts), exactly as the ratified spec
+ * prescribes ("the dashboard keeps the one-time unlock... as today"). The
+ * resident-master exposure window of the dashboard process is the H2 concern,
+ * tracked separately (core-dump/swap/ptrace hardening), and is unchanged by
+ * this bridge — it neither widens nor narrows it.
  */
 
 import { toBase64url } from "../core/encoding.js";

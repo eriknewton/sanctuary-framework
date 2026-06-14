@@ -5,8 +5,15 @@
  * surface) uses this to hand the supervisor a protect/unprotect/status request
  * over the authenticated `AF_UNIX` socket. It sends ONE MAC-authenticated,
  * length-bounded frame and reads ONE response, then closes. The transient key
- * travels only inside the protect frame and is dropped from the dashboard's
- * heap as soon as the frame is on the wire.
+ * travels only inside the protect frame.
+ *
+ * Heap-residency honesty (do NOT over-claim — codex S1): the key is NOT
+ * "dropped from the dashboard's heap as soon as the frame is on the wire." The
+ * key the bridge passes in IS the dashboard's resident master buffer (Tier A
+ * reuses it for the read surface, so it stays live by design), and the
+ * base64url frame copy is an immutable JS string that cannot be wiped and
+ * lingers until GC. The blast-radius win is split-process (the spawner lives in
+ * a separate process — review H1), not "no key material in the dashboard heap."
  */
 
 import { connect, type Socket } from "node:net";
