@@ -63,7 +63,7 @@
     "@libp2p/mdns": "11.0.47",
     "@libp2p/peer-id": "5.1.9",
     "@libp2p/ping": "3.1.7",
-    "@libp2p/tcp": "10.1.19",
+    "@libp2p/tcp": "11.0.22",
     "@modelcontextprotocol/sdk": "1.29.0",
     "@multiformats/multiaddr": "12.5.1",
     "@noble/ciphers": "2.2.0",
