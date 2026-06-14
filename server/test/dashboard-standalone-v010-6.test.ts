@@ -264,4 +264,191 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
         "Otherwise remote/non-loopback deployments would skip auth entirely."
     ).toBe(true);
   });
+
+  // legacy-dashboard-approval-route: the legacy /v1.0 dashboard approve/deny
+  // buttons formerly called the GET-only `fetchAPI` helper, but the server
+  // dispatches approval DECISIONS on POST (and requires the operator token
+  // even on loopback auto-auth, per PR #525). A GET 404s, so the buttons
+  // were dead. They must instead emit a token-bearing POST so they hit the
+  // same token-gated decision surface as the v1.1 fortress view.
+  describe("legacy dashboard approve/deny buttons emit a token-bearing POST", () => {
+    const html = generateDashboardHTML({
+      timeoutSeconds: 60,
+      serverVersion: "approval-route-test",
+      loopbackAutoAuth: true,
+    } as Parameters<typeof generateDashboardHTML>[0]);
+
+    it("defines a POST helper that attaches the operator bearer token", () => {
+      // A helper that issues method:'POST' with the AUTH_TOKEN bearer header.
+      const postHelperRe =
+        /async\s+function\s+postAPI\s*\([\s\S]*?method:\s*'POST'[\s\S]*?'Authorization':\s*'Bearer\s*'\s*\+\s*AUTH_TOKEN/;
+      expect(
+        postHelperRe.test(html),
+        "the legacy dashboard must define a POST helper that sends the operator " +
+          "bearer token, so approval decisions go through the #525 requireToken gate."
+      ).toBe(true);
+    });
+
+    it("approve/deny click handlers call the POST helper, not the GET fetchAPI", () => {
+      // Approve handler routes through postAPI('/api/approve/...').
+      expect(
+        /postAPI\(\s*`\/api\/approve\//.test(html),
+        "the approve button must POST to /api/approve/:id via the token-bearing helper."
+      ).toBe(true);
+      // Deny handler routes through postAPI('/api/deny/...').
+      expect(
+        /postAPI\(\s*`\/api\/deny\//.test(html),
+        "the deny button must POST to /api/deny/:id via the token-bearing helper."
+      ).toBe(true);
+      // Regression guard: the dead GET path (fetchAPI against the decision
+      // routes) must be gone — a GET 404s and the button never approves.
+      expect(
+        /fetchAPI\(\s*`\/api\/approve\//.test(html),
+        "the approve button must NOT use the GET-only fetchAPI (it 404s against the POST-only route)."
+      ).toBe(false);
+      expect(
+        /fetchAPI\(\s*`\/api\/deny\//.test(html),
+        "the deny button must NOT use the GET-only fetchAPI (it 404s against the POST-only route)."
+      ).toBe(false);
+    });
+
+    // Token-required-by-design recovery (codex MUST-FIX follow-up): on a
+    // fresh loopback-auto-auth session the page is admitted WITHOUT a token,
+    // so AUTH_TOKEN === '' and the approval POST hits the server's
+    // requireToken gate and returns 401. A redirect to '/' is a DEAD END
+    // under loopback auto-auth (the server serves the dashboard, never the
+    // login form), so postAPI must instead prompt for the operator token,
+    // persist it, and RETRY the decision once with that token — keeping the
+    // action token-gated while giving the operator a real path to approve.
+    function extractPostAPI(): string {
+      const postFn = /async function postAPI\(endpoint\)\s*\{[\s\S]*?\n {4}\}/.exec(html);
+      expect(postFn, "HTML must define the postAPI helper").not.toBeNull();
+      return postFn![0];
+    }
+
+    it("on 401, postAPI prompts for the operator token and RETRIES the POST with it", () => {
+      const simulated = `
+        const API_BASE = '';
+        const AUTH_TOKEN = '';
+        const stored = {};
+        const sessionStorage = {
+          getItem: (k) => stored[k] || null,
+          setItem: (k, v) => { stored[k] = v; },
+          removeItem: (k) => { delete stored[k]; },
+        };
+        let didRedirect = false;
+        function redirectToLogin() { didRedirect = true; }
+        const window = { prompt: () => 'operator-token-xyz', location: { href: '' } };
+        const calls = [];
+        async function fetch(url, opts) {
+          const token = opts.headers['Authorization'].replace('Bearer ', '');
+          calls.push({ method: opts.method, token });
+          // First (tokenless) attempt 401s; the retry WITH the token succeeds.
+          if (!token) return { status: 401, ok: false, json: async () => ({}) };
+          return { status: 200, ok: true, json: async () => ({ ok: true }) };
+        }
+        ${extractPostAPI()}
+        return (async () => {
+          const result = await postAPI('/api/approve/abc');
+          return JSON.stringify({
+            calls, didRedirect, result, storedToken: stored.authToken,
+          });
+        })();
+      `;
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      const runner = new Function(simulated);
+      return (runner() as Promise<string>).then((raw) => {
+        const out = JSON.parse(raw);
+        // Both calls were POSTs (never a GET), and the retry carried the token.
+        expect(out.calls.map((c: { method: string }) => c.method)).toEqual(["POST", "POST"]);
+        expect(out.calls[0].token, "first attempt is the empty AUTH_TOKEN").toBe("");
+        expect(
+          out.calls[1].token,
+          "the retry must carry the operator-entered token, going THROUGH the requireToken gate."
+        ).toBe("operator-token-xyz");
+        expect(out.storedToken, "the entered token is persisted for subsequent calls").toBe(
+          "operator-token-xyz"
+        );
+        expect(out.didRedirect, "a successful retry must not redirect").toBe(false);
+        expect(out.result).toEqual({ ok: true });
+      });
+    });
+
+    it("on a rejected token, postAPI re-prompts (no dead-end redirect) and succeeds with a valid token", () => {
+      const simulated = `
+        const API_BASE = '';
+        const AUTH_TOKEN = '';
+        const stored = {};
+        const sessionStorage = {
+          getItem: (k) => stored[k] || null,
+          setItem: (k, v) => { stored[k] = v; },
+          removeItem: (k) => { delete stored[k]; },
+        };
+        let didRedirect = false;
+        function redirectToLogin() { didRedirect = true; }
+        // First prompt yields a bad token, second yields the valid one.
+        const answers = ['bad-token', 'good-token'];
+        let pi = 0;
+        const window = { prompt: () => answers[pi++], location: { href: '' } };
+        const calls = [];
+        async function fetch(url, opts) {
+          const token = opts.headers['Authorization'].replace('Bearer ', '');
+          calls.push(token);
+          if (token === 'good-token') return { status: 200, ok: true, json: async () => ({ ok: true }) };
+          return { status: 401, ok: false, json: async () => ({}) };
+        }
+        ${extractPostAPI()}
+        return (async () => {
+          const result = await postAPI('/api/deny/abc');
+          return JSON.stringify({ calls, didRedirect, result, storedToken: stored.authToken });
+        })();
+      `;
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      const runner = new Function(simulated);
+      return (runner() as Promise<string>).then((raw) => {
+        const out = JSON.parse(raw);
+        // tokenless -> 401, bad-token -> 401, good-token -> 200.
+        expect(out.calls).toEqual(["", "bad-token", "good-token"]);
+        expect(out.didRedirect, "the re-prompt path must NOT dead-end via redirect").toBe(false);
+        expect(out.storedToken).toBe("good-token");
+        expect(out.result).toEqual({ ok: true });
+      });
+    });
+
+    it("on 401, dismissing the token prompt leaves the op pending (safe no-op, never auto-approve)", () => {
+      const simulated = `
+        const API_BASE = '';
+        const AUTH_TOKEN = '';
+        const stored = {};
+        const sessionStorage = {
+          getItem: (k) => stored[k] || null,
+          setItem: (k, v) => { stored[k] = v; },
+          removeItem: (k) => { delete stored[k]; },
+        };
+        let didRedirect = false;
+        function redirectToLogin() { didRedirect = true; }
+        // Operator cancels the prompt.
+        const window = { prompt: () => null, location: { href: '' } };
+        let callCount = 0;
+        async function fetch(url, opts) {
+          callCount++;
+          return { status: 401, ok: false, json: async () => ({}) };
+        }
+        ${extractPostAPI()}
+        return (async () => {
+          const result = await postAPI('/api/approve/abc');
+          return JSON.stringify({ callCount, result, storedToken: stored.authToken || null });
+        })();
+      `;
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      const runner = new Function(simulated);
+      return (runner() as Promise<string>).then((raw) => {
+        const out = JSON.parse(raw);
+        // Exactly one (tokenless) attempt, no retry, no decision recorded.
+        expect(out.callCount, "no retry when the operator dismisses the prompt").toBe(1);
+        expect(out.result, "dismissed prompt => no decision (op stays pending)").toBeNull();
+        expect(out.storedToken).toBeNull();
+      });
+    });
+  });
 });

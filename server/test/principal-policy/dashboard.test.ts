@@ -583,6 +583,47 @@ describe("Principal Dashboard", () => {
       const res = await fetch(`http://127.0.0.1:${autoPort}/api/status`);
       expect(res.status).toBe(200);
     });
+
+    // legacy-dashboard-approval-route: the approval DECISION routes are
+    // dispatched POST-only. There is no live GET handler, so a GET can never
+    // release a Tier-1 op — closing any residual "self-approve via GET"
+    // door that the POST-only requireToken gate would not cover. This locks
+    // the absence in: a GET to /api/approve/:id (even WITH the operator token)
+    // must not approve, and the op must stay pending.
+    it("a GET to /api/approve/:id never approves (POST-only decision surface, no GET door)", async () => {
+      const approvalPromise = autoDashboard.requestApproval(makeReq());
+      const pending = await (
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+      ).json();
+      expect(pending).toHaveLength(1);
+
+      // GET — the legacy buttons USED to emit this (via the GET-only
+      // fetchAPI helper). It must NOT resolve the decision. Even with the
+      // operator token attached, there is no GET handler to honor it.
+      const getRes = await fetch(
+        `http://127.0.0.1:${autoPort}/api/approve/${pending[0].id}`,
+        { method: "GET", headers: { Authorization: `Bearer ${AUTH_TOKEN}` } },
+      );
+      expect(getRes.status).toBe(404);
+      // The Tier-1 op must remain pending: no GET self-approval occurred.
+      expect(autoDashboard.pendingCount).toBe(1);
+
+      void approvalPromise.catch(() => undefined);
+    });
+
+    it("a GET to /api/deny/:id never denies (POST-only decision surface, no GET door)", async () => {
+      const approvalPromise = autoDashboard.requestApproval(makeReq());
+      const pending = await (
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+      ).json();
+      const getRes = await fetch(
+        `http://127.0.0.1:${autoPort}/api/deny/${pending[0].id}`,
+        { method: "GET", headers: { Authorization: `Bearer ${AUTH_TOKEN}` } },
+      );
+      expect(getRes.status).toBe(404);
+      expect(autoDashboard.pendingCount).toBe(1);
+      void approvalPromise.catch(() => undefined);
+    });
   });
 
   // ── No-auth mode (backward compatibility) ──────────────────────────

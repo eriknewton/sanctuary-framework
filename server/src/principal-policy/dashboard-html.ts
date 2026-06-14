@@ -1919,6 +1919,71 @@ export function generateDashboardHTML(options: {
       }
     }
 
+    // Approval DECISION calls (approve/deny) release a Tier-1 op, so the
+    // server dispatches them on POST and requires the operator bearer token
+    // even on loopback auto-auth (see dashboard.ts isLegacyApprovalDecision /
+    // checkAuth requireToken). fetchAPI above issues a GET, which 404s against
+    // those POST-only routes — using it here left the legacy buttons dead.
+    // This helper issues the matching token-bearing POST so the buttons go
+    // through the same token-gated decision surface as the v1.1 fortress view.
+    //
+    // Token requirement is by design: under loopback auto-auth the page is
+    // admitted for read-only data WITHOUT a token (LOOPBACK_AUTH), but a
+    // co-resident agent must not be able to self-approve, so the decision
+    // gate still demands the operator token. When AUTH_TOKEN is empty (a
+    // fresh loopback session that never logged in) the POST returns 401.
+    //
+    // We cannot recover by redirecting to the login page: under loopback
+    // auto-auth the server treats the loopback caller as authenticated, so
+    // both '/' and '/v1.0' serve the dashboard, never the login form — the
+    // operator would have no way to supply a token. Instead, on 401 we prompt
+    // for the operator token inline, persist it to sessionStorage, and retry
+    // the decision ONCE with that token. This keeps the action token-gated
+    // (the server still enforces requireToken) while giving the operator a
+    // real path to approve. If they dismiss the prompt, the decision is left
+    // pending — a safe no-op, never an auto-approve.
+    async function postAPI(endpoint) {
+      const send = (token) =>
+        fetch(API_BASE + endpoint, {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + token,
+          },
+        });
+      try {
+        let response = await send(AUTH_TOKEN);
+
+        // On 401, prompt for the operator token and retry. We re-prompt on a
+        // rejected token rather than redirecting: under loopback auto-auth a
+        // redirect to '/' is a dead end (the server serves the dashboard, not
+        // the login form), so the inline prompt is the only path that reaches
+        // a valid token. Each retry still hits the server requireToken gate —
+        // the client never self-authorizes. A dismissed prompt leaves the op
+        // pending (safe no-op, never an auto-approve).
+        let prompt = 'Operator token required to record this decision. Paste your operator token:';
+        while (response.status === 401) {
+          const entered = (window.prompt(prompt) || '').trim();
+          if (!entered) {
+            // Operator dismissed the prompt — leave the op pending.
+            return null;
+          }
+          sessionStorage.setItem('authToken', entered);
+          response = await send(entered);
+          prompt = 'That token was rejected. Paste a valid operator token, or cancel to leave this decision pending:';
+        }
+
+        if (!response.ok) {
+          console.error('API Error:', response.status);
+          return null;
+        }
+
+        return await response.json();
+      } catch (err) {
+        console.error('Fetch error:', err);
+        return null;
+      }
+    }
+
     function redirectToLogin() {
       sessionStorage.removeItem('authToken');
       window.location.href = '/';
@@ -2511,14 +2576,14 @@ export function generateDashboardHTML(options: {
       document.querySelectorAll('.pending-approve').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const id = btn.getAttribute('data-id');
-          await fetchAPI(\`/api/approve/\${id}\`);
+          await postAPI(\`/api/approve/\${id}\`);
         });
       });
 
       document.querySelectorAll('.pending-deny').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const id = btn.getAttribute('data-id');
-          await fetchAPI(\`/api/deny/\${id}\`);
+          await postAPI(\`/api/deny/\${id}\`);
         });
       });
     }
