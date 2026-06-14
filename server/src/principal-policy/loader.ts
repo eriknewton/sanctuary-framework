@@ -418,9 +418,34 @@ function parseApprovalRedirect(raw: unknown): ApprovalRedirectConfig {
 
 /**
  * Generate the default policy file content as YAML.
+ *
+ * Drift invariant: the tier1 / tier2 / tier3 / approval-channel / approval-redirect
+ * BODIES are rendered directly from the canonical in-memory constants
+ * (`DEFAULT_POLICY`, `DEFAULT_TIER2`, `DEFAULT_CHANNEL`, `DEFAULT_APPROVAL_REDIRECT`)
+ * rather than hand-maintained here. This makes it structurally impossible for the
+ * generated YAML to omit a Tier-1 op that the canonical list declares. The prior
+ * behavior, where ~8 Tier-1 ops (decommission_certificate, federation_node_join,
+ * sanctuary_forget, sanctuary_compound_execute, sanctuary_audit_search_widen,
+ * sdw_export, sdw_import, sdw_export_delete) were missing from the hand-written YAML
+ * and only landed at Tier 1 via the unclassified→Tier-1 safe default, was
+ * correct-by-accident: one careless edit to that safe default would have silently
+ * relaxed them. The prose section comments are still authored here (operator-facing
+ * docs); only the op lists and scalar values come from the canonical source.
+ * `loader-default-yaml-drift.test.ts` asserts the round-trip equality as a
+ * regression guard.
+ *
+ * Exported solely so the drift-guard test can render the YAML without touching
+ * the filesystem; it has no other caller outside this module.
  */
-function generateDefaultPolicyYaml(): string {
-  return `# Sanctuary Principal Policy v1
+export function generateDefaultPolicyYaml(): string {
+  const listBlock = (ops: readonly string[]): string =>
+    ops.map((op) => `  - ${op}`).join("\n");
+
+  const t2 = DEFAULT_TIER2;
+  const ch = DEFAULT_CHANNEL;
+  const ar = DEFAULT_APPROVAL_REDIRECT;
+
+  return `# Sanctuary Principal Policy v${DEFAULT_POLICY.version}
 # This file controls what your agent can do without asking.
 # Edit this file directly. Your agent cannot modify it.
 # Changes take effect on server restart.
@@ -430,107 +455,36 @@ function generateDefaultPolicyYaml(): string {
 # Optional keys (omit to use defaults; new defaults merge automatically):
 #   tier2_anomaly, tier3_always_allow
 
-version: 1
+version: ${DEFAULT_POLICY.version}
 
 # ─── Tier 1: Always Requires Approval ────────────────────────────────────
 # These operations ALWAYS require your explicit approval.
 # They are inherently high-risk regardless of context.
 tier1_always_approve:
-  - state_export
-  - state_import
-  - state_delete
-  - identity_sign
-  - identity_rotate
-  - reputation_import
-  - reputation_export
-  - bootstrap_provide_guarantee
-  - sovereignty_profile_update
-  - governor_reset
-  - sanctuary_bootstrap
-  - sanctuary_export_identity_bundle
-  - exit_bundle_export
-  - exit_bundle_import
-  - exit_bundle_import_activate
-  - exit_bundle_rekey
-  - policy_change
-  - lockdown
-  - unwrap
-  - principal_policy_view
-  - principal_baseline_view
-  - sanctuary_policy_status
-  - context_gate_set_policy
-  - context_gate_apply_template
+${listBlock(DEFAULT_POLICY.tier1_always_approve)}
 
 # ─── Tier 2: Behavioral Anomaly Detection ────────────────────────────────
 # Triggers approval when agent behavior deviates from its baseline.
 # Options for each setting: approve | log | allow
 tier2_anomaly:
-  new_namespace_access: approve
-  new_counterparty: approve
-  frequency_spike_multiplier: 5
-  max_signs_per_minute: 10
-  bulk_read_threshold: 20
-  first_session_policy: approve
+  new_namespace_access: ${t2.new_namespace_access}
+  new_counterparty: ${t2.new_counterparty}
+  frequency_spike_multiplier: ${t2.frequency_spike_multiplier}
+  max_signs_per_minute: ${t2.max_signs_per_minute}
+  bulk_read_threshold: ${t2.bulk_read_threshold}
+  first_session_policy: ${t2.first_session_policy}
 
 # ─── Tier 3: Always Allowed (Audit Only) ─────────────────────────────────
 # These operations never require approval but are always logged.
 tier3_always_allow:
-  - state_read
-  - state_write
-  - state_list
-  - identity_create
-  - identity_list
-  - identity_verify
-  - proof_commitment
-  - proof_reveal
-  - disclosure_set_policy
-  - disclosure_evaluate
-  - reputation_record
-  - reputation_query
-  - bootstrap_create_escrow
-  - exec_attest
-  - monitor_health
-  - monitor_audit_log
-  - manifest
-  - shr_generate
-  - shr_verify
-  - handshake_initiate
-  - handshake_respond
-  - handshake_complete
-  - handshake_status
-  - handshake_exchange
-  - handshake_verify_attestation
-  - handshake_abort
-  - reputation_query_weighted
-  - federation_peers
-  - federation_trust_evaluate
-  - federation_status
-  - zk_commit
-  - zk_prove
-  - zk_verify
-  - zk_range_prove
-  - zk_range_verify
-  - context_gate_recommend
-  - context_gate_filter
-  - context_gate_list_policies
-  - sovereignty_audit
-  - audit_export_siem
-  - shr_gateway_export
-  - bridge_commit
-  - bridge_verify
-  - bridge_attest
-  - sovereignty_profile_get
-  - governor_status
-  - reputation_publish
-  - memory_attest
-  - compliance_generate_eu_ai_act_bundle
-  - compliance_eu_ai_act_annex_iii_classify
+${listBlock(DEFAULT_POLICY.tier3_always_allow)}
+
 # ─── Approval Channel ────────────────────────────────────────────────────
 # How Sanctuary reaches you when approval is needed.
 # NOTE: Timeout always results in denial. This is not configurable (SEC-002).
 approval_channel:
-  type: stderr
-  timeout_seconds: 300
+  type: ${ch.type}
+  timeout_seconds: ${ch.timeout_seconds}
 
 # ─── Approval Redirect (v1.3 WP-V1.3-10 Upsilon-2) ───────────────────────
 # Cross-harness approval-inbox redirect. When enabled, Tier 1/2 approvals
@@ -544,8 +498,8 @@ approval_channel:
 #            wins. Right shape for harnesses that cannot fully suppress
 #            their local approval prompt (e.g. Mastra-class).
 approval_redirect:
-  enabled: false
-  mode: replace
+  enabled: ${ar.enabled}
+  mode: ${ar.mode}
 `;
 }
 

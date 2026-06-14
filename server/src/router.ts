@@ -209,6 +209,18 @@ export function createServer(
         approvalRef ? { approval_ref: approvalRef } : undefined
       );
       if (!result.allowed) {
+        // OPACITY NOTE (Invariant #7, policy-surface sweep 2026-06-13): this hint
+        // is a deliberate 2-valued agent-facing UX affordance, not a leak of policy
+        // internals. "request_review" tells the agent to seek human approval;
+        // "try_lower_scope" tells it to reduce scope / drop an injected arg and
+        // retry. That lets the agent self-correct instead of blindly retrying. It
+        // distinguishes exactly ONE bit — "needs approval" vs "scope/injection
+        // blocked" — i.e. which enforcement LAYER fired. It never reveals the
+        // matched rule, the tier, the anomaly threshold, the namespace, or any
+        // other policy detail (those stay in the audit record only). Collapsing
+        // this to a single fixed hint would trade that self-correction affordance
+        // for marginally tighter opacity; that is a product/opacity call flagged
+        // for Erik (collapse-vs-keep). Behavior is intentionally UNCHANGED here.
         const errorPayload = fixedDenial(
           `audit:gate:${name}`,
           result.approval_required ? "request_review" : "try_lower_scope",
