@@ -6,6 +6,8 @@ import { Writable } from "node:stream";
 
 import {
   CASTLE_WALL_BOOT_LABEL,
+  bootServiceInstalled,
+  deriveHomebrewStableBinDir,
   parseBootArgs,
   renderBootLaunchDaemonPlist,
   runInstallBoot,
@@ -166,6 +168,35 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).toThrow(/absolute/);
     });
 
+    it("also prepends the stable symlink dir behind the interpreter dir (#450 item 2: brew-upgrade durability)", () => {
+      // nodeBinDir is the version-pinned Cellar keg (vanishes on `brew upgrade
+      // node`); stableBinDir is the prefix symlink dir that survives the upgrade.
+      // Both must be on PATH, with the exact interpreter first.
+      const plist = renderBootLaunchDaemonPlist({
+        ...base,
+        nodeBinDir: "/opt/homebrew/Cellar/node/25.8.2/bin",
+        stableBinDir: "/opt/homebrew/bin",
+      });
+      expect(plist).toContain(
+        "<string>/opt/homebrew/Cellar/node/25.8.2/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+      );
+    });
+
+    it("dedupes the stable dir against the interpreter dir and rejects a relative stable dir", () => {
+      // If both resolve to the same dir, it appears once.
+      const plist = renderBootLaunchDaemonPlist({
+        ...base,
+        nodeBinDir: "/opt/homebrew/bin",
+        stableBinDir: "/opt/homebrew/bin",
+      });
+      expect(plist).toContain(
+        "<string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>",
+      );
+      expect(() =>
+        renderBootLaunchDaemonPlist({ ...base, stableBinDir: "opt/homebrew/bin" }),
+      ).toThrow(/absolute/);
+    });
+
     it("XML-escapes paths with special characters", () => {
       const plist = renderBootLaunchDaemonPlist({
         ...base,
@@ -221,6 +252,88 @@ describe("castle-wall boot service (F1 Option C)", () => {
           programArguments: ["/usr/bin/x", "--safe-mode", "a\nb"],
         }),
       ).toThrow(/control characters/);
+    });
+  });
+
+  describe("deriveHomebrewStableBinDir (#450 item 2)", () => {
+    it("maps a Cellar keg interpreter to the prefix's stable bin dir", () => {
+      expect(
+        deriveHomebrewStableBinDir("/opt/homebrew/Cellar/node/25.8.2/bin/node"),
+      ).toBe("/opt/homebrew/bin");
+      expect(
+        deriveHomebrewStableBinDir("/usr/local/Cellar/node/24.0.0/bin/node"),
+      ).toBe("/usr/local/bin");
+    });
+
+    it("returns null for non-Cellar interpreters (system node, nvm, already-stable)", () => {
+      expect(deriveHomebrewStableBinDir("/usr/bin/node")).toBeNull();
+      expect(deriveHomebrewStableBinDir("/opt/homebrew/bin/node")).toBeNull();
+      expect(
+        deriveHomebrewStableBinDir("/Users/op/.nvm/versions/node/v22.0.0/bin/node"),
+      ).toBeNull();
+      // A leading /Cellar/ with no prefix is not a real keg path.
+      expect(deriveHomebrewStableBinDir("/Cellar/node/bin/node")).toBeNull();
+    });
+
+    it("refuses to derive from an UNTRUSTED Cellar prefix (codex MED: root-PATH escalation)", () => {
+      // An operator-writable `/Cellar/`-shaped prefix must never put a fallback
+      // dir on the ROOT boot daemon PATH.
+      expect(
+        deriveHomebrewStableBinDir("/Users/op/Cellar/node/25.8.2/bin/node"),
+      ).toBeNull();
+      expect(
+        deriveHomebrewStableBinDir("/tmp/evil/Cellar/node/1/bin/node"),
+      ).toBeNull();
+    });
+  });
+
+  describe("bootServiceInstalled (#450 item 5 / codex: validate, not just file-exists)", () => {
+    const validPlist = renderBootLaunchDaemonPlist({
+      programArguments: [
+        "/usr/local/bin/node",
+        "/opt/sanctuary/dist/cli.js",
+        "castle-wall",
+        "daemon",
+        "--safe-mode",
+        "--launchd",
+      ],
+      fortressPath: "/Users/operator/.sanctuary",
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+    });
+
+    it("returns true for a well-formed boot-survival plist", async () => {
+      const path = join(await makeTemp("f1-plist-"), "boot.plist");
+      await writeFile(path, validPlist);
+      expect(await bootServiceInstalled(path)).toBe(true);
+    });
+
+    it("returns false when the plist is absent", async () => {
+      const path = join(await makeTemp("f1-plist-"), "missing.plist");
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for a wrong-label plist (file-exists is not enough)", async () => {
+      const path = join(await makeTemp("f1-plist-"), "wrong.plist");
+      await writeFile(path, validPlist.replace(CASTLE_WALL_BOOT_LABEL, "com.evil.other"));
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for a plist missing --safe-mode (would run the wrong mode)", async () => {
+      const path = join(await makeTemp("f1-plist-"), "nomode.plist");
+      await writeFile(path, validPlist.replace("<string>--safe-mode</string>", ""));
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for a plist with RunAtLoad disabled", async () => {
+      const path = join(await makeTemp("f1-plist-"), "norunatload.plist");
+      await writeFile(
+        path,
+        validPlist.replace(
+          "<key>RunAtLoad</key>\n\t<true/>",
+          "<key>RunAtLoad</key>\n\t<false/>",
+        ),
+      );
+      expect(await bootServiceInstalled(path)).toBe(false);
     });
   });
 

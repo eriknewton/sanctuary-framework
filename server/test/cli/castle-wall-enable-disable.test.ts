@@ -128,6 +128,56 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("enable refuses when no persistent boot service is installed (#450 item 5 composition guard)", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    // Daemon is reachable NOW (passes the first gate), but no boot service is
+    // installed: arming would brick on the next reboot. The guard must refuse.
+    const code = await runEnable(["--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: async () => false,
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("no persistent Castle Wall boot service is installed");
+    expect(err.text()).toContain("install-boot");
+    // Never reaches the host app: nothing armed.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable --force bypasses the boot-service composition guard (#450 item 5)", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+      bootServiceInstalledProbe: async () => {
+        throw new Error("boot-service probe must not run under --force");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+  });
+
   it("enable --force bypasses the daemon gate and verifies via status", async () => {
     const { hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();
@@ -174,6 +224,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
+      bootServiceInstalledProbe: async () => true,
     });
     expect(code).toBe(0);
 
@@ -239,6 +290,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
+      bootServiceInstalledProbe: async () => true,
     });
 
     expect(code).toBe(3);
@@ -544,6 +596,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
+      bootServiceInstalledProbe: async () => true,
       sysextProbe: async () => "[activated enabled]",
     });
 
@@ -571,6 +624,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
+      bootServiceInstalledProbe: async () => true,
       sysextProbe: async () => "[activated disabled]",
     });
 

@@ -172,6 +172,46 @@ export interface BootPlistOptions {
    * dev/test where the program path is already an absolute interpreter.
    */
   nodeBinDir?: string;
+  /**
+   * Absolute STABLE symlink bin dir to also prepend (e.g. `/opt/homebrew/bin`),
+   * after `nodeBinDir`. `nodeBinDir` typically resolves to a version-pinned
+   * Homebrew Cellar keg dir (`.../Cellar/node/<version>/bin`) which DISAPPEARS on
+   * `brew upgrade node` — silently re-bricking boot. The Homebrew prefix's `bin`
+   * is a stable symlink the package manager re-points at the new version, so
+   * including it is the durability belt to `nodeBinDir`'s suspenders. Derive it
+   * with {@link deriveHomebrewStableBinDir}. Omitted when there is no separate
+   * stable dir (system node / nvm / already-stable interpreter).
+   */
+  stableBinDir?: string;
+}
+
+/**
+ * The only Homebrew prefixes whose `bin` we will put on the ROOT boot daemon's
+ * PATH: the canonical Apple-Silicon and Intel locations, both root-owned by a
+ * normal install. Any other `/Cellar/`-shaped prefix (e.g. one under an
+ * operator-writable home) is NOT trusted — adding an operator-writable dir to a
+ * root daemon's PATH is a privilege-escalation vector (codex 2026-06-14, MED).
+ */
+const TRUSTED_HOMEBREW_PREFIXES = ["/opt/homebrew", "/usr/local"] as const;
+
+/**
+ * Derive the STABLE Homebrew symlink bin dir from a node interpreter path that
+ * lives inside a version-pinned Cellar keg under a TRUSTED Homebrew prefix:
+ *   /opt/homebrew/Cellar/node/25.8.2/bin/node  ->  /opt/homebrew/bin
+ *   /usr/local/Cellar/node/25.8.2/bin/node     ->  /usr/local/bin
+ * The Cellar `bin` dir is version-pinned and vanishes on `brew upgrade node`;
+ * the prefix's `bin` is a stable symlink Homebrew re-points at the new version.
+ * Returns null when the interpreter is NOT under a TRUSTED Cellar keg (system
+ * node, nvm, an already-stable symlink path, or a `/Cellar/` segment under any
+ * untrusted/operator-writable prefix) — there is no safe stable dir to add.
+ */
+export function deriveHomebrewStableBinDir(interpreterPath: string): string | null {
+  for (const prefix of TRUSTED_HOMEBREW_PREFIXES) {
+    if (interpreterPath.startsWith(`${prefix}/Cellar/`)) {
+      return `${prefix}/bin`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -231,17 +271,23 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   // crash-loops, never starting — the box stays bricked at boot. Prepend the
   // interpreter's directory so the shim resolves its node. Fail-closed at render
   // time if a bad value is passed.
-  const basePathDirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-  let pathDirs = basePathDirs;
-  if (opts.nodeBinDir !== undefined) {
-    if (!isAbsolute(opts.nodeBinDir)) {
-      throw new Error(`Node interpreter dir must be absolute (got: ${opts.nodeBinDir}).`);
+  const pathDirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  // Prepend interpreter dirs (validated, deduped). Apply stableBinDir first then
+  // nodeBinDir so the final order is [nodeBinDir, stableBinDir, ...base]: the
+  // exact running interpreter wins while present, with the stable symlink dir as
+  // the `brew upgrade node` survival fallback right behind it.
+  const prependPathDir = (dir: string | undefined, what: string): void => {
+    if (dir === undefined) return;
+    if (!isAbsolute(dir)) {
+      throw new Error(`${what} must be absolute (got: ${dir}).`);
     }
-    assertNoControlChars(opts.nodeBinDir, "node interpreter dir");
-    if (!basePathDirs.includes(opts.nodeBinDir)) {
-      pathDirs = [opts.nodeBinDir, ...basePathDirs];
+    assertNoControlChars(dir, what);
+    if (!pathDirs.includes(dir)) {
+      pathDirs.unshift(dir);
     }
-  }
+  };
+  prependPathDir(opts.stableBinDir, "stable interpreter dir");
+  prependPathDir(opts.nodeBinDir, "node interpreter dir");
   const envEntries: Array<[string, string]> = [
     ["PATH", pathDirs.join(":")],
     ["SANCTUARY_STORAGE_PATH", opts.fortressPath],
@@ -294,6 +340,37 @@ ${envXml}
 </dict>
 </plist>
 `;
+}
+
+/**
+ * Validate that a persistent, well-formed Castle Wall BOOT service is installed
+ * — not merely that a file exists at the path (#450 item 5 / codex 2026-06-14).
+ * Reads the world-readable plist and confirms it is THE boot-survival unit: the
+ * expected Label, `RunAtLoad=true`, and a `--safe-mode` ProgramArguments entry.
+ * Returns false on absent / unreadable / malformed / wrong-label / non-safe-mode
+ * (fail-closed: an unverifiable boot service is treated as not installed).
+ *
+ * RESIDUAL (honest): from the operator context this cannot detect a root
+ * `launchctl disable system/<label>` override — that state lives in launchd's
+ * root-owned database, unreadable without root. `install-boot` verifies a live
+ * pid at install time; this guard ensures the persistent unit is present and
+ * well-formed, so a reboot brings it up unless an explicit root disable intervened.
+ */
+export async function bootServiceInstalled(
+  plistPath: string = CASTLE_WALL_BOOT_PLIST_PATH,
+): Promise<boolean> {
+  let contents: string;
+  try {
+    contents = await readFile(plistPath, "utf8");
+  } catch {
+    return false;
+  }
+  // Structural checks against the rendered plist (its own source of truth for
+  // these markers); no XML-parser dependency needed.
+  if (!contents.includes(`<string>${CASTLE_WALL_BOOT_LABEL}</string>`)) return false;
+  if (!/<key>RunAtLoad<\/key>\s*<true\s*\/>/.test(contents)) return false;
+  if (!contents.includes("<string>--safe-mode</string>")) return false;
+  return true;
 }
 
 interface ParsedBootArgs {
@@ -646,6 +723,13 @@ export async function runInstallBoot(
       // Put the running interpreter's dir on the daemon PATH so a
       // `#!/usr/bin/env node` shim resolves node under launchd's minimal PATH.
       nodeBinDir: dirname(execPath),
+      // ...and the stable Homebrew symlink dir behind it, so a `brew upgrade
+      // node` (which retires the version-pinned Cellar keg dir) cannot silently
+      // re-brick boot. Null for non-Homebrew interpreters (nothing to add).
+      ...((): { stableBinDir?: string } => {
+        const stable = deriveHomebrewStableBinDir(execPath);
+        return stable ? { stableBinDir: stable } : {};
+      })(),
     });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);

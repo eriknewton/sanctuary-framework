@@ -14,6 +14,7 @@ import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
 import {
   CASTLE_WALL_ALREADY_RUNNING_MESSAGE,
+  safeModeHandoffMessage,
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
@@ -274,6 +275,63 @@ describe("Castle Wall macOS daemon integration", () => {
     ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
 
     await first.stop();
+  });
+
+  it("records the daemon role in active-config (#450 item 4)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const configPath = activeConfigPath(fortressPath);
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: configPath,
+      listenerFactory: fakeListenerFactory,
+      daemonMode: "safe",
+    });
+    const written = JSON.parse(await readFile(configPath, "utf8")) as { mode?: string };
+    expect(written.mode).toBe("safe");
+    await handle.stop();
+  });
+
+  it("a full daemon colliding with a live SAFE-MODE boot daemon gets handoff guidance, not the Phase 3 message (#450 item 4)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const configPath = activeConfigPath(fortressPath);
+    // Simulate a live root safe-mode boot daemon holding this fortress.
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        socket_path: join(fortressPath, "castle.sock"),
+        fortress_id: "fortress-test",
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+        mode: "safe",
+      }),
+    );
+
+    // The full operator daemon must REFUSE (never orphan the root daemon) with
+    // actionable stand-down guidance — and must NOT claim "Multi-wrap is Phase 3".
+    let caught: Error | undefined;
+    try {
+      await startMacOSCastleWallDaemon({
+        fortressPath,
+        fortressId: "fortress-test",
+        masterKey,
+        localSign: true,
+        auditLog,
+        platform: "darwin",
+        activeConfigPath: configPath,
+        listenerFactory: fakeListenerFactory,
+      });
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toBe(safeModeHandoffMessage(process.pid));
+    expect(caught!.message).toContain("launchctl bootout");
+    expect(caught!.message).not.toContain("Phase 3");
   });
 
   it("rejects startup when active discovery config points at a live PID", async () => {

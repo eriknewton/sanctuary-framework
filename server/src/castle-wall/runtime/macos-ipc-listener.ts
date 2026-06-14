@@ -41,7 +41,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { unlink, chmod } from "node:fs/promises";
+import { unlink, chmod, lchown, lstat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 
 import { CASTLE_WALL_IPC_NAMESPACE } from "../constants.js";
@@ -84,6 +84,20 @@ export interface MacOSFlowIpcListenerOptions {
    * multi-user fortresses are out of scope for v1.x.
    */
   socketMode?: number;
+  /**
+   * Re-own the bound socket to this uid after binding (F1 #450 item 3). The
+   * safe-mode BOOT daemon runs as ROOT, so it creates a root-owned socket the
+   * operator CLI (notably the dead-man `disable` lever) cannot connect to —
+   * EPERM on a 0600 root socket as a non-root uid. Set this to the operator
+   * (fortress owner) uid so the operator owns the socket while mode stays 0600:
+   * root (the daemon + a root-running extension) still reaches it via superuser
+   * bypass, and no other local user can. Undefined (the full operator daemon,
+   * already operator-owned) leaves ownership untouched. Best-effort: a failed
+   * chown warns but does not abort startup (the socket stays secure root:0600
+   * and the GUI dead-man toggle remains the backstop — aborting would drop to a
+   * worse daemon-less brick).
+   */
+  socketOwnerUid?: number;
   /**
    * Maximum number of concurrent extension connections. Default 8.
    * Production deployments expect exactly one (the single loaded
@@ -180,6 +194,7 @@ export class MacOSFlowIpcListener {
   private readonly socketPath: string;
   private readonly consumer: MacOSFlowEventConsumer;
   private readonly socketMode: number;
+  private readonly socketOwnerUid: number | undefined;
   private readonly maxConnections: number;
   private readonly generateNonce: () => Uint8Array;
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
@@ -200,6 +215,7 @@ export class MacOSFlowIpcListener {
     this.socketPath = opts.socketPath;
     this.consumer = opts.consumer;
     this.socketMode = opts.socketMode ?? 0o600;
+    this.socketOwnerUid = opts.socketOwnerUid;
     this.maxConnections = opts.maxConnections ?? 8;
     this.generateNonce = opts.generateNonce ?? defaultNonceBytes;
     this.handshakeSigner = opts.handshakeSigner ?? null;
@@ -232,6 +248,50 @@ export class MacOSFlowIpcListener {
             ),
           );
           return;
+        }
+        // F1 #450 item 3: re-own the socket to the operator when a root daemon
+        // bound it (safe-mode boot daemon), so the operator CLI dead-man lever
+        // can reach it. Keep the existing gid; chmod ran first so 0600 holds
+        // (chown preserves regular perms). Best-effort + loud: a failed chown
+        // leaves the socket secure (root:0600) and the GUI toggle as backstop —
+        // we warn rather than abort, since aborting would drop to a daemon-less brick.
+        //
+        // SECURITY (codex 2026-06-14): the socket path lives under the
+        // operator-writable fortress dir, so a local operator/agent could unlink
+        // our just-bound socket and swap something in before we re-own it.
+        //   - `lstat` + `isSocket()` rejects a non-socket swap (we only re-own a
+        //     real socket), and `lchown` does NOT follow symlinks, so the
+        //     symlink-redirect-to-arbitrary-target escalation is closed.
+        //   - RESIDUAL (documented, not fully closed here): this is still a
+        //     by-NAME chown, so a hard-link/regular-file swap winning the tiny
+        //     window between `lstat` and `lchown` could re-own the swapped inode
+        //     to the operator uid. Fully eliminating it needs either binding the
+        //     safe-mode socket in a root-owned (non-operator-writable) directory
+        //     — a coordinated SocketPath.swift mirror change — or an fd-based
+        //     bind+fchown (not exposed by Node's net.Server). Tracked as a
+        //     must-resolve-before-#450-merge item; the symlink vector (the severe
+        //     one) is closed and macOS hard-link protections blunt the residual.
+        if (this.socketOwnerUid !== undefined) {
+          try {
+            const linkStat = await lstat(this.socketPath);
+            if (linkStat.isSocket()) {
+              await lchown(this.socketPath, this.socketOwnerUid, linkStat.gid);
+            } else {
+              // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+              console.error(
+                `[castle-wall] warning: refusing to re-own the IPC socket — ${this.socketPath} is not a socket ` +
+                  "(possible swap). The operator CLI dead-man lever may be unreachable in the safe-mode window; " +
+                  "disarm via the System Settings VPN & Filters toggle if needed.",
+              );
+            }
+          } catch (err) {
+            // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+            console.error(
+              `[castle-wall] warning: could not re-own the IPC socket to operator uid ${this.socketOwnerUid} ` +
+                `(${err instanceof Error ? err.message : String(err)}); the operator CLI dead-man lever may be ` +
+                `unreachable in the pre-login safe-mode window — disarm via the System Settings VPN & Filters toggle if needed.`,
+            );
+          }
         }
         this.server = server;
         this.stats.isListening = true;

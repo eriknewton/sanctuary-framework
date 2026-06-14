@@ -32,6 +32,7 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { bootServiceInstalled } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import type {
   CastleWallMessage,
@@ -79,6 +80,14 @@ export interface CastleWallCommandContext {
   hostAppCandidates?: string[];
   /** Override the daemon-socket reachability probe (tests). */
   daemonProbe?: (socketPath: string) => Promise<boolean>;
+  /**
+   * Override the persistent-boot-service presence probe used by the `enable`
+   * composition guard (#450 item 5; tests). Defaults to {@link bootServiceInstalled},
+   * which validates the LaunchDaemon plist is the well-formed boot-survival unit
+   * (correct label + RunAtLoad + --safe-mode), not merely that a file exists.
+   * Returns true iff a persistent boot-survival service is installed.
+   */
+  bootServiceInstalledProbe?: () => Promise<boolean>;
   /**
    * Override the `open` runner used by the DEFAULT LaunchServices invoker
    * (tests exercise the report-file round-trip without shelling out to real
@@ -1388,9 +1397,18 @@ export async function runDaemon(
  * persisted last-valid signed manifest against the pinned PUBLIC key (no secret
  * needed), and absent a manifest classifies every flow `.agent` and denies.
  * Full operation (approvals that touch fortress state, the master-key audit
- * log) resumes when the operator logs in and the full daemon supersedes this
- * one. SSH / operator endpoints stay reachable throughout, so an unattended
- * reboot can no longer brick the box.
+ * log) resumes when the operator logs in and starts the full daemon.
+ *
+ * HANDOFF (#450 item 4 — de-scoped, no automatic supersede): this boot daemon
+ * is a ROOT launchd KeepAlive unit. The full operator daemon runs unprivileged
+ * and CANNOT stop it, so it does not silently "supersede" this one (an earlier
+ * doc comment claimed it did; that coordination was never implemented). Until
+ * the boot daemon is explicitly stood down — `sudo launchctl bootout
+ * system/<boot-label>`, after which it returns on the next reboot — a starting
+ * full daemon detects the live boot daemon (via the active-config `mode` marker)
+ * and refuses with handoff guidance rather than orphaning it. The box stays
+ * safely in safe mode meanwhile. SSH / operator endpoints stay reachable
+ * throughout, so an unattended reboot can no longer brick the box.
  */
 export async function runSafeModeDaemon(
   _argv: string[] = [],
@@ -1464,6 +1482,23 @@ export async function runSafeModeDaemon(
       return startMacOSCastleWallDaemon(input);
     });
 
+  // #450 item 3: safe mode runs as root, so the socket it binds is root-owned
+  // and the operator CLI dead-man lever (`disable`) cannot reach it. Re-own the
+  // socket to the FORTRESS OWNER (= operator). Derive the uid from the fortress
+  // dir owner rather than trust SUDO_USER/env, so it tracks whoever actually
+  // owns the fortress. Fail-soft: if the fortress is unreadable we skip the
+  // re-own (the daemon still comes up + enforces; only the programmatic lever is
+  // degraded, with the GUI toggle as backstop) rather than refuse to start.
+  let socketOwnerUid: number | undefined;
+  try {
+    socketOwnerUid = (await stat(storagePath)).uid;
+  } catch (error) {
+    write(
+      err,
+      `Warning: could not resolve the fortress owner for ${storagePath} (${error instanceof Error ? error.message : String(error)}); the operator may be unable to reach the safe-mode socket. Disarm via System Settings VPN & Filters if needed.\n`,
+    );
+  }
+
   let daemon: { socketPath: string; stop: () => Promise<void> };
   try {
     daemon = await startDaemon({
@@ -1473,6 +1508,10 @@ export async function runSafeModeDaemon(
       // safe-mode audit key so no fortress key material is constructed here.
       masterKey: safeModeAuditKey,
       auditLog,
+      ...(socketOwnerUid !== undefined ? { socketOwnerUid } : {}),
+      // #450 item 4: mark the active-config so a colliding full daemon gives the
+      // operator precise stand-down/handoff guidance (no automatic supersede).
+      daemonMode: "safe",
       auditSource: "launchd-boot-safe-mode",
       ...(signerClientPath ? { signerClientPath } : {}),
       ...(ctx.signerClientInvoke ? { signerClientInvoke: ctx.signerClientInvoke } : {}),
@@ -2370,6 +2409,29 @@ async function runArmDisarm(
           "(filter on + daemon down = locked out, including SSH).\n" +
           "Start the daemon first:  sanctuary castle-wall daemon\n" +
           "Or pass --force if the daemon is supervised out-of-band.\n",
+      );
+      return 1;
+    }
+  }
+
+  if (action === "enable" && !parsed.force) {
+    // Composition guard (#450 item 5): "arming implies a persistent BOOT service
+    // is installed." The daemon-reachability gate above only proves a daemon is
+    // up NOW — a manually-started daemon passes it, yet leaves the box with an
+    // armed filter and NO boot daemon, so the NEXT REBOOT comes up deny-all with
+    // SSH locked out (the exact F1 boot-cut). Require the persistent boot service
+    // to exist so you cannot arm into the reboot-brick state. --force overrides
+    // (a boot-survival service supervised out-of-band).
+    const bootProbe = ctx.bootServiceInstalledProbe ?? (() => bootServiceInstalled());
+    if (!(await bootProbe())) {
+      write(
+        err,
+        "Refusing to arm: no persistent Castle Wall boot service is installed.\n" +
+          "Reachability of a daemon NOW does not survive a reboot — arming without the\n" +
+          "boot service means the NEXT REBOOT comes up deny-all with no daemon (SSH\n" +
+          "locked out, the F1 boot-cut).\n" +
+          "Install it first:  sudo sanctuary castle-wall install-boot\n" +
+          "Or pass --force if a boot-survival service is supervised out-of-band.\n",
       );
       return 1;
     }

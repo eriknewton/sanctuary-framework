@@ -57,6 +57,33 @@ export interface DaemonSigner {
 export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
   "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
 
+/**
+ * launchd label of the safe-mode boot daemon. Mirror of `CASTLE_WALL_BOOT_LABEL`
+ * in `cli/castle-wall-boot.ts` — duplicated (not imported) to keep this runtime
+ * module free of a dependency on the CLI layer. Used only to build the handoff
+ * guidance when a full daemon collides with a live safe-mode boot daemon.
+ */
+const CASTLE_WALL_BOOT_LABEL_MIRROR = "ai.sanctuaryprotocol.castle-wall.daemon";
+
+/**
+ * #450 item 4: actionable, non-bricking handoff message for when a FULL operator
+ * daemon tries to start while the root SAFE-MODE boot daemon is still live.
+ * There is no automatic supersede (the operator daemon cannot stop a root
+ * KeepAlive unit), so guide the operator to stand the boot daemon down. The box
+ * stays protected in safe mode until they do.
+ */
+export function safeModeHandoffMessage(pid: number): string {
+  return (
+    `A Castle Wall SAFE-MODE boot daemon (PID ${pid}) is currently enforcing this fortress.\n` +
+    "The full operator daemon does not automatically supersede the root boot daemon\n" +
+    "(it is a launchd KeepAlive unit that an unprivileged daemon cannot stop). Stand it\n" +
+    "down for this session, then start the full daemon again:\n" +
+    `  sudo launchctl bootout system/${CASTLE_WALL_BOOT_LABEL_MIRROR}\n` +
+    "The boot daemon returns automatically on the next reboot; the box stays protected\n" +
+    "in safe mode until you hand off."
+  );
+}
+
 export interface MacOSCastleWallDaemonInput {
   fortressPath: string;
   fortressId: string;
@@ -64,6 +91,21 @@ export interface MacOSCastleWallDaemonInput {
   auditLog: AuditLog;
   platform?: NodeJS.Platform;
   socketPath?: string;
+  /**
+   * Re-own the bound IPC socket to this uid (F1 #450 item 3). Set by the
+   * SAFE-MODE boot daemon (which runs as root) to the operator/fortress-owner
+   * uid so the operator CLI dead-man lever can reach the otherwise root-owned
+   * socket. Undefined for the full operator daemon (socket is already
+   * operator-owned). See {@link MacOSFlowIpcListenerOptions.socketOwnerUid}.
+   */
+  socketOwnerUid?: number;
+  /**
+   * Which daemon role is starting (#450 item 4). Recorded in the active-config
+   * `mode` marker so a colliding starter can give precise handoff guidance:
+   * "safe" = the root safe-mode boot daemon; "full" (default) = the operator
+   * login daemon. Purely advisory for messaging — it is not a trust signal.
+   */
+  daemonMode?: "safe" | "full";
   activeConfigPath?: string;
   listenerFactory?: (options: MacOSCastleWallListenerOptions) => MacOSCastleWallListenerHandle;
   /**
@@ -148,6 +190,8 @@ interface ActiveCastleWallConfig {
   pid: number;
   started_at: string;
   pinned_pubkey_sha256?: string;
+  /** Daemon role marker (#450 item 4): "safe" boot daemon vs "full" login daemon. */
+  mode?: "safe" | "full";
 }
 
 export async function startMacOSCastleWallDaemon(
@@ -169,6 +213,7 @@ export async function startMacOSCastleWallDaemon(
     : CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH;
 
   const auditSource = input.auditSource ?? "sanctuary-wrap";
+  const daemonMode: "safe" | "full" = input.daemonMode ?? "full";
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
@@ -224,6 +269,9 @@ export async function startMacOSCastleWallDaemon(
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
     socketPath,
+    ...(input.socketOwnerUid !== undefined
+      ? { socketOwnerUid: input.socketOwnerUid }
+      : {}),
     consumer,
     handshakeSigner: {
       fortressId: input.fortressId,
@@ -284,6 +332,7 @@ export async function startMacOSCastleWallDaemon(
         pid: process.pid,
         started_at: new Date().toISOString(),
         pinned_pubkey_sha256: pinnedPublicKeySha256,
+        mode: daemonMode,
       },
       legacyActiveConfigPath,
     );
@@ -790,6 +839,14 @@ async function assertActiveConfigNotOwnedByLiveProcess(
   const config = await readActiveConfig(configPath, legacyConfigPath);
   if (!config) return;
   if (isPidAlive(config.pid)) {
+    // #450 item 4: distinguish "a root safe-mode boot daemon is holding this
+    // fortress" (the login-handoff case) from a generic full-vs-full collision,
+    // so the operator gets actionable stand-down guidance instead of the
+    // misleading "Multi-wrap is Phase 3" message. Either way we REFUSE (never
+    // orphan the live daemon) — the box stays protected meanwhile.
+    if (config.mode === "safe") {
+      throw new Error(safeModeHandoffMessage(config.pid));
+    }
     throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
   }
 }
@@ -912,6 +969,9 @@ async function readActiveConfig(
     ) {
       return null;
     }
+    // `mode` is advisory (#450 item 4): tolerate its absence (older daemons) and
+    // ignore any value other than the two known roles.
+    const mode = parsed.mode === "safe" || parsed.mode === "full" ? parsed.mode : undefined;
     return {
       socket_path: parsed.socket_path,
       fortress_id: parsed.fortress_id,
@@ -923,6 +983,7 @@ async function readActiveConfig(
       ...(parsed.pinned_pubkey_sha256 !== undefined
         ? { pinned_pubkey_sha256: parsed.pinned_pubkey_sha256 }
         : {}),
+      ...(mode !== undefined ? { mode } : {}),
     };
   } catch {
     return null;

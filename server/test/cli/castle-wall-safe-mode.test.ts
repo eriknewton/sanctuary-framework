@@ -157,5 +157,12 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
     expect(Buffer.from(captured!.masterKey).equals(Buffer.from(expectedAuditKey))).toBe(true);
     // Storage points at the operator fortress.
     expect(captured!.fortressPath).toBe(fortress);
+    // #450 item 3: safe mode (root) re-owns the socket to the fortress OWNER so
+    // the operator CLI dead-man lever can reach it. The temp fortress is owned
+    // by the test runner, so the derived owner uid is the current uid.
+    const selfUid = process.getuid?.();
+    if (selfUid !== undefined) {
+      expect(captured!.socketOwnerUid).toBe(selfUid);
+    }
   });
 });
