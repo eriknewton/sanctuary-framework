@@ -43,6 +43,8 @@ pub enum DaemonError {
     WalOpen(String),
     #[error("manifest store init failed: {0}")]
     ManifestStoreInit(String),
+    #[error("F-4 startup failure: audit-producer key load/generate failed: {0}")]
+    ProducerKeyLoad(String),
 }
 
 /// Map a daemon error to a FailureMode for disposition routing.
@@ -56,6 +58,7 @@ pub fn mode_for_error(err: &DaemonError) -> FailureMode {
         DaemonError::Auth(_) => FailureMode::StartupIpcBindFailed,
         DaemonError::WalOpen(_) => FailureMode::StartupFilterInstallFailed,
         DaemonError::ManifestStoreInit(_) => FailureMode::StartupPolicyParseFailed,
+        DaemonError::ProducerKeyLoad(_) => FailureMode::StartupPolicyParseFailed,
     }
 }
 
@@ -451,6 +454,20 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
+    // Slice L1: load (or first-boot generate) the daemon-held audit-producer
+    // key. The private half stays in this process / a root-owned 0600 file and
+    // is never sent over IPC; the public half is published world-readable for
+    // the consumer to TOFU-pin. A failure to provision the key is a
+    // refuse-to-start condition: a daemon that cannot sign its enforcement
+    // events would silently downgrade the read-side authenticity basis, which
+    // the fail-closed contract forbids.
+    let producer_signer = crate::ipc::producer_sig::ProducerSigner::load_or_generate(
+        &config.producer_key_path,
+        &config.producer_pub_key_path,
+    )
+    .map(Arc::new)
+    .map_err(|err| DaemonError::ProducerKeyLoad(err.to_string()))?;
+
     let ipc_server = IpcServer::start(crate::ipc::server::ServerConfig {
         socket_path: config.socket_path.clone(),
         pinned_public_key: pinned_key_bytes,
@@ -460,6 +477,7 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         fortress_id: config.fortress_id.clone(),
         manifest_store: Some(Arc::clone(&manifest_store)),
         wal_writer: Some(Arc::clone(&wal_writer)),
+        producer_signer: Some(producer_signer),
     })?;
 
     // Emit a daemon_started audit event so reconnects can see the boot.
@@ -568,6 +586,8 @@ mod tests {
             policy_dir: dir.path().to_path_buf(),
             wal_path: dir.path().join("wal.jsonl"),
             pinned_public_key_path: pinned,
+            producer_key_path: dir.path().join("audit-producer.key"),
+            producer_pub_key_path: dir.path().join("audit-producer.pub"),
             prompt_timeout: Duration::from_secs(30),
             no_wall_max_duration: Duration::from_secs(3600),
             wal_ttl: Duration::from_secs(86_400),

@@ -79,10 +79,12 @@ fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
         policy_dir: policy_dir.clone(),
         wal_path,
         pinned_public_key_path: pinned_path,
+        producer_key_path: policy_dir.join("audit-producer.key"),
+        producer_pub_key_path: policy_dir.join("audit-producer.pub"),
         prompt_timeout: Duration::from_secs(30),
         no_wall_max_duration: Duration::from_secs(3600),
-        wal_ttl: Duration::from_secs(86_400),
         wal_size_cap_bytes: 16 * 1024 * 1024,
+        wal_ttl: Duration::from_secs(86_400),
     };
     let handle = boot(cfg).expect("boot daemon");
     BootedDaemon {
@@ -369,6 +371,98 @@ fn audit_drain_returns_daemon_started_event_after_boot() {
             assert!(!more_pending);
             // Genesis entry has no prior chain hash; subsequent entries do.
             assert_eq!(events[0].prior_sha256_hex, None);
+        }
+        other => panic!("unexpected reply {:?}", other),
+    }
+    let _ = stream;
+    let _ = booted.handle.stop();
+}
+
+/// Slice L1 acceptance: every drained enforcement event carries a producer
+/// signature that verifies against the daemon's published producer public key,
+/// and a signature is NOT valid against a different (seq) message — i.e. a
+/// replayed past signature cannot pass as a current event.
+#[test]
+fn audit_drain_events_carry_verifiable_producer_signature() {
+    use castle_wall_daemon::constants::PRODUCER_SIG_KEY_ID_V1;
+    use castle_wall_daemon::ipc::producer_sig::producer_signing_bytes;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let booted = boot_daemon_with_policy(1);
+
+    // Load the daemon's PUBLISHED producer public key (world-readable). This is
+    // the only key material the consumer side has; it can verify but not sign.
+    let pub_path = booted.policy_dir.join("audit-producer.pub");
+    let pub_bytes = fs::read(&pub_path).expect("producer pub key published at boot");
+    assert_eq!(pub_bytes.len(), 32, "producer pub key is 32 raw bytes");
+    let mut pk_arr = [0u8; 32];
+    pk_arr.copy_from_slice(&pub_bytes);
+    let verifying_key = VerifyingKey::from_bytes(&pk_arr).expect("valid verifying key");
+
+    let mut stream = connect_and_handshake(
+        &booted.socket_path,
+        &booted.signing_key,
+        &booted.fortress_id,
+    );
+    let req = MessageEnvelope {
+        jsonrpc: "2.0".to_string(),
+        method: format!("{}.audit_drain_request", IPC_NAMESPACE),
+        params: IpcMessage::AuditDrainRequest {
+            request_id: "drain-sig".to_string(),
+            after_seq: None,
+            max_events: 100,
+        },
+    };
+    send_envelope(&mut stream, &req);
+    let mut buf = Vec::new();
+    let reply = recv_envelope(&mut stream, &mut buf);
+    match reply.params {
+        IpcMessage::AuditDrainResponse { events, .. } => {
+            assert!(!events.is_empty(), "expected at least the daemon_started event");
+            for e in &events {
+                // Every event is signed and key-id-tagged (the signer is wired).
+                let sig_b64 = e
+                    .producer_signature_b64url
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("event seq {} missing producer signature", e.seq));
+                assert_eq!(
+                    e.producer_key_id.as_deref(),
+                    Some(PRODUCER_SIG_KEY_ID_V1),
+                    "event seq {} has the v1 producer key id",
+                    e.seq
+                );
+                let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(sig_b64.as_bytes())
+                    .expect("signature is base64url");
+                assert_eq!(sig_bytes.len(), 64, "ed25519 signature is 64 bytes");
+                let mut sig_arr = [0u8; 64];
+                sig_arr.copy_from_slice(&sig_bytes);
+                let signature = Signature::from_bytes(&sig_arr);
+
+                // Positive: verifies over the canonical seq‖ts‖event binding.
+                let message = producer_signing_bytes(
+                    &e.event_canonical_json,
+                    e.captured_at_unix_ms,
+                    e.seq,
+                );
+                verifying_key
+                    .verify(&message, &signature)
+                    .unwrap_or_else(|_| panic!("event seq {} signature must verify", e.seq));
+
+                // Negative (replay): the same signature does NOT verify when the
+                // seq is changed, so a captured signature can't be replayed onto
+                // a different position to fake current liveness.
+                let replayed = producer_signing_bytes(
+                    &e.event_canonical_json,
+                    e.captured_at_unix_ms,
+                    e.seq.wrapping_add(1),
+                );
+                assert!(
+                    verifying_key.verify(&replayed, &signature).is_err(),
+                    "event seq {} signature must NOT verify against a different seq (replay)",
+                    e.seq
+                );
+            }
         }
         other => panic!("unexpected reply {:?}", other),
     }

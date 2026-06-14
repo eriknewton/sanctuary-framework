@@ -631,6 +631,8 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         policy_dir,
         wal_path: dir.path().join("wal.jsonl"),
         pinned_public_key_path: pinned_path,
+        producer_key_path: dir.path().join("audit-producer.key"),
+        producer_pub_key_path: dir.path().join("audit-producer.pub"),
         prompt_timeout: Duration::from_secs(30),
         no_wall_max_duration: Duration::from_secs(3600),
         wal_ttl: Duration::from_secs(86_400),

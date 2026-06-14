@@ -157,6 +157,18 @@ pub struct AuditDrainEvent {
     pub prior_sha256_hex: Option<String>,
     pub event_canonical_json: String,
     pub critical: bool,
+    /// Producer signature over `producer_signing_bytes(canonical, ts, seq)`
+    /// (Slice L1, see `ipc::producer_sig`). base64url-no-pad of the 64-byte
+    /// Ed25519 signature. `None` only when the daemon has no producer key
+    /// wired (legacy/test boot); a wired daemon always signs. The consumer
+    /// treats a missing signature as non-enforcement-evidence when it has a
+    /// pinned producer key (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_signature_b64url: Option<String>,
+    /// Key id identifying which pinned producer public key verifies the
+    /// signature. Mirrors `PRODUCER_SIG_KEY_ID_V1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_key_id: Option<String>,
 }
 
 #[cfg(test)]

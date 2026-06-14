@@ -8,4 +8,5 @@
 pub mod auth;
 pub mod framing;
 pub mod messages;
+pub mod producer_sig;
 pub mod server;
