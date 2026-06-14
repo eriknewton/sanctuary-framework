@@ -25,6 +25,8 @@ import { readFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { exec } from "node:child_process";
 import { platform } from "node:os";
+import { join } from "node:path";
+import { loadPinnedProducerKeyB64url } from "../castle-wall/runtime/producer-signature.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
@@ -213,6 +215,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
+  /**
+   * Cached pinned producer public key for read-side signature re-verification
+   * (Slice R). `undefined` = not yet loaded; `null` = loaded and absent (no key
+   * file → channel basis, the honest macOS / pre-provision default); a string =
+   * the loaded base64url key. Loaded from the SAME canonical path the daemon
+   * publishes (`<storage_path>/policy/egress/audit-producer.pub`), so the reader
+   * never uses a weaker basis than the consumer wrote with.
+   */
+  private _pinnedProducerKeyB64url: string | null | undefined = undefined;
   private dashboardHTML: string;
   private fortressHTML: string | null = null;
   private loginHTML: string;
@@ -902,12 +913,52 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.v11Bindings?.fortressId ??
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
+    // Slice R: load the pinned producer key once (cached) before serving so the
+    // readers can re-verify producer signatures. Absent file → null → channel
+    // basis (current behavior preserved on macOS / pre-provision).
+    await this.ensurePinnedProducerKeyLoaded();
     const deps: PostureRouteDeps = {
       auditLog: this.auditLog ?? null,
       originMachine,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+      resolvePinnedProducerKey: () => this._pinnedProducerKeyB64url ?? null,
     };
     return handlePostureRoute(deps, req, res, url, method);
+  }
+
+  /**
+   * Load + cache the pinned producer public key for read-side re-verification
+   * (Slice R). The key file is published by the daemon at
+   * `<storage_path>/policy/egress/audit-producer.pub` (mirroring the daemon's
+   * own relative layout).
+   *
+   * A successfully-loaded key is cached permanently (the pinned anchor is stable
+   * for a fortress). A MISSING/malformed/unreadable key is NOT cached as a
+   * permanent `null`: it leaves the field `undefined` so a later request
+   * re-attempts the load — otherwise a posture request that landed before
+   * provisioning wrote the key would pin the reader to the channel basis forever
+   * (codex MEDIUM #4). An absent key always yields a transient `null` for THIS
+   * request (channel basis), and never throws into the request path or defaults
+   * the wall green.
+   */
+  private async ensurePinnedProducerKeyLoaded(): Promise<void> {
+    // Already loaded a real key → stable, never re-read.
+    if (typeof this._pinnedProducerKeyB64url === "string") return;
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) {
+      // No storage path to read from: transient null (re-checked next request).
+      this._pinnedProducerKeyB64url = undefined;
+      return;
+    }
+    const keyPath = join(storagePath, "policy", "egress", "audit-producer.pub");
+    try {
+      this._pinnedProducerKeyB64url = await loadPinnedProducerKeyB64url(keyPath);
+    } catch {
+      // Absent / wrong-length / unreadable: channel basis for THIS request, but
+      // leave undefined so a post-provision request re-attempts the load. Never
+      // throw; never default-green.
+      this._pinnedProducerKeyB64url = undefined;
+    }
   }
 
   /**

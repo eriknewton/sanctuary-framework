@@ -276,3 +276,35 @@ These limits are printed by the verifier on every run. Do not over-claim past th
   still pass if no newer checkpoint is provided to the verifier.
 - No automatic publication: export is local, and sharing a bundle or key is the
   operator's action.
+
+## What the dashboard "armed" (green) light rests on
+
+The Sovereignty Posture dashboard renders Castle Wall green ("armed") only from
+fresh enforcement evidence in the tamper-evident audit log — never from a
+daemon's self-reported belief. The cryptographic basis of that green light is
+now surfaced honestly in the `producer_authenticity` field, and it differs by
+platform:
+
+- **Linux (per-producer authenticated).** When the daemon's pinned
+  audit-producer public key is provisioned to the reader
+  (`<storage_path>/policy/egress/audit-producer.pub`, the same anchor the
+  daemon publishes), the dashboard RE-verifies each enforcement event's
+  Ed25519 producer signature at read time, against that pinned key — the same
+  kind of pinned anchor the transparency checkpoints verify against. The
+  daemon's signing key is not reachable from the in-process Sanctuary server,
+  so an in-process module that forges an audit entry (marker + claimed
+  `producer_signed` basis, but no valid signature) fails this re-verification
+  and can never render the wall green or inflate the kernel-block counts. The
+  surface reports `producer_authenticity: "producer_signed"`.
+
+- **macOS (channel-authenticated, NOT per-producer).** The macOS enforcing
+  extension does not sign per-event verdicts today, so no pinned producer key
+  is available to the reader. The dashboard then falls back to the legacy
+  basis: the green light rests on the mutually-pinned IPC channel plus the
+  tamper-evident audit chain. This is honestly labeled
+  `producer_authenticity: "channel_authenticated"`. It is NOT a per-event,
+  per-producer authenticity claim. Per-event authenticity on macOS is pending
+  the extension-signing slice; do not over-claim it.
+
+In both cases the `unknown`-is-never-green invariant holds: absence of fresh
+evidence, a stale read, or an integrity finding renders amber, never green.

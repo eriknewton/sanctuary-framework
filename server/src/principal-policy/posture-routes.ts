@@ -79,6 +79,16 @@ export interface PostureRouteDeps {
   platform?: NodeJS.Platform;
   /** Injectable clock for tests. */
   now?: () => number;
+  /**
+   * The reader's pinned producer public key (base64url-no-pad), loaded from the
+   * SAME source the audit consumer uses (`<policy_dir>/audit-producer.pub`).
+   * Resolved lazily per request so post-provision wiring is observed. When it
+   * returns null (macOS today / pre-provision), the readers fall back to the
+   * honest channel-authenticated basis — never claimed as per-producer
+   * authenticated. The dashboard MUST supply the same key the consumer wrote
+   * with, never a weaker basis (Slice R, R-4).
+   */
+  resolvePinnedProducerKey?: () => string | null;
 }
 
 /**
@@ -204,6 +214,9 @@ async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPostu
     originMachine: deps.originMachine,
     ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
     ...(deps.now ? { now: deps.now() } : {}),
+    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+      ? deps.resolvePinnedProducerKey()
+      : null,
   });
 }
 
@@ -212,6 +225,9 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
     auditLog: deps.auditLog as AuditLog,
     originMachine: deps.originMachine,
     ...(deps.now ? { now: deps.now() } : {}),
+    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+      ? deps.resolvePinnedProducerKey()
+      : null,
   });
 }
 
@@ -230,6 +246,9 @@ async function buildFeatureHealth(
     auditLog: deps.auditLog as AuditLog,
     originMachine: deps.originMachine,
     ...(deps.now ? { now: deps.now() } : {}),
+    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+      ? deps.resolvePinnedProducerKey()
+      : null,
   });
 }
 

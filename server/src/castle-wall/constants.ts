@@ -53,6 +53,30 @@ export const CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY = "cw_producer_sig" as const;
 export const CASTLE_WALL_PRODUCER_KID_DETAIL_KEY = "cw_producer_kid" as const;
 
 /**
+ * `details` keys under which a producer-signed entry persists the EXACT signed
+ * inputs, so a read-side consumer (Slice R) can reconstruct the signed message
+ * and re-verify the signature against the pinned producer key — closing the
+ * in-process forgery hole at READ time, not merely trusting the persisted
+ * marker or basis string.
+ *
+ * `cw_producer_signed_canonical` is the verbatim `eventCanonicalJson` the daemon
+ * signed (stored as-is; never re-canonicalized — re-encoding would drift the
+ * bytes and break verification). `cw_producer_captured_at_ms` is the capture
+ * timestamp the signature is bound to (the seq is already persisted as the
+ * entry's `details.seq`). Together with `cw_producer_sig` + `cw_producer_kid`,
+ * these are the full `ProducerSignatureInput` the reader needs.
+ *
+ * Only the producer-signed branch carries these; the channel-unsigned branch
+ * must NOT (there is no producer signature to reconstruct, and persisting a
+ * forged canonical/timestamp must never let a forged entry masquerade as
+ * verifiable).
+ */
+export const CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY =
+  "cw_producer_signed_canonical" as const;
+export const CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY =
+  "cw_producer_captured_at_ms" as const;
+
+/**
  * `details` key recording the authenticity basis the consumer established for
  * this entry. `producer_signed` means a producer signature was verified
  * against the pinned key (the in-process forgery hole is closed for this

@@ -73,6 +73,12 @@ import {
   DEFAULT_DIGEST_WINDOW_MS,
   ENFORCEMENT_FUTURE_SKEW_MS,
 } from "./posture.js";
+import {
+  reverifyEntryProducerSignature,
+  enforcementEntryCounts,
+  producerSignedDedupKey,
+  type VerifyProducerSignatureFn,
+} from "./producer-reverify.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -293,6 +299,14 @@ export interface BuildFeatureHealthInput {
   freshnessWindowMs?: number;
   /** Window over which invocations are counted. */
   windowMs?: number;
+  /**
+   * The reader's pinned producer public key (see `BuildCastleWallPostureInput`).
+   * Threaded into every per-feature evaluation so provenance-gated Castle Wall
+   * invocations re-verify their producer signature. Null on macOS / pre-provision.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }
 
 /**
@@ -326,9 +340,21 @@ export function evaluateFeatureHealth(args: {
   now: number;
   freshnessWindowMs: number;
   integrityOk: boolean;
+  /**
+   * The reader's pinned producer public key (see `BuildCastleWallPostureInput`).
+   * When non-null, a provenance-gated Castle Wall INVOCATION only counts toward
+   * green if its producer signature RE-verifies against this key; a forged
+   * `producer_signed`-claiming invocation is dropped. When null, invocation
+   * recognition rests on the channel basis (legacy / macOS). Fault recognition
+   * is never gated by it (faults fail toward RED — see `classify`).
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
+  const pinnedProducerKey = args.pinnedProducerKeyB64url ?? null;
   const freshnessEntries = args.freshnessEntries ?? entries;
   const freshnessComplete = args.freshnessComplete ?? true;
   const freshnessFloor = now - freshnessWindowMs;
@@ -360,7 +386,14 @@ export function evaluateFeatureHealth(args: {
   const classify = (
     entry: AuditEntry,
   ):
-    | { ts: number; tsValid: boolean; isInvocation: boolean; isFault: boolean }
+    | {
+        ts: number;
+        tsValid: boolean;
+        isInvocation: boolean;
+        isFault: boolean;
+        /** Dedup key for a re-verified producer-signed invocation, else null. */
+        signedDedupKey: string | null;
+      }
     | null => {
     if (entry.layer !== feature.layer) return null;
     const op = entry.operation;
@@ -370,27 +403,63 @@ export function evaluateFeatureHealth(args: {
     // Gate ONLY green-earning invocation evidence; never gate fault recognition.
     // (For Castle Wall, invocationOps and faultOps are disjoint, so a fault entry
     // is never dropped here.)
+    let signedTs: number | null = null;
+    let signedDedupKey: string | null = null;
     if (feature.requireCastleWallProvenance && isInvocation) {
       const hasProvenance =
         isRecord(entry.details) &&
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
           CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
       if (!hasProvenance) return null;
+      // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
+      // authority for a green-earning invocation is the producer signature,
+      // RE-verified here against the pinned key. When a key IS configured, only a
+      // `producer_signed_verified` invocation counts — a channel/absent-basis or
+      // forged entry is dropped (the consumer never persists genuine enforcement
+      // evidence on the channel basis when a key is set; codex HIGH #1). When NO
+      // key is configured, the channel basis counts (honest macOS floor). Fault
+      // ops are NOT routed here (they fail toward RED), so this never drops a
+      // real fault.
+      const reResult = reverifyEntryProducerSignature(
+        entry.details,
+        pinnedProducerKey,
+        args.verifyProducerSignature,
+      );
+      if (!enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null)) {
+        return null;
+      }
+      signedTs = reResult.signedCapturedAtMs;
+      if (reResult.basis === "producer_signed_verified" && isRecord(entry.details)) {
+        signedDedupKey = producerSignedDedupKey(entry.details);
+      }
     }
-    const ts = Date.parse(entry.timestamp);
+    // Freshness uses the SIGNATURE-BOUND capture time for a verified producer
+    // signature, defeating same-seq replay with a forged-fresh top-level
+    // timestamp (codex HIGH #3). Channel-basis / fault entries use the top-level
+    // timestamp (the honest no-key floor).
+    const ts = signedTs !== null ? signedTs : Date.parse(entry.timestamp);
     // Reject future-dated evidence beyond a small clock-skew tolerance: a future
     // timestamp must not keep a self-reporting feature green past the real
     // freshness window.
     const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-    return { ts, tsValid, isInvocation, isFault };
+    return { ts, tsValid, isInvocation, isFault, signedDedupKey };
   };
 
-  // Pass 1 — counts + staleness over the full digest window.
+  // Pass 1 — counts + staleness over the full digest window. A re-verified
+  // producer-signed invocation counts at MOST ONCE: a copied genuine signed
+  // entry (same seq + signature) must not inflate invocation_count (codex
+  // round-4 HIGH). Pass 2 is max-based, so duplicates there are harmless and
+  // need no dedup.
+  const countedSignedKeys = new Set<string>();
   let invocationCount = 0;
   let latestInvocationMs: number | null = null;
   for (const entry of entries) {
     const c = classify(entry);
     if (c === null || !c.isInvocation) continue;
+    if (c.signedDedupKey !== null) {
+      if (countedSignedKeys.has(c.signedDedupKey)) continue; // duplicate replay
+      countedSignedKeys.add(c.signedDedupKey);
+    }
     invocationCount += 1;
     if (
       !Number.isNaN(c.ts) &&
@@ -601,6 +670,10 @@ export async function buildFeatureHealthPanel(
       now,
       freshnessWindowMs,
       integrityOk,
+      pinnedProducerKeyB64url: input.pinnedProducerKeyB64url ?? null,
+      ...(input.verifyProducerSignature
+        ? { verifyProducerSignature: input.verifyProducerSignature }
+        : {}),
     }),
   );
 

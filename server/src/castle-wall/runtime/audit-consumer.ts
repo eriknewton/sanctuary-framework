@@ -20,6 +20,8 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
@@ -572,6 +574,12 @@ export class AuditConsumer {
       signatureB64url: envelope.producer.signatureB64url as string,
       keyId: envelope.producer.keyId as string,
       signedBody: parsed.body,
+      // The exact signed inputs, persisted so a read-side consumer can
+      // reconstruct the signed message and RE-verify (Slice R). Stored
+      // verbatim — never re-canonicalized — so the reader hashes identical
+      // bytes to the daemon and this consumer.
+      eventCanonicalJson: envelope.producer.eventCanonicalJson,
+      capturedAtUnixMs: envelope.producer.capturedAtUnixMs,
     };
   }
 
@@ -630,6 +638,13 @@ type SignatureOutcome =
       keyId: string;
       /** The authenticated WAL body; the source of truth for persisted evidence. */
       signedBody: Record<string, unknown>;
+      /**
+       * The verbatim canonical-JSON string the daemon signed, persisted so a
+       * read-side consumer can reconstruct the signed message and re-verify.
+       */
+      eventCanonicalJson: string;
+      /** The capture timestamp the signature is bound to (re-verify input). */
+      capturedAtUnixMs: number;
     }
   | { kind: "unsigned" }
   | { kind: "rejected"; reason: string };
@@ -715,6 +730,15 @@ function buildDetailsForEvent(
     }
     out[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY] = signature.signatureB64url;
     out[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY] = signature.keyId;
+    // R-1: persist the EXACT signed inputs so a read-side consumer can
+    // reconstruct the signed message and re-verify the signature against the
+    // pinned key (the seq is already preserved as `out.seq` above). Stored
+    // verbatim — the reader must hash identical bytes to what the daemon
+    // signed, so re-canonicalizing here would break verification.
+    out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY] =
+      signature.eventCanonicalJson;
+    out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY] =
+      signature.capturedAtUnixMs;
     out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED;
     out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
@@ -730,6 +754,10 @@ function buildDetailsForEvent(
   if (event.rule_id !== null) out.rule_id = event.rule_id;
   delete out[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
   delete out[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY];
+  // A forged event must NOT be able to plant re-verification inputs that a
+  // read-side consumer might mistake for a verified signature.
+  delete out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  delete out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
   out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
     CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED;
   // Provenance LAST, so a forged `event.details.cw_source` cannot survive into
