@@ -36,6 +36,13 @@ The TypeScript MCP server is large (54 modules) and several names collide. Befor
 
 [`SANCTUARY_ARCHITECTURE.md`](SANCTUARY_ARCHITECTURE.md) is the *why* (architecture, data flow, trust model); the module map is the *where*.
 
+### Branch hygiene
+
+Keep the branch list legible — it accumulates dead weight fast otherwise.
+- **Merged-PR head branches auto-delete on merge** (repo setting `delete_branch_on_merge=true`). Do not re-disable it.
+- A weekly **`stale-branch-report`** workflow (`.github/workflows/stale-branch-report.yml`) surfaces branches with no open PR and no commits in 60 days. Prune the dead ones promptly.
+- **Never delete an unmerged branch that has no PR without first checking it for wanted work** — that is the one case where deletion can lose something.
+
 ## WHAT THESE TOOLS MUST NEVER DO
 
 These are hard constraints. Violation of any of these is a security defect.
