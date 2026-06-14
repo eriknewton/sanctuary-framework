@@ -558,7 +558,7 @@ export async function createSanctuaryServer(options?: {
     {
       name: "monitor_health",
       description:
-        "Sanctuary Health Report (SHR) — standardized sovereignty status.",
+        "Report this instance's live health and sovereignty status: overall state (healthy/degraded/compromised), versions, Castle Wall enforcement state, audit/state/egress posture, and any active degradations. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
@@ -591,7 +591,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query the sovereignty audit log.",
+      description: "Query this instance's sovereignty audit log, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect recorded operations. Read-only; entries are redacted for agent consumption (no secret material).",
       inputSchema: {
         type: "object",
         properties: {

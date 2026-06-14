@@ -495,7 +495,7 @@ export function createAgentNativeCooperativeTools(
   const tools: ToolDefinition[] = [
     {
       name: "sanctuary_remember",
-      description: "Store active-session memory through encrypted state_write.",
+      description: "Store a key/value into encrypted sovereign memory for this session. Wraps state_write with an approval-binding and audit record. Use this (not raw state_write) for agent working memory you want auditable. Returns { key, namespace_handle, audit_ref }; the namespace is an opaque handle, never the raw path.",
       tool_class: "write",
       approvalTargetToolName: "state_write",
       approvalTargetArgs: rememberPrimitiveArgs,
@@ -537,7 +537,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_recall",
-      description: "Read active-session memory with verification preserved.",
+      description: "Read a key from encrypted sovereign memory, verifying integrity before returning. Returns { value, verified: true, audit_ref } (pass opts.full for the full record). Denied if integrity fails or the key was hidden via sanctuary_hide. Use as the read counterpart to sanctuary_remember.",
       tool_class: "read",
       approvalTargetToolName: "state_read",
       approvalTargetArgs: recallPrimitiveArgs,
@@ -590,7 +590,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_hide",
-      description: "Hide a key from default facade recall without erasing it.",
+      description: "Mark a stored key as hidden so sanctuary_recall will not return it, without deleting the data. Use to suppress a memory from default reads while keeping it recoverable. Returns an audit_ref; the value still exists in the store and can be deleted with sanctuary_forget.",
       tool_class: "write",
       approvalTargetToolName: "state_read",
       approvalTargetArgs: recallPrimitiveArgs,
@@ -645,7 +645,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_forget",
-      description: "Securely delete a key through state_delete with approval proof.",
+      description: "Permanently and securely delete a memory key (random-overwrite then remove) via state_delete. Tier 1: requires operator approval; pass the approval proof. Irreversible. Returns an audit_ref for the deletion event.",
       tool_class: "write",
       approvalTargetToolName: "state_delete",
       approvalTargetArgs: deletePrimitiveArgs,
@@ -685,7 +685,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_help",
-      description: "Policy-mediated guidance for Sanctuary tool use.",
+      description: "Given a free-text intent, return policy-aware guidance on which Sanctuary tools to use and how, including a runnable example for ordinary (non-gated) intents. Use to discover the right tool before acting. Read-only; returns the classified guidance plus an audit_ref.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -708,7 +708,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_who_am_i",
-      description: "Return disclosable active-session identity facts.",
+      description: "Return the disclosable identity facts for the current session: label, did, active-identity fingerprint, and memory namespace handle. Use to confirm which sovereign identity you are operating as. Read-only; private keys are never included.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
@@ -731,7 +731,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_active_protections",
-      description: "Return positive-only coarse guarantees for this session.",
+      description: "List the security guarantees currently in force for this session (e.g. state-encrypted-at-rest, approval-gate-mediated, append-only audit for critical ops, opaque memory handles). Use to tell a counterparty or yourself what protections apply. Read-only; returns guarantee flags plus an audit_ref. Reports only what IS active: absence of a flag is not a claim.",
       tool_class: "read",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
@@ -754,7 +754,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_events_open_cursor",
-      description: "Open an identity-bound pull cursor over redacted local events.",
+      description: "Open a paginated cursor over your own redacted local audit events, optionally filtered by operation. Use before sanctuary_events_read to page through recent activity. Returns { cursor, audit_ref }. Bound to your identity; cross-agent and callback/URL filters are refused.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -789,7 +789,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_events_read",
-      description: "Read redacted local events from an identity-bound cursor.",
+      description: "Read the next page of redacted events from a cursor opened with sanctuary_events_open_cursor (default 10, max 25 per call). Returns { events, next_cursor, audit_ref }. Only your own identity's events are visible; capped at 10 reads per cursor, then rate-limited.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -829,7 +829,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_events_close",
-      description: "Close a pull event cursor.",
+      description: "Release an event cursor opened with sanctuary_events_open_cursor. Call when done paging to free the cursor. Returns { closed: true, audit_ref }.",
       tool_class: "write",
       inputSchema: { type: "object", properties: { cursor: { type: "string" } }, required: ["cursor"] },
       handler: async (args) => {
@@ -848,7 +848,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_audit_search",
-      description: "Search own signed/default audit history with integrity checks.",
+      description: "Full-text search your own audit history (scope is always own_signed), verifying entries against the audit chain first. Use to find when a past operation ran and its result. Returns matching entries with timestamp, operation, and verified_against_audit_chain status; refuses if the chain fails integrity.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -893,7 +893,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_compound_execute",
-      description: "Execute a small plan with up-front approval binding for gated steps.",
+      description: "Execute a short plan of facade steps (sanctuary_remember/recall/hide/forget) in one call, reserving operator approvals up front for any Tier 1 step (e.g. a forget/delete). Use to batch a memory workflow atomically with respect to approval. Pass approvals keyed by step_id; the plan is hash-bound, and a missing approval aborts the whole plan.",
       tool_class: "write",
       inputSchema: {
         type: "object",
