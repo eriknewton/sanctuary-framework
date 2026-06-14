@@ -11,7 +11,7 @@ module map at [`server/src/README.md`](server/src/README.md).
 
 ## WHAT THESE TOOLS ARE
 
-**Sanctuary** is a TypeScript MCP server (~37,500 lines, 75 tools) that gives AI agents four layers of cryptographic sovereignty — without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Version 0.9.0-rc.1.
+**Sanctuary** is a TypeScript MCP server (~202,000 lines, 90 MCP tools, 88 of them exposed to agents by default) that gives AI agents four layers of cryptographic sovereignty — without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Version 1.3.3.
 
 What it concretely does:
 
@@ -190,7 +190,7 @@ The structured security review completed 2026-03-28 with all Critical and High f
 
 Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit/`) — environment fingerprinting with OpenClaw-specific detection, four-layer gap analysis with deterministic scoring (0–100), and human-readable report generation. Published to npm as v0.3.1 on 2026-03-30.
 
-**Current version: v0.9.0-rc.1** (shipped 2026-04-16). 75 MCP tools, 1,348 tests, 84 test files. Major additions since v0.4.2: Sovereignty Dashboard, `sanctuary wrap` one-command install, EU AI Act compliance generator, context gating, SIEM export, sovereignty profile, governor, and federation tools.
+**Current version: v1.3.3.** 90 MCP tools (88 exposed to agents by default), 6,900+ tests. Major additions since v0.4.2: Sovereignty Dashboard, `sanctuary wrap` one-command install, EU AI Act compliance generator, context gating, SIEM export, sovereignty profile, governor, and federation tools.
 
 ---
 
