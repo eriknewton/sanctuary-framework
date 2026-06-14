@@ -919,7 +919,7 @@ export function createL1Tools(
 
     {
       name: "identity_list",
-      description: "List all managed sovereign identities.",
+      description: "List all managed sovereign identities with labels, DIDs, public keys, and which is primary. Read-only; no private key material returned.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1295,7 +1295,7 @@ export function createL1Tools(
     {
       name: "state_list",
       description:
-        "List keys in a namespace (metadata only, no decryption).",
+        "List the keys in a namespace with metadata (version, size, timestamps) only: values are not decrypted or returned. Use to enumerate stored state before a targeted state_read. Read-only.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1382,7 +1382,7 @@ export function createL1Tools(
     {
       name: "state_export",
       description:
-        "Export state as an encrypted, portable bundle for migration.",
+        "Export a namespace's state as an encrypted, portable bundle for migration to another Sanctuary instance. Tier 1: requires operator approval (data leaves the local store). Returns the encrypted bundle; import elsewhere with state_import.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1427,7 +1427,7 @@ export function createL1Tools(
 
     {
       name: "state_import",
-      description: "Import a previously exported state bundle.",
+      description: "Import a previously exported encrypted state bundle into this instance. Tier 1: requires operator approval. Verifies bundle integrity before writing; pairs with state_export.",
       inputSchema: {
         type: "object",
         properties: {

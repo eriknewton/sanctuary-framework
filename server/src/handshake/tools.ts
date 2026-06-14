@@ -399,7 +399,7 @@ export function createHandshakeTools(
     {
       name: "handshake_status",
       description:
-        "Check the status of a handshake session, or verify a completion message (responder side).",
+        "Check the state of an in-flight handshake session by id, or (responder side) verify an initiator's completion message. Read-only; returns session phase and, for verification, the validated counterparty SHR result.",
       inputSchema: {
         type: "object",
         properties: {
