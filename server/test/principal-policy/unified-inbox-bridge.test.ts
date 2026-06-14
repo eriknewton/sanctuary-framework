@@ -56,13 +56,24 @@ function makeBridge(opts?: { fortressId?: string }): {
   return { bridge, auditLog };
 }
 
-async function makeServer(bridge: UnifiedInboxBridge): Promise<{
+async function makeServer(
+  bridge: UnifiedInboxBridge,
+  opts?: { authToken?: string },
+): Promise<{
   base: string;
+  authToken?: string;
   close: () => Promise<void>;
 }> {
+  const authToken = opts?.authToken;
   const server: Server = createServer(async (req, res) => {
     const handled = await handleUnifiedInboxRoute(
-      { authConfig: { loopbackAutoAuth: true }, bridge },
+      {
+        authConfig: {
+          loopbackAutoAuth: true,
+          ...(authToken !== undefined ? { authToken } : {}),
+        },
+        bridge,
+      },
       req,
       res,
     );
@@ -74,6 +85,7 @@ async function makeServer(bridge: UnifiedInboxBridge): Promise<{
   const addr = server.address() as AddressInfo;
   return {
     base: `http://127.0.0.1:${addr.port}`,
+    ...(authToken !== undefined ? { authToken } : {}),
     close: () =>
       new Promise<void>((resolve) =>
         server.close(() => resolve()),
@@ -327,11 +339,19 @@ describe("Psi-1 — HTTP routes", () => {
       summary: "approval",
       observed_at: OBSERVED_AT,
     })!;
-    const { base, close } = await makeServer(bridge);
+    // SECURITY (loopback-no-autoauth-for-approvals): resolve is a Tier-1
+    // approval decision, so it requires the operator bearer token even
+    // though loopback auto-auth is on. Configure a token and present it.
+    const { base, authToken, close } = await makeServer(bridge, {
+      authToken: "operator-token",
+    });
     try {
       const res = await fetch(
         `${base}${UNIFIED_INBOX_API_PREFIX}/${entry.inbox_id}/resolve`,
-        { method: "POST" },
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${authToken}` },
+        },
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
@@ -341,6 +361,58 @@ describe("Psi-1 — HTTP routes", () => {
       expect(body.data.entry.resolved_by).toBe("operator");
       const ops = await auditOps(auditLog);
       expect(ops).toContain(UNIFIED_INBOX_AUDIT_OPS.RESOLVED);
+    } finally {
+      await close();
+    }
+  });
+
+  it("POST /resolve is REJECTED (401) on loopback auto-auth without the operator token", async () => {
+    // SECURITY (loopback-no-autoauth-for-approvals): a co-resident agent
+    // sharing loopback must NOT be able to self-resolve an approval entry
+    // via auto-auth. Resolve is a state-changing approval decision and
+    // always requires the operator token, even with loopback auto-auth on.
+    const { bridge } = makeBridge();
+    const entry = bridge.ingestApproval({
+      source_event_id: "a1",
+      severity: "warn",
+      summary: "approval",
+      observed_at: OBSERVED_AT,
+    })!;
+    const { base, close } = await makeServer(bridge, {
+      authToken: "operator-token",
+    });
+    try {
+      const res = await fetch(
+        `${base}${UNIFIED_INBOX_API_PREFIX}/${entry.inbox_id}/resolve`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(401);
+      // The entry must remain unresolved: the gate held.
+      const after = bridge.get(entry.inbox_id);
+      expect(after?.resolved_at).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("read-only list still served under loopback auto-auth without a token", async () => {
+    // The carve-out is scoped to the approval ACTION only; read-only
+    // routes keep loopback auto-auth for local-dashboard convenience.
+    const { bridge } = makeBridge();
+    bridge.ingestApproval({
+      source_event_id: "a1",
+      severity: "warn",
+      summary: "approval",
+      observed_at: OBSERVED_AT,
+    })!;
+    const { base, close } = await makeServer(bridge, {
+      authToken: "operator-token",
+    });
+    try {
+      const res = await fetch(`${base}${UNIFIED_INBOX_API_PREFIX}`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { entries: unknown[] } };
+      expect(body.data.entries.length).toBe(1);
     } finally {
       await close();
     }

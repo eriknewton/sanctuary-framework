@@ -457,7 +457,10 @@ interface RouteRig {
   stop: () => Promise<void>;
 }
 
-async function startRouteRig(opts?: { authToken?: string }): Promise<RouteRig> {
+async function startRouteRig(opts?: {
+  authToken?: string;
+  loopbackAutoAuth?: boolean;
+}): Promise<RouteRig> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
@@ -476,7 +479,7 @@ async function startRouteRig(opts?: { authToken?: string }): Promise<RouteRig> {
   const server = createServer((req, res) => {
     void handleApprovalInboxRoute(
       {
-        authConfig: { loopbackAutoAuth: false, authToken },
+        authConfig: { loopbackAutoAuth: opts?.loopbackAutoAuth ?? false, authToken },
         aggregator,
         operatorId: "operator_test",
       },
@@ -686,5 +689,119 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator HTTP routes", () => {
 
     expect(snapshotSeen).toBe(true);
     expect(aggregatedSeen).toBe(true);
+  });
+});
+
+/**
+ * SECURITY (loopback-no-autoauth-for-approvals): with `--auto-auth-localhost`
+ * ON, a co-resident agent shares the loopback interface with the operator.
+ * The human-approval ACTION (approve/deny) must therefore NEVER be granted
+ * on loopback origin alone; it must require the operator bearer token
+ * regardless of auto-auth. Read-only routes may keep loopback auto-auth.
+ */
+describe("loopback auto-auth does not gate the approval ACTION", () => {
+  let rig: RouteRig;
+
+  beforeEach(async () => {
+    // Auto-auth ON; the rig binds 127.0.0.1, so every request is loopback.
+    rig = await startRouteRig({ loopbackAutoAuth: true });
+  });
+
+  afterEach(async () => {
+    await rig.stop();
+  });
+
+  async function ingestPending(correlationId: string): Promise<string> {
+    const entry = await rig.aggregator.ingest({
+      phase: "requested",
+      operation: "state_export",
+      tier: 1,
+      reason: "tier1",
+      context: { harness: "claude-code", agent_id: "agent-x" },
+      request_timestamp: "2026-05-09T12:00:00.000Z",
+      correlation_id: correlationId,
+    });
+    return entry!.aggregator_id;
+  }
+
+  it("rejects a tokenless loopback POST /:id/approve (401) even with auto-auth on", async () => {
+    const id = await ingestPending("corr-autoauth-approve");
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${id}/approve`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+    // The Tier-1 op must remain unresolved: the gate held.
+    const entry = await rig.aggregator.getEntry(id);
+    expect(entry?.status).toBe("pending");
+  });
+
+  it("rejects a tokenless loopback POST /:id/deny (401) even with auto-auth on", async () => {
+    const id = await ingestPending("corr-autoauth-deny");
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${id}/deny`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+    const entry = await rig.aggregator.getEntry(id);
+    expect(entry?.status).toBe("pending");
+  });
+
+  it("rejects a tokenless approve carrying a WRONG bearer token (401)", async () => {
+    const id = await ingestPending("corr-autoauth-wrongtoken");
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${id}/approve`,
+      {
+        method: "POST",
+        headers: { authorization: "Bearer not-the-operator-token" },
+      },
+    );
+    expect(res.status).toBe(401);
+    const entry = await rig.aggregator.getEntry(id);
+    expect(entry?.status).toBe("pending");
+  });
+
+  it("accepts POST /:id/approve WITH the valid operator token (200)", async () => {
+    const id = await ingestPending("corr-autoauth-approve-ok");
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${id}/approve`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      data: { entry: { status: string } };
+    };
+    expect(body.data.entry.status).toBe("approved");
+  });
+
+  it("accepts POST /:id/deny WITH the valid operator token (200)", async () => {
+    const id = await ingestPending("corr-autoauth-deny-ok");
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${id}/deny`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      data: { entry: { status: string } };
+    };
+    expect(body.data.entry.status).toBe("denied");
+  });
+
+  it("still serves the read-only inbox list under loopback auto-auth WITHOUT a token", async () => {
+    await ingestPending("corr-autoauth-readonly");
+    const res = await fetch(`${rig.url}${APPROVAL_INBOX_API_PREFIX}`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      data: { entries: unknown[] };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.data.entries.length).toBe(1);
   });
 });

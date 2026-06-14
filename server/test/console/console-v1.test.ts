@@ -456,6 +456,73 @@ describe("AC11: Auth gate enforced on every /api/console/* route", () => {
     expect(enforceAuth(config, mockReq, url)).toBe(true);
   });
 
+  // SECURITY (loopback-no-autoauth-for-approvals): requireToken suppresses
+  // the loopback auto-auth shortcut so approval-decision routes always
+  // require the operator token, even on loopback with auto-auth enabled.
+  it("enforceAuth with requireToken REJECTS a tokenless loopback request even when loopbackAutoAuth=true", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+      authToken: "secret",
+    };
+    const mockReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: {},
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/approval-inbox/x/approve");
+
+    expect(() =>
+      enforceAuth(config, mockReq, url, { requireToken: true }),
+    ).toThrow(AuthGateError);
+  });
+
+  it("enforceAuth with requireToken ACCEPTS a loopback request carrying the valid token", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+      authToken: "secret",
+    };
+    const mockReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: { authorization: "Bearer secret" },
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/approval-inbox/x/approve");
+
+    expect(
+      enforceAuth(config, mockReq, url, { requireToken: true }),
+    ).toBe(true);
+  });
+
+  it("enforceAuth with requireToken REJECTS a loopback request with a wrong token", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+      authToken: "secret",
+    };
+    const mockReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: { authorization: "Bearer wrong" },
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/approval-inbox/x/approve");
+
+    expect(() =>
+      enforceAuth(config, mockReq, url, { requireToken: true }),
+    ).toThrow(AuthGateError);
+  });
+
+  it("enforceAuth WITHOUT requireToken still permits the loopback shortcut (read-only convenience preserved)", () => {
+    const config: AuthConfig = {
+      loopbackAutoAuth: true,
+      authToken: "secret",
+    };
+    const mockReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: {},
+    } as unknown as IncomingMessage;
+    const url = new URL("http://localhost/api/approval-inbox");
+
+    expect(enforceAuth(config, mockReq, url, { requireToken: false })).toBe(
+      true,
+    );
+  });
+
   it("enforceAuth rejects non-loopback without token", () => {
     const config: AuthConfig = {
       loopbackAutoAuth: true,

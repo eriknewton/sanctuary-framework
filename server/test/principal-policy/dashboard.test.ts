@@ -491,6 +491,100 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── Loopback auto-auth carve-out for approval decisions ────────────
+  //
+  // SECURITY (loopback-no-autoauth-for-approvals): with auth_token set AND
+  // loopback auto-auth ON, the legacy approve/deny DECISION must still
+  // require the operator token, because the co-resident agent shares the
+  // loopback interface. Read-only routes keep the auto-auth convenience.
+  describe("Loopback auto-auth does not gate the approve/deny decision", () => {
+    const AUTH_TOKEN = "operator-loopback-token";
+    let autoDashboard: DashboardApprovalChannel;
+    let autoPort: number;
+
+    beforeEach(async () => {
+      await bindWithRetry(async () => {
+        autoPort = randomTestPort();
+        autoDashboard = new DashboardApprovalChannel({
+          port: autoPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+        });
+        await autoDashboard.start();
+        // Enable loopback auto-auth: the vulnerability precondition.
+        autoDashboard.setAutoAuthLocalhost(true);
+      });
+    });
+
+    afterEach(async () => {
+      await autoDashboard.stop();
+    });
+
+    const makeReq = (): ApprovalRequest => ({
+      operation: "state_export",
+      tier: 1,
+      reason: "Tier 1 operation",
+      context: {},
+      timestamp: new Date().toISOString(),
+    });
+
+    it("rejects a tokenless loopback POST /api/approve/:id (401) even with auto-auth on", async () => {
+      const approvalPromise = autoDashboard.requestApproval(makeReq());
+      // Read-only pending list still works under auto-auth, no token.
+      const listRes = await fetch(`http://127.0.0.1:${autoPort}/api/pending`);
+      expect(listRes.status).toBe(200);
+      const pending = await listRes.json();
+      expect(pending).toHaveLength(1);
+
+      const res = await fetch(
+        `http://127.0.0.1:${autoPort}/api/approve/${pending[0].id}`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(401);
+      // The Tier-1 op must remain pending: the gate held.
+      expect(autoDashboard.pendingCount).toBe(1);
+
+      // Clean up the still-pending promise (auto_deny resolves on timeout).
+      void approvalPromise.catch(() => undefined);
+    });
+
+    it("rejects a tokenless loopback POST /api/deny/:id (401) even with auto-auth on", async () => {
+      const approvalPromise = autoDashboard.requestApproval(makeReq());
+      const pending = await (
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+      ).json();
+      const res = await fetch(
+        `http://127.0.0.1:${autoPort}/api/deny/${pending[0].id}`,
+        { method: "POST" },
+      );
+      expect(res.status).toBe(401);
+      expect(autoDashboard.pendingCount).toBe(1);
+      void approvalPromise.catch(() => undefined);
+    });
+
+    it("accepts POST /api/approve/:id WITH the operator token (200) under auto-auth", async () => {
+      const approvalPromise = autoDashboard.requestApproval(makeReq());
+      const pending = await (
+        await fetch(`http://127.0.0.1:${autoPort}/api/pending`)
+      ).json();
+      const res = await fetch(
+        `http://127.0.0.1:${autoPort}/api/approve/${pending[0].id}`,
+        { method: "POST", headers: { Authorization: `Bearer ${AUTH_TOKEN}` } },
+      );
+      expect(res.status).toBe(200);
+      const response = await approvalPromise;
+      expect(response.decision).toBe("approve");
+      expect(response.decided_by).toBe("human");
+    });
+
+    it("read-only status still served under loopback auto-auth without a token", async () => {
+      const res = await fetch(`http://127.0.0.1:${autoPort}/api/status`);
+      expect(res.status).toBe(200);
+    });
+  });
+
   // ── No-auth mode (backward compatibility) ──────────────────────────
 
   describe("No-auth mode", () => {
