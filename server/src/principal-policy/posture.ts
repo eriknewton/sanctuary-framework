@@ -71,6 +71,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `no_wall_engaged`, ...) from the "armed" determination: a started filter is
  * not a filtering filter, which is exactly the divergence H3 forbids us from
  * papering over.
+ *
+ * SLICE R BOUNDARY (disclosed, deliberately not changed here): `policy_loaded`
+ * is NOT per-event-signed enforcement evidence — it attests "a manifest was
+ * accepted," not "the wall is live-adjudicating now." Under Slice R, when a
+ * pinned producer key IS configured, a `policy_loaded` entry re-verifies as
+ * channel-basis and therefore does NOT arm (only re-verified producer-signed
+ * live-adjudication evidence does). On the NO-KEY path (macOS today /
+ * pre-provision), `policy_loaded` can still arm on the CHANNEL basis — this is
+ * the pre-existing shipped `posture.ts` behavior and is honestly surfaced as
+ * `producer_authenticity: "channel_authenticated"`, never as per-event
+ * authenticity. Narrowing the no-key arm set (to mirror feature-health's
+ * stricter `CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS`, which already excludes
+ * `policy_loaded`) is a macOS-channel-floor change outside this slice's scope;
+ * Slice M closes per-event authenticity on macOS.
  */
 export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
   Object.freeze(
