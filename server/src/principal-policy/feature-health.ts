@@ -75,7 +75,7 @@ import {
 } from "./posture.js";
 import {
   reverifyEntryProducerSignature,
-  reverifyBasisCounts,
+  enforcementEntryCounts,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 
@@ -395,6 +395,7 @@ export function evaluateFeatureHealth(args: {
     // Gate ONLY green-earning invocation evidence; never gate fault recognition.
     // (For Castle Wall, invocationOps and faultOps are disjoint, so a fault entry
     // is never dropped here.)
+    let signedTs: number | null = null;
     if (feature.requireCastleWallProvenance && isInvocation) {
       const hasProvenance =
         isRecord(entry.details) &&
@@ -403,20 +404,28 @@ export function evaluateFeatureHealth(args: {
       if (!hasProvenance) return null;
       // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
       // authority for a green-earning invocation is the producer signature,
-      // RE-verified here against the pinned key. A forged in-process entry that
-      // claims `producer_signed` but fails re-verify is dropped — it cannot make
-      // the feature read green. With no pinned key the reader cannot check and
-      // falls to the channel basis (the honest macOS / pre-provision floor).
-      // Fault ops are NOT routed here (they fail toward RED), so this never
-      // drops a real fault.
-      const reBasis = reverifyEntryProducerSignature(
+      // RE-verified here against the pinned key. When a key IS configured, only a
+      // `producer_signed_verified` invocation counts — a channel/absent-basis or
+      // forged entry is dropped (the consumer never persists genuine enforcement
+      // evidence on the channel basis when a key is set; codex HIGH #1). When NO
+      // key is configured, the channel basis counts (honest macOS floor). Fault
+      // ops are NOT routed here (they fail toward RED), so this never drops a
+      // real fault.
+      const reResult = reverifyEntryProducerSignature(
         entry.details,
         pinnedProducerKey,
         args.verifyProducerSignature,
       );
-      if (!reverifyBasisCounts(reBasis)) return null;
+      if (!enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null)) {
+        return null;
+      }
+      signedTs = reResult.signedCapturedAtMs;
     }
-    const ts = Date.parse(entry.timestamp);
+    // Freshness uses the SIGNATURE-BOUND capture time for a verified producer
+    // signature, defeating same-seq replay with a forged-fresh top-level
+    // timestamp (codex HIGH #3). Channel-basis / fault entries use the top-level
+    // timestamp (the honest no-key floor).
+    const ts = signedTs !== null ? signedTs : Date.parse(entry.timestamp);
     // Reject future-dated evidence beyond a small clock-skew tolerance: a future
     // timestamp must not keep a self-reporting feature green past the real
     // freshness window.

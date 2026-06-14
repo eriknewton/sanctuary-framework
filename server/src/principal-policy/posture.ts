@@ -47,7 +47,7 @@ import {
 } from "../castle-wall/constants.js";
 import {
   reverifyEntryProducerSignature,
-  reverifyBasisCounts,
+  enforcementEntryCounts,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 
@@ -290,54 +290,59 @@ export async function buildCastleWallPosture(
     if (!isCastleWall) continue;
 
     // SIGNATURE GATE (Slice R — the real close): the marker above is a cheap
-    // pre-filter; it is forgeable by any in-process writer. For enforcement
-    // EVIDENCE, the authority is the producer signature, RE-verified here
-    // against the pinned key. An entry that claims `producer_signed` but fails
-    // re-verify (forged, stale, stapled) is dropped entirely — it does not
-    // count and cannot arm. With no pinned key the reader cannot check and
-    // falls to the honest channel basis (R-3). Non-enforcement-evidence
-    // operations (e.g. `policy_loaded`, not-enforcing faults) are not signed,
-    // so they are not gated by re-verification.
-    const isEnforcementEvidence =
-      op === "egress_allowed" ||
-      op === "egress_blocked" ||
-      op === "operator_decision";
-    let reverifiedProducerSigned = false;
-    if (isEnforcementEvidence) {
-      const reBasis = reverifyEntryProducerSignature(
-        entry.details,
-        pinnedProducerKey,
-        input.verifyProducerSignature,
-      );
-      // A forged/failed producer_signed entry (key-bearing reader) must never
-      // count toward verdicts OR arm — fail closed, skip it entirely.
-      if (!reverifyBasisCounts(reBasis)) continue;
-      reverifiedProducerSigned = reBasis === "producer_signed_verified";
+    // pre-filter; it is forgeable by any in-process writer. The authority is the
+    // producer signature, RE-verified here against the pinned key.
+    //
+    // When a pinned key IS configured (`keyPresent`), the audit CONSUMER never
+    // persists genuine enforcement evidence on the channel basis — it rejects
+    // unsigned enforcement evidence. So a key-bearing reader counts an
+    // arm-eligible Castle Wall entry ONLY if it re-verifies as
+    // `producer_signed_verified`; a `channel_authenticated`/absent-basis entry
+    // (including a forged marker-only entry, or a `policy_loaded` entry the
+    // daemon does not sign) does NOT count — fail closed (codex HIGH #1/#2).
+    // When NO key is configured, the channel basis counts (the honest legacy /
+    // macOS floor).
+    const keyPresent = pinnedProducerKey !== null;
+    const reResult = reverifyEntryProducerSignature(
+      entry.details,
+      pinnedProducerKey,
+      input.verifyProducerSignature,
+    );
+    const isArmEligible = CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op);
+    const isNotEnforcing = CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op);
+    // Only arm-eligible enforcement ops are gated by the signature. Not-enforcing
+    // (fault) ops are NOT signed and must NEVER be dropped by the gate — they
+    // fail toward RED/degraded (a dropped fault would leave a green-while-faulted
+    // wall). They keep the channel/marker basis.
+    if (isArmEligible && !enforcementEntryCounts(reResult.basis, keyPresent)) {
+      continue;
     }
 
     if (op === "egress_allowed") verdictCounts.allowed += 1;
     else if (op === "egress_blocked") verdictCounts.blocked += 1;
     else if (op === "operator_decision") verdictCounts.operator_decisions += 1;
 
-    // Reject future-dated evidence beyond a small clock-skew tolerance: an
-    // event timestamped far in the future must NOT keep the wall green past
-    // the real freshness window. Such a timestamp is treated as invalid for
-    // the arm-state determination (it still counts in the display verdicts
-    // above, which are informational, not green-gating).
-    const tsValidForArm = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+    // Freshness uses the SIGNATURE-BOUND capture time for a verified producer
+    // signature (so a same-seq replay carrying an old signed timestamp cannot be
+    // made fresh by forging the top-level audit timestamp — codex HIGH #3). For
+    // channel-basis / fault entries there is no signed time, so the top-level
+    // timestamp is used (the honest no-key floor). Future-dated evidence beyond a
+    // small skew is rejected for arming either way.
+    const armTs =
+      reResult.signedCapturedAtMs !== null ? reResult.signedCapturedAtMs : ts;
+    const tsValidForArm =
+      !Number.isNaN(armTs) && armTs <= now + ENFORCEMENT_FUTURE_SKEW_MS;
 
-    if (CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op) && tsValidForArm) {
-      if (latestEnforcementMs === null || ts > latestEnforcementMs) {
-        latestEnforcementMs = ts;
-        // `policy_loaded` is arm-eligible but not signed enforcement evidence;
-        // it can never assert producer-signed authenticity.
+    if (isArmEligible && tsValidForArm) {
+      if (latestEnforcementMs === null || armTs > latestEnforcementMs) {
+        latestEnforcementMs = armTs;
         latestEnforcementWasProducerSigned =
-          isEnforcementEvidence && reverifiedProducerSigned;
+          reResult.basis === "producer_signed_verified";
       }
     }
-    if (CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op) && tsValidForArm) {
-      if (latestNotEnforcingMs === null || ts > latestNotEnforcingMs) {
-        latestNotEnforcingMs = ts;
+    if (isNotEnforcing && tsValidForArm) {
+      if (latestNotEnforcingMs === null || armTs > latestNotEnforcingMs) {
+        latestNotEnforcingMs = armTs;
       }
     }
   }
@@ -535,12 +540,13 @@ export async function buildAuditDigest(
         entry.operation === "egress_allowed");
     const reverifyCounts =
       !isCastleWallBlockOrAllow ||
-      reverifyBasisCounts(
+      enforcementEntryCounts(
         reverifyEntryProducerSignature(
           entry.details,
           pinnedProducerKey,
           input.verifyProducerSignature,
-        ),
+        ).basis,
+        pinnedProducerKey !== null,
       );
     if (isCastleWallBlockOrAllow && reverifyCounts && entry.operation === "egress_blocked")
       kernelBlocks += 1;

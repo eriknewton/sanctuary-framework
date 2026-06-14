@@ -231,6 +231,162 @@ describe("Slice R — HEADLINE NEGATIVE: a forged in-process entry never renders
   }
 });
 
+describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-basis enforcement evidence", () => {
+  it("posture: a channel_authenticated_unsigned egress_blocked does NOT arm when a key IS configured", async () => {
+    const log = newLog();
+    await appendChannelUnsigned(log);
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    // When a key is set the consumer never persists genuine enforcement evidence
+    // on the channel basis, so a channel-basis enforcement entry is a forgery.
+    expect(posture.arm_state).not.toBe("armed");
+    expect(posture.verdict_counts.blocked).toBe(0);
+  });
+
+  it("posture: a marker-only egress_blocked (no basis) does NOT arm when a key IS configured", async () => {
+    const log = newLog();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(posture.arm_state).not.toBe("armed");
+  });
+
+  it("digest: a channel-basis egress_blocked does NOT count as a kernel_block with a key configured", async () => {
+    const log = newLog();
+    await appendChannelUnsigned(log);
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(digest.kernel_blocks).toBe(0);
+  });
+
+  it("feature-health: a channel-basis invocation does NOT render active with a key configured", async () => {
+    const log = newLog();
+    await appendChannelUnsigned(log);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
+    expect(cw!.status).not.toBe("active");
+  });
+});
+
+describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verification when a key is set", () => {
+  it("a marker-only policy_loaded does NOT arm posture when a key IS configured", async () => {
+    const log = newLog();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "policy_loaded",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    // policy_loaded is not signed enforcement evidence; with a key configured it
+    // is treated as channel/forged basis and cannot arm.
+    expect(posture.arm_state).not.toBe("armed");
+  });
+
+  it("a marker-only policy_loaded STILL arms when NO key is configured (legacy / macOS floor preserved)", async () => {
+    const log = newLog();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "policy_loaded",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "macos",
+      now: NOW,
+      pinnedProducerKeyB64url: null,
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.producer_authenticity).toBe("channel_authenticated");
+  });
+});
+
+describe("Slice R — codex HIGH #3: same-seq replay with a forged-fresh top-level timestamp does NOT arm", () => {
+  it("an old signed tuple copied into a fresh-timestamped audit entry is rejected by freshness-of-signed-time", async () => {
+    const log = newLog();
+    // Build a GENUINELY signed tuple over an OLD captured time (well outside the
+    // freshness window), then persist it into an audit entry whose TOP-LEVEL
+    // timestamp is forged fresh. The signature still verifies (same seq, same
+    // canonical, same captured_at), but freshness is judged from the signed time.
+    const OLD_TS = NOW - 60 * 60 * 1000; // 1h ago
+    const canonical = JSON.stringify({
+      timestamp: new Date(OLD_TS).toISOString(),
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "agent-1",
+      result: "blocked",
+      details: { agent_id: "agent-1" },
+    });
+    const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "success",
+      // Forged-fresh top-level timestamp (an in-process replayer's lever).
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: {
+        seq: 0,
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        // The signed captured-at is the OLD time (bound into the signature).
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+    });
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "linux",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    // The signature verifies, but the signed time is stale → not armed.
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("stale_evidence");
+  });
+});
+
 describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and renders green", () => {
   it("posture: genuine signed entry arms with producer_signed authenticity", async () => {
     const log = newLog();

@@ -7,7 +7,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 
 import {
   reverifyEntryProducerSignature,
-  reverifyBasisCounts,
+  enforcementEntryCounts,
 } from "../../src/principal-policy/producer-reverify.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
 import {
@@ -45,33 +45,34 @@ function signedDetails(): Record<string, unknown> {
   };
 }
 
+const basisOf = (...args: Parameters<typeof reverifyEntryProducerSignature>) =>
+  reverifyEntryProducerSignature(...args).basis;
+
 describe("reverifyEntryProducerSignature", () => {
-  it("verifies a genuine signed entry against the pinned key", () => {
-    expect(reverifyEntryProducerSignature(signedDetails(), pubB64)).toBe(
-      "producer_signed_verified",
-    );
+  it("verifies a genuine signed entry against the pinned key + carries signed time", () => {
+    const result = reverifyEntryProducerSignature(signedDetails(), pubB64);
+    expect(result.basis).toBe("producer_signed_verified");
+    // The signature-bound capture time is returned so the reader judges freshness
+    // from it, not the forgeable top-level audit timestamp.
+    expect(result.signedCapturedAtMs).toBe(TS);
   });
 
   it("rejects a producer_signed entry with a missing signature (key present)", () => {
     const d = signedDetails();
     delete d[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
-    expect(reverifyEntryProducerSignature(d, pubB64)).toBe(
-      "producer_signed_rejected",
-    );
+    expect(basisOf(d, pubB64)).toBe("producer_signed_rejected");
   });
 
   it("rejects a producer_signed entry whose canonical bytes were altered", () => {
     const d = signedDetails();
     d[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY] = CANONICAL + " ";
-    expect(reverifyEntryProducerSignature(d, pubB64)).toBe(
-      "producer_signed_rejected",
-    );
+    expect(basisOf(d, pubB64)).toBe("producer_signed_rejected");
   });
 
   it("rejects a producer_signed entry signed by a DIFFERENT key", () => {
     const d = signedDetails();
     expect(
-      reverifyEntryProducerSignature(
+      basisOf(
         d,
         toBase64url(ed25519.getPublicKey(ed25519.utils.randomPrivateKey())),
       ),
@@ -81,15 +82,14 @@ describe("reverifyEntryProducerSignature", () => {
   it("rejects a producer_signed entry whose seq was tampered (binding)", () => {
     const d = signedDetails();
     d.seq = SEQ + 1;
-    expect(reverifyEntryProducerSignature(d, pubB64)).toBe(
-      "producer_signed_rejected",
-    );
+    expect(basisOf(d, pubB64)).toBe("producer_signed_rejected");
   });
 
   it("a producer_signed entry with NO pinned key falls to channel basis (cannot verify)", () => {
-    expect(reverifyEntryProducerSignature(signedDetails(), null)).toBe(
-      "channel_authenticated",
-    );
+    const result = reverifyEntryProducerSignature(signedDetails(), null);
+    expect(result.basis).toBe("channel_authenticated");
+    // No signed time is asserted on the channel basis.
+    expect(result.signedCapturedAtMs).toBeNull();
   });
 
   it("a channel_authenticated_unsigned entry is channel basis (even with a key)", () => {
@@ -97,29 +97,21 @@ describe("reverifyEntryProducerSignature", () => {
       seq: 0,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
     };
-    expect(reverifyEntryProducerSignature(d, pubB64)).toBe(
-      "channel_authenticated",
-    );
+    expect(basisOf(d, pubB64)).toBe("channel_authenticated");
   });
 
   it("an entry with no basis field is channel basis (legacy)", () => {
-    expect(reverifyEntryProducerSignature({ seq: 0 }, pubB64)).toBe(
-      "channel_authenticated",
-    );
+    expect(basisOf({ seq: 0 }, pubB64)).toBe("channel_authenticated");
   });
 
   it("non-record details are channel basis (never crash)", () => {
-    expect(reverifyEntryProducerSignature(null, pubB64)).toBe(
-      "channel_authenticated",
-    );
-    expect(reverifyEntryProducerSignature("x", pubB64)).toBe(
-      "channel_authenticated",
-    );
+    expect(basisOf(null, pubB64)).toBe("channel_authenticated");
+    expect(basisOf("x", pubB64)).toBe("channel_authenticated");
   });
 
   it("uses an injected verify fn when provided", () => {
     let called = false;
-    const basis = reverifyEntryProducerSignature(signedDetails(), pubB64, () => {
+    const basis = basisOf(signedDetails(), pubB64, () => {
       called = true;
       return { ok: false, reason: "stub" };
     });
@@ -128,10 +120,16 @@ describe("reverifyEntryProducerSignature", () => {
   });
 });
 
-describe("reverifyBasisCounts", () => {
-  it("counts verified and channel bases; never counts a rejected forgery", () => {
-    expect(reverifyBasisCounts("producer_signed_verified")).toBe(true);
-    expect(reverifyBasisCounts("channel_authenticated")).toBe(true);
-    expect(reverifyBasisCounts("producer_signed_rejected")).toBe(false);
+describe("enforcementEntryCounts", () => {
+  it("KEY PRESENT: only producer_signed_verified counts (channel/forged never count)", () => {
+    expect(enforcementEntryCounts("producer_signed_verified", true)).toBe(true);
+    expect(enforcementEntryCounts("channel_authenticated", true)).toBe(false);
+    expect(enforcementEntryCounts("producer_signed_rejected", true)).toBe(false);
+  });
+
+  it("NO KEY: channel basis counts (honest floor); a rejected forgery cannot occur but never counts", () => {
+    expect(enforcementEntryCounts("channel_authenticated", false)).toBe(true);
+    expect(enforcementEntryCounts("producer_signed_verified", false)).toBe(true);
+    expect(enforcementEntryCounts("producer_signed_rejected", false)).toBe(false);
   });
 });

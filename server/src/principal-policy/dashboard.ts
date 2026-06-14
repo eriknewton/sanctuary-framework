@@ -928,27 +928,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /**
    * Load + cache the pinned producer public key for read-side re-verification
-   * (Slice R), once. Idempotent: the first call resolves it; later calls are a
-   * no-op. The key file is published by the Linux daemon at
+   * (Slice R). The key file is published by the daemon at
    * `<storage_path>/policy/egress/audit-producer.pub` (mirroring the daemon's
-   * own relative layout). An absent or malformed key resolves to `null`, which
-   * makes the readers fall back to the honest channel-authenticated basis — it
-   * must NEVER throw into the request path or default the wall green.
+   * own relative layout).
+   *
+   * A successfully-loaded key is cached permanently (the pinned anchor is stable
+   * for a fortress). A MISSING/malformed/unreadable key is NOT cached as a
+   * permanent `null`: it leaves the field `undefined` so a later request
+   * re-attempts the load — otherwise a posture request that landed before
+   * provisioning wrote the key would pin the reader to the channel basis forever
+   * (codex MEDIUM #4). An absent key always yields a transient `null` for THIS
+   * request (channel basis), and never throws into the request path or defaults
+   * the wall green.
    */
   private async ensurePinnedProducerKeyLoaded(): Promise<void> {
-    if (this._pinnedProducerKeyB64url !== undefined) return;
+    // Already loaded a real key → stable, never re-read.
+    if (typeof this._pinnedProducerKeyB64url === "string") return;
     const storagePath = this._sanctuaryConfig?.storage_path;
     if (typeof storagePath !== "string" || storagePath.length === 0) {
-      this._pinnedProducerKeyB64url = null;
+      // No storage path to read from: transient null (re-checked next request).
+      this._pinnedProducerKeyB64url = undefined;
       return;
     }
     const keyPath = join(storagePath, "policy", "egress", "audit-producer.pub");
     try {
       this._pinnedProducerKeyB64url = await loadPinnedProducerKeyB64url(keyPath);
     } catch {
-      // Absent / wrong-length / unreadable: fall back to the channel basis.
-      // Never throw into the request path; never default-green.
-      this._pinnedProducerKeyB64url = null;
+      // Absent / wrong-length / unreadable: channel basis for THIS request, but
+      // leave undefined so a post-provision request re-attempts the load. Never
+      // throw; never default-green.
+      this._pinnedProducerKeyB64url = undefined;
     }
   }
 

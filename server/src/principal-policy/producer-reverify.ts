@@ -82,6 +82,20 @@ export type EntryReverifyBasis =
   | "producer_signed_rejected"
   | "channel_authenticated";
 
+/**
+ * The full re-verification result. For a `producer_signed_verified` entry it
+ * also carries the SIGNED capture timestamp, so the reader judges freshness from
+ * the signature-bound time — NOT the forgeable top-level audit-entry timestamp.
+ * A replay of a real signed tuple (same seq, same canonical, same captured_at)
+ * into a fresh audit entry keeps its OLD signed timestamp, so freshness-by-
+ * signed-time rejects it even though the top-level timestamp was forged fresh.
+ */
+export interface EntryReverifyResult {
+  basis: EntryReverifyBasis;
+  /** The signature-bound capture time (ms), present only when verified. */
+  signedCapturedAtMs: number | null;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -111,15 +125,19 @@ export function reverifyEntryProducerSignature(
   details: unknown,
   pinnedProducerKeyB64url: string | null,
   verify: VerifyProducerSignatureFn = verifyProducerSignature,
-): EntryReverifyBasis {
-  if (!isRecord(details)) return "channel_authenticated";
+): EntryReverifyResult {
+  const channel: EntryReverifyResult = {
+    basis: "channel_authenticated",
+    signedCapturedAtMs: null,
+  };
+  if (!isRecord(details)) return channel;
 
   const basis = details[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY];
 
   // Not a producer-signed-claiming entry (channel-unsigned, or legacy/absent):
   // channel basis. Never elevate a channel-basis entry to producer-authenticated.
   if (basis !== CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED) {
-    return "channel_authenticated";
+    return channel;
   }
 
   // The entry CLAIMS producer_signed. Without a pinned key the reader cannot
@@ -127,7 +145,7 @@ export function reverifyEntryProducerSignature(
   // must NOT crash. Fall to the channel basis with the honest label: this green
   // rests on channel-authentication, not on a verified producer signature.
   if (pinnedProducerKeyB64url === null) {
-    return "channel_authenticated";
+    return channel;
   }
 
   // A pinned key IS available: the producer_signed claim is now CHECKABLE, so
@@ -151,7 +169,7 @@ export function reverifyEntryProducerSignature(
     typeof capturedAtUnixMs !== "number" ||
     typeof seq !== "number"
   ) {
-    return "producer_signed_rejected";
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
   }
 
   const input: ProducerSignatureInput = {
@@ -162,19 +180,44 @@ export function reverifyEntryProducerSignature(
     keyId,
   };
   const verdict = verify(input, pinnedProducerKeyB64url);
-  return verdict.ok ? "producer_signed_verified" : "producer_signed_rejected";
+  if (!verdict.ok) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  // Verified: carry the SIGNATURE-BOUND capture time so the reader judges
+  // freshness from it, not the forgeable top-level audit timestamp. This closes
+  // the same-seq replay: copying an old signed tuple into a fresh audit entry
+  // keeps its old signed `capturedAtUnixMs`, so freshness-by-signed-time rejects
+  // it regardless of the forged top-level timestamp.
+  return {
+    basis: "producer_signed_verified",
+    signedCapturedAtMs: capturedAtUnixMs,
+  };
 }
 
 /**
- * Does this re-verification basis permit an enforcement-evidence entry to count
- * toward a GREEN arm-state / kernel-block tally?
+ * Does this re-verification basis permit a Castle Wall ENFORCEMENT-EVIDENCE
+ * entry to count toward a GREEN arm-state / kernel-block / active tally?
  *
- *  - `producer_signed_verified` → yes (per-producer authenticated).
- *  - `channel_authenticated`    → yes (legacy channel basis; the only honest
- *    floor on a no-key reader, and the shipped behavior on macOS).
- *  - `producer_signed_rejected` → NO. A forged/failed producer_signed entry,
- *    on a key-bearing reader, must never render green.
+ * The rule is asymmetric on whether the reader holds a pinned key, mirroring the
+ * design's "never read with a weaker basis than the consumer wrote with" (R-4):
+ *
+ *  - **Key present** (`keyPresent === true`): ONLY `producer_signed_verified`
+ *    counts. This is the load-bearing close. When a key is configured the audit
+ *    CONSUMER rejects any enforcement evidence lacking a valid producer
+ *    signature (it never persists a genuine enforcement entry on the channel
+ *    basis), so a key-bearing reader seeing a `channel_authenticated` /
+ *    absent-basis enforcement entry is looking at a FORGERY — an in-process
+ *    writer that stamped the marker but could not sign. It must not count.
+ *    `producer_signed_rejected` (forged/failed signature) also never counts.
+ *  - **No key** (`keyPresent === false`): `channel_authenticated` counts (the
+ *    honest legacy / macOS floor); `producer_signed_rejected` cannot occur (a
+ *    no-key reader never attempts verification — see
+ *    `reverifyEntryProducerSignature`).
  */
-export function reverifyBasisCounts(basis: EntryReverifyBasis): boolean {
+export function enforcementEntryCounts(
+  basis: EntryReverifyBasis,
+  keyPresent: boolean,
+): boolean {
+  if (keyPresent) return basis === "producer_signed_verified";
   return basis !== "producer_signed_rejected";
 }
