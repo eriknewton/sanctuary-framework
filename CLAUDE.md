@@ -24,6 +24,18 @@ See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer harden
 
 What these tools are, the one-page architecture (entry points, data flow, auth/trust model, dependencies), the testable sovereignty-property assertions, known complexity/risk areas, the review context, and the 2026-03-31 context-gating delta are in [`SANCTUARY_ARCHITECTURE.md`](SANCTUARY_ARCHITECTURE.md). Read it when doing deep Sanctuary work; the MANDATORY rules below stay here because they must fire without a lookup.
 
+## Codebase conventions (read before touching `server/src`)
+
+The TypeScript MCP server is large (54 modules) and several names collide. Before changing server code, orient with the map and hold these conventions:
+
+- **Module map first.** [`server/src/README.md`](server/src/README.md) is a 54-module index with a "distinct from" and "do-not-touch" column per module, plus the confusable-cluster disambiguations (the four "audit" things, the `mesh`/`federation` split-brain, `key-17`, and more). Read it before navigating `server/src`. If you add, remove, or rename a module, update its row in the SAME PR — the map's whole value is that it never drifts from the tree.
+- **Barrel convention.** Every module exposes a thin re-export `index.ts` so consumers import the module surface, not its internal layout (46/54 today; the 8 exceptions — the four `l1`-`l4` layer dirs, `cli`, `v1`, `compliance`, `contracts` — are listed in the map). A new module adds a barrel or documents why it is an exception.
+- **Frozen surfaces never move.** A reorganization may move directory names and relative import paths; the surfaces in [`server/reorg-surface-manifest.md`](server/reorg-surface-manifest.md) must survive byte-for-byte — MCP tool names and schemas, route paths, HKDF/crypto labels, persisted at-rest keys, the `L1Status..L4Status` exports, and user-visible display strings. Rule of thumb: paths and imports move; anything on the wire, on disk, or on screen does not. The `l1`-`l4` tokens are LIVE wire and at-rest contracts even though the L-number numbering is being retired in prose — never edit the token itself.
+- **Forward documentation rule.** New public surface gets a consumer-written doc-comment. The ~90 MCP tool `description` fields are product copy for an AI-agent audience (an agent reads them to decide whether and how to call a tool) — keep them accurate and never overclaim. See the forward rule in [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Structural-health snapshot.** `npm run refresh-reorg-evidence` (live module / importer / god-file counts) and `npm run check-import-cycles` (dependency-cycle baseline) report the codebase's structural health; run them before any reorg PR.
+
+[`SANCTUARY_ARCHITECTURE.md`](SANCTUARY_ARCHITECTURE.md) is the *why* (architecture, data flow, trust model); the module map is the *where*.
+
 ## WHAT THESE TOOLS MUST NEVER DO
 
 These are hard constraints. Violation of any of these is a security defect.
