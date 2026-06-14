@@ -421,3 +421,68 @@ describe("feature-health — fault precedence + freshness completeness (codex 20
     expect(r.status).toBe("fault");
   });
 });
+
+describe("feature-health — green-strict/fault-loose + activity honesty (codex round-2 2026-06-13)", () => {
+  it("HIGH regression: a privacy CONFIG write alone does NOT render privacy_strips green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // Administrative housekeeping (a config update), not an actual strip.
+    await log.appendCritical({
+      layer: "l2",
+      operation: "query_anonymity_pii_config_updated",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    const privacy = row(panel, "privacy_strips");
+    expect(privacy.status).not.toBe("active");
+    expect(privacy.status).toBe("unconfirmed");
+  });
+
+  it("an actual pii_rewritten DOES render privacy_strips active", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l2",
+      operation: "query_anonymity_pii_rewritten",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(row(panel, "privacy_strips").status).toBe("active");
+  });
+
+  it("MEDIUM regression: an UNMARKED Castle Wall fault still flips the wall to fault, even with fresh marked enforcement present", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // Fresh, properly-marked enforcement evidence (would otherwise be green)...
+    await appendCW(log, "egress_allowed", new Date(now - 90_000).toISOString());
+    // ...and a real fault written WITHOUT the cw_source marker (as the daemon
+    // does for policy_validation_failed). The fault must NOT be dropped.
+    await log.appendCritical({
+      layer: "l1",
+      operation: "policy_validation_failed",
+      identity_id: FORTRESS,
+      result: "failure",
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("fault");
+    expect(cw.basis).toBe("fault_evidence");
+  });
+});

@@ -272,12 +272,12 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       label: "Query-privacy strips",
       layer: "l2",
       liveness: "event_driven",
+      // ONLY the actual rewrite proves the privacy stripper DID something. A
+      // config update or a consent record is administrative housekeeping, not a
+      // strip — counting them as activity would render the feature green without
+      // a single query ever having been stripped (codex HIGH 2026-06-13).
       invocationOps: Object.freeze(
-        new Set<string>([
-          "query_anonymity_pii_rewritten",
-          "query_anonymity_pii_config_updated",
-          "query_anonymity_pii_consent_recorded",
-        ]),
+        new Set<string>(["query_anonymity_pii_rewritten"]),
       ),
       brokenZeroDetectable: false,
     },
@@ -333,16 +333,30 @@ export function evaluateFeatureHealth(args: {
   const freshnessComplete = args.freshnessComplete ?? true;
   const freshnessFloor = now - freshnessWindowMs;
 
-  // Shared per-entry guard: belongs to this feature's layer, is an invocation or
-  // fault op for it, and (Castle Wall only) carries the consumer's provenance
-  // marker. A forged `details.cw_source` from the wire cannot survive into the
-  // persisted entry because the consumer stamps the marker AFTER spreading the
-  // event's own details. NOTE (codex LOW 2026-06-13): this gate defends against
-  // FOREIGN entries; it is not cryptographic provenance — any in-process writer
-  // holding `AuditLog.append` could set the marker. That matches the existing
-  // `posture.ts` Castle-Wall trust boundary exactly (in-process writers are
-  // trusted; the wall's real anti-forgery anchor is the signed manifest, not
-  // this read-side projection). Returns the classification, or null to skip.
+  // Shared per-entry guard: belongs to this feature's layer and is an invocation
+  // or fault op for it. The Castle Wall provenance gate is ASYMMETRIC by design —
+  // green is gated strictly, faults are recognized loosely:
+  //
+  //  - GREEN-EARNING invocation ops MUST carry the consumer's `cw_source` marker.
+  //    A foreign producer reusing an op name like `egress_blocked` therefore
+  //    cannot ARM (green) the wall. (A forged wire-level `cw_source` cannot
+  //    survive into the persisted entry because the consumer stamps the marker
+  //    AFTER spreading the event's own details.)
+  //  - FAULT ops are NOT gated: some real Castle Wall not-enforcing writes (e.g.
+  //    `policy_validation_failed` from the daemon) are appended WITHOUT the
+  //    marker. Gating faults on it would DROP real faults and leave the wall
+  //    green-while-faulted (codex MEDIUM 2026-06-13). We fail toward RED: a
+  //    foreign fake fault is only a false alarm (availability), never a hidden
+  //    fault.
+  //
+  // NOTE (codex HIGH 2026-06-13, accepted as shipped-parity): the green gate is a
+  // string-equality check on a mutable `details` field, so any IN-PROCESS writer
+  // holding `AuditLog.append` could forge a green. This is the EXACT trust
+  // boundary the shipped `posture.ts` already lives with (in-process writers are
+  // trusted; the wall's real anti-forgery anchor is the signed manifest, not this
+  // read-side projection). This slice is no MORE permissive than posture.ts;
+  // cryptographic per-entry provenance is out of scope for a read projection.
+  // Returns the classification, or null to skip.
   const classify = (
     entry: AuditEntry,
   ):
@@ -353,7 +367,10 @@ export function evaluateFeatureHealth(args: {
     const isInvocation = feature.invocationOps.has(op);
     const isFault = feature.faultOps !== undefined && feature.faultOps.has(op);
     if (!isInvocation && !isFault) return null;
-    if (feature.requireCastleWallProvenance) {
+    // Gate ONLY green-earning invocation evidence; never gate fault recognition.
+    // (For Castle Wall, invocationOps and faultOps are disjoint, so a fault entry
+    // is never dropped here.)
+    if (feature.requireCastleWallProvenance && isInvocation) {
       const hasProvenance =
         isRecord(entry.details) &&
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
