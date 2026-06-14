@@ -485,4 +485,25 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     expect(cw.status).toBe("fault");
     expect(cw.basis).toBe("fault_evidence");
   });
+
+  it("DOCUMENTED TRUST BOUNDARY: a correct-marker IN-PROCESS write DOES render green — this is exact posture.ts parity, not a new hole (codex HIGH 2026-06-13, accepted; audit-entry producer authenticity is a tracked system-level item)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // An in-process writer with AuditLog access can stamp the consumer's marker
+    // and arm the wall green. This is the SAME trust boundary the shipped
+    // posture.ts arm-state already lives with (in-process writers are trusted;
+    // the wall's real anti-forgery anchor is the signed manifest, not this
+    // read-side projection). This surface is no MORE permissive than posture.ts.
+    // Closing this requires per-entry producer authenticity in the audit log —
+    // a cross-cutting change that also hardens posture.ts, tracked separately.
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    // Behavior asserted explicitly so the boundary is visible and deliberate,
+    // never an unexamined gap: a correctly-marked fresh entry renders green.
+    expect(row(panel, "castle_wall_egress").status).toBe("active");
+  });
 });
