@@ -57,7 +57,7 @@
     "@chainsafe/libp2p-noise": "16.1.5",
     "@chainsafe/libp2p-yamux": "7.0.4",
     "@libp2p/crypto": "5.1.17",
-    "@libp2p/identify": "3.0.39",
+    "@libp2p/identify": "4.1.8",
     "@libp2p/interface": "2.11.0",
     "@libp2p/kad-dht": "16.3.3",
     "@libp2p/mdns": "11.0.47",
