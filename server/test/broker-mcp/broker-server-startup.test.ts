@@ -2,8 +2,8 @@
  * broker-server startup — v0.10.1 regression guard for v0.10.0-rc.2 finding #1.
  *
  * v0.10.0-rc.2 had `require("../../package.json")` inline at
- * server/src/mcp/broker-server.ts. The relative path resolved correctly
- * from source (server/src/mcp/ → server/package.json) but resolved one
+ * server/src/broker-mcp/broker-server.ts. The relative path resolved correctly
+ * from source (server/src/broker-mcp/ → server/package.json) but resolved one
  * level too high from the bundled output (server/dist/cli.js → repo root,
  * which has no package.json). The `sanctuary broker-server` subcommand
  * therefore failed to start with `Cannot find module '../../package.json'`.
@@ -25,7 +25,7 @@ import { Broker } from "../../src/l3-disclosure/broker/broker.js";
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { createBrokerMcpServer } from "../../src/mcp/broker-server.js";
+import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -34,7 +34,7 @@ const pkgVersion = JSON.parse(
   readFileSync(join(repoRoot, "package.json"), "utf8")
 ).version as string;
 const brokerServerSource = readFileSync(
-  join(repoRoot, "src", "mcp", "broker-server.ts"),
+  join(repoRoot, "src", "broker-mcp", "broker-server.ts"),
   "utf8"
 );
 

@@ -21,7 +21,7 @@ import { Broker } from "../../src/l3-disclosure/broker/broker.js";
 import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { createBrokerMcpServer } from "../../src/mcp/broker-server.js";
+import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
 
 function makeFakeBackend(seed: Record<string, string> = {}): Backend {
   const store = new Map(Object.entries(seed));
