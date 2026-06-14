@@ -5,6 +5,10 @@ gate, the 8 "must never do" security invariants, skill routing) stay in `CLAUDE.
 a lookup. This file is the reference detail split out of `CLAUDE.md` on 2026-06-08 to cut per-session
 context load.
 
+**Per-module index:** this doc is the *why* (architecture, data flow, trust model); for the *where* -
+what each of the 54 `server/src` modules owns, how they relate, and which names are traps - see the
+module map at [`server/src/README.md`](server/src/README.md).
+
 ## WHAT THESE TOOLS ARE
 
 **Sanctuary** is a TypeScript MCP server (~37,500 lines, 75 tools) that gives AI agents four layers of cryptographic sovereignty — without requiring changes to the host agent harness. It ships as an npm package (`@sanctuary-framework/mcp-server`), Docker image, and Claude Code plugin. Version 0.9.0-rc.1.
