@@ -305,6 +305,16 @@ export interface BuildFeatureHealthInput {
    * invocations re-verify their producer signature. Null on macOS / pre-provision.
    */
   pinnedProducerKeyB64url?: string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED (the daemon published
+   * one) but the reader could NOT load it. The read-side authenticity basis is
+   * therefore unavailable, so NO feature may render green — falling back to the
+   * channel basis would be a weaker basis than the key-bearing consumer's. When
+   * true, the panel is computed with `integrityOk=false`, which the existing
+   * "tainted read → unknown" lever maps to `unknown` for every row (never green).
+   * Set only when `pinnedProducerKeyB64url` is null.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
 }
@@ -647,6 +657,16 @@ export async function buildFeatureHealthPanel(
     freshnessEntries = [];
     freshnessComplete = false;
     integrityOk = false;
+  }
+
+  // Slice P fail-honest: a producer key is expected but the reader could not
+  // load it, so the read-side authenticity basis is unavailable. Force the
+  // tainted-read path (integrityOk=false, freshnessComplete=false): every row
+  // renders `unknown`, never green on a weaker basis than the consumer wrote
+  // with. This reuses the existing "untrustworthy read → unknown" invariant.
+  if (input.producerKeyExpectedButUnavailable === true) {
+    integrityOk = false;
+    freshnessComplete = false;
   }
 
   // Bound each window's UPPER edge: the query only filters `since`, so skip any

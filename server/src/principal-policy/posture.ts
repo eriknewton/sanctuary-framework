@@ -156,7 +156,10 @@ export interface CastleWallPosture {
     | "stale_evidence"
     | "no_evidence"
     | "not_enforcing_evidence"
-    | "not_installed";
+    | "not_installed"
+    // Slice P: a producer key is expected but the reader could not load it, so
+    // the wall is reported `degraded` rather than green on a weaker basis.
+    | "producer_key_unavailable";
   /** ISO8601 of the most recent enforcement-evidence event, if any. */
   last_enforcement_evidence_at: string | null;
   /** Freshness window (ms) used to judge "recent". */
@@ -205,6 +208,17 @@ export interface BuildCastleWallPostureInput {
    * the same key the consumer wrote with; never read with a weaker basis.
    */
   pinnedProducerKeyB64url?: string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED for this fortress
+   * (the daemon published one) but the reader could NOT load it (present but
+   * unreadable / malformed). In that state the reader cannot re-verify producer
+   * signatures, yet the key-bearing consumer IS enforcing on the signed basis —
+   * so falling back to the channel basis here would let the reader render green
+   * on a weaker basis than the consumer wrote with. When true, the posture is
+   * forced to a non-armed `degraded` state (never armed, never green) regardless
+   * of evidence. Set only when `pinnedProducerKeyB64url` is null.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
 }
@@ -234,6 +248,24 @@ export async function buildCastleWallPosture(
   const digestWindowMs = input.digestWindowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const platform = mapPlatform(input.platform ?? process.platform);
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+
+  // Slice P fail-honest: a producer key is expected (the daemon published one)
+  // but the reader could not load it. The consumer is enforcing on the signed
+  // basis, so the reader must NOT fall back to the channel basis and render
+  // green — it surfaces `degraded` (not-armed) until the key is readable again.
+  if (input.producerKeyExpectedButUnavailable === true) {
+    return {
+      origin_machine: input.originMachine,
+      arm_state: "degraded",
+      platform,
+      evidence_basis: "producer_key_unavailable",
+      last_enforcement_evidence_at: null,
+      freshness_window_ms: freshnessWindowMs,
+      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+      audit_integrity_ok: true,
+      producer_authenticity: "not_applicable",
+    };
+  }
 
   // Read the l1 (Castle Wall) slice over the digest window. The freshness
   // judgment is then made over the same entries by timestamp so a single read
@@ -543,6 +575,15 @@ export interface BuildAuditDigestInput {
    * excluded. When null, kernel counts rest on the channel basis (legacy).
    */
   pinnedProducerKeyB64url?: string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED (the daemon published
+   * one) but the reader could NOT load it. The kernel counts would otherwise
+   * rest on the channel basis (a weaker basis than the key-bearing consumer's),
+   * so when true the digest reports an unverified chain with zero kernel counts —
+   * the same honest shape as a tainted read. Set only when
+   * `pinnedProducerKeyB64url` is null.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
 }
@@ -568,6 +609,26 @@ export async function buildAuditDigest(
   const windowStart = new Date(now - windowMs).toISOString();
   const windowEnd = new Date(now).toISOString();
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+
+  // Slice P fail-honest: a producer key is expected but the reader could not
+  // load it. Report an unverified chain with zero kernel counts rather than let
+  // channel-basis (possibly forged) entries inflate kernel verdict counts.
+  if (input.producerKeyExpectedButUnavailable === true) {
+    return {
+      origin_machine: input.originMachine,
+      window_start: windowStart,
+      window_end: windowEnd,
+      total_operations: 0,
+      failures: 0,
+      kernel_blocks: 0,
+      kernel_allows: 0,
+      approvals_granted: 0,
+      approvals_denied: 0,
+      by_agent: [],
+      chain_verified: false,
+      integrity_finding_count: 0,
+    };
+  }
 
   let entries;
   let integrityFindings;
