@@ -91,13 +91,13 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
@@ -148,19 +148,19 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
 
       - name: Download synthetic coverage parity report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-parity
           path: artifacts/parity
