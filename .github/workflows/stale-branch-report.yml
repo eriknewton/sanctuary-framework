@@ -1,0 +1,54 @@
+name: Stale branch report
+
+# Branch-accumulation prevention, part 2 of 2.
+# Part 1 is the repo setting `delete_branch_on_merge` (merged-PR head branches
+# auto-delete on merge — that was 95%+ of the accumulation). This workflow
+# catches the LONG TAIL: branches with no open PR that never merge. It is
+# REPORT-ONLY by design and never deletes — an unmerged no-PR branch can hold
+# wanted work, so deletion stays a human decision.
+
+on:
+  schedule:
+    - cron: "17 8 * * 1" # Mondays 08:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List stale branches (no open PR, no commits in 60 days)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '60 days ago' +%s)
+          gh pr list --repo "$REPO" --state open --limit 500 \
+            --json headRefName --jq '.[].headRefName' | sort -u > /tmp/openpr.txt
+          {
+            echo "## Stale branch report ($(date -u +%F))"
+            echo
+            echo "Branches with **no open PR** and **no commits in 60 days**."
+            echo "Merged-PR branches auto-delete (repo setting \`delete_branch_on_merge\`); this is the no-PR long tail."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          stale=0
+          while read -r br; do
+            case "$br" in main | gh-pages) continue ;; esac
+            grep -qxF "$br" /tmp/openpr.txt && continue
+            iso=$(gh api "repos/$REPO/branches/$br" --jq '.commit.commit.committer.date')
+            ts=$(date -u -d "$iso" +%s)
+            if [ "$ts" -lt "$cutoff" ]; then
+              echo "- \`$br\` — last commit ${iso%T*}" >> "$GITHUB_STEP_SUMMARY"
+              stale=$((stale + 1))
+            fi
+          done < <(gh api "repos/$REPO/branches" --paginate --jq '.[].name')
+          if [ "$stale" -eq 0 ]; then
+            echo "_None — the branch list is clean._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "_Report-only; nothing is deleted. Prune dead branches; never delete an unmerged no-PR branch without first checking it for wanted work._" >> "$GITHUB_STEP_SUMMARY"
