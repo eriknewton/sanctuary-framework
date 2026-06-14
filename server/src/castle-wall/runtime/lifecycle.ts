@@ -14,6 +14,7 @@ import { ApprovalStub } from "./approval-stub.js";
 import { AuditConsumer, type AuditSink } from "./audit-consumer.js";
 import { IpcClient, type IpcTransport, type ClientKeyMaterial } from "./ipc-client.js";
 import { RuntimeIpcError } from "./errors.js";
+import { loadFortressProducerKey } from "./producer-signature.js";
 
 /** Public lifecycle state surface. */
 export type CastleWallLifecycleState =
@@ -41,6 +42,30 @@ export interface StartCastleWallInput {
    * the runtime once the drain pull-loop (next slice) feeds the consumer.
    */
   pinnedProducerKeyB64url?: string | null;
+  /**
+   * Slice P consumer provisioning: the fortress storage path. When provided (and
+   * `pinnedProducerKeyB64url` is not explicitly set), the lifecycle resolves the
+   * pinned producer key through the SAME single-source loader the readers use
+   * (`loadFortressProducerKey` → `<storagePath>/policy/egress/audit-producer.pub`),
+   * so the consumer and the readers can never diverge onto different keys/paths.
+   *
+   * Activation + fail direction:
+   *   - key `present`    → the consumer REQUIRES a valid producer signature on
+   *                        enforcement evidence (the L1 close activates).
+   *   - key `absent`     → channel basis (honest macOS / pre-provision floor).
+   *   - key `unreadable` → a key is EXPECTED but cannot be loaded; `startCastleWall`
+   *                        THROWS (fail closed). The consumer must never write
+   *                        enforcement evidence on the channel basis while the
+   *                        daemon is signing — a key-null consumer would persist
+   *                        forgeable entries the reader could later trust.
+   *
+   * When `fortressStoragePath` is set it is AUTHORITATIVE (divergence-proof): an
+   * explicit NON-null `pinnedProducerKeyB64url` passed alongside it is REJECTED
+   * (two sources of truth for one key), and an explicit `null` does NOT downgrade
+   * a present on-disk key. Pass an explicit `pinnedProducerKeyB64url` only WITHOUT
+   * a storage path (tests / callers that resolve the key themselves).
+   */
+  fortressStoragePath?: string;
   promptTimeoutMs?: number;
   strictMode?: boolean;
   /** Optional override for handshake timeout; defaults to 5s. */
@@ -75,8 +100,49 @@ export async function startCastleWall(
     setTimer: input.setTimer,
     clearTimer: input.clearTimer,
   });
+
+  // Slice P: resolve the consumer's pinned producer key from the single source.
+  //
+  // Precedence (divergence-proof, codex MEDIUM #3): when a `fortressStoragePath`
+  // is given, storage resolution is AUTHORITATIVE — the consumer reads the same
+  // path the readers do, so it can never be pinned to a weaker basis than the
+  // reader by a caller passing an explicit `null`. An explicit NON-null
+  // `pinnedProducerKeyB64url` is honored only as a path-less convenience (tests /
+  // callers that resolve the key themselves); it is rejected ALONGSIDE a
+  // storage path to keep one source of truth. `unreadable` is a refuse-to-start
+  // condition (fail closed): a key is expected but cannot be loaded, so the
+  // consumer must not silently fall back to the channel basis while the daemon
+  // signs.
+  let consumerPinnedKey: string | null;
+  if (typeof input.fortressStoragePath === "string") {
+    if (
+      input.pinnedProducerKeyB64url !== undefined &&
+      input.pinnedProducerKeyB64url !== null
+    ) {
+      throw new RuntimeIpcError(
+        "Castle Wall consumer: pass either fortressStoragePath OR an explicit pinnedProducerKeyB64url, not both — they are two sources of truth for one key."
+      );
+    }
+    const load = await loadFortressProducerKey(input.fortressStoragePath);
+    if (load.status === "present") {
+      consumerPinnedKey = load.keyB64url;
+    } else if (load.status === "absent") {
+      consumerPinnedKey = null;
+    } else {
+      throw new RuntimeIpcError(
+        `Castle Wall consumer: audit-producer key is expected but unreadable; refusing to start on the channel basis (${load.reason}).`
+      );
+    }
+  } else if (input.pinnedProducerKeyB64url !== undefined) {
+    // No storage path: honor the explicit key (incl. an explicit null = channel
+    // basis for path-less callers/tests).
+    consumerPinnedKey = input.pinnedProducerKeyB64url;
+  } else {
+    consumerPinnedKey = null;
+  }
+
   const audit = new AuditConsumer(input.auditSink, undefined, {
-    pinnedProducerKeyB64url: input.pinnedProducerKeyB64url ?? null,
+    pinnedProducerKeyB64url: consumerPinnedKey,
   });
   let state: CastleWallLifecycleState = "handshaking";
 

@@ -1,0 +1,10 @@
+{
+  "_comment": "Producer-signature CROSS-LANGUAGE byte-compat vector (Slice L1 + Slice P). The signature in `sig_b64url` was produced by the Rust daemon's `ed25519-dalek` ProducerSigner::sign_event over `producer_signing_bytes(canonical, ts, seq)`; the daemon-published verifying key is `pubkey_b64url`. Both languages re-derive the signing bytes and verify the SAME signature against the SAME key, proving the Rust producer and the TS consumer/readers hash and verify identical bytes. Consumed by server/test/castle-wall/runtime/producer-sig-cross-lang.test.ts (TS, @noble) and castle-wall-daemon/tests/integration_producer_sig_cross_lang.rs (Rust, ed25519-dalek). The keypair derives from a FIXED, non-secret seed so the vector is reproducible; it is NOT a production key. If either language's signing-bytes layout changes, this vector fails in BOTH suites.",
+  "seed_note": "Ed25519 seed = bytes 1..=32 (1,2,...,32). Reproduce with castle-wall-daemon ProducerSigner::from_signing_key(SigningKey::from_bytes(&[1..=32])).",
+  "pubkey_b64url": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+  "canonical": "{\"event_type\":\"egress_blocked\",\"fortress_id\":\"deadbeef\",\"seq\":42}",
+  "captured_at_unix_ms": 1718000000000,
+  "seq": 42,
+  "key_id": "cw-audit-producer-v1",
+  "sig_b64url": "XoIK0Mi_zfGUmHXy2GB70hd-gPY8LahGjgrd6Ut-oBRXt0_pmGNuXn0xLQv0h9HAWQCp6Wgp6pFvsKs-I4pHCw"
+}

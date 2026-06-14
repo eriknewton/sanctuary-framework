@@ -89,6 +89,15 @@ export interface PostureRouteDeps {
    * with, never a weaker basis (Slice R, R-4).
    */
   resolvePinnedProducerKey?: () => string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
+   * daemon published one) but the dashboard could NOT load it (present but
+   * unreadable / malformed). When true, the readers refuse to render green on the
+   * channel basis — the wall posture forces `degraded`, the digest reports an
+   * unverified chain, and feature-health rows render `unknown`. Mutually
+   * exclusive with a non-null `resolvePinnedProducerKey()`.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
 }
 
 /**
@@ -217,6 +226,9 @@ async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPostu
     pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
       ? deps.resolvePinnedProducerKey()
       : null,
+    ...(deps.producerKeyExpectedButUnavailable
+      ? { producerKeyExpectedButUnavailable: true }
+      : {}),
   });
 }
 
@@ -228,6 +240,9 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
     pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
       ? deps.resolvePinnedProducerKey()
       : null,
+    ...(deps.producerKeyExpectedButUnavailable
+      ? { producerKeyExpectedButUnavailable: true }
+      : {}),
   });
 }
 
@@ -249,6 +264,9 @@ async function buildFeatureHealth(
     pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
       ? deps.resolvePinnedProducerKey()
       : null,
+    ...(deps.producerKeyExpectedButUnavailable
+      ? { producerKeyExpectedButUnavailable: true }
+      : {}),
   });
 }
 
