@@ -78,7 +78,7 @@ import {
  * `mcp__<server>__<tool>` identifier shape (slash -> double underscore).
  *
  * Sourced from the broker tool registrations in
- * server/src/mcp/broker-server.ts. Keep this list in sync with the
+ * server/src/broker-mcp/broker-server.ts. Keep this list in sync with the
  * shipped broker tool surface; the broker's policy gate stops any
  * write-side or destructive operation regardless of the allowlist.
  */
