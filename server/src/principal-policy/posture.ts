@@ -44,6 +44,7 @@ import type { AgentPlatform } from "../wrap/config-reader.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
 } from "../castle-wall/constants.js";
 import {
   reverifyEntryProducerSignature,
@@ -413,6 +414,44 @@ function mapPlatform(platform: NodeJS.Platform): "macos" | "linux" | "other" {
   return "other";
 }
 
+/**
+ * Map from the daemon's signed WAL `operation` vocabulary to the read-side
+ * `operation` the digest counts. Mirrors `WAL_OPERATION_TO_EVENT_TYPE` in the
+ * audit consumer. Used to bind a re-verified signed body's operation to the
+ * entry it is filed under, so a signed "allow" tuple cannot be stapled onto a
+ * "block" entry to mis-count kernel verdicts.
+ */
+const SIGNED_WAL_OP_TO_ENTRY_OP: Readonly<Record<string, string>> = Object.freeze({
+  egress_approved: "egress_allowed",
+  egress_blocked: "egress_blocked",
+  egress_pending: "operator_decision",
+});
+
+/**
+ * True iff the persisted signed canonical body's `operation` maps to the audit
+ * entry's `operation`. Returns false on any parse failure or mismatch (fail
+ * closed). Only meaningful for a re-verified producer-signed entry.
+ */
+function signedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  if (typeof canonical !== "string") return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonical);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+  const signedOp = (parsed as Record<string, unknown>).operation;
+  if (typeof signedOp !== "string") return false;
+  return SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] === entryOperation;
+}
+
 // ── G2: today's audit story digest ──────────────────────────────────
 
 export interface AuditDigest {
@@ -538,19 +577,37 @@ export async function buildAuditDigest(
         CASTLE_WALL_AUDIT_PROVENANCE_VALUE &&
       (entry.operation === "egress_blocked" ||
         entry.operation === "egress_allowed");
-    const reverifyCounts =
-      !isCastleWallBlockOrAllow ||
-      enforcementEntryCounts(
-        reverifyEntryProducerSignature(
-          entry.details,
-          pinnedProducerKey,
-          input.verifyProducerSignature,
-        ).basis,
-        pinnedProducerKey !== null,
+    let kernelCounts = !isCastleWallBlockOrAllow;
+    if (isCastleWallBlockOrAllow) {
+      const re = reverifyEntryProducerSignature(
+        entry.details,
+        pinnedProducerKey,
+        input.verifyProducerSignature,
       );
-    if (isCastleWallBlockOrAllow && reverifyCounts && entry.operation === "egress_blocked")
+      kernelCounts = enforcementEntryCounts(re.basis, pinnedProducerKey !== null);
+      // For a re-verified producer-signed entry, bind the count to the SIGNATURE
+      // rather than the forgeable top-level fields (codex re-review HIGH): (a)
+      // the signed capture time must fall within the digest window, so a same-seq
+      // replay of an OLD signed tuple into a fresh-timestamped entry does not
+      // inflate today's kernel counts; (b) the signed canonical `operation` must
+      // map to the entry's operation, so a signed "allow" tuple cannot be stapled
+      // onto a "block" entry to mis-count. Channel-basis (no-key) entries have no
+      // signed time/op, so they keep the top-level-timestamp window bound applied
+      // above (the honest no-key floor).
+      if (re.basis === "producer_signed_verified") {
+        const signedMs = re.signedCapturedAtMs;
+        const inWindow =
+          signedMs !== null && signedMs > now - windowMs && signedMs <= windowEndMs;
+        const opBound = signedOperationMatchesEntry(
+          entry.details ?? {},
+          entry.operation,
+        );
+        kernelCounts = kernelCounts && inWindow && opBound;
+      }
+    }
+    if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_blocked")
       kernelBlocks += 1;
-    else if (isCastleWallBlockOrAllow && reverifyCounts && entry.operation === "egress_allowed")
+    else if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_allowed")
       kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result

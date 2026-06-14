@@ -387,6 +387,89 @@ describe("Slice R — codex HIGH #3: same-seq replay with a forged-fresh top-lev
   });
 });
 
+describe("Slice R — codex re-review HIGH: digest kernel counts bind to the signature, not the entry", () => {
+  it("a same-seq replay of an OLD signed tuple into a fresh entry does NOT inflate kernel_blocks", async () => {
+    const log = newLog();
+    const OLD_TS = NOW - 48 * 60 * 60 * 1000; // 2 days ago, outside the 24h digest window
+    const canonical = JSON.stringify({
+      timestamp: new Date(OLD_TS).toISOString(),
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "agent-1",
+      result: "blocked",
+      details: { agent_id: "agent-1" },
+    });
+    const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(), // forged-fresh top-level ts
+      details: {
+        seq: 0,
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+    });
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    // The signature verifies, but the signed capture time is outside the digest
+    // window → the replay does not inflate the kernel-block count.
+    expect(digest.kernel_blocks).toBe(0);
+  });
+
+  it("a signed 'allow' tuple stapled onto an 'egress_blocked' entry does NOT count as a kernel_block", async () => {
+    const log = newLog();
+    // Genuinely sign an egress_APPROVED (allow) WAL body, then file it under an
+    // egress_blocked audit entry. The signature verifies, but the signed
+    // operation (egress_approved → egress_allowed) does not map to the entry's
+    // egress_blocked, so it must not count as a block.
+    const allowCanonical = JSON.stringify({
+      timestamp: new Date(FRESH_TS).toISOString(),
+      layer: "l1",
+      operation: "egress_approved",
+      identity_id: "agent-1",
+      result: "success",
+      details: { agent_id: "agent-1" },
+    });
+    const sig = ed25519.sign(producerSigningBytes(allowCanonical, FRESH_TS, 0), daemonPriv);
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked", // stapled onto the WRONG operation slot
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS).toISOString(),
+      details: {
+        seq: 0,
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: allowCanonical,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+    });
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    expect(digest.kernel_blocks).toBe(0);
+    // It also must not be mis-counted as an allow (it was filed as a block).
+    expect(digest.kernel_allows).toBe(0);
+  });
+});
+
 describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and renders green", () => {
   it("posture: genuine signed entry arms with producer_signed authenticity", async () => {
     const log = newLog();
