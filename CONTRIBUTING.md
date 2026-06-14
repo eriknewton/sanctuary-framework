@@ -42,7 +42,7 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 
 1. Fork the repository and clone your fork
 2. Install dependencies: `cd server && npm install`
-3. Run the test suite: `npm test` (all 1071+ tests should pass)
+3. Run the test suite: `npm test` (must stay green; the enforced minimum is tracked in `.test-baseline`)
 
 ### Development Guidelines
 
@@ -51,12 +51,14 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 - Every new tool requires a corresponding test file
 - Every bug fix requires a regression test
 - Use conventional commit format: `feat:`, `fix:`, `docs:`, `test:`, `security:`
+- Run `npm run lint` before pushing; CI enforces zero ESLint errors (warnings are reported, not blocking)
+- An `.editorconfig` at the repo root sets the basics (UTF-8, LF, 2-space indent, final newline); most editors apply it automatically
 
 ### Pull Request Process
 
 1. Create a branch from `main`
 2. Make your changes with tests
-3. Run `npm test` — all tests must pass
+3. Run `npm test` and `npm run lint` — tests must pass and lint must report zero errors
 4. Submit PR with description of changes and motivation
 5. Address review feedback; maintainer merges after approval
 

@@ -1,0 +1,21 @@
+# EditorConfig — consistent style across editors (https://editorconfig.org)
+# Universal settings apply to every file; indent width is set only for the
+# file types in the TypeScript/web tree. The Rust (castle-wall-daemon) and
+# Swift (castle-wall-macos / -vmm) trees keep their own formatter conventions.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{ts,tsx,js,jsx,cjs,mjs,json,jsonc,css,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+indent_style = space
+indent_size = 2
+# Two trailing spaces are a Markdown hard line break — do not trim them.
+trim_trailing_whitespace = false
