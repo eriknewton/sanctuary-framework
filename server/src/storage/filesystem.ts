@@ -5,7 +5,16 @@
  * Files are stored as: {basePath}/{namespace}/{key}.enc
  *
  * Security invariants:
- * - Secure deletion overwrites file content with random bytes before unlinking
+ * - Data at rest is CIPHERTEXT: state entries are encrypted before they reach
+ *   this backend. Secure deletion makes a best-effort attempt to overwrite the
+ *   file's bytes with random data (3 passes, each fsync'd) before unlinking, so
+ *   any residual on the medium is overwritten random bytes or the prior
+ *   ciphertext — never plaintext. In-place overwrite is NOT guaranteed on
+ *   copy-on-write (APFS), journaled (ext4), or flash-FTL/SSD storage, where the
+ *   filesystem or controller may write the new bytes to fresh blocks and leave
+ *   the original blocks intact until reclaimed. This routine therefore does not
+ *   promise unrecoverable erasure of the original on-disk bytes; the at-rest
+ *   confidentiality guarantee rests on encryption, not on this overwrite.
  * - Directory creation uses restrictive permissions (0o700)
  * - File creation uses restrictive permissions (0o600)
  *
@@ -31,7 +40,7 @@
  *   pairs; they are forward-only by design.
  */
 
-import { mkdir, open, readFile, writeFile, unlink, readdir, rename, stat } from "node:fs/promises";
+import { mkdir, open, readFile, unlink, readdir, rename, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
 import {
@@ -217,10 +226,35 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
         const fileStat = await stat(filePath);
         const size = fileStat.size;
 
-        // Overwrite with random bytes (3 passes for defense in depth)
-        for (let pass = 0; pass < 3; pass++) {
+        // A zero-byte file has no content to overwrite (and randomBytes(0)
+        // rejects a non-positive length); skip straight to unlink.
+        // Overwrite with random bytes (3 passes for defense in depth). Each
+        // pass is fsync'd so the bytes are flushed to the medium rather than
+        // left in the page cache; this is best-effort durability, not a
+        // guarantee of in-place overwrite on CoW / journaled / flash-FTL
+        // filesystems (see the header comment).
+        for (let pass = 0; size > 0 && pass < 3; pass++) {
           const randomData = randomBytes(size);
-          await writeFile(filePath, randomData, { mode: 0o600 });
+          const fileHandle = await open(filePath, "r+");
+          try {
+            // write() may short-write, so loop until every byte is on the fd
+            // before fsync; otherwise a pass could flush only a prefix and
+            // leave the suffix as prior ciphertext.
+            let offset = 0;
+            while (offset < randomData.length) {
+              const { bytesWritten } = await fileHandle.write(
+                randomData,
+                offset,
+                randomData.length - offset,
+                offset
+              );
+              if (bytesWritten === 0) break;
+              offset += bytesWritten;
+            }
+            await fileHandle.sync();
+          } finally {
+            await fileHandle.close();
+          }
         }
       }
 

@@ -206,6 +206,27 @@ describe("FilesystemStorage", () => {
       expect(deleted).toBe(true);
       expect(await storage.read("ns", "key")).toBeNull();
     });
+
+    it("fsync'd overwrite path removes a multi-block file", async () => {
+      // Exercises the fd-based open/write/sync/close overwrite for a file
+      // larger than a single page; the file must still be removed afterward.
+      const data = new Uint8Array(64 * 1024).fill(0x5a);
+      await storage.write("big-ns", "big-key", data);
+
+      const deleted = await storage.delete("big-ns", "big-key", true);
+      expect(deleted).toBe(true);
+      expect(await storage.read("big-ns", "big-key")).toBeNull();
+    });
+
+    it("fsync'd overwrite path handles a zero-byte file", async () => {
+      // A 0-length file means the overwrite writes nothing; open/sync/close
+      // must not throw and the file must still be unlinked.
+      await storage.write("empty-ns", "empty-key", new Uint8Array(0));
+
+      const deleted = await storage.delete("empty-ns", "empty-key", true);
+      expect(deleted).toBe(true);
+      expect(await storage.read("empty-ns", "empty-key")).toBeNull();
+    });
   });
 
   // ── List ───────────────────────────────────────────────────────────
