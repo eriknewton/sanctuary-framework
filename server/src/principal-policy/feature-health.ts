@@ -73,6 +73,11 @@ import {
   DEFAULT_DIGEST_WINDOW_MS,
   ENFORCEMENT_FUTURE_SKEW_MS,
 } from "./posture.js";
+import {
+  reverifyEntryProducerSignature,
+  reverifyBasisCounts,
+  type VerifyProducerSignatureFn,
+} from "./producer-reverify.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -293,6 +298,14 @@ export interface BuildFeatureHealthInput {
   freshnessWindowMs?: number;
   /** Window over which invocations are counted. */
   windowMs?: number;
+  /**
+   * The reader's pinned producer public key (see `BuildCastleWallPostureInput`).
+   * Threaded into every per-feature evaluation so provenance-gated Castle Wall
+   * invocations re-verify their producer signature. Null on macOS / pre-provision.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }
 
 /**
@@ -326,9 +339,21 @@ export function evaluateFeatureHealth(args: {
   now: number;
   freshnessWindowMs: number;
   integrityOk: boolean;
+  /**
+   * The reader's pinned producer public key (see `BuildCastleWallPostureInput`).
+   * When non-null, a provenance-gated Castle Wall INVOCATION only counts toward
+   * green if its producer signature RE-verifies against this key; a forged
+   * `producer_signed`-claiming invocation is dropped. When null, invocation
+   * recognition rests on the channel basis (legacy / macOS). Fault recognition
+   * is never gated by it (faults fail toward RED — see `classify`).
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
+  const pinnedProducerKey = args.pinnedProducerKeyB64url ?? null;
   const freshnessEntries = args.freshnessEntries ?? entries;
   const freshnessComplete = args.freshnessComplete ?? true;
   const freshnessFloor = now - freshnessWindowMs;
@@ -376,6 +401,20 @@ export function evaluateFeatureHealth(args: {
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
           CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
       if (!hasProvenance) return null;
+      // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
+      // authority for a green-earning invocation is the producer signature,
+      // RE-verified here against the pinned key. A forged in-process entry that
+      // claims `producer_signed` but fails re-verify is dropped — it cannot make
+      // the feature read green. With no pinned key the reader cannot check and
+      // falls to the channel basis (the honest macOS / pre-provision floor).
+      // Fault ops are NOT routed here (they fail toward RED), so this never
+      // drops a real fault.
+      const reBasis = reverifyEntryProducerSignature(
+        entry.details,
+        pinnedProducerKey,
+        args.verifyProducerSignature,
+      );
+      if (!reverifyBasisCounts(reBasis)) return null;
     }
     const ts = Date.parse(entry.timestamp);
     // Reject future-dated evidence beyond a small clock-skew tolerance: a future
@@ -601,6 +640,10 @@ export async function buildFeatureHealthPanel(
       now,
       freshnessWindowMs,
       integrityOk,
+      pinnedProducerKeyB64url: input.pinnedProducerKeyB64url ?? null,
+      ...(input.verifyProducerSignature
+        ? { verifyProducerSignature: input.verifyProducerSignature }
+        : {}),
     }),
   );
 

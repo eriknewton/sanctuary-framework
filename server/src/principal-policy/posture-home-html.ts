@@ -261,6 +261,18 @@ export function renderPostureHomeHTML(): string {
       w.verdict_counts.operator_decisions + " operator decisions</div>" +
       '<div class="evidence">Evidence basis: <code>' + esc(w.evidence_basis) + "</code>" +
       (w.last_enforcement_evidence_at ? " · last enforcement " + esc(w.last_enforcement_evidence_at) : "") + "</div>" +
+      // Slice R: honestly surface the cryptographic basis the green light rests
+      // on. producer_signed = the daemon producer signature was re-verified at
+      // read time. channel_authenticated = the green rests on the mutually-
+      // pinned IPC channel + tamper-evident chain only (the honest macOS / pre-
+      // provision floor; NOT per-producer authenticated). Only shown when armed.
+      (w.arm_state === "armed" && w.producer_authenticity
+        ? '<div class="evidence">Authenticity: <code>' + esc(w.producer_authenticity) + "</code>" +
+          (w.producer_authenticity === "producer_signed"
+            ? " (enforcement evidence cryptographically re-verified against the pinned producer key)"
+            : " (channel-authenticated + tamper-evident chain; per-producer signing not available on this reader)") +
+          "</div>"
+        : "") +
       (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present — arm-state read may be incomplete.</div>');
   }
 

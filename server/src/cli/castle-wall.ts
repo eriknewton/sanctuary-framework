@@ -138,6 +138,18 @@ interface HeadlessReport {
   build?: HeadlessBuildIdentity;
 }
 
+/**
+ * The CLI's `armed` status shape. It sources from the live daemon lease/IPC
+ * (`source: "castle-wall-cli"`), NOT from the audit-marker read path, so it does
+ * not re-verify per-event producer signatures (Slice R) — and, importantly, it
+ * makes NO per-producer-authenticity claim at all. `armed` here means "the
+ * daemon holds a live, non-revoked enforcement lease"; it is liveness, not an
+ * authenticity assertion. Because it asserts no authenticity basis, it cannot
+ * diverge from the posture surface's `producer_authenticity` (the H3 second-
+ * green-path hazard): there is no contradictory claim to make. Any future field
+ * that DOES assert authenticity here must mirror `CastleWallPosture.
+ * producer_authenticity`, never assert producer-signed independently.
+ */
 interface LeaseStatusFile {
   armed: boolean;
   revoked?: boolean;

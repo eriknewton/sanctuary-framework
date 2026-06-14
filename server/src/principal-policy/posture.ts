@@ -45,6 +45,11 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../castle-wall/constants.js";
+import {
+  reverifyEntryProducerSignature,
+  reverifyBasisCounts,
+  type VerifyProducerSignatureFn,
+} from "./producer-reverify.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -144,6 +149,25 @@ export interface CastleWallPosture {
   verdict_counts: CastleWallVerdictCounts;
   /** True when an integrity finding tainted the audit read backing this. */
   audit_integrity_ok: boolean;
+  /**
+   * The CRYPTOGRAPHIC basis the green light rests on — surfaced honestly so the
+   * UI never over-claims (never-overclaim ethos). This is independent of the
+   * `arm_state` color: a wall can be `armed` on either basis.
+   *
+   *  - `producer_signed` — the fresh enforcement evidence backing `armed` had
+   *    its daemon producer signature RE-verified at read time against the
+   *    pinned key. The in-process forgery hole is closed for this read.
+   *  - `channel_authenticated` — `armed` rests on the legacy channel basis
+   *    (mutually-pinned IPC + tamper-evident chain) because no pinned producer
+   *    key was available to this reader (macOS today, or Linux pre-provision).
+   *    NOT per-producer authenticated — honestly labeled as such.
+   *  - `not_applicable` — the wall is not `armed`, so no authenticity basis is
+   *    asserted (unknown/degraded/not_installed).
+   */
+  producer_authenticity:
+    | "producer_signed"
+    | "channel_authenticated"
+    | "not_applicable";
 }
 
 export interface BuildCastleWallPostureInput {
@@ -153,6 +177,20 @@ export interface BuildCastleWallPostureInput {
   now?: number;
   freshnessWindowMs?: number;
   digestWindowMs?: number;
+  /**
+   * The reader's pinned producer public key (base64url-no-pad), loaded from the
+   * SAME source the audit consumer uses (`<policy_dir>/audit-producer.pub` via
+   * `loadPinnedProducerKeyB64url`). When non-null, fresh enforcement evidence
+   * must RE-verify its persisted producer signature against this key to count
+   * toward `armed`; a `producer_signed`-claiming entry that fails re-verify
+   * (forged) renders non-green. When null (macOS today / pre-provision), the
+   * reader falls back to the channel-authenticated basis and labels the green
+   * honestly — never as per-producer-authenticated. The impure caller MUST pass
+   * the same key the consumer wrote with; never read with a weaker basis.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }
 
 /**
@@ -179,6 +217,7 @@ export async function buildCastleWallPosture(
     input.freshnessWindowMs ?? DEFAULT_ENFORCEMENT_FRESHNESS_MS;
   const digestWindowMs = input.digestWindowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const platform = mapPlatform(input.platform ?? process.platform);
+  const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
 
   // Read the l1 (Castle Wall) slice over the digest window. The freshness
   // judgment is then made over the same entries by timestamp so a single read
@@ -206,6 +245,7 @@ export async function buildCastleWallPosture(
       freshness_window_ms: freshnessWindowMs,
       verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
       audit_integrity_ok: false,
+      producer_authenticity: "not_applicable",
     };
   }
 
@@ -217,6 +257,10 @@ export async function buildCastleWallPosture(
   };
   let latestEnforcementMs: number | null = null;
   let latestNotEnforcingMs: number | null = null;
+  // Track the authenticity basis of the MOST RECENT arm-eligible enforcement
+  // entry, so the posture honestly reports whether the green light rests on a
+  // re-verified producer signature or merely the channel basis.
+  let latestEnforcementWasProducerSigned = false;
 
   for (const entry of entries) {
     const op = entry.operation;
@@ -245,6 +289,32 @@ export async function buildCastleWallPosture(
 
     if (!isCastleWall) continue;
 
+    // SIGNATURE GATE (Slice R — the real close): the marker above is a cheap
+    // pre-filter; it is forgeable by any in-process writer. For enforcement
+    // EVIDENCE, the authority is the producer signature, RE-verified here
+    // against the pinned key. An entry that claims `producer_signed` but fails
+    // re-verify (forged, stale, stapled) is dropped entirely — it does not
+    // count and cannot arm. With no pinned key the reader cannot check and
+    // falls to the honest channel basis (R-3). Non-enforcement-evidence
+    // operations (e.g. `policy_loaded`, not-enforcing faults) are not signed,
+    // so they are not gated by re-verification.
+    const isEnforcementEvidence =
+      op === "egress_allowed" ||
+      op === "egress_blocked" ||
+      op === "operator_decision";
+    let reverifiedProducerSigned = false;
+    if (isEnforcementEvidence) {
+      const reBasis = reverifyEntryProducerSignature(
+        entry.details,
+        pinnedProducerKey,
+        input.verifyProducerSignature,
+      );
+      // A forged/failed producer_signed entry (key-bearing reader) must never
+      // count toward verdicts OR arm — fail closed, skip it entirely.
+      if (!reverifyBasisCounts(reBasis)) continue;
+      reverifiedProducerSigned = reBasis === "producer_signed_verified";
+    }
+
     if (op === "egress_allowed") verdictCounts.allowed += 1;
     else if (op === "egress_blocked") verdictCounts.blocked += 1;
     else if (op === "operator_decision") verdictCounts.operator_decisions += 1;
@@ -259,6 +329,10 @@ export async function buildCastleWallPosture(
     if (CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op) && tsValidForArm) {
       if (latestEnforcementMs === null || ts > latestEnforcementMs) {
         latestEnforcementMs = ts;
+        // `policy_loaded` is arm-eligible but not signed enforcement evidence;
+        // it can never assert producer-signed authenticity.
+        latestEnforcementWasProducerSigned =
+          isEnforcementEvidence && reverifiedProducerSigned;
       }
     }
     if (CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op) && tsValidForArm) {
@@ -299,6 +373,19 @@ export async function buildCastleWallPosture(
     basis = "no_evidence";
   }
 
+  // Honest authenticity basis: only assert `producer_signed` when the wall is
+  // actually `armed` AND the freshest arm-eligible evidence was a re-verified
+  // producer signature. Anything else armed rests on the channel basis (the
+  // honest macOS / no-key floor). Non-armed states assert no basis.
+  let producerAuthenticity: CastleWallPosture["producer_authenticity"];
+  if (armState !== "armed") {
+    producerAuthenticity = "not_applicable";
+  } else if (latestEnforcementWasProducerSigned) {
+    producerAuthenticity = "producer_signed";
+  } else {
+    producerAuthenticity = "channel_authenticated";
+  }
+
   return {
     origin_machine: input.originMachine,
     arm_state: armState,
@@ -311,6 +398,7 @@ export async function buildCastleWallPosture(
     freshness_window_ms: freshnessWindowMs,
     verdict_counts: verdictCounts,
     audit_integrity_ok: integrityOk,
+    producer_authenticity: producerAuthenticity,
   };
 }
 
@@ -350,6 +438,16 @@ export interface BuildAuditDigestInput {
   originMachine: string;
   now?: number;
   windowMs?: number;
+  /**
+   * The reader's pinned producer public key (see `BuildCastleWallPostureInput`).
+   * When non-null, a Castle Wall `egress_blocked`/`egress_allowed` entry only
+   * counts toward `kernel_blocks`/`kernel_allows` if its producer signature
+   * RE-verifies against this key; a forged `producer_signed`-claiming entry is
+   * excluded. When null, kernel counts rest on the channel basis (legacy).
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
+  verifyProducerSignature?: VerifyProducerSignatureFn;
 }
 
 /**
@@ -372,6 +470,7 @@ export async function buildAuditDigest(
   const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
   const windowStart = new Date(now - windowMs).toISOString();
   const windowEnd = new Date(now).toISOString();
+  const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
 
   let entries;
   let integrityFindings;
@@ -422,15 +521,31 @@ export async function buildAuditDigest(
     totalOperations += 1;
     if (entry.result === "failure") failures += 1;
 
-    // Kernel block/allow counts require Castle Wall provenance — same gate as
-    // the G4 arm-state, so a non-Castle-Wall producer reusing the operation
-    // name cannot inflate "kernel blocks/allows."
-    const isCastleWall =
+    // Kernel block/allow counts require Castle Wall provenance AND a re-verified
+    // producer signature (same gate as the G4 arm-state). The provenance marker
+    // is a cheap pre-filter; the producer signature is the authority. A forged
+    // in-process entry (marker + claimed `producer_signed` but no valid sig)
+    // fails re-verify and is NOT counted — closing the kernel-block inflation
+    // hole. With no pinned key the count rests on the honest channel basis.
+    const isCastleWallBlockOrAllow =
       isRecord(entry.details) &&
       entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
-        CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
-    if (isCastleWall && entry.operation === "egress_blocked") kernelBlocks += 1;
-    else if (isCastleWall && entry.operation === "egress_allowed") kernelAllows += 1;
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE &&
+      (entry.operation === "egress_blocked" ||
+        entry.operation === "egress_allowed");
+    const reverifyCounts =
+      !isCastleWallBlockOrAllow ||
+      reverifyBasisCounts(
+        reverifyEntryProducerSignature(
+          entry.details,
+          pinnedProducerKey,
+          input.verifyProducerSignature,
+        ),
+      );
+    if (isCastleWallBlockOrAllow && reverifyCounts && entry.operation === "egress_blocked")
+      kernelBlocks += 1;
+    else if (isCastleWallBlockOrAllow && reverifyCounts && entry.operation === "egress_allowed")
+      kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result
       // (success = approved, failure = denied) when the detail is absent.

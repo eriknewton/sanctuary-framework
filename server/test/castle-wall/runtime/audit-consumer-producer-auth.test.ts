@@ -30,6 +30,8 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
 } from "../../../src/castle-wall/constants.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
 
@@ -178,6 +180,44 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(consumer.getStats().producerSignatureAccepted).toBe(1);
     expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
     expect(consumer.getWalChainState().lastAckedSeq).toBe(0);
+  });
+
+  it("R-1: PERSISTS the signed canonical bytes + captured_at so a reader can re-verify", async () => {
+    const event = blockedEvent(0, null);
+    const env = signedEnvelope(event, daemonPriv);
+    await consumer.ingestCritical(env);
+
+    const persisted = sink.entries.find((e) => e.operation === "egress_blocked");
+    expect(persisted).toBeDefined();
+    // The verbatim signed canonical string is stored (NOT re-canonicalized), so
+    // the reader can reconstruct the exact signed message.
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY],
+    ).toBe(env.producer!.eventCanonicalJson);
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY],
+    ).toBe(env.producer!.capturedAtUnixMs);
+    // seq is preserved from the chain-authenticated event details.
+    expect(persisted!.details?.seq).toBe(0);
+    // Together with sig/kid, this is the full ProducerSignatureInput. Round-trip
+    // it through the verifier to prove the persisted tuple actually re-verifies.
+    const reBytes = producerSigningBytes(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY] as string,
+      persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY] as number,
+      persisted!.details?.seq as number,
+    );
+    const sigBytes = (() => {
+      const s = persisted!.details?.[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY] as string;
+      const std = s.replace(/-/g, "+").replace(/_/g, "/");
+      const pad = (4 - (std.length % 4)) % 4;
+      const bin = atob(std + "=".repeat(pad));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    })();
+    expect(
+      ed25519.verify(sigBytes, reBytes, ed25519.getPublicKey(daemonPriv)),
+    ).toBe(true);
   });
 
   it("REJECTS an enforcement event with NO signature (the load-bearing test)", async () => {
@@ -369,6 +409,10 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
         prior_sha256_hex: null,
         [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: "FORGED",
         [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        // R-1 re-verification inputs the forger plants, hoping a Slice-R reader
+        // mistakes them for a verifiable signature.
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: "{\"forged\":true}",
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: 123,
       },
     });
     await consumer.ingestCritical({ event, ack: async () => {} });
@@ -377,6 +421,14 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
     // The forged signature must NOT survive, and the basis must be honest.
     expect(
       persisted!.details?.[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]
+    ).toBeUndefined();
+    // R-1: the planted re-verification inputs must be stripped too, so a reader
+    // never treats this channel-basis entry as a verifiable producer signature.
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]
+    ).toBeUndefined();
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]
     ).toBeUndefined();
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED
