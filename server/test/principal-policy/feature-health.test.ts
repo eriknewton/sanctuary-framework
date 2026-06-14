@@ -335,3 +335,89 @@ describe("feature-health — custom registry edge cases", () => {
     expect(r.status).toBe("fault");
   });
 });
+
+describe("feature-health — fault precedence + freshness completeness (codex 2026-06-13)", () => {
+  const SELF: FeatureRegistryEntry = {
+    id: "test_self",
+    label: "Test self-reporting",
+    layer: "l1",
+    liveness: "self_reporting",
+    invocationOps: new Set(["op_invoke"]),
+    faultOps: new Set(["op_fault"]),
+    brokenZeroDetectable: true,
+  };
+  const FRESH = 10 * 60 * 1000;
+  const entry = (op: string, agoMs: number, now: number): AuditEntry => ({
+    timestamp: new Date(now - agoMs).toISOString(),
+    layer: "l1",
+    operation: op,
+    identity_id: FORTRESS,
+    result: op === "op_fault" ? "failure" : "success",
+  });
+
+  it("HIGH regression: a fresh fault co-occurring with fresh invocation is fault, NEVER green", () => {
+    const now = Date.now();
+    // A later invocation must not bury an earlier fresh fault.
+    const r = evaluateFeatureHealth({
+      feature: SELF,
+      entries: [entry("op_fault", 5000, now), entry("op_invoke", 1000, now)],
+      originMachine: FORTRESS,
+      now,
+      freshnessWindowMs: FRESH,
+      integrityOk: true,
+    });
+    expect(r.status).toBe("fault");
+    expect(r.basis).toBe("fault_evidence");
+  });
+
+  it("MEDIUM regression: an incomplete freshness scan cannot render green (fails closed to unknown)", () => {
+    const now = Date.now();
+    // Fresh invocation present, no fault seen — but the scan was truncated, so we
+    // cannot prove a fault wasn't dropped. Must be unknown, never active.
+    const r = evaluateFeatureHealth({
+      feature: SELF,
+      entries: [entry("op_invoke", 1000, now)],
+      freshnessEntries: [entry("op_invoke", 1000, now)],
+      freshnessComplete: false,
+      originMachine: FORTRESS,
+      now,
+      freshnessWindowMs: FRESH,
+      integrityOk: true,
+    });
+    expect(r.status).toBe("unknown");
+    expect(r.basis).toBe("freshness_scan_incomplete");
+  });
+
+  it("a fresh fault still wins even when the freshness scan is incomplete", () => {
+    const now = Date.now();
+    const r = evaluateFeatureHealth({
+      feature: SELF,
+      entries: [entry("op_invoke", 1000, now)],
+      freshnessEntries: [entry("op_fault", 3000, now), entry("op_invoke", 1000, now)],
+      freshnessComplete: false,
+      originMachine: FORTRESS,
+      now,
+      freshnessWindowMs: FRESH,
+      integrityOk: true,
+    });
+    expect(r.status).toBe("fault");
+    expect(r.basis).toBe("fault_evidence");
+  });
+
+  it("a fault seen only in the dedicated freshness scan still surfaces (separate window sets)", () => {
+    const now = Date.now();
+    // The digest window carries only invocations (fault dropped by truncation);
+    // the dedicated freshness scan carries the fault. Fault must surface.
+    const r = evaluateFeatureHealth({
+      feature: SELF,
+      entries: [entry("op_invoke", 1000, now)],
+      freshnessEntries: [entry("op_fault", 2000, now)],
+      freshnessComplete: true,
+      originMachine: FORTRESS,
+      now,
+      freshnessWindowMs: FRESH,
+      integrityOk: true,
+    });
+    expect(r.status).toBe("fault");
+  });
+});

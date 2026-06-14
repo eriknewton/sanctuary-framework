@@ -133,7 +133,13 @@ export type FeatureHealthBasis =
   | "stale_evidence"
   | "no_evidence_self_reporting"
   | "no_activity_event_driven"
-  | "integrity_tainted";
+  | "integrity_tainted"
+  // The freshness-window scan could not be proven complete (it returned a full
+  // page, so an older fault inside the window may have been dropped). We cannot
+  // prove the absence of a fault, so a self-reporting feature can never render
+  // green on this basis — it fails closed to `unknown`. See codex MEDIUM
+  // 2026-06-13.
+  | "freshness_scan_incomplete";
 
 /**
  * A feature's matcher + liveness declaration. This is configuration, not
@@ -299,7 +305,23 @@ export interface BuildFeatureHealthInput {
  */
 export function evaluateFeatureHealth(args: {
   feature: FeatureRegistryEntry;
+  /** The full digest window (e.g. 24h): used for invocation_count + staleness. */
   entries: ReadonlyArray<AuditEntry>;
+  /**
+   * The freshness window (e.g. 10m): the basis for the fault/green decision.
+   * Defaults to `entries` for callers (and tests) that pass a single set. The
+   * panel builder passes a dedicated, completeness-checked freshness read so a
+   * fault inside the window can never be dropped by the digest read's page
+   * limit (codex MEDIUM 2026-06-13).
+   */
+  freshnessEntries?: ReadonlyArray<AuditEntry>;
+  /**
+   * False when the freshness read could not be proven complete (it returned a
+   * full page). A self-reporting feature then cannot render green — it fails
+   * closed to `unknown` — because an older fault in the window may be unseen.
+   * Defaults to true.
+   */
+  freshnessComplete?: boolean;
   originMachine: string;
   now: number;
   freshnessWindowMs: number;
@@ -307,60 +329,78 @@ export function evaluateFeatureHealth(args: {
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
+  const freshnessEntries = args.freshnessEntries ?? entries;
+  const freshnessComplete = args.freshnessComplete ?? true;
   const freshnessFloor = now - freshnessWindowMs;
 
-  let invocationCount = 0;
-  let latestInvocationMs: number | null = null;
-  let latestFreshInvocationMs: number | null = null;
-  let latestFreshFaultMs: number | null = null;
-
-  for (const entry of entries) {
-    if (entry.layer !== feature.layer) continue;
+  // Shared per-entry guard: belongs to this feature's layer, is an invocation or
+  // fault op for it, and (Castle Wall only) carries the consumer's provenance
+  // marker. A forged `details.cw_source` from the wire cannot survive into the
+  // persisted entry because the consumer stamps the marker AFTER spreading the
+  // event's own details. NOTE (codex LOW 2026-06-13): this gate defends against
+  // FOREIGN entries; it is not cryptographic provenance — any in-process writer
+  // holding `AuditLog.append` could set the marker. That matches the existing
+  // `posture.ts` Castle-Wall trust boundary exactly (in-process writers are
+  // trusted; the wall's real anti-forgery anchor is the signed manifest, not
+  // this read-side projection). Returns the classification, or null to skip.
+  const classify = (
+    entry: AuditEntry,
+  ):
+    | { ts: number; tsValid: boolean; isInvocation: boolean; isFault: boolean }
+    | null => {
+    if (entry.layer !== feature.layer) return null;
     const op = entry.operation;
-    const ts = Date.parse(entry.timestamp);
-    // Reject future-dated evidence beyond a small clock-skew tolerance: a
-    // future timestamp must not keep a self-reporting feature green past the
-    // real freshness window.
-    const tsValid =
-      !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-
     const isInvocation = feature.invocationOps.has(op);
-    const isFault =
-      feature.faultOps !== undefined && feature.faultOps.has(op);
-    if (!isInvocation && !isFault) continue;
-
-    // Provenance gate (Castle Wall only): an entry only counts if it carries
-    // the audit consumer's provenance marker. A forged `details.cw_source` from
-    // the wire cannot survive into the persisted entry because the consumer
-    // stamps the marker AFTER spreading the event's own details.
+    const isFault = feature.faultOps !== undefined && feature.faultOps.has(op);
+    if (!isInvocation && !isFault) return null;
     if (feature.requireCastleWallProvenance) {
       const hasProvenance =
         isRecord(entry.details) &&
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
           CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
-      if (!hasProvenance) continue;
+      if (!hasProvenance) return null;
     }
+    const ts = Date.parse(entry.timestamp);
+    // Reject future-dated evidence beyond a small clock-skew tolerance: a future
+    // timestamp must not keep a self-reporting feature green past the real
+    // freshness window.
+    const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+    return { ts, tsValid, isInvocation, isFault };
+  };
 
-    if (isInvocation) {
-      invocationCount += 1;
-      if (!Number.isNaN(ts)) {
-        if (latestInvocationMs === null || ts > latestInvocationMs) {
-          latestInvocationMs = ts;
-        }
-        if (tsValid && ts >= freshnessFloor) {
-          if (
-            latestFreshInvocationMs === null ||
-            ts > latestFreshInvocationMs
-          ) {
-            latestFreshInvocationMs = ts;
-          }
-        }
-      }
+  // Pass 1 — counts + staleness over the full digest window.
+  let invocationCount = 0;
+  let latestInvocationMs: number | null = null;
+  for (const entry of entries) {
+    const c = classify(entry);
+    if (c === null || !c.isInvocation) continue;
+    invocationCount += 1;
+    if (
+      !Number.isNaN(c.ts) &&
+      (latestInvocationMs === null || c.ts > latestInvocationMs)
+    ) {
+      latestInvocationMs = c.ts;
     }
-    if (isFault && tsValid && ts >= freshnessFloor) {
-      if (latestFreshFaultMs === null || ts > latestFreshFaultMs) {
-        latestFreshFaultMs = ts;
-      }
+  }
+
+  // Pass 2 — the fault/green decision over the (completeness-checked) freshness
+  // window. Fresh fault AND fresh invocation are both freshness-window facts.
+  let latestFreshInvocationMs: number | null = null;
+  let latestFreshFaultMs: number | null = null;
+  for (const entry of freshnessEntries) {
+    const c = classify(entry);
+    if (c === null || !c.tsValid || c.ts < freshnessFloor) continue;
+    if (
+      c.isInvocation &&
+      (latestFreshInvocationMs === null || c.ts > latestFreshInvocationMs)
+    ) {
+      latestFreshInvocationMs = c.ts;
+    }
+    if (
+      c.isFault &&
+      (latestFreshFaultMs === null || c.ts > latestFreshFaultMs)
+    ) {
+      latestFreshFaultMs = c.ts;
     }
   }
 
@@ -373,22 +413,27 @@ export function evaluateFeatureHealth(args: {
     status = "unknown";
     basis = "integrity_tainted";
   } else if (feature.liveness === "self_reporting") {
-    // Self-reporting: green only on FRESH live-adjudication evidence; a fresh
-    // fault is red; stale or absent evidence is unknown (NEVER green). The
-    // "daemon silently died" case lands here as `unknown` — the periodic
-    // heartbeat producer that would distinguish quiet-healthy from dead is
-    // Slice 2, by design.
-    if (latestFreshFaultMs !== null && latestFreshInvocationMs === null) {
+    // Self-reporting: green ONLY on fresh live-adjudication evidence; a fresh
+    // fault is red and takes precedence over green ALWAYS; stale or absent
+    // evidence is unknown (NEVER green). The "daemon silently died" case lands
+    // here as `unknown` — the periodic heartbeat producer that would distinguish
+    // quiet-healthy from dead is Slice 2, by design.
+    if (latestFreshFaultMs !== null) {
+      // Fault precedence: a fresh fault renders the feature `fault` even when
+      // fresh enforcement evidence co-occurs in the window (a wall that
+      // crashed/unbound after adjudicating is degraded, not healthy). Ordering
+      // this branch FIRST is the load-bearing "no green while faulted" guarantee
+      // — codex HIGH 2026-06-13.
       status = "fault";
       basis = "fault_evidence";
+    } else if (!freshnessComplete) {
+      // The freshness scan was not provably complete, so an older fault in the
+      // window may be unseen. We cannot prove fault-absence → never green.
+      status = "unknown";
+      basis = "freshness_scan_incomplete";
     } else if (latestFreshInvocationMs !== null) {
       status = "active";
       basis = "fresh_enforcement_evidence";
-    } else if (latestFreshFaultMs !== null) {
-      // A fault co-occurring with fresh enforcement: still surface the fault —
-      // a wall that crashed after adjudicating is degraded, not healthy.
-      status = "fault";
-      basis = "fault_evidence";
     } else if (latestInvocationMs !== null) {
       status = "unknown";
       basis = "stale_evidence";
@@ -471,15 +516,19 @@ export async function buildFeatureHealthPanel(
   const windowStart = new Date(now - windowMs).toISOString();
   const windowEnd = new Date(now).toISOString();
 
+  // The audit query pages with a fixed limit and returns the most-recent slice;
+  // a full page means older entries in the range were dropped (truncation).
+  const AUDIT_PAGE_LIMIT = 10_000;
+
   let entries: AuditEntry[];
   let integrityOk: boolean;
   try {
-    // One read over the whole window across all layers; per-feature folding
-    // narrows by layer. A window-sized limit (not the default 50) so the count
-    // reflects the full window, not a recent slice.
+    // One read over the whole digest window across all layers; per-feature
+    // folding narrows by layer. A window-sized limit (not the default 50) so the
+    // count reflects the full window, not a recent slice.
     const result = await input.auditLog.query({
       since: windowStart,
-      limit: 10_000,
+      limit: AUDIT_PAGE_LIMIT,
     });
     entries = result.entries;
     integrityOk = result.integrity_findings.length === 0;
@@ -490,18 +539,47 @@ export async function buildFeatureHealthPanel(
     integrityOk = false;
   }
 
-  // Bound the window's UPPER edge: the query only filters `since`, so skip any
+  // Dedicated freshness-window read for the fault/green decision. The digest read
+  // above can drop the OLDEST entries when the window is busier than one page,
+  // which could mask a fault inside the (much shorter) freshness window and let a
+  // feature read green while faulted — codex MEDIUM 2026-06-13. A scan scoped to
+  // the freshness window is far less likely to truncate; if it DOES return a full
+  // page we cannot prove fault-absence, so `freshnessComplete=false` forces every
+  // self-reporting feature to fail closed to `unknown`.
+  const freshnessFloorIso = new Date(now - freshnessWindowMs).toISOString();
+  let freshnessEntries: AuditEntry[];
+  let freshnessComplete: boolean;
+  try {
+    const fresh = await input.auditLog.query({
+      since: freshnessFloorIso,
+      limit: AUDIT_PAGE_LIMIT,
+    });
+    freshnessEntries = fresh.entries;
+    freshnessComplete = fresh.entries.length < AUDIT_PAGE_LIMIT;
+    if (fresh.integrity_findings.length > 0) integrityOk = false;
+  } catch {
+    freshnessEntries = [];
+    freshnessComplete = false;
+    integrityOk = false;
+  }
+
+  // Bound each window's UPPER edge: the query only filters `since`, so skip any
   // entry timestamped past `now` (an unparseable timestamp is kept; the chain's
   // own integrity machinery owns malformed-entry detection).
-  const inWindow = entries.filter((e) => {
-    const ts = Date.parse(e.timestamp);
-    return Number.isNaN(ts) || ts <= now;
-  });
+  const upperBounded = (list: AuditEntry[]): AuditEntry[] =>
+    list.filter((e) => {
+      const ts = Date.parse(e.timestamp);
+      return Number.isNaN(ts) || ts <= now;
+    });
+  const inWindow = upperBounded(entries);
+  const inFreshness = upperBounded(freshnessEntries);
 
   const rows = registry.map((feature) =>
     evaluateFeatureHealth({
       feature,
       entries: inWindow,
+      freshnessEntries: inFreshness,
+      freshnessComplete,
       originMachine: input.originMachine,
       now,
       freshnessWindowMs,
