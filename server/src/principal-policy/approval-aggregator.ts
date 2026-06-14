@@ -230,6 +230,51 @@ export interface ApprovalGateEvent {
    * resolution event. Format: `<iso-ms-timestamp>:<operation>:<random4>`.
    */
   correlation_id: string;
+  /**
+   * Canonical normalized-args hash from the gate (see
+   * `ApprovalRequest.args_binding`). Folded into the dedup/match key so
+   * same-op same-ms DIFFERENT-args requests are distinguishable. Emitted on
+   * both `requested` and `resolved` (it is request-stable). Absent on the
+   * argless escalation paths; the key then falls back to the historic
+   * `<timestamp>:<operation>` form.
+   */
+  args_binding?: string;
+  /**
+   * Human-facing target the request acts on, derived by the gate via
+   * `deriveTargetResource` (e.g. `state_export:SECRET`). Surfaced in the
+   * operator card's `action_summary` so two same-operation cards are
+   * visibly distinct — the operator must be able to tell the PUBLIC export
+   * from the SECRET export they are approving. Display-only; the security
+   * binding is carried by `args_binding`.
+   */
+  target_resource?: string;
+}
+
+/**
+ * Compose the dedup/match key that pins a channel waiter and an aggregator
+ * record to a single, fully-qualified approval request. Shared by the
+ * aggregator (`auditEntryIdForEvent`) and the redirect-inbox channel
+ * (`auditEntryIdFor`) so the two surfaces can NEVER drift: a mismatch would
+ * either silently re-open the amplification hole or wedge a legitimate
+ * approval as unmatchable.
+ *
+ * `args_binding` is the gate's `normalizedArgsHash` — the SAME normalization
+ * the direct approval-proof envelope binds via `normalized_args_hash`. When
+ * present it makes two same-operation, same-millisecond requests with
+ * DIFFERENT args produce DISTINCT keys (two inbox cards, two waiters);
+ * approving one therefore settles only its own waiter. A true re-delivery of
+ * the identical request (same op + same args) yields the identical key, so
+ * legitimate dedup is preserved. When absent (argless escalation paths) the
+ * key collapses to the historic `<timestamp>:<operation>` form, leaving
+ * pre-existing behavior unchanged.
+ */
+export function approvalRequestKey(parts: {
+  timestamp: string;
+  operation: string;
+  args_binding?: string;
+}): string {
+  const base = `${parts.timestamp}:${parts.operation}`;
+  return parts.args_binding ? `${base}:${parts.args_binding}` : base;
 }
 
 /**
@@ -964,7 +1009,11 @@ export class ApprovalAggregator {
    * the audit entry the gate appended on the same call.
    */
   private auditEntryIdForEvent(event: ApprovalGateEvent): string {
-    return `${event.request_timestamp}:${event.operation}`;
+    return approvalRequestKey({
+      timestamp: event.request_timestamp,
+      operation: event.operation,
+      args_binding: event.args_binding,
+    });
   }
 
   private derivePolicyRuleId(event: ApprovalGateEvent): string {
@@ -972,6 +1021,15 @@ export class ApprovalAggregator {
   }
 
   private deriveActionSummary(event: ApprovalGateEvent): string {
+    // Surface the gate-derived target so two same-operation cards are
+    // visibly distinct (PUBLIC export vs SECRET export). Only appended when
+    // the target adds information beyond the bare operation name, so the
+    // historic `<operation> (tier N)` summary is preserved for argless /
+    // namespace-less requests.
+    const target = event.target_resource;
+    if (target && target !== event.operation) {
+      return `${event.operation} → ${target} (tier ${event.tier})`;
+    }
     return `${event.operation} (tier ${event.tier})`;
   }
 

@@ -38,6 +38,52 @@ import type {
 import { AuditLog } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import {
+  normalizedArgsHash,
+  deriveTargetResource,
+} from "../../src/agent-native/safety-base.js";
+
+/**
+ * Build a request+event pair for a Tier-1 operation carrying the gate's
+ * args-binding (the SAME `normalizedArgsHash` / `deriveTargetResource` the
+ * production gate computes). `timestamp` is shared between request and event
+ * (the gate stamps both from the same `requestTimestamp`), and is taken as a
+ * parameter so two requests can be forced into the SAME millisecond — the
+ * amplification precondition.
+ */
+function gateRequestWithArgs(
+  operation: string,
+  args: Record<string, unknown>,
+  timestamp: string,
+  tier: 1 | 2 = 1,
+): { request: ApprovalRequest; gateEvent: ApprovalGateEvent } {
+  const argsHash = normalizedArgsHash(args);
+  const targetResource = deriveTargetResource(operation, args);
+  const correlationId = `${timestamp}:${operation}:${Math.random()
+    .toString(16)
+    .slice(2, 6)}`;
+  const context = { operation, args_summary: args };
+  const request: ApprovalRequest = {
+    operation,
+    tier,
+    reason: `${operation} requires approval`,
+    context,
+    timestamp,
+    args_binding: argsHash,
+  };
+  const gateEvent: ApprovalGateEvent = {
+    phase: "requested",
+    operation,
+    tier,
+    reason: request.reason,
+    context,
+    request_timestamp: timestamp,
+    correlation_id: correlationId,
+    args_binding: argsHash,
+    target_resource: targetResource,
+  };
+  return { request, gateEvent };
+}
 
 const FORTRESS = "fortress_test_upsilon2";
 const IDENTITY = "identity_test_upsilon2";
@@ -360,5 +406,176 @@ describe("AggregatorBackedChannel — Upsilon-2", () => {
     const resp2 = await resp2Promise;
     expect(resp2.decision).toBe("deny");
     expect(underlyingCalls).toBe(1); // not invoked the second time
+  });
+
+  // ── Approval-amplification fix: args-binding on the redirect match key ──
+  //
+  // Finding (security sweep, main @ b3b6aca1): in `replace` mode the redirect
+  // inbox matched an operator resolution to a pending Tier-1 request SOLELY
+  // by `<timestamp>:<operation>`. Two same-op same-ms requests with DIFFERENT
+  // args (state_export of PUBLIC vs SECRET) deduped to ONE inbox card with
+  // TWO channel waiters; approving the one benign card settled BOTH waiters —
+  // approving the never-displayed SECRET export off a PUBLIC approval. The
+  // fix folds the gate's `normalizedArgsHash` into the dedup/match key so the
+  // two requests split into two cards / two waiters.
+  describe("approval-amplification: args-binding on the redirect match key", () => {
+    it("two same-op same-ms DIFFERENT-args requests yield two cards; approving one settles only its waiter", async () => {
+      const { aggregator } = await buildAggregator();
+      const underlying = new RecordingCallbackChannel(async () => {
+        throw new Error("underlying must NOT be invoked in replace mode");
+      });
+      const channel = new AggregatorBackedChannel({
+        underlying,
+        aggregator,
+        resolveRedirect: () => ({ enabled: true, mode: "replace" }),
+        replaceModeTimeoutMs: 5000,
+      });
+
+      // Same operation, SAME millisecond, DIFFERENT args (the exploit).
+      const sameMs = new Date().toISOString();
+      const pub = gateRequestWithArgs(
+        "state_export",
+        { namespace: "PUBLIC" },
+        sameMs,
+      );
+      const secret = gateRequestWithArgs(
+        "state_export",
+        { namespace: "SECRET" },
+        sameMs,
+      );
+
+      // The gate ingests `requested` for both before blocking on the channel.
+      const pubEntry = await aggregator.ingest(pub.gateEvent);
+      const secretEntry = await aggregator.ingest(secret.gateEvent);
+
+      // TWO distinct inbox cards — NOT one deduped card.
+      expect(pubEntry).not.toBeNull();
+      expect(secretEntry).not.toBeNull();
+      expect(secretEntry!.aggregator_id).not.toBe(pubEntry!.aggregator_id);
+      const pending = await aggregator.list({ status: "pending" });
+      expect(pending.length).toBe(2);
+
+      // The cards are visibly distinct so the operator can tell them apart.
+      expect(pubEntry!.action_summary).toContain("PUBLIC");
+      expect(secretEntry!.action_summary).toContain("SECRET");
+      expect(pubEntry!.audit_log_entry_id).not.toBe(
+        secretEntry!.audit_log_entry_id,
+      );
+
+      // Both channel waiters are now blocked on the inbox.
+      const pubResponsePromise = channel.requestApproval(pub.request);
+      const secretResponsePromise = channel.requestApproval(secret.request);
+
+      // Operator approves ONLY the PUBLIC card.
+      await aggregator.resolve(pubEntry!.aggregator_id, "approved", OPERATOR);
+      const pubResponse = await pubResponsePromise;
+      expect(pubResponse.decision).toBe("approve");
+      expect(pubResponse.decided_by).toBe("human");
+
+      // The SECRET waiter MUST NOT have settled off the PUBLIC approval —
+      // it stays pending and (here) only ever resolves via its own timeout.
+      const secretEntryAfter = (await aggregator.list()).find(
+        (e) => e.aggregator_id === secretEntry!.aggregator_id,
+      );
+      expect(secretEntryAfter?.status).toBe("pending");
+
+      // Prove the SECRET waiter did not auto-approve: resolve it on its OWN
+      // card and confirm the decision is the operator's, independently made.
+      await aggregator.resolve(secretEntry!.aggregator_id, "denied", OPERATOR);
+      const secretResponse = await secretResponsePromise;
+      expect(secretResponse.decision).toBe("deny");
+      expect(secretResponse.decided_by).toBe("human");
+    });
+
+    it("regression: a true same-op SAME-args re-delivery still dedups to one card", async () => {
+      const { aggregator } = await buildAggregator();
+      const sameMs = new Date().toISOString();
+      const first = gateRequestWithArgs(
+        "state_export",
+        { namespace: "PUBLIC" },
+        sameMs,
+      );
+      // Identical operation + identical args + same ms = a genuine
+      // re-delivery, which dedup is SUPPOSED to collapse.
+      const redelivery = gateRequestWithArgs(
+        "state_export",
+        { namespace: "PUBLIC" },
+        sameMs,
+      );
+
+      const firstEntry = await aggregator.ingest(first.gateEvent);
+      const dupEntry = await aggregator.ingest(redelivery.gateEvent);
+
+      expect(firstEntry).not.toBeNull();
+      // Second ingest is deduped → returns null, no second card.
+      expect(dupEntry).toBeNull();
+      const pending = await aggregator.list({ status: "pending" });
+      expect(pending.length).toBe(1);
+    });
+
+    it("regression: single bound Tier-1 request still matches, approves, and settles", async () => {
+      const { aggregator } = await buildAggregator();
+      const underlying = new RecordingCallbackChannel(async () => {
+        throw new Error("underlying must NOT be invoked in replace mode");
+      });
+      const channel = new AggregatorBackedChannel({
+        underlying,
+        aggregator,
+        resolveRedirect: () => ({ enabled: true, mode: "replace" }),
+        replaceModeTimeoutMs: 5000,
+      });
+      const { request, gateEvent } = gateRequestWithArgs(
+        "state_export",
+        { namespace: "SECRET" },
+        new Date().toISOString(),
+      );
+      const entry = await aggregator.ingest(gateEvent);
+      expect(entry).not.toBeNull();
+      const responsePromise = channel.requestApproval(request);
+      await aggregator.resolve(entry!.aggregator_id, "approved", OPERATOR);
+      const response = await responsePromise;
+      expect(response.decision).toBe("approve");
+      expect(response.decided_by).toBe("human");
+    });
+
+    it("regression: deny on a bound request still propagates", async () => {
+      const { aggregator } = await buildAggregator();
+      const channel = new AggregatorBackedChannel({
+        underlying: new AutoApproveChannel(),
+        aggregator,
+        resolveRedirect: () => ({ enabled: true, mode: "replace" }),
+        replaceModeTimeoutMs: 5000,
+      });
+      const { request, gateEvent } = gateRequestWithArgs(
+        "identity_rotate",
+        { key: "primary" },
+        new Date().toISOString(),
+      );
+      const entry = await aggregator.ingest(gateEvent);
+      const responsePromise = channel.requestApproval(request);
+      await aggregator.resolve(entry!.aggregator_id, "denied", OPERATOR);
+      const response = await responsePromise;
+      expect(response.decision).toBe("deny");
+      expect(response.decided_by).toBe("human");
+    });
+
+    it("regression: fail-closed timeout unchanged on a bound request", async () => {
+      const { aggregator } = await buildAggregator();
+      const channel = new AggregatorBackedChannel({
+        underlying: new AutoApproveChannel(),
+        aggregator,
+        resolveRedirect: () => ({ enabled: true, mode: "replace" }),
+        replaceModeTimeoutMs: 50,
+      });
+      const { request, gateEvent } = gateRequestWithArgs(
+        "state_export",
+        { namespace: "PUBLIC" },
+        new Date().toISOString(),
+      );
+      await aggregator.ingest(gateEvent);
+      const response = await channel.requestApproval(request);
+      expect(response.decision).toBe("deny");
+      expect(response.decided_by).toBe("timeout");
+    });
   });
 });

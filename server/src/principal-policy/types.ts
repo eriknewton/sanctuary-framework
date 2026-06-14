@@ -113,6 +113,23 @@ export interface ApprovalRequest {
   reason: string;
   context: Record<string, unknown>;
   timestamp: string;
+  /**
+   * Canonical hash of the normalized tool arguments
+   * (`normalizedArgsHash` from agent-native/safety-base — the SAME
+   * normalization the direct approval-proof envelope binds via
+   * `normalized_args_hash`). Present whenever the gate has the raw args in
+   * scope (every classified Tier-1/Tier-2 request). The redirect-inbox
+   * match key and the aggregator dedup key both fold this in so two
+   * same-operation, same-millisecond requests with DIFFERENT args resolve
+   * to two distinct inbox cards and two distinct channel waiters — closing
+   * the approval-amplification hole where one benign approval settled an
+   * unrelated, never-displayed sibling request. A true re-delivery of the
+   * SAME request (same op + same args) still produces an identical key, so
+   * legitimate dedup is preserved. Absent on the rare argless escalation
+   * paths (e.g. injection-escalate), in which case the key falls back to
+   * the historic `<timestamp>:<operation>` form.
+   */
+  args_binding?: string;
 }
 
 /** Approval response from the human */
