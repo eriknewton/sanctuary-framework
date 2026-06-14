@@ -45,10 +45,11 @@ import type {
   ApprovalResponse,
 } from "../types.js";
 import type { ApprovalChannel } from "../approval-channel.js";
-import type {
-  ApprovalAggregator,
-  AggregatedApproval,
-  ApprovalAggregatorEmit,
+import {
+  approvalRequestKey,
+  type ApprovalAggregator,
+  type AggregatedApproval,
+  type ApprovalAggregatorEmit,
 } from "../approval-aggregator.js";
 
 /**
@@ -96,12 +97,24 @@ const DEFAULT_REPLACE_MODE_TIMEOUT_MS = 5 * 60 * 1000;
 /**
  * Internal: structural match between an `ApprovalRequest` (what the gate
  * hands the channel) and an `AggregatedApproval` (what the aggregator
- * persists). Both share the audit_entry_id format
- * `<request.timestamp>:<request.operation>` — see `auditEntryIdForEvent`
- * in approval-aggregator.ts.
+ * persists). Both share the audit_entry_id key — see `auditEntryIdForEvent`
+ * in approval-aggregator.ts — composed by the SHARED `approvalRequestKey`
+ * helper so the two surfaces can never drift. The key folds in the
+ * request's `args_binding` (the gate's `normalizedArgsHash`) so two
+ * same-operation, same-millisecond requests with DIFFERENT args produce
+ * DISTINCT keys: each gets its own inbox card and its own channel waiter,
+ * and approving one settles ONLY its own waiter. This closes the
+ * approval-amplification hole in `replace` mode where the redirect path —
+ * which (unlike the direct proof path's `verifyApprovalProof`) does NOT
+ * bind `normalized_args_hash` — let one benign approval settle an
+ * unrelated, never-displayed sibling request.
  */
 function auditEntryIdFor(request: ApprovalRequest): string {
-  return `${request.timestamp}:${request.operation}`;
+  return approvalRequestKey({
+    timestamp: request.timestamp,
+    operation: request.operation,
+    args_binding: request.args_binding,
+  });
 }
 
 function statusToDecision(

@@ -69,6 +69,17 @@ export type ApprovalEventCallback = (event: {
     decided_by: string;
   };
   correlation_id: string;
+  /**
+   * Canonical normalized-args hash (`normalizedArgsHash`, identical to the
+   * direct approval-proof envelope's `normalized_args_hash`). Folded into the
+   * aggregator dedup key and the redirect-channel match key so two same-op
+   * same-ms DIFFERENT-args requests resolve to two distinct inbox cards and
+   * two distinct waiters (closes approval amplification). Absent on argless
+   * escalation paths. See `ApprovalRequest.args_binding`.
+   */
+  args_binding?: string;
+  /** Operator-card disambiguation label (`deriveTargetResource`). */
+  target_resource?: string;
 }) => void;
 
 export class ApprovalGate {
@@ -242,7 +253,9 @@ export class ApprovalGate {
               signal_count: injectionResult.signals.length,
               signal_types: [...new Set(injectionResult.signals.map(s => s.type))],
             },
-          }
+          },
+          undefined,
+          this.buildRequestBinding(operation, args)
         );
       }
     }
@@ -256,7 +269,7 @@ export class ApprovalGate {
             operation: toolName,
             proxy: true,
             args_summary: this.summarizeArgs(args),
-          });
+          }, undefined, this.buildRequestBinding(operation, args));
         }
 
         if (proxyTier === 2) {
@@ -266,7 +279,7 @@ export class ApprovalGate {
             return this.requestApproval(operation, 2, `Proxy: ${anomaly.reason}`, {
               ...anomaly.context,
               proxy: true,
-            }, anomaly.commit);
+            }, anomaly.commit, this.buildRequestBinding(operation, args));
           }
         }
 
@@ -298,6 +311,19 @@ export class ApprovalGate {
       return this.verifyApprovalProof(toolName, args, approval.approval_ref, classification);
     }
 
+    // Args-binding for the redirect-inbox approval path. Reuses the EXACT
+    // normalization the direct approval-proof envelope binds
+    // (`normalizedArgsHash` / `deriveTargetResource` from
+    // agent-native/safety-base) so the `replace`-mode redirect channel gains
+    // identical args-binding. Without this, the redirect path keyed every
+    // approval solely on `<timestamp>:<operation>`, so two same-op same-ms
+    // requests with different args (e.g. state_export of PUBLIC vs SECRET)
+    // deduped to ONE inbox card with TWO waiters and a single benign
+    // approval settled both — violating Invariant #3 (irreversible op
+    // requires human approval of THAT op). The binding splits them into two
+    // cards / two waiters so each is decided independently.
+    const requestBinding = this.buildRequestBinding(operation, args);
+
     // ── Tier 1: Always requires approval ──────────────────────────────
     if (classification.tier === 1) {
       if (classification.unclassified) {
@@ -317,7 +343,7 @@ export class ApprovalGate {
         operation,
         args_summary: this.summarizeArgs(args),
         ...(classification.unclassified ? { unclassified: true } : {}),
-      });
+      }, undefined, requestBinding);
     }
 
     // ── Tier 2: Behavioral anomaly detection ──────────────────────────
@@ -327,7 +353,8 @@ export class ApprovalGate {
         2,
         classification.anomaly.reason,
         classification.anomaly.context,
-        classification.anomaly.commit
+        classification.anomaly.commit,
+        requestBinding
       );
     }
 
@@ -355,7 +382,7 @@ export class ApprovalGate {
     return this.requestApproval(operation, 1, classification.reason, {
       operation,
       unclassified: true,
-    });
+    }, undefined, requestBinding);
   }
 
   classifyRiskTier(toolName: string, args: Record<string, unknown>): RiskTier {
@@ -663,7 +690,17 @@ export class ApprovalGate {
     tier: 1 | 2,
     reason: string,
     context: Record<string, unknown>,
-    onApprove?: () => void
+    onApprove?: () => void,
+    // Args-binding for the redirect-inbox match/dedup key. `argsHash` is the
+    // gate's `normalizedArgsHash` — the SAME normalization the direct
+    // approval-proof envelope binds via `normalized_args_hash` — so the
+    // `replace`-mode redirect path gains identical args-binding and two
+    // same-op same-ms DIFFERENT-args requests resolve to two distinct cards
+    // and two distinct waiters (closes approval amplification). Optional so
+    // the argless escalation paths (e.g. injection-escalate) keep their
+    // historic `<timestamp>:<operation>` key. `targetResource` is
+    // display-only (operator card disambiguation).
+    binding?: { argsHash: string; targetResource?: string }
   ): Promise<GateResult> {
     const requestTimestamp = new Date().toISOString();
     const request: ApprovalRequest = {
@@ -672,6 +709,7 @@ export class ApprovalGate {
       reason,
       context,
       timestamp: requestTimestamp,
+      ...(binding ? { args_binding: binding.argsHash } : {}),
     };
 
     // Fire `requested` lifecycle to the aggregator before the channel
@@ -689,6 +727,10 @@ export class ApprovalGate {
           context,
           request_timestamp: requestTimestamp,
           correlation_id: correlationId,
+          ...(binding ? { args_binding: binding.argsHash } : {}),
+          ...(binding?.targetResource
+            ? { target_resource: binding.targetResource }
+            : {}),
         });
       } catch {
         // Never let the aggregator break the gate.
@@ -728,6 +770,10 @@ export class ApprovalGate {
               decided_by: "channel_failure",
             },
             correlation_id: correlationId,
+            ...(binding ? { args_binding: binding.argsHash } : {}),
+            ...(binding?.targetResource
+              ? { target_resource: binding.targetResource }
+              : {}),
           });
         } catch {
           // swallow
@@ -777,6 +823,10 @@ export class ApprovalGate {
             decided_by: response.decided_by,
           },
           correlation_id: correlationId,
+          ...(binding ? { args_binding: binding.argsHash } : {}),
+          ...(binding?.targetResource
+            ? { target_resource: binding.targetResource }
+            : {}),
         });
       } catch {
         // swallow
@@ -837,6 +887,28 @@ export class ApprovalGate {
       }
     }
     return summary;
+  }
+
+  /**
+   * Build the redirect-inbox args-binding for an approval request. The
+   * `argsHash` (gate's `normalizedArgsHash`, identical to the direct
+   * proof envelope's `normalized_args_hash`) is the security-load-bearing
+   * field; `targetResource` is display-only. `deriveTargetResource` can
+   * throw on a malformed state bundle, so it is wrapped — a bad bundle
+   * degrades the operator card label but must never crash the gate or
+   * weaken the hash binding.
+   */
+  private buildRequestBinding(
+    operation: string,
+    args: Record<string, unknown>
+  ): { argsHash: string; targetResource?: string } {
+    let targetResource: string | undefined;
+    try {
+      targetResource = deriveTargetResource(operation, args);
+    } catch {
+      targetResource = undefined;
+    }
+    return { argsHash: normalizedArgsHash(args), targetResource };
   }
 
   /** Get the baseline tracker for saving at session end */
