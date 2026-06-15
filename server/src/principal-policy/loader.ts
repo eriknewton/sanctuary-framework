@@ -64,6 +64,10 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   policy can plan to evade it).
  * - context_gate_set_policy / context_gate_apply_template: policy-adjacent
  *   enforcement mutations must not be silently agent-auto-allowed.
+ * - audit_export_siem: bulk-exports decrypted audit events across all
+ *   principals, each carrying its policy tier and approve/deny decision — a
+ *   policy-inference oracle for the agent (no-read invariant). SIEM forwarding
+ *   is an operator function, so it must require operator approval. (CISO MED-1.)
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
@@ -72,6 +76,7 @@ const FORCED_TIER1_OPERATIONS = [
   "sanctuary_policy_status",
   "context_gate_set_policy",
   "context_gate_apply_template",
+  "audit_export_siem",
 ] as const;
 
 /**
@@ -120,6 +125,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_policy_status", // Reads Principal Policy status; always requires approval.
     "context_gate_set_policy", // Policy-adjacent enforcement mutation; always requires approval.
     "context_gate_apply_template", // Policy-adjacent enforcement mutation; always requires approval.
+    "audit_export_siem", // Bulk audit export (per-op tier+decision across all principals); operator-only — prevents agent policy-inference (CISO MED-1).
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -177,7 +183,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "l2_hardening_status",
     "l2_verify_isolation",
     "sovereignty_audit",
-    "audit_export_siem",
     "shr_gateway_export",
     "bridge_commit",
     "bridge_verify",

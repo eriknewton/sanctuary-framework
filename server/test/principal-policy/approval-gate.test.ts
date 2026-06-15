@@ -169,6 +169,27 @@ describe("Approval Gate", () => {
         expect(result.approval_required).toBe(true);
       }
     });
+
+    it("gates audit_export_siem at Tier 1 — a cooperative agent cannot bulk-export audit without operator approval (CISO MED-1)", async () => {
+      // The SIEM export decrypts audit events across ALL principals, each
+      // carrying its policy tier + approve/deny decision — a policy-inference
+      // oracle. It must require operator approval, not auto-allow to the agent.
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain("audit_export_siem");
+      expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("audit_export_siem");
+
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("audit_export_siem", { format: "cef" });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+    });
   });
 
   describe("Tier 2 — behavioral anomaly detection", () => {

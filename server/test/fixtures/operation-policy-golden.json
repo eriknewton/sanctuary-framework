@@ -1,5 +1,6 @@
 {
   "tier1_always_approve": [
+    "audit_export_siem",
     "bootstrap_provide_guarantee",
     "context_gate_apply_template",
     "context_gate_set_policy",
@@ -42,7 +43,6 @@
     "new_namespace_access": "approve"
   },
   "tier3_always_allow": [
-    "audit_export_siem",
     "bootstrap_create_escrow",
     "bridge_attest",
     "bridge_commit",

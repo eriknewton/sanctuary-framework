@@ -56,6 +56,7 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -125,6 +126,26 @@ approval_channel:
       }
     });
 
+    it("migrates audit_export_siem out of Tier 3 on upgrade (CISO MED-1)", () => {
+      // A pre-upgrade on-disk policy that still auto-allows audit_export_siem.
+      // validatePolicy must force it to Tier 1 and prune it from Tier 3, so a
+      // cooperative agent on an upgraded install cannot bulk-export audit (and
+      // infer per-operation tier + decision) without operator approval.
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+tier3_always_allow:
+  - state_read
+  - audit_export_siem
+approval_channel:
+  type: stderr
+`;
+      const policy = parsePolicy(yaml);
+      expect(policy.tier1_always_approve).toContain("audit_export_siem");
+      expect(policy.tier3_always_allow).not.toContain("audit_export_siem");
+    });
+
     it("handles comments in YAML", () => {
       const yaml = `
 version: 1 # policy version
@@ -145,6 +166,7 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
       ]);
     });
 
@@ -167,6 +189,7 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -202,6 +225,7 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
@@ -276,6 +300,7 @@ approval_channel:
           "sanctuary_policy_status",
           "context_gate_set_policy",
           "context_gate_apply_template",
+          "audit_export_siem",
         ];
 
         for (const tool of forcedTier1Tools) {

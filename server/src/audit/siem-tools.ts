@@ -4,8 +4,12 @@
  * Registers the audit_export_siem MCP tool that exports audit log entries
  * in standard SIEM formats (CEF and OCSF).
  *
- * Tier 3: Auto-allow with audit logging (read-only operation).
- * No approval required in non-interactive (stdio) mode.
+ * Tier 1: Operator approval required. SIEM forwarding is an operator function;
+ * the export bulk-decrypts audit events across all principals, each carrying its
+ * policy tier and approve/deny decision, so auto-allowing it would hand the agent
+ * a policy-inference oracle (no-read invariant, CLAUDE.md #7). The operator IS
+ * allowed to see this structure, so the rich SIEM fields are preserved — only the
+ * gate changed (Tier 3 → Tier 1; CISO MED-1).
  */
 
 import type { ToolDefinition } from "../router.js";
@@ -30,7 +34,9 @@ export function createSIEMTools(
         "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into " +
         "Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. " +
         "Encrypted audit entries are decrypted and formatted according to your chosen standard. " +
-        "Tier 3 — auto-allow (read-only, audit logging only).",
+        "Tier 1 — operator approval required: SIEM forwarding is an operator function, and the " +
+        "bulk export reveals each operation's policy tier and approve/deny decision, so it is not " +
+        "auto-allowed to the agent (prevents policy-inference).",
       inputSchema: {
         type: "object",
         properties: {
