@@ -7,7 +7,7 @@
  *  1. Default-off composition
  *  2. Tier 1 Private + composition-disabled is fully offline
  *  3. Opt-in activation spawns sidecar
- *  4. Sidecar uses real Concordia v0.4.0
+ *  4. Sidecar uses real Concordia v0.6.0
  *  5. Commitment events auto-emit Concordia receipts
  *  6. Mandate primitive supported
  *  7. Verascore auto-hook defaults to private scope
@@ -247,16 +247,16 @@ describe("Composition v1.0", () => {
   });
 
   // =====================================================================
-  // AC 4: Sidecar uses real Concordia v0.4.0
+  // AC 4: Sidecar uses real Concordia v0.6.0
   // =====================================================================
-  describe("AC 4: Real Concordia v0.4.0", () => {
+  describe("AC 4: Real Concordia v0.6.0", () => {
     let svc: CompositionService;
 
     afterEach(async () => {
       if (svc) await svc.stop();
     });
 
-    it("sidecar reports concordia_version 0.4.0", async () => {
+    it("sidecar reports concordia_version 0.6.0", async () => {
       svc = new CompositionService(
         {
           composition_enabled: true,
@@ -269,7 +269,7 @@ describe("Composition v1.0", () => {
       await svc.start();
       const version = await svc.getSidecarVersion();
       expect(version).not.toBeNull();
-      expect(version!.concordia_version).toBe("0.4.0");
+      expect(version!.concordia_version).toBe("0.6.0");
       expect(version!.sidecar_version).toBe("1.0.0");
     }, 20000);
   });
