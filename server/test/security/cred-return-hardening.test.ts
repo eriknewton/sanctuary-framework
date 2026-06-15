@@ -2,6 +2,11 @@ import { describe, it, expect } from "vitest";
 import { createSanctuaryServer } from "../../src/index.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import type { AuditEntry } from "../../src/l2-operational/audit-log.js";
+import {
+  attributeFlows,
+  groupFlowsByRule,
+} from "../../src/castle-wall/audit/per-rule-report.js";
 
 async function callTool(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
@@ -149,5 +154,42 @@ describe("credential/policy return hardening", () => {
     const raw = await auditLog.query({ layer: "l1", limit: 10 });
     const rawEntry = raw.entries.find((e) => e.operation === "egress_allowed");
     expect(rawEntry?.details?.rule_id).toBe("allow-anthropic-api");
+  });
+
+  it("the per-rule-per-flow read-out NEVER exposes rule_id when fed the agent-facing (redacted) read path (#c4, property #11)", async () => {
+    const { server, auditLog } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "cred-return-per-rule-boundary",
+    });
+    // A flow whose deciding rule is recorded for the operator.
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "castle-wall-agent",
+      result: "failure",
+      details: { decision: "drop", rule_id: "deny-secret-rule", source: "macos_extension" },
+    });
+
+    // What an AGENT sees through the agent-facing read boundary (monitor_audit_log).
+    const agentView = parseToolResult(await callTool(server, "monitor_audit_log", { limit: 10, layer: "l1" }));
+    const agentEntries: AuditEntry[] = agentView.entries;
+
+    // Running the per-rule aggregator over the agent-facing output must NEVER
+    // surface the rule id: the redacted sentinel collapses into the default-deny
+    // bucket. This is the structural proof that the new operator surface cannot
+    // become an agent-side policy-inference oracle (property #11).
+    const flowsFromAgentView = attributeFlows(agentEntries);
+    const blocked = flowsFromAgentView.find((f) => f.operation === "egress_blocked");
+    expect(blocked).toBeDefined();
+    expect(blocked?.ruleId).toBeNull();
+
+    const groupsFromAgentView = groupFlowsByRule(flowsFromAgentView);
+    expect(groupsFromAgentView.some((g) => g.ruleId === "deny-secret-rule")).toBe(false);
+    expect(JSON.stringify(groupsFromAgentView)).not.toContain("deny-secret-rule");
+
+    // Sanity: the operator path (raw query) still attributes the flow to the rule.
+    const raw = await auditLog.query({ layer: "l1", limit: 10 });
+    const operatorFlows = attributeFlows(raw.entries.filter((e) => e.layer === "l1"));
+    expect(operatorFlows.find((f) => f.operation === "egress_blocked")?.ruleId).toBe("deny-secret-rule");
   });
 });

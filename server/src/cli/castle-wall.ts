@@ -23,6 +23,14 @@ import {
   AuditIntegrityError,
   type AuditEntry,
 } from "../l2-operational/audit-log.js";
+import {
+  DEFAULT_DENY_BUCKET,
+  attributeFlows,
+  filterFlowsByRule,
+  groupFlowsByRule,
+  type FlowAttribution,
+  type PerRuleGroup,
+} from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
@@ -134,6 +142,10 @@ export interface CastleWallParsedArgs {
   acceptBrokenChain?: boolean;
   ttlSeconds?: number;
   noTtl?: boolean;
+  /** audit-dump: roll flows up per deciding rule (counts + allow/deny split). */
+  byRule?: boolean;
+  /** audit-dump: restrict the per-flow read-out to a single matched rule id. */
+  rule?: string;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -1742,7 +1754,29 @@ export async function runAuditDump(
       layer: "l1",
       limit: 100_000,
     });
-    for (const entry of query.entries.filter(isCastleWallAuditEntry)) {
+    const castleWallEntries = query.entries.filter(isCastleWallAuditEntry);
+
+    // Per-rule-per-flow read-out modes (#c4). These attribute each RECORDED flow
+    // to the rule that decided it; they do NOT change emission, schema, or
+    // enforcement, and they do NOT make the trail tamper-evident (that is the
+    // separate, currently-inert producer-signed-audit capability). The rule id
+    // shown here is operator-only — this CLI runs in operator context.
+    if (parsed.byRule || parsed.rule !== undefined) {
+      const flows = attributeFlows(castleWallEntries);
+      if (parsed.rule !== undefined) {
+        const ruleId = normalizeRuleFilter(parsed.rule);
+        for (const flow of filterFlowsByRule(flows, ruleId)) {
+          write(out, JSON.stringify(flowReportRecord(flow)) + "\n");
+        }
+        return 0;
+      }
+      for (const group of groupFlowsByRule(flows)) {
+        write(out, JSON.stringify(perRuleGroupRecord(group)) + "\n");
+      }
+      return 0;
+    }
+
+    for (const entry of castleWallEntries) {
       write(out, JSON.stringify(entry) + "\n");
     }
     return 0;
@@ -1750,6 +1784,54 @@ export async function runAuditDump(
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
+}
+
+/**
+ * Resolve a `--rule` filter value to a per-rule-report rule id. The
+ * default-deny (null-rule) bucket is verbose to type, so `--rule default-deny`
+ * (and the bare bucket label) both select it.
+ */
+function normalizeRuleFilter(value: string): string {
+  if (value === "default-deny" || value === DEFAULT_DENY_BUCKET) {
+    return DEFAULT_DENY_BUCKET;
+  }
+  return value;
+}
+
+/** Operator-facing JSON shape for a single attributed flow row. */
+function flowReportRecord(flow: FlowAttribution): Record<string, unknown> {
+  return {
+    timestamp: flow.timestamp,
+    operation: flow.operation,
+    decision: flow.decision,
+    // `null` rule_id is rendered honestly as the default-deny bucket label; a
+    // real rule is never fabricated for a flow that matched none.
+    rule_id: flow.ruleId,
+    rule: flow.ruleId ?? DEFAULT_DENY_BUCKET,
+    ...(flow.destinationHost !== null
+      ? { destination_host: flow.destinationHost }
+      : {}),
+  };
+}
+
+/** Operator-facing JSON shape for a per-rule rollup row. */
+function perRuleGroupRecord(group: PerRuleGroup): Record<string, unknown> {
+  return {
+    rule: group.ruleId,
+    default_deny: group.isDefaultDeny,
+    total: group.total,
+    allow: group.allow,
+    deny: group.deny,
+    prompt: group.prompt,
+    samples: group.samples.map((flow) => ({
+      timestamp: flow.timestamp,
+      operation: flow.operation,
+      decision: flow.decision,
+      ...(flow.destinationHost !== null
+        ? { destination_host: flow.destinationHost }
+        : {}),
+    })),
+  };
 }
 
 export async function runConfigureOrigin(
@@ -2689,6 +2771,12 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.force = true;
     } else if (arg === "--accept-broken-chain") {
       parsed.acceptBrokenChain = true;
+    } else if (arg === "--by-rule") {
+      parsed.byRule = true;
+    } else if (arg.startsWith("--rule=")) {
+      parsed.rule = arg.slice("--rule=".length);
+    } else if (arg === "--rule") {
+      parsed.rule = argv[++i];
     } else if (!arg.startsWith("-") && !parsed.requestId) {
       parsed.requestId = arg;
     }

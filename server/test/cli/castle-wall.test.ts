@@ -434,6 +434,102 @@ describe("castle-wall CLI verbs", () => {
     expect(JSON.parse(lines[0]!).operation).toBe("egress_allowed");
   });
 
+  /** Seed a fortress with flows decided by several distinct rules + default-deny. */
+  async function seedRuleAttributedFlows() {
+    const fortress = await makeFortress();
+    const auditLog = new AuditLog(
+      new FilesystemStorage(join(fortress.fortressPath, "state")),
+      fortress.masterKey,
+      { integrityMode: "lenient" },
+    );
+    // rule "allow-anthropic": 2 allows
+    await auditLog.append("l1", "egress_allowed", "agent-1", { decision: "allow", rule_id: "allow-anthropic", destination: { host: "api.anthropic.com", ip: "1.1.1.1", port: 443, protocol: "tcp" } }, "success");
+    await auditLog.append("l1", "egress_allowed", "agent-1", { decision: "allow", rule_id: "allow-anthropic" }, "success");
+    // rule "deny-tracker": 1 deny (Rust producer-signed key shape)
+    await auditLog.append("l1", "egress_blocked", "agent-1", { decision: "drop", rule_id_matched: "deny-tracker" }, "failure");
+    // rule "allow-github": 1 allow
+    await auditLog.append("l1", "egress_allowed", "agent-1", { decision: "allow", rule_id: "allow-github" }, "success");
+    // default-deny: 1 deny with no rule
+    await auditLog.append("l1", "egress_blocked", "agent-1", { decision: "drop" }, "failure");
+    // a non-flow lifecycle event that must be excluded from the read-out
+    await auditLog.append("l1", "filter_started", "system", {}, "success");
+    await auditLog.flush();
+    return fortress;
+  }
+
+  it("audit-dump --by-rule rolls flows up per rule with allow/deny split + default-deny bucket", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const out = new CaptureStream();
+    const code = await runAuditDump(["--fortress", fortressPath, "--by-rule"], {
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    const groups = out.text().trim().split("\n").map((l) => JSON.parse(l));
+
+    const byRule = new Map(groups.map((g) => [g.rule, g]));
+    expect(byRule.get("allow-anthropic")).toMatchObject({ total: 2, allow: 2, deny: 0, default_deny: false });
+    expect(byRule.get("deny-tracker")).toMatchObject({ total: 1, allow: 0, deny: 1, default_deny: false });
+    expect(byRule.get("allow-github")).toMatchObject({ total: 1, allow: 1, deny: 0, default_deny: false });
+
+    // default-deny rolls into the explicit null-rule bucket, never a fabricated rule.
+    const defaultDeny = groups.find((g) => g.default_deny === true);
+    expect(defaultDeny).toBeDefined();
+    expect(defaultDeny.total).toBe(1);
+    expect(defaultDeny.deny).toBe(1);
+
+    // The lifecycle event (filter_started) is not a flow and must not appear.
+    expect(groups.some((g) => g.rule === "filter_started")).toBe(false);
+  });
+
+  it("audit-dump --rule <id> shows only that rule's attributed flows", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const out = new CaptureStream();
+    const code = await runAuditDump(["--fortress", fortressPath, "--rule", "allow-anthropic"], {
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    const flows = out.text().trim().split("\n").map((l) => JSON.parse(l));
+    expect(flows).toHaveLength(2);
+    expect(flows.every((f) => f.rule_id === "allow-anthropic")).toBe(true);
+    expect(flows.every((f) => f.decision === "allow")).toBe(true);
+    // The recorded destination host surfaces for operator legibility.
+    expect(flows.some((f) => f.destination_host === "api.anthropic.com")).toBe(true);
+  });
+
+  it("audit-dump --rule default-deny shows the no-matching-rule flows", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const out = new CaptureStream();
+    const code = await runAuditDump(["--fortress", fortressPath, "--rule", "default-deny"], {
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    const flows = out.text().trim().split("\n").map((l) => JSON.parse(l));
+    expect(flows).toHaveLength(1);
+    expect(flows[0].rule_id).toBeNull();
+    expect(flows[0].decision).toBe("deny");
+  });
+
+  it("audit-dump --by-rule is deterministic across N>=3 runs (identical output)", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const runOnce = async () => {
+      const out = new CaptureStream();
+      const code = await runAuditDump(["--fortress", fortressPath, "--by-rule"], {
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+      });
+      expect(code).toBe(0);
+      return out.text();
+    };
+    const a = await runOnce();
+    const b = await runOnce();
+    const c = await runOnce();
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+  });
+
   it("init auto-provisions the Castle Wall pinned key", async () => {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-init-"));
     tempDirs.push(fortressPath);
