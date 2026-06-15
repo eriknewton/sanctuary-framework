@@ -52,8 +52,24 @@ export class RuntimeApprovalTimeoutError extends CastleWallError {
 
 /**
  * The Linux producer-signed activation could not bring the enforcing daemon to
- * an armed, key-loaded state. Thrown FAIL-CLOSED: the daemon would not start,
- * the unit is not active, or the pinned producer key is expected-but-unreadable.
+ * an armed, key-loaded, draining state. Thrown FAIL-CLOSED whenever a REQUESTED
+ * (opted-in) Linux activation cannot prove it is enforcing:
+ *
+ *   - `daemon_start_failed` / `daemon_not_active` — the systemd unit would not
+ *     start or did not report active.
+ *   - `producer_key_unreadable` — the published key file exists but is malformed
+ *     / unreadable (a key is expected).
+ *   - `producer_key_absent` — opted in on Linux, the daemon launched, but no
+ *     producer key was published. On the OPT-IN path a key is REQUIRED, so an
+ *     absent key after launch is a fail-closed not-armed condition (NOT the
+ *     channel-basis floor — that floor only applies WITHOUT opt-in). (codex
+ *     CRITICAL: fail-open on absent key in the opt-in path.)
+ *   - `handshake_failed` — the IPC handshake to the daemon failed.
+ *   - `drain_failed` — the audit drain transport failed, so the wall would be
+ *     armed-but-not-draining (its signed enforcement evidence never reaches the
+ *     consumer). Load-bearing in opt-in mode. (codex HIGH: swallowed drain
+ *     failure.)
+ *
  * The caller surfaces NOT-ARMED — never fake-green, never a silent channel-basis
  * fallback when a key is expected.
  */
@@ -62,7 +78,9 @@ export class RuntimeLinuxActivationError extends CastleWallError {
     | "daemon_start_failed"
     | "daemon_not_active"
     | "producer_key_unreadable"
-    | "handshake_failed";
+    | "producer_key_absent"
+    | "handshake_failed"
+    | "drain_failed";
   constructor(message: string, reason: RuntimeLinuxActivationError["reason"]) {
     super(message);
     this.name = "RuntimeLinuxActivationError";

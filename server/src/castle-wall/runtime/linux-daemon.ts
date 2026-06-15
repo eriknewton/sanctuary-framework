@@ -39,7 +39,7 @@
 
 import { createConnection } from "node:net";
 import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
-import { join } from "node:path";
+import { join, isAbsolute, normalize } from "node:path";
 
 import { resolveCastleWallSocketPath } from "./socket-path.js";
 import {
@@ -91,15 +91,30 @@ export function renderProducerKeyDropIn(input: {
   fortressStoragePath: string;
   daemonBinary?: string;
 }): string {
-  const daemon = input.daemonBinary ?? CASTLE_WALL_DAEMON_BINARY_DEFAULT;
-  const egressDir = join(input.fortressStoragePath, "policy", "egress");
+  // FIX 5 (codex MEDIUM — systemd unit injection). Validate the operator-derived
+  // inputs BEFORE splicing them into the unit. A newline or control char in the
+  // storage path or fortress id could otherwise smuggle a second directive (e.g.
+  // an extra `ExecStart=` or a `User=root`) into the rendered drop-in. We reject
+  // control chars outright, require the storage path to be absolute + normalized,
+  // and quote/escape EVERY token we emit (daemon path, key flags, fortress id,
+  // ReadWritePaths) so even a value with whitespace stays a single token.
+  const fortressStoragePath = assertSafeAbsolutePath(
+    input.fortressStoragePath,
+    "fortress storage path"
+  );
+  const fortressId = assertSafeSystemdToken(input.fortressId, "fortress id");
+  const daemon = assertSafeAbsolutePath(
+    input.daemonBinary ?? CASTLE_WALL_DAEMON_BINARY_DEFAULT,
+    "daemon binary path"
+  );
+  const egressDir = join(fortressStoragePath, "policy", "egress");
   // producerKeyDaemonLaunchArgs derives every flag from the one storage root,
   // so the publish path is equal-by-construction to the TS read path.
-  const keyArgs = producerKeyDaemonLaunchArgs(input.fortressStoragePath);
+  const keyArgs = producerKeyDaemonLaunchArgs(fortressStoragePath);
   const execLine = [
-    daemon,
+    shellQuote(daemon),
     "--fortress-id",
-    shellQuote(input.fortressId),
+    shellQuote(fortressId),
     ...keyArgs.map(shellQuote),
   ].join(" ");
   return [
@@ -112,8 +127,9 @@ export function renderProducerKeyDropIn(input: {
     "ExecStart=",
     `ExecStart=${execLine}`,
     // The daemon (ProtectSystem=strict) must be able to write the key files
-    // into the fortress egress dir.
-    `ReadWritePaths=${egressDir}`,
+    // into the fortress egress dir. Quoted so a path with whitespace stays one
+    // token (systemd accepts a quoted ReadWritePaths value).
+    `ReadWritePaths=${shellQuote(egressDir)}`,
     "",
   ].join("\n");
 }
@@ -155,10 +171,22 @@ export interface LaunchLinuxDaemonInput {
   fortressId: string;
   fortressStoragePath: string;
   daemonBinary?: string;
+  /**
+   * TEST-ONLY override of the systemd unit name. Production callers MUST NOT set
+   * this (the unit name is a fixed constant, `CASTLE_WALL_SYSTEMD_UNIT`);
+   * exposing an arbitrary unit name to production would let an operator-supplied
+   * value pick which unit gets the spliced ExecStart. (codex MEDIUM.)
+   */
   unit?: string;
-  /** Drop-in directory override (tests). Defaults to the real systemd path. */
+  /**
+   * TEST-ONLY override of the drop-in directory (hermetic tests point it away
+   * from the host `/etc`). Production resolves it from the unit name.
+   */
   dropInDir?: string;
-  /** Drop-in filename. Defaults to `10-sanctuary-producer-key.conf`. */
+  /**
+   * TEST-ONLY override of the drop-in filename. Production uses the fixed
+   * `10-sanctuary-producer-key.conf`.
+   */
   dropInFileName?: string;
   systemctl: SystemctlRunner;
   fs?: LauncherFs;
@@ -182,9 +210,21 @@ export async function launchLinuxCastleWallDaemon(
 ): Promise<LaunchLinuxDaemonResult> {
   const fs = input.fs ?? realFs;
   const unit = input.unit ?? CASTLE_WALL_SYSTEMD_UNIT;
+  // FIX 5: validate even the test-only overrides — a control char in the unit
+  // name or filename is an injection vector into the systemctl argv / drop-in
+  // path. The filename must additionally be a bare basename (no separator).
+  assertNoControlChars(unit, "systemd unit name");
   const dropInDir = input.dropInDir ?? castleWallDropInDir(unit);
+  assertNoControlChars(dropInDir, "drop-in directory");
   const dropInFileName =
     input.dropInFileName ?? "10-sanctuary-producer-key.conf";
+  assertNoControlChars(dropInFileName, "drop-in filename");
+  if (dropInFileName.includes("/")) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: drop-in filename must be a bare basename (no "/"); got "${dropInFileName}".`,
+      "daemon_start_failed"
+    );
+  }
   const dropInPath = join(dropInDir, dropInFileName);
 
   const contents = renderProducerKeyDropIn({
@@ -371,10 +411,94 @@ function errMsg(err: unknown): string {
  * shell-like quoting; double-quote and escape embedded quotes/backslashes. We
  * only ever pass our own derived paths + the fortress id, but quoting keeps a
  * path with a space (or a hostile fortress id) from splitting the command.
+ *
+ * Callers MUST validate for control characters first (see `assertNoControlChars`
+ * / `assertSafe*`): quoting alone does not neutralize a newline, which systemd
+ * treats as a directive separator regardless of surrounding quotes.
  */
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Reject any value containing an ASCII control character (incl. newline, CR,
+ * tab, NUL). FIX 5: a newline is the injection primitive for a systemd drop-in —
+ * it ends the current directive and starts a new one, which quoting does NOT
+ * prevent. We refuse rather than try to escape, so a hostile path/id can never
+ * smuggle an extra `[Service]` directive.
+ */
+function assertNoControlChars(value: string, label: string): void {
+  // Explicit code-point scan (no literal control bytes in source). C0 controls
+  // 0x00-0x1F (includes \t \n \r \0) and DEL 0x7F are the systemd-drop-in
+  // injection primitives; reject rather than try to escape.
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) {
+      throw new RuntimeLinuxActivationError(
+        `Castle Wall Linux activation: ${label} contains a control character (code 0x${code
+          .toString(16)
+          .padStart(2, "0")}); refusing to render a systemd drop-in (injection guard).`,
+        "daemon_start_failed"
+      );
+    }
+  }
+}
+
+/**
+ * Validate a value that becomes a single systemd token (e.g. the fortress id):
+ * no control chars, non-empty. Returned verbatim for the caller to `shellQuote`.
+ */
+function assertSafeSystemdToken(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: ${label} must be a non-empty string.`,
+      "daemon_start_failed"
+    );
+  }
+  assertNoControlChars(value, label);
+  return value;
+}
+
+/**
+ * Validate a filesystem path spliced into the unit: non-empty, no control
+ * chars, ABSOLUTE, and normalized (no `..` traversal segments). Returns the
+ * normalized path. FIX 5: requiring absolute + normalized removes the
+ * relative-path / traversal ambiguity from `ReadWritePaths` and `ExecStart`.
+ */
+function assertSafeAbsolutePath(value: string, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: ${label} must be a non-empty path.`,
+      "daemon_start_failed"
+    );
+  }
+  assertNoControlChars(value, label);
+  if (!isAbsolute(value)) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: ${label} must be an absolute path (got "${value}").`,
+      "daemon_start_failed"
+    );
+  }
+  // Check the RAW value for `..` traversal segments BEFORE normalize() collapses
+  // them away — the concern is a traversal in the operator-supplied input, not in
+  // the resolved result.
+  if (value.split("/").includes("..")) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: ${label} must not contain ".." traversal segments (got "${value}").`,
+      "daemon_start_failed"
+    );
+  }
+  // Refuse a non-canonical path (normalize would change it): keeps the value the
+  // daemon receives equal to the value we validated.
+  const normalized = normalize(value);
+  if (normalized !== value) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: ${label} must be a normalized absolute path (got "${value}", normalizes to "${normalized}").`,
+      "daemon_start_failed"
+    );
+  }
+  return normalized;
 }
 
 export { resolveCastleWallSocketPath };

@@ -17,6 +17,7 @@ import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
   parseCastleWallArgs,
+  runDaemon,
   runProvisionPin,
   runRePin,
   runAuditDump,
@@ -26,6 +27,7 @@ import {
   runStatus,
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
+import { LINUX_PRODUCER_SIGNED_ACTIVATION_ENV } from "../../src/castle-wall/runtime/linux-activation-gate.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
@@ -1419,5 +1421,73 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     expect(out.text()).toContain(
       `Global pin (enforcement anchor): ${fingerprint(helper.pub)}`,
     );
+  });
+
+  // ── FIX 3 (codex HIGH): the daemon entrypoint ROUTES opt-in Linux to the
+  //    producer-signed gate, and everything else to the macOS/channel path. ──
+  describe("runDaemon routing (FIX 3)", () => {
+    it("Linux WITHOUT the opt-in flag stays macOS-only (routes to the channel/macOS path, refuses Linux)", async () => {
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: { SANCTUARY_STORAGE_PATH: "/nonexistent/fortress" }, // no opt-in flag
+        platform: "linux",
+      });
+      expect(code).toBe(1);
+      // The default (non-opt-in) Linux posture: unsupported, pointed at the flag.
+      expect(err.text()).toMatch(/macOS-only by default/);
+      expect(err.text()).toMatch(/SANCTUARY_CASTLE_LINUX_PRODUCER_SIGNED=1/);
+    });
+
+    it("Linux WITH the opt-in flag routes PAST the macOS-only guard into the producer-signed path", async () => {
+      const { fortressPath } = await makeFortress();
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      // Opted in on Linux: must NOT print the macOS-only refusal. With no pinned
+      // key provisioned it fails at pin resolution (a Linux-path failure), which
+      // proves it routed past the guard rather than bailing as macOS-only.
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
+        },
+        platform: "linux",
+      });
+      expect(code).toBe(1);
+      expect(err.text()).not.toMatch(/macOS-only/);
+      // It reached the Linux-capable daemon flow (pin / credential resolution).
+      expect(err.text()).toMatch(/No pinned key found|Refusing to start|fail-closed/i);
+    });
+
+    it("macOS keeps the existing macOS daemon path (never the Linux gate)", async () => {
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      // Even with the (Linux-only) flag set, darwin must NOT route to the Linux
+      // gate. With no pinned key it fails at the macOS pin read, not at a Linux
+      // producer-signed error.
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: "/nonexistent/fortress",
+          [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
+        },
+        platform: "darwin",
+      });
+      expect(code).toBe(1);
+      // The macOS path: it did NOT bail as "macOS-only" and did NOT enter the
+      // Linux producer-signed gate. The specific downstream failure (pin read /
+      // passphrase / establishMaster) depends on host Keychain state, so we
+      // assert the ROUTING (no Linux-gate involvement), not the exact failure.
+      expect(err.text()).not.toMatch(/macOS-only/);
+      expect(err.text()).not.toMatch(/Linux producer-signed/);
+      expect(err.text()).not.toMatch(/fail-closed.*not armed/i);
+      // It reached the real macOS daemon flow (a pin / credential failure).
+      expect(err.text()).toMatch(/No pinned key found|Refusing to start/i);
+    });
   });
 });

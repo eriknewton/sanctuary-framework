@@ -1123,13 +1123,31 @@ export async function runDaemon(
   const platform = ctx.platform ?? process.platform;
   const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
 
-  if (platform !== "darwin") {
-    write(err, "castle-wall daemon is macOS-only.\n");
+  // FIX 3 (codex HIGH — wire the opt-in producer-signed close into production).
+  // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
+  // operator explicitly opts in to the producer-signed close, in which case it
+  // routes to the Linux activation gate (fail-closed, off-by-default,
+  // drill-pending). The gate re-checks platform + opt-in internally.
+  const { isLinuxProducerSignedActivationRequested } = await import(
+    "../castle-wall/runtime/index.js"
+  );
+  const linuxProducerSigned =
+    platform === "linux" &&
+    isLinuxProducerSignedActivationRequested({ env });
+
+  if (platform !== "darwin" && !linuxProducerSigned) {
+    write(
+      err,
+      platform === "linux"
+        ? "castle-wall daemon is macOS-only by default. To run the opt-in Linux producer-signed close, set SANCTUARY_CASTLE_LINUX_PRODUCER_SIGNED=1 (drill-pending, off by default).\n"
+        : "castle-wall daemon is macOS-only.\n",
+    );
     return 1;
   }
 
   // F1 Option C: the launchd boot service comes up in SAFE MODE — it holds
   // only the software-protected boot token, never the fortress master key.
+  // (macOS-only path; Linux never reaches here with --safe-mode.)
   if (argv.includes("--safe-mode")) {
     return runSafeModeDaemon(argv, ctx);
   }
@@ -1212,46 +1230,101 @@ export async function runDaemon(
     err,
   });
 
-  // F1 — resolve the signer-client shim the same way `re-pin` does: explicit
-  // ctx → env → auto-discovered bundled shim. Lets a normally-installed box arm
-  // without the operator having to set SANCTUARY_CASTLE_SIGNER_CLIENT by hand
-  // (the 2026-06-13 drill operability gap). Only used in helper-sign mode.
-  const resolvedSignerClient = localSign
-    ? undefined
-    : await resolveSignerClientPath(env, platform, ctx);
-
-  const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
   let daemon: { socketPath: string; stop: () => Promise<void> };
-  try {
-    daemon = await startMacOSCastleWallDaemon({
-      fortressPath: storagePath,
-      fortressId: fortressIdFromStoragePath(storagePath),
-      masterKey: derived.key,
-      auditLog,
-      ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
-      ...(localSign ? { localSign: true } : {}),
-      ...(resolvedSignerClient
-        ? { signerClientPath: resolvedSignerClient }
-        : {}),
-    });
-  } catch (error) {
-    write(err, `Daemon failed to start: ${(error as Error).message}\n`);
-    if (localSign) {
-      write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
-    } else {
-      write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+
+  if (linuxProducerSigned) {
+    // FIX 3: opt-in Linux producer-signed close. Route through the fail-closed
+    // activation gate using the fortress's existing pinned key as the IPC
+    // handshake identity. No macOS helper signer is involved (the systemd daemon
+    // holds its own root-owned producer key). Off-by-default + drill-pending.
+    const {
+      maybeActivateLinuxProducerSignedCastleWall,
+      buildLinuxIpcClientKeyMaterial,
+    } = await import("../castle-wall/runtime/index.js");
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    try {
+      const key = await buildLinuxIpcClientKeyMaterial({
+        fortressPath: storagePath,
+        fortressId,
+        masterKey: derived.key,
+      });
+      const outcome = await maybeActivateLinuxProducerSignedCastleWall({
+        fortressId,
+        fortressStoragePath: storagePath,
+        key,
+        auditSink: auditLog,
+        env,
+      });
+      if (!outcome.activated) {
+        // Not possible here (we already gated on platform + opt-in), but never
+        // fake-arm: surface not-armed rather than pretend.
+        write(
+          err,
+          `Refusing to report armed: Linux producer-signed activation did not engage (${outcome.reason}).\n`,
+        );
+        return 1;
+      }
+      const socketPath = resolveCastleWallSocketPath({
+        platform,
+        fortressId,
+        fortressPath: storagePath,
+      }).path;
+      daemon = { socketPath, stop: () => outcome.activation.stop() };
+    } catch (error) {
+      write(err, `Daemon failed to start (Linux producer-signed, fail-closed): ${(error as Error).message}\n`);
+      write(err, "The producer-signed close is fail-closed: a daemon-start, key, handshake, or drain failure surfaces NOT-ARMED rather than degrading to the channel basis.\n");
+      return 1;
     }
-    return 1;
+  } else {
+    // F1 — resolve the signer-client shim the same way `re-pin` does: explicit
+    // ctx → env → auto-discovered bundled shim. Lets a normally-installed box arm
+    // without the operator having to set SANCTUARY_CASTLE_SIGNER_CLIENT by hand
+    // (the 2026-06-13 drill operability gap). Only used in helper-sign mode.
+    const resolvedSignerClient = localSign
+      ? undefined
+      : await resolveSignerClientPath(env, platform, ctx);
+
+    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    try {
+      daemon = await startMacOSCastleWallDaemon({
+        fortressPath: storagePath,
+        fortressId: fortressIdFromStoragePath(storagePath),
+        masterKey: derived.key,
+        auditLog,
+        ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
+        ...(localSign ? { localSign: true } : {}),
+        ...(resolvedSignerClient
+          ? { signerClientPath: resolvedSignerClient }
+          : {}),
+      });
+    } catch (error) {
+      write(err, `Daemon failed to start: ${(error as Error).message}\n`);
+      if (localSign) {
+        write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
+      } else {
+        write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+      }
+      return 1;
+    }
   }
 
   write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
-  if (launchdBoot) {
-    write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");
-  }
-  if (localSign) {
-    write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
+  if (linuxProducerSigned) {
+    write(
+      out,
+      `Linux producer-signed close ACTIVE (opt-in): the systemd daemon signs every ` +
+        `enforcement event with its root-owned producer key; the in-process server ` +
+        `re-verifies against pin ${pinFingerprint}. Drill-acceptance pending.\n`,
+    );
   } else {
-    write(out, `Signing via the root signer helper (no passphrase used for signing); pin ${pinFingerprint}.\n`);
+    if (launchdBoot) {
+      write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");
+    }
+    if (localSign) {
+      write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
+    } else {
+      write(out, `Signing via the root signer helper (no passphrase used for signing); pin ${pinFingerprint}.\n`);
+    }
   }
   write(out, "Daemon running in the foreground. Ctrl-C (SIGINT) or SIGTERM to stop.\n");
 

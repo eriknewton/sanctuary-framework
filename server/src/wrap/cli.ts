@@ -96,7 +96,6 @@ import {
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
-import type { MacOSCastleWallDaemonHandle } from "../castle-wall/runtime/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -776,7 +775,10 @@ export async function runWrap(
     }
   }
 
-  let castleWallDaemon: MacOSCastleWallDaemonHandle | undefined;
+  // The active Castle Wall bring-up: the macOS daemon (channel basis, default) OR
+  // the opt-in Linux producer-signed activation (FIX 3). Both expose `stop()`; we
+  // keep only the common shape so the cleanup is uniform.
+  let castleWallDaemon: { stop(): Promise<void> } | undefined;
   const registerCastleWallCleanup = () => {
     if (!castleWallDaemon) return;
     const stop = () => {
@@ -788,10 +790,42 @@ export async function runWrap(
   };
   const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
     if (castleWallDaemon) return;
-    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
-    castleWallDaemon = await startMacOSCastleWallDaemon({
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const runtime = await import("../castle-wall/runtime/index.js");
+
+    // FIX 3 (codex HIGH — wire the opt-in producer-signed close into production).
+    // On Linux WITH the explicit opt-in flag, route through the producer-signed
+    // activation gate (fail-closed, drill-pending, off by default). macOS — and
+    // Linux WITHOUT the flag — keep the existing macOS daemon / channel basis.
+    // The gate itself re-checks platform + opt-in, so this is belt-and-suspenders.
+    if (
+      process.platform === "linux" &&
+      runtime.isLinuxProducerSignedActivationRequested()
+    ) {
+      const key = await runtime.buildLinuxIpcClientKeyMaterial({
+        fortressPath: storagePath,
+        fortressId,
+        masterKey,
+      });
+      const outcome = await runtime.maybeActivateLinuxProducerSignedCastleWall({
+        fortressId,
+        fortressStoragePath: storagePath,
+        key,
+        auditSink: auditLog,
+      });
+      // The gate returns activated:false only when NOT opted in / not Linux —
+      // neither is possible here (we just checked both), so an inactive outcome
+      // means a logic drift; treat it as a no-op rather than a fake-arm.
+      if (outcome.activated) {
+        castleWallDaemon = outcome.activation;
+        registerCastleWallCleanup();
+      }
+      return;
+    }
+
+    castleWallDaemon = await runtime.startMacOSCastleWallDaemon({
       fortressPath: storagePath,
-      fortressId: fortressIdFromStoragePath(storagePath),
+      fortressId,
       masterKey,
       auditLog,
     });

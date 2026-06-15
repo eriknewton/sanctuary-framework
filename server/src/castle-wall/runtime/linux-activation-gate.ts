@@ -15,11 +15,13 @@
  *     systemd launcher off-Linux).
  *
  *   - FAIL-CLOSED. If the daemon will not start, the unit is not active, the
- *     handshake fails, or the pinned producer key is expected-but-unreadable,
- *     the activation THROWS `RuntimeLinuxActivationError`. The caller surfaces
+ *     handshake fails, the pinned producer key is expected-but-unreadable, the
+ *     key is ABSENT after an opted-in launch (a key is required on this path —
+ *     see FIX 1), or the audit drain transport wedges (armed-but-not-draining —
+ *     see FIX 4), the activation THROWS / trips NOT-ARMED. The caller surfaces
  *     NOT-ARMED. There is NO branch that swallows a failure and falls back to
- *     the channel basis when a key is expected — `startCastleWall` itself throws
- *     on `unreadable`, and we let that propagate.
+ *     the channel basis when a key is expected. The channel-basis floor applies
+ *     ONLY on the non-opt-in path; here, opting in means enforcement is required.
  *
  * # Drill-acceptance caveat (never overclaim)
  *
@@ -45,7 +47,12 @@ import {
   type LinuxAuditDrainHandle,
   type LinuxAuditDrainOptions,
 } from "./linux-audit-drain.js";
+import { loadFortressProducerKey } from "./producer-signature.js";
 import { RuntimeLinuxActivationError } from "./errors.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
+import { toBase64url } from "../../core/encoding.js";
 
 /**
  * The capability flag that OPTS IN to the Linux producer-signed close.
@@ -112,6 +119,17 @@ export interface ActivateLinuxProducerSignedInput {
   drainOptions?: LinuxAuditDrainOptions;
   /** Skip starting the continuous drain loop (tests that drive drain manually). */
   startDrainLoop?: boolean;
+  /**
+   * Sink for a durable NOT-ARMED / audit-failure signal when the drain loop hits
+   * a transport failure (FIX 4 — drain health is load-bearing in opt-in mode).
+   * The activation wraps the caller's `drainOptions.onError`: the FIRST drain
+   * transport failure trips `markDrainUnhealthy`, which records the failure and
+   * tears the activation down (so the wall is never silently armed-but-not-
+   * draining). When omitted, a default handler stops the drain loop on the first
+   * failure (still never silently "armed"). Tests inject this to assert the
+   * unhealthy transition + teardown fire.
+   */
+  onDrainUnhealthy?: (err: Error) => void;
 }
 
 /** A live producer-signed activation; close it on shutdown. */
@@ -120,6 +138,13 @@ export interface LinuxProducerSignedActivation {
   drain: LinuxAuditDrainHandle | null;
   /** The drop-in path written, for diagnostics. */
   dropInPath: string;
+  /**
+   * Whether the drain loop is still healthy. Returns false once a drain
+   * transport failure has tripped the durable NOT-ARMED / audit-failure signal
+   * (FIX 4): in opt-in mode a wedged drain means the wall is armed-but-not-
+   * draining, which must never read as healthy.
+   */
+  drainHealthy(): boolean;
   /** Tear down the drain loop + lifecycle (does NOT stop the systemd daemon). */
   stop(): Promise<void>;
 }
@@ -190,6 +215,39 @@ export async function activateLinuxProducerSignedCastleWall(
     fs: input.fs,
   });
 
+  // FIX 1 (codex CRITICAL — fail-open on absent key in the opt-in path).
+  //
+  // We only reach here when the operator OPTED IN on Linux and the daemon was
+  // launched. On the opt-in path a published producer key is EXPECTED: the
+  // daemon was launched with `--producer-pub-key` pointed at exactly the path the
+  // consumer reads, so by the time it is active it must have published its key.
+  //
+  // Without this check, an ABSENT key would let `startCastleWall` start on the
+  // CHANNEL BASIS (lifecycle.ts: `absent` → consumer key-null) and the gate would
+  // still return `activated: true` — reporting armed-but-NOT-enforcing (fake
+  // green). The channel-basis floor is legitimate ONLY without opt-in; here a key
+  // is required, so an absent key after an opted-in launch is fail-closed
+  // not-armed. (`unreadable` already throws below via `startCastleWall`; this adds
+  // the missing `absent` case so all three loads are handled honestly:
+  // present→enforce, unreadable→throw, absent→throw — none silently channel.)
+  const keyLoad = await loadFortressProducerKey(input.fortressStoragePath);
+  if (keyLoad.status !== "present") {
+    const reason: RuntimeLinuxActivationError["reason"] =
+      keyLoad.status === "absent"
+        ? "producer_key_absent"
+        : "producer_key_unreadable";
+    const detail =
+      keyLoad.status === "absent"
+        ? "no audit-producer key was published after the opted-in daemon launch"
+        : keyLoad.reason;
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation failed (fail-closed, not armed): ${detail}. ` +
+        `On the opt-in producer-signed path a published key is REQUIRED — refusing ` +
+        `to report armed on the (weaker) channel basis.`,
+      reason
+    );
+  }
+
   // P-2 (transport): resolve the daemon socket + connect a real UDS transport
   // (or the injected mock). A connect failure fails closed.
   const socketPath =
@@ -232,22 +290,142 @@ export async function activateLinuxProducerSignedCastleWall(
 
   // P-2 (drain loop): pull signed events from the daemon into the consumer's
   // fail-closed re-verification gate.
-  const drain =
-    input.startDrainLoop === false
-      ? null
-      : startLinuxAuditDrainLoop(
-          lifecycle.client(),
-          lifecycle.audit(),
-          input.drainOptions
+  //
+  // FIX 4 (codex HIGH — swallowed drain failure → armed-but-not-draining).
+  //
+  // In opt-in producer-signed mode the drain loop is LOAD-BEARING: if the
+  // transport to the daemon wedges, the daemon's signed enforcement evidence
+  // never reaches the consumer, so a "running" lifecycle would be silently
+  // armed-but-not-draining. We make the FIRST drain transport failure trip a
+  // durable NOT-ARMED / audit-failure signal and stop the drain loop (mark
+  // unhealthy), so the failure is observable and the activation never pretends
+  // the wall is healthy. We wrap any caller-supplied `onError` so we don't
+  // swallow their diagnostics; the health transition is additive.
+  let drain: LinuxAuditDrainHandle | null = null;
+  let drainUnhealthy = false;
+  const callerOnError = input.drainOptions?.onError;
+  const markDrainUnhealthy = (err: Error): void => {
+    if (drainUnhealthy) return;
+    drainUnhealthy = true;
+    // Record the audit-failure / not-armed signal durably. The audit sink IS the
+    // tamper-evident record; emitting here means an operator/reader sees the wall
+    // stopped draining rather than a silent green. `append` may be sync (void) or
+    // async; wrap both so a sink error never escapes the error handler.
+    void (async () => {
+      try {
+        await input.auditSink.append(
+          "l1",
+          "castle_wall_drain_failed",
+          input.fortressId,
+          {
+            reason: err.message,
+            evidence_basis: "producer_signed",
+            armed: false,
+            note: "drain transport failed — wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
+          },
+          "failure"
         );
+        await input.auditSink.flush();
+      } catch {
+        // The durable record is best-effort; the health transition + teardown
+        // below are the load-bearing parts and still fire.
+      }
+    })();
+    // Surface to the caller's health hook (tests assert this fires).
+    input.onDrainUnhealthy?.(err);
+    // Stop the loop so it cannot keep silently retrying a wedged link while the
+    // lifecycle still reports "running".
+    void drain?.stop().catch(() => {});
+  };
+
+  if (input.startDrainLoop !== false) {
+    const drainOptions: LinuxAuditDrainOptions = {
+      ...input.drainOptions,
+      onError: (err: Error) => {
+        callerOnError?.(err);
+        markDrainUnhealthy(err);
+      },
+    };
+    drain = startLinuxAuditDrainLoop(
+      lifecycle.client(),
+      lifecycle.audit(),
+      drainOptions
+    );
+  }
 
   return {
     lifecycle,
     drain,
     dropInPath: launch.dropInPath,
+    /** Whether the drain loop has tripped its unhealthy / not-armed signal. */
+    drainHealthy: () => !drainUnhealthy,
     stop: async () => {
       if (drain) await drain.stop();
       await lifecycle.stop();
     },
+  };
+}
+
+/** Relative location of the fortress's pinned Castle Wall public key. */
+const CASTLE_PINNED_PUBKEY_RELPATH = "castle-pinned-pubkey.bin";
+/** Relative location of the fortress's pinned Castle Wall (encrypted) private key. */
+const CASTLE_PINNED_PRIVKEY_RELPATH = "castle-pinned-privkey.enc";
+
+/**
+ * Build the IPC-handshake {@link ClientKeyMaterial} for the Linux activation from
+ * the fortress's on-disk pinned Castle Wall key pair + the fortress master key.
+ *
+ * This mirrors the macOS daemon's local-sign key load
+ * (`macos-daemon.ts:loadLocalSigningKey`): read the 32-byte pinned public key,
+ * decrypt the pinned private key with the master key, re-encrypt the 32-byte seed
+ * (the IPC client decrypts it transiently per signature). It is the glue the
+ * production entrypoints use to thread the existing fortress identity into the
+ * opt-in Linux activation WITHOUT a second key source. FAIL-CLOSED: a missing /
+ * wrong-length / undecryptable key throws (the caller surfaces not-armed).
+ *
+ * The private key bytes are zeroed after re-encryption; only the encrypted form
+ * is retained on the returned material.
+ */
+export async function buildLinuxIpcClientKeyMaterial(input: {
+  fortressPath: string;
+  fortressId: string;
+  masterKey: Uint8Array;
+}): Promise<ClientKeyMaterial> {
+  const publicKey = new Uint8Array(
+    await readFile(join(input.fortressPath, CASTLE_PINNED_PUBKEY_RELPATH))
+  );
+  if (publicKey.length !== 32) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation: pinned public key must be 32 bytes (found ${publicKey.length}).`,
+      "handshake_failed"
+    );
+  }
+  const storedPriv = JSON.parse(
+    await readFile(join(input.fortressPath, CASTLE_PINNED_PRIVKEY_RELPATH), "utf8")
+  ) as EncryptedPayload;
+  const privateKey = decrypt(storedPriv, input.masterKey);
+  let encryptedPrivateKey: EncryptedPayload;
+  try {
+    const seed =
+      privateKey.length === 64
+        ? privateKey.slice(0, 32)
+        : privateKey.length === 32
+          ? privateKey
+          : null;
+    if (seed === null) {
+      throw new RuntimeLinuxActivationError(
+        `Castle Wall Linux activation: pinned private key must decrypt to 32 bytes (found ${privateKey.length}).`,
+        "handshake_failed"
+      );
+    }
+    encryptedPrivateKey = encrypt(seed, input.masterKey);
+  } finally {
+    privateKey.fill(0);
+  }
+  return {
+    fortressId: input.fortressId,
+    signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
+    encryptedPrivateKey,
+    encryptionKey: input.masterKey,
   };
 }

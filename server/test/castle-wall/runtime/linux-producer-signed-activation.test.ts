@@ -55,6 +55,12 @@ import {
   drainOnce,
 } from "../../../src/castle-wall/runtime/linux-audit-drain.js";
 import {
+  AuditConsumer,
+  type AuditSink,
+} from "../../../src/castle-wall/runtime/audit-consumer.js";
+import type { IpcClient } from "../../../src/castle-wall/runtime/ipc-client.js";
+import type { AuditDrainResponse } from "../../../src/castle-wall/ipc/messages.js";
+import {
   maybeActivateLinuxProducerSignedCastleWall,
   isLinuxProducerSignedActivationRequested,
   LINUX_PRODUCER_SIGNED_ACTIVATION_ENV,
@@ -343,6 +349,85 @@ describe("C4 — P-1 launcher: systemd drop-in renders + verifies active", () =>
     expect(conf).toContain("ReadWritePaths=/srv/fortress/policy/egress");
   });
 
+  // ── FIX 5 (codex MEDIUM): systemd unit injection guard ──────────────────
+  it("QUOTES a storage path with whitespace (stays one ExecStart/ReadWritePaths token)", () => {
+    const conf = renderProducerKeyDropIn({
+      fortressId: "fortress:test",
+      fortressStoragePath: "/srv/my fortress",
+    });
+    // A space in the path must be quoted everywhere it appears so systemd does
+    // not split it into two tokens / two paths.
+    expect(conf).toContain('--policy-dir "/srv/my fortress/policy/egress"');
+    expect(conf).toContain('ReadWritePaths="/srv/my fortress/policy/egress"');
+  });
+
+  it("REJECTS a storage path containing a newline (injection guard)", () => {
+    expect(() =>
+      renderProducerKeyDropIn({
+        fortressId: "fortress:test",
+        fortressStoragePath: "/srv/x\nExecStart=/bin/sh -c evil",
+      })
+    ).toThrow(RuntimeLinuxActivationError);
+    expect(() =>
+      renderProducerKeyDropIn({
+        fortressId: "fortress:test",
+        fortressStoragePath: "/srv/x\nExecStart=/bin/sh -c evil",
+      })
+    ).toThrow(/control character/i);
+  });
+
+  it("REJECTS a fortress id containing a newline / control char (injection guard)", () => {
+    expect(() =>
+      renderProducerKeyDropIn({
+        fortressId: "fortress\nUser=root",
+        fortressStoragePath: "/srv/fortress",
+      })
+    ).toThrow(/control character/i);
+  });
+
+  it("REJECTS a RELATIVE storage path (must be absolute + normalized)", () => {
+    expect(() =>
+      renderProducerKeyDropIn({
+        fortressId: "fortress:test",
+        fortressStoragePath: "relative/fortress",
+      })
+    ).toThrow(/absolute path/i);
+  });
+
+  it("REJECTS a storage path with a .. traversal segment", () => {
+    expect(() =>
+      renderProducerKeyDropIn({
+        fortressId: "fortress:test",
+        fortressStoragePath: "/srv/../etc/fortress",
+      })
+    ).toThrow(/traversal/i);
+  });
+
+  it("REJECTS a control char in the (test-only) unit name and drop-in filename", async () => {
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    await expect(
+      launchLinuxCastleWallDaemon({
+        fortressId: "fortress:test",
+        fortressStoragePath: tmp,
+        systemctl: runner,
+        fs,
+        unit: "evil\nWantedBy=multi-user.target",
+        dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      })
+    ).rejects.toThrow(/control character/i);
+    await expect(
+      launchLinuxCastleWallDaemon({
+        fortressId: "fortress:test",
+        fortressStoragePath: tmp,
+        systemctl: runner,
+        fs,
+        dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+        dropInFileName: "../escape.conf",
+      })
+    ).rejects.toThrow(/bare basename/i);
+  });
+
   it("installs the drop-in, reloads, restarts, and VERIFIES is-active", async () => {
     const { runner, calls } = activeSystemctl();
     const { fs, files } = memoryFs();
@@ -488,35 +573,39 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
     if (!outcome.activated) expect(outcome.reason).toBe("not_linux");
   });
 
-  it("(c2) Linux + absent key: consumer stays on the channel basis (pre-provision floor, not a failure)", async () => {
-    // No pubkey published → loadFortressProducerKey = absent → channel basis.
+  it("(c2) Linux + opt-in + ABSENT key: FAIL-CLOSED (never channel basis, never armed) — codex CRITICAL FIX 1", async () => {
+    // FIX 1: on the OPTED-IN Linux path a published producer key is REQUIRED. An
+    // absent key after the daemon launches must THROW (not-armed), never report
+    // `activated: true` on the (weaker) channel basis — that would be a fake-green
+    // armed-but-not-enforcing state. (Absent-key WITHOUT opt-in legitimately stays
+    // channel-basis; that case never reaches this gate at all.)
     const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
     const mock = buildMockDaemon([]);
     const { runner } = activeSystemctl();
     const { fs } = memoryFs();
 
-    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
-      fortressId: "fortress:test",
-      fortressStoragePath: tmp,
-      key: keyMaterial(),
-      auditSink: auditLog,
-      platform: "linux",
-      explicitOptIn: true,
-      systemctl: runner,
-      fs,
-      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
-      connectTransport: async () => mock.transport,
-      startDrainLoop: false,
-    });
-    await mock.sendChallenge();
-    const outcome = await outcomeP;
-    expect(outcome.activated).toBe(true);
-    if (!outcome.activated) return;
-    // Absent key → NOT enforcing (channel basis), but NOT a refusal: the daemon
-    // is up and the lifecycle is running.
-    expect(outcome.activation.lifecycle.audit().isProducerSignatureEnforced()).toBe(false);
-    expect(outcome.activation.lifecycle.state()).toBe("running");
-    await outcome.activation.stop();
+    // No pubkey published → loadFortressProducerKey = absent → fail-closed throw.
+    let thrown: unknown;
+    try {
+      await maybeActivateLinuxProducerSignedCastleWall({
+        fortressId: "fortress:test",
+        fortressStoragePath: tmp,
+        key: keyMaterial(),
+        auditSink: auditLog,
+        platform: "linux",
+        explicitOptIn: true,
+        systemctl: runner,
+        fs,
+        dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+        connectTransport: async () => mock.transport,
+        startDrainLoop: false,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect((thrown as RuntimeLinuxActivationError).reason).toBe("producer_key_absent");
+    expect((thrown as Error).message).toMatch(/not armed/i);
   });
 
   it("(d) FAIL-CLOSED when the daemon will not start (not-armed, never green, never channel fallback)", async () => {
@@ -565,5 +654,202 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
         startDrainLoop: false,
       })
     ).rejects.toThrow(/unreadable|not armed|fail-closed/i);
+  });
+});
+
+describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED event", () => {
+  /** A sink that fails the FIRST enforcement-evidence append, then succeeds. */
+  class PersistFailsOnceSink implements AuditSink {
+    entries: Array<{ operation: string; details?: Record<string, unknown> }> = [];
+    private failedOnce = false;
+    append(
+      _layer: "l1",
+      operation: string,
+      _identityId: string,
+      details?: Record<string, unknown>,
+    ): void {
+      if (
+        !this.failedOnce &&
+        (operation === "egress_blocked" || operation === "egress_allowed")
+      ) {
+        this.failedOnce = true;
+        throw new Error("audit disk unavailable (transient)");
+      }
+      this.entries.push({ operation, details });
+    }
+    async flush(): Promise<void> {}
+  }
+
+  /** A minimal fake IpcClient that serves a fixed batch once and records acks. */
+  function fakeClient(events: AuditDrainEvent[]): {
+    client: IpcClient;
+    acks: number[];
+  } {
+    const acks: number[] = [];
+    let served = false;
+    const client = {
+      async drainRequest(): Promise<AuditDrainResponse> {
+        const batch = served ? [] : events;
+        served = true;
+        return {
+          events: batch,
+          next_after_seq:
+            batch.length > 0 ? batch[batch.length - 1]!.seq : null,
+          more_pending: false,
+          wal_overflow_count: 0,
+        } as AuditDrainResponse;
+      },
+      async sendDrainAck(seq: number): Promise<void> {
+        acks.push(seq);
+      },
+    } as unknown as IpcClient;
+    return { client, acks };
+  }
+
+  it("BREAKs the batch on a transient persist failure — never acks the next seq (no WAL truncation)", async () => {
+    // No pinned key on the consumer → events accepted on the channel basis, so we
+    // isolate the persistence-failure + ack behavior (not the signature gate).
+    const sink = new PersistFailsOnceSink();
+    const consumer = new AuditConsumer(sink);
+    // seq 1 persist FAILS (PersistFailsOnceSink throws the first enforcement
+    // append). The loop must BREAK before ever touching seq 2, so seq 2's exact
+    // prior-hash is irrelevant — what matters is it is never acked.
+    const { client, acks } = fakeClient([
+      forgedDrainEvent(1, null),
+      forgedDrainEvent(2, null),
+    ]);
+
+    const errors: Error[] = [];
+    const res = await drainOnce(client, consumer, null, 256, (e) => errors.push(e));
+
+    // seq 1 failed to persist → NOT acked; the loop BROKE so seq 2 was never
+    // even ingested → also NOT acked. The daemon will re-deliver from seq 1.
+    expect(acks).not.toContain(1);
+    expect(acks).not.toContain(2);
+    expect(acks).toHaveLength(0);
+    expect(res.drained).toBe(0);
+    expect(res.nextAfterSeq).toBeNull();
+    // The transient failure surfaced via onError.
+    expect(errors.some((e) => /transient/.test(e.message))).toBe(true);
+    // And the consumer never accepted either enforcement event.
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
+  });
+
+  it("CONTINUES the batch when an event SETTLES (a refused forgery is acked, later events still flow)", async () => {
+    // Contrast case: a forgery is durably refused + acked (it settled), so the
+    // loop keeps going and a following genuine event is still pulled. This proves
+    // the BREAK is scoped to UN-settled (transient) failures, not every throw.
+    const priv = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(priv);
+    await publishPubKey(tmp, pub);
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const { loadFortressProducerKey } = await import(
+      "../../../src/castle-wall/runtime/producer-signature.js"
+    );
+    const load = await loadFortressProducerKey(tmp);
+    expect(load.status).toBe("present");
+    if (load.status !== "present") return;
+    const consumer = new AuditConsumer(auditLog, undefined, {
+      pinnedProducerKeyB64url: load.keyB64url,
+    });
+    // seq 1 forged (refused+acked → settles), seq 2 genuine (accepted+acked).
+    const { client, acks } = fakeClient([
+      forgedDrainEvent(1, null),
+      signedDrainEvent(priv, 2, null),
+    ]);
+    const res = await drainOnce(client, consumer, null, 256, () => {});
+    // Both settled → both acked; the loop did NOT break on the refused forgery.
+    expect(acks).toContain(1);
+    expect(acks).toContain(2);
+    expect(res.drained).toBe(2);
+    expect(consumer.getStats().producerSignatureRejections).toBe(1);
+    expect(consumer.getStats().producerSignatureAccepted).toBe(1);
+  });
+});
+
+describe("C4 — FIX 4 (codex HIGH): drain transport failure trips NOT-ARMED (never silently armed)", () => {
+  it("a drain transport failure marks the activation unhealthy + records a durable not-armed signal", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(priv);
+    await publishPubKey(tmp, pub);
+
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    // Spy on the audit sink so we can assert the durable not-armed record.
+    const appended: string[] = [];
+    const origAppend = auditLog.append.bind(auditLog);
+    (auditLog as unknown as { append: AuditSink["append"] }).append = ((
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      appended.push(operation);
+      return origAppend(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+
+    const mock = buildMockDaemon([]);
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    // Deterministic timer: capture each scheduled cycle callback instead of
+    // letting it auto-fire, so we control exactly when the (wedged) cycle runs.
+    const scheduled: Array<() => void> = [];
+    const unhealthyErrors: Error[] = [];
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: {
+        pollIntervalMs: 10_000,
+        setTimer: (cb) => {
+          scheduled.push(cb as () => void);
+          return scheduled.length;
+        },
+        clearTimer: () => {},
+      },
+      onDrainUnhealthy: (e) => unhealthyErrors.push(e),
+    });
+    // The handshake completes via sendChallenge while activation is in-flight.
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    expect(outcome.activation.drainHealthy()).toBe(true); // healthy before any failure
+
+    // Drain the first (healthy, empty) cycle so its scheduled follow-up exists.
+    for (let i = 0; i < 50 && scheduled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(scheduled.length).toBeGreaterThanOrEqual(1);
+
+    // Wedge the daemon link: every drainRequest now throws.
+    const client = outcome.activation.lifecycle.client();
+    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
+      async () => {
+        throw new Error("daemon link dropped");
+      };
+    // Fire the next scheduled cycle: it hits the wedged link → onError →
+    // markDrainUnhealthy. Await the loop's in-flight settle.
+    scheduled[scheduled.length - 1]!();
+    for (let i = 0; i < 50 && outcome.activation.drainHealthy(); i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+
+    // The drain failure must have tripped the health transition + durable record.
+    expect(outcome.activation.drainHealthy()).toBe(false);
+    expect(unhealthyErrors.length).toBeGreaterThanOrEqual(1);
+    expect(unhealthyErrors[0]!.message).toMatch(/daemon link dropped/);
+    expect(appended).toContain("castle_wall_drain_failed");
+
+    await outcome.activation.stop();
   });
 });

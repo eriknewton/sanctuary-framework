@@ -185,11 +185,14 @@ export function buildCriticalEnvelopeFromDrainEvent(
  *
  * Both the consumer's expected throws (an `AuditChainError` for a refused
  * forgery is thrown AFTER the durable refusal + ack) and a TRANSIENT throw
- * (persistence/transport, before ack) surface here; we report them and keep
- * iterating the batch (a forgery in the middle of a batch must not block later
- * genuine events from being pulled — each event is independently
- * seq-acked/cursored). The cursor only ever advances via the ack callback, so a
- * transient (un-acked) failure correctly leaves that seq pending.
+ * (persistence/transport, before ack) surface here. The cursor only ever
+ * advances via the ack callback, so it tells us which kind we hit: after each
+ * event we compare `cursor` to the event's seq. If it advanced, the event
+ * SETTLED (a refused forgery is recorded + acked, so later genuine events in the
+ * batch keep flowing). If it did NOT advance, the event was NOT durably handled
+ * (transient failure before ack) and we STOP the batch — never acking past an
+ * unpersisted seq, which would let the daemon truncate its WAL through a lost
+ * event (FIX 2). The daemon re-delivers from the last settled seq next cycle.
  */
 export async function drainOnce(
   client: IpcClient,
@@ -226,9 +229,23 @@ export async function drainOnce(
       // error — but only AFTER durably recording it AND calling our ack (so the
       // cursor already advanced past it inside the callback above). A TRANSIENT
       // throw (persistence/transport) happens BEFORE ack, so the cursor stays
-      // put and the daemon re-delivers. Either way we just report and continue:
-      // the ack callback is the single source of cursor truth.
+      // put and the daemon re-delivers. We report it below.
       onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+    // FIX 2 (codex CRITICAL — drain must never ack past an UNPERSISTED event).
+    //
+    // The ack callback advances `cursor` to `drainedEvent.seq` ONLY when the
+    // consumer durably settled this event (accepted, rejected-and-recorded, or
+    // duplicate-dropped). If `cursor !== drainedEvent.seq` here, this event did
+    // NOT settle (a TRANSIENT persistence/transport failure threw before ack).
+    // We MUST stop the batch now: continuing would feed seq N+1 to the consumer,
+    // which — with `lastEventCanonicalHash` still null because seq N never
+    // persisted — would accept N+1 as a fresh bootstrap and ack
+    // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
+    // (silent audit data loss). Breaking leaves `cursor` at the last durably
+    // settled seq; the daemon re-delivers from there on the next cycle.
+    if (cursor !== drainedEvent.seq) {
+      break;
     }
   }
 
