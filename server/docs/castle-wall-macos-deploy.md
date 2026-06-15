@@ -9,6 +9,13 @@ wrapped agents on the operator's Mac. The macOS implementation uses
 Apple's `NetworkExtension` framework (`NEFilterDataProvider`) and runs
 as a system-extension bundle.
 
+Boot-service install (daemon up at boot in safe mode, F1 Option C) is
+documented in
+[castle-wall-macos-boot-service.md](castle-wall-macos-boot-service.md);
+headless arm/disarm (`sanctuary castle-wall enable|disable`, shipped in PR
+#448) is summarized in
+[castle-wall-headless-arm-design.md](castle-wall-headless-arm-design.md).
+
 ## Phase 2 (Alpha-3) scope
 
 What Phase 2 ships:

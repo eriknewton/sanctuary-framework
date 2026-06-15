@@ -300,6 +300,67 @@ describe("MacOSFlowIpcListener", () => {
     expect(h.listener.getStats().isListening).toBe(true);
   });
 
+  it("re-owns the socket to socketOwnerUid while keeping mode 0o600 (#450 item 3)", async () => {
+    // The safe-mode boot daemon runs as root and would bind a root-owned
+    // socket the operator CLI dead-man lever cannot reach. socketOwnerUid
+    // re-owns it to the operator. We can only chown to a uid we are allowed to
+    // (self, unless root), so assert the round-trip against the current uid.
+    const selfUid = process.getuid?.();
+    if (selfUid === undefined) return; // non-POSIX; nothing to assert
+    const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
+    tmpDirs.push(dir);
+    const socketPath = join(dir, "castle.sock");
+    const audit = makeAuditSink();
+    const approvals = makeApprovalQueue();
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE]),
+      approvalQueue: approvals.queue,
+      auditSink: audit.sink,
+      defaultApprovalTimeoutSeconds: 30,
+    });
+    const listener = new MacOSFlowIpcListener({
+      socketPath,
+      consumer,
+      socketOwnerUid: selfUid,
+    });
+    liveListeners.push(listener);
+    await listener.start();
+    const info = await stat(socketPath);
+    expect(info.uid).toBe(selfUid);
+    // chown preserves the 0o600 set by the prior chmod (no widening).
+    expect(info.mode & 0o777).toBe(0o600);
+  });
+
+  it("does not abort startup when the operator chown cannot apply (best-effort lever)", async () => {
+    // A chown to a uid we cannot grant (an arbitrary other uid, as non-root)
+    // fails — but the daemon must still come up enforcing; the GUI toggle is the
+    // backstop. Skip if running as root (where the chown would actually succeed).
+    const selfUid = process.getuid?.();
+    if (selfUid === undefined || selfUid === 0) return;
+    const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
+    tmpDirs.push(dir);
+    const socketPath = join(dir, "castle.sock");
+    const audit = makeAuditSink();
+    const approvals = makeApprovalQueue();
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE]),
+      approvalQueue: approvals.queue,
+      auditSink: audit.sink,
+      defaultApprovalTimeoutSeconds: 30,
+    });
+    const listener = new MacOSFlowIpcListener({
+      socketPath,
+      consumer,
+      socketOwnerUid: 1, // not grantable as a normal user
+    });
+    liveListeners.push(listener);
+    // start() resolves (does not throw) and the socket is listening.
+    await listener.start();
+    expect(listener.getStats().isListening).toBe(true);
+    const info = await stat(socketPath);
+    expect(info.isSocket()).toBe(true);
+  });
+
   it("sends a handshake_challenge to every new connection", async () => {
     const h = await newHarness();
     registerHarness(h);
