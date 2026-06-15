@@ -58,6 +58,17 @@ Because moving a file *necessarily* perturbs some build artifacts, the manifest 
 
 ---
 
+## snake_case directory islands (fresh-eyes D8) — Erik-gated, NOT obvious wins
+
+Two module dirs use snake_case rather than the repo's kebab-case convention: **`compliance/eu_ai_act/`** and **`dashboard/v1_1/`**. They are **path-safe to kebab-rename** in principle, BUT their snake tokens **double as FROZEN wire/route values** that must NOT change, so a dir rename is decoupled from the token and these are **Erik-gated nits, deferred** (treat exactly like the optional `audit`→`posture-audit` rename — lead with documentation, do not auto-do):
+
+- **`compliance/eu_ai_act/`** — the `eu_ai_act` token also appears in the **live MCP tool name `compliance_eu_ai_act_annex_iii_classify`** (a frozen wire identifier; see the frozen-surfaces guard) and in the EU AI Act coverage/assurance artifacts (compliance-evidence docs, risk 9). The directory path may be kebab-renamed only with the tool name + coverage claims left byte-identical; not on the critical path.
+- **`dashboard/v1_1/`** — the `v1_1` token is a **frozen import-path token** and the dir backs the frozen `/v1.1` route surface (see the "Dashboard `/v1.1` + port 3501" row). Renaming the dir does not change `/v1.1`, but it churns every importer; deferred.
+
+Also note (D8): the `sentinel/sentinels/` self-nest is intentional and gets a one-line README in the module-map pass, not a rename.
+
+---
+
 ## Default-deny diff closing rule
 
 On **every** reorg PR, the following diffs must be **empty or path-only**. The reviewer runs the manifest-selected subset for the surfaces the PR touches; the full set is the catch-all for any surface not individually enumerated above.

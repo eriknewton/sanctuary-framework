@@ -1,0 +1,59 @@
+============================================================
+  Sanctuary import-cycle baseline (server/src)
+============================================================
+  files scanned ......... 667
+  intra-src edges ....... 2882
+  self-imports .......... 0
+  cycles (SCC size > 1) . 9
+
+-- Cycles --------------------------------------------------
+(each cycle is a set of files mutually reachable via imports)
+
+Cycle 1  (4 files):
+    agent-native/safety-base.ts
+    honeypot/tool-call-trap-runtime.ts
+    principal-policy/gate.ts
+    router.ts
+
+Cycle 2  (2 files):
+    castle-wall/audit/events.ts
+    castle-wall/ipc/messages.ts
+
+Cycle 3  (6 files):
+    chat/agent-context-cache.ts
+    chat/operator-chat-service.ts
+    concierge/index.ts
+    concierge/sanctuary-context-reader.ts
+    contracts/v1.2/operator-chat-events.ts
+    hub/types.ts
+
+Cycle 4  (8 files):
+    console/auth-middleware.ts
+    dashboard/api.ts
+    dashboard/v1_1/dispatch.ts
+    dashboard/v1_1/index.ts
+    dashboard/v1_1/intelligence-api-router.ts
+    dashboard/v1_1/wiring.ts
+    hub/api-router.ts
+    hub/index.ts
+
+Cycle 5  (2 files):
+    core/anti-rollback.ts
+    core/master-custody.ts
+
+Cycle 6  (2 files):
+    principal-policy/unified-inbox-bridge.ts
+    principal-policy/unified-inbox-store.ts
+
+Cycle 7  (2 files):
+    sdw/provenance.ts
+    sdw/write-gate.ts
+
+Cycle 8  (2 files):
+    sentinel/sentinel-finding-store.ts
+    sentinel/types.ts
+
+Cycle 9  (2 files):
+    v1/federation-sync-envelope.ts
+    v1/federation.ts
+

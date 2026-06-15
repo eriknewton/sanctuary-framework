@@ -185,7 +185,14 @@ jobs:
             echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
             exit 1
           fi
+          # Fail-above (mirror of the pre-commit hook): a passing count
+          # higher than the floor must be locked into .test-baseline in
+          # the SAME PR. A stale low floor lets a later regression hide
+          # under the gap — the extra passing tests mask the loss until
+          # the floor is finally bumped. The fix is mechanical: set
+          # .test-baseline to the new count in this PR.
           if (( passing > baseline )); then
-            echo "::warning::Passing count ($passing) exceeds baseline ($baseline). Update .test-baseline in a follow-up commit to lock in the new floor."
+            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $((passing - baseline)) new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+            exit 1
           fi
           echo "✓ Baseline guard passed."

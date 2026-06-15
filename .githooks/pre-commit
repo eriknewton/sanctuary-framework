@@ -35,12 +35,16 @@
 #          failed to load before vitest registered it — the same
 #          failure shape as 4ac95830, hiding 98 tests for 26 hours.
 #
-#       c. Test baseline regression.
+#       c. Test baseline drift (BOTH directions).
 #          If vitest's passing-test count falls below the integer
 #          in .test-baseline at repo root, the commit is blocked.
-#          If the passing count exceeds the baseline, the hook
-#          prints a warning reminding the author to bump
-#          .test-baseline in a follow-up commit.
+#          If the passing count rises ABOVE the baseline without the
+#          author bumping .test-baseline in the SAME commit, the
+#          commit is also blocked: a silent ratchet-up lets a later
+#          regression hide under the stale floor (the new passing
+#          tests mask the loss). The fix is mechanical and required —
+#          stage the new count in .test-baseline. Net-zero churn
+#          commits (count == baseline) pass untouched.
 #
 # Runtime budget: < 60 seconds on a modern Mac. Typecheck is ~3s,
 # the test suite is ~20s, total well under the budget.
@@ -247,9 +251,41 @@ if (( passing < baseline )); then
   exit 1
 fi
 
+# Fail-above WITHOUT an in-commit baseline bump. A passing count higher
+# than the floor must be ACCOUNTED FOR — either by raising .test-baseline
+# in this same commit, or it is a silent ratchet that lets a later
+# regression hide under the stale floor (the extra passing tests mask the
+# loss until the floor is finally bumped).
+#
+# Local-vs-CI note (coordinator baseline-floor rule): the floor is the
+# LINUX CI passing count; a macOS dev box legitimately runs MORE tests
+# than that floor (platform-specific suites), so requiring passing ==
+# baseline locally would be impossible. The reconciliation: if the author
+# bumped .test-baseline in THIS commit (it is staged), the drift is
+# accounted for and the commit passes even though local passing > the new
+# (Linux) floor. If .test-baseline is NOT staged and passing > baseline,
+# that is an unaccounted drift and the commit is blocked. The CI guard
+# (which runs on Linux, where local == CI) enforces the exact floor.
 if (( passing > baseline )); then
-  warn "Passing count ($passing) exceeds baseline ($baseline)."
-  warn "Update .test-baseline in a follow-up commit to lock in the new floor."
+  baseline_staged=""
+  if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
+    baseline_staged="yes"
+  fi
+  if [[ -z "$baseline_staged" ]]; then
+    fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
+    printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
+    printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
+    printf '[baseline-guard]   Unaccounted above floor:   %s\n' "$((passing - baseline))" >&2
+    printf '\n' >&2
+    fail "Account for the drift IN THIS COMMIT: raise .test-baseline (by the"
+    fail "number of NEW tests that run on Linux CI, per the baseline-floor"
+    fail "rule — NOT to your local macOS count) and stage it"
+    fail "(git add .test-baseline). A deferred bump lets a future regression"
+    fail "hide under the stale floor."
+    printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline is bumped in this commit — drift accounted for (local may exceed the Linux floor)."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."
