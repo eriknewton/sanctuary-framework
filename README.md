@@ -52,7 +52,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.3.3** on the npm `latest` channel (shipped 2026-05-26). v1.3.3 lands Castle Wall macOS Phase 2.5 retail UX, the Track 4A server-to-sysext IPC integration, and the Track 4A.2 sysext socket-path discovery file. See the [v1.3.3 release notes](docs/releases/v1.3.3.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.4.0** on the npm `latest` channel (cut 2026-06-15, the first tag since v1.3.2). v1.4.0 brings the published package back in line with `main`: it adds the macOS Castle Wall per-uid allow/deny enforcement demonstration (drill 2026-06-11), a wave of Sentinel and audit-surface hardening, the agent-native cooperative surface, the Sovereign Data Workspace storage spine, federation v1 plumbing, and signed transparency checkpoints with opt-in external-anchoring scaffolding. See the [v1.4.0 release notes](docs/releases/v1.4.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
@@ -70,7 +70,7 @@ Current capability summary:
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Castle Wall (OS-level egress enforcement): Linux | Shipped (Phase 1, 2026-05-06) |
-| Castle Wall macOS: signed sysext, host app, Phase 2.5 retail UX, IPC integration | Sysext + activation wiring shipped in v1.3.3; active enforcement code (NEFilterManager arming) on main post-v1.3.3; end-to-end Mini1 drill PASS pending |
+| Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; per-uid allow/deny egress-enforcement demonstrated on a real host (drill 2026-06-11, one host / one OS version). Not reboot-survival; not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
 | Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
@@ -288,7 +288,7 @@ The operator holds the keys in every mode. The sovereign-managed mode will requi
 
 Sanctuary installs the substrate sovereignty used to come with. Architecturally it ships as five named mechanisms.
 
-**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) shipped in v1.3.3; active enforcement code on main awaiting end-to-end Mini1 drill PASS. Windows on the roadmap.
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) has a proven per-uid allow/deny egress-enforcement demonstration captured on a real host (drill 2026-06-11): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected. That is a demonstration on one host and one OS version, not reboot-survival and not an audited per-rule-per-flow trail. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
