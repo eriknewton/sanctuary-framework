@@ -32,7 +32,10 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
-import { bootServiceInstalled } from "./castle-wall-boot.js";
+import {
+  CASTLE_WALL_BOOT_PLIST_PATH,
+  bootServiceInstalled,
+} from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import type {
   CastleWallMessage,
@@ -87,7 +90,7 @@ export interface CastleWallCommandContext {
    * (correct label + RunAtLoad + --safe-mode), not merely that a file exists.
    * Returns true iff a persistent boot-survival service is installed.
    */
-  bootServiceInstalledProbe?: () => Promise<boolean>;
+  bootServiceInstalledProbe?: (expectedFortressPath?: string) => Promise<boolean>;
   /**
    * Override the `open` runner used by the DEFAULT LaunchServices invoker
    * (tests exercise the report-file round-trip without shelling out to real
@@ -2422,8 +2425,23 @@ async function runArmDisarm(
     // SSH locked out (the exact F1 boot-cut). Require the persistent boot service
     // to exist so you cannot arm into the reboot-brick state. --force overrides
     // (a boot-survival service supervised out-of-band).
-    const bootProbe = ctx.bootServiceInstalledProbe ?? (() => bootServiceInstalled());
-    if (!(await bootProbe())) {
+    const bootProbe =
+      ctx.bootServiceInstalledProbe ??
+      ((expectedFortressPath?: string) =>
+        bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, expectedFortressPath));
+    if (!(await bootProbe(fortressPath))) {
+      const bootServiceExists = await bootProbe();
+      if (bootServiceExists) {
+        write(
+          err,
+          `Refusing to arm: the installed Castle Wall boot service targets a different fortress than this command (${fortressPath}).\n` +
+            "A boot service for another fortress does not survive reboot for this one; arming\n" +
+            "would make the NEXT REBOOT come up deny-all with no daemon for this fortress.\n" +
+            "Install the matching service first:  sudo sanctuary castle-wall install-boot --fortress <path>\n" +
+            "Or pass --force if a boot-survival service is supervised out-of-band.\n",
+        );
+        return 1;
+      }
       write(
         err,
         "Refusing to arm: no persistent Castle Wall boot service is installed.\n" +

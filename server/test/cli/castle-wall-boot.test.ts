@@ -307,6 +307,33 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(await bootServiceInstalled(path)).toBe(true);
     });
 
+    it("returns true when the plist targets the expected fortress path", async () => {
+      const path = join(await makeTemp("f1-plist-"), "boot.plist");
+      await writeFile(path, validPlist);
+      expect(await bootServiceInstalled(path, "/Users/operator/.sanctuary/")).toBe(true);
+    });
+
+    it("returns false when the plist targets a different fortress path", async () => {
+      const path = join(await makeTemp("f1-plist-"), "boot.plist");
+      await writeFile(path, validPlist);
+      expect(await bootServiceInstalled(path, "/Users/operator/other-sanctuary")).toBe(
+        false,
+      );
+    });
+
+    it("keeps legacy validation when no expected fortress path is provided", async () => {
+      const path = join(await makeTemp("f1-plist-"), "boot.plist");
+      await writeFile(
+        path,
+        validPlist.replace(
+          /\n\t\t<key>SANCTUARY_STORAGE_PATH<\/key>\n\t\t<string>[^<]*<\/string>/,
+          "",
+        ),
+      );
+      expect(await bootServiceInstalled(path)).toBe(true);
+      expect(await bootServiceInstalled(path, "/Users/operator/.sanctuary")).toBe(false);
+    });
+
     it("returns false when the plist is absent", async () => {
       const path = join(await makeTemp("f1-plist-"), "missing.plist");
       expect(await bootServiceInstalled(path)).toBe(false);

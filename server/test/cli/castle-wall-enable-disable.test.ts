@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
@@ -19,6 +19,10 @@ import {
   type HostAppInvoker,
   type OpenRunner,
 } from "../../src/cli/castle-wall.js";
+import {
+  bootServiceInstalled,
+  renderBootLaunchDaemonPlist,
+} from "../../src/cli/castle-wall-boot.js";
 
 const TEST_BUILD_SHA = "test-build-sha";
 
@@ -106,6 +110,21 @@ describe("castle-wall enable/disable CLI verbs", () => {
     return { fortressPath, hostAppPath, env, recoveryKey };
   }
 
+  function makeBootPlist(fortressPath: string): string {
+    return renderBootLaunchDaemonPlist({
+      programArguments: [
+        "/usr/local/bin/node",
+        "/opt/sanctuary/dist/cli.js",
+        "castle-wall",
+        "daemon",
+        "--safe-mode",
+        "--launchd",
+      ],
+      fortressPath,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+    });
+  }
+
   it("enable refuses when no daemon is reachable", async () => {
     const { hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();
@@ -151,6 +170,84 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).toContain("install-boot");
     // Never reaches the host app: nothing armed.
     expect(calls).toHaveLength(0);
+  });
+
+  it("enable refuses when the installed boot service targets a different fortress", async () => {
+    const { fortressPath: fortressA, hostAppPath, env } = await makeFixture();
+    const fortressB = await mkdtemp(join(tmpdir(), "sanctuary-cw-arm-b-"));
+    tempDirs.push(fortressB);
+    const plistPath = join(fortressA, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(fortressA));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--fortress", fortressB, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("targets a different fortress");
+    expect(err.text()).toContain(fortressB);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable accepts a boot service that targets the armed fortress", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("enable accepts a boot service that targets the default fortress", async () => {
+    const defaultFortressPath = join(homedir(), ".sanctuary");
+    const plistDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-default-boot-"));
+    tempDirs.push(plistDir);
+    const plistPath = join(plistDir, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(defaultFortressPath));
+    const err = new CaptureStream();
+
+    const code = await runEnable([], {
+      out: new CaptureStream(),
+      err,
+      env: {},
+      platform: "darwin",
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+    });
+
+    expect(code).toBe(2);
+    expect(err.text()).toContain("requires either --ttl");
+    expect(err.text()).not.toContain("no persistent Castle Wall boot service");
+    expect(err.text()).not.toContain("targets a different fortress");
   });
 
   it("enable --force bypasses the boot-service composition guard (#450 item 5)", async () => {

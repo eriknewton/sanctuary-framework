@@ -141,6 +141,15 @@ function xmlEscape(value: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function xmlUnescape(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 function assertNoControlChars(value: string, what: string): void {
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1F\x7F]/.test(value)) {
@@ -347,8 +356,11 @@ ${envXml}
  * — not merely that a file exists at the path (#450 item 5 / codex 2026-06-14).
  * Reads the world-readable plist and confirms it is THE boot-survival unit: the
  * expected Label, `RunAtLoad=true`, and a `--safe-mode` ProgramArguments entry.
+ * When `expectedFortressPath` is supplied, also confirms the service targets
+ * that same fortress through its `SANCTUARY_STORAGE_PATH` environment value.
  * Returns false on absent / unreadable / malformed / wrong-label / non-safe-mode
- * (fail-closed: an unverifiable boot service is treated as not installed).
+ * / wrong-fortress (fail-closed: an unverifiable boot service is treated as not
+ * installed for this guard).
  *
  * RESIDUAL (honest): from the operator context this cannot detect a root
  * `launchctl disable system/<label>` override — that state lives in launchd's
@@ -358,6 +370,7 @@ ${envXml}
  */
 export async function bootServiceInstalled(
   plistPath: string = CASTLE_WALL_BOOT_PLIST_PATH,
+  expectedFortressPath?: string,
 ): Promise<boolean> {
   let contents: string;
   try {
@@ -370,6 +383,18 @@ export async function bootServiceInstalled(
   if (!contents.includes(`<string>${CASTLE_WALL_BOOT_LABEL}</string>`)) return false;
   if (!/<key>RunAtLoad<\/key>\s*<true\s*\/>/.test(contents)) return false;
   if (!contents.includes("<string>--safe-mode</string>")) return false;
+  if (expectedFortressPath !== undefined) {
+    const storagePathMatch =
+      /<key>SANCTUARY_STORAGE_PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(contents);
+    if (!storagePathMatch) return false;
+    const installedFortressPathRaw = xmlUnescape(storagePathMatch[1]!);
+    if (!isAbsolute(installedFortressPathRaw)) return false;
+    const installedFortressPath = resolve(installedFortressPathRaw);
+    const expectedFortressPathResolved = resolve(expectedFortressPath);
+    if (xmlEscape(installedFortressPath) !== xmlEscape(expectedFortressPathResolved)) {
+      return false;
+    }
+  }
   return true;
 }
 
