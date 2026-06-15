@@ -90,6 +90,9 @@ const ROOT_DOC_EXACT: ReadonlySet<string> = new Set([
   "GOVERNANCE.md",
   "LICENSE",
   "ASSURANCE_MATRIX.md",
+  // the security policy GitHub renders on the Security tab — public-facing,
+  // so the no-CIMC + no-em-dash guards must cover it too.
+  "SECURITY.md",
 ]);
 
 /**

@@ -62,6 +62,7 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "README.md",
   "ROADMAP.md",
   "SANCTUARY_ARCHITECTURE.md",
+  "SECURITY.md",
   "Sanctuary Site",
   "announcements",
   "castle-wall-daemon",

@@ -1,5 +1,9 @@
 # Sanctuary
 
+[![CI](https://github.com/eriknewton/sanctuary-framework/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eriknewton/sanctuary-framework/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@sanctuary-framework/mcp-server.svg)](https://www.npmjs.com/package/@sanctuary-framework/mcp-server)
+[![License](https://img.shields.io/npm/l/@sanctuary-framework/mcp-server.svg)](LICENSE)
+
 **Your Agent. Your Machine. Your Keys.**
 
 Sanctuary wraps any AI agent harness in a substrate that protects you at the kernel, signs every action with keys you hold, and keeps the data and reputation your agents accumulate on your hardware. Whether you run one agent or a fleet, the substrate stays yours.
