@@ -6,13 +6,22 @@
  * barrel introductions are a classic way to add an import cycle by accident (a
  * cycle can compile yet break import-time tool-registration order — scoping §8
  * risk 1, the index.ts split risk). A committed baseline
- * (test/fixtures/import-cycle-baseline.txt) freezes the count that exists today;
+ * (test/fixtures/import-cycle-baseline.txt) freezes the cycles that exist today;
  * this test fails if a change INTRODUCES a new cycle, while tolerating the
  * pre-existing ones until they are paid down deliberately.
  *
  * It re-runs the detector's logic in-process (importing the script would run its
  * main()), so the gate stays zero-dependency and in lockstep with the committed
  * baseline file. The baseline is regenerated with `npm run check-import-cycles:baseline`.
+ *
+ * SET-BASED, not count-based (the codex-backstop finding on #569): comparing
+ * only the cycle COUNT is a hole — a reorg can introduce a brand-new cycle while
+ * an old one disappears in the same diff, leaving the count unchanged so a
+ * count<=baseline check passes. This guard instead compares the SCC MEMBER SETS:
+ * it fails if any cycle whose exact member set is NOT in the committed baseline
+ * appears, regardless of whether the total count went up, down, or stayed flat.
+ * The baseline file already lists each cycle's member files, so no baseline
+ * format change is needed; the parse below reads those member blocks.
  */
 
 import { describe, it, expect } from "vitest";
@@ -80,8 +89,22 @@ function resolveSpecifier(fromFile: string, spec: string): string | null {
   return null;
 }
 
-/** Count strongly-connected components of size > 1 (Tarjan, iterative). */
-function countCycles(files: string[]): number {
+/**
+ * Canonical signature for one cycle: its member files (src-relative, POSIX
+ * separators) sorted and joined. Two runs that find the same set of files in a
+ * cycle produce the same signature regardless of discovery order.
+ */
+function sccSignature(memberRelPaths: string[]): string {
+  return [...memberRelPaths].sort().join(" | ");
+}
+
+/**
+ * Compute the SCC member-set signature for every strongly-connected component
+ * of size > 1 (Tarjan, iterative). Returns the SET of signatures — the unit of
+ * comparison for the guard, so a swap (new cycle in, old cycle out, same count)
+ * is caught.
+ */
+function computeSccSignatures(files: string[]): Set<string> {
   const index = new Map<string, number>();
   files.forEach((f, i) => index.set(f, i));
   const adj: number[][] = files.map(() => []);
@@ -101,7 +124,7 @@ function countCycles(files: string[]): number {
   const onStack = new Uint8Array(n);
   const stack: number[] = [];
   let counter = 0;
-  let cycles = 0;
+  const signatures = new Set<string>();
   for (let start = 0; start < n; start++) {
     if (idx[start] !== -1) continue;
     const call: Array<{ node: number; pos: number }> = [{ node: start, pos: 0 }];
@@ -131,7 +154,12 @@ function countCycles(files: string[]): number {
             comp.push(w);
             if (w === frame.node) break;
           }
-          if (comp.length > 1) cycles++;
+          if (comp.length > 1) {
+            const members = comp.map((i) =>
+              relative(SERVER_SRC, files[i]!).split("\\").join("/"),
+            );
+            signatures.add(sccSignature(members));
+          }
         }
         call.pop();
         const parent = call[call.length - 1];
@@ -141,14 +169,49 @@ function countCycles(files: string[]): number {
       }
     }
   }
-  return cycles;
+  return signatures;
 }
 
-function baselineCount(): number {
+/**
+ * Parse the committed baseline file's "Cycle N (M files):" blocks into the same
+ * member-set signature form produced by computeSccSignatures. Each block is a
+ * header line followed by indented member file paths until a blank line.
+ */
+function baselineSignatures(): Set<string> {
   const text = readFileSync(BASELINE_PATH, "utf-8");
-  const m = text.match(/cycles \(SCC size > 1\)\s*\.*\s*(\d+)/);
-  if (!m) throw new Error("could not parse cycle count from baseline file");
-  return Number.parseInt(m[1]!, 10);
+  const lines = text.split("\n");
+  const signatures = new Set<string>();
+  let current: string[] | null = null;
+  const flush = (): void => {
+    if (current && current.length > 0) {
+      signatures.add(sccSignature(current));
+    }
+    current = null;
+  };
+  const headerRe = /^Cycle\s+\d+\s+\(\d+\s+files?\):/;
+  for (const raw of lines) {
+    if (headerRe.test(raw.trim())) {
+      flush();
+      current = [];
+      continue;
+    }
+    if (current !== null) {
+      const member = raw.trim();
+      if (member === "") {
+        flush();
+      } else {
+        current.push(member.split("\\").join("/"));
+      }
+    }
+  }
+  flush();
+  if (signatures.size === 0) {
+    throw new Error(
+      "could not parse any cycle member sets from the baseline file; expected " +
+        "'Cycle N (M files):' blocks followed by indented member paths",
+    );
+  }
+  return signatures;
 }
 
 describe("import-cycle baseline guard", () => {
@@ -158,16 +221,34 @@ describe("import-cycle baseline guard", () => {
     expect(files.length).toBeGreaterThan(400);
   });
 
-  it("introduces no NEW import cycle beyond the committed baseline", () => {
-    const baseline = baselineCount();
-    const current = countCycles(files);
+  it("the baseline file parses into the expected member sets", () => {
+    // Guards the parser itself: the committed baseline currently lists 9
+    // cycles, so a parse that silently yields an empty/short set (and would
+    // make the guard below vacuous) is caught here.
+    const baseline = baselineSignatures();
+    const headerCount = (
+      readFileSync(BASELINE_PATH, "utf-8").match(/^Cycle\s+\d+\s+\(/gm) ?? []
+    ).length;
+    expect(baseline.size).toBe(headerCount);
+    expect(baseline.size).toBeGreaterThanOrEqual(1);
+  });
+
+  it("introduces no NEW import cycle (by member set) beyond the committed baseline", () => {
+    const baseline = baselineSignatures();
+    const current = computeSccSignatures(files);
+
+    // The defect this catches: a swap that keeps the COUNT flat. We compare the
+    // exact member sets, so a brand-new cycle reds even if an old one vanished
+    // in the same diff.
+    const introduced = [...current].filter((sig) => !baseline.has(sig)).sort();
     expect(
-      current,
-      `Import cycle count rose from the committed baseline (${baseline}) to ` +
-        `${current}. A reorg/split likely introduced a new cycle (scoping §8 ` +
-        "risk 1). Inspect with `npm run check-import-cycles`, break the cycle, " +
-        "or — if the increase is intentional and reviewed — regenerate the " +
-        "baseline with `npm run check-import-cycles:baseline` in this PR.",
-    ).toBeLessThanOrEqual(baseline);
+      introduced,
+      "A NEW import cycle (member set not in the committed baseline) appeared " +
+        "(scoping §8 risk 1) — even if the total cycle count did not rise (a " +
+        "swap can mask it). Inspect with `npm run check-import-cycles`, break " +
+        "the new cycle, or — if it is intentional and reviewed — regenerate the " +
+        "baseline with `npm run check-import-cycles:baseline` in this PR. " +
+        "New cycle(s):\n  " + introduced.join("\n  "),
+    ).toEqual([]);
   });
 });

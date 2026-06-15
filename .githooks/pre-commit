@@ -53,6 +53,17 @@
 # Use only for emergency commits; the override is logged with
 # timestamp and HEAD SHA to .test-baseline-overrides.log for audit.
 #
+# Enforcement status (be precise — do NOT call this hook "not
+# bypassable"): this LOCAL hook is the fast first line, but it is
+# CI-enforced with an audited emergency override — it can be skipped
+# with `SKIP_TEST_BASELINE=1` (documented + logged above) or with
+# `git commit --no-verify`, and it is absent in environments where the
+# hook was never installed. The HARD merge gate is the CI mirror at
+# .github/workflows/test-baseline-guard.yml (made a required status
+# check via the branch-protection runbook in
+# docs/audit/branch-protection-setup.md). Treat this hook as the local
+# convenience copy of that authority, not a guarantee on its own.
+#
 # Installation:
 #   cd server && npm run install-hooks
 #
@@ -261,11 +272,19 @@ fi
 # LINUX CI passing count; a macOS dev box legitimately runs MORE tests
 # than that floor (platform-specific suites), so requiring passing ==
 # baseline locally would be impossible. The reconciliation: if the author
-# bumped .test-baseline in THIS commit (it is staged), the drift is
-# accounted for and the commit passes even though local passing > the new
-# (Linux) floor. If .test-baseline is NOT staged and passing > baseline,
-# that is an unaccounted drift and the commit is blocked. The CI guard
-# (which runs on Linux, where local == CI) enforces the exact floor.
+# RAISED .test-baseline in THIS commit (an UPWARD bump of the staged value
+# over the previous committed value), the drift is accounted for and the
+# commit passes even though local passing > the new (Linux) floor. If
+# .test-baseline is NOT staged and passing > baseline, that is an
+# unaccounted drift and the commit is blocked. The CI guard (which runs on
+# Linux, where local == CI) enforces the exact floor.
+#
+# IMPORTANT (mirrors the CI guard's intent): merely STAGING .test-baseline is
+# not enough — the staged value must be GREATER than the previously committed
+# value. A flat re-stage (same number) or a LOWERED edit is NOT an accounting
+# of the drift: it would let an author satisfy this gate while keeping the
+# floor stale (or pushing it down so a real regression slips under it). So we
+# compare the staged blob against HEAD's blob and require a strict increase.
 if (( passing > baseline )); then
   baseline_staged=""
   if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
@@ -285,7 +304,38 @@ if (( passing > baseline )); then
     printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
-  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline is bumped in this commit — drift accounted for (local may exceed the Linux floor)."
+
+  # .test-baseline IS staged — verify the staged value is a strict UPWARD
+  # bump over the previously committed value. The staged content is the
+  # `:.test-baseline` blob (the index); the previous committed content is
+  # `HEAD:.test-baseline`. On the very first commit of the file there is no
+  # HEAD blob, so the prior value is treated as 0 and any positive staged
+  # value qualifies as an upward bump.
+  staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]')
+  if ! [[ "$staged_baseline" =~ ^[0-9]+$ ]]; then
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
+    printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
+    exit 1
+  fi
+  prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]')
+  if ! [[ "$prev_baseline" =~ ^[0-9]+$ ]]; then
+    prev_baseline=0
+  fi
+  if (( staged_baseline <= prev_baseline )); then
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    printf '[baseline-guard]   Previously committed: %s\n' "$prev_baseline" >&2
+    printf '[baseline-guard]   Staged value:         %s\n' "$staged_baseline" >&2
+    printf '[baseline-guard]   Current passing:      %s\n' "$passing" >&2
+    printf '\n' >&2
+    fail "Staging .test-baseline only accounts for the drift if it RAISES the"
+    fail "floor. A flat re-stage or a lowered edit is not an accounting — it"
+    fail "keeps the floor stale (or pushes it down so a regression slips"
+    fail "under it). Raise it to the new Linux CI passing count and re-stage"
+    fail "(git add .test-baseline)."
+    printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline raised $prev_baseline -> $staged_baseline in this commit — drift accounted for (local may exceed the Linux floor)."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."

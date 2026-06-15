@@ -6,14 +6,27 @@
  * group split) must NOT change:
  *
  *   1. test/fixtures/tools-list-wire-golden.json — the agent-facing MCP
- *      `tools/list` response: the exact tool NAMES, their registration ORDER,
- *      and the count. The index.ts split (scoping §8 risk 10) can silently
- *      reorder or drop a tool while unit tests stay green; reordering
- *      registration "for tidiness" is explicitly forbidden. This golden catches
- *      it. (router.ts emits only name/description/inputSchema on the wire; the
- *      richer internal metadata — tool_class, approvalTarget* — is NOT
- *      reachable from the wire and is presence-guarded by frozen-surfaces +
- *      noted as a follow-up internal-registry snapshot in the surface manifest.)
+ *      `tools/list` response: the exact tool NAMES, each tool's INPUT SCHEMA,
+ *      their registration ORDER, and the count. The index.ts split (scoping §8
+ *      risk 10) can silently reorder or drop a tool while unit tests stay green;
+ *      reordering registration "for tidiness" is explicitly forbidden. A reorg
+ *      could also silently alter an inputSchema (a wire contract a hidden MCP
+ *      client validates against). This golden catches both.
+ *
+ *      DELIBERATE EXCLUSION — the top-level tool `description`. router.ts emits
+ *      name/description/inputSchema on the wire, but tool descriptions are
+ *      AI-agent-audience product copy that legitimately changes under the
+ *      forward / doc-coverage rule (memory: market-directly-to-ai-agents; the
+ *      tool `description` fields ARE the agent-facing pitch and are iterated
+ *      independently of any reorg). Snapshotting them here would red every
+ *      legitimate doc/copy PR. So the golden freezes the WIRE CONTRACT
+ *      ({name, inputSchema}) and omits the prose. NOTE: per-parameter schema
+ *      descriptions INSIDE inputSchema are part of the JSON-Schema contract a
+ *      client validates/branches on, so they stay in the snapshot — only the
+ *      top-level tool description is dropped. The richer internal metadata —
+ *      tool_class, approvalTarget* — is NOT reachable from the wire and is
+ *      presence-guarded by frozen-surfaces + noted as a follow-up
+ *      internal-registry snapshot in the surface manifest.)
  *
  *   2. test/fixtures/operation-policy-golden.json — DEFAULT_POLICY's tier1 /
  *      tier3 op lists and the full tier2 anomaly config. Tiering is BEHAVIOR but
@@ -41,9 +54,14 @@ import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 
 const FIXTURES = join(fileURLToPath(import.meta.url), "..", "..", "fixtures");
 
+/** The frozen wire contract per tool: name + input schema, NOT description. */
+interface WireTool {
+  name: string;
+  inputSchema: Record<string, unknown>;
+}
 interface WireGolden {
   tool_count: number;
-  tools: string[];
+  tools: WireTool[];
 }
 interface PolicyGolden {
   tier1_always_approve: string[];
@@ -51,10 +69,16 @@ interface PolicyGolden {
   tier3_always_allow: string[];
 }
 
-/** Issue a tools/list request against the built server's registered handler. */
-async function listToolNames(
+/**
+ * Issue a tools/list request against the built server's registered handler and
+ * return the canonical wire contract per tool: {name, inputSchema}. The
+ * top-level `description` is deliberately dropped (see the file header — it is
+ * AI-agent-audience copy that changes under the forward-doc rule, not a reorg
+ * surface).
+ */
+async function listToolWire(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
-): Promise<string[]> {
+): Promise<WireTool[]> {
   const handler = (
     server as unknown as { _requestHandlers: Map<string, (...a: unknown[]) => unknown> }
   )._requestHandlers.get("tools/list");
@@ -62,12 +86,12 @@ async function listToolNames(
   const result = (await handler(
     { method: "tools/list", params: {} },
     {},
-  )) as { tools: Array<{ name: string }> };
-  return result.tools.map((t) => t.name);
+  )) as { tools: Array<{ name: string; inputSchema: Record<string, unknown> }> };
+  return result.tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema }));
 }
 
 describe("reorg surface snapshot: MCP tools/list wire shape", () => {
-  it("the agent-facing tool catalog matches the committed wire golden (names + order + count)", async () => {
+  it("the agent-facing tool catalog matches the committed wire golden (names + inputSchema + order + count)", async () => {
     const golden = JSON.parse(
       readFileSync(join(FIXTURES, "tools-list-wire-golden.json"), "utf-8"),
     ) as WireGolden;
@@ -76,23 +100,38 @@ describe("reorg surface snapshot: MCP tools/list wire shape", () => {
       storage: new MemoryStorage(),
       passphrase: "snapshot-harness-deterministic-v1",
     });
-    const names = await listToolNames(server);
+    const wire = await listToolWire(server);
 
     // Count first (clearest failure if a tool was added/removed).
     expect(
-      names.length,
+      wire.length,
       `Agent tool catalog count changed from the golden (${golden.tool_count}) ` +
-        `to ${names.length}. A reorg must not add/remove/hide a wire tool. If a ` +
+        `to ${wire.length}. A reorg must not add/remove/hide a wire tool. If a ` +
         "tool change is intentional + reviewed, regenerate the golden in this PR.",
     ).toBe(golden.tool_count);
 
-    // Then exact order — the index.ts registration-group split must preserve it.
+    // Names + order — the index.ts registration-group split must preserve them.
+    // Surfaced as a separate assertion because a name/order drift is the most
+    // common + clearest failure, and reads better than a deep-equal diff.
     expect(
-      names,
+      wire.map((t) => t.name),
       "tools/list NAMES or ORDER drifted from the committed golden. Never " +
         "reorder tool registration for tidiness; a hidden MCP client may depend " +
         "on order/identity. Regenerate the golden only for an intentional, " +
         "reviewed tool change.",
+    ).toEqual(golden.tools.map((t) => t.name));
+
+    // Then the full wire contract: {name, inputSchema} per tool, in order. This
+    // catches a silent inputSchema drift (a changed/removed required field, a
+    // re-typed property) that a names-only snapshot would miss. The top-level
+    // tool `description` is intentionally NOT compared (see the file header).
+    expect(
+      wire,
+      "tools/list wire contract ({name, inputSchema}) drifted from the committed " +
+        "golden — an input schema changed (or a tool moved). A reorg must not " +
+        "alter the wire schema. If a schema change is intentional + reviewed, " +
+        "regenerate the golden in this PR. (Tool DESCRIPTIONS are excluded from " +
+        "this golden by design and never trip it.)",
     ).toEqual(golden.tools);
   });
 
@@ -101,7 +140,7 @@ describe("reorg surface snapshot: MCP tools/list wire shape", () => {
       storage: new MemoryStorage(),
       passphrase: "snapshot-harness-deterministic-v1",
     });
-    const names = await listToolNames(server);
+    const names = (await listToolWire(server)).map((t) => t.name);
     const dupes = names.filter((n, i) => names.indexOf(n) !== i);
     expect(dupes, `duplicate tool names: ${dupes.join(", ")}`).toEqual([]);
   });
