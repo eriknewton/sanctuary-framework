@@ -974,7 +974,14 @@ function printCastleWallHelp(): void {
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
     reload           Reload policy in the running fortress daemon.
-    audit-dump       Emit Castle Wall audit events as JSONL.
+    audit-dump       Emit Castle Wall audit events as JSONL. Read-only.
+                     --by-rule        Roll recorded flows up per deciding rule:
+                                      per-rule total + allow/deny/prompt split + sample flows.
+                     --rule <id>      Show only flows the given rule decided
+                                      (use --rule default-deny for flows that matched no rule).
+                     Surfaces RECORDED per-flow rule attribution. It does NOT make the
+                     audit trail tamper-evident: tamper-evidence (producer-signed audit
+                     activation) is a separate capability, not yet active in production on Linux.
     audit-findings   List audit-chain integrity findings for the fortress (read-only diagnostic).
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.

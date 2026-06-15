@@ -13,3 +13,16 @@ export {
   canonicalizeAuditEvent,
   canonicalizeAuditEventToBytes,
 } from "./builder.js";
+
+export type {
+  FlowAttribution,
+  FlowDecisionCategory,
+  PerRuleGroup,
+  GroupByRuleOptions,
+} from "./per-rule-report.js";
+export {
+  DEFAULT_DENY_BUCKET,
+  attributeFlows,
+  filterFlowsByRule,
+  groupFlowsByRule,
+} from "./per-rule-report.js";

@@ -125,6 +125,7 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "./castle-wall/constants.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -141,10 +142,36 @@ const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
   // cannot learn which allow/deny rule matched and map the essentials list by
   // probing (property #11, no-policy-inference).
   "rule_id",
+  // The Linux producer-signed audit path persists the matched rule under
+  // `rule_id_matched` (the Rust daemon's body, see audit-consumer.ts
+  // buildDetailsForEvent / WAL_OPERATION_TO_EVENT_TYPE). It carries the same
+  // operator-only attribution as `rule_id` and MUST be redacted on the
+  // agent-facing read path for the same property-#11 reason; without this an
+  // agent could read the matched rule off a signed entry (pre-existing leak
+  // since #520, closed here).
+  "rule_id_matched",
   "policy_match",
   "policy_decision",
   "policy_tier",
   "tier",
+  // Linux producer-signed decision provenance. `buildDetailsForEvent`
+  // (castle-wall/runtime/audit-consumer.ts) spreads the signed body's own
+  // `details` into the persisted entry, so the daemon's `decision_provenance`
+  // lands as a TOP-LEVEL detail key. It records WHY/HOW the allow/deny resolved
+  // (the policy reasoning path), so it is policy-inference-sensitive in exactly
+  // the property-#11 sense and is operator/auditor-only. Redact it on the
+  // agent-facing read path alongside `rule_id_matched`.
+  "decision_provenance",
+  // The producer-signed canonical blob (`cw_producer_signed_canonical`) is the
+  // VERBATIM signed JSON body persisted as a STRING. Key-based redaction does
+  // not reach inside a string, so without redacting the whole value an agent
+  // reading a signed entry recovers the matched rule (and `decision_provenance`,
+  // `agent_id`, `dest_*`) embedded in that body — a deeper no-policy-inference
+  // leak than the top-level `rule_id_matched` (property #11). Agents never need
+  // the signature-verification blob (re-verification is operator/auditor-side),
+  // so redacting the whole value is correct. Imported from constants.ts so the
+  // wire-constant literal is not duplicated.
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
 ]);
 
 function redactAuditValueForAgent(value: unknown): unknown {
