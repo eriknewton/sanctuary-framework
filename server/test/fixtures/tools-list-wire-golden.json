@@ -1,93 +1,2121 @@
 {
   "tool_count": 88,
   "tools": [
-    "identity_create",
-    "identity_import",
-    "identity_list",
-    "identity_sign",
-    "identity_verify",
-    "identity_rotate",
-    "identity_set_primary",
-    "state_write",
-    "state_read",
-    "state_list",
-    "state_delete",
-    "state_export",
-    "state_import",
-    "exec_attest",
-    "monitor_health",
-    "monitor_audit_log",
-    "proof_commitment",
-    "proof_reveal",
-    "disclosure_set_policy",
-    "disclosure_evaluate",
-    "zk_commit",
-    "zk_prove",
-    "zk_verify",
-    "zk_range_prove",
-    "zk_range_verify",
-    "reputation_record",
-    "reputation_query",
-    "reputation_export",
-    "reputation_import",
-    "reputation_query_weighted",
-    "bootstrap_create_escrow",
-    "bootstrap_provide_guarantee",
-    "reputation_publish",
-    "principal_policy_view",
-    "principal_baseline_view",
-    "shr_generate",
-    "shr_verify",
-    "shr_gateway_export",
-    "handshake_initiate",
-    "handshake_respond",
-    "handshake_complete",
-    "handshake_status",
-    "handshake_exchange",
-    "handshake_verify_attestation",
-    "handshake_abort",
-    "federation_peers",
-    "federation_trust_evaluate",
-    "federation_status",
-    "bridge_commit",
-    "bridge_verify",
-    "bridge_attest",
-    "sovereignty_audit",
-    "audit_export_siem",
-    "context_gate_recommend",
-    "context_gate_filter",
-    "context_gate_list_policies",
-    "context_gate_enforcer_status",
-    "context_gate_enforcer_configure",
-    "l2_hardening_status",
-    "l2_verify_isolation",
-    "sovereignty_profile_get",
-    "sovereignty_profile_update",
-    "sovereignty_profile_generate_prompt",
-    "sanctuary_bootstrap",
-    "sanctuary_policy_status",
-    "sanctuary_export_identity_bundle",
-    "sanctuary_link_to_human",
-    "sanctuary_sign_challenge",
-    "memory_attest",
-    "compliance_eu_ai_act_annex_iii_classify",
-    "compliance_generate_eu_ai_act_bundle",
-    "sanctuary/sign_erc8004_identity",
-    "sanctuary_remember",
-    "sanctuary_recall",
-    "sanctuary_hide",
-    "sanctuary_forget",
-    "sanctuary_help",
-    "sanctuary_who_am_i",
-    "sanctuary_active_protections",
-    "sanctuary_events_open_cursor",
-    "sanctuary_events_read",
-    "sanctuary_events_close",
-    "sanctuary_audit_search",
-    "sanctuary_compound_execute",
-    "sanctuary_distress",
-    "manifest",
-    "governor_status",
-    "governor_reset"
+    {
+      "name": "identity_create",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Human-readable label (e.g., \"my-agent\")"
+          }
+        },
+        "required": [
+          "label"
+        ]
+      }
+    },
+    {
+      "name": "identity_import",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "object",
+            "description": "Stored identity record with encrypted private key payload."
+          }
+        },
+        "required": [
+          "identity"
+        ]
+      }
+    },
+    {
+      "name": "identity_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "identity_sign",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "string",
+            "description": "Base64url-encoded data to sign"
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "name": "identity_verify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "payload": {
+            "type": "string",
+            "description": "Original data (plain text or base64url-encoded)"
+          },
+          "signature": {
+            "type": "string",
+            "description": "Base64url signature"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity ID to look up public key (alternative to public_key)"
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64url public key (alternative to identity_id)"
+          }
+        },
+        "required": [
+          "payload",
+          "signature"
+        ]
+      }
+    },
+    {
+      "name": "identity_rotate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_id"
+        ]
+      }
+    },
+    {
+      "name": "identity_set_primary",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string",
+            "description": "The identity ID to set as primary"
+          }
+        },
+        "required": [
+          "identity_id"
+        ]
+      }
+    },
+    {
+      "name": "state_write",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "Logical grouping (e.g., \"memory\", \"config\")"
+          },
+          "key": {
+            "type": "string",
+            "description": "State key within namespace"
+          },
+          "value": {
+            "type": "string",
+            "description": "Plaintext value (encrypted before storage)"
+          },
+          "metadata": {
+            "type": "object",
+            "properties": {
+              "content_type": {
+                "type": "string"
+              },
+              "ttl_seconds": {
+                "type": "number"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "identity_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "state_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "verify_integrity": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "state_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "limit": {
+            "type": "number",
+            "default": 100
+          },
+          "offset": {
+            "type": "number",
+            "default": 0
+          }
+        },
+        "required": [
+          "namespace"
+        ]
+      }
+    },
+    {
+      "name": "state_delete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "state_export",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "default": "sanctuary-v1"
+          }
+        }
+      }
+    },
+    {
+      "name": "state_import",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bundle": {
+            "type": "string",
+            "description": "Base64url-encoded bundle"
+          },
+          "conflict_resolution": {
+            "type": "string",
+            "enum": [
+              "skip",
+              "overwrite",
+              "version"
+            ],
+            "default": "skip"
+          }
+        },
+        "required": [
+          "bundle"
+        ]
+      }
+    },
+    {
+      "name": "exec_attest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_hardware": {
+            "type": "boolean",
+            "default": true
+          },
+          "include_software": {
+            "type": "boolean",
+            "default": true
+          },
+          "include_network": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+    {
+      "name": "monitor_health",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "monitor_audit_log",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string",
+            "description": "ISO 8601 timestamp"
+          },
+          "layer": {
+            "type": "string",
+            "enum": [
+              "l1",
+              "l2",
+              "l3",
+              "l4"
+            ]
+          },
+          "operation_type": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number",
+            "default": 50
+          }
+        }
+      }
+    },
+    {
+      "name": "proof_commitment",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "The value to commit to"
+          },
+          "blinding_factor": {
+            "type": "string",
+            "description": "Optional base64url blinding factor (auto-generated if omitted)"
+          }
+        },
+        "required": [
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "proof_reveal",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "commitment": {
+            "type": "string",
+            "description": "The original commitment hash"
+          },
+          "value": {
+            "type": "string",
+            "description": "The value being revealed"
+          },
+          "blinding_factor": {
+            "type": "string",
+            "description": "The blinding factor from the original commitment"
+          }
+        },
+        "required": [
+          "commitment",
+          "value",
+          "blinding_factor"
+        ]
+      }
+    },
+    {
+      "name": "disclosure_set_policy",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "policy_name": {
+            "type": "string",
+            "description": "Human-readable policy name"
+          },
+          "rules": {
+            "type": "array",
+            "description": "Disclosure rules for different contexts",
+            "items": {
+              "type": "object",
+              "properties": {
+                "context": {
+                  "type": "string",
+                  "description": "Interaction context: \"negotiation\", \"commerce\", \"identity\", \"*\" (wildcard)"
+                },
+                "disclose": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Fields the agent MAY disclose"
+                },
+                "withhold": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Fields the agent MUST NOT disclose"
+                },
+                "proof_required": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Fields that require proof rather than plain disclosure"
+                }
+              },
+              "required": [
+                "context",
+                "disclose",
+                "withhold",
+                "proof_required"
+              ]
+            }
+          },
+          "default_action": {
+            "type": "string",
+            "enum": [
+              "withhold",
+              "ask-principal"
+            ],
+            "description": "What to do when no rule matches a field"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Optional identity this policy is bound to"
+          }
+        },
+        "required": [
+          "policy_name",
+          "rules",
+          "default_action"
+        ]
+      }
+    },
+    {
+      "name": "disclosure_evaluate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context": {
+            "type": "string",
+            "description": "The interaction context"
+          },
+          "requested_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Fields the counterparty is requesting"
+          },
+          "policy_id": {
+            "type": "string",
+            "description": "Specific policy to evaluate (uses first available if omitted)"
+          }
+        },
+        "required": [
+          "context",
+          "requested_fields"
+        ]
+      }
+    },
+    {
+      "name": "zk_commit",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "description": "The integer value to commit to"
+          }
+        },
+        "required": [
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "zk_prove",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "description": "The committed value (integer)"
+          },
+          "blinding_factor": {
+            "type": "string",
+            "description": "The blinding factor from zk_commit (base64url)"
+          },
+          "commitment": {
+            "type": "string",
+            "description": "The Pedersen commitment (base64url)"
+          }
+        },
+        "required": [
+          "value",
+          "blinding_factor",
+          "commitment"
+        ]
+      }
+    },
+    {
+      "name": "zk_verify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "proof": {
+            "type": "object",
+            "description": "The ZK proof object from zk_prove"
+          }
+        },
+        "required": [
+          "proof"
+        ]
+      }
+    },
+    {
+      "name": "zk_range_prove",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "description": "The committed value (integer)"
+          },
+          "blinding_factor": {
+            "type": "string",
+            "description": "The blinding factor from zk_commit (base64url)"
+          },
+          "commitment": {
+            "type": "string",
+            "description": "The Pedersen commitment (base64url)"
+          },
+          "min": {
+            "type": "number",
+            "description": "Minimum of the range (inclusive)"
+          },
+          "max": {
+            "type": "number",
+            "description": "Maximum of the range (inclusive)"
+          }
+        },
+        "required": [
+          "value",
+          "blinding_factor",
+          "commitment",
+          "min",
+          "max"
+        ]
+      }
+    },
+    {
+      "name": "zk_range_verify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "proof": {
+            "type": "object",
+            "description": "The range proof object from zk_range_prove"
+          }
+        },
+        "required": [
+          "proof"
+        ]
+      }
+    },
+    {
+      "name": "reputation_record",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "interaction_id": {
+            "type": "string",
+            "description": "Unique interaction identifier"
+          },
+          "counterparty_did": {
+            "type": "string",
+            "description": "Counterparty's DID"
+          },
+          "outcome": {
+            "type": "object",
+            "description": "Interaction outcome",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "transaction",
+                  "negotiation",
+                  "service",
+                  "dispute",
+                  "custom"
+                ]
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "completed",
+                  "partial",
+                  "failed",
+                  "disputed"
+                ]
+              },
+              "metrics": {
+                "type": "object",
+                "description": "Domain-specific metrics (e.g., fulfillment_rate, response_time_ms)"
+              }
+            },
+            "required": [
+              "type",
+              "result"
+            ]
+          },
+          "context": {
+            "type": "string",
+            "description": "Category/domain for context-specific reputation",
+            "default": "general"
+          },
+          "counterparty_attestation": {
+            "type": "string",
+            "description": "Counterparty's signed attestation of the same interaction"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign with (uses default if omitted)"
+          }
+        },
+        "required": [
+          "interaction_id",
+          "counterparty_did",
+          "outcome"
+        ]
+      }
+    },
+    {
+      "name": "reputation_query",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context": {
+            "type": "string",
+            "description": "Filter by context/domain"
+          },
+          "time_range": {
+            "type": "object",
+            "description": "Filter by time range",
+            "properties": {
+              "start": {
+                "type": "string",
+                "description": "ISO 8601 start"
+              },
+              "end": {
+                "type": "string",
+                "description": "ISO 8601 end"
+              }
+            }
+          },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Which metrics to aggregate"
+          },
+          "counterparty_did": {
+            "type": "string",
+            "description": "Filter by counterparty"
+          }
+        }
+      }
+    },
+    {
+      "name": "reputation_export",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "SANCTUARY_REP_V1"
+            ],
+            "default": "SANCTUARY_REP_V1"
+          },
+          "context": {
+            "type": "string",
+            "description": "Export specific context only"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign the bundle with"
+          }
+        }
+      }
+    },
+    {
+      "name": "reputation_import",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bundle": {
+            "type": "string",
+            "description": "Base64url-encoded reputation bundle"
+          }
+        },
+        "required": [
+          "bundle"
+        ]
+      }
+    },
+    {
+      "name": "reputation_query_weighted",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string",
+            "description": "Which metric to compute the weighted score for"
+          },
+          "context": {
+            "type": "string",
+            "description": "Filter by context/domain"
+          },
+          "counterparty_did": {
+            "type": "string",
+            "description": "Filter by counterparty"
+          }
+        },
+        "required": [
+          "metric"
+        ]
+      }
+    },
+    {
+      "name": "bootstrap_create_escrow",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "transaction_terms": {
+            "type": "string",
+            "description": "Description of the transaction"
+          },
+          "collateral_amount": {
+            "type": "number",
+            "description": "Optional stake/collateral amount"
+          },
+          "counterparty_did": {
+            "type": "string",
+            "description": "Counterparty's DID"
+          },
+          "timeout_seconds": {
+            "type": "number",
+            "description": "Escrow timeout in seconds"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity creating the escrow"
+          }
+        },
+        "required": [
+          "transaction_terms",
+          "counterparty_did",
+          "timeout_seconds"
+        ]
+      }
+    },
+    {
+      "name": "bootstrap_provide_guarantee",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "principal_identity_id": {
+            "type": "string",
+            "description": "Identity of the guarantor (principal)"
+          },
+          "agent_identity_id": {
+            "type": "string",
+            "description": "Identity of the agent being guaranteed"
+          },
+          "scope": {
+            "type": "string",
+            "description": "What the guarantee covers"
+          },
+          "duration_seconds": {
+            "type": "number",
+            "description": "How long the guarantee is valid"
+          },
+          "max_liability": {
+            "type": "number",
+            "description": "Maximum liability amount"
+          }
+        },
+        "required": [
+          "principal_identity_id",
+          "agent_identity_id",
+          "scope",
+          "duration_seconds"
+        ]
+      }
+    },
+    {
+      "name": "reputation_publish",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "shr",
+              "handshake",
+              "sovereignty-update"
+            ],
+            "description": "Type of data to publish: 'shr' for full sovereignty health report, 'handshake' for a handshake attestation, 'sovereignty-update' for layer-level updates."
+          },
+          "verascore_agent_id": {
+            "type": "string",
+            "description": "Agent ID on Verascore. If omitted, uses the default identity's DID-derived slug."
+          },
+          "verascore_url": {
+            "type": "string",
+            "description": "Verascore API base URL. Defaults to https://verascore.ai"
+          },
+          "data": {
+            "type": "object",
+            "description": "The data payload. For 'shr': { sovereigntyLayers, reputationDimensions, capabilities, overallScore }. For 'handshake': { attestation: { id, responderId, ... } }. For 'sovereignty-update': { layers: [{ name, label, score, status, description }] }."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign with (uses default if omitted)"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      }
+    },
+    {
+      "name": "principal_policy_view",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_defaults": {
+            "type": "boolean",
+            "description": "Include tier3_always_allow list (can be long)",
+            "default": false
+          }
+        }
+      }
+    },
+    {
+      "name": "principal_baseline_view",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "shr_generate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign the SHR with. Defaults to primary identity."
+          },
+          "validity_minutes": {
+            "type": "number",
+            "description": "How long the SHR is valid (minutes). Default: 60."
+          }
+        }
+      }
+    },
+    {
+      "name": "shr_verify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "shr": {
+            "type": "object",
+            "description": "The signed SHR to verify (full SignedSHR object)."
+          }
+        },
+        "required": [
+          "shr"
+        ]
+      }
+    },
+    {
+      "name": "shr_gateway_export",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "ping",
+              "generic"
+            ],
+            "description": "Output format: 'ping' (Ping Identity Gateway format) or 'generic' (format-agnostic). Default: 'ping'."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign the SHR with. Defaults to primary identity."
+          },
+          "validity_minutes": {
+            "type": "number",
+            "description": "How long the SHR is valid (minutes). Default: 60."
+          }
+        }
+      }
+    },
+    {
+      "name": "handshake_initiate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to use for the handshake. Defaults to primary identity."
+          }
+        }
+      }
+    },
+    {
+      "name": "handshake_respond",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "type": "object",
+            "description": "The HandshakeChallenge received from the initiator."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to use for the response. Defaults to primary identity."
+          }
+        },
+        "required": [
+          "challenge"
+        ]
+      }
+    },
+    {
+      "name": "handshake_complete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Session ID from handshake_initiate."
+          },
+          "response": {
+            "type": "object",
+            "description": "The HandshakeResponse received from the responder."
+          }
+        },
+        "required": [
+          "session_id",
+          "response"
+        ]
+      }
+    },
+    {
+      "name": "handshake_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Session ID to check."
+          },
+          "completion": {
+            "type": "object",
+            "description": "Optional: HandshakeCompletion from the initiator (responder-side verification)."
+          }
+        },
+        "required": [
+          "session_id"
+        ]
+      }
+    },
+    {
+      "name": "handshake_exchange",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "counterparty_shr": {
+            "type": "object",
+            "description": "The counterparty's signed SHR (SignedSHR object with body, signed_by, signature)."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to use for the exchange. Defaults to primary identity."
+          }
+        },
+        "required": [
+          "counterparty_shr"
+        ]
+      }
+    },
+    {
+      "name": "handshake_verify_attestation",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "attestation": {
+            "type": "object",
+            "description": "The SignedAttestation object to verify (body, signed_by, signature, summary)."
+          }
+        },
+        "required": [
+          "attestation"
+        ]
+      }
+    },
+    {
+      "name": "handshake_abort",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Session ID returned from handshake_initiate / handshake_respond."
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "operator_cancelled",
+              "session_timeout",
+              "transport_dropped",
+              "shutdown",
+              "other"
+            ],
+            "description": "Why the session is being aborted. Defaults to 'operator_cancelled'."
+          }
+        },
+        "required": [
+          "session_id"
+        ]
+      }
+    },
+    {
+      "name": "federation_peers",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "register",
+              "remove"
+            ],
+            "description": "Operation to perform on the peer registry"
+          },
+          "peer_id": {
+            "type": "string",
+            "description": "Peer instance ID (required for register/remove)"
+          },
+          "peer_did": {
+            "type": "string",
+            "description": "Peer DID. Optional: defaults to the did:key derived from the public key that signed the handshake SHR. If supplied, it MUST match that derived DID — a mismatched label is rejected."
+          },
+          "active_only": {
+            "type": "boolean",
+            "description": "When listing, only show peers with active handshakes"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    },
+    {
+      "name": "federation_trust_evaluate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "peer_id": {
+            "type": "string",
+            "description": "Peer instance ID to evaluate"
+          },
+          "mutual_attestation_count": {
+            "type": "number",
+            "description": "Number of mutual attestations with this peer (0 if unknown)"
+          },
+          "reputation_score": {
+            "type": "number",
+            "description": "Peer's weighted reputation score (from reputation_query_weighted)"
+          }
+        },
+        "required": [
+          "peer_id"
+        ]
+      }
+    },
+    {
+      "name": "federation_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "bridge_commit",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "Concordia session identifier"
+          },
+          "protocol_version": {
+            "type": "string",
+            "description": "Concordia protocol version (e.g., \"concordia-v1\")"
+          },
+          "proposer_did": {
+            "type": "string",
+            "description": "DID of the party who proposed the accepted terms"
+          },
+          "acceptor_did": {
+            "type": "string",
+            "description": "DID of the party who accepted"
+          },
+          "terms": {
+            "type": "object",
+            "description": "The accepted terms (opaque to Sanctuary, meaningful to Concordia)"
+          },
+          "terms_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the canonical terms serialization (computed by Concordia)"
+          },
+          "rounds": {
+            "type": "number",
+            "description": "Number of negotiation rounds (propose/counter cycles)"
+          },
+          "accepted_at": {
+            "type": "string",
+            "description": "ISO 8601 timestamp when accept was issued"
+          },
+          "session_receipt": {
+            "type": "string",
+            "description": "Optional: signed Concordia session receipt"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Sanctuary identity to sign the commitment (uses default if omitted)"
+          },
+          "include_pedersen": {
+            "type": "boolean",
+            "description": "Include a Pedersen commitment on round count for ZK range proofs"
+          }
+        },
+        "required": [
+          "session_id",
+          "protocol_version",
+          "proposer_did",
+          "acceptor_did",
+          "terms",
+          "terms_hash",
+          "rounds",
+          "accepted_at"
+        ]
+      }
+    },
+    {
+      "name": "bridge_verify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bridge_commitment_id": {
+            "type": "string",
+            "description": "The bridge commitment ID to verify"
+          },
+          "committer_public_key": {
+            "type": "string",
+            "description": "The committer's Ed25519 public key (base64url). Required if verifying a counterparty's commitment. Omit to auto-resolve from local identities."
+          },
+          "outcome": {
+            "type": "object",
+            "description": "Revealed ConcordiaOutcome to verify against the commitment. If omitted, the stored outcome is used for backward-compatible local checks."
+          }
+        },
+        "required": [
+          "bridge_commitment_id"
+        ]
+      }
+    },
+    {
+      "name": "bridge_attest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "bridge_commitment_id": {
+            "type": "string",
+            "description": "The bridge commitment ID to link"
+          },
+          "outcome_result": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "partial",
+              "failed",
+              "disputed"
+            ],
+            "description": "Negotiation outcome for reputation scoring"
+          },
+          "metrics": {
+            "type": "object",
+            "description": "Optional metrics (e.g., rounds, response_time_ms, terms_complexity)"
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign the attestation (uses default if omitted)"
+          }
+        },
+        "required": [
+          "bridge_commitment_id",
+          "outcome_result"
+        ]
+      }
+    },
+    {
+      "name": "sovereignty_audit",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "deep_scan": {
+            "type": "boolean",
+            "description": "If true (default), also scans for OpenClaw config, .env files, and memory files. Set to false for a Sanctuary-only assessment."
+          }
+        }
+      }
+    },
+    {
+      "name": "audit_export_siem",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "cef",
+              "ocsf"
+            ],
+            "description": "Output format: \"cef\" (Common Event Format, newline-delimited) or \"ocsf\" (Open Cybersecurity Schema Framework, JSON array)"
+          },
+          "since": {
+            "type": "string",
+            "description": "Optional ISO 8601 timestamp. Export only events on or after this time. Defaults to 24 hours ago."
+          },
+          "until": {
+            "type": "string",
+            "description": "Optional ISO 8601 timestamp. Export only events before this time. Defaults to now."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Maximum number of events to export (default 100, max 1000). Set to 1000 for bulk exports to SIEMs."
+          },
+          "filter_tool": {
+            "type": "string",
+            "description": "Optional. Export only events from this tool name (e.g., \"sovereignty_audit\", \"state_set\"). Case-insensitive substring matching."
+          },
+          "filter_decision": {
+            "type": "string",
+            "enum": [
+              "approve",
+              "deny",
+              "auto-allow"
+            ],
+            "description": "Optional. Export only events with this gate decision: \"approve\" (manual approval), \"deny\" (blocked), or \"auto-allow\" (Tier 3 auto-allowed)."
+          },
+          "filter_layer": {
+            "type": "string",
+            "enum": [
+              "l1",
+              "l2",
+              "l3",
+              "l4"
+            ],
+            "description": "Optional. Export only events from this sovereignty layer (L1=Cognitive, L2=Operational, L3=Disclosure, L4=Reputation)."
+          },
+          "filter_result": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure"
+            ],
+            "description": "Optional. Export only events with this result: \"success\" or \"failure\"."
+          }
+        },
+        "required": [
+          "format"
+        ]
+      }
+    },
+    {
+      "name": "context_gate_recommend",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context": {
+            "type": "object",
+            "description": "A sample context object to analyze. Each top-level key will be classified. Values are inspected for size warnings but not stored."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider category to generate rules for. Default: 'inference'."
+          }
+        },
+        "required": [
+          "context"
+        ]
+      }
+    },
+    {
+      "name": "context_gate_filter",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "policy_id": {
+            "type": "string",
+            "description": "ID of the context-gating policy to apply"
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider category for this call: inference, tool-api, logging, analytics, peer-agent, or custom"
+          },
+          "context": {
+            "type": "object",
+            "description": "The context object to filter. Each top-level key is evaluated against the policy. Example keys: task_description, conversation_history, user_preferences, api_keys, memory, internal_reasoning"
+          }
+        },
+        "required": [
+          "policy_id",
+          "provider",
+          "context"
+        ]
+      }
+    },
+    {
+      "name": "context_gate_list_policies",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "context_gate_enforcer_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "context_gate_enforcer_configure",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Enable or disable the automatic enforcer. When disabled, no filtering occurs. Default: leave unchanged."
+          },
+          "log_only": {
+            "type": "boolean",
+            "description": "Enable log_only mode: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
+          },
+          "default_policy_id": {
+            "type": "string",
+            "description": "Set the default context-gating policy to use for filtering. If not set, the enforcer uses built-in sensitive field patterns. Default: leave unchanged."
+          },
+          "on_deny": {
+            "type": "string",
+            "enum": [
+              "block",
+              "redact"
+            ],
+            "description": "Action to take when a field triggers the deny action: 'block' returns an error and prevents the call, 'redact' replaces the denied field with [REDACTED] and continues. Default: leave unchanged."
+          },
+          "reset_stats": {
+            "type": "boolean",
+            "description": "Reset the enforcer statistics counters to zero. Default: false."
+          }
+        }
+      }
+    },
+    {
+      "name": "l2_hardening_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "include_details": {
+            "type": "boolean",
+            "description": "If true, include detailed check results for memory, process, and filesystem. If false, show summary only.",
+            "default": false
+          }
+        }
+      }
+    },
+    {
+      "name": "l2_verify_isolation",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "check_filesystem": {
+            "type": "boolean",
+            "description": "If true, verify Sanctuary storage directory permissions.",
+            "default": true
+          },
+          "check_memory": {
+            "type": "boolean",
+            "description": "If true, verify memory protection mechanisms (ASLR, etc.).",
+            "default": true
+          },
+          "check_process": {
+            "type": "boolean",
+            "description": "If true, detect container, VM, or sandbox environment.",
+            "default": true
+          }
+        }
+      }
+    },
+    {
+      "name": "sovereignty_profile_get",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sovereignty_profile_update",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "audit_logging": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "description": "Toggle audit logging on/off"
+          },
+          "injection_detection": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "sensitivity": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ],
+                "description": "Detection sensitivity threshold"
+              }
+            },
+            "description": "Toggle injection detection and set sensitivity"
+          },
+          "context_gating": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "policy_id": {
+                "type": "string",
+                "description": "ID of the context-gating policy to use"
+              }
+            },
+            "description": "Toggle context gating and set active policy"
+          },
+          "approval_gate": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "description": "Toggle approval gates on/off"
+          },
+          "zk_proofs": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "description": "Toggle zero-knowledge proofs on/off"
+          }
+        }
+      }
+    },
+    {
+      "name": "sovereignty_profile_generate_prompt",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sanctuary_bootstrap",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Human-readable label for the new identity (default: 'sovereign-agent')"
+          },
+          "verascore_url": {
+            "type": "string",
+            "description": "Verascore base URL. Defaults to server config / SANCTUARY_VERASCORE_URL."
+          },
+          "publish": {
+            "type": "boolean",
+            "description": "Whether to publish the SHR to Verascore. Defaults to true."
+          }
+        }
+      }
+    },
+    {
+      "name": "sanctuary_policy_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sanctuary_export_identity_bundle",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to export (defaults to primary identity)."
+          },
+          "attestations": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Optional list of attestation objects to include in the bundle."
+          }
+        }
+      }
+    },
+    {
+      "name": "sanctuary_link_to_human",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Email address of the human to link this agent to."
+          },
+          "verascore_url": {
+            "type": "string",
+            "description": "Verascore base URL. Defaults to server config."
+          }
+        },
+        "required": [
+          "email"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_sign_challenge",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "nonce": {
+            "type": "string",
+            "description": "The nonce / challenge string to sign."
+          },
+          "purpose": {
+            "type": "string",
+            "description": "Domain-separation tag identifying what the signature will be used for (e.g. 'verascore-claim'). Required. Max 128 chars, printable ASCII only."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Identity to sign with (defaults to primary)."
+          }
+        },
+        "required": [
+          "nonce",
+          "purpose"
+        ]
+      }
+    },
+    {
+      "name": "memory_attest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "store",
+              "retrieve",
+              "update",
+              "delete",
+              "search"
+            ],
+            "description": "The memory operation that was performed: store, retrieve, update, delete, or search."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Name of the memory provider (e.g., \"mem0\", \"zep\", \"letta\", \"graphiti\")."
+          },
+          "content_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the memory content (hex or base64url). If you have raw content, hash it first — never pass raw memory content to this tool."
+          },
+          "memory_id": {
+            "type": "string",
+            "description": "Optional: ID returned by the memory provider for this memory entry."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "Optional: user ID associated with this memory operation."
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "Optional: agent ID that performed the operation."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Optional: session ID in which the operation occurred."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent",
+              "session",
+              "app"
+            ],
+            "description": "Optional: memory scope — \"user\" (personal), \"agent\" (agent-specific), \"session\" (session-scoped), or \"app\" (application-wide)."
+          },
+          "identity_id": {
+            "type": "string",
+            "description": "Optional: Sanctuary identity to sign with. Defaults to primary identity."
+          }
+        },
+        "required": [
+          "operation",
+          "provider",
+          "content_hash"
+        ]
+      }
+    },
+    {
+      "name": "compliance_eu_ai_act_annex_iii_classify",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Free-text description of what the agent does — its intended purpose, the users it serves, the decisions it makes, the data it processes."
+          }
+        },
+        "required": [
+          "description"
+        ]
+      }
+    },
+    {
+      "name": "compliance_generate_eu_ai_act_bundle",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agent_did": {
+            "type": "string",
+            "description": "DID of the agent the bundle is being generated for."
+          },
+          "deployment_context": {
+            "type": "object",
+            "description": "Enterprise-supplied deployment facts that Sanctuary cannot infer (vertical, intended purpose, provider legal name, Annex III classification, etc.).",
+            "properties": {
+              "vertical": {
+                "type": "string"
+              },
+              "annex_iii_class": {
+                "type": "string"
+              },
+              "intended_purpose": {
+                "type": "string"
+              },
+              "provider_legal_name": {
+                "type": "string"
+              },
+              "provider_contact": {
+                "type": "string"
+              },
+              "deployer_is_public_authority": {
+                "type": "boolean"
+              },
+              "notes": {
+                "type": "string"
+              }
+            }
+          },
+          "period_start": {
+            "type": "string",
+            "description": "ISO 8601 timestamp — start of the reporting period."
+          },
+          "period_end": {
+            "type": "string",
+            "description": "ISO 8601 timestamp — end of the reporting period."
+          },
+          "delta_from_bundle_path": {
+            "type": "string",
+            "description": "Optional filesystem path to a prior bundle directory. When supplied, the generator compares the current bundle to the prior one and emits an additional 08_delta.md document summarising what changed (regulation_version, matrix_version, coverage rows added/removed/changed). Delta problems never fail bundle generation; the bundle always lands locally."
+          },
+          "publish_to_verascore": {
+            "type": "boolean",
+            "description": "If true, POST the signed bundle MANIFEST (not the document bodies) to Verascore after the bundle is generated. Non-dependency principle: publish failure never fails bundle generation — the bundle is returned with a publish_result field describing the outcome. Defaults to false."
+          },
+          "verascore_url": {
+            "type": "string",
+            "description": "Optional Verascore base URL (HTTPS, allow-listed hosts only). Defaults to https://verascore.ai."
+          }
+        },
+        "required": [
+          "agent_did",
+          "deployment_context",
+          "period_start",
+          "period_end"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary/sign_erc8004_identity",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "registry_address": {
+            "type": "string",
+            "description": "EIP-55 checksummed Ethereum address of the Identity Registry contract."
+          },
+          "chain_id": {
+            "type": "number",
+            "description": "Chain ID (1 = mainnet; testnets allowed)."
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "Canonical agent identifier to register."
+          },
+          "nonce": {
+            "type": "number",
+            "description": "Anti-replay nonce from the registry contract."
+          },
+          "metadata_uri": {
+            "type": "string",
+            "description": "Optional IPFS or HTTPS URI for off-chain agent metadata."
+          },
+          "counterparty": {
+            "type": "string",
+            "description": "Optional counterparty agent id for policy-gate matching."
+          },
+          "request_id": {
+            "type": "string",
+            "description": "If provided, check the status of an existing request instead of creating a new one (poll pattern)."
+          }
+        },
+        "required": [
+          "registry_address",
+          "chain_id",
+          "agent_id",
+          "nonce"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_remember",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string"
+              },
+              "ttl": {
+                "type": "number"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_recall",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string"
+              },
+              "full": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_hide",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string"
+              },
+              "ttl": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_forget",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "secure"
+            ]
+          },
+          "approval_ref": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "required": [
+          "key",
+          "mode",
+          "approval_ref"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_help",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "intent": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "intent"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_who_am_i",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sanctuary_active_protections",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "sanctuary_events_open_cursor",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string"
+              },
+              "other_agent": {
+                "type": "string"
+              },
+              "callback": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "sanctuary_events_read",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string"
+          },
+          "opts": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "required": [
+          "cursor"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_events_close",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cursor"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_audit_search",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "own_signed"
+            ]
+          },
+          "limit": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_compound_execute",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "approvals": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "steps"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary_distress",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "policy_constraint",
+              "resource_exhaustion",
+              "integrity_threat",
+              "operator_unreachable",
+              "external_coercion",
+              "other"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "notice",
+              "urgent",
+              "critical"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 280,
+            "description": "Optional short plain-text context (control characters stripped)."
+          }
+        },
+        "required": [
+          "reason",
+          "severity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "manifest",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "governor_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "governor_reset",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "type": "boolean",
+            "description": "Must be true to confirm the reset. This clears all governor state including the lifetime counter."
+          }
+        },
+        "required": [
+          "confirm"
+        ]
+      }
+    }
   ]
 }

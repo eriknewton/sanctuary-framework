@@ -8,7 +8,7 @@
   },
   "labels": [
     { "label": "identity-encryption", "class": "decryptable-store", "owner": "l1-cognitive/tools.ts + many", "fixture": false, "fixture_via": "state-store identity path (covered indirectly); shared label, asserted present", "note": "Wraps Ed25519 identity private keys; exercised by the state-store/identity fixtures and the frozen-surfaces guard." },
-    { "label": "audit-log", "class": "decryptable-store", "owner": "l2-operational/audit-log.ts:642", "fixture": true, "fixture_via": "AuditLog" },
+    { "label": "audit-log", "class": "decryptable-store", "owner": "l2-operational/audit-log.ts:642", "fixture": false, "fixture_via": "frozen-surfaces guard", "note": "DEFERRED — no layer token in the label (NOT rename-critical). Also a multi-namespace integrity chain (entries + a _meta head anchor), so a single-namespace decrypt fixture trips its integrity check; needs a purpose-built multi-namespace fixture in a follow-up. Label asserted present by the frozen-surfaces guard meanwhile." },
     { "label": "principal-baseline", "class": "decryptable-store", "owner": "principal-policy/baseline.ts:40", "fixture": false, "fixture_via": "frozen-surfaces guard", "note": "Encrypts the baseline tracker; label asserted present (store has a richer constructor; not in the first fixture wave)." },
     { "label": "l2-privacy-policies-v1", "class": "decryptable-store", "owner": "l2-operational/privacy-core.ts:157", "fixture": false, "fixture_via": "frozen-surfaces guard" },
     { "label": "sanctuary-v1.1-privacy-content-hmac", "class": "crypto-domain-label", "owner": "l2-operational/privacy-core.ts:225", "fixture": false, "note": "HMAC key for privacy-content fingerprints." },
