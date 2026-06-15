@@ -1,0 +1,59 @@
+# Sanctuary SBOM (Software Bill of Materials)
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generates a CycloneDX Software Bill of Materials for the repository on
+# every push to main and on every published release, and uploads it as a
+# build artifact. This makes the exact dependency surface of any given
+# build auditable after the fact, a supply-chain table-stake for a
+# security product.
+#
+# This complements (does not replace) the existing dependency hygiene:
+# Dependabot tracks npm/pip/actions, the Python sidecar installs with
+# `pip install --require-hashes`, and CI uses lockfile-pinned `npm ci`.
+#
+# CodeQL static analysis runs separately via GitHub default setup; this
+# repository deliberately does NOT ship a manual codeql.yml because a
+# hand-written workflow would conflict with default setup. See SECURITY.md.
+
+name: SBOM
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+# Least-privilege: the job only needs to read the source tree. SBOM output
+# is uploaded as a workflow artifact, which does not require write scopes.
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: generate-sbom
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # anchore/sbom-action wraps Syft and emits CycloneDX. Scanning the
+      # checked-out tree captures the declared dependency manifests
+      # (package-lock.json, Cargo.lock, requirements.txt) across the repo.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sanctuary-sbom.cyclonedx.json
+          output-file: sanctuary-sbom.cyclonedx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanctuary-sbom
+          path: sanctuary-sbom.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 90
