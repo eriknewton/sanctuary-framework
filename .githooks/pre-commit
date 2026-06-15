@@ -92,6 +92,52 @@ warn() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$YELLOW" "$1" "$N
 fail() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$RED" "$1" "$NC" >&2; }
 ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC" >&2; }
 
+# ── Counter validation (fail CLOSED) ────────────────────────────────
+# The vitest-derived counters (`actual_total`, `passing`) are extracted from
+# vitest's text output with `grep -oE "[0-9]+"`. The capture is *shaped* like a
+# non-negative integer, but two pathological inputs are still possible and both
+# would corrupt the arithmetic guards downstream:
+#
+#   - a leading-zero string (e.g. "007") — historically a source of octal-parse
+#     surprises in `(( ... ))`; we reject it for the same reason we reject a
+#     leading-zero .test-baseline above; and
+#   - an absurdly large value (e.g. a 19-digit string) that overflows bash's
+#     signed-64-bit `(( ... ))` arithmetic and silently wraps (the macOS system
+#     bash is 3.2), so a numeric `(( _val > MAX ))` guard CANNOT catch it — the
+#     comparison itself overflows. Left unchecked, a wrapped-negative count would
+#     turn a "passing < baseline" regression check into a false PASS.
+#
+# So before ANY arithmetic touches a counter, validate it here and fail CLOSED.
+# The upper bound is enforced by DIGIT COUNT first (a value with more digits than
+# COUNTER_MAX is unambiguously larger and must never reach (( ))); only a value
+# already known to fit is compared numerically. A real suite never approaches
+# 100,000,000 tests/files, so a legitimate run never trips this; only a
+# parse-corrupted or adversarial value does. Args: <human-name> <value>.
+#
+# This MUST be invoked as a plain statement (`validate_counter NAME "$v"`), NOT
+# inside a command substitution: bash 3.2 does not propagate an `exit` out of a
+# `$(...)` subshell to abort the parent under `set -e`, which would fail OPEN.
+COUNTER_MAX=100000000   # 9 digits; see digit-count guard below.
+validate_counter() {
+  local _name="$1" _val="$2"
+  if ! [[ "$_val" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "$_name from vitest output is not a canonical integer, got: '$_val' — commit blocked"
+    exit 1
+  fi
+  # Reject by digit count first (overflow-safe), then numerically for same-length
+  # values. A value with MORE digits than COUNTER_MAX is definitely larger; a
+  # value with the SAME digit count is compared with (( )), which is safe because
+  # it is known to fit in 64-bit.
+  if (( ${#_val} > ${#COUNTER_MAX} )) \
+     || { (( ${#_val} == ${#COUNTER_MAX} )) && (( _val > COUNTER_MAX )); }; then
+    fail "$_name from vitest output ($_val) exceeds the sane upper bound ($COUNTER_MAX) — commit blocked"
+    printf '[baseline-guard]   This is almost certainly a parse-corrupted or adversarial value; refusing\n' >&2
+    printf '[baseline-guard]   to run arithmetic on it (overflow could mask a regression).\n' >&2
+    exit 1
+  fi
+  return 0
+}
+
 # ── Emergency override ───────────────────────────────────────────────
 if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
   warn "SKIP_TEST_BASELINE=1 — emergency override active"
@@ -273,6 +319,8 @@ if [[ -z "$actual_total" ]]; then
   echo "$test_output" | tail -30 >&2
   exit 1
 fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+validate_counter "Test Files count" "$actual_total"
 
 if (( actual_total < expected_files )); then
   fail "SILENT TEST FILE DROP DETECTED — commit blocked"
@@ -294,6 +342,8 @@ if [[ -z "$passing" ]]; then
   echo "$test_output" | tail -30 >&2
   exit 1
 fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+validate_counter "passing-test count" "$passing"
 
 if (( passing < baseline )); then
   fail "TEST BASELINE REGRESSION — commit blocked"
