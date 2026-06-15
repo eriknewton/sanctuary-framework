@@ -357,6 +357,20 @@ if [[ -n "$baseline_is_staged" ]]; then
     printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
+  # An OVER-RAISED staged floor (above the current passing count) is also invalid:
+  # it poisons the NEXT commit (passing < floor -> fail-below blocks a clean commit)
+  # and can mask a real regression up to the inflated number. The correct staged
+  # value is the new LINUX CI passing count, which is <= local passing (a macOS box
+  # legitimately runs MORE tests than the Linux floor), so a legitimate value never
+  # trips this — only an inflated one does. (codex #571 r3 finding.)
+  if (( _sb > passing )); then
+    fail "STAGED .test-baseline ($_sb) EXCEEDS the current passing count ($passing) — commit blocked"
+    printf '[baseline-guard]   An over-raised floor poisons the next commit and can mask a\n' >&2
+    printf '[baseline-guard]   regression up to the inflated number. Set .test-baseline to the\n' >&2
+    printf '[baseline-guard]   new LINUX CI passing count (<= your local passing), not higher.\n' >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
 fi
 if (( passing > baseline )); then
   if [[ -z "$baseline_is_staged" ]]; then
