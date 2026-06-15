@@ -3,7 +3,7 @@
 The Concordia sidecar is an optional Python process launched by the Sanctuary
 composition layer (WP-MVP-10) when `composition_enabled: true` is set in the
 fortress config. It speaks JSON-RPC 2.0 over stdio with the Sanctuary Node.js
-process and wraps `concordia-protocol==0.4.0` for receipt packing, receipt
+process and wraps `concordia-protocol==0.6.0` for receipt packing, receipt
 verification, and mandate verification.
 
 Composition is OFF by default. The structural moat invariant ("framework alone

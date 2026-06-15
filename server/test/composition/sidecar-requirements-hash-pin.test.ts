@@ -97,8 +97,8 @@ describe("requirements.in shape", () => {
     ? readFileSync(REQUIREMENTS_IN, "utf-8")
     : "";
 
-  it("pins concordia-protocol to 0.4.0 (the Follow-up #1 baseline)", () => {
-    expect(contents).toMatch(/concordia-protocol==0\.4\.0/);
+  it("pins concordia-protocol to 0.6.0 (the adopted baseline)", () => {
+    expect(contents).toMatch(/concordia-protocol==0\.6\.0/);
   });
 });
 
