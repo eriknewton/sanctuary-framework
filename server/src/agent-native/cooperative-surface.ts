@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import { buildAgentSearchCorpus } from "../l2-operational/agent-audit-redaction.js";
 import type { IdentityManager } from "../l1-cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -871,7 +872,23 @@ export function createAgentNativeCooperativeTools(
           const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10)));
           const matches = queried.entries
             .filter((entry) => entry.identity_id === activeIdentity.identity_id)
-            .filter((entry) => `${entry.operation} ${canonicalJson(entry.details ?? {})}`.toLowerCase().includes(needle))
+            // Search the AGENT search-corpus projection, never the raw entry
+            // (property #11, no-policy-inference). The returned rows already omit
+            // details, but filtering over raw details would leak their presence
+            // differentially: an agent could probe a guessed `rule_id` /
+            // `rule_id_matched` / `decision_provenance` / signed-canonical-blob
+            // value and read a match off `result_count`. buildAgentSearchCorpus
+            // OMITS those keys entirely — value, key NAME, and the `[redacted]`
+            // sentinel are all absent — so a probe for a sensitive value, a
+            // sensitive key name, or the sentinel can never hit. Legitimate
+            // search over `operation` and non-sensitive detail fields is
+            // preserved. The OPERATOR audit-search path stays full-fidelity (it
+            // does not call this projection).
+            .filter((entry) =>
+              `${entry.operation} ${canonicalJson(buildAgentSearchCorpus(entry))}`
+                .toLowerCase()
+                .includes(needle)
+            )
             .slice(-limit)
             .map((entry, index) => ({
               audit_ref: `audit:search:${index}`,
