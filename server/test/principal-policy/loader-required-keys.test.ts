@@ -97,6 +97,7 @@ approval_channel:
       "sanctuary_policy_status",
       "context_gate_set_policy",
       "context_gate_apply_template",
+      "audit_export_siem",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -115,6 +116,7 @@ approval_channel:
       "sanctuary_policy_status",
       "context_gate_set_policy",
       "context_gate_apply_template",
+      "audit_export_siem",
     ]);
   });
 

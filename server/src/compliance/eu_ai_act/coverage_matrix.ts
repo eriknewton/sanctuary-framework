@@ -945,8 +945,11 @@ const ROWS: CoverageRow[] = [
     review_notes:
       "Verified against v0.7.0 source on 2026-04-10: audit/siem-tools." +
       "ts:18-77 registers audit_export_siem with CEF and OCSF format " +
-      "support and the full filter set. Classified Tier 3 (auto-allow, " +
-      "read-only) in loader.ts. No corrections to the original draft.",
+      "support and the full filter set. Re-tiered to Tier 1 (operator " +
+      "approval required) in loader.ts on 2026-06-15: the bulk export " +
+      "reveals each operation's policy tier and decision, so SIEM " +
+      "forwarding is an operator function, not an agent auto-allow " +
+      "(CISO MED-1).",
   },
 
   {

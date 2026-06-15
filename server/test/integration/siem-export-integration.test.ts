@@ -399,5 +399,30 @@ describe("SIEM Export Integration", () => {
 
       expect(metadata.count).toBeLessThanOrEqual(metadata.total_available);
     });
+
+    it("operator export still carries the coarse SIEM signal after the Tier-1 re-tier (CISO MED-1)", async () => {
+      // Re-tiering audit_export_siem to Tier 1 gates the AGENT; the OPERATOR who
+      // approves the export runs the handler exactly as below. #573 reduced the
+      // SIEM formatter to the agent-safe allowlist (coarse allow/deny outcome
+      // derived from `result`, plus severity/disposition; the fine gate decision
+      // and tier/agent_did/session were stripped as defense-in-depth). The export
+      // still carries the security signal a SIEM consumer needs. NOTE: whether to
+      // restore richer operator-only fields now that this surface is Tier-1 is a
+      // tracked CISO re-review follow-up, intentionally NOT decided here.
+
+      // CEF: coarse per-event outcome (allow/deny derived from result) + severity.
+      const cef = (await tool.handler({ format: "cef" })).content[1].text;
+      expect(cef).toContain("outcome=allow");
+      expect(cef).toContain("outcome=deny");
+      expect(cef).toMatch(/^CEF:0\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|\d+\|/m); // severity field
+
+      // OCSF: severity_id + disposition_id (coarse security signal) preserved.
+      const ocsf = JSON.parse((await tool.handler({ format: "ocsf" })).content[1].text);
+      expect(ocsf.length).toBeGreaterThan(0);
+      for (const obj of ocsf) {
+        expect(obj).toHaveProperty("severity_id");
+        expect(obj).toHaveProperty("disposition_id");
+      }
+    });
   });
 });
