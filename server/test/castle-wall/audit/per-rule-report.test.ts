@@ -138,14 +138,30 @@ describe("castle-wall per-rule-per-flow audit read-out", () => {
       expect(got.every((f) => f.ruleId === "allow-a")).toBe(true);
     });
 
-    it("selects the default-deny (null) flows via the bucket sentinel", () => {
-      const got = filterFlowsByRule(flows, DEFAULT_DENY_BUCKET);
+    it("selects the default-deny (null) flows via the null selector", () => {
+      const got = filterFlowsByRule(flows, null);
       expect(got).toHaveLength(1);
       expect(got[0]?.ruleId).toBeNull();
     });
 
     it("returns nothing for an unknown rule id", () => {
       expect(filterFlowsByRule(flows, "no-such-rule")).toHaveLength(0);
+    });
+
+    it("treats the bucket DISPLAY label as a literal rule id (no sentinel collision)", () => {
+      // A real rule literally named the bucket display string must be selectable
+      // as itself, and must NOT collapse into the null-rule (default-deny) flows.
+      const collisionFlows = attributeFlows([
+        flowEntry({ timestamp: "2026-06-16T00:00:01Z", operation: "egress_allowed", ruleId: DEFAULT_DENY_BUCKET }),
+        flowEntry({ timestamp: "2026-06-16T00:00:02Z", operation: "egress_blocked" }),
+      ]);
+      const literal = filterFlowsByRule(collisionFlows, DEFAULT_DENY_BUCKET);
+      expect(literal).toHaveLength(1);
+      expect(literal[0]?.ruleId).toBe(DEFAULT_DENY_BUCKET);
+      // The null selector still picks the genuine null-rule flow, not the literal.
+      const nullSel = filterFlowsByRule(collisionFlows, null);
+      expect(nullSel).toHaveLength(1);
+      expect(nullSel[0]?.ruleId).toBeNull();
     });
   });
 

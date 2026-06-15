@@ -262,14 +262,24 @@ function destinationHostOf(entry: AuditEntry): string | null {
 }
 
 /**
- * Filter attributed flows to a single rule id. Pass {@link DEFAULT_DENY_BUCKET}
- * to select the null-rule (default-deny) flows.
+ * Filter attributed flows to a single rule id. Pass `null` to select the
+ * null-rule (default-deny) flows.
+ *
+ * SECURITY/correctness: the null-rule selector is `null`, NOT the
+ * {@link DEFAULT_DENY_BUCKET} display label. The display label is a literal
+ * string and may legitimately collide with an operator-authored rule id of the
+ * same name; using it as a sentinel would make such a rule unselectable (it
+ * would silently resolve to the default-deny flows instead). Matching here is on
+ * the unaliased `ruleId` exactly, so a real rule named like the bucket label is
+ * still reachable. (Mirrors the symbol-keyed null bucket in
+ * {@link groupFlowsByRule}; the alias from the short `default-deny` token lives
+ * in the CLI's `normalizeRuleFilter`, never in this core matcher.)
  */
 export function filterFlowsByRule(
   flows: FlowAttribution[],
-  ruleId: string
+  ruleId: string | null
 ): FlowAttribution[] {
-  if (ruleId === DEFAULT_DENY_BUCKET) {
+  if (ruleId === null) {
     return flows.filter((f) => f.ruleId === null);
   }
   return flows.filter((f) => f.ruleId === ruleId);

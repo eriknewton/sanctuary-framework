@@ -27,6 +27,7 @@ import {
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
+import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
 
 class CaptureStream extends Writable {
@@ -510,6 +511,48 @@ describe("castle-wall CLI verbs", () => {
     expect(flows).toHaveLength(1);
     expect(flows[0].rule_id).toBeNull();
     expect(flows[0].decision).toBe("deny");
+  });
+
+  it("audit-dump --rule treats the bucket DISPLAY label as a literal rule id (alias is only `default-deny`)", async () => {
+    // A real rule literally named exactly the bucket display string must remain
+    // selectable: only the short `--rule default-deny` is the bucket alias. The
+    // alias must never shadow a literal rule.
+    const fortress = await makeFortress();
+    const auditLog = new AuditLog(
+      new FilesystemStorage(join(fortress.fortressPath, "state")),
+      fortress.masterKey,
+      { integrityMode: "lenient" },
+    );
+    // A genuine allow rule whose id collides with the bucket display label.
+    await auditLog.append("l1", "egress_allowed", "agent-1", { decision: "allow", rule_id: DEFAULT_DENY_BUCKET }, "success");
+    // A genuine no-matching-rule (null) flow -> the real default-deny bucket.
+    await auditLog.append("l1", "egress_blocked", "agent-1", { decision: "drop" }, "failure");
+    await auditLog.flush();
+
+    // `--rule "<display label>"` selects the LITERAL rule's allow flow, not the
+    // null-rule bucket's deny flow.
+    const litOut = new CaptureStream();
+    const litCode = await runAuditDump(["--fortress", fortress.fortressPath, "--rule", DEFAULT_DENY_BUCKET], {
+      out: litOut,
+      env: { SANCTUARY_STORAGE_PATH: fortress.fortressPath, SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(litCode).toBe(0);
+    const litFlows = litOut.text().trim().split("\n").map((l) => JSON.parse(l));
+    expect(litFlows).toHaveLength(1);
+    expect(litFlows[0].rule_id).toBe(DEFAULT_DENY_BUCKET);
+    expect(litFlows[0].decision).toBe("allow");
+
+    // `--rule default-deny` still selects the genuine null-rule bucket flow.
+    const bucketOut = new CaptureStream();
+    const bucketCode = await runAuditDump(["--fortress", fortress.fortressPath, "--rule", "default-deny"], {
+      out: bucketOut,
+      env: { SANCTUARY_STORAGE_PATH: fortress.fortressPath, SANCTUARY_RECOVERY_KEY: fortress.recoveryKey },
+    });
+    expect(bucketCode).toBe(0);
+    const bucketFlows = bucketOut.text().trim().split("\n").map((l) => JSON.parse(l));
+    expect(bucketFlows).toHaveLength(1);
+    expect(bucketFlows[0].rule_id).toBeNull();
+    expect(bucketFlows[0].decision).toBe("deny");
   });
 
   it("audit-dump --rule with no value is a usage error, not a silent raw dump", async () => {

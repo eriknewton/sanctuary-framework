@@ -1797,13 +1797,18 @@ export async function runAuditDump(
 }
 
 /**
- * Resolve a `--rule` filter value to a per-rule-report rule id. The
- * default-deny (null-rule) bucket is verbose to type, so `--rule default-deny`
- * (and the bare bucket label) both select it.
+ * Resolve a `--rule` filter value to a per-rule-report selector. The default-deny
+ * (null-rule) bucket is verbose to type, so the convenience alias
+ * `--rule default-deny` selects it, returned here as `null` (the unambiguous
+ * null-rule selector `filterFlowsByRule` expects). The raw bucket DISPLAY label
+ * (`DEFAULT_DENY_BUCKET`, e.g. "(default-deny: no matching rule)") is NOT an
+ * alias: it is returned as a literal rule id, so a real allow/deny rule that
+ * happens to be named exactly that can still be selected (the alias must not
+ * shadow a literal rule).
  */
-function normalizeRuleFilter(value: string): string {
-  if (value === "default-deny" || value === DEFAULT_DENY_BUCKET) {
-    return DEFAULT_DENY_BUCKET;
+function normalizeRuleFilter(value: string): string | null {
+  if (value === "default-deny") {
+    return null;
   }
   return value;
 }
