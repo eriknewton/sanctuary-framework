@@ -47,6 +47,8 @@
     "lint": "eslint src/",
     "refresh-reorg-evidence": "vite-node scripts/refresh-reorg-evidence.ts",
     "check-import-cycles": "vite-node scripts/check-import-cycles.ts",
+    "check-import-cycles:baseline": "vite-node scripts/check-import-cycles.ts > test/fixtures/import-cycle-baseline.txt",
+    "gen-at-rest-fixtures": "vite-node scripts/gen-at-rest-fixtures.ts",
     "hygiene": "npm run refresh-reorg-evidence && npm run check-import-cycles",
     "clean": "rm -rf dist",
     "install-hooks": "node scripts/install-hooks.js",

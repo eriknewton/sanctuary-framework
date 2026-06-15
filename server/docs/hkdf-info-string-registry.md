@@ -1,6 +1,6 @@
 # HKDF info-string registry
 
-> **Status:** Created per full-sweep #83. This file is the centralized index of every HKDF info string Sanctuary emits, with the module that owns each string and the upstream secret it derives from.
+> **Status:** Created per full-sweep #83. **Reconciled against a full code scan 2026-06-16** (Phase-0 rename safety net): a mechanical scan of every `derivePurposeKey` / `deriveNamespaceKey` / direct `hkdf()` constant arg + the master-rotation purpose registry found 35 in-code labels absent from this doc. They are added below, each tagged `(scan-reconciled 2026-06-16)`. The authoritative source is the **code scan**, not this doc; the machine-readable classification lives at `server/test/fixtures/at-rest/hkdf-label-classification.json` and is guarded by `server/test/structure/hkdf-registry-reconciliation.test.ts`, which re-runs the scan and fails if a new in-code label is added without a registry row. This file is the centralized index of every HKDF info string Sanctuary emits, with the module that owns each string and the upstream secret it derives from.
 
 ## Why this registry exists
 
@@ -61,6 +61,40 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | `transparency-counter-floor` | `server/src/transparency/emitter.ts` | (literal) | MAC key for the transparency checkpoint anti-rollback counter floor. (Registered retroactively; shipped with PR #451.) |
 | `transparency-anchor-signing-v1` | `server/src/transparency/anchor.ts` | `TRANSPARENCY_ANCHOR_SIGNING_PURPOSE` | Derives the dedicated ECDSA P-256 anchoring key (the per-fortress pseudonym that signs salted commitment preimages for Sigstore Rekor anchors). Retry suffix `/retry-N` reserved for the astronomically rare out-of-range derivation. |
 | `transparency-anchor-config-mac-v1` | `server/src/transparency/anchor.ts` | `TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE` | MAC key authenticating the opt-in anchoring config (a tampered config must not silently enable transmission or silently disable anchoring). |
+| `l2-honeypot-trap-v1` | `server/src/honeypot/trap-store.ts:48` | `HKDF_INFO` | Encrypts the honeypot trap store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-sentinel-finding-v1` | `server/src/sentinel/sentinel-finding-store.ts:39` | `HKDF_INFO` | Encrypts the sentinel-finding store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-anomaly-classifier-state-v1` | `server/src/anomaly-detection/classifier-state-store.ts:33` | `HKDF_INFO` | Encrypts the anomaly-classifier state store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-auto-trigger-rules-v1` | `server/src/auto-trigger/threshold-config-store.ts:44` | `HKDF_INFO` | Encrypts the auto-trigger threshold/rules store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-recognition-hosted-did-web-v1` | `server/src/recognition/did-web-hosted-registry.ts:29` | `HKDF_INFO` | Encrypts the hosted did:web registry store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-query-anonymity-tier-b-v1` | `server/src/query-anonymity/pii-config-store.ts:47` | `HKDF_INFO` | Encrypts the query-anonymity tier-B PII config store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-approval-aggregator-v1` | `server/src/principal-policy/approval-aggregator.ts:41` | `APPROVAL_AGGREGATOR_HKDF_INFO` | Encrypts the approval-aggregator's own per-fortress store (DISTINCT from the payload store below). **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-approval-aggregator-payload-v1` | `server/src/principal-policy/aggregator-store.ts:47` | `HKDF_INFO` | Encrypts the approval-aggregator payload store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `l2-english-policy-activation-v1` | `server/src/policy-engine/english-policy-activator.ts:148` | `ACTIVATION_HKDF_INFO` | Encrypts the English-policy activation store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `principal-policy-unified-inbox-v1` | `server/src/principal-policy/unified-inbox-store.ts:32` | `HKDF_INFO` | Encrypts the unified-inbox store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `principal-policy-unified-inbox-operator-prefs-v1` | `server/src/principal-policy/unified-inbox-prefs-store.ts:15` | `HKDF_INFO` | Encrypts the unified-inbox operator-prefs store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `principal-policy-unified-inbox-retention-policy-v1` | `server/src/principal-policy/unified-inbox-retention-policy.ts:39` | `HKDF_INFO` | Encrypts the unified-inbox retention-policy store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `concierge-memory-store-v1` | `server/src/chat/concierge-memory-store.ts:49` | `HKDF_INFO` | Encrypts the concierge memory store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `query-anonymity-reverse-mapping-v1` | `server/src/query-anonymity/reverse-mapping-store.ts:21` | `HKDF_INFO` | (Already documented in row above for Rho-3 reverse mappings; constant `HKDF_INFO`.) **(scan note 2026-06-16: confirmed present.)** |
+| `distress-inbox` | `server/src/distress/inbox.ts:60` | (literal) | Encrypts the distress inbox store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `audit-head-anchor` | `server/src/l2-operational/audit-log.ts:387,646` | (literal) | MAC key for the audit-log head anchor (tamper-evident chain head). **(scan-reconciled 2026-06-16; MAC/crypto-domain label, not a decryptable store.)** |
+| `audit-rotation-anchor` | `server/src/l2-operational/audit-log.ts:645` | (literal) | MAC key for the audit-log rotation anchor. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `audit-epoch-wrap` | `server/src/l2-operational/audit-log.ts:164` | `AUDIT_EPOCH_WRAP_PURPOSE` | AEAD wrap key for per-epoch audit keys. **(scan-reconciled 2026-06-16; key-wrap/crypto-domain label.)** |
+| `audit-epoch-record-mac` | `server/src/l2-operational/audit-log.ts:165` | `AUDIT_EPOCH_MAC_PURPOSE` | MAC key for per-epoch audit records. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `custody-envelope-mac` | `server/src/core/master-custody.ts:577` | (literal) | MAC key for the custody envelope. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `custody-sentinel` | `server/src/core/master-custody.ts:702,823` | (literal) | Custody-sentinel probe key. **(scan-reconciled 2026-06-16; crypto-domain label.)** |
+| `custody-rotation-journal-mac` | `server/src/core/master-rotation.ts:147` | `JOURNAL_MAC_PURPOSE` | MAC key for the custody rotation journal. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `custody-rollback-freeze-mac` | `server/src/core/anti-rollback.ts:181`, `core/master-rotation.ts:450` | `FREEZE_MAC_PURPOSE` / `ROLLBACK_FREEZE_MAC_PURPOSE` | MAC key for the rollback-freeze record. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `custody-epoch-witness-mac` | `server/src/core/anti-rollback.ts:177` | `EPOCH_WITNESS_MAC_PURPOSE` | MAC key for the custody epoch-witness record. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `state-meta-mac` | `server/src/l1-cognitive/state-store.ts:467,1773` | (literal) | MAC key for Cognitive state-store metadata. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `sdw-catalog-v1` | `server/src/sdw/records.ts:8` (`SDW_CATALOG_HKDF_INFO`) | `SDW_CATALOG_HKDF_INFO` | Encrypts the SDW catalog store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `sdw-working-state-v1` | `server/src/sdw/records.ts:9` | `SDW_WORKING_STATE_HKDF_INFO` | Encrypts the SDW working-state store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `sdw-query-history-v1` | `server/src/sdw/records.ts:10` | `SDW_QUERY_HISTORY_HKDF_INFO` | Encrypts the SDW query-history store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `sdw-document-corpus-v1` | `server/src/sdw/records.ts:11` | `SDW_DOCUMENT_CORPUS_HKDF_INFO` | Encrypts the SDW document-corpus store. **(scan-reconciled 2026-06-16; decryptable store.)** |
+| `sdw-vector-memory-v1` | `server/src/sdw/records.ts:12` | `SDW_VECTOR_MEMORY_HKDF_INFO` | Reserved for the SDW vector-memory store. **(scan-reconciled 2026-06-16; decryptable store / reserved.)** |
+| `sdw-replay-anchor-mac` | `server/src/sdw/replay-anchor.ts:17`, `sdw/write-gate.ts:26` | `SDW_REPLAY_MAC_INFO` | MAC key for SDW replay anchors. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `recovery-key-wrap` | `server/src/core/master-custody.ts:370` | (literal) | AEAD key wrapping the master under the recovery key. **(scan-reconciled 2026-06-16; key-wrap; salt = `sanctuary-custody-v1`, see §D.)** |
+| `keychain-wrap` | `server/src/core/master-custody.ts:385` | (literal) | AEAD key wrapping the master under the keychain custody key. **(scan-reconciled 2026-06-16; key-wrap; salt = `sanctuary-custody-v1`, see §D.)** |
+| `castle-wall-safe-mode-audit-v1` | `server/src/castle-wall/boot/boot-token.ts:68` | `SAFE_MODE_AUDIT_INFO` | Derives the safe-mode audit key from the boot token (salt = undefined; see §D). **(scan-reconciled 2026-06-16; crypto-domain label.)** |
 
 ### C. Namespace strings (info to deriveNamespaceKey, salt = sanctuary-namespace-v1)
 
@@ -84,6 +118,9 @@ These derivations bypass the high-level helpers because they need a salt other t
 | `fortress_id` | `sanctuary-agent-contract-v0.1` `\|\| <agent_subkey_id>` | `server/src/agent-contract/identity-bind.ts:55,79` | Per-agent identity-binding subkeys. |
 | `fortress_id` | `sanctuary-composition-v1.0-sidecar-signing-key` | `server/src/composition/sidecar-signing-key.ts:77` | Composition sidecar's Ed25519 signing keypair. See `composition/constants.ts:HKDF_COMPOSITION_SIDECAR_SIGNING_INFO`. |
 | `fortress_id` | `sanctuary-recovery-flows-v0.1-master-rotation-bundle` `\|\| <bundle_id>` | `server/src/mesh/recovery-flows/secret-bundle.ts:78` | Recovery-flow master-rotation bundle wrap. |
+| `sanctuary-custody-v1` (`CUSTODY_HKDF_SALT`) | `recovery-key-wrap` | `server/src/core/master-custody.ts:166,370` | AEAD key wrapping the master under the recovery key. **(scan-reconciled 2026-06-16.)** |
+| `sanctuary-custody-v1` (`CUSTODY_HKDF_SALT`) | `keychain-wrap` | `server/src/core/master-custody.ts:166,385` | AEAD key wrapping the master under the keychain custody key. **(scan-reconciled 2026-06-16.)** |
+| undefined (boot-token context) | `castle-wall-safe-mode-audit-v1` | `server/src/castle-wall/boot/boot-token.ts:68,175` | Derives the safe-mode audit key from the boot token (not a fortress-master derivation). **(scan-reconciled 2026-06-16.)** |
 
 ### E. Domain-separation strings used elsewhere (not strictly HKDF info, but co-located by convention)
 
@@ -96,6 +133,10 @@ These strings serve the same domain-separation purpose as HKDF info but appear i
 | `sanctuary-zk-range-sum-v1` | `server/src/l3-disclosure/zk-proofs.ts:361,418` | Fiat-Shamir transcript label for range-sum proof. |
 | `sanctuary-zk-bit-v1` | `server/src/l3-disclosure/zk-proofs.ts:462,492,529` | Fiat-Shamir transcript label for bit-decomposition proof. |
 | `sanctuary-sign-challenge-v1` | `server/src/sanctuary-tools.ts:563` | Domain-separation prefix for signed challenges. |
+| `key-17:x402-signer:v1` | `server/src/key-17/x402-signer.ts:61` (direct `hkdf()` info) | Derives the x402 payment-signer key. The `key-17` folder token is embedded in the label, so the folder must NEVER be renamed without a crypto migration. **(scan-reconciled 2026-06-16.)** |
+| `key-17:erc8004-identity:v1` | `server/src/key-17/erc8004-identity-signer.ts:58` (direct `hkdf()` info) | Derives the ERC-8004 identity-signer key. Folder token embedded. **(scan-reconciled 2026-06-16.)** |
+| `key-17:ap2-mandate:v1` | `server/src/key-17/ap2-mandate-signer.ts:62` (direct `hkdf()` info) | Derives the AP2 mandate-signer key. Folder token embedded. **(scan-reconciled 2026-06-16.)** |
+| `sanctuary.v1.session-token` | `server/src/v1/session-service.ts:63` (`TOKEN_AAD`) | AES-256-GCM additional authenticated data binding v1 session tokens to their domain (not an HKDF info string; co-located here per convention). **(scan-reconciled 2026-06-16.)** |
 
 ## Adding a new info string
 
