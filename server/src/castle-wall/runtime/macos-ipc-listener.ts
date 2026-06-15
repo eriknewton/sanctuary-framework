@@ -268,9 +268,11 @@ export class MacOSFlowIpcListener {
         //     to the operator uid. Fully eliminating it needs either binding the
         //     safe-mode socket in a root-owned (non-operator-writable) directory
         //     — a coordinated SocketPath.swift mirror change — or an fd-based
-        //     bind+fchown (not exposed by Node's net.Server). Tracked as a
-        //     must-resolve-before-#450-merge item; the symlink vector (the severe
-        //     one) is closed and macOS hard-link protections blunt the residual.
+        //     bind+fchown (not exposed by Node's net.Server). The safe-mode
+        //     socket's operator-reachability assumes the confined agent runs
+        //     under a separate uid from the operator; the operator-owned 0o700
+        //     fortress dir excludes the agent from the socket dir. A same-uid
+        //     agent is an unsupported config (it also breaks per-uid enforcement).
         if (this.socketOwnerUid !== undefined) {
           try {
             const linkStat = await lstat(this.socketPath);

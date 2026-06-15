@@ -86,6 +86,10 @@ daemon, and it is sound *because of* the split credential:
   (and the file-based System keychain, the other boot-available store).
 - Full-operation signing still routes through the root signer helper; no
   private key reaches this process.
+- The safe-mode socket's operator-reachability assumes the confined agent runs
+  under a separate uid from the operator; the operator-owned `0o700` fortress
+  dir excludes the agent from the socket dir. A same-uid agent is an unsupported
+  config (it also breaks per-uid enforcement).
 
 ## Operator verbs
 
