@@ -719,8 +719,16 @@ describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED ev
       forgedDrainEvent(2, null),
     ]);
 
-    const errors: Error[] = [];
-    const res = await drainOnce(client, consumer, null, 256, (e) => errors.push(e));
+    const diagnostics: Error[] = [];
+    const faults: Error[] = [];
+    const res = await drainOnce(
+      client,
+      consumer,
+      null,
+      256,
+      (e) => diagnostics.push(e),
+      (e) => faults.push(e)
+    );
 
     // seq 1 failed to persist → NOT acked; the loop BROKE so seq 2 was never
     // even ingested → also NOT acked. The daemon will re-deliver from seq 1.
@@ -729,8 +737,11 @@ describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED ev
     expect(acks).toHaveLength(0);
     expect(res.drained).toBe(0);
     expect(res.nextAfterSeq).toBeNull();
-    // The transient failure surfaced via onError.
-    expect(errors.some((e) => /transient/.test(e.message))).toBe(true);
+    // codex HIGH split: a transient persist failure is an UNSETTLED FAULT (the
+    // cursor never advanced), so it surfaces on `onDrainFault` — NOT on the
+    // settled-diagnostics `onError`. This is what trips NOT-ARMED in opt-in mode.
+    expect(faults.some((e) => /transient/.test(e.message))).toBe(true);
+    expect(diagnostics).toHaveLength(0);
     // And the consumer never accepted either enforcement event.
     expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
   });
@@ -837,19 +848,292 @@ describe("C4 — FIX 4 (codex HIGH): drain transport failure trips NOT-ARMED (ne
       async () => {
         throw new Error("daemon link dropped");
       };
-    // Fire the next scheduled cycle: it hits the wedged link → onError →
-    // markDrainUnhealthy. Await the loop's in-flight settle.
+    // Fire the next scheduled cycle: it hits the wedged link → the cycle's
+    // outer catch → onDrainFault → markDrainUnhealthy. drainHealthy() flips
+    // SYNCHRONOUSLY; the durable record + teardown then settle asynchronously.
     scheduled[scheduled.length - 1]!();
     for (let i = 0; i < 50 && outcome.activation.drainHealthy(); i++) {
       await new Promise((r) => setTimeout(r, 1));
     }
-
-    // The drain failure must have tripped the health transition + durable record.
+    // Health flips the instant the fault is seen (the wall is not-armed NOW).
     expect(outcome.activation.drainHealthy()).toBe(false);
+
+    // Round-3 HIGH: the NOT-ARMED record must be DURABLE before the transition
+    // is complete. `whenDrainSettled()` resolves only after the append+flush
+    // have been AWAITED (no fire-and-forget) and the loop stopped — so the
+    // durable record is guaranteed present here, not raced.
+    await outcome.activation.whenDrainSettled();
+
     expect(unhealthyErrors.length).toBeGreaterThanOrEqual(1);
     expect(unhealthyErrors[0]!.message).toMatch(/daemon link dropped/);
     expect(appended).toContain("castle_wall_drain_failed");
 
     await outcome.activation.stop();
+  });
+});
+
+describe("C4 — round-3 HIGH: NOT-ARMED record durability + settled-refusal vs transport failure", () => {
+  /**
+   * Drive the activation's LIVE drain loop deterministically: capture each
+   * scheduled cycle so the test fires cycles explicitly. Returns the activation
+   * outcome + the scheduled-callback queue + the spied audit operations.
+   */
+  async function activateWithCapturedLoop(opts: {
+    auditSink: AuditSink;
+    drainQueue: AuditDrainEvent[];
+    onDrainUnhealthy?: (err: Error, info: { recordDurable: boolean }) => void;
+    onAuditUnavailable?: (fatal: RuntimeLinuxActivationError) => void;
+  }): Promise<{
+    activation: NonNullable<
+      Awaited<ReturnType<typeof maybeActivateLinuxProducerSignedCastleWall>> extends infer R
+        ? R extends { activated: true; activation: infer A }
+          ? A
+          : never
+        : never
+    >;
+    scheduled: Array<() => void>;
+  }> {
+    const mock = buildMockDaemon(opts.drainQueue);
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    const scheduled: Array<() => void> = [];
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: opts.auditSink,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: {
+        pollIntervalMs: 10_000,
+        setTimer: (cb) => {
+          scheduled.push(cb as () => void);
+          return scheduled.length;
+        },
+        clearTimer: () => {},
+      },
+      onDrainUnhealthy: opts.onDrainUnhealthy,
+      onAuditUnavailable: opts.onAuditUnavailable,
+    });
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+    if (!outcome.activated) throw new Error("expected activation");
+    return { activation: outcome.activation, scheduled };
+  }
+
+  /** Spy wrapper that records the operations appended to a real AuditLog. */
+  function spyAppend(log: AuditLog): string[] {
+    const appended: string[] = [];
+    const orig = log.append.bind(log);
+    (log as unknown as { append: AuditSink["append"] }).append = ((
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      appended.push(operation);
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+    return appended;
+  }
+
+  it("(b) a SETTLED producer-signature refusal does NOT stop the drain / does NOT trip NOT-ARMED", async () => {
+    // The forger mints the marker but no valid signature. The live consumer
+    // (key loaded) durably REJECTS + acks it — a SETTLED refusal. The drain must
+    // stay HEALTHY: a refused forgery is the gate working, not a transport
+    // failure. (codex HIGH: settled-refusal must not be a false NOT-ARMED.)
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const appended = spyAppend(auditLog);
+    const unhealthy: Error[] = [];
+
+    const { activation, scheduled } = await activateWithCapturedLoop({
+      auditSink: auditLog,
+      drainQueue: [forgedDrainEvent(1, null)],
+      onDrainUnhealthy: (e) => unhealthy.push(e),
+    });
+    // The live consumer is enforcing (key loaded), so the forgery is rejected.
+    expect(activation.lifecycle.audit().isProducerSignatureEnforced()).toBe(true);
+
+    // Let the first cycle run (it drains + durably refuses + acks the forgery),
+    // then settle.
+    for (let i = 0; i < 100 && scheduled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled();
+
+    // Health is UNTOUCHED: a settled refusal is not a transport fault.
+    expect(activation.drainHealthy()).toBe(true);
+    expect(unhealthy).toHaveLength(0);
+    // The refusal was durably recorded; NO not-armed record was written.
+    expect(appended).toContain("producer_signature_rejected");
+    expect(appended).not.toContain("castle_wall_drain_failed");
+    // The consumer rejected (not accepted) the forgery.
+    expect(activation.lifecycle.audit().getStats().producerSignatureRejections).toBe(1);
+    expect(activation.lifecycle.audit().getStats().producerSignatureAccepted).toBe(0);
+
+    // CONTRAST: a real transport failure on the SAME activation DOES trip
+    // NOT-ARMED — proving the split is about settlement, not "any error".
+    const client = activation.lifecycle.client();
+    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
+      async () => {
+        throw new Error("daemon link dropped");
+      };
+    expect(scheduled.length).toBeGreaterThanOrEqual(1);
+    scheduled[scheduled.length - 1]!();
+    for (let i = 0; i < 100 && activation.drainHealthy(); i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled();
+    expect(activation.drainHealthy()).toBe(false);
+    expect(unhealthy.length).toBeGreaterThanOrEqual(1);
+    expect(appended).toContain("castle_wall_drain_failed");
+
+    await activation.stop();
+  });
+
+  it("(a-i) the NOT-ARMED transition is NOT complete until the durable record is settled (append is AWAITED, not fire-and-forget)", async () => {
+    // A sink whose `castle_wall_drain_failed` append BLOCKS on a gate we control.
+    // If the transition awaited the record, `whenDrainSettled()` must NOT resolve
+    // while the gate is closed, and MUST resolve once we open it. (Round-3 HIGH:
+    // the old code did `void (async () => { append... })()` — fire-and-forget —
+    // so a process exit / sink failure could leave drainHealthy()=false with NO
+    // durable record.)
+    // A published key so activation passes the FIX-1 gate (no events drained,
+    // so the key value is irrelevant — only its presence).
+    await publishPubKey(tmp, ed25519.getPublicKey(ed25519.utils.randomPrivateKey()));
+    let releaseRecord!: () => void;
+    const recordGate = new Promise<void>((res) => {
+      releaseRecord = res;
+    });
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const orig = auditLog.append.bind(auditLog);
+    let notArmedAppendStarted = false;
+    (auditLog as unknown as { append: AuditSink["append"] }).append = (async (
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      if (operation === "castle_wall_drain_failed") {
+        notArmedAppendStarted = true;
+        await recordGate; // block until the test releases it
+      }
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+
+    const { activation, scheduled } = await activateWithCapturedLoop({
+      auditSink: auditLog,
+      drainQueue: [],
+    });
+    for (let i = 0; i < 100 && scheduled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled(); // the first (healthy, empty) cycle
+
+    // Wedge the link → fault → markDrainUnhealthy → durable record append begins
+    // (and BLOCKS on our gate).
+    const client = activation.lifecycle.client();
+    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
+      async () => {
+        throw new Error("daemon link dropped");
+      };
+    scheduled[scheduled.length - 1]!();
+    // Wait until the not-armed append has STARTED but is parked on the gate.
+    for (let i = 0; i < 100 && !notArmedAppendStarted; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(notArmedAppendStarted).toBe(true);
+    // Health already reads false (the wall is not-armed the instant the fault is
+    // seen)...
+    expect(activation.drainHealthy()).toBe(false);
+
+    // ...but the TRANSITION is not complete: `whenDrainSettled()` must still be
+    // pending because the durable record append is awaited and parked.
+    let settled = false;
+    const settledP = activation.whenDrainSettled().then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false); // proves the append is AWAITED, not fire-and-forget
+
+    // Release the record; NOW the transition completes.
+    releaseRecord();
+    await settledP;
+    expect(settled).toBe(true);
+
+    await activation.stop();
+  });
+
+  it("(a-ii) a NOT-ARMED record that CANNOT be persisted takes the explicit audit-unavailable FATAL path (no silent drop, stays not-armed)", async () => {
+    // The sink throws on the `castle_wall_drain_failed` append. The transition
+    // must NOT silently drop the record: it surfaces an explicit
+    // `RuntimeLinuxActivationError` (reason `drain_failed`) via `onAuditUnavailable`,
+    // reports `recordDurable: false` to the health hook, and the wall STAYS
+    // not-armed. Fail-closed + loud. (Round-3 HIGH: errors were previously
+    // swallowed in a catch{}.)
+    await publishPubKey(tmp, ed25519.getPublicKey(ed25519.utils.randomPrivateKey()));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const orig = auditLog.append.bind(auditLog);
+    (auditLog as unknown as { append: AuditSink["append"] }).append = (async (
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      if (operation === "castle_wall_drain_failed") {
+        throw new Error("audit sink unavailable (disk full)");
+      }
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+
+    const fatals: RuntimeLinuxActivationError[] = [];
+    const unhealthyInfos: Array<{ recordDurable: boolean }> = [];
+    const { activation, scheduled } = await activateWithCapturedLoop({
+      auditSink: auditLog,
+      drainQueue: [],
+      onDrainUnhealthy: (_e, info) => unhealthyInfos.push(info),
+      onAuditUnavailable: (f) => fatals.push(f),
+    });
+    for (let i = 0; i < 100 && scheduled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled();
+
+    // Wedge the link → fault → markDrainUnhealthy → the not-armed append THROWS.
+    const client = activation.lifecycle.client();
+    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
+      async () => {
+        throw new Error("daemon link dropped");
+      };
+    scheduled[scheduled.length - 1]!();
+    for (let i = 0; i < 100 && activation.drainHealthy(); i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled();
+
+    // The wall STAYS not-armed (never falls back to a silent green on a record
+    // failure)...
+    expect(activation.drainHealthy()).toBe(false);
+    // ...the explicit FATAL fired (NOT a silently-swallowed error)...
+    expect(fatals).toHaveLength(1);
+    expect(fatals[0]).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect(fatals[0]!.reason).toBe("drain_failed");
+    expect(fatals[0]!.message).toMatch(/audit unavailable/i);
+    expect(fatals[0]!.message).toMatch(/disk full/);
+    // ...and the health hook was told the record was NOT made durable.
+    expect(unhealthyInfos).toHaveLength(1);
+    expect(unhealthyInfos[0]!.recordDurable).toBe(false);
+
+    await activation.stop();
   });
 });

@@ -73,11 +73,28 @@ export interface LinuxAuditDrainOptions {
   setTimer?: (cb: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
   /**
-   * Optional sink for non-fatal loop diagnostics (transient drain errors). The
-   * loop never throws on a transient error — it logs and retries — so a wedged
-   * daemon link degrades observably rather than crashing the host process.
+   * Optional sink for non-fatal loop DIAGNOSTICS that do NOT mean the drain
+   * stopped making progress: a producer-signature refusal that the consumer
+   * durably recorded + acked (the event SETTLED — a refused forgery, by design),
+   * or any other settled-but-noteworthy condition. The loop CONTINUES after
+   * these; in opt-in mode they MUST NOT trip the not-armed health signal, or a
+   * forged event could DoS the wall into a false NOT-ARMED. (codex HIGH:
+   * settled-refusal must not stop the loop like a transport failure.)
    */
   onError?: (err: Error) => void;
+  /**
+   * Optional sink for an UNSETTLED drain FAULT: a condition where the loop could
+   * not advance past an event because it did NOT durably settle — a transient
+   * persistence/transport failure that threw BEFORE the ack, a malformed drain
+   * entry the consumer cannot even parse, or the `drainRequest` transport itself
+   * throwing. These are the load-bearing failures: in opt-in producer-signed
+   * mode the daemon's signed enforcement evidence is NOT reaching the consumer,
+   * so the wall is armed-but-not-draining and must read NOT-ARMED. Distinct from
+   * `onError` precisely so a SETTLED refusal (cursor advanced) never trips the
+   * health machine while a real transport/persistence fault always does. (codex
+   * HIGH FIX.)
+   */
+  onDrainFault?: (err: Error) => void;
 }
 
 /**
@@ -193,13 +210,30 @@ export function buildCriticalEnvelopeFromDrainEvent(
  * (transient failure before ack) and we STOP the batch — never acking past an
  * unpersisted seq, which would let the daemon truncate its WAL through a lost
  * event (FIX 2). The daemon re-delivers from the last settled seq next cycle.
+ *
+ * # Settled refusal vs unsettled fault — the cursor IS the discriminator (codex HIGH)
+ *
+ * The cursor check is also the single arbiter of WHICH error channel a throw
+ * goes to, so a forged event can never DoS the wall into a false NOT-ARMED:
+ *   - cursor ADVANCED past the event ⇒ it SETTLED. If it threw, it was a
+ *     producer-signature refusal that the consumer durably recorded + acked —
+ *     a DIAGNOSTIC (`onError`), and the loop CONTINUES. A refused forgery is the
+ *     gate working as designed, NOT a transport failure.
+ *   - cursor did NOT advance ⇒ the event did NOT settle (a transient
+ *     persistence/transport throw before ack, or a malformed entry the consumer
+ *     cannot even parse). That is an UNSETTLED FAULT (`onDrainFault`): in opt-in
+ *     mode the signed evidence is not reaching the consumer, so the wall is
+ *     armed-but-not-draining and must read NOT-ARMED. We break the batch.
+ * Routing strictly by the cursor (never by error TYPE) means no settled outcome
+ * — however it is reported — can ever trip the health machine.
  */
 export async function drainOnce(
   client: IpcClient,
   consumer: AuditConsumer,
   afterSeq: number | null,
   maxEvents: number,
-  onError?: (err: Error) => void
+  onError?: (err: Error) => void,
+  onDrainFault?: (err: Error) => void
 ): Promise<{ nextAfterSeq: number | null; morePending: boolean; drained: number }> {
   const response: AuditDrainResponse = await client.drainRequest(afterSeq, maxEvents);
   let cursor: number | null = afterSeq;
@@ -216,12 +250,18 @@ export async function drainOnce(
       drained += 1;
     });
     if (built.kind === "error") {
-      // A malformed drain entry is not the consumer's concern; surface it and
+      // A malformed drain entry never settles (the cursor cannot advance past a
+      // body we cannot even parse). That is an UNSETTLED FAULT: the daemon's
+      // signed bytes are not arriving intact, so in opt-in mode the wall is
+      // armed-but-not-draining. Route it to `onDrainFault` (trips NOT-ARMED) and
       // STOP iterating so the cursor does not advance past the gap (the daemon
       // re-delivers from `cursor`).
-      onError?.(new Error(`audit_drain: ${built.reason} at seq ${drainedEvent.seq}`));
+      onDrainFault?.(
+        new Error(`audit_drain: ${built.reason} at seq ${drainedEvent.seq}`)
+      );
       break;
     }
+    let ingestError: Error | undefined;
     try {
       await consumer.ingestCritical(built.envelope);
     } catch (err) {
@@ -229,22 +269,39 @@ export async function drainOnce(
       // error — but only AFTER durably recording it AND calling our ack (so the
       // cursor already advanced past it inside the callback above). A TRANSIENT
       // throw (persistence/transport) happens BEFORE ack, so the cursor stays
-      // put and the daemon re-delivers. We report it below.
-      onError?.(err instanceof Error ? err : new Error(String(err)));
+      // put and the daemon re-delivers. We do NOT classify by error type here;
+      // the cursor check below decides whether this was a settled refusal
+      // (diagnostic) or an unsettled fault (NOT-ARMED).
+      ingestError = err instanceof Error ? err : new Error(String(err));
     }
-    // FIX 2 (codex CRITICAL — drain must never ack past an UNPERSISTED event).
+    // FIX 2 (codex CRITICAL — drain must never ack past an UNPERSISTED event) +
+    // settled-refusal-vs-fault split (codex HIGH).
     //
     // The ack callback advances `cursor` to `drainedEvent.seq` ONLY when the
     // consumer durably settled this event (accepted, rejected-and-recorded, or
-    // duplicate-dropped). If `cursor !== drainedEvent.seq` here, this event did
-    // NOT settle (a TRANSIENT persistence/transport failure threw before ack).
-    // We MUST stop the batch now: continuing would feed seq N+1 to the consumer,
-    // which — with `lastEventCanonicalHash` still null because seq N never
-    // persisted — would accept N+1 as a fresh bootstrap and ack
-    // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
-    // (silent audit data loss). Breaking leaves `cursor` at the last durably
-    // settled seq; the daemon re-delivers from there on the next cycle.
-    if (cursor !== drainedEvent.seq) {
+    // duplicate-dropped). The cursor is therefore the single discriminator:
+    if (cursor === drainedEvent.seq) {
+      // SETTLED. If it threw, it was a producer-signature refusal recorded +
+      // acked — a diagnostic, NOT a transport failure. Report it via `onError`;
+      // the loop CONTINUES so later genuine events in the batch keep flowing.
+      // A refused forgery must never stop the loop (else a forger could DoS the
+      // wall into a false NOT-ARMED).
+      if (ingestError) onError?.(ingestError);
+    } else {
+      // NOT SETTLED. A TRANSIENT persistence/transport failure threw before ack
+      // (cursor stayed put). Continuing would feed seq N+1 to the consumer,
+      // which — with `lastEventCanonicalHash` still null because seq N never
+      // persisted — would accept N+1 as a fresh bootstrap and ack
+      // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
+      // (silent audit data loss). This is an UNSETTLED FAULT → `onDrainFault`
+      // (trips NOT-ARMED in opt-in mode). We STOP the batch; the cursor stays at
+      // the last durably settled seq and the daemon re-delivers from there.
+      onDrainFault?.(
+        ingestError ??
+          new Error(
+            `audit_drain: event seq ${drainedEvent.seq} did not settle (no ack)`
+          )
+      );
       break;
     }
   }
@@ -259,10 +316,13 @@ export async function drainOnce(
 /**
  * Continuously drain in a poll loop until stopped. Each cycle pulls all
  * currently-pending batches (following `more_pending`) then sleeps
- * `pollIntervalMs` before the next cycle. Transient errors are reported via
- * `onError` and the loop continues (a wedged daemon link degrades observably,
- * it does not crash the host). Returns a handle whose `stop()` halts the loop
- * after the in-flight cycle settles.
+ * `pollIntervalMs` before the next cycle. The loop NEVER throws out of itself (a
+ * wedged daemon link degrades observably, it does not crash the host). Settled
+ * diagnostics (a durably-recorded producer-signature refusal) are reported via
+ * `onError` and the loop continues; an UNSETTLED FAULT (transport/persistence
+ * failure, malformed entry, or a `drainRequest` that itself throws) is reported
+ * via `onDrainFault` — the load-bearing NOT-ARMED signal in opt-in mode. Returns
+ * a handle whose `stop()` halts the loop after the in-flight cycle settles.
  */
 export interface LinuxAuditDrainHandle {
   /** Stop the loop after the current cycle settles. */
@@ -298,16 +358,24 @@ export function startLinuxAuditDrainLoop(
           consumer,
           cursor,
           maxEvents,
-          options.onError
+          options.onError,
+          options.onDrainFault
         );
         cursor = result.nextAfterSeq;
         if (result.drained > 0) lastAcked = cursor;
         morePending = result.morePending;
       }
     } catch (err) {
-      // A drain-request transport failure (link dropped) is transient: report
-      // and retry on the next tick. Never throw out of the loop.
-      options.onError?.(err instanceof Error ? err : new Error(String(err)));
+      // A `drainRequest` itself threw — the daemon link dropped. The signed
+      // enforcement evidence is not reaching the consumer, so in opt-in mode the
+      // wall is armed-but-not-draining: this is an UNSETTLED transport FAULT
+      // (`onDrainFault` → NOT-ARMED), NOT a settled diagnostic. We never throw
+      // out of the loop; the health machine (opt-in mode) decides whether to
+      // tear the activation down. Without an `onDrainFault` handler the loop
+      // simply retries on the next tick (the channel-basis floor behavior).
+      const fault = err instanceof Error ? err : new Error(String(err));
+      if (options.onDrainFault) options.onDrainFault(fault);
+      else options.onError?.(fault);
     }
     if (!stopped) {
       timer = setTimer(() => {

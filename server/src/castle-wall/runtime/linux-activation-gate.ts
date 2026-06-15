@@ -120,16 +120,28 @@ export interface ActivateLinuxProducerSignedInput {
   /** Skip starting the continuous drain loop (tests that drive drain manually). */
   startDrainLoop?: boolean;
   /**
-   * Sink for a durable NOT-ARMED / audit-failure signal when the drain loop hits
-   * a transport failure (FIX 4 — drain health is load-bearing in opt-in mode).
-   * The activation wraps the caller's `drainOptions.onError`: the FIRST drain
-   * transport failure trips `markDrainUnhealthy`, which records the failure and
-   * tears the activation down (so the wall is never silently armed-but-not-
-   * draining). When omitted, a default handler stops the drain loop on the first
-   * failure (still never silently "armed"). Tests inject this to assert the
-   * unhealthy transition + teardown fire.
+   * Hook for a durable NOT-ARMED / audit-failure signal when the drain loop hits
+   * an UNSETTLED transport/persistence FAULT (FIX 4 — drain health is
+   * load-bearing in opt-in mode). The activation routes only `onDrainFault`
+   * (NOT settled producer-signature refusals) here: the FIRST drain fault trips
+   * `markDrainUnhealthy`, which DURABLY records the failure and tears the
+   * activation down (so the wall is never silently armed-but-not-draining).
+   * `recordDurable` reports whether the not-armed record was persisted before
+   * this hook fired (false ⇒ the audit sink was itself unavailable; see
+   * `onAuditUnavailable`). Tests inject this to assert the unhealthy transition
+   * + teardown fire.
    */
-  onDrainUnhealthy?: (err: Error) => void;
+  onDrainUnhealthy?: (err: Error, info: { recordDurable: boolean }) => void;
+  /**
+   * Explicit FATAL hook for the "audit unavailable" path: a drain fault was
+   * observed (wall reads NOT-ARMED) but the durable not-armed record could NOT
+   * be persisted (the audit sink threw). Fail-closed + loud — there is no silent
+   * fall-back to a less-secure state. When omitted the fatal is still raised
+   * internally (the wall stays not-armed + the loop stops); this hook just lets
+   * the operator entrypoint surface it (e.g. crash the supervised process so a
+   * human notices the box is enforcing-blind).
+   */
+  onAuditUnavailable?: (fatal: RuntimeLinuxActivationError) => void;
 }
 
 /** A live producer-signed activation; close it on shutdown. */
@@ -139,13 +151,28 @@ export interface LinuxProducerSignedActivation {
   /** The drop-in path written, for diagnostics. */
   dropInPath: string;
   /**
-   * Whether the drain loop is still healthy. Returns false once a drain
-   * transport failure has tripped the durable NOT-ARMED / audit-failure signal
-   * (FIX 4): in opt-in mode a wedged drain means the wall is armed-but-not-
-   * draining, which must never read as healthy.
+   * Whether the drain loop is still healthy. Returns false the instant a drain
+   * transport/persistence FAULT is observed (FIX 4): in opt-in mode a wedged
+   * drain means the wall is armed-but-not-draining, which must never read as
+   * healthy. Flips synchronously when the fault is seen; the durable not-armed
+   * record + teardown then settle asynchronously (await `whenDrainSettled`).
    */
   drainHealthy(): boolean;
-  /** Tear down the drain loop + lifecycle (does NOT stop the systemd daemon). */
+  /**
+   * Resolves once the in-flight unhealthy-transition teardown has fully settled
+   * — i.e. the durable NOT-ARMED record was persisted (or the explicit
+   * audit-unavailable fatal path was taken) AND the drain loop was stopped.
+   * Resolves immediately when no transition is in flight. Round-3 HIGH: lets a
+   * caller/test prove the NOT-ARMED record is DURABLE before treating the
+   * transition as complete (the record append+flush is awaited, not
+   * fire-and-forget).
+   */
+  whenDrainSettled(): Promise<void>;
+  /**
+   * Tear down the drain loop + lifecycle (does NOT stop the systemd daemon).
+   * Awaits any in-flight unhealthy-transition teardown first, so a durable
+   * not-armed record is never lost to a teardown race.
+   */
   stop(): Promise<void>;
 }
 
@@ -291,27 +318,48 @@ export async function activateLinuxProducerSignedCastleWall(
   // P-2 (drain loop): pull signed events from the daemon into the consumer's
   // fail-closed re-verification gate.
   //
-  // FIX 4 (codex HIGH — swallowed drain failure → armed-but-not-draining).
+  // FIX 4 (codex HIGH — swallowed drain failure → armed-but-not-draining) +
+  // round-3 HIGHs: (1) the NOT-ARMED record must be DURABLE before the
+  // health-transition/teardown completes; (2) a SETTLED producer-signature
+  // refusal must NOT stop the loop like a transport failure.
   //
   // In opt-in producer-signed mode the drain loop is LOAD-BEARING: if the
   // transport to the daemon wedges, the daemon's signed enforcement evidence
   // never reaches the consumer, so a "running" lifecycle would be silently
-  // armed-but-not-draining. We make the FIRST drain transport failure trip a
-  // durable NOT-ARMED / audit-failure signal and stop the drain loop (mark
-  // unhealthy), so the failure is observable and the activation never pretends
-  // the wall is healthy. We wrap any caller-supplied `onError` so we don't
-  // swallow their diagnostics; the health transition is additive.
+  // armed-but-not-draining. We trip a durable NOT-ARMED signal + tear the
+  // activation down ONLY on an UNSETTLED drain FAULT (`onDrainFault`): a
+  // transport/persistence failure or a malformed entry — never on a settled
+  // refusal. A producer-signature REJECTION is the gate working as designed (it
+  // is durably recorded + acked by the consumer); routing it here would let a
+  // forged event DoS the wall into a false NOT-ARMED. Settled refusals flow
+  // through `onError` (diagnostics only) and the loop continues.
   let drain: LinuxAuditDrainHandle | null = null;
   let drainUnhealthy = false;
+  // The async teardown chain (durable record → caller hook → loop stop). The
+  // health transition is not COMPLETE until this settles, so callers/tests can
+  // await it. `drainHealthy()` flips to false synchronously at the START of the
+  // transition (the wall must read not-armed the instant a fault is seen), but
+  // the teardown completion is observable via `whenDrainSettled`.
+  let drainTeardown: Promise<void> = Promise.resolve();
   const callerOnError = input.drainOptions?.onError;
+  const callerOnDrainFault = input.drainOptions?.onDrainFault;
   const markDrainUnhealthy = (err: Error): void => {
     if (drainUnhealthy) return;
+    // Flip health to false SYNCHRONOUSLY: the instant a fault is observed the
+    // wall is not draining, so `drainHealthy()` must already read false even
+    // before the durable record lands.
     drainUnhealthy = true;
-    // Record the audit-failure / not-armed signal durably. The audit sink IS the
-    // tamper-evident record; emitting here means an operator/reader sees the wall
-    // stopped draining rather than a silent green. `append` may be sync (void) or
-    // async; wrap both so a sink error never escapes the error handler.
-    void (async () => {
+    drainTeardown = (async () => {
+      // Record the audit-failure / not-armed signal DURABLY *before* we treat the
+      // transition as complete. The audit sink IS the tamper-evident record;
+      // emitting here means an operator/reader sees the wall stopped draining
+      // rather than a silent green. Round-3 HIGH: the append+flush were
+      // previously fire-and-forget (unawaited, errors swallowed), so a process
+      // exit / sink failure could leave `drainHealthy()=false` with NO durable
+      // record. We now AWAIT both and, if the record cannot be persisted, take an
+      // EXPLICIT fatal "audit unavailable" path (fail-closed) rather than a silent
+      // drop. `append` may be sync (void) or async; `await` handles both.
+      let recordDurable = false;
       try {
         await input.auditSink.append(
           "l1",
@@ -321,28 +369,50 @@ export async function activateLinuxProducerSignedCastleWall(
             reason: err.message,
             evidence_basis: "producer_signed",
             armed: false,
-            note: "drain transport failed — wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
+            note: "drain transport/persistence fault — wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
           },
           "failure"
         );
         await input.auditSink.flush();
-      } catch {
-        // The durable record is best-effort; the health transition + teardown
-        // below are the load-bearing parts and still fire.
+        recordDurable = true;
+      } catch (recordErr) {
+        // Fail CLOSED + LOUD: the not-armed signal could not be made durable. We
+        // never silently lose the record. Surface an explicit "audit unavailable"
+        // fatal to the operator hook; the wall already reads not-armed
+        // (`drainUnhealthy = true` above) and the loop is still stopped below, so
+        // there is no fall-back to a less-secure (silent-green) state.
+        const fatal = new RuntimeLinuxActivationError(
+          `Castle Wall Linux activation: drain fault could NOT be durably recorded ` +
+            `(audit unavailable). Original fault: ${err.message}. ` +
+            `Record error: ${recordErr instanceof Error ? recordErr.message : String(recordErr)}.`,
+          "drain_failed"
+        );
+        input.onAuditUnavailable?.(fatal);
       }
+      // Surface the original fault to the caller's health hook (tests assert
+      // this fires). Pass whether the record was made durable so an operator can
+      // distinguish "recorded not-armed" from "not-armed AND audit unavailable".
+      input.onDrainUnhealthy?.(err, { recordDurable });
+      // Stop the loop so it cannot keep silently retrying a wedged link while the
+      // lifecycle still reports "running". Await it so the transition is fully
+      // settled (loop quiesced) before this promise resolves.
+      await drain?.stop().catch(() => {});
     })();
-    // Surface to the caller's health hook (tests assert this fires).
-    input.onDrainUnhealthy?.(err);
-    // Stop the loop so it cannot keep silently retrying a wedged link while the
-    // lifecycle still reports "running".
-    void drain?.stop().catch(() => {});
   };
 
   if (input.startDrainLoop !== false) {
     const drainOptions: LinuxAuditDrainOptions = {
       ...input.drainOptions,
+      // Settled diagnostics (e.g. a durably-recorded producer-signature refusal):
+      // pass through to the caller; the loop CONTINUES; health is untouched.
       onError: (err: Error) => {
         callerOnError?.(err);
+      },
+      // Unsettled FAULT (transport/persistence failure, malformed entry): this is
+      // the load-bearing NOT-ARMED case. Pass through to the caller, then trip
+      // the durable not-armed signal + teardown.
+      onDrainFault: (err: Error) => {
+        callerOnDrainFault?.(err);
         markDrainUnhealthy(err);
       },
     };
@@ -359,7 +429,12 @@ export async function activateLinuxProducerSignedCastleWall(
     dropInPath: launch.dropInPath,
     /** Whether the drain loop has tripped its unhealthy / not-armed signal. */
     drainHealthy: () => !drainUnhealthy,
+    /** Resolves once an in-flight unhealthy-transition teardown has settled. */
+    whenDrainSettled: () => drainTeardown,
     stop: async () => {
+      // Await any in-flight unhealthy-transition teardown first so we never lose
+      // the durable not-armed record to a teardown race.
+      await drainTeardown.catch(() => {});
       if (drain) await drain.stop();
       await lifecycle.stop();
     },
