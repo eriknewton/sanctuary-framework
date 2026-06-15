@@ -479,6 +479,84 @@ describe("agent-native Phase 2 cooperative surface", () => {
     }
   });
 
+  // Residual presence-oracle (codex MEDIUM): an in-place redaction projection
+  // leaves the sensitive KEY NAMES and the `[redacted]` sentinel in the search
+  // corpus, so probing a key name or the sentinel would differentially match
+  // entries that carry a policy-sensitive field. The search corpus OMITS those
+  // keys entirely, so a probe for a key name OR the sentinel yields the SAME
+  // result_count whether or not the entry has the sensitive field (no presence
+  // oracle). Verified differentially against a control entry that has none of
+  // the sensitive keys.
+  it("audit search does not leak sensitive key NAMES or the [redacted] sentinel via probing (presence oracle closed, property #11)", async () => {
+    const env = await setup();
+    const ownIdentity = env.identity.identity_id as string;
+
+    // Entry A: carries every sensitive detail key.
+    await env.auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: ownIdentity,
+      result: "failure",
+      details: {
+        decision: "deny_once",
+        rule_id: "deny-mac-rule",
+        rule_id_matched: "deny-linux-rule",
+        decision_provenance: "policy_path_provenance",
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]:
+          '{"rule_id_matched":"deny-in-blob","agent_id":"a"}',
+        dest_host: "host-a.example",
+      },
+    });
+    // Entry B (control): same shape, NONE of the sensitive keys present.
+    await env.auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: ownIdentity,
+      result: "success",
+      details: { decision: "allow", dest_host: "host-b.example" },
+    });
+
+    // Sanity: both entries are discoverable by the (non-sensitive) operation.
+    const byOperation = await callTool(env.facadeTools, "sanctuary_audit_search", {
+      query: "egress_blocked",
+      scope: "own_signed",
+    });
+    expect((byOperation.results as unknown[]).length).toBe(2);
+
+    // Probing a sensitive KEY NAME must NOT differentially reveal that entry A
+    // carries it: the key name is absent from the corpus, so zero matches —
+    // identical to the control entry that never had the key.
+    for (const keyName of [
+      "rule_id",
+      "rule_id_matched",
+      "decision_provenance",
+      CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+    ]) {
+      const probed = await callTool(env.facadeTools, "sanctuary_audit_search", {
+        query: keyName,
+        scope: "own_signed",
+      });
+      expect(
+        (probed.results as unknown[]).length,
+        `key-name probe "${keyName}" must not differentially match`
+      ).toBe(0);
+      expect(JSON.stringify(probed.results)).not.toContain(keyName);
+    }
+
+    // Probing the redaction SENTINEL must also not differentially match: an
+    // in-place projection would have written "[redacted]" into entry A's corpus
+    // for each stripped key, turning the sentinel itself into a presence oracle.
+    const sentinelProbe = await callTool(env.facadeTools, "sanctuary_audit_search", {
+      query: "[redacted]",
+      scope: "own_signed",
+    });
+    expect(
+      (sentinelProbe.results as unknown[]).length,
+      "sentinel probe must not differentially match"
+    ).toBe(0);
+    expect(JSON.stringify(sentinelProbe.results)).not.toContain("[redacted]");
+  });
+
   // The OPERATOR audit path stays full-fidelity over the SAME seeded entry: it
   // must still see the unredacted matched rule. The agent redaction is scoped to
   // the agent-facing search/read boundary only and must not bleed into operator

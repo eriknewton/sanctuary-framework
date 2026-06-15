@@ -9,10 +9,13 @@
  *   - `monitor_audit_log` (server/src/index.ts) — the agent-facing audit READ.
  *   - `sanctuary_audit_search` (server/src/agent-native/cooperative-surface.ts)
  *     — the agent-facing audit SEARCH. The search must build its match corpus
- *     from the REDACTED projection produced here, not from the raw entry, or a
- *     redacted field becomes a probing oracle: an agent could guess a `rule_id`
- *     (etc.) and learn a match differentially from `result_count` even though
- *     the returned rows omit details (property #11 violation).
+ *     via `buildAgentSearchCorpus` here, which OMITS the sensitive keys entirely,
+ *     not from the raw entry (and not from an in-place redaction either), or a
+ *     sensitive field becomes a probing oracle: an agent could guess a `rule_id`
+ *     value — OR probe the sensitive key NAME / the `[redacted]` sentinel that an
+ *     in-place projection would leave behind — and learn a match differentially
+ *     from `result_count` even though the returned rows omit details
+ *     (property #11 violation).
  *
  * The OPERATOR audit path (the CLI audit-dump / per-rule read-out in
  * server/src/castle-wall/audit/per-rule-report.ts) is full-fidelity and MUST
@@ -100,18 +103,53 @@ export function redactAuditEntryForAgent(entry: AuditEntry): AuditEntry {
 }
 
 /**
- * The agent-redacted detail projection used as the SEARCH corpus for the
- * agent-facing `sanctuary_audit_search`. Returns the entry's `details` with
- * every policy-inference-sensitive key replaced by the redaction sentinel, so
- * searching/filtering over it can never differentially hit a redacted field's
- * real value — closing the no-policy-inference probing oracle (property #11).
+ * Recursively DROP every policy-inference-sensitive key from a details value,
+ * keeping non-sensitive keys (and recursing into their nested values). Unlike
+ * `redactAuditValueForAgent`, which replaces a sensitive value IN PLACE with the
+ * `[redacted]` sentinel, this removes the key/value pair ENTIRELY: neither the
+ * sensitive key NAME nor the sentinel string survives. Arrays are mapped through
+ * element-wise; non-object scalars pass through unchanged.
+ */
+function dropAgentSensitiveDetailKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => dropAgentSensitiveDetailKeys(item));
+  }
+  if (value && typeof value === "object") {
+    const projected: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if (AUDIT_AGENT_REDACT_DETAIL_KEYS.has(key)) continue;
+      projected[key] = dropAgentSensitiveDetailKeys(nested);
+    }
+    return projected;
+  }
+  return value;
+}
+
+/**
+ * Build the agent-facing SEARCH corpus projection of an entry's `details` for
+ * `sanctuary_audit_search`. Every policy-inference-sensitive key in
+ * AUDIT_AGENT_REDACT_DETAIL_KEYS is OMITTED entirely — its key name, its value,
+ * AND the `[redacted]` sentinel are all absent from the result.
+ *
+ * Omitting (rather than redacting-in-place) closes the residual presence oracle
+ * left by an in-place projection: with `rule_id` -> `[redacted]` the key name
+ * `"rule_id"` and the literal `"[redacted]"` both stay in the search string, so
+ * an agent could probe for a sensitive key name OR the sentinel and read a
+ * differential `result_count`, learning WHICH entries carry a policy-sensitive
+ * field even though it never recovers the value (property #11, no-policy-
+ * inference). After this projection a probe for a sensitive key name, the
+ * sentinel, or a sensitive value yields no differential match; non-sensitive
+ * fields (e.g. `operation`, `dest_host`, `decision`) stay searchable.
  *
  * Returns an empty object for entries with no details, so callers can build a
- * stable corpus string without special-casing.
+ * stable corpus string without special-casing. Reuses the single-sourced
+ * AUDIT_AGENT_REDACT_DETAIL_KEYS set: adding a key there closes the read, the
+ * in-place redaction, AND this search corpus together. The OPERATOR audit-search
+ * path stays full-fidelity and MUST NOT use this projection.
  */
-export function redactAuditDetailsForAgent(
+export function buildAgentSearchCorpus(
   entry: Pick<AuditEntry, "details">
 ): Record<string, unknown> {
   if (!entry.details) return {};
-  return redactAuditValueForAgent(entry.details) as Record<string, unknown>;
+  return dropAgentSensitiveDetailKeys(entry.details) as Record<string, unknown>;
 }
