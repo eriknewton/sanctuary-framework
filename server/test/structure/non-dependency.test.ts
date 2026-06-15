@@ -10,11 +10,14 @@
  * (fresh-install tests still pass because the dev box has both checked out).
  *
  * Until now this was a prose review gate the coordinator checked by hand. This
- * test converts it into a CI-failing fact: it scans EVERY `server/src/**` TS
- * file and fails if any of them imports an external Concordia/Verascore
- * package, or reaches OUTSIDE `server/src` into a Concordia/Verascore package
- * directory (e.g. the `sidecars/concordia/` sidecar source or a sibling
- * `Concordia/` / `Verascore/` checkout).
+ * test converts it into a CI-failing fact: it scans EVERY first-party TS file
+ * (`firstPartySourceFiles()` — server/src, menubar/, quickstart/, scripts/, and
+ * server config, not just server/src) and fails if any of them imports an
+ * external Concordia/Verascore package, or reaches OUTSIDE its tree into a
+ * Concordia/Verascore package directory (e.g. the `sidecars/concordia/` sidecar
+ * source or a sibling `Concordia/` / `Verascore/` checkout). A package.json
+ * manifest scan over the root, server, menubar, and quickstart packages
+ * backstops a declared-but-unimported hard dependency.
  *
  * IMPORT-AWARE VIA THE TS COMPILER (not a regex): the specifiers are extracted
  * by parsing each file with the TypeScript compiler API and walking the AST, so

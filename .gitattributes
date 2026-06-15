@@ -1,0 +1,11 @@
+# Sanctuary repository git attributes.
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+
+# Append-only audit logs: union-merge so two branches that both append a line
+# (e.g. an emergency `SKIP_TEST_BASELINE=1` commit on each side) keep BOTH lines
+# on rebase/merge instead of producing a textual conflict. The log is a tracked,
+# deliberate audit trail (NOT gitignored); union-merge preserves every entry.
+# DoE re-review 3a / N-3 (2026-06-15): this log conflicted on every rebase
+# before this attribute existed.
+/.test-baseline-overrides.log merge=union

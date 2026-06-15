@@ -1350,7 +1350,7 @@ function defaultRekorFloorDeps(args: {
       const { readAnchorConfig, anchorReceiptsPresentOnDisk } = await import(
         "../transparency/anchoring.js"
       );
-      let configEnabled = false;
+      let configEnabled: boolean;
       try {
         const state = await readAnchorConfig({
           storage: args.storage,

@@ -272,6 +272,14 @@ export async function classifyApprovalRequest(params: {
     }));
   } catch (error) {
     if (error instanceof ToolArgumentValidationError) {
+      // SECURITY: do NOT attach `error` as the thrown error's `cause`. The
+      // FIXED_DENIAL_MESSAGE is a fixed, generic denial by design (no-policy-
+      // inference invariant): denials must not reveal which rule, tier, or
+      // validation path triggered them. Threading the original
+      // ToolArgumentValidationError through `cause` would leak that internal
+      // detail to an agent-reachable surface, so the cause is deliberately
+      // dropped here.
+      // eslint-disable-next-line preserve-caught-error -- intentional: see SECURITY note above
       throw new Error(FIXED_DENIAL_MESSAGE);
     }
     throw error;
