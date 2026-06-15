@@ -384,6 +384,13 @@ export async function bootServiceInstalled(
   if (!/<key>RunAtLoad<\/key>\s*<true\s*\/>/.test(contents)) return false;
   if (!contents.includes("<string>--safe-mode</string>")) return false;
   if (expectedFortressPath !== undefined) {
+    // Reject a malformed plist with DUPLICATE SANCTUARY_STORAGE_PATH keys: plist
+    // semantics make the LAST duplicate effective, so a first-match read could be
+    // fooled (first=expected, later=the fortress launchd actually boots). A
+    // well-formed Sanctuary plist embeds exactly one; any other count fails closed.
+    const storageKeyCount = (contents.match(/<key>SANCTUARY_STORAGE_PATH<\/key>/g) ?? [])
+      .length;
+    if (storageKeyCount !== 1) return false;
     const storagePathMatch =
       /<key>SANCTUARY_STORAGE_PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(contents);
     if (!storagePathMatch) return false;

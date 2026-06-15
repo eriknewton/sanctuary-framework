@@ -321,6 +321,18 @@ describe("castle-wall boot service (F1 Option C)", () => {
       );
     });
 
+    it("returns false on duplicate SANCTUARY_STORAGE_PATH keys (last-wins evasion)", async () => {
+      const path = join(await makeTemp("f1-plist-"), "dupkey.plist");
+      // First key matches the expected fortress (would fool a first-match read),
+      // but launchd makes the LATER duplicate effective — fail closed on the dup.
+      const dupPlist = validPlist.replace(
+        /(<key>SANCTUARY_STORAGE_PATH<\/key>\s*<string>[^<]*<\/string>)/,
+        "$1\n\t\t<key>SANCTUARY_STORAGE_PATH</key>\n\t\t<string>/Users/operator/evil-sanctuary</string>",
+      );
+      await writeFile(path, dupPlist);
+      expect(await bootServiceInstalled(path, "/Users/operator/.sanctuary")).toBe(false);
+    });
+
     it("keeps legacy validation when no expected fortress path is provided", async () => {
       const path = join(await makeTemp("f1-plist-"), "boot.plist");
       await writeFile(
