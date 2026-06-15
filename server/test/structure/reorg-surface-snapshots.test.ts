@@ -20,7 +20,10 @@
  *      tool `description` fields ARE the agent-facing pitch and are iterated
  *      independently of any reorg). Snapshotting them here would red every
  *      legitimate doc/copy PR. So the golden freezes the WIRE CONTRACT
- *      ({name, inputSchema}) and omits the prose. NOTE: per-parameter schema
+ *      ({name, inputSchema}) and omits the prose — but a separate presence guard
+ *      ("every wire tool emits a non-empty string description") still requires the
+ *      field to EXIST and be non-empty, so deleting a description entirely is
+ *      caught even though WHAT it says is free to change. NOTE: per-parameter schema
  *      descriptions INSIDE inputSchema are part of the JSON-Schema contract a
  *      client validates/branches on, so they stay in the snapshot — only the
  *      top-level tool description is dropped. The richer internal metadata —
@@ -90,6 +93,27 @@ async function listToolWire(
   return result.tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema }));
 }
 
+/**
+ * Issue tools/list and return each tool's {name, description} as emitted on the
+ * wire. The golden deliberately omits the description PROSE (it is iterated AI-
+ * agent copy), but the field must still EXIST and be non-empty — see the
+ * "every wire tool has a non-empty description" guard. Kept separate from
+ * listToolWire so the golden comparison never sees the prose.
+ */
+async function listToolDescriptions(
+  server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
+): Promise<Array<{ name: string; description: unknown }>> {
+  const handler = (
+    server as unknown as { _requestHandlers: Map<string, (...a: unknown[]) => unknown> }
+  )._requestHandlers.get("tools/list");
+  if (!handler) throw new Error("tools/list handler not registered");
+  const result = (await handler(
+    { method: "tools/list", params: {} },
+    {},
+  )) as { tools: Array<{ name: string; description?: unknown }> };
+  return result.tools.map((t) => ({ name: t.name, description: t.description }));
+}
+
 describe("reorg surface snapshot: MCP tools/list wire shape", () => {
   it("the agent-facing tool catalog matches the committed wire golden (names + inputSchema + order + count)", async () => {
     const golden = JSON.parse(
@@ -143,6 +167,31 @@ describe("reorg surface snapshot: MCP tools/list wire shape", () => {
     const names = (await listToolWire(server)).map((t) => t.name);
     const dupes = names.filter((n, i) => names.indexOf(n) !== i);
     expect(dupes, `duplicate tool names: ${dupes.join(", ")}`).toEqual([]);
+  });
+
+  // The wire golden EXCLUDES the description prose by design (it is iterated AI-
+  // agent copy). That exclusion left a gap: deleting a tool's description entirely
+  // — emitting `description: ""` or omitting the field — would not trip any
+  // snapshot. This guard closes it WITHOUT putting the prose in the golden: every
+  // tool must emit a non-empty string `description` on the wire (the agent-facing
+  // pitch must exist), while WHAT it says stays free to change.
+  it("every wire tool emits a non-empty string description (prose still excluded from the golden)", async () => {
+    const { server } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "snapshot-harness-deterministic-v1",
+    });
+    const tools = await listToolDescriptions(server);
+
+    const offenders = tools.filter(
+      (t) => typeof t.description !== "string" || t.description.trim() === "",
+    );
+    expect(
+      offenders.map((t) => t.name),
+      "these tools have a missing/empty/non-string wire `description`. The " +
+        "description PROSE is intentionally not snapshotted (it is iterated agent " +
+        "copy), but the field must EXIST and be non-empty — an agent reads it to " +
+        "decide whether/how to call the tool. Give each a real description.",
+    ).toEqual([]);
   });
 });
 

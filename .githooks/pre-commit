@@ -124,16 +124,60 @@ ok "Gate 1/2: typecheck clean."
 # ── Gate 2: transform-error detection + test baseline ───────────────
 log "Gate 2/2: npm test + transform-error detection + baseline check"
 
-# Read the baseline integer from .test-baseline.
-if [[ ! -f .test-baseline ]]; then
-  fail ".test-baseline file missing at repo root"
-  printf '[baseline-guard]   Create it with a single integer: the current passing count.\n' >&2
+# Resolve the enforcement floor from the SOURCE THAT WILL BE COMMITTED — never the
+# unstaged working tree (the bypass this guard closes).
+#
+# Why not the working tree: if we read .test-baseline off disk here, an author
+# could raise it on disk (so passing == the on-disk number) WITHOUT staging it.
+# Then the fail-above ratchet check below (passing > baseline) sees passing ==
+# baseline and skips entirely, so the actually-committed floor stays stale and a
+# later regression can hide under it. The on-disk edit isn't even part of the
+# commit. So the floor must come from git's object store, not the working tree.
+#
+# The floor IN EFFECT for this commit is HEAD's committed blob
+# (`HEAD:.test-baseline`). A STAGED raise is a *proposed* new floor and is
+# validated separately, in the fail-above block, by comparing the staged blob
+# (`:.test-baseline`) against HEAD and requiring a strict increase. Keeping the
+# regression/trigger floor at HEAD avoids a false "regression" when a Linux-floor
+# bump is staged that is (legitimately) below the higher local macOS passing count.
+baseline_is_staged=""
+if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
+  baseline_is_staged="yes"
+fi
+
+# `|| true`: under `set -o pipefail` a failing `git show` (e.g. no HEAD on the
+# first-ever commit) would otherwise propagate non-zero through the command
+# substitution and abort the hook under `set -e`. We want the empty-value handling
+# below to run instead.
+baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+# First-ever commit of the file (no HEAD blob): treat the floor as 0 so the
+# fail-above block requires the introducing value to be staged and validated.
+if [[ -z "$baseline" ]]; then
+  baseline=0
+fi
+if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
+  fail "committed .test-baseline (HEAD:.test-baseline) is not a single integer, got: '$baseline'"
   exit 1
 fi
-baseline=$(tr -d '[:space:]' < .test-baseline)
-if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
-  fail ".test-baseline must contain a single integer, got: '$baseline'"
+
+# A .test-baseline must exist on disk for the repo to be in a sane state, but its
+# CONTENT is intentionally NOT used for enforcement (see above). Missing-file is
+# still worth flagging unless it is being introduced (staged) in this commit.
+if [[ ! -f .test-baseline && -z "$baseline_is_staged" ]]; then
+  fail ".test-baseline file missing at repo root"
+  printf '[baseline-guard]   Create it with a single integer (the current passing count) and stage it.\n' >&2
   exit 1
+fi
+
+# Defense-in-depth diagnostic: if the working-tree file disagrees with the
+# enforced (committed) floor, surface it. An UNSTAGED raise is exactly the bypass
+# shape, so make it loud — it is being IGNORED for enforcement, by design.
+if [[ -f .test-baseline ]]; then
+  worktree_baseline=$(tr -d '[:space:]' < .test-baseline)
+  if [[ "$worktree_baseline" =~ ^[0-9]+$ && "$worktree_baseline" != "$baseline" && -z "$baseline_is_staged" ]]; then
+    warn "working-tree .test-baseline ($worktree_baseline) differs from the committed floor ($baseline) and is UNSTAGED."
+    warn "The unstaged edit will NOT be committed and is IGNORED for enforcement. Stage it (git add .test-baseline) to make it count."
+  fi
 fi
 
 # Count test files on disk (expected).
@@ -253,8 +297,8 @@ fi
 
 if (( passing < baseline )); then
   fail "TEST BASELINE REGRESSION — commit blocked"
-  printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
-  printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
+  printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
+  printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
   printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
   printf '\n' >&2
   fail "Fix the regression, or update .test-baseline in a separate"
@@ -286,15 +330,11 @@ fi
 # floor stale (or pushing it down so a real regression slips under it). So we
 # compare the staged blob against HEAD's blob and require a strict increase.
 if (( passing > baseline )); then
-  baseline_staged=""
-  if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
-    baseline_staged="yes"
-  fi
-  if [[ -z "$baseline_staged" ]]; then
+  if [[ -z "$baseline_is_staged" ]]; then
     fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
-    printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
-    printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
-    printf '[baseline-guard]   Unaccounted above floor:   %s\n' "$((passing - baseline))" >&2
+    printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
+    printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
+    printf '[baseline-guard]   Unaccounted above floor:               %s\n' "$((passing - baseline))" >&2
     printf '\n' >&2
     fail "Account for the drift IN THIS COMMIT: raise .test-baseline (by the"
     fail "number of NEW tests that run on Linux CI, per the baseline-floor"
@@ -311,13 +351,13 @@ if (( passing > baseline )); then
   # `HEAD:.test-baseline`. On the very first commit of the file there is no
   # HEAD blob, so the prior value is treated as 0 and any positive staged
   # value qualifies as an upward bump.
-  staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]')
+  staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   if ! [[ "$staged_baseline" =~ ^[0-9]+$ ]]; then
     fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
     exit 1
   fi
-  prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]')
+  prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   if ! [[ "$prev_baseline" =~ ^[0-9]+$ ]]; then
     prev_baseline=0
   fi
