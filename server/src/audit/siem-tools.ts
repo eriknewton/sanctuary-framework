@@ -12,10 +12,7 @@ import type { ToolDefinition } from "../router.js";
 import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
 import type { SessionBinding } from "../agent-native/safety-base.js";
 import { formatAsCEF, formatAsOCSF, agentDecision } from "./siem-formatter.js";
-import {
-  redactAuditEntryForAgent,
-  buildAgentSearchCorpus,
-} from "../l2-operational/agent-audit-redaction.js";
+import { redactAuditEntryForAgent } from "../l2-operational/agent-audit-redaction.js";
 
 export function createSIEMTools(
   auditLog: AuditLog,
@@ -196,23 +193,26 @@ export function createSIEMTools(
           };
         }
 
-        // Query audit log (over-fetch, then own-identity filter, then bound by
-        // limit so `limit` bounds the caller's OWN entries).
+        // Query audit log scoped to the caller's identity BEFORE the limit
+        // (AuditLog.query applies identity_id before its slice), so the
+        // over-fetch window is entirely the caller's OWN entries — a caller with
+        // many other-identity entries ahead of theirs is no longer undercounted
+        // (CISO LOW, 2026-06-16). `result.total` is the caller's own in-window
+        // population; the remaining tool/decision/result/until filters + the
+        // final limit slice are applied below.
         const result = await auditLog.query({
           since,
           layer: filterLayer,
           operation_type: undefined, // Will filter after
+          identity_id: binding.identity_id,
           limit: 1000,
         });
 
-        const totalAvailable = result.entries.filter(
-          (e: AuditEntry) => e.identity_id === binding.identity_id
-        ).length;
+        const totalAvailable = result.total;
 
-        // Apply additional filters (own-identity, tool name, decision, result).
-        let filtered = result.entries.filter(
-          (e: AuditEntry) => e.identity_id === binding.identity_id
-        );
+        // Apply additional filters (tool name, decision, result); entries are
+        // already own-identity-scoped by the query above.
+        let filtered = result.entries;
 
         if (filterTool) {
           filtered = filtered.filter((e: AuditEntry) =>
@@ -222,19 +222,17 @@ export function createSIEMTools(
 
         if (filterDecision) {
           // Filter on the AGENT-SAFE coarse decision (2-valued allow/deny),
-          // derived from the allowlisted `decision` value + result — never the
-          // raw operator `gate_decision` detail (which would re-introduce a
-          // policy read). The schema enum keeps approve/deny/auto-allow for
-          // back-compat, but "approve" and "auto-allow" both map to the coarse
-          // "allow" (the approve-vs-auto distinction is a tier signal we do not
-          // expose).
+          // derived from the entry `result` alone — never the raw operator
+          // `gate_decision` detail NOR the fine-grained `decision` value (both
+          // would re-introduce a policy read; `decision` was removed from the
+          // agent corpus, CISO HIGH 2026-06-16). The schema enum keeps
+          // approve/deny/auto-allow for back-compat, but "approve" and
+          // "auto-allow" both map to the coarse "allow" (the approve-vs-auto
+          // distinction is a tier signal we do not expose).
           const wantDeny = filterDecision === "deny";
           filtered = filtered.filter((e: AuditEntry) => {
             const view = redactAuditEntryForAgent(e);
-            const safeDecision = buildAgentSearchCorpus(e).decision as
-              | string
-              | undefined;
-            const coarse = agentDecision(view, safeDecision);
+            const coarse = agentDecision(view);
             return wantDeny ? coarse === "deny" : coarse === "allow";
           });
         }
@@ -258,19 +256,16 @@ export function createSIEMTools(
         let output: string;
 
         if (format === "cef") {
+          // Coarse severity/outcome derives from the agent view's `result` only;
+          // the fine-grained `decision` is no longer a safe source (removed from
+          // the agent corpus, CISO HIGH 2026-06-16), so it is not threaded in.
           const cefLines = filtered.map((entry: AuditEntry) =>
-            formatAsCEF(
-              redactAuditEntryForAgent(entry),
-              buildAgentSearchCorpus(entry).decision as string | undefined
-            )
+            formatAsCEF(redactAuditEntryForAgent(entry))
           );
           output = cefLines.join("\n");
         } else {
           const ocsfObjects = filtered.map((entry: AuditEntry) =>
-            formatAsOCSF(
-              redactAuditEntryForAgent(entry),
-              buildAgentSearchCorpus(entry).decision as string | undefined
-            )
+            formatAsOCSF(redactAuditEntryForAgent(entry))
           );
           output = JSON.stringify(ocsfObjects, null, 2);
         }

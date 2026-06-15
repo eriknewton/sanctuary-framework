@@ -82,25 +82,29 @@ export function redactAuditEntryForAgent(entry: AuditEntry): AgentAuditView {
 
 /**
  * Curated allowlist of `details` keys that are SAFE to expose to the agent-facing
- * audit SEARCH corpus. These are values the calling agent already supplied or
- * already knows about its OWN activity (the coarse allow/deny decision and the
- * egress destination it itself targeted), and which carry no policy-inference
- * signal (no rule id, no tier, no threshold, no decision-provenance). Everything
- * NOT listed here — including the free-text `reason`, every `*rule_id*`,
- * `tier`/`policy_*`, `decision_provenance`, and the producer-signed canonical
- * blob — is omitted from the search corpus entirely, so it is neither returned
- * NOR differentially probeable.
+ * audit SEARCH corpus. These are values the calling agent already supplied — the
+ * egress destination it itself targeted — and which carry no policy-inference
+ * signal (no rule id, no tier, no threshold, no decision granularity, no
+ * decision-provenance). Everything NOT listed here — including the free-text
+ * `reason`, the fine-grained `decision`, every `*rule_id*`, `tier`/`policy_*`,
+ * `decision_provenance`, and the producer-signed canonical blob — is omitted from
+ * the search corpus entirely, so it is neither returned NOR differentially
+ * probeable.
  *
- * Keep this list TINY and obviously-safe. The bar for adding a key: an agent
- * already knows the value for its own operations, and the value reveals nothing
- * about the operator's policy. When in doubt, leave it out — that is the whole
- * point of an allowlist.
+ * `decision` was DELIBERATELY REMOVED (CISO HIGH, 2026-06-16): although the agent
+ * observes the coarse allow/deny of its own call, the persisted `decision` is
+ * fine-grained (`allow_once`/`allow_always`/`deny_once`/`deny_always`/
+ * `timeout_default_deny`, castle-wall/ipc/messages.ts). Indexing it let a
+ * cooperative agent probe `result_count` to learn WHICH policy disposition fired
+ * (e.g. an always-rule vs a once-prompt, or a timeout default-deny) — a
+ * policy-inference oracle. The agent already knows pass/fail from its own call
+ * result; the granularity is the operator's policy and stays off the corpus.
+ *
+ * Keep this list TINY and obviously-safe. The bar for adding a key: the agent
+ * itself supplied the value, and the value reveals nothing about the operator's
+ * policy. When in doubt, leave it out — that is the whole point of an allowlist.
  */
 export const AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS = new Set<string>([
-  // The coarse allow/deny outcome of the agent's own operation (e.g. "allow",
-  // "deny_once"). Not a rule id, not a tier — just the decision the agent could
-  // already observe from whether its call succeeded.
-  "decision",
   // The egress destination the agent itself targeted. The agent supplied this;
   // it is not operator policy.
   "dest_host",

@@ -581,19 +581,18 @@ export async function createSanctuaryServer(options?: {
           return toolResult({ entries: [], count: 0 });
         }
         const limit = Math.max(1, (args.limit as number) ?? 50);
-        // Query a wider window, then filter to the caller's identity, then slice,
-        // so `limit` bounds the caller's OWN entries (not a global page that may
-        // contain few/none of theirs).
+        // Filter to the caller's identity BEFORE the limit (AuditLog.query
+        // applies identity_id before its slice), so `limit` bounds the caller's
+        // OWN entries — a caller with many other-identity entries ahead of theirs
+        // in the window no longer gets undercounted (CISO LOW, 2026-06-16).
         const result = await auditLog.query({
           since: args.since as string | undefined,
           layer: args.layer as "l1" | "l2" | "l3" | "l4" | undefined,
           operation_type: args.operation_type as string | undefined,
-          limit: 500,
+          identity_id: binding.identity_id,
+          limit,
         });
-        const own = result.entries
-          .filter((entry) => entry.identity_id === binding.identity_id)
-          .slice(-limit)
-          .map((entry) => redactAuditEntryForAgent(entry));
+        const own = result.entries.map((entry) => redactAuditEntryForAgent(entry));
         return toolResult({ entries: own, count: own.length });
       },
     },

@@ -810,11 +810,20 @@ export function createAgentNativeCooperativeTools(
           cursor.reads += 1;
           if (cursor.reads > 10) return deny("audit:sanctuary_events_read", "wait", "minutes");
           const limit = Math.min(25, Math.max(1, Number((args.opts as Record<string, unknown> | undefined)?.limit ?? 10)));
+          // Scope to the caller's identity BEFORE the limit (AuditLog.query
+          // filters identity_id before its slice) so the 500-entry window is
+          // entirely the caller's OWN entries — cursor paging no longer drops a
+          // caller's older entries that sat behind other identities' (CISO LOW,
+          // 2026-06-16).
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
-            options.auditLog.query({ operation_type: cursor.operation, limit: 500 })
+            options.auditLog.query({
+              operation_type: cursor.operation,
+              identity_id: activeIdentity.identity_id,
+              limit: 500,
+            })
           );
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
-          const own = queried.entries.filter((entry) => entry.identity_id === activeIdentity.identity_id);
+          const own = queried.entries;
           const page = own.slice(cursor.offset, cursor.offset + limit);
           cursor.offset += page.length;
           const auditRef = await audit("sanctuary_events_read", { count: page.length });
@@ -864,27 +873,36 @@ export function createAgentNativeCooperativeTools(
         try {
           if (args.scope && args.scope !== "own_signed") return deny("audit:sanctuary_audit_search");
           const activeIdentity = active();
+          // Scope to the caller's identity BEFORE the limit (AuditLog.query
+          // filters identity_id before its slice) so the 500-entry search window
+          // is entirely the caller's OWN entries — a caller with many
+          // other-identity entries ahead of theirs no longer has older own
+          // entries pushed out of the searchable window (CISO LOW, 2026-06-16).
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
-            options.auditLog.query({ limit: 500 })
+            options.auditLog.query({
+              identity_id: activeIdentity.identity_id,
+              limit: 500,
+            })
           );
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_audit_search");
           const needle = String(args.query).toLowerCase();
           const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10)));
           const matches = queried.entries
-            .filter((entry) => entry.identity_id === activeIdentity.identity_id)
             // Search the AGENT search-corpus projection, never the raw entry
             // (property #11, no-policy-inference; LOW-1). The needle is matched
             // ONLY against the operation name plus the search-ALLOWLIST of safe
             // detail keys (buildAgentSearchCorpus) — a tiny, explicitly non-
-            // policy subset (decision, dest_host/destination). Every other key —
-            // the free-text `reason`, every `*rule_id*`, `tier`/`policy_*`,
-            // `decision_provenance`, the signed-canonical blob, and any NEW
-            // operator-attribution field — is absent from the corpus, so a probe
-            // for a sensitive value, a sensitive key NAME, or any sentinel can
-            // never differentially match off `result_count`. Because it is an
-            // allowlist, adding a sensitive detail key later cannot regress this.
-            // The OPERATOR audit-search path stays full-fidelity (it does not
-            // call this projection).
+            // policy subset (dest_host/destination — the egress targets the agent
+            // itself supplied). Every other key — the free-text `reason`, the
+            // fine-grained `decision` (REMOVED 2026-06-16: it let an agent probe
+            // WHICH policy disposition fired off `result_count`), every
+            // `*rule_id*`, `tier`/`policy_*`, `decision_provenance`, the
+            // signed-canonical blob, and any NEW operator-attribution field — is
+            // absent from the corpus, so a probe for a sensitive value, a
+            // sensitive key NAME, or any sentinel can never differentially match
+            // off `result_count`. Because it is an allowlist, adding a sensitive
+            // detail key later cannot regress this. The OPERATOR audit-search
+            // path stays full-fidelity (it does not call this projection).
             .filter((entry) =>
               `${entry.operation} ${canonicalJson(buildAgentSearchCorpus(entry))}`
                 .toLowerCase()

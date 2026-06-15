@@ -46,11 +46,25 @@ function createTestEntry(overrides?: Partial<AuditEntry>): AuditEntry {
   };
 }
 
-/** The allowlisted view + safe coarse decision the formatters actually receive. */
+/**
+ * The allowlisted view the formatters actually receive in production.
+ *
+ * NOTE (CISO HIGH, 2026-06-16): `decision` was removed from the agent search
+ * corpus, and siem-tools.ts NO LONGER threads a `safeDecision` to the
+ * formatters — the coarse allow/deny outcome derives from the entry `result`
+ * alone. So `safeDecision` is `undefined` here, mirroring production. The
+ * formatter's `safeDecision` PARAMETER still exists and is honored when passed;
+ * its decision-string→outcome contract is covered directly in the `agentDecision`
+ * unit tests below.
+ */
 function viewOf(entry: AuditEntry): { view: AgentAuditView; safeDecision?: string } {
+  // Reference buildAgentSearchCorpus so this test still pins that `decision` is
+  // NOT in the corpus (it returns undefined); production derives outcome from
+  // `result`, so we pass no safeDecision.
+  void buildAgentSearchCorpus(entry).decision;
   return {
     view: redactAuditEntryForAgent(entry),
-    safeDecision: buildAgentSearchCorpus(entry).decision as string | undefined,
+    safeDecision: undefined,
   };
 }
 
@@ -134,21 +148,20 @@ describe("CEF Format (allowlist)", () => {
     });
   });
 
-  describe("Outcome derivation", () => {
-    it("derives outcome=deny from a deny/drop/block decision", () => {
-      for (const d of ["deny_once", "drop", "block"]) {
-        expect(cefOf(createTestEntry({ details: { decision: d } }))).toContain(
-          "outcome=deny"
-        );
-      }
+  describe("Outcome derivation (from result; decision no longer threaded)", () => {
+    // Production derives the coarse outcome from `result` alone now (decision
+    // removed from the corpus, CISO HIGH 2026-06-16). The decision-string→outcome
+    // contract of the agentDecision PARAMETER is covered directly below.
+    it("derives outcome=deny from a failure result (even if details carry a deny decision)", () => {
+      expect(
+        cefOf(createTestEntry({ result: "failure", details: { decision: "deny_once" } }))
+      ).toContain("outcome=deny");
     });
 
-    it("derives outcome=allow from allow/approve/auto-allow decisions", () => {
-      for (const d of ["allow", "approve", "auto-allow"]) {
-        expect(cefOf(createTestEntry({ details: { decision: d } }))).toContain(
-          "outcome=allow"
-        );
-      }
+    it("derives outcome=allow from a success result (even if details carry a decision)", () => {
+      expect(
+        cefOf(createTestEntry({ result: "success", details: { decision: "allow" } }))
+      ).toContain("outcome=allow");
     });
 
     it("should include timestamp in rt field as milliseconds", () => {

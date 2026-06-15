@@ -23,8 +23,11 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createSanctuaryServer } from "../../src/index.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -37,6 +40,10 @@ import { createSIEMTools } from "../../src/audit/siem-tools.js";
 import { createServer } from "../../src/router.js";
 import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import type { ToolDefinition } from "../../src/router.js";
+import { Broker } from "../../src/l3-disclosure/broker/broker.js";
+import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
+import type { Backend } from "../../src/l3-disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../src/l3-disclosure/broker/backend-interface.js";
 
 const ALLOWED_VIEW_KEYS = [...AGENT_AUDIT_VIEW_FIELDS].sort();
 
@@ -128,20 +135,22 @@ describe("agent-audit-allowlist: unit (redactAuditEntryForAgent)", () => {
     expect(view.has_details).toBe(false);
   });
 
-  it("search corpus is an ALLOWLIST: only safe keys survive; reason/rule_id/tier omitted", () => {
+  it("search corpus is an ALLOWLIST: only safe keys survive; decision/reason/rule_id/tier omitted", () => {
     const corpus = buildAgentSearchCorpus({
       details: {
-        decision: "deny_once",
         dest_host: "host.example",
         // none of these may appear in the corpus:
+        decision: "deny_once", // REMOVED 2026-06-16 (policy-disposition oracle)
         reason: "Signing frequency (7/min) exceeds limit (5/min)",
         rule_id: "deny-secret-rule",
         tier: 2,
         decision_provenance: "policy-path",
       },
     });
-    expect(corpus).toEqual({ decision: "deny_once", dest_host: "host.example" });
+    expect(corpus).toEqual({ dest_host: "host.example" });
     const serialized = JSON.stringify(corpus);
+    expect(serialized).not.toContain("decision");
+    expect(serialized).not.toContain("deny_once");
     expect(serialized).not.toContain("reason");
     expect(serialized).not.toContain("exceeds limit");
     expect(serialized).not.toContain("rule_id");
@@ -153,8 +162,10 @@ describe("agent-audit-allowlist: unit (redactAuditEntryForAgent)", () => {
   it("the searchable allowlist stays tiny and obviously-safe (guard against scope creep)", () => {
     // If this changes, a reviewer must consciously confirm the new key carries
     // no policy-inference signal. Keep it minimal — that is the allowlist's point.
+    // `decision` was REMOVED 2026-06-16: its fine granularity
+    // (allow_once/allow_always/deny_once/deny_always/timeout_default_deny) let an
+    // agent probe WHICH policy disposition fired off `result_count`.
     expect([...AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS].sort()).toEqual([
-      "decision",
       "dest_host",
       "destination",
     ]);
@@ -446,9 +457,9 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
       identity_id: owner,
       result: "failure",
       details: {
-        decision: "deny_once", // allowlisted-searchable, safe
-        dest_host: "host.example", // allowlisted-searchable, safe
+        dest_host: "host.example", // allowlisted-searchable (agent-supplied), safe
         // Everything below must NEVER reach an agent surface:
+        decision: "deny_once", // REMOVED from the search corpus 2026-06-16
         reason: THRESHOLD,
         tier: 2,
         rule_id: "deny-secret-rule",
@@ -612,5 +623,310 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
         .handler({ cursor })
     );
     assertNoLeak(JSON.stringify(page.events));
+  });
+
+  it("broker/audit_query (the 5th agent-facing audit surface) emits no raw details / secret name / scope / reason", async () => {
+    // The broker MCP surface is agent-facing: a harnessed agent calls
+    // broker/audit_query. Its underlying details carry the credential NAME, the
+    // granted/requested scope, the ttl, the `scope_exceeds_grant` reason, and the
+    // tenant/audience claims — none of which may cross to the agent. Drive the
+    // REAL broker MCP tool against denied+issued activity and assert the
+    // allowlist view, not the raw details.
+    const store = new Map<string, string>([["gmail_oauth", "SECRET-VALUE-XYZ"]]);
+    const backend: Backend = {
+      async ensureInitialized() {},
+      async unlock() {},
+      async isUnlocked() {
+        return true;
+      },
+      async addSecret(n, v) {
+        if (store.has(n)) throw new Error("exists");
+        store.set(n, v);
+      },
+      async readSecret(n) {
+        const v = store.get(n);
+        if (v === undefined) throw new SecretNotFoundError(n);
+        return v;
+      },
+      async rotateSecret(n, v) {
+        if (!store.has(n)) throw new SecretNotFoundError(n);
+        store.set(n, v);
+      },
+      async deleteSecret(n) {
+        if (!store.delete(n)) throw new SecretNotFoundError(n);
+      },
+      async listSecretNames() {
+        return Array.from(store.keys());
+      },
+    };
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, generateRandomKey());
+    const broker = new Broker({
+      backend,
+      auditLog,
+      grants: [{ skill: "gmail-triage", secret: "gmail_oauth", scope: "read" }],
+      principalIdentityId: "did:sanctuary:1",
+    });
+    const server = createBrokerMcpServer(broker, {
+      skill: "gmail-triage",
+      agentId: "nsa",
+      identityId: "did:sanctuary:1",
+      tenantId: "tenant-alpha",
+      fortressId: "fortress-alpha",
+      audience: "sanctuary-broker",
+    });
+    const handler = (
+      server as unknown as { _requestHandlers: Map<string, Function> }
+    )._requestHandlers.get("tools/call")!;
+    const call = (name: string, a: Record<string, unknown> = {}) =>
+      handler({ method: "tools/call" as const, params: { name, arguments: a } }, {});
+
+    const issue = parse(await call("broker/request_token", { skill: "gmail-triage", secret: "gmail_oauth" }));
+    await call("broker/read_secret", { token: issue.token });
+    // Over-scope → TOKEN_DENIED with reason "scope_exceeds_grant" + granted_scope.
+    await call("broker/request_token", { skill: "gmail-triage", secret: "gmail_oauth", scope: "rotate" });
+
+    const body = parse(await call("broker/audit_query", {}));
+    // Surfaced ops, but every entry is the fixed allowlist view.
+    expect(body.entries.length).toBeGreaterThan(0);
+    for (const e of body.entries) {
+      expect(Object.keys(e).sort()).toEqual(ALLOWED_VIEW_KEYS);
+      expect(e.details).toBeUndefined();
+    }
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("SECRET-VALUE-XYZ");
+    expect(serialized).not.toContain("gmail_oauth"); // the credential NAME
+    expect(serialized).not.toContain("granted_scope");
+    expect(serialized).not.toContain("scope_exceeds_grant");
+    expect(serialized).not.toContain("ttl_seconds");
+    expect(serialized).not.toContain("tenant-alpha");
+    expect(serialized).not.toContain("sanctuary-broker"); // audience
+    // The operator path still has the full reason (defence-in-depth: redaction
+    // is at the agent boundary, the persisted entry is unchanged).
+    const opQ = await auditLog.query({ operation_type: BROKER_OPS.TOKEN_DENIED, layer: "l3" });
+    expect(opQ.entries[0]?.details?.reason).toBe("scope_exceeds_grant");
+  });
+});
+
+describe("agent-audit-allowlist: HIGH — decision-granularity search oracle (all 5 values)", () => {
+  // Property #11 attack: the persisted `decision` is fine-grained (the 5 values
+  // an operator policy can yield — castle-wall/ipc/messages.ts). When it was in
+  // the search corpus, a cooperative agent could probe each value and read
+  // WHICH disposition fired off the differential `result_count`. With `decision`
+  // removed from the corpus, a probe for ANY of the 5 values yields zero matches
+  // for EVERY value — no differential oracle — even though all entries remain
+  // discoverable by their (non-sensitive) operation name.
+  const DECISION_VALUES = [
+    "allow_once",
+    "allow_always",
+    "deny_once",
+    "deny_always",
+    "timeout_default_deny",
+  ] as const;
+
+  async function cooperativeSearchHarness() {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const { StateStore } = await import("../../src/l1-cognitive/state-store.js");
+    const { createL1Tools } = await import("../../src/l1-cognitive/tools.js");
+    const { createAgentNativeCooperativeTools } = await import(
+      "../../src/agent-native/cooperative-surface.js"
+    );
+    const { ApprovalProofStore } = await import(
+      "../../src/agent-native/safety-base.js"
+    );
+    const stateStore = new StateStore(storage, masterKey);
+    let active: ReturnType<typeof binding> | undefined;
+    const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+      { currentSessionBinding: () => active }
+    );
+    await identityManager.load();
+    const id = JSON.parse(
+      (await l1Tools.find((t) => t.name === "identity_create")!.handler({
+        label: "dec",
+      })).content[0]!.text
+    );
+    active = binding(id.identity_id as string);
+    const { tools: facadeTools } = createAgentNativeCooperativeTools({
+      identityManager,
+      namespaceRegistry,
+      auditLog,
+      currentSessionBinding: () => active,
+      primitiveTools: l1Tools,
+      storage,
+      approvalProofStore: new ApprovalProofStore(),
+    });
+    return { auditLog, facadeTools, active };
+  }
+
+  it("a probe for ANY of the 5 decision values yields no differential result_count match", async () => {
+    const { auditLog, facadeTools, active } = await cooperativeSearchHarness();
+
+    // Seed one own-signed entry per decision value under a stable operation
+    // name. Each entry's `decision` differs; nothing else policy-sensitive.
+    for (const value of DECISION_VALUES) {
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: active!.identity_id,
+        result: value.startsWith("deny") || value.startsWith("timeout") ? "failure" : "success",
+        details: { decision: value, dest_host: "host.example" },
+      });
+    }
+
+    const search = facadeTools.find((t) => t.name === "sanctuary_audit_search")!;
+
+    // Baseline: all entries ARE discoverable by the non-sensitive op name.
+    const byOp = parse(
+      await search.handler({ query: "egress_blocked", scope: "own_signed" })
+    );
+    expect((byOp.results as unknown[]).length).toBe(DECISION_VALUES.length);
+
+    // The oracle attack: probing each of the 5 decision values must return the
+    // SAME result_count (zero) — no value differentially matches, so the agent
+    // cannot learn which disposition any entry carries.
+    const counts: number[] = [];
+    for (const value of DECISION_VALUES) {
+      const probed = parse(
+        await search.handler({ query: value, scope: "own_signed" })
+      );
+      const n = (probed.results as unknown[]).length;
+      expect(n, `probe "${value}" must not differentially match`).toBe(0);
+      // And no decision value leaks into the returned rows.
+      expect(JSON.stringify(probed.results)).not.toContain(value);
+      counts.push(n);
+    }
+    // No differential across the 5 probes.
+    expect(new Set(counts).size).toBe(1);
+    expect(counts.every((c) => c === 0)).toBe(true);
+
+    // A substring shared by 4 of the 5 values ("allow"/"deny") must also not
+    // differentially match — the corpus carries none of them.
+    for (const frag of ["allow", "deny", "timeout_default_deny"]) {
+      const probed = parse(
+        await search.handler({ query: frag, scope: "own_signed" })
+      );
+      expect(
+        (probed.results as unknown[]).length,
+        `fragment "${frag}" must not match via decision`
+      ).toBe(0);
+    }
+  });
+});
+
+// ── COMPREHENSIVE structural guard ──────────────────────────────────────────
+// The behavioral tripwire above proves the FIVE known agent-facing audit reads
+// are clean. This guard makes the durability claim COMPREHENSIVE: it pins the
+// exhaustive registry of agent-facing audit-read surfaces and asserts each one's
+// source routes its audit output through the allowlist (redactAuditEntryForAgent
+// / AgentAuditView) and never returns a raw audit-`details` object on its
+// agent-facing path. A NEW agent-facing audit read that bypasses the allowlist —
+// or a regression that re-introduces a raw-details return into one of these
+// files — turns this RED. The operator-only audit consumers (anomaly detectors,
+// sentinels, dashboard, CLI, compliance, posture/feature-health) legitimately
+// see full fidelity and are deliberately NOT in this set.
+describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-facing audit-read registry)", () => {
+  const SERVER_SRC = join(
+    fileURLToPath(import.meta.url),
+    "..",
+    "..",
+    "..",
+    "src"
+  );
+  const read = (rel: string) => readFileSync(join(SERVER_SRC, rel), "utf8");
+
+  // The EXHAUSTIVE set of source modules that expose an audit READ to an
+  // agent-facing boundary (an MCP tool an agent can call). Adding a new one is a
+  // CONSCIOUS, reviewed act: it must be added here AND route through the
+  // allowlist, or this guard reds.
+  const AGENT_FACING_AUDIT_READ_MODULES = [
+    "index.ts", // monitor_audit_log
+    "audit/siem-tools.ts", // audit_export_siem
+    "agent-native/cooperative-surface.ts", // sanctuary_audit_search / sanctuary_events_read
+    "l3-disclosure/broker/broker.ts", // broker/audit_query (queryAudit)
+  ] as const;
+
+  it("every agent-facing audit-read module imports the allowlist projection", () => {
+    for (const mod of AGENT_FACING_AUDIT_READ_MODULES) {
+      const src = read(mod);
+      expect(
+        /redactAuditEntryForAgent|AgentAuditView|buildAgentSearchCorpus/.test(src),
+        `${mod} must route audit reads through the allowlist (agent-audit-redaction)`
+      ).toBe(true);
+      // It must IMPORT from the single allowlist source of truth, not re-derive
+      // a parallel projection.
+      expect(
+        src.includes("agent-audit-redaction"),
+        `${mod} must import from agent-audit-redaction (single source of truth)`
+      ).toBe(true);
+    }
+  });
+
+  it("the broker's AGENT-facing audit return type is the allowlist view (TS-enforced, no raw details)", () => {
+    const src = read("l3-disclosure/broker/broker.ts");
+    // The agent-facing AuditSummary entry type is the allowlist view. Because
+    // `queryAudit` is typed `Promise<AuditSummary>`, the compiler itself forbids
+    // returning a raw `details` field on the agent path — this guard pins the
+    // type so a future widening (adding `details?` back to AuditSummary) reds.
+    expect(src).toMatch(/export interface AuditSummary\s*\{[\s\S]*?entries:\s*AgentAuditView\[\]/);
+    // The agent path applies the redaction explicitly…
+    expect(src).toMatch(/queryAudit\([\s\S]*?\):\s*Promise<AuditSummary>/);
+    expect(src).toContain("redactAuditEntryForAgent");
+  });
+
+  it("raw broker audit `details` flow only through the explicitly OPERATOR-named surface", () => {
+    // The broker is the one module with BOTH an agent read (queryAudit →
+    // redacted AuditSummary) and an operator read (queryAuditOperator → full
+    // OperatorAuditSummary). The durability requirement is that any raw-details
+    // passthrough is on the OPERATOR surface only. We assert every raw-`details`
+    // copy site in the file lives within an `Operator`-named symbol — so a future
+    // change that routes raw details onto the AGENT path (queryAudit /
+    // AuditSummary) reds. The agent-facing modules that have NO operator audit
+    // read must carry no raw-details copy at all.
+    const RAW_DETAILS_COPY = /(?:details:\s*\w+\??\.details\b|\.\.\.\s*\w+\??\.details\b)/g;
+
+    // (a) The three agent-only audit-read modules never copy raw details.
+    for (const mod of [
+      "index.ts",
+      "audit/siem-tools.ts",
+      "agent-native/cooperative-surface.ts",
+    ]) {
+      const src = read(mod);
+      expect(
+        RAW_DETAILS_COPY.test(src),
+        `${mod} has no operator audit read; it must not copy a raw \`details\` object at all`
+      ).toBe(false);
+      RAW_DETAILS_COPY.lastIndex = 0;
+    }
+
+    // (b) In broker.ts, every raw-details copy site must be inside an
+    // `Operator`-named region (OperatorAuditSummary type / queryAuditOperator).
+    // We slice the file at the operator symbols and assert no raw-details copy
+    // survives OUTSIDE those operator regions.
+    const brokerSrc = read("l3-disclosure/broker/broker.ts");
+    const OPERATOR_REGION =
+      /(export interface OperatorAuditSummary[\s\S]*?\n\}\n)|(async queryAuditOperator\([\s\S]*?\n  \}\n)/g;
+    const outsideOperator = brokerSrc.replace(OPERATOR_REGION, "");
+    expect(
+      RAW_DETAILS_COPY.test(outsideOperator),
+      "broker.ts copies a raw `details` object OUTSIDE the operator-only surface — the agent path must stay redacted"
+    ).toBe(false);
+  });
+
+  it("the allowlist view is exactly the fixed 4-field shape (pins the contract)", () => {
+    // If a field is added/removed from the agent-facing view, this guard reds so
+    // the change is a conscious, reviewed widening of what every surface emits.
+    expect([...AGENT_AUDIT_VIEW_FIELDS].sort()).toEqual([
+      "has_details",
+      "operation",
+      "result",
+      "timestamp",
+    ]);
   });
 });

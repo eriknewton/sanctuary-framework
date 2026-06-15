@@ -131,7 +131,7 @@ export function createBrokerMcpServer(
       {
         name: "broker/audit_query",
         description:
-          "Query the broker-scoped audit trail (all L3 broker operations). Never returns secret values.",
+          "Query your own broker-scoped audit trail (token request/issue/deny/read for your identity). Each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — never the secret name, the granted/requested scope, the ttl, the denial reason, or any tenant/audience claim; those are operator-only.",
         inputSchema: {
           type: "object",
           properties: {
@@ -199,7 +199,15 @@ export function createBrokerMcpServer(
         case "broker/audit_query": {
           const since = optionalString(args, "since");
           const limit = optionalNumber(args, "limit");
-          const summary = await broker.queryAudit({ since, limit });
+          // Scope to the verified caller's OWN broker entries and return the
+          // allowlist-redacted view only (no secret name / scope / ttl / reason
+          // / tenant). The identity is the harness-verified principal, never
+          // read from MCP args.
+          const summary = await broker.queryAudit({
+            since,
+            limit,
+            identity_id: opts.identityId,
+          });
           return ok(summary);
         }
 

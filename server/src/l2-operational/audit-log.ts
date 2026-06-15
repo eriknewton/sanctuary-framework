@@ -1509,11 +1509,22 @@ export class AuditLog {
 
   /**
    * Query the audit log with filtering.
+   *
+   * `identity_id`, when supplied, is applied BEFORE the `limit` slice, so an
+   * own-identity read gets up to `limit` of the CALLER'S OWN in-window entries
+   * rather than a global page that may contain few/none of theirs. Without this
+   * the agent-facing own-identity reads (monitor_audit_log, audit_export_siem,
+   * the cooperative search/events surfaces, broker/audit_query) had to query a
+   * fixed wider window and post-filter — a caller with many other-identity
+   * entries ahead of theirs in that window saw an undercount (CISO LOW,
+   * 2026-06-16; fail-closed — never a leak, but `count` was incomplete).
+   * `total` reflects the post-filter population so callers can detect truncation.
    */
   async query(options: {
     since?: string;
     layer?: AuditEntry["layer"];
     operation_type?: string;
+    identity_id?: string;
     limit?: number;
   }): Promise<{
     entries: AuditEntry[];
@@ -1543,6 +1554,11 @@ export class AuditLog {
       filtered = filtered.filter(
         (e) => e.operation === options.operation_type
       );
+    }
+    // Identity filter BEFORE the limit slice (own-identity-read paging fix): the
+    // limit must bound the caller's OWN entries, not a global page.
+    if (options.identity_id !== undefined) {
+      filtered = filtered.filter((e) => e.identity_id === options.identity_id);
     }
 
     const total = filtered.length;
