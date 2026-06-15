@@ -23,9 +23,10 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { createSanctuaryServer } from "../../src/index.js";
 import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -852,6 +853,126 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "l3-disclosure/broker/broker.ts", // broker/audit_query (queryAudit)
   ] as const;
 
+  // Agent-callable MCP tools that DO read the audit log but never surface audit
+  // ENTRIES (or their `details`) to the agent — so there is nothing to redact.
+  // They are agent-facing (NOT operator/internal), pinned here and guarded below
+  // (must copy no raw `details`) so that a future edit which starts returning
+  // entries from one of them turns RED instead of silently leaking.
+  //   audit/tools.ts — `sovereignty_audit` queries with { limit: 0 } and reads
+  //     only result.integrity_findings (audit-chain health); no entries.
+  //   shr/tools.ts   — `shr_generate` (gatherL4Evidence) derives a single
+  //     boolean (verascore_linked) from a reputation_publish probe; no entries
+  //     are returned.
+  const AGENT_FACING_NON_ENTRY_AUDIT_READS = [
+    "audit/tools.ts",
+    "shr/tools.ts",
+  ] as const;
+
+  // Operator / internal / principal audit reads that legitimately see FULL
+  // fidelity (the deciding rule, the tier, the reason). NONE is reachable by an
+  // agent calling an MCP tool: they are internal analyzers, CLI commands, the
+  // human operator's HTTP dashboard/hub routes, cross-agent coordination
+  // internals, or the principal's own Tier-1-approval-gated Exit export. Per the
+  // agent-audit-redaction.ts header they MUST NOT use the agent redaction. Listed
+  // explicitly so that adding a NEW audit reader forces a conscious classification
+  // (asserted by the auto-discovery closure test below).
+  const OPERATOR_INTERNAL_AUDIT_READS = [
+    // anomaly detection — internal scoring over the audit stream
+    "anomaly-detection/detectors/audit-event-class-distribution-detector.ts",
+    "anomaly-detection/feature-extractors/audit-event-class-distribution.ts",
+    "anomaly-detection/feature-extractors/credential-use-sequence.ts",
+    "anomaly-detection/feature-extractors/cross-agent-timing.ts",
+    "anomaly-detection/feature-extractors/per-agent-activity.ts",
+    "anomaly-detection/feature-extractors/time-of-day-activity.ts",
+    "anomaly-detection/feature-extractors/tool-call-sequence.ts",
+    // sentinels — internal background watchers
+    "sentinel/sentinels/credential-usage-watcher.ts",
+    "sentinel/sentinels/cross-agent-chatter-watcher.ts",
+    "sentinel/sentinels/egress-volume-watcher.ts",
+    "sentinel/sentinels/suspicious-tool-call-detector.ts",
+    // operator dashboards / hub / activity feed — human-facing HTTP surfaces
+    "dashboard/aggregator.ts",
+    "dashboard/v1_1/wiring.ts",
+    "hub/activity-feed.ts",
+    "principal-policy/dashboard.ts",
+    "principal-policy/approval-aggregator.ts",
+    "principal-policy/feature-health.ts",
+    "principal-policy/posture.ts",
+    "principal-policy/unified-inbox-producers.ts",
+    // operator CLI
+    "cli/audit.ts",
+    "cli/castle-wall.ts",
+    // compliance report generation — operator artifact
+    "compliance/eu_ai_act/generator.ts",
+    // operator chat context / concierge — human operator surface
+    "chat/agent-context-cache.ts",
+    "concierge/sanctuary-context-reader.ts",
+    // cross-agent coordination handoff log — internal
+    "coordination/handoff-log.ts",
+    // query-anonymity routes — operator analytics
+    "query-anonymity/query-anonymity-routes.ts",
+    // principal Exit bundle — full-fidelity receipts, Tier-1 approval-gated
+    "exit/bundle.ts",
+  ] as const;
+
+  // ── AUTO-DISCOVERY ──────────────────────────────────────────────────────
+  // Statically enumerate EVERY `(<receiver>.)auditLog.query(...)` call site
+  // under src/ with the TypeScript parser. This is the load-bearing inversion
+  // the codex #573 review asked for: the agent-facing registry is no longer the
+  // sole defence. A brand-new agent-facing audit-read tool added in a NEW file
+  // is auto-discovered here and must be consciously CLASSIFIED — it can no longer
+  // slip past review just by not being added to a hand-maintained list.
+  //
+  // No type-checker is needed: every audit read in the tree uses the `auditLog`
+  // receiver name (the codebase convention), so a syntactic match on
+  // `<ident|...>.query(...)` where the receiver's terminal name is `auditLog`
+  // captures them all while correctly NOT matching the unrelated `.query(`
+  // receivers — pgvector `client.query`, `reputationStore.query`,
+  // `handoffLog.query`, the `auditPreflight` connectivity probe, or the broker's
+  // own `broker.queryAudit` facade (whose underlying read lives in broker.ts and
+  // IS matched there).
+  function discoverAuditLogReaders(): string[] {
+    const found = new Set<string>();
+    const isAuditLogReceiver = (expr: ts.Expression): boolean => {
+      if (ts.isIdentifier(expr)) return expr.text === "auditLog";
+      if (ts.isPropertyAccessExpression(expr)) return expr.name.text === "auditLog";
+      return false;
+    };
+    const walkDir = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) {
+          if (name === "node_modules") continue;
+          walkDir(p);
+          continue;
+        }
+        if (!name.endsWith(".ts") || name.endsWith(".d.ts") || name.endsWith(".test.ts")) {
+          continue;
+        }
+        const sf = ts.createSourceFile(
+          p,
+          readFileSync(p, "utf8"),
+          ts.ScriptTarget.Latest,
+          /*setParentNodes*/ false
+        );
+        const visit = (node: ts.Node) => {
+          if (
+            ts.isCallExpression(node) &&
+            ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === "query" &&
+            isAuditLogReceiver(node.expression.expression)
+          ) {
+            found.add(relative(SERVER_SRC, p).split(sep).join("/"));
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(sf);
+      }
+    };
+    walkDir(SERVER_SRC);
+    return [...found].sort();
+  }
+
   it("every agent-facing audit-read module imports the allowlist projection", () => {
     for (const mod of AGENT_FACING_AUDIT_READ_MODULES) {
       const src = read(mod);
@@ -928,5 +1049,82 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       "result",
       "timestamp",
     ]);
+  });
+
+  it("AUTO-DISCOVERY: every auditLog.query reader is classified; a NEW agent-facing audit read cannot evade the registry", () => {
+    const discovered = discoverAuditLogReaders();
+
+    // Sanity: the parser actually walked the tree. Guards against a vacuous
+    // green (e.g. an empty walk would make every set-difference trivially pass).
+    expect(
+      discovered.length,
+      "auto-discovery found no auditLog.query readers — the source walk is broken"
+    ).toBeGreaterThanOrEqual(AGENT_FACING_AUDIT_READ_MODULES.length);
+    for (const m of AGENT_FACING_AUDIT_READ_MODULES) {
+      expect(
+        discovered,
+        `known agent-facing reader ${m} must be auto-discovered`
+      ).toContain(m);
+    }
+
+    const agentFacing = new Set<string>(AGENT_FACING_AUDIT_READ_MODULES);
+    const nonEntry = new Set<string>(AGENT_FACING_NON_ENTRY_AUDIT_READS);
+    const operator = new Set<string>(OPERATOR_INTERNAL_AUDIT_READS);
+
+    // Each reader is classified EXACTLY once — the three buckets are disjoint.
+    const overlap = [
+      ...[...agentFacing].filter((f) => nonEntry.has(f) || operator.has(f)),
+      ...[...nonEntry].filter((f) => operator.has(f)),
+    ].sort();
+    expect(
+      overlap,
+      `audit-read module(s) classified in more than one bucket: ${overlap.join(", ")}`
+    ).toEqual([]);
+
+    const classified = new Set<string>([
+      ...agentFacing,
+      ...nonEntry,
+      ...operator,
+    ]);
+
+    // (1) THE GAP CLOSURE (codex #573): any discovered reader not in a bucket is
+    // a NEW, unclassified audit read. A brand-new agent-facing audit-read tool
+    // added in a NEW file lands HERE and REDS — it can no longer slip past by
+    // simply not being added to the hand-maintained agent-facing list.
+    const unaccounted = discovered.filter((f) => !classified.has(f));
+    expect(
+      unaccounted,
+      `Unclassified auditLog.query reader(s): ${unaccounted.join(", ")}. ` +
+        `Classify each one: if an AGENT can reach it via an MCP tool AND it returns ` +
+        `audit ENTRIES, route them through redactAuditEntryForAgent / ` +
+        `buildAgentSearchCorpus and add it to AGENT_FACING_AUDIT_READ_MODULES; ` +
+        `if it is an agent tool that surfaces NO entries, add it to ` +
+        `AGENT_FACING_NON_ENTRY_AUDIT_READS; if it is an operator/internal/principal ` +
+        `full-fidelity read, add it to OPERATOR_INTERNAL_AUDIT_READS.`
+    ).toEqual([]);
+
+    // (2) No stale registry entries: every classified module must still be a real
+    // auditLog.query reader, so the lists stay honest as files move or refactor.
+    const stale = [...classified].filter((f) => !discovered.includes(f)).sort();
+    expect(
+      stale,
+      `Classified module(s) no longer read the audit log — remove or update: ${stale.join(", ")}`
+    ).toEqual([]);
+  });
+
+  it("agent-facing NON-entry audit reads surface no raw `details` (nothing redactable crosses to the agent)", () => {
+    // These tools are agent-callable but classified as surfacing no audit
+    // entries. Pin that: a raw `details` copy appearing in one of them would mean
+    // entry data is now reaching the agent path and the file must move into
+    // AGENT_FACING_AUDIT_READ_MODULES (and route through the allowlist).
+    const RAW_DETAILS_COPY = /(?:details:\s*\w+\??\.details\b|\.\.\.\s*\w+\??\.details\b)/g;
+    for (const mod of AGENT_FACING_NON_ENTRY_AUDIT_READS) {
+      const src = read(mod);
+      expect(
+        RAW_DETAILS_COPY.test(src),
+        `${mod} is agent-facing but classified non-entry — it must not copy a raw \`details\` object`
+      ).toBe(false);
+      RAW_DETAILS_COPY.lastIndex = 0;
+    }
   });
 });
