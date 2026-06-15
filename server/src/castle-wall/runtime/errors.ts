@@ -49,3 +49,23 @@ export class RuntimeApprovalTimeoutError extends CastleWallError {
     this.name = "RuntimeApprovalTimeoutError";
   }
 }
+
+/**
+ * The Linux producer-signed activation could not bring the enforcing daemon to
+ * an armed, key-loaded state. Thrown FAIL-CLOSED: the daemon would not start,
+ * the unit is not active, or the pinned producer key is expected-but-unreadable.
+ * The caller surfaces NOT-ARMED — never fake-green, never a silent channel-basis
+ * fallback when a key is expected.
+ */
+export class RuntimeLinuxActivationError extends CastleWallError {
+  readonly reason:
+    | "daemon_start_failed"
+    | "daemon_not_active"
+    | "producer_key_unreadable"
+    | "handshake_failed";
+  constructor(message: string, reason: RuntimeLinuxActivationError["reason"]) {
+    super(message);
+    this.name = "RuntimeLinuxActivationError";
+    this.reason = reason;
+  }
+}

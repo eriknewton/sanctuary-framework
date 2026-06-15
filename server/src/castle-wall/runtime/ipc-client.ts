@@ -16,6 +16,7 @@ import {
 } from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import type {
+  AuditDrainResponse,
   CastleWallMessage,
   HandshakeChallenge,
   HandshakeResponse,
@@ -112,6 +113,43 @@ export class IpcClient {
     };
     const envelope = wrapEnvelope("policy_reload_request", params);
     return await this.send<PolicyReloadResponse>(requestId, envelope);
+  }
+
+  /**
+   * Pull a batch of WAL entries strictly above `afterSeq` (capped at
+   * `maxEvents`). Per scope-lock §8 hybrid PULL model: main drives the pace.
+   * Resolves with the daemon's `audit_drain_response` (which carries the
+   * per-event producer-signature material the consumer re-verifies).
+   */
+  async drainRequest(
+    afterSeq: number | null,
+    maxEvents: number
+  ): Promise<AuditDrainResponse> {
+    const requestId = this.options.generateNonceHex();
+    const params: CastleWallMessage = {
+      type: "audit_drain_request",
+      request_id: requestId,
+      after_seq: afterSeq,
+      max_events: maxEvents,
+    };
+    const envelope = wrapEnvelope("audit_drain_request", params);
+    return await this.send<AuditDrainResponse>(requestId, envelope);
+  }
+
+  /**
+   * Acknowledge durable receipt of every drained event through `lastAckedSeq`
+   * so the daemon truncates its WAL through that point. One-way; no response.
+   * The `request_id` is informational (correlates with the drain in daemon
+   * logs); the daemon does not reply.
+   */
+  async sendDrainAck(lastAckedSeq: number): Promise<void> {
+    const params: CastleWallMessage = {
+      type: "audit_drain_ack",
+      request_id: this.options.generateNonceHex(),
+      last_acked_seq: lastAckedSeq,
+    };
+    const envelope = wrapEnvelope("audit_drain_ack", params);
+    await this.transport.send(frame(JSON.stringify(envelope)));
   }
 
   /**
@@ -334,6 +372,8 @@ function expectedReplyType(requestType: string): string {
       return "status_response";
     case "policy_reload_request":
       return "policy_reload_response";
+    case "audit_drain_request":
+      return "audit_drain_response";
     default:
       return requestType;
   }
