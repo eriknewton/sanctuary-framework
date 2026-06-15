@@ -141,6 +141,14 @@ const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
   // cannot learn which allow/deny rule matched and map the essentials list by
   // probing (property #11, no-policy-inference).
   "rule_id",
+  // The Linux producer-signed audit path persists the matched rule under
+  // `rule_id_matched` (the Rust daemon's body, see audit-consumer.ts
+  // buildDetailsForEvent / WAL_OPERATION_TO_EVENT_TYPE). It carries the same
+  // operator-only attribution as `rule_id` and MUST be redacted on the
+  // agent-facing read path for the same property-#11 reason; without this an
+  // agent could read the matched rule off a signed entry (pre-existing leak
+  // since #520, closed here).
+  "rule_id_matched",
   "policy_match",
   "policy_decision",
   "policy_tier",

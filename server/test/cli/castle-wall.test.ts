@@ -512,6 +512,37 @@ describe("castle-wall CLI verbs", () => {
     expect(flows[0].decision).toBe("deny");
   });
 
+  it("audit-dump --rule with no value is a usage error, not a silent raw dump", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runAuditDump(["--fortress", fortressPath, "--rule"], {
+      out,
+      err,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    // Non-zero usage exit, an explanatory stderr line, and crucially NO raw
+    // audit entries dumped to stdout (the prior silent-fallback bug).
+    expect(code).not.toBe(0);
+    expect(err.text()).toContain("--rule requires a rule id");
+    expect(out.text()).toBe("");
+  });
+
+  it("audit-dump --rule immediately followed by another flag is a usage error", async () => {
+    const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    // `--rule --by-rule`: `--rule` must NOT swallow the following flag as its value.
+    const code = await runAuditDump(["--fortress", fortressPath, "--rule", "--by-rule"], {
+      out,
+      err,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).not.toBe(0);
+    expect(err.text()).toContain("--rule requires a rule id");
+    expect(out.text()).toBe("");
+  });
+
   it("audit-dump --by-rule is deterministic across N>=3 runs (identical output)", async () => {
     const { fortressPath, recoveryKey } = await seedRuleAttributedFlows();
     const runOnce = async () => {

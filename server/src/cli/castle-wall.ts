@@ -146,6 +146,12 @@ export interface CastleWallParsedArgs {
   byRule?: boolean;
   /** audit-dump: restrict the per-flow read-out to a single matched rule id. */
   rule?: string;
+  /**
+   * Set when `--rule` was given with no following value (end of argv or
+   * immediately followed by another flag). The caller turns this into a usage
+   * error instead of silently falling back to the raw dump.
+   */
+  ruleMissingValue?: boolean;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -1740,6 +1746,10 @@ export async function runAuditDump(
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
+  if (parsed.ruleMissingValue) {
+    write(err, "Error: --rule requires a rule id (e.g. --rule allow-anthropic, or --rule default-deny).\n");
+    return 2;
+  }
   const fortressPath = resolveFortressArg(parsed.fortress, env);
   const sinceIso = parsed.since
     ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
@@ -2776,7 +2786,16 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
-      parsed.rule = argv[++i];
+      // `--rule` requires a value. If the next token is missing or is itself a
+      // flag, do NOT consume it — flag the omission so the caller emits a usage
+      // error rather than silently falling back to the raw audit dump.
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("-")) {
+        parsed.ruleMissingValue = true;
+      } else {
+        parsed.rule = next;
+        i++;
+      }
     } else if (!arg.startsWith("-") && !parsed.requestId) {
       parsed.requestId = arg;
     }

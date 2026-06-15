@@ -156,6 +156,48 @@ describe("credential/policy return hardening", () => {
     expect(rawEntry?.details?.rule_id).toBe("allow-anthropic-api");
   });
 
+  it("redacts the Linux producer-signed matched rule (rule_id_matched) from monitor_audit_log (property #11)", async () => {
+    const { server, auditLog } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "cred-return-rule-id-matched-redaction",
+    });
+    // The Linux producer-signed audit path persists the matched rule under
+    // `rule_id_matched` (the Rust daemon's signed WAL body). The agent-facing
+    // read boundary must strip it for the same reason it strips `rule_id`: an
+    // agent must not be able to learn which allow/deny rule matched and map the
+    // essentials list by probing (property #11, no-policy-inference). This is a
+    // pre-existing leak (since #520) closed by adding `rule_id_matched` to
+    // AUDIT_AGENT_REDACT_DETAIL_KEYS.
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "castle-wall-agent",
+      result: "failure",
+      details: {
+        decision: "deny_once",
+        rule_id_matched: "deny-blocked-example",
+        cw_evidence_basis: "producer_signed",
+      },
+    });
+
+    const result = await callTool(server, "monitor_audit_log", { limit: 10, layer: "l1" });
+    const parsed = parseToolResult(result);
+    const text = result.content[0]!.text;
+    const entry = parsed.entries.find(
+      (candidate: { operation: string }) => candidate.operation === "egress_blocked"
+    );
+
+    expect(entry.details.rule_id_matched).toBe("[redacted]");
+    expect(entry.details.decision).toBe("deny_once");
+    expect(text).not.toContain("deny-blocked-example");
+
+    // The operator path (raw audit query, no agent redaction) still sees the
+    // matched rule -- that is the whole point of operator attribution.
+    const raw = await auditLog.query({ layer: "l1", limit: 10 });
+    const rawEntry = raw.entries.find((e) => e.operation === "egress_blocked");
+    expect(rawEntry?.details?.rule_id_matched).toBe("deny-blocked-example");
+  });
+
   it("the per-rule-per-flow read-out NEVER exposes rule_id when fed the agent-facing (redacted) read path (#c4, property #11)", async () => {
     const { server, auditLog } = await createSanctuaryServer({
       storage: new MemoryStorage(),

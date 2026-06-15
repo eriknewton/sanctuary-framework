@@ -53,6 +53,24 @@ const RULE_ID_DETAIL_KEYS = ["rule_id", "rule_id_matched"] as const;
  * (filter_started, policy_loaded, ...) are not flows and are excluded from the
  * per-rule read-out. These are the NORMALIZED stored tags
  * (audit-consumer maps the daemon's egress_approved/egress_pending onto these).
+ *
+ * NO DOUBLE-COUNT (verified against the recorded lifecycle, not assumed):
+ * `operator_decision` is the normalized tag for the Linux daemon's
+ * `egress_pending` verdict (audit-consumer WAL_OPERATION_TO_EVENT_TYPE). A
+ * `PromptRequired` verdict in the current daemon is terminal-on-the-packet: the
+ * nfqueue verdict loop maps it to `NfVerdict::Drop` (castle-wall-daemon/src/
+ * nfqueue.rs ~438) and `evaluate_attempt` emits exactly ONE WAL event per
+ * packet. There is no prompt-and-wait re-evaluation that would write a SECOND
+ * terminal `egress_approved`/`egress_blocked` event for the same flow (the
+ * approval.rs module only coalesces prompt EMISSION; it never re-evaluates or
+ * emits a terminal verdict). On the macOS path, `flow_pending_approval` writes
+ * NO audit entry at all (it only enqueues); only the terminal
+ * `flow_decision_recorded` writes one `egress_allowed`/`egress_blocked`. So a
+ * single flow is recorded once — either as one `operator_decision` (Linux
+ * prompt-drop) or one terminal entry — never both. Counting all three tags here
+ * therefore counts each flow exactly once. If a future build adds a real
+ * prompt-resolution that emits a terminal event keyed to the same flow, this
+ * set (and the counting) MUST be revisited to dedupe prompt+resolution pairs.
  */
 const FLOW_OPERATIONS = new Set<string>([
   "egress_allowed",
@@ -92,16 +110,26 @@ function categoryFromDecisionValue(
   }
 }
 
+/** The agent-redaction sentinel. A detail key holding this is operator-stripped. */
+const REDACTED_SENTINEL = "[redacted]";
+
 /** Extract the matched rule id from a stored entry's details, or null if none. */
 function ruleIdOf(entry: AuditEntry): string | null {
   const details = entry.details;
   if (!details) return null;
+  // A redacted value ("[redacted]") only ever appears if a caller fed
+  // agent-redacted entries in. That is a misuse this module refuses to launder
+  // into a "rule" — and crucially, a redacted FIRST key must NEVER fall through
+  // to a later key. Both `rule_id` and `rule_id_matched` are redacted together
+  // on the agent path, but defend against any partial-redaction shape: if ANY
+  // rule-id key is redacted, the whole entry collapses to the null/default-deny
+  // bucket rather than resurfacing a sibling key's rule id (property #11).
+  for (const key of RULE_ID_DETAIL_KEYS) {
+    if (details[key] === REDACTED_SENTINEL) return null;
+  }
   for (const key of RULE_ID_DETAIL_KEYS) {
     const value = details[key];
-    // A redacted value ("[redacted]") must NEVER be treated as a rule id — that
-    // would only ever appear if a caller fed agent-redacted entries in, which is
-    // a misuse this module refuses to silently launder into a "rule".
-    if (typeof value === "string" && value.length > 0 && value !== "[redacted]") {
+    if (typeof value === "string" && value.length > 0) {
       return value;
     }
   }
@@ -259,15 +287,23 @@ export function groupFlowsByRule(
   options: GroupByRuleOptions = {}
 ): PerRuleGroup[] {
   const sampleLimit = options.sampleLimit ?? DEFAULT_SAMPLE_LIMIT;
-  const byRule = new Map<string, PerRuleGroup>();
+  // Key the rollup on the REAL ruleId (a string) or a unique symbol for the
+  // null-rule bucket — never on the DEFAULT_DENY_BUCKET display string. Keying
+  // on the display label would merge a real rule literally authored with that
+  // exact name into the synthetic default-deny bucket. A symbol can never equal
+  // any operator-authored rule id (always a string), so the two never collide;
+  // the display label is rendered only at group construction, below.
+  const NULL_RULE_KEY = Symbol("default-deny");
+  const byRule = new Map<string | symbol, PerRuleGroup>();
 
   for (const flow of flows) {
-    const key = flow.ruleId ?? DEFAULT_DENY_BUCKET;
+    const isDefaultDeny = flow.ruleId === null;
+    const key: string | symbol = flow.ruleId ?? NULL_RULE_KEY;
     let group = byRule.get(key);
     if (!group) {
       group = {
-        ruleId: key,
-        isDefaultDeny: flow.ruleId === null,
+        ruleId: isDefaultDeny ? DEFAULT_DENY_BUCKET : (flow.ruleId as string),
+        isDefaultDeny,
         total: 0,
         allow: 0,
         deny: 0,
