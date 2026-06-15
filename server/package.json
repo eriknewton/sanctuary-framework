@@ -82,7 +82,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@playwright/test": "1.59.1",
-    "@types/node": "22.19.18",
+    "@types/node": "25.9.3",
     "@types/pg": "8.20.0",
     "eslint": "10.4.1",
     "tsup": "8.5.1",
