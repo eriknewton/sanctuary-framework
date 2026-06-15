@@ -12,8 +12,12 @@
  */
 
 import type { Backend } from "./backend-interface.js";
-import type { AuditLog } from "../../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../../l2-operational/audit-log.js";
 import { BROKER_OPS } from "../../l2-operational/audit-log.js";
+import {
+  redactAuditEntryForAgent,
+  type AgentAuditView,
+} from "../../l2-operational/agent-audit-redaction.js";
 import {
   TokenIssuer,
   type SkillSecretGrant,
@@ -31,6 +35,26 @@ export interface BrokerOptions {
 }
 
 export interface AuditSummary {
+  /**
+   * Allowlist-redacted entries — the SAME agent-facing view every other
+   * agent-facing audit read emits ({ timestamp, operation, result,
+   * has_details }). The broker audit `details` carry the credential NAME, the
+   * granted/requested scope, ttl, the `scope_exceeds_grant`-style reason, and
+   * the tenant/audience claims (token-issuer.ts); none of that may cross to the
+   * agent, so the raw `details` object is NEVER returned here (CISO HIGH,
+   * 2026-06-16).
+   */
+  entries: AgentAuditView[];
+  total: number;
+}
+
+/**
+ * Operator-only, FULL-FIDELITY broker audit summary. Carries the raw `details`
+ * (credential NAME, scope, reason). Served exclusively to the operator CLI
+ * (`sanctuary-secrets audit`) — NEVER to the agent-facing `broker/audit_query`
+ * tool, which uses the redacted {@link AuditSummary} above.
+ */
+export interface OperatorAuditSummary {
   entries: Array<{
     timestamp: string;
     operation: string;
@@ -225,33 +249,81 @@ export class Broker {
   }
 
   /**
-   * Audit query restricted to broker-scoped operations. Returns entries
-   * with their timestamps, op, and result (never the secret value).
+   * Audit query restricted to broker-scoped operations, for the agent-facing
+   * `broker/audit_query` MCP tool.
+   *
+   * Returns ONLY the allowlist-redacted agent view of each entry ({ timestamp,
+   * operation, result, has_details }) — the SAME view every other agent-facing
+   * audit read uses (redactAuditEntryForAgent). The raw broker `details` (the
+   * credential NAME, granted/requested scope, ttl, the `scope_exceeds_grant`
+   * reason, the tenant/audience/fortress claims) are NEVER returned (CISO HIGH,
+   * 2026-06-16). When `identity_id` is supplied the result is scoped to that
+   * caller's OWN broker entries, filtered BEFORE the limit so the limit bounds
+   * the caller's own entries (CISO LOW, 2026-06-16).
+   *
+   * The full-fidelity broker audit (secret name, scope, reason) is an OPERATOR
+   * need and is served off the operator CLI / `auditLog.query` directly — not
+   * through this agent-facing tool.
    */
-  async queryAudit(opts?: { since?: string; limit?: number }): Promise<AuditSummary> {
+  async queryAudit(opts?: {
+    since?: string;
+    limit?: number;
+    identity_id?: string;
+  }): Promise<AuditSummary> {
+    const { entries, total } = await this.mergeBrokerAuditEntries(opts);
+    const limit = opts?.limit ?? 1000;
+    // Allowlist redaction at the boundary — no raw details ever leave here.
+    const redacted = entries.map((e) => redactAuditEntryForAgent(e));
+    return { entries: redacted.slice(-limit), total };
+  }
+
+  /**
+   * OPERATOR-ONLY full-fidelity broker audit. Returns the raw `details` (secret
+   * NAME, scope, reason) for the operator CLI (`sanctuary-secrets audit`). NEVER
+   * call this from an agent-facing surface — that is what {@link queryAudit}
+   * (the redacted view) is for.
+   */
+  async queryAuditOperator(opts?: {
+    since?: string;
+    limit?: number;
+  }): Promise<OperatorAuditSummary> {
+    const { entries, total } = await this.mergeBrokerAuditEntries(opts);
+    const limit = opts?.limit ?? 1000;
+    const full = entries.map((e) => ({
+      timestamp: e.timestamp,
+      operation: e.operation,
+      result: e.result,
+      details: e.details,
+    }));
+    return { entries: full.slice(-limit), total };
+  }
+
+  /**
+   * Shared scan: BROKER_OPS filtered, merged, and time-sorted. Returns the RAW
+   * AuditEntry rows; each public query method then projects to its own
+   * fidelity (redacted agent view vs full operator view). AuditLog.query filters
+   * by a single operation, so we call once per broker op and merge.
+   */
+  private async mergeBrokerAuditEntries(opts?: {
+    since?: string;
+    limit?: number;
+    identity_id?: string;
+  }): Promise<{ entries: AuditEntry[]; total: number }> {
     const allOps = Object.values(BROKER_OPS);
-    // AuditLog.query filters by a single operation, call once per op and merge.
-    const merged: AuditSummary["entries"] = [];
+    const merged: AuditEntry[] = [];
     let total = 0;
     for (const op of allOps) {
       const r = await this.auditLog.query({
         since: opts?.since,
         layer: "l3",
         operation_type: op,
+        identity_id: opts?.identity_id,
         limit: opts?.limit ?? 1000,
       });
       total += r.total;
-      for (const e of r.entries) {
-        merged.push({
-          timestamp: e.timestamp,
-          operation: e.operation,
-          result: e.result,
-          details: e.details,
-        });
-      }
+      merged.push(...r.entries);
     }
     merged.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    const limit = opts?.limit ?? 1000;
-    return { entries: merged.slice(-limit), total };
+    return { entries: merged, total };
   }
 }

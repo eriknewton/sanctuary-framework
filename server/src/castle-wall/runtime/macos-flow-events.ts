@@ -228,12 +228,16 @@ export class MacOSFlowEventConsumer {
     // is null only when the sysext reported no matched rule.
     //
     // SECURITY (property #11, no-policy-inference): `rule_id` is an operator-only
-    // key. It is redacted at every agent-facing read boundary -- `monitor_audit_log`
-    // strips it via AUDIT_AGENT_REDACT_DETAIL_KEYS (server/src/index.ts), the SIEM
-    // formatters never project it, and the cooperative-surface pull/search tools
-    // never return raw details. So an agent that can query audit entries still
-    // cannot learn which rules matched and map the essentials list by probing.
-    // The operator reads the unredacted entry via the Castle Wall CLI / dashboard.
+    // key. The agent-facing read surfaces use an ALLOWLIST (agent-audit-redaction.ts),
+    // not a denylist: `monitor_audit_log` and the SIEM formatters emit only the
+    // fixed safe view (timestamp/operation/result/has_details) and never pass
+    // `details` through, and the cooperative-surface pull/search tools never
+    // return raw details (search is matched only against the safe-key allowlist).
+    // So an agent that can query audit entries cannot learn which rules matched
+    // and map the essentials list by probing — and a NEW operator-attribution
+    // detail key added here stays private by default (no denylist to forget to
+    // update). The operator reads the unredacted entry via the Castle Wall CLI /
+    // dashboard.
     await this.auditSink.append(
       CASTLE_WALL_AUDIT_LAYER,
       eventType,
