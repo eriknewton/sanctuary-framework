@@ -329,6 +329,35 @@ fi
 # of the drift: it would let an author satisfy this gate while keeping the
 # floor stale (or pushing it down so a real regression slips under it). So we
 # compare the staged blob against HEAD's blob and require a strict increase.
+#
+# STRICT-UPWARD STAGED CHECK RUNS UNCONDITIONALLY (codex #571 round-2 fix): if
+# .test-baseline is staged at all, validate it HERE, before the passing>baseline
+# branch. Otherwise, when passing == the committed floor, a staged LOWERED value
+# or a staged DELETION would skip the in-branch check below and quietly commit a
+# weaker/missing floor that a future regression could hide under. Fresh locals
+# (_sb/_pb) so the in-branch "drift accounted" message keeps its own vars.
+if [[ -n "$baseline_is_staged" ]]; then
+  _sb=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "$_sb" =~ ^[0-9]+$ ]]; then
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
+    printf '[baseline-guard]   Staged value: %s\n' "'$_sb'" >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+  _pb=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  [[ "$_pb" =~ ^[0-9]+$ ]] || _pb=0
+  if (( _sb <= _pb )); then
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    printf '[baseline-guard]   Previously committed: %s\n' "$_pb" >&2
+    printf '[baseline-guard]   Staged value:         %s\n' "$_sb" >&2
+    printf '\n' >&2
+    fail "A flat re-stage, a lowered edit, or a deletion is not an accounting of"
+    fail "drift — it keeps the floor stale (or pushes it down so a regression"
+    fail "slips under it). Raise it to the new Linux CI passing count and re-stage."
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+fi
 if (( passing > baseline )); then
   if [[ -z "$baseline_is_staged" ]]; then
     fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
