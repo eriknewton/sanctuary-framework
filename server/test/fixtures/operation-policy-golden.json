@@ -2,6 +2,7 @@
   "tier1_always_approve": [
     "audit_export_siem",
     "bootstrap_provide_guarantee",
+    "compliance_generate_eu_ai_act_bundle",
     "context_gate_apply_template",
     "context_gate_set_policy",
     "decommission_certificate",
@@ -48,7 +49,6 @@
     "bridge_commit",
     "bridge_verify",
     "compliance_eu_ai_act_annex_iii_classify",
-    "compliance_generate_eu_ai_act_bundle",
     "context_gate_filter",
     "context_gate_list_policies",
     "context_gate_recommend",

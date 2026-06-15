@@ -138,7 +138,7 @@
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 4	server/src/compliance/eu_ai_act/cli.ts
 35	server/src/compliance/eu_ai_act/coverage_matrix.ts
-18	server/src/compliance/eu_ai_act/generator.ts
+17	server/src/compliance/eu_ai_act/generator.ts
 11	server/src/compliance/eu_ai_act/pdf.ts
 9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
 7	server/src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts
