@@ -1,155 +1,140 @@
 /**
- * Agent-facing audit redaction (property #11, no-policy-inference).
+ * Agent-facing audit redaction (property #11, no-policy-inference) — ALLOWLIST.
  *
- * This is the SINGLE source of truth for which audit-detail keys are
- * policy-inference-sensitive and must be stripped before an audit entry crosses
- * an agent-facing boundary. It is shared by every agent-facing audit surface so
- * that adding one sensitive key here closes ALL of them at once:
+ * THE INVERSION (CISO HIGH-1 / 2026-06-15): this module used to carry a DENYLIST
+ * (`AUDIT_AGENT_REDACT_DETAIL_KEYS`) of the audit-`details` keys that must be
+ * stripped before an entry crosses an agent-facing boundary. A denylist is
+ * fragile-by-construction: every NEW operator-attribution field added to a
+ * persisted audit entry ships to the agent unless someone remembers to extend a
+ * hidden list in another file. It leaked four times that way, and a LIVE leak
+ * remained: the free-text `reason` field (never on the denylist) carried anomaly
+ * THRESHOLDS verbatim ("Signing frequency (7/min) exceeds limit (5/min)", "…
+ * threshold: 50", "3× above average", "not classified in any policy tier"),
+ * letting an agent read its own detection thresholds and operate just under them.
  *
- *   - `monitor_audit_log` (server/src/index.ts) — the agent-facing audit READ.
- *   - `sanctuary_audit_search` (server/src/agent-native/cooperative-surface.ts)
- *     — the agent-facing audit SEARCH. The search must build its match corpus
- *     via `buildAgentSearchCorpus` here, which OMITS the sensitive keys entirely,
- *     not from the raw entry (and not from an in-place redaction either), or a
- *     sensitive field becomes a probing oracle: an agent could guess a `rule_id`
- *     value — OR probe the sensitive key NAME / the `[redacted]` sentinel that an
- *     in-place projection would leave behind — and learn a match differentially
- *     from `result_count` even though the returned rows omit details
- *     (property #11 violation).
+ * The durable fix is to INVERT to an ALLOWLIST. Agent-facing audit surfaces now
+ * emit ONLY a fixed, explicitly-safe shape and NEVER pass `details` through any
+ * field-name filter. A new operator-attribution field added to a persisted entry
+ * is private by default — it can only reach an agent if someone deliberately adds
+ * it to one of the allowlists here. This is the single source of truth for both:
+ *
+ *   - The agent-facing audit READ shape (`AGENT_AUDIT_VIEW_FIELDS`), used by
+ *     `monitor_audit_log` (server/src/index.ts), `audit_export_siem`
+ *     (server/src/audit/*), and the cooperative pull/search surfaces
+ *     (server/src/agent-native/cooperative-surface.ts).
+ *   - The agent-facing SEARCH corpus (`AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS`),
+ *     used by `sanctuary_audit_search`. The search needle is matched ONLY against
+ *     the operation name plus this curated, non-policy-inference subset of detail
+ *     keys — never the raw entry — so a probe for a policy-sensitive value, key
+ *     name, or sentinel can never differentially match off `result_count`
+ *     (property #11, no-policy-inference).
  *
  * The OPERATOR audit path (the CLI audit-dump / per-rule read-out in
- * server/src/castle-wall/audit/per-rule-report.ts) is full-fidelity and MUST
- * NOT use this redaction — operators are authorized to see the deciding rule.
- *
- * Single-sourcing matters most when producer-signing activates: the moment a
- * new operator-only field lands in the persisted entry, it must be added to
- * AUDIT_AGENT_REDACT_DETAIL_KEYS here once, and both the read and the search
- * surface close together.
+ * server/src/castle-wall/audit/per-rule-report.ts, the dashboard, and raw
+ * `auditLog.query`) is full-fidelity and MUST NOT use this redaction — operators
+ * own the policy and are authorized to see the deciding rule, the tier, and the
+ * reason.
  */
 
 import type { AuditEntry } from "./audit-log.js";
-import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "../castle-wall/constants.js";
 
-export const AUDIT_AGENT_REDACTED = "[redacted]";
+/**
+ * The ONLY fields an agent-facing audit READ may expose from an entry. Anything
+ * not in this set — every `details` field, the `identity_id`, the `layer` — is
+ * withheld by construction. `has_details` is a coarse boolean so an agent can
+ * tell an entry carried operator-side detail without learning what it was.
+ */
+export const AGENT_AUDIT_VIEW_FIELDS = [
+  "timestamp",
+  "operation",
+  "result",
+  "has_details",
+] as const;
 
-export const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
-  "decided_by",
-  "identity_id",
-  "operatorId",
-  "operator_id",
-  "resolved_by",
-  "policy_rule_id",
-  // Castle Wall matched-rule id (#381). Written to the stored audit entry for
-  // operator attribution; redacted here so an agent querying audit entries
-  // cannot learn which allow/deny rule matched and map the essentials list by
-  // probing (property #11, no-policy-inference).
-  "rule_id",
-  // The Linux producer-signed audit path persists the matched rule under
-  // `rule_id_matched` (the Rust daemon's body, see audit-consumer.ts
-  // buildDetailsForEvent / WAL_OPERATION_TO_EVENT_TYPE). It carries the same
-  // operator-only attribution as `rule_id` and MUST be redacted on the
-  // agent-facing read path for the same property-#11 reason; without this an
-  // agent could read the matched rule off a signed entry (pre-existing leak
-  // since #520, closed here).
-  "rule_id_matched",
-  "policy_match",
-  "policy_decision",
-  "policy_tier",
-  "tier",
-  // Linux producer-signed decision provenance. `buildDetailsForEvent`
-  // (castle-wall/runtime/audit-consumer.ts) spreads the signed body's own
-  // `details` into the persisted entry, so the daemon's `decision_provenance`
-  // lands as a TOP-LEVEL detail key. It records WHY/HOW the allow/deny resolved
-  // (the policy reasoning path), so it is policy-inference-sensitive in exactly
-  // the property-#11 sense and is operator/auditor-only. Redact it on the
-  // agent-facing read path alongside `rule_id_matched`.
-  "decision_provenance",
-  // The producer-signed canonical blob (`cw_producer_signed_canonical`) is the
-  // VERBATIM signed JSON body persisted as a STRING. Key-based redaction does
-  // not reach inside a string, so without redacting the whole value an agent
-  // reading a signed entry recovers the matched rule (and `decision_provenance`,
-  // `agent_id`, `dest_*`) embedded in that body — a deeper no-policy-inference
-  // leak than the top-level `rule_id_matched` (property #11). Agents never need
-  // the signature-verification blob (re-verification is operator/auditor-side),
-  // so redacting the whole value is correct. Imported from constants.ts so the
-  // wire-constant literal is not duplicated.
-  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
-]);
-
-export function redactAuditValueForAgent(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => redactAuditValueForAgent(item));
-  }
-  if (value && typeof value === "object") {
-    const redacted: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      redacted[key] = AUDIT_AGENT_REDACT_DETAIL_KEYS.has(key)
-        ? AUDIT_AGENT_REDACTED
-        : redactAuditValueForAgent(nested);
-    }
-    return redacted;
-  }
-  return value;
+/**
+ * The agent-facing, redacted view of a single audit entry. Fixed shape; carries
+ * no `details`, no `identity_id`, no policy attribution.
+ */
+export interface AgentAuditView {
+  timestamp: string;
+  operation: string;
+  result: "success" | "failure";
+  has_details: boolean;
 }
 
-export function redactAuditEntryForAgent(entry: AuditEntry): AuditEntry {
+/**
+ * Redact an audit entry for agent consumption. Returns ONLY the allowlisted
+ * fixed shape — timestamp, operation, result, and a coarse has_details flag.
+ *
+ * Unlike the retired denylist projection, this never iterates `details` and
+ * never copies a `details` field through a filter: a field can only reach an
+ * agent by being one of the four allowlisted top-level fields. Adding a new
+ * operator-attribution detail key therefore CANNOT regress into an agent leak.
+ */
+export function redactAuditEntryForAgent(entry: AuditEntry): AgentAuditView {
   return {
-    ...entry,
-    identity_id: AUDIT_AGENT_REDACTED,
-    details: entry.details
-      ? (redactAuditValueForAgent(entry.details) as Record<string, unknown>)
-      : undefined,
+    timestamp: entry.timestamp,
+    operation: entry.operation,
+    result: entry.result,
+    has_details: !!entry.details,
   };
 }
 
 /**
- * Recursively DROP every policy-inference-sensitive key from a details value,
- * keeping non-sensitive keys (and recursing into their nested values). Unlike
- * `redactAuditValueForAgent`, which replaces a sensitive value IN PLACE with the
- * `[redacted]` sentinel, this removes the key/value pair ENTIRELY: neither the
- * sensitive key NAME nor the sentinel string survives. Arrays are mapped through
- * element-wise; non-object scalars pass through unchanged.
+ * Curated allowlist of `details` keys that are SAFE to expose to the agent-facing
+ * audit SEARCH corpus. These are values the calling agent already supplied or
+ * already knows about its OWN activity (the coarse allow/deny decision and the
+ * egress destination it itself targeted), and which carry no policy-inference
+ * signal (no rule id, no tier, no threshold, no decision-provenance). Everything
+ * NOT listed here — including the free-text `reason`, every `*rule_id*`,
+ * `tier`/`policy_*`, `decision_provenance`, and the producer-signed canonical
+ * blob — is omitted from the search corpus entirely, so it is neither returned
+ * NOR differentially probeable.
+ *
+ * Keep this list TINY and obviously-safe. The bar for adding a key: an agent
+ * already knows the value for its own operations, and the value reveals nothing
+ * about the operator's policy. When in doubt, leave it out — that is the whole
+ * point of an allowlist.
  */
-function dropAgentSensitiveDetailKeys(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => dropAgentSensitiveDetailKeys(item));
-  }
-  if (value && typeof value === "object") {
-    const projected: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      if (AUDIT_AGENT_REDACT_DETAIL_KEYS.has(key)) continue;
-      projected[key] = dropAgentSensitiveDetailKeys(nested);
-    }
-    return projected;
-  }
-  return value;
-}
+export const AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS = new Set<string>([
+  // The coarse allow/deny outcome of the agent's own operation (e.g. "allow",
+  // "deny_once"). Not a rule id, not a tier — just the decision the agent could
+  // already observe from whether its call succeeded.
+  "decision",
+  // The egress destination the agent itself targeted. The agent supplied this;
+  // it is not operator policy.
+  "dest_host",
+  "destination",
+]);
 
 /**
- * Build the agent-facing SEARCH corpus projection of an entry's `details` for
- * `sanctuary_audit_search`. Every policy-inference-sensitive key in
- * AUDIT_AGENT_REDACT_DETAIL_KEYS is OMITTED entirely — its key name, its value,
- * AND the `[redacted]` sentinel are all absent from the result.
+ * Build the agent-facing SEARCH corpus projection of an entry's `details`. Only
+ * keys in AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS survive (their scalar values are
+ * kept; nested values are dropped — the searchable keys are all scalars). Every
+ * other key — its name, its value, and any nested content — is OMITTED entirely.
  *
- * Omitting (rather than redacting-in-place) closes the residual presence oracle
- * left by an in-place projection: with `rule_id` -> `[redacted]` the key name
- * `"rule_id"` and the literal `"[redacted]"` both stay in the search string, so
- * an agent could probe for a sensitive key name OR the sentinel and read a
- * differential `result_count`, learning WHICH entries carry a policy-sensitive
- * field even though it never recovers the value (property #11, no-policy-
- * inference). After this projection a probe for a sensitive key name, the
- * sentinel, or a sensitive value yields no differential match; non-sensitive
- * fields (e.g. `operation`, `dest_host`, `decision`) stay searchable.
+ * Because this is an ALLOWLIST, a probe for a policy-sensitive value, a sensitive
+ * key NAME, or any redaction sentinel yields no differential match: the field is
+ * simply absent from the corpus whether or not the entry carried it (property
+ * #11, no-policy-inference). A new operator-attribution field added to the
+ * persisted entry is NOT searchable unless it is deliberately allowlisted here.
  *
- * Returns an empty object for entries with no details, so callers can build a
- * stable corpus string without special-casing. Reuses the single-sourced
- * AUDIT_AGENT_REDACT_DETAIL_KEYS set: adding a key there closes the read, the
- * in-place redaction, AND this search corpus together. The OPERATOR audit-search
- * path stays full-fidelity and MUST NOT use this projection.
+ * Returns an empty object for entries with no details so callers can build a
+ * stable corpus string without special-casing. The OPERATOR audit-search path
+ * stays full-fidelity and MUST NOT use this projection.
  */
 export function buildAgentSearchCorpus(
   entry: Pick<AuditEntry, "details">
 ): Record<string, unknown> {
   if (!entry.details) return {};
-  return dropAgentSensitiveDetailKeys(entry.details) as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entry.details)) {
+    if (!AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS.has(key)) continue;
+    // Only scalar values are searchable. A non-scalar under an allowlisted key
+    // is dropped rather than recursed, so no nested key/value can ride in.
+    if (value === null || typeof value !== "object") {
+      projected[key] = value;
+    }
+  }
+  return projected;
 }

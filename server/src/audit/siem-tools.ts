@@ -10,9 +10,22 @@
 
 import type { ToolDefinition } from "../router.js";
 import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
-import { formatAsCEF, formatAsOCSF } from "./siem-formatter.js";
+import type { SessionBinding } from "../agent-native/safety-base.js";
+import { formatAsCEF, formatAsOCSF, agentDecision } from "./siem-formatter.js";
+import {
+  redactAuditEntryForAgent,
+  buildAgentSearchCorpus,
+} from "../l2-operational/agent-audit-redaction.js";
 
-export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] } {
+export function createSIEMTools(
+  auditLog: AuditLog,
+  // OWN-IDENTITY FILTER (CISO MED-3): `audit_export_siem` is agent-callable, so
+  // it must export only the CALLER's own entries (system/gate entries — which
+  // carry operator-only context — are never returned). Optional so existing
+  // callers that pre-date the filter still construct; when absent, the tool
+  // fails closed (exports nothing) rather than degrading open.
+  currentSessionBinding?: () => SessionBinding | undefined
+): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
       name: "audit_export_siem",
@@ -154,16 +167,52 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
           ? (String(args.filter_result).toLowerCase() as "success" | "failure" | undefined)
           : undefined;
 
-        // Query audit log
+        // OWN-IDENTITY FILTER (CISO MED-3, property #11): resolve the caller's
+        // identity and export ONLY their own entries. No bound session identity
+        // → fail closed (export nothing) rather than exposing other identities'
+        // or system entries. Never degrade open.
+        const binding = currentSessionBinding?.();
+        if (!binding) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  format,
+                  count: 0,
+                  total_available: 0,
+                  time_range: { since, until: until || new Date().toISOString() },
+                  filters: {
+                    tool: filterTool,
+                    decision: filterDecision,
+                    layer: filterLayer,
+                    result: filterResult,
+                  },
+                  note: "No bound session identity; SIEM export is scoped to the caller's own entries.",
+                }),
+              },
+              { type: "text" as const, text: "" },
+            ],
+          };
+        }
+
+        // Query audit log (over-fetch, then own-identity filter, then bound by
+        // limit so `limit` bounds the caller's OWN entries).
         const result = await auditLog.query({
           since,
           layer: filterLayer,
           operation_type: undefined, // Will filter after
-          limit,
+          limit: 1000,
         });
 
-        // Apply additional filters (tool name, gate decision, result)
-        let filtered = result.entries;
+        const totalAvailable = result.entries.filter(
+          (e: AuditEntry) => e.identity_id === binding.identity_id
+        ).length;
+
+        // Apply additional filters (own-identity, tool name, decision, result).
+        let filtered = result.entries.filter(
+          (e: AuditEntry) => e.identity_id === binding.identity_id
+        );
 
         if (filterTool) {
           filtered = filtered.filter((e: AuditEntry) =>
@@ -172,9 +221,21 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
         }
 
         if (filterDecision) {
+          // Filter on the AGENT-SAFE coarse decision (2-valued allow/deny),
+          // derived from the allowlisted `decision` value + result — never the
+          // raw operator `gate_decision` detail (which would re-introduce a
+          // policy read). The schema enum keeps approve/deny/auto-allow for
+          // back-compat, but "approve" and "auto-allow" both map to the coarse
+          // "allow" (the approve-vs-auto distinction is a tier signal we do not
+          // expose).
+          const wantDeny = filterDecision === "deny";
           filtered = filtered.filter((e: AuditEntry) => {
-            const decision = String(e.details?.gate_decision || "auto-allow").toLowerCase();
-            return decision === filterDecision;
+            const view = redactAuditEntryForAgent(e);
+            const safeDecision = buildAgentSearchCorpus(e).decision as
+              | string
+              | undefined;
+            const coarse = agentDecision(view, safeDecision);
+            return wantDeny ? coarse === "deny" : coarse === "allow";
           });
         }
 
@@ -188,16 +249,29 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
           filtered = filtered.filter((e: AuditEntry) => new Date(e.timestamp) < untilDate);
         }
 
-        // Format output
+        // Bound by the requested limit AFTER own-identity + filters.
+        filtered = filtered.slice(-limit);
+
+        // Format output from the ALLOWLISTED agent view only. The raw entry is
+        // never handed to a formatter, so no `tier` / `rule_id` / agent DID /
+        // session id / free-text `reason` can ride out through a SIEM record.
         let output: string;
 
         if (format === "cef") {
-          // CEF: newline-delimited strings
-          const cefLines = filtered.map((entry: AuditEntry) => formatAsCEF(entry));
+          const cefLines = filtered.map((entry: AuditEntry) =>
+            formatAsCEF(
+              redactAuditEntryForAgent(entry),
+              buildAgentSearchCorpus(entry).decision as string | undefined
+            )
+          );
           output = cefLines.join("\n");
         } else {
-          // OCSF: JSON array
-          const ocsfObjects = filtered.map((entry: AuditEntry) => formatAsOCSF(entry));
+          const ocsfObjects = filtered.map((entry: AuditEntry) =>
+            formatAsOCSF(
+              redactAuditEntryForAgent(entry),
+              buildAgentSearchCorpus(entry).decision as string | undefined
+            )
+          );
           output = JSON.stringify(ocsfObjects, null, 2);
         }
 
@@ -208,7 +282,7 @@ export function createSIEMTools(auditLog: AuditLog): { tools: ToolDefinition[] }
               text: JSON.stringify({
                 format,
                 count: filtered.length,
-                total_available: result.total,
+                total_available: totalAvailable,
                 time_range: {
                   since,
                   until: until || new Date().toISOString(),

@@ -15,6 +15,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { createRequire } from "node:module";
+import { randomBytes } from "node:crypto";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
 import type { AuditLog } from "./l2-operational/audit-log.js";
@@ -290,13 +291,37 @@ export function createServer(
       );
       return result;
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Unknown error";
+      // FAIL-CLOSED ERROR HANDLING (CISO MED-2, Invariant #7 no-policy-inference):
+      // an uncaught handler error must NOT return its raw message to the agent —
+      // `err.message` can carry a path, a policy detail, a stack-derived
+      // internal, or a thrown invariant string (info disclosure / fail-open).
+      // Instead, LOG the full error operator-side (audit log) under a synthetic
+      // audit_ref, and return only a GENERIC payload to the agent carrying that
+      // ref so an operator can correlate. Mirrors the cooperative tools'
+      // fixedDenial discipline (generic agent-facing, full detail in audit).
+      const auditRef = `audit:tool_error:${randomBytes(8).toString("hex")}`;
+      const message = err instanceof Error ? err.message : "Unknown error";
+      const stack = err instanceof Error ? err.stack : undefined;
+      // Operator-visible record (full fidelity). Defensive: a logging failure
+      // must never re-surface the raw error to the agent, so swallow it — the
+      // generic response below is always returned.
+      try {
+        await options?.auditLog?.append(
+          "l2",
+          `tool_error:${name}`,
+          callerIdentity,
+          { audit_ref: auditRef, error: message, stack },
+          "failure"
+        );
+      } catch {
+        // Audit-write failed (e.g. integrity-locked chain). Do not leak; the
+        // agent still receives only the generic payload.
+      }
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({ error: message }),
+            text: JSON.stringify({ error: "tool execution failed", audit_ref: auditRef }),
           },
         ],
         isError: true,

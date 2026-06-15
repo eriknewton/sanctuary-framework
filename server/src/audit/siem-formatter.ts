@@ -1,142 +1,115 @@
 /**
- * Sanctuary MCP Server — SIEM Export Formatters
+ * Sanctuary MCP Server — SIEM Export Formatters (agent-facing, ALLOWLIST)
  *
  * Formats audit log entries in standard security event formats:
  * - CEF (Common Event Format)
  * - OCSF (Open Cybersecurity Schema Framework)
  *
- * Used by the audit_export_siem tool to export events to Splunk, Datadog, and other SIEMs.
+ * Used by the agent-callable `audit_export_siem` tool to export events to Splunk,
+ * Datadog, and other SIEMs.
+ *
+ * SECURITY (property #11, no-policy-inference; CISO MED-1 2026-06-15): because
+ * `audit_export_siem` is an agent-callable Tier-3 tool, these formatters consume
+ * ONLY the agent-facing ALLOWLIST view of an entry (timestamp, operation, result,
+ * has_details) plus the explicitly-safe `decision` detail value. They do NOT read
+ * the raw audit `details`, so the policy `tier`, the matched `rule_id`, the agent
+ * DID, the session id, and the threshold-bearing free-text `reason` can never
+ * ride out through a SIEM record. Severity is derived from `result`/`decision`
+ * only — never from the policy tier.
+ *
+ * A FULL-FIDELITY operator SIEM export (tier-derived severity, agent DID, session
+ * correlation) is a legitimate operator need but belongs behind an operator
+ * approval gate; re-tiering `audit_export_siem` to Tier-1 is flagged as a
+ * recommendation for the operator (see siem-tools.ts).
  */
 
-import type { AuditEntry } from "../l2-operational/audit-log.js";
+import type { AgentAuditView } from "../l2-operational/agent-audit-redaction.js";
 
-// ── Gate Decision Type ──────────────────────────────────────────────────
-
-export type GateDecision = "approve" | "deny" | "auto-allow";
+// ── Coarse decision (agent-safe) ────────────────────────────────────────
 
 /**
- * Parse gate decision from audit entry details.
- * Defaults to "auto-allow" if not specified.
+ * The coarse allow/deny outcome the calling agent already knows for its OWN
+ * operation. Deliberately 2-valued: the approve-vs-auto-allow distinction is a
+ * POLICY TIER signal (did the operation need human approval?), which is exactly
+ * what property #11 forbids leaking — so it is collapsed. This is NOT the raw
+ * operator gate decision; it is derived from the allowlisted `decision` value
+ * (the agent's own observed outcome) and the entry `result`.
  */
-function parseGateDecision(details?: Record<string, unknown>): GateDecision {
-  if (!details || typeof details.gate_decision !== "string") {
-    return "auto-allow";
-  }
-  const decision = details.gate_decision.toLowerCase();
-  if (decision === "approve" || decision === "deny") {
-    return decision;
-  }
-  return "auto-allow";
-}
+export type AgentDecision = "allow" | "deny";
 
 /**
- * Parse tier level from audit entry details (default to 3 if not specified).
+ * Normalize the agent-safe coarse outcome from the allowlisted `decision` value
+ * (if present) and the entry `result`. A `failure` result, or an allowlisted
+ * `decision` beginning with "deny"/"drop"/"block", maps to "deny"; everything
+ * else (including an explicit "allow"/"approve"/"auto-allow") maps to "allow".
  */
-function parseTier(details?: Record<string, unknown>): number {
-  if (!details || typeof details.tier !== "number") {
-    return 3;
+export function agentDecision(
+  view: AgentAuditView,
+  safeDecision?: string
+): AgentDecision {
+  if (typeof safeDecision === "string") {
+    const d = safeDecision.toLowerCase();
+    if (d.startsWith("deny") || d.startsWith("drop") || d.startsWith("block")) {
+      return "deny";
+    }
+    if (d.startsWith("allow") || d.startsWith("approve") || d.startsWith("auto")) {
+      return "allow";
+    }
   }
-  return Math.max(1, Math.min(3, details.tier)); // Clamp to 1-3
-}
-
-/**
- * Parse session ID from audit entry details.
- */
-function parseSessionId(details?: Record<string, unknown>): string {
-  if (!details || typeof details.session_id !== "string") {
-    return "unknown";
-  }
-  return details.session_id;
-}
-
-/**
- * Parse agent DID from audit entry details.
- */
-function parseAgentDid(details?: Record<string, unknown>): string {
-  if (!details || typeof details.agent_did !== "string") {
-    return "unknown";
-  }
-  return details.agent_did;
+  return view.result === "failure" ? "deny" : "allow";
 }
 
 // ── CEF (Common Event Format) Formatter ─────────────────────────────────
 
 export interface CEFOptions {
-  /**
-   * CEF version (default: "0")
-   */
+  /** CEF version (default: "0") */
   version?: string;
-
-  /**
-   * Vendor name (default: "Sanctuary")
-   */
+  /** Vendor name (default: "Sanctuary") */
   vendor?: string;
-
-  /**
-   * Product name (default: "MCP-Server")
-   */
+  /** Product name (default: "MCP-Server") */
   product?: string;
-
-  /**
-   * Product version (default: "0.7.0")
-   */
+  /** Product version (default: "0.7.0") */
   productVersion?: string;
 }
 
 /**
- * Map gate decision and tier to CEF severity (0-10).
- * - deny = 8 (high severity)
- * - approve(T1) = 5 (medium)
- * - approve(T2) = 3 (low)
- * - auto-allow(T3) = 1 (informational)
+ * Map the agent-safe outcome to CEF severity (0-10). Severity is derived from the
+ * outcome/result only — never from the (operator-only) policy tier:
+ * - deny / failure = 8 (high)
+ * - allow / auto-allow = 1 (informational)
  */
-function gateToCEFSeverity(decision: GateDecision, tier: number): number {
-  if (decision === "deny") {
-    return 8;
-  }
-  if (decision === "approve") {
-    if (tier === 1) return 5; // Tier 1 requires manual approval
-    if (tier === 2) return 3; // Tier 2 requires careful review
-  }
-  return 1; // auto-allow or tier 3
+function agentToCEFSeverity(decision: AgentDecision): number {
+  return decision === "deny" ? 8 : 1;
 }
 
 /**
- * Format an audit entry as CEF (Common Event Format).
+ * Format an agent-facing audit view as CEF (Common Event Format).
  *
- * Produces a single-line CEF event suitable for Splunk, QRadar, etc.
- *
- * Format:
- * ```
- * CEF:0|Sanctuary|MCP-Server|0.7.0|<tool_name>|<description>|<severity>|src=<agent_did> act=<tool_name> outcome=<gate_decision> tier=<tier> cs1=<session_id> cs1Label=SessionId
- * ```
+ * Produces a single-line CEF event suitable for Splunk, QRadar, etc., built ONLY
+ * from allowlisted fields. There is no `src` (agent DID), no `tier`, and no
+ * session id, so no operator/policy attribution leaks.
  */
-export function formatAsCEF(entry: AuditEntry, options?: CEFOptions): string {
+export function formatAsCEF(
+  view: AgentAuditView,
+  safeDecision?: string,
+  options?: CEFOptions
+): string {
   const version = options?.version ?? "0";
   const vendor = options?.vendor ?? "Sanctuary";
   const product = options?.product ?? "MCP-Server";
   const productVersion = options?.productVersion ?? "0.7.0";
 
-  const decision = parseGateDecision(entry.details);
-  const tier = parseTier(entry.details);
-  const sessionId = parseSessionId(entry.details);
-  const agentDid = parseAgentDid(entry.details);
+  const decision = agentDecision(view, safeDecision);
+  const severity = agentToCEFSeverity(decision);
+  const signatureId = view.operation.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const description = `Sanctuary ${view.operation}`;
 
-  const severity = gateToCEFSeverity(decision, tier);
-  const signatureId = entry.operation.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const description = `Sanctuary ${entry.operation}`;
-
-  // Build extension (key=value pairs)
+  // Extension (key=value pairs). Allowlisted fields only.
   const extensions = [
-    `src=${agentDid}`,
-    `act=${entry.operation}`,
+    `act=${view.operation}`,
     `outcome=${decision}`,
-    `tier=${tier}`,
-    `cs1=${sessionId}`,
-    `cs1Label=SessionId`,
-    `rt=${new Date(entry.timestamp).getTime()}`,
-    `layer=${entry.layer}`,
-    `result=${entry.result}`,
+    `rt=${new Date(view.timestamp).getTime()}`,
+    `result=${view.result}`,
   ];
 
   return `CEF:${version}|${vendor}|${product}|${productVersion}|${signatureId}|${description}|${severity}|${extensions.join(" ")}`;
@@ -145,30 +118,24 @@ export function formatAsCEF(entry: AuditEntry, options?: CEFOptions): string {
 // ── OCSF (Open Cybersecurity Schema Framework) Formatter ────────────────
 
 /**
- * Map gate decision to OCSF status_id (1=success, 2=failure).
+ * Map the agent-safe outcome + result to OCSF status_id (1=success, 2=failure).
  */
-function gateToOCSFStatus(decision: GateDecision, result: "success" | "failure"): 1 | 2 {
-  return decision === "deny" || result === "failure" ? 2 : 1;
+function agentToOCSFStatus(view: AgentAuditView, decision: AgentDecision): 1 | 2 {
+  return decision === "deny" || view.result === "failure" ? 2 : 1;
 }
 
 /**
- * Map gate decision and tier to OCSF severity_id (1=Informational, 4=Critical).
+ * Map the agent-safe outcome to OCSF severity_id (1=Informational, 4=Critical).
+ * Derived from the outcome only — never from the (operator-only) policy tier.
  */
-function gateToCOCSFSeverity(decision: GateDecision, tier: number): 1 | 2 | 3 | 4 {
-  if (decision === "deny") {
-    return 4; // Critical
-  }
-  if (decision === "approve") {
-    if (tier === 1) return 3; // High
-    if (tier === 2) return 2; // Medium
-  }
-  return 1; // Informational (auto-allow or tier 3)
+function agentToOCSFSeverity(decision: AgentDecision): 1 | 4 {
+  return decision === "deny" ? 4 : 1;
 }
 
 /**
- * Map gate decision to OCSF disposition_id (1=allowed, 2=blocked).
+ * Map the agent-safe outcome to OCSF disposition_id (1=allowed, 2=blocked).
  */
-function gateToOCSFDisposition(decision: GateDecision): 1 | 2 {
+function agentToOCSFDisposition(decision: AgentDecision): 1 | 2 {
   return decision === "deny" ? 2 : 1;
 }
 
@@ -192,21 +159,19 @@ export interface OCSFObject {
 }
 
 /**
- * Format an audit entry as OCSF (Open Cybersecurity Schema Framework).
+ * Format an agent-facing audit view as OCSF (Open Cybersecurity Schema Framework).
  *
- * Returns a JSON object conforming to OCSF class_uid 3001 (API Activity).
- *
- * OCSF is a vendor-agnostic schema used by Splunk, Datadog, CrowdStrike, and others.
+ * Returns a JSON object conforming to OCSF class_uid 3001 (API Activity), built
+ * ONLY from allowlisted fields. The actor uid is a fixed "self" sentinel (the
+ * export is already scoped to the caller's own identity) rather than the raw
+ * agent DID, so no identity or policy attribution leaks.
  */
-export function formatAsOCSF(entry: AuditEntry): OCSFObject {
-  const decision = parseGateDecision(entry.details);
-  const tier = parseTier(entry.details);
-  const agentDid = parseAgentDid(entry.details);
-
-  const timestamp = new Date(entry.timestamp).getTime();
-  const statusId = gateToOCSFStatus(decision, entry.result);
-  const severityId = gateToCOCSFSeverity(decision, tier);
-  const dispositionId = gateToOCSFDisposition(decision);
+export function formatAsOCSF(view: AgentAuditView, safeDecision?: string): OCSFObject {
+  const decision = agentDecision(view, safeDecision);
+  const timestamp = new Date(view.timestamp).getTime();
+  const statusId = agentToOCSFStatus(view, decision);
+  const severityId = agentToOCSFSeverity(decision);
+  const dispositionId = agentToOCSFDisposition(decision);
 
   return {
     class_uid: 3001,
@@ -219,11 +184,13 @@ export function formatAsOCSF(entry: AuditEntry): OCSFObject {
     activity_name: "API Call",
     actor: {
       user: {
-        uid: agentDid,
+        // Scoped to the caller's own identity already; emit a fixed self
+        // sentinel rather than the raw DID (no identity leak).
+        uid: "self",
       },
     },
     api: {
-      operation: entry.operation,
+      operation: view.operation,
       service: {
         name: "sanctuary-mcp",
       },

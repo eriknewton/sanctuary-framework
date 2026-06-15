@@ -551,7 +551,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query this instance's sovereignty audit log, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect recorded operations. Read-only; entries are redacted for agent consumption (no secret material).",
+      description: "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — no details, identity, or policy attribution.",
       inputSchema: {
         type: "object",
         properties: {
@@ -565,16 +565,36 @@ export async function createSanctuaryServer(options?: {
         },
       },
       handler: async (args) => {
+        // OWN-IDENTITY FILTER (CISO MED-3, property #11): an agent may only read
+        // its OWN audit entries. Entries attributed to `system` (every gate /
+        // policy decision, anomaly escalation, injection block) carry operator-
+        // only context and are written with identity_id === "system", so the
+        // own-identity filter alone keeps them off the agent-facing read — the
+        // threshold-bearing free-text `reason` on a `gate_*` entry never reaches
+        // an agent, both because it is a `system` entry AND because the redacted
+        // view drops `details` entirely (defence in depth). Mirrors
+        // sanctuary_audit_search's own_signed scope.
+        const binding = currentSessionBinding();
+        // No bound session identity → fail closed (return nothing) rather than
+        // exposing other identities' (or system) entries. Never degrade open.
+        if (!binding) {
+          return toolResult({ entries: [], count: 0 });
+        }
+        const limit = Math.max(1, (args.limit as number) ?? 50);
+        // Query a wider window, then filter to the caller's identity, then slice,
+        // so `limit` bounds the caller's OWN entries (not a global page that may
+        // contain few/none of theirs).
         const result = await auditLog.query({
           since: args.since as string | undefined,
           layer: args.layer as "l1" | "l2" | "l3" | "l4" | undefined,
           operation_type: args.operation_type as string | undefined,
-          limit: (args.limit as number) ?? 50,
+          limit: 500,
         });
-        return toolResult({
-          ...result,
-          entries: result.entries.map((entry) => redactAuditEntryForAgent(entry)),
-        });
+        const own = result.entries
+          .filter((entry) => entry.identity_id === binding.identity_id)
+          .slice(-limit)
+          .map((entry) => redactAuditEntryForAgent(entry));
+        return toolResult({ entries: own, count: own.length });
       },
     },
   ];
@@ -718,7 +738,7 @@ export async function createSanctuaryServer(options?: {
   const { tools: auditTools } = createAuditTools(config, auditLog);
 
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
-  const { tools: siemTools } = createSIEMTools(auditLog);
+  const { tools: siemTools } = createSIEMTools(auditLog, currentSessionBinding);
 
   // 14e. Initialize Sovereignty Profile store. Its context_gating subsection is
   // the persisted source of truth for the runtime context gate enforcer.

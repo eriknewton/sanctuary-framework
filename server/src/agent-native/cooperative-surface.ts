@@ -873,17 +873,18 @@ export function createAgentNativeCooperativeTools(
           const matches = queried.entries
             .filter((entry) => entry.identity_id === activeIdentity.identity_id)
             // Search the AGENT search-corpus projection, never the raw entry
-            // (property #11, no-policy-inference). The returned rows already omit
-            // details, but filtering over raw details would leak their presence
-            // differentially: an agent could probe a guessed `rule_id` /
-            // `rule_id_matched` / `decision_provenance` / signed-canonical-blob
-            // value and read a match off `result_count`. buildAgentSearchCorpus
-            // OMITS those keys entirely — value, key NAME, and the `[redacted]`
-            // sentinel are all absent — so a probe for a sensitive value, a
-            // sensitive key name, or the sentinel can never hit. Legitimate
-            // search over `operation` and non-sensitive detail fields is
-            // preserved. The OPERATOR audit-search path stays full-fidelity (it
-            // does not call this projection).
+            // (property #11, no-policy-inference; LOW-1). The needle is matched
+            // ONLY against the operation name plus the search-ALLOWLIST of safe
+            // detail keys (buildAgentSearchCorpus) — a tiny, explicitly non-
+            // policy subset (decision, dest_host/destination). Every other key —
+            // the free-text `reason`, every `*rule_id*`, `tier`/`policy_*`,
+            // `decision_provenance`, the signed-canonical blob, and any NEW
+            // operator-attribution field — is absent from the corpus, so a probe
+            // for a sensitive value, a sensitive key NAME, or any sentinel can
+            // never differentially match off `result_count`. Because it is an
+            // allowlist, adding a sensitive detail key later cannot regress this.
+            // The OPERATOR audit-search path stays full-fidelity (it does not
+            // call this projection).
             .filter((entry) =>
               `${entry.operation} ${canonicalJson(buildAgentSearchCorpus(entry))}`
                 .toLowerCase()
