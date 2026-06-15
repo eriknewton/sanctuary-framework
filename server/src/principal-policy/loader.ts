@@ -68,6 +68,13 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   principals, each carrying its policy tier and approve/deny decision — a
  *   policy-inference oracle for the agent (no-read invariant). SIEM forwarding
  *   is an operator function, so it must require operator approval. (CISO MED-1.)
+ * - compliance_generate_eu_ai_act_bundle: the generated bundle body embeds the
+ *   verbatim Tier-2 anomaly policy (e.g. frequency_spike_multiplier), the
+ *   approval-channel timeout, and audit-derived aggregate gate-decision counts —
+ *   the same policy-inference leak class as audit_export_siem, through a
+ *   different door (no-read invariant). It is also a governance conflict of
+ *   interest: an agent must not self-generate its own compliance attestation.
+ *   So it must require operator approval. (CISO NEW-1.)
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
@@ -77,6 +84,7 @@ const FORCED_TIER1_OPERATIONS = [
   "context_gate_set_policy",
   "context_gate_apply_template",
   "audit_export_siem",
+  "compliance_generate_eu_ai_act_bundle",
 ] as const;
 
 /**
@@ -126,6 +134,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "context_gate_set_policy", // Policy-adjacent enforcement mutation; always requires approval.
     "context_gate_apply_template", // Policy-adjacent enforcement mutation; always requires approval.
     "audit_export_siem", // Bulk audit export (per-op tier+decision across all principals); operator-only — prevents agent policy-inference (CISO MED-1).
+    "compliance_generate_eu_ai_act_bundle", // Bundle body embeds verbatim Tier-2 thresholds + approval timeout + audit-derived aggregates; operator-only — prevents agent policy-inference + self-attestation (CISO NEW-1).
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -193,8 +202,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
     "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
     "memory_attest", // Read-only audit attestation — records that a memory op happened
-    "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
-    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
+    // compliance_generate_eu_ai_act_bundle re-tiered Tier-3 → Tier-1 (CISO NEW-1):
+    // its bundle body emits verbatim Tier-2 thresholds + the approval timeout +
+    // audit-derived aggregates, a policy-inference oracle for the agent, and an
+    // agent self-generating its own compliance attestation is a conflict of
+    // interest. See FORCED_TIER1_OPERATIONS + tier1_always_approve above.
+    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier — stays Tier 3 (no policy thresholds in its output)
     "sanctuary_remember",
     "sanctuary_recall",
     "sanctuary_hide",

@@ -190,6 +190,37 @@ describe("Approval Gate", () => {
       expect(result.allowed).toBe(false);
       expect(result.approval_required).toBe(true);
     });
+
+    it("gates compliance_generate_eu_ai_act_bundle at Tier 1 — a cooperative agent cannot self-generate a compliance bundle without operator approval (CISO NEW-1)", async () => {
+      // The generated bundle body embeds the verbatim Tier-2 anomaly policy
+      // (e.g. frequency_spike_multiplier), the approval-channel timeout, and
+      // audit-derived aggregate gate-decision counts — the same policy-inference
+      // leak class as audit_export_siem, a different door. It is also a
+      // governance conflict of interest: an agent must not self-generate its own
+      // compliance attestation. So it must require operator approval, never
+      // auto-allow to the agent.
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+      expect(DEFAULT_POLICY.tier3_always_allow).not.toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("compliance_generate_eu_ai_act_bundle", {
+        agent_did: "did:key:zExampleAgent",
+      });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+    });
   });
 
   describe("Tier 2 — behavioral anomaly detection", () => {
