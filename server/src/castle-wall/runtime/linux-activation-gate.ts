@@ -44,6 +44,8 @@ import {
 } from "./linux-daemon.js";
 import {
   startLinuxAuditDrainLoop,
+  drainOnce,
+  DEFAULT_AUDIT_DRAIN_MAX_EVENTS,
   type LinuxAuditDrainHandle,
   type LinuxAuditDrainOptions,
 } from "./linux-audit-drain.js";
@@ -119,6 +121,17 @@ export interface ActivateLinuxProducerSignedInput {
   drainOptions?: LinuxAuditDrainOptions;
   /** Skip starting the continuous drain loop (tests that drive drain manually). */
   startDrainLoop?: boolean;
+  /**
+   * Whether to PROVE the audit channel is live (one successful drain round-trip)
+   * BEFORE reporting armed (codex round-4 HIGH — fail-open at the arming
+   * boundary). Default true: a handshake-only "armed" is not enough — the signed
+   * enforcement evidence must demonstrably flow, or the activation fails closed
+   * (NOT-ARMED) rather than reporting armed for the request-timeout window on an
+   * unconfirmed channel. Only honored when the continuous loop runs
+   * (`startDrainLoop !== false`). A harness that deliberately injects a
+   * non-responsive transport sets this false to skip the probe.
+   */
+  confirmInitialDrain?: boolean;
   /**
    * Hook for a durable NOT-ARMED / audit-failure signal when the drain loop hits
    * an UNSETTLED transport/persistence FAULT (FIX 4 — drain health is
@@ -416,10 +429,76 @@ export async function activateLinuxProducerSignedCastleWall(
         markDrainUnhealthy(err);
       },
     };
+
+    // CODEX HIGH (round-4 — fail-OPEN at the arming boundary): the continuous
+    // loop's first cycle is started fire-and-forget by `startLinuxAuditDrainLoop`,
+    // so without this step the activation would return `activated: true` (and
+    // `drainHealthy()` would read true) the instant the loop is *scheduled* —
+    // BEFORE a single drain round-trip has succeeded. A daemon that completes the
+    // handshake but then wedges the very first `audit_drain_request` would report
+    // ARMED for the whole request-timeout window (`IpcClient.requestTimeoutMs`,
+    // default 10s) with zero signed evidence having flowed. That is exactly the
+    // "armed-but-not-draining" fake-green this file's contract forbids.
+    //
+    // Fix-CLOSED: PROVE the audit channel is live before reporting armed. Await
+    // ONE drain round-trip (an empty batch counts — it proves the link delivers;
+    // a SETTLED producer-signature refusal in the batch also counts — the channel
+    // works and a refused forgery is the gate working, not a transport failure).
+    // A transport failure/timeout makes `drainRequest` REJECT, which `drainOnce`
+    // propagates → we fail closed. A transient persistence fault during the probe
+    // trips `markDrainUnhealthy` (via the wired `onDrainFault`) → `drainUnhealthy`
+    // becomes true → we also fail closed. The continuous loop then resumes from
+    // the cursor the probe reached, so no event is drained twice or skipped.
+    //
+    // `confirmInitialDrain: false` opts a caller out (e.g. a harness that injects
+    // a non-responsive transport on purpose); the default is the fail-closed probe.
+    const maxEvents =
+      input.drainOptions?.maxEvents ?? DEFAULT_AUDIT_DRAIN_MAX_EVENTS;
+    let initialCursor: number | null = null;
+    if (input.confirmInitialDrain !== false) {
+      try {
+        const probe = await drainOnce(
+          lifecycle.client(),
+          lifecycle.audit(),
+          null,
+          maxEvents,
+          drainOptions.onError,
+          drainOptions.onDrainFault
+        );
+        initialCursor = probe.nextAfterSeq;
+      } catch (err) {
+        // The initial drain round-trip failed (link dropped / request timed out
+        // before any batch arrived). Tear down what we opened and surface
+        // NOT-ARMED — never report armed on an unconfirmed audit channel.
+        await lifecycle.stop().catch(() => {});
+        const message = err instanceof Error ? err.message : String(err);
+        throw new RuntimeLinuxActivationError(
+          `Castle Wall Linux activation failed (fail-closed, not armed): the initial ` +
+            `audit drain did not complete a round-trip, so the signed enforcement ` +
+            `evidence channel is unproven (armed-but-not-draining). Cause: ${message}`,
+          "drain_failed"
+        );
+      }
+      if (drainUnhealthy) {
+        // A persistence fault tripped during the probe (the channel delivered but
+        // the consumer could not durably settle). The not-armed record + teardown
+        // are already in flight; await them, then surface NOT-ARMED.
+        await drainTeardown.catch(() => {});
+        await lifecycle.stop().catch(() => {});
+        throw new RuntimeLinuxActivationError(
+          `Castle Wall Linux activation failed (fail-closed, not armed): the initial ` +
+            `audit drain could not be durably settled (audit persistence fault).`,
+          "drain_failed"
+        );
+      }
+    }
+
     drain = startLinuxAuditDrainLoop(
       lifecycle.client(),
       lifecycle.audit(),
-      drainOptions
+      // Resume the continuous loop from where the confirmation probe left off so
+      // a drained/settled event is neither re-pulled nor skipped.
+      { ...drainOptions, initialCursor }
     );
   }
 

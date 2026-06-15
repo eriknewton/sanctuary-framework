@@ -69,6 +69,14 @@ export interface LinuxAuditDrainOptions {
   maxEvents?: number;
   /** Poll interval (ms) between drain cycles when running continuously. Default 1000. */
   pollIntervalMs?: number;
+  /**
+   * Seq to resume the loop's cursor from (exclusive — the first cycle pulls
+   * strictly above it). Defaults to null (drain from the start). The activation
+   * gate sets this to the cursor its fail-closed initial-drain confirmation
+   * probe reached, so the continuous loop neither re-pulls nor skips an event
+   * the probe already drained.
+   */
+  initialCursor?: number | null;
   /** Injected timer for tests; defaults to setTimeout. */
   setTimer?: (cb: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -342,7 +350,7 @@ export function startLinuxAuditDrainLoop(
   const clearTimer = options.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
 
   let stopped = false;
-  let cursor: number | null = null;
+  let cursor: number | null = options.initialCursor ?? null;
   let lastAcked: number | null = null;
   let timer: unknown = null;
   let inflight: Promise<void> = Promise.resolve();

@@ -1137,3 +1137,163 @@ describe("C4 — round-3 HIGH: NOT-ARMED record durability + settled-refusal vs 
     await activation.stop();
   });
 });
+
+describe("C4 — round-4 HIGH: never report ARMED before the audit channel is PROVEN (initial-drain confirmation)", () => {
+  /**
+   * A mock daemon that completes the handshake normally but FAILS the first
+   * `audit_drain_request` (its `transport.send` rejects for that frame). Models a
+   * daemon that handshakes then wedges the drain channel — the case where a
+   * handshake-only "armed" would be fake-green.
+   */
+  function handshakeOkDrainWedgedDaemon(): {
+    transport: IpcTransport;
+    sendChallenge: () => Promise<void>;
+  } {
+    let listener: ((bytes: Uint8Array) => void) | null = null;
+    let buffer = new Uint8Array(0);
+    const emit = (msg: CastleWallMessage): void => {
+      if (!listener) throw new Error("mock daemon: no listener attached");
+      listener(
+        frame(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: `castle-wall.${msg.type}`,
+            params: msg,
+          })
+        )
+      );
+    };
+    return {
+      transport: {
+        send: async (bytes: Uint8Array) => {
+          const merged = new Uint8Array(buffer.length + bytes.length);
+          merged.set(buffer, 0);
+          merged.set(bytes, buffer.length);
+          buffer = merged;
+          while (true) {
+            const step = parseFrame(buffer);
+            if (step.kind === "complete") {
+              const body = step.body;
+              buffer = new Uint8Array(buffer.subarray(step.consumedBytes));
+              const env = JSON.parse(body) as { params?: CastleWallMessage };
+              const msg = env.params;
+              if (msg && msg.type === "audit_drain_request") {
+                // The drain channel is wedged: reject the send so the client's
+                // `drainRequest` rejects immediately (deterministic — no waiting
+                // on the request timeout).
+                throw new Error("drain channel wedged (first request)");
+              }
+              // handshake_response / lock / unlock are accepted silently.
+            } else if (step.kind === "need_more") {
+              break;
+            } else {
+              throw new Error(`mock daemon framing error: ${step.reason}`);
+            }
+          }
+        },
+        onData: (l) => {
+          listener = l;
+          return () => {
+            listener = null;
+          };
+        },
+        close: async () => {
+          listener = null;
+        },
+      },
+      sendChallenge: async () => {
+        for (let i = 0; i < 500 && !listener; i++) {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+        if (!listener) throw new Error("mock daemon: listener never attached");
+        emit({ type: "handshake_challenge", nonce_b64url: "AAEC" });
+      },
+    };
+  }
+
+  it("FAILS CLOSED (not-armed) when the handshake succeeds but the FIRST drain round-trip does not complete", async () => {
+    // The daemon handshakes (so `startCastleWall` succeeds and the key is loaded
+    // + enforcing) but then wedges the drain channel. Without the initial-drain
+    // confirmation the activation would return `activated: true` for the whole
+    // request-timeout window with ZERO signed evidence flowing. The probe must
+    // catch this and THROW NOT-ARMED instead.
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = handshakeOkDrainWedgedDaemon();
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      // Continuous loop (default) + initial-drain confirmation (default) engaged.
+    });
+    await mock.sendChallenge();
+
+    // The activation must REJECT (not resolve as armed): the audit channel was
+    // never proven, so reporting armed would be fake-green.
+    let thrown: unknown;
+    try {
+      await outcomeP;
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect((thrown as RuntimeLinuxActivationError).reason).toBe("drain_failed");
+    expect((thrown as Error).message).toMatch(/not armed/i);
+    expect((thrown as Error).message).toMatch(/unproven|round-trip/i);
+  });
+
+  it("ARMS when the initial drain completes a round-trip (empty batch counts — the channel is proven live)", async () => {
+    // Contrast: a daemon that handshakes AND serves an (empty) first drain proves
+    // the channel delivers, so the activation legitimately reports armed. This is
+    // the positive side of the round-4 contract.
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = buildMockDaemon([]); // serves an empty first drain, then more_pending=false
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: {
+        // Park the continuous loop's NEXT cycle so the test controls teardown;
+        // the initial-drain PROBE still runs (it is not the scheduled loop).
+        pollIntervalMs: 10_000,
+        setTimer: () => 1,
+        clearTimer: () => {},
+      },
+    });
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    // Armed AND healthy: the channel was proven by the initial round-trip.
+    expect(outcome.activation.drainHealthy()).toBe(true);
+    expect(outcome.activation.lifecycle.audit().isProducerSignatureEnforced()).toBe(
+      true
+    );
+
+    await outcome.activation.stop();
+  });
+});
