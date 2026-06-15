@@ -155,7 +155,7 @@ baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
 if [[ -z "$baseline" ]]; then
   baseline=0
 fi
-if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
+if ! [[ "$baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
   fail "committed .test-baseline (HEAD:.test-baseline) is not a single integer, got: '$baseline'"
   exit 1
 fi
@@ -174,7 +174,7 @@ fi
 # shape, so make it loud — it is being IGNORED for enforcement, by design.
 if [[ -f .test-baseline ]]; then
   worktree_baseline=$(tr -d '[:space:]' < .test-baseline)
-  if [[ "$worktree_baseline" =~ ^[0-9]+$ && "$worktree_baseline" != "$baseline" && -z "$baseline_is_staged" ]]; then
+  if [[ "$worktree_baseline" =~ ^(0|[1-9][0-9]*)$ && "$worktree_baseline" != "$baseline" && -z "$baseline_is_staged" ]]; then
     warn "working-tree .test-baseline ($worktree_baseline) differs from the committed floor ($baseline) and is UNSTAGED."
     warn "The unstaged edit will NOT be committed and is IGNORED for enforcement. Stage it (git add .test-baseline) to make it count."
   fi
@@ -338,14 +338,14 @@ fi
 # (_sb/_pb) so the in-branch "drift accounted" message keeps its own vars.
 if [[ -n "$baseline_is_staged" ]]; then
   _sb=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if ! [[ "$_sb" =~ ^[0-9]+$ ]]; then
+  if ! [[ "$_sb" =~ ^(0|[1-9][0-9]*)$ ]]; then
     fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$_sb'" >&2
     printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
   _pb=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  [[ "$_pb" =~ ^[0-9]+$ ]] || _pb=0
+  [[ "$_pb" =~ ^(0|[1-9][0-9]*)$ ]] || _pb=0
   if (( _sb <= _pb )); then
     fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
     printf '[baseline-guard]   Previously committed: %s\n' "$_pb" >&2
@@ -395,13 +395,13 @@ if (( passing > baseline )); then
   # HEAD blob, so the prior value is treated as 0 and any positive staged
   # value qualifies as an upward bump.
   staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if ! [[ "$staged_baseline" =~ ^[0-9]+$ ]]; then
+  if ! [[ "$staged_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
     fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
     exit 1
   fi
   prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if ! [[ "$prev_baseline" =~ ^[0-9]+$ ]]; then
+  if ! [[ "$prev_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
     prev_baseline=0
   fi
   if (( staged_baseline <= prev_baseline )); then
