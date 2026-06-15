@@ -15,6 +15,8 @@ import {
   type SessionBinding,
 } from "../../src/agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "../../src/agent-native/cooperative-surface.js";
+import { attributeFlows } from "../../src/castle-wall/audit/per-rule-report.js";
+import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "../../src/castle-wall/constants.js";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
@@ -417,6 +419,129 @@ describe("agent-native Phase 2 cooperative surface", () => {
     });
     expect(own.scope).toBe("own_signed");
     expect(JSON.stringify(own.results)).not.toContain("needle-value");
+  });
+
+  // Property #11 (no-policy-inference): the agent-facing audit search must NOT be
+  // a probing oracle. The returned rows already omit details, but searching over
+  // the RAW details would still let an agent guess a policy-inference-sensitive
+  // value (rule_id / rule_id_matched / decision_provenance / the signed-canonical
+  // blob) and learn a differential match off result_count. The search corpus is
+  // the agent-REDACTED projection, so a probe for any sensitive value can never
+  // hit, while the entry stays findable by its (non-sensitive) operation.
+  it("audit search does not leak policy-inference-sensitive details via probing (oracle closed, property #11)", async () => {
+    const env = await setup();
+    const ownIdentity = env.identity.identity_id as string;
+
+    // Seed a Castle Wall enforcement audit entry carrying every sensitive detail
+    // key on the cooperative surface's shared audit log, owned by the active agent
+    // so it falls within the search's own_signed identity scope.
+    await env.auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: ownIdentity,
+      result: "failure",
+      details: {
+        decision: "deny_once",
+        rule_id: "deny-secret-mac-rule",
+        rule_id_matched: "deny-secret-linux-rule",
+        decision_provenance: "policy_path_secret_provenance",
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]:
+          '{"rule_id_matched":"deny-embedded-in-signed-blob","agent_id":"a"}',
+        dest_host: "non-sensitive-host.example",
+      },
+    });
+
+    // Baseline: the entry IS discoverable by its non-sensitive operation name.
+    const byOperation = await callTool(env.facadeTools, "sanctuary_audit_search", {
+      query: "egress_blocked",
+      scope: "own_signed",
+    });
+    expect((byOperation.results as unknown[]).length).toBe(1);
+
+    // Each sensitive value must yield ZERO matches — the probe cannot
+    // differentially confirm the value's presence (result_count unaffected).
+    for (const probe of [
+      "deny-secret-mac-rule", // rule_id
+      "deny-secret-linux-rule", // rule_id_matched
+      "policy_path_secret_provenance", // decision_provenance
+      "deny-embedded-in-signed-blob", // value inside the signed-canonical blob string
+    ]) {
+      const probed = await callTool(env.facadeTools, "sanctuary_audit_search", {
+        query: probe,
+        scope: "own_signed",
+      });
+      expect(
+        (probed.results as unknown[]).length,
+        `probe "${probe}" must not differentially match`
+      ).toBe(0);
+      // And the sensitive value never appears in the returned payload.
+      expect(JSON.stringify(probed.results)).not.toContain(probe);
+    }
+  });
+
+  // The OPERATOR audit path stays full-fidelity over the SAME seeded entry: it
+  // must still see the unredacted matched rule. The agent redaction is scoped to
+  // the agent-facing search/read boundary only and must not bleed into operator
+  // attribution (per-rule-per-flow read-out).
+  it("operator audit path still sees full (unredacted) details after the agent search fix", async () => {
+    const env = await setup();
+    const ownIdentity = env.identity.identity_id as string;
+    await env.auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: ownIdentity,
+      result: "failure",
+      details: {
+        decision: "deny_once",
+        rule_id: "deny-operator-visible-rule",
+        dest_host: "h.example",
+      },
+    });
+
+    // Operator reads the raw audit log directly: details are full-fidelity.
+    const raw = await env.auditLog.query({ layer: "l1", limit: 50 });
+    const rawEntry = raw.entries.find((e) => e.operation === "egress_blocked");
+    expect(rawEntry?.details?.rule_id).toBe("deny-operator-visible-rule");
+
+    // The operator per-rule-per-flow read-out attributes the flow to that rule.
+    const attributed = attributeFlows(raw.entries);
+    const flow = attributed.find((f) => f.operation === "egress_blocked");
+    expect(flow?.ruleId).toBe("deny-operator-visible-rule");
+  });
+
+  // Legitimate agent search over NON-sensitive fields keeps working: the redacted
+  // projection preserves operation names and non-sensitive detail values.
+  it("agent search still matches non-sensitive detail fields after the fix", async () => {
+    const env = await setup();
+    const ownIdentity = env.identity.identity_id as string;
+    await env.auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: ownIdentity,
+      result: "success",
+      details: {
+        decision: "allow",
+        rule_id: "allow-secret-rule",
+        dest_host: "searchable-allowed-host.example",
+      },
+    });
+
+    // A non-sensitive detail value is still searchable.
+    const byHost = await callTool(env.facadeTools, "sanctuary_audit_search", {
+      query: "searchable-allowed-host",
+      scope: "own_signed",
+    });
+    expect((byHost.results as unknown[]).length).toBe(1);
+    expect((byHost.results as Array<Record<string, unknown>>)[0]!.operation).toBe(
+      "egress_allowed"
+    );
+
+    // ...but the sensitive rule_id on the SAME entry is still not searchable.
+    const byRule = await callTool(env.facadeTools, "sanctuary_audit_search", {
+      query: "allow-secret-rule",
+      scope: "own_signed",
+    });
+    expect((byRule.results as unknown[]).length).toBe(0);
   });
 
   it("fails compound plans before step one when required approvals are missing", async () => {

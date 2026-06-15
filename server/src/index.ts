@@ -16,7 +16,7 @@ import { createDistressTools } from "./distress/tools.js";
 import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
-import { AuditLog, type AuditEntry } from "./l2-operational/audit-log.js";
+import { AuditLog } from "./l2-operational/audit-log.js";
 import { createL3Tools } from "./l3-disclosure/tools.js";
 import { createL4Tools } from "./l4-reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
@@ -125,80 +125,13 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
-import { CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY } from "./castle-wall/constants.js";
+// Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
+// in l2-operational/agent-audit-redaction.ts so the redact-key set is shared by
+// the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
+// SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
+import { redactAuditEntryForAgent } from "./l2-operational/agent-audit-redaction.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
-
-const AUDIT_AGENT_REDACTED = "[redacted]";
-const AUDIT_AGENT_REDACT_DETAIL_KEYS = new Set([
-  "decided_by",
-  "identity_id",
-  "operatorId",
-  "operator_id",
-  "resolved_by",
-  "policy_rule_id",
-  // Castle Wall matched-rule id (#381). Written to the stored audit entry for
-  // operator attribution; redacted here so an agent querying audit entries
-  // cannot learn which allow/deny rule matched and map the essentials list by
-  // probing (property #11, no-policy-inference).
-  "rule_id",
-  // The Linux producer-signed audit path persists the matched rule under
-  // `rule_id_matched` (the Rust daemon's body, see audit-consumer.ts
-  // buildDetailsForEvent / WAL_OPERATION_TO_EVENT_TYPE). It carries the same
-  // operator-only attribution as `rule_id` and MUST be redacted on the
-  // agent-facing read path for the same property-#11 reason; without this an
-  // agent could read the matched rule off a signed entry (pre-existing leak
-  // since #520, closed here).
-  "rule_id_matched",
-  "policy_match",
-  "policy_decision",
-  "policy_tier",
-  "tier",
-  // Linux producer-signed decision provenance. `buildDetailsForEvent`
-  // (castle-wall/runtime/audit-consumer.ts) spreads the signed body's own
-  // `details` into the persisted entry, so the daemon's `decision_provenance`
-  // lands as a TOP-LEVEL detail key. It records WHY/HOW the allow/deny resolved
-  // (the policy reasoning path), so it is policy-inference-sensitive in exactly
-  // the property-#11 sense and is operator/auditor-only. Redact it on the
-  // agent-facing read path alongside `rule_id_matched`.
-  "decision_provenance",
-  // The producer-signed canonical blob (`cw_producer_signed_canonical`) is the
-  // VERBATIM signed JSON body persisted as a STRING. Key-based redaction does
-  // not reach inside a string, so without redacting the whole value an agent
-  // reading a signed entry recovers the matched rule (and `decision_provenance`,
-  // `agent_id`, `dest_*`) embedded in that body — a deeper no-policy-inference
-  // leak than the top-level `rule_id_matched` (property #11). Agents never need
-  // the signature-verification blob (re-verification is operator/auditor-side),
-  // so redacting the whole value is correct. Imported from constants.ts so the
-  // wire-constant literal is not duplicated.
-  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
-]);
-
-function redactAuditValueForAgent(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => redactAuditValueForAgent(item));
-  }
-  if (value && typeof value === "object") {
-    const redacted: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      redacted[key] = AUDIT_AGENT_REDACT_DETAIL_KEYS.has(key)
-        ? AUDIT_AGENT_REDACTED
-        : redactAuditValueForAgent(nested);
-    }
-    return redacted;
-  }
-  return value;
-}
-
-function redactAuditEntryForAgent(entry: AuditEntry): AuditEntry {
-  return {
-    ...entry,
-    identity_id: AUDIT_AGENT_REDACTED,
-    details: entry.details
-      ? (redactAuditValueForAgent(entry.details) as Record<string, unknown>)
-      : undefined,
-  };
-}
 
 export interface SanctuaryServer {
   server: Server;
