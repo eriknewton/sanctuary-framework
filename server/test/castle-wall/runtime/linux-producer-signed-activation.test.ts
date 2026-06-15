@@ -53,6 +53,7 @@ import {
 import {
   buildCriticalEnvelopeFromDrainEvent,
   drainOnce,
+  startLinuxAuditDrainLoop,
 } from "../../../src/castle-wall/runtime/linux-audit-drain.js";
 import {
   AuditConsumer,
@@ -1295,5 +1296,149 @@ describe("C4 — round-4 HIGH: never report ARMED before the audit channel is PR
     );
 
     await outcome.activation.stop();
+  });
+});
+
+describe("C4 — round-5 HIGH: initial-drain probe never skips an unsettled event when it stops mid-batch", () => {
+  it("FAILS CLOSED when the probe partially settles then hits a transient persist fault mid-batch (loop never starts, no skip)", async () => {
+    // codex round-5: if the probe drains [seq1(ok), seq2(persist-fault)], it must
+    // NOT report armed and start the continuous loop resumed PAST seq2 (which
+    // would skip the unsettled seq2). seq1 settles (durably persisted + acked);
+    // seq2's enforcement append throws (transient) → drainOnce routes it to
+    // onDrainFault and breaks WITHOUT advancing the cursor past seq2 → the probe's
+    // markDrainUnhealthy trips → activation FAILS CLOSED (NOT-ARMED). The loop is
+    // never started, so seq2 cannot be skipped; on a later re-activation the
+    // daemon re-delivers from seq2.
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+
+    // Two FORGED events in ONE batch. seq1's refusal record persists (settles +
+    // acks → cursor advances to 1). seq2's `producer_signature_rejected` append
+    // THROWS (transient persist fault) → ingestCritical throws BEFORE acking →
+    // seq2 does NOT settle, the cursor stays at 1. Forgeries need no WAL-chain
+    // anchor, which isolates the "probe stops mid-batch at an unsettled fault"
+    // scenario cleanly.
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const orig = auditLog.append.bind(auditLog);
+    let refusalAppends = 0;
+    const appended: string[] = [];
+    (auditLog as unknown as { append: AuditSink["append"] }).append = (async (
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      appended.push(operation);
+      if (operation === "producer_signature_rejected") {
+        refusalAppends += 1;
+        if (refusalAppends === 2) {
+          throw new Error("audit disk unavailable mid-batch (transient)");
+        }
+      }
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+
+    const mock = buildMockDaemon([forgedDrainEvent(1, null), forgedDrainEvent(2, null)]);
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    const faults: Error[] = [];
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: { onDrainFault: (e) => faults.push(e) },
+    });
+    await mock.sendChallenge();
+
+    let thrown: unknown;
+    try {
+      await outcomeP;
+    } catch (err) {
+      thrown = err;
+    }
+    // FAIL-CLOSED: the activation threw NOT-ARMED rather than reporting armed.
+    expect(thrown).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect((thrown as RuntimeLinuxActivationError).reason).toBe("drain_failed");
+    // The mid-batch fault was observed during the probe.
+    expect(faults.length).toBeGreaterThanOrEqual(1);
+    // seq1's refusal WAS durably recorded + acked (it settled); seq2 did NOT
+    // (the daemon was NOT acked through 2), so the daemon re-delivers from seq2.
+    expect(appended).toContain("producer_signature_rejected");
+    expect(mock.acks).toContain(1);
+    expect(mock.acks).not.toContain(2);
+  });
+
+  it("after a clean probe the consumer's DURABLE settled floor is the resume cursor (lastAckedSeq), and a loop seeded from it requests strictly above it", async () => {
+    // Part 1 (integration): a clean probe drains seq1 (genuine, accepted). The
+    // consumer's durable lastAckedSeq advances to 1 — that is exactly the value
+    // the activation seeds the continuous loop's cursor from (initialCursor =
+    // getWalChainState().lastAckedSeq), so the resume point is the authoritative
+    // settled high-water mark, never a probe-local cursor that could outrun it.
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = buildMockDaemon([signedDrainEvent(priv, 1, null)]);
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: { pollIntervalMs: 10_000, setTimer: () => 1, clearTimer: () => {} },
+    });
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    // The durable settled floor the loop is seeded from.
+    expect(outcome.activation.lifecycle.audit().getWalChainState().lastAckedSeq).toBe(1);
+    await outcome.activation.stop();
+
+    // Part 2 (unit): a loop seeded with initialCursor=1 issues its first drain
+    // request strictly ABOVE seq1 (after_seq=1) — it does not re-pull from null/0
+    // (no needless re-pull of the settled seq1) and does not jump ahead.
+    const requested: Array<number | null> = [];
+    const stubClient = {
+      async drainRequest(afterSeq: number | null): Promise<AuditDrainResponse> {
+        requested.push(afterSeq);
+        return {
+          events: [],
+          next_after_seq: afterSeq,
+          more_pending: false,
+          wal_overflow_count: 0,
+        } as AuditDrainResponse;
+      },
+      async sendDrainAck(): Promise<void> {},
+    } as unknown as IpcClient;
+    const loop = startLinuxAuditDrainLoop(
+      stubClient,
+      outcome.activation.lifecycle.audit(),
+      { initialCursor: 1, pollIntervalMs: 10_000, setTimer: () => 1, clearTimer: () => {} }
+    );
+    // Let the loop's first (synchronous) cycle issue its request.
+    for (let i = 0; i < 50 && requested.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await loop.stop();
+    expect(requested).toContain(1);
+    expect(requested).not.toContain(0);
+    expect(requested).not.toContain(null);
   });
 });

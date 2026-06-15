@@ -457,7 +457,7 @@ export async function activateLinuxProducerSignedCastleWall(
     let initialCursor: number | null = null;
     if (input.confirmInitialDrain !== false) {
       try {
-        const probe = await drainOnce(
+        await drainOnce(
           lifecycle.client(),
           lifecycle.audit(),
           null,
@@ -465,7 +465,18 @@ export async function activateLinuxProducerSignedCastleWall(
           drainOptions.onError,
           drainOptions.onDrainFault
         );
-        initialCursor = probe.nextAfterSeq;
+        // RESUME from the CONSUMER's durable settled floor, NOT the probe's local
+        // `nextAfterSeq` (codex round-5 — initialCursor must never outrun
+        // settlement). `lastAckedSeq` is the authoritative high-water mark: the
+        // consumer advances it ONLY on durable persistence, so it can never point
+        // past an unsettled event even if the probe stopped mid-batch at a fault.
+        // (The `drainUnhealthy` guard below already fails closed on a probe fault
+        // so the loop never starts in that case; sourcing the cursor from the
+        // consumer's durable state makes the no-skip property hold by
+        // construction rather than by the probe's break-vs-advance bookkeeping.
+        // Re-pulling is additionally idempotent: the consumer's chain validator
+        // duplicate-drops an already-settled seq and refuses any skip-ahead.)
+        initialCursor = lifecycle.audit().getWalChainState().lastAckedSeq;
       } catch (err) {
         // The initial drain round-trip failed (link dropped / request timed out
         // before any batch arrived). Tear down what we opened and surface
@@ -496,8 +507,11 @@ export async function activateLinuxProducerSignedCastleWall(
     drain = startLinuxAuditDrainLoop(
       lifecycle.client(),
       lifecycle.audit(),
-      // Resume the continuous loop from where the confirmation probe left off so
-      // a drained/settled event is neither re-pulled nor skipped.
+      // Resume the continuous loop from the consumer's DURABLE settled floor
+      // (`initialCursor`, set above from `getWalChainState().lastAckedSeq`) so a
+      // settled event is not needlessly re-pulled and an unsettled one is never
+      // skipped. Even if this hint were stale, the consumer's chain validator is
+      // the real guard (duplicate-drop / refuse-skip-ahead).
       { ...drainOptions, initialCursor }
     );
   }
