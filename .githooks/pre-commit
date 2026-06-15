@@ -50,8 +50,11 @@
 # the test suite is ~20s, total well under the budget.
 #
 # Emergency override: set SKIP_TEST_BASELINE=1 to bypass the hook.
-# Use only for emergency commits; the override is logged with
-# timestamp and HEAD SHA to .test-baseline-overrides.log for audit.
+# Use only for emergency commits. The override is REFUSED unless a
+# human-readable justification is also supplied in SKIP_REASON, e.g.:
+#   SKIP_TEST_BASELINE=1 SKIP_REASON="hotfix: CI runner outage, see #NNN" git commit ...
+# The override is logged to .test-baseline-overrides.log with timestamp,
+# HEAD SHA, branch, author (whoami), and the reason for audit.
 #
 # Enforcement status (be precise — do NOT call this hook "not
 # bypassable"): this LOCAL hook is the fast first line, but it is
@@ -140,13 +143,31 @@ validate_counter() {
 
 # ── Emergency override ───────────────────────────────────────────────
 if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
+  # An accountable override REQUIRES a reason. Refuse a bare bypass: an
+  # unexplained skip is exactly the unaudited shortcut this audit log exists to
+  # prevent. `SKIP_REASON` must be a non-empty, non-whitespace string.
+  skip_reason="${SKIP_REASON:-}"
+  if [[ -z "${skip_reason//[[:space:]]/}" ]]; then
+    fail "SKIP_TEST_BASELINE=1 was set WITHOUT a justification — override refused."
+    printf '[baseline-guard]   An emergency override must be accountable. Re-run with a reason:\n' >&2
+    printf '[baseline-guard]     SKIP_TEST_BASELINE=1 SKIP_REASON="why you are bypassing" git commit ...\n' >&2
+    exit 1
+  fi
+  # Collapse newlines/tabs so a multi-line reason cannot corrupt the single-line
+  # log record (each override is exactly one tab-delimited line).
+  skip_reason=$(printf '%s' "$skip_reason" | tr '\n\t' '  ')
   warn "SKIP_TEST_BASELINE=1 — emergency override active"
   warn "This commit is being made without running the baseline guard."
   warn "Override is logged to .test-baseline-overrides.log for audit."
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   head_sha=$(git rev-parse HEAD 2>/dev/null || echo "pre-commit")
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")
+  author=$(whoami 2>/dev/null || echo "unknown-user")
   repo_root_for_log=$(git rev-parse --show-toplevel)
-  printf '%s  %s  skipped-by-env\n' "$timestamp" "$head_sha" \
+  # Tab-delimited: timestamp <tab> sha <tab> branch <tab> author <tab> reason.
+  # Append-only; union-merged on rebase via .gitattributes (DoE 3a/N-3).
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp" "$head_sha" "$branch" "$author" "$skip_reason" \
     >> "$repo_root_for_log/.test-baseline-overrides.log"
   exit 0
 fi

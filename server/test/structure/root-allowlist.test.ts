@@ -45,6 +45,7 @@ const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const ALLOWLIST: ReadonlyArray<string> = [
   ".claude",
   ".editorconfig",
+  ".gitattributes",
   ".githooks",
   ".github",
   ".gitignore",

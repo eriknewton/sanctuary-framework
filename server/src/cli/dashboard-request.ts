@@ -40,10 +40,22 @@ interface DashboardErrorBody {
   detail?: unknown;
 }
 
+/**
+ * Issue a request to the local Sanctuary dashboard and return the parsed JSON
+ * body. The return is deliberately `any`: the body is untrusted, schema-loose
+ * remote JSON whose shape varies per endpoint, and the CLI command consumers
+ * (inbox.ts, task.ts, status.ts, v1-session.ts) read it loosely (`body.data?.X`
+ * envelopes, then `?? body` fallbacks). Typing it `unknown` would force a cast
+ * at every one of those ~14 field accesses across unrelated CLI files for no
+ * safety gain (they already treat the value as untyped). JUDGMENT (DoE H-1): a
+ * scoped, justified `any` on this one return is preferred over a sprawling,
+ * regression-prone cast refactor; callers that DO want a shape narrow with `as`.
+ */
 export async function dashboardRequest(
   path: string,
   init?: RequestInit,
   ctx?: DashboardRequestContext,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional: untrusted, schema-loose remote JSON; see JSDoc above
 ): Promise<any> {
   const base = (
     ctx?.dashboardUrl ?? process.env.SANCTUARY_DASHBOARD_URL ?? DEFAULT_DASHBOARD_URL
