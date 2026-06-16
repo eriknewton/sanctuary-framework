@@ -62,7 +62,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdir, readFile, rename, rm, stat, writeFile, chmod } from "node:fs/promises";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execPath } from "node:process";
 import { Writable } from "node:stream";
@@ -70,6 +70,7 @@ import { fileURLToPath } from "node:url";
 
 import { AuditLog } from "../operational/audit-log.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   CASTLE_BOOT_TOKEN_PATH,
@@ -148,6 +149,93 @@ function xmlUnescape(value: string): string {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+}
+
+type ParsedPlistValue =
+  | string
+  | number
+  | boolean
+  | ParsedPlistValue[]
+  | { [key: string]: ParsedPlistValue };
+
+type PlistToken =
+  | { type: "dict-open" }
+  | { type: "dict-close" }
+  | { type: "array-open" }
+  | { type: "array-close" }
+  | { type: "key"; value: string }
+  | { type: "string"; value: string }
+  | { type: "integer"; value: number }
+  | { type: "boolean"; value: boolean };
+
+function tokenizePlist(contents: string): PlistToken[] {
+  const tokens: PlistToken[] = [];
+  const tokenRe =
+    /<dict(?:\s[^>]*)?>|<\/dict\s*>|<array(?:\s[^>]*)?>|<\/array\s*>|<key>([\s\S]*?)<\/key>|<string>([\s\S]*?)<\/string>|<integer>([-+]?\d+)<\/integer>|<true\s*\/>|<false\s*\/>/g;
+  for (const match of contents.matchAll(tokenRe)) {
+    const raw = match[0];
+    if (raw.startsWith("<dict")) tokens.push({ type: "dict-open" });
+    else if (raw.startsWith("</dict")) tokens.push({ type: "dict-close" });
+    else if (raw.startsWith("<array")) tokens.push({ type: "array-open" });
+    else if (raw.startsWith("</array")) tokens.push({ type: "array-close" });
+    else if (raw.startsWith("<key>")) {
+      tokens.push({ type: "key", value: xmlUnescape(match[1] ?? "") });
+    } else if (raw.startsWith("<string>")) {
+      tokens.push({ type: "string", value: xmlUnescape(match[2] ?? "") });
+    } else if (raw.startsWith("<integer>")) {
+      tokens.push({ type: "integer", value: Number.parseInt(match[3] ?? "", 10) });
+    } else if (raw.startsWith("<true")) tokens.push({ type: "boolean", value: true });
+    else if (raw.startsWith("<false")) tokens.push({ type: "boolean", value: false });
+  }
+  return tokens;
+}
+
+function parseBootPlist(contents: string): Record<string, ParsedPlistValue> | null {
+  const tokens = tokenizePlist(contents);
+  let index = 0;
+
+  function parseValue(): ParsedPlistValue | null {
+    const token = tokens[index++];
+    if (!token) return null;
+    if (
+      token.type === "string" ||
+      token.type === "integer" ||
+      token.type === "boolean"
+    ) {
+      return token.value;
+    }
+    if (token.type === "array-open") {
+      const values: ParsedPlistValue[] = [];
+      while (tokens[index]?.type !== "array-close") {
+        const value = parseValue();
+        if (value === null) return null;
+        values.push(value);
+      }
+      index++;
+      return values;
+    }
+    if (token.type === "dict-open") {
+      const obj: Record<string, ParsedPlistValue> = {};
+      while (tokens[index]?.type !== "dict-close") {
+        const keyToken = tokens[index++];
+        if (!keyToken || keyToken.type !== "key") return null;
+        if (Object.prototype.hasOwnProperty.call(obj, keyToken.value)) return null;
+        const value = parseValue();
+        if (value === null) return null;
+        obj[keyToken.value] = value;
+      }
+      index++;
+      return obj;
+    }
+    return null;
+  }
+
+  while (index < tokens.length && tokens[index]?.type !== "dict-open") index++;
+  if (index >= tokens.length) return null;
+  const parsed = parseValue();
+  return parsed && !Array.isArray(parsed) && typeof parsed === "object"
+    ? (parsed as Record<string, ParsedPlistValue>)
+    : null;
 }
 
 function assertNoControlChars(value: string, what: string): void {
@@ -374,33 +462,35 @@ export async function bootServiceInstalled(
 ): Promise<boolean> {
   let contents: string;
   try {
-    contents = await readFile(plistPath, "utf8");
+    contents = await readFileCustody(plistPath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
   } catch {
     return false;
   }
-  // Structural checks against the rendered plist (its own source of truth for
-  // these markers); no XML-parser dependency needed.
-  if (!contents.includes(`<string>${CASTLE_WALL_BOOT_LABEL}</string>`)) return false;
-  if (!/<key>RunAtLoad<\/key>\s*<true\s*\/>/.test(contents)) return false;
-  if (!contents.includes("<string>--safe-mode</string>")) return false;
+  const plist = parseBootPlist(contents);
+  if (!plist) return false;
+  if (plist.Label !== CASTLE_WALL_BOOT_LABEL) return false;
+  if (plist.RunAtLoad !== true) return false;
+  const programArguments = plist.ProgramArguments;
+  if (
+    !Array.isArray(programArguments) ||
+    !programArguments.some((arg) => arg === "--safe-mode")
+  ) {
+    return false;
+  }
   if (expectedFortressPath !== undefined) {
-    // Reject a malformed plist with DUPLICATE SANCTUARY_STORAGE_PATH keys: plist
-    // semantics make the LAST duplicate effective, so a first-match read could be
-    // fooled (first=expected, later=the fortress launchd actually boots). A
-    // well-formed Sanctuary plist embeds exactly one; any other count fails closed.
-    const storageKeyCount = (contents.match(/<key>SANCTUARY_STORAGE_PATH<\/key>/g) ?? [])
-      .length;
-    if (storageKeyCount !== 1) return false;
-    const storagePathMatch =
-      /<key>SANCTUARY_STORAGE_PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(contents);
-    if (!storagePathMatch) return false;
-    const installedFortressPathRaw = xmlUnescape(storagePathMatch[1]!);
+    const environment = plist.EnvironmentVariables;
+    if (!environment || Array.isArray(environment) || typeof environment !== "object") {
+      return false;
+    }
+    const installedFortressPathRaw = environment.SANCTUARY_STORAGE_PATH;
+    if (typeof installedFortressPathRaw !== "string") return false;
     if (!isAbsolute(installedFortressPathRaw)) return false;
     const installedFortressPath = resolve(installedFortressPathRaw);
     const expectedFortressPathResolved = resolve(expectedFortressPath);
-    if (xmlEscape(installedFortressPath) !== xmlEscape(expectedFortressPathResolved)) {
-      return false;
-    }
+    if (installedFortressPath !== expectedFortressPathResolved) return false;
   }
   return true;
 }
@@ -782,7 +872,10 @@ export async function runInstallBoot(
     return 1;
   }
 
-  const existing = await readFile(plistPath, "utf8").catch(() => null);
+  const existing = await readFileCustody(plistPath, {
+    encoding: "utf8",
+    verifyPathIdentity: true,
+  }).catch(() => null);
   // Idempotent shortcut: only when the plist already matches AND the service is
   // STABLY running. Use the same stability check as the install path — a
   // one-shot read here would re-introduce the false-PASS on a preexisting
@@ -794,10 +887,10 @@ export async function runInstallBoot(
   }
 
   try {
-    const tempPath = `${plistPath}.${process.pid}.tmp`;
-    await writeFile(tempPath, plist, { encoding: "utf8", mode: 0o644 });
-    await chmod(tempPath, 0o644);
-    await rename(tempPath, plistPath);
+    await writeFileCustody(plistPath, plist, {
+      mode: 0o644,
+      createParent: false,
+    });
   } catch (error) {
     write(err, `Error writing ${plistPath}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;

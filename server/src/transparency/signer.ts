@@ -15,7 +15,6 @@
  * unsigned-emission path anywhere downstream.
  */
 
-import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { toBase64url } from "../core/encoding.js";
@@ -25,6 +24,10 @@ import {
   HelperSignerClient,
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
+import {
+  readFileCustody,
+  readFileCustodyWithStats,
+} from "../storage/custody-fs.js";
 import { TransparencyEmitError, type TransparencySigner } from "./emitter.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -100,9 +103,10 @@ async function assertGlobalPinMatches(
 ): Promise<void> {
   let pin: { uid: number; bytes: Uint8Array } | null;
   try {
-    const uid = (await stat(pinPath)).uid;
-    const bytes = await readFile(pinPath);
-    pin = { uid, bytes };
+    const { data, stats } = await readFileCustodyWithStats(pinPath, {
+      verifyPathIdentity: true,
+    });
+    pin = { uid: stats.uid, bytes: data };
   } catch {
     return;
   }
@@ -125,9 +129,14 @@ async function loadLocalTransparencySigner(
   let publicKey: Uint8Array;
   let encryptedPrivateKey: EncryptedPayload;
   try {
-    publicKey = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+    publicKey = await readFileCustody(join(fortressPath, CASTLE_PINNED_PUBKEY), {
+      verifyPathIdentity: true,
+    });
     encryptedPrivateKey = JSON.parse(
-      await readFile(join(fortressPath, CASTLE_PINNED_PRIVKEY), "utf8")
+      await readFileCustody(join(fortressPath, CASTLE_PINNED_PRIVKEY), {
+        encoding: "utf8",
+        verifyPathIdentity: true,
+      })
     ) as EncryptedPayload;
   } catch (err) {
     throw new TransparencyEmitError(

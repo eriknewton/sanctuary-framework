@@ -115,7 +115,7 @@
 2	server/src/broker-mcp/broker-server.ts
 8	server/src/castle-wall/allowlist/habeas-port.ts
 2	server/src/castle-wall/allowlist/schema.ts
-2	server/src/castle-wall/boot/boot-token.ts
+1	server/src/castle-wall/boot/boot-token.ts
 10	server/src/castle-wall/runtime/audit-consumer.ts
 1	server/src/castle-wall/runtime/helper-signer.ts
 1	server/src/castle-wall/runtime/lifecycle.ts

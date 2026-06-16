@@ -20,7 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFile, writeFile, mkdir, access } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { homedir, hostname, platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -29,6 +29,7 @@ import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
 import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -555,13 +556,24 @@ async function readFromFallbackFile(
   home: string,
   derive: (home: string) => Uint8Array = deriveMachineKey
 ): Promise<FallbackReadResult> {
+  let raw: Buffer;
   try {
-    await access(path);
-  } catch {
-    return { status: "not-found" };
+    raw = await readFileCustody(path, {
+      mode: { rejectGroupOrOther: true },
+      verifyPathIdentity: true,
+    });
+  } catch (err) {
+    const code =
+      err instanceof Error && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") return { status: "not-found" };
+    return {
+      status: "unreadable",
+      reason: (err as Error).message ?? "unknown read error",
+    };
   }
   try {
-    const raw = await readFile(path);
     const parsed = parseFallbackEnvelope(raw);
     const key = derive(home);
     if (parsed) {
@@ -618,7 +630,7 @@ async function writeToFallbackFile(
     }),
     "utf-8",
   );
-  await writeFile(path, payload, { mode: 0o600 });
+  await writeFileCustody(path, payload, { mode: 0o600, parentMode: 0o700 });
 }
 
 function fallbackFileAad(path: string): Uint8Array {
