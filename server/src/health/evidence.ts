@@ -75,11 +75,11 @@ export interface BuildHealthEvidenceInput {
 
 export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): HealthEvidenceReport {
   const castleWall = evaluateCastleWall(input.castleWall);
-  const l1Status = l1StatusFromCastleWall(castleWall.status);
-  const l2Status: RuntimeStatus =
+  const cognitiveStatus = cognitiveStatusFromCastleWall(castleWall.status);
+  const operationalStatus: RuntimeStatus =
     input.config.execution.environment === "tee" ? "active" : "degraded";
   const auditWritesPersistent = input.storageBackendName === "FilesystemStorage";
-  const degradations = buildDegradations(castleWall, l1Status, l2Status);
+  const degradations = buildDegradations(castleWall, cognitiveStatus, operationalStatus);
 
   return {
     sanctuary_version: getSanctuaryVersion(),
@@ -98,7 +98,7 @@ export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): Heal
     },
     layers: {
       l1: {
-        status: l1Status,
+        status: cognitiveStatus,
         evidence:
           `state encryption ${input.config.state.encryption}; ` +
           `state integrity ${input.config.state.integrity}; ` +
@@ -109,7 +109,7 @@ export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): Heal
         state_integrity: input.config.state.integrity,
       },
       l2: {
-        status: l2Status,
+        status: operationalStatus,
         evidence:
           input.config.execution.environment === "tee"
             ? "TEE execution environment configured"
@@ -227,7 +227,7 @@ function castleWallEvidenceString(snapshot: CastleWallRuntimeSnapshot): string {
   return parts.join("; ");
 }
 
-function l1StatusFromCastleWall(status: RuntimeStatus): RuntimeStatus {
+function cognitiveStatusFromCastleWall(status: RuntimeStatus): RuntimeStatus {
   if (status === "active") return "active";
   if (status === "unknown") return "unknown";
   return "degraded";
@@ -235,11 +235,11 @@ function l1StatusFromCastleWall(status: RuntimeStatus): RuntimeStatus {
 
 function buildDegradations(
   castleWall: CastleWallEvidence,
-  l1Status: RuntimeStatus,
-  l2Status: RuntimeStatus
+  cognitiveStatus: RuntimeStatus,
+  operationalStatus: RuntimeStatus
 ): HealthEvidenceReport["degradations"] {
   const degradations: HealthEvidenceReport["degradations"] = [];
-  if (l1Status !== "active") {
+  if (cognitiveStatus !== "active") {
     degradations.push({
       layer: "l1",
       description: `Castle Wall status is ${castleWall.status}`,
@@ -247,7 +247,7 @@ function buildDegradations(
       mitigation: "Wire the Castle Wall runtime detector or enable Castle Wall enforcement",
     });
   }
-  if (l2Status === "degraded") {
+  if (operationalStatus === "degraded") {
     degradations.push({
       layer: "l2",
       description: "Process-level isolation only (no TEE)",
