@@ -1,0 +1,38 @@
+{
+  "layer_keys": [
+    "l1",
+    "l2",
+    "l3",
+    "l4"
+  ],
+  "layer_field_names": {
+    "l1": [
+      "encryption",
+      "identity_type",
+      "integrity",
+      "key_custody",
+      "state_portable",
+      "status"
+    ],
+    "l2": [
+      "attestation_available",
+      "isolation_type",
+      "status"
+    ],
+    "l3": [
+      "proof_system",
+      "selective_disclosure",
+      "status"
+    ],
+    "l4": [
+      "attestation_format",
+      "reputation_mode",
+      "reputation_portable",
+      "status"
+    ]
+  },
+  "degradation_layer_values": [
+    "l2",
+    "l4"
+  ]
+}
