@@ -10,17 +10,17 @@ import { tightenStoragePermissions } from "./storage/permissions.js";
 import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
-import { StateStore } from "./l1-cognitive/state-store.js";
-import { createCognitiveTools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
+import { StateStore } from "./cognitive/state-store.js";
+import { createCognitiveTools, createInternalIdentitySigningHelpers } from "./cognitive/tools.js";
 import { createDistressTools } from "./distress/tools.js";
 import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
-import { AuditLog } from "./l2-operational/audit-log.js";
-import { createDisclosureTools } from "./l3-disclosure/tools.js";
-import { createReputationTools } from "./l4-reputation/tools.js";
+import { AuditLog } from "./operational/audit-log.js";
+import { createDisclosureTools } from "./disclosure/tools.js";
+import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
-import type { IdentityManager } from "./l1-cognitive/tools.js";
+import type { IdentityManager } from "./cognitive/tools.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
@@ -86,8 +86,8 @@ import {
   bindContextGateEnforcerToProfileStore,
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
-} from "./l2-operational/context-gate-tools.js";
-import { createOperationalHardeningTools } from "./l2-operational/hardening-tools.js";
+} from "./operational/context-gate-tools.js";
+import { createOperationalHardeningTools } from "./operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
@@ -97,10 +97,10 @@ import {
   DynamicProxyToolRegistry,
   enableToolListChangedNotifications,
 } from "./proxy/dynamic-proxy.js";
-import { CallGovernor } from "./l2-operational/call-governor.js";
-import { createGovernorTools } from "./l2-operational/governor-tools.js";
+import { CallGovernor } from "./operational/call-governor.js";
+import { createGovernorTools } from "./operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
-import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
+import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
@@ -118,7 +118,7 @@ import {
   readCustodyEpochCount,
   probeAuditHeadAnchor,
   deriveAuditEpochKeys,
-} from "./l2-operational/audit-log.js";
+} from "./operational/audit-log.js";
 import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
 import {
   buildV11Bindings,
@@ -126,10 +126,10 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
-// in l2-operational/agent-audit-redaction.ts so the redact-key set is shared by
+// in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
-import { redactAuditEntryForAgent } from "./l2-operational/agent-audit-redaction.js";
+import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -1629,9 +1629,9 @@ function classifyMcpTools(tools: ToolDefinition[]): ToolDefinition[] {
 }
 
 export { loadConfig, type SanctuaryConfig } from "./config.js";
-export { StateStore } from "./l1-cognitive/state-store.js";
-export { AuditLog } from "./l2-operational/audit-log.js";
-export { CommitmentStore } from "./l3-disclosure/commitments.js";
+export { StateStore } from "./cognitive/state-store.js";
+export { AuditLog } from "./operational/audit-log.js";
+export { CommitmentStore } from "./disclosure/commitments.js";
 export {
   createPedersenCommitment,
   verifyPedersenCommitment,
@@ -1639,54 +1639,54 @@ export {
   verifyProofOfKnowledge,
   createRangeProof,
   verifyRangeProof,
-} from "./l3-disclosure/zk-proofs.js";
+} from "./disclosure/zk-proofs.js";
 export type {
   PedersenCommitment,
   ZKProofOfKnowledge,
   ZKRangeProof,
-} from "./l3-disclosure/zk-proofs.js";
-export { PolicyStore } from "./l3-disclosure/policies.js";
-export { ReputationStore } from "./l4-reputation/reputation-store.js";
+} from "./disclosure/zk-proofs.js";
+export { PolicyStore } from "./disclosure/policies.js";
+export { ReputationStore } from "./reputation/reputation-store.js";
 export {
   resolveTier,
   computeWeightedScore,
   tierDistribution,
   TIER_WEIGHTS,
-} from "./l4-reputation/tiers.js";
-export type { SovereigntyTier, TierMetadata, TieredAttestation } from "./l4-reputation/tiers.js";
+} from "./reputation/tiers.js";
+export type { SovereigntyTier, TierMetadata, TieredAttestation } from "./reputation/tiers.js";
 export { FederationRegistry } from "./federation/registry.js";
 export type {
   FederationPeer,
   FederationCapabilities,
   PeerTrustEvaluation,
 } from "./federation/types.js";
-export { ContextGatePolicyStore } from "./l2-operational/context-gate.js";
+export { ContextGatePolicyStore } from "./operational/context-gate.js";
 export {
   TEMPLATES as CONTEXT_GATE_TEMPLATES,
   getTemplate,
   listTemplateIds,
-} from "./l2-operational/context-gate-templates.js";
-export type { ContextGateTemplate } from "./l2-operational/context-gate-templates.js";
+} from "./operational/context-gate-templates.js";
+export type { ContextGateTemplate } from "./operational/context-gate-templates.js";
 export {
   classifyField,
   recommendPolicy,
-} from "./l2-operational/context-gate-recommend.js";
+} from "./operational/context-gate-recommend.js";
 export type {
   FieldClassification,
   PolicyRecommendation,
-} from "./l2-operational/context-gate-recommend.js";
+} from "./operational/context-gate-recommend.js";
 export {
   InMemoryModelProvenanceStore,
   MODEL_PRESETS,
-} from "./l2-operational/model-provenance.js";
+} from "./operational/model-provenance.js";
 export type {
   ModelProvenance,
   ModelProvenanceStore,
-} from "./l2-operational/model-provenance.js";
+} from "./operational/model-provenance.js";
 export {
   evaluateField,
   filterContext,
-} from "./l2-operational/context-gate.js";
+} from "./operational/context-gate.js";
 export type {
   ContextGatePolicy,
   ContextGateRule,
@@ -1694,15 +1694,15 @@ export type {
   FieldFilterResult,
   ProviderCategory,
   ContextAction,
-} from "./l2-operational/context-gate.js";
+} from "./operational/context-gate.js";
 export { InjectionDetector } from "./security/injection-detector.js";
 export type {
   InjectionDetectorConfig,
   DetectionResult,
   InjectionSignal,
 } from "./security/injection-detector.js";
-export { ContextGateEnforcer } from "./l2-operational/context-gate-enforcer.js";
-export type { EnforcerConfig } from "./l2-operational/context-gate-enforcer.js";
+export { ContextGateEnforcer } from "./operational/context-gate-enforcer.js";
+export type { EnforcerConfig } from "./operational/context-gate-enforcer.js";
 export { SovereigntyProfileStore, createDefaultProfile } from "./sovereignty-profile.js";
 export type { SovereigntyProfile, SovereigntyProfileUpdate, UpstreamServer } from "./sovereignty-profile.js";
 export { ClientManager } from "./proxy/client-manager.js";

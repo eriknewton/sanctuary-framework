@@ -6,8 +6,8 @@
  * for tests and callers that want to wire in live events.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";

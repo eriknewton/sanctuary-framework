@@ -49,7 +49,7 @@ import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { INTEL_OPS } from "./audit-events.js";
 import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRADEOFF_KEYS, LOCAL_MODEL_LABELS } from "./templates.js";
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";

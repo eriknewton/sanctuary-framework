@@ -19,9 +19,9 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity, verify } from "../../src/core/identity.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { hash, hashToString } from "../../src/core/hashing.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
-import { createMemoryAttestTools } from "../../src/l1-cognitive/memory-attest.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
+import { createMemoryAttestTools } from "../../src/cognitive/memory-attest.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import type { ToolDefinition } from "../../src/router.js";
 

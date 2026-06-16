@@ -33,10 +33,10 @@ import {
   establishMaster,
   readCustodyEnvelope,
 } from "../../src/core/master-custody.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import {

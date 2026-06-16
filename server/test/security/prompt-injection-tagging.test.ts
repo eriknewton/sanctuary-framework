@@ -29,7 +29,7 @@ import {
 } from "../../src/bridge/bridge.js";
 import type { ConcordiaOutcome, BridgeCommitment } from "../../src/bridge/types.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolDefinition } from "../../src/router.js";
 import { createBridgeTools } from "../../src/bridge/tools.js";
 

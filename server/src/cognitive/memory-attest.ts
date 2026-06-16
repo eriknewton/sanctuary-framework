@@ -14,7 +14,7 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { IdentityManager } from "./tools.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { sign } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hashToString } from "../core/hashing.js";

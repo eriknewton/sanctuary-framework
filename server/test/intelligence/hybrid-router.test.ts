@@ -20,7 +20,7 @@ import {
   validateHybridRules,
 } from "../../src/intelligence/substrates/hybrid/per-surface-router.js";
 import { SubstrateSelector } from "../../src/intelligence/selector.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import type { HybridRoutingRules, Surface } from "../../src/intelligence/types.js";

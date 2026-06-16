@@ -15,7 +15,7 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 
 export function createPrincipalPolicyTools(
   policy: PrincipalPolicy,

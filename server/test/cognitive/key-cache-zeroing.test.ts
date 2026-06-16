@@ -13,7 +13,7 @@ import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { deriveNamespaceKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { encrypt } from "../../src/core/encryption.js";

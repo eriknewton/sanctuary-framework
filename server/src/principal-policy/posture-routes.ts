@@ -22,7 +22,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";

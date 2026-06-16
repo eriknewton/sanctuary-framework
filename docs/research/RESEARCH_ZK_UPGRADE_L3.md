@@ -23,10 +23,10 @@ This document outlines what exists, what "Full" would mean, and what a hypotheti
 ### What Exists Today
 
 **Files:**
-- `server/src/l3-disclosure/zk-proofs.ts` — 551 LOC
-- `server/src/l3-disclosure/commitments.ts` — 169 LOC
-- `server/src/l3-disclosure/policies.ts` — 237 LOC
-- `server/src/l3-disclosure/tools.ts` — 526 LOC
+- `server/src/disclosure/zk-proofs.ts` — 551 LOC
+- `server/src/disclosure/commitments.ts` — 169 LOC
+- `server/src/disclosure/policies.ts` — 237 LOC
+- `server/src/disclosure/tools.ts` — 526 LOC
 - **Tests:** 640 LOC across 3 test files
 
 **Cryptographic Primitives:**

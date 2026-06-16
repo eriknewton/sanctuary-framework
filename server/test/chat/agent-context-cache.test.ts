@@ -19,7 +19,7 @@ import {
 } from "../../src/chat/agent-context-cache.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { HubAgentRegistrySource } from "../../src/hub/types.js";
-import type { AuditLog, AuditEntry } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../../src/operational/audit-log.js";
 
 const NOW = new Date("2026-05-10T15:00:00.000Z").getTime();
 

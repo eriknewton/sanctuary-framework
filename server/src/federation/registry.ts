@@ -16,7 +16,7 @@
  */
 
 import type { HandshakeResult } from "../handshake/types.js";
-import { trustTierToSovereigntyTier } from "../l4-reputation/tiers.js";
+import { trustTierToSovereigntyTier } from "../reputation/tiers.js";
 import type {
   FederationPeer,
   FederationCapabilities,

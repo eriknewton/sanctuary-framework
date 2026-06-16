@@ -13,8 +13,8 @@
 
 import type { ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
-import type { IdentityManager } from "./l1-cognitive/tools.js";
-import type { AuditLog } from "./l2-operational/audit-log.js";
+import type { IdentityManager } from "./cognitive/tools.js";
+import type { AuditLog } from "./operational/audit-log.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import type { SanctuaryConfig } from "./config.js";
 import { sign as identitySign } from "./core/identity.js";
@@ -27,8 +27,8 @@ import { derivePurposeKey } from "./core/key-derivation.js";
 import { toBase64url } from "./core/encoding.js";
 import { createIdentity } from "./core/identity.js";
 import { generateSHR, type ReputationEvidence } from "./shr/generator.js";
-import { gatherL4Evidence } from "./shr/tools.js";
-import type { ReputationStore } from "./l4-reputation/reputation-store.js";
+import { gatherReputationEvidence } from "./shr/tools.js";
+import type { ReputationStore } from "./reputation/reputation-store.js";
 
 export interface SanctuaryToolsOptions {
   config: SanctuaryConfig;
@@ -94,7 +94,7 @@ export function createSanctuaryTools(
     identity: { identity_id: string; did: string }
   ): Promise<ReputationEvidence | undefined> {
     if (!reputationStore) return undefined;
-    return gatherL4Evidence(reputationStore, auditLog, identity);
+    return gatherReputationEvidence(reputationStore, auditLog, identity);
   }
 
   /**

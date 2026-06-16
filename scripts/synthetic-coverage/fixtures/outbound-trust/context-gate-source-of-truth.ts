@@ -2,12 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateRandomKey } from "../../../../server/src/core/random.js";
-import { AuditLog } from "../../../../server/src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../../server/src/operational/audit-log.js";
 import {
   buildContextGateCombinedStatus,
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
-} from "../../../../server/src/l2-operational/context-gate-tools.js";
+} from "../../../../server/src/operational/context-gate-tools.js";
 import { ProxyRouter } from "../../../../server/src/proxy/proxy-router.js";
 import { createDefaultProfile, SovereigntyProfileStore } from "../../../../server/src/sovereignty-profile.js";
 import { FilesystemStorage } from "../../../../server/src/storage/filesystem.js";

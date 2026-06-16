@@ -11,7 +11,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   mintProvenanceStamp,
   classifyMemoryClass,

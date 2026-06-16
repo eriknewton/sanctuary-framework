@@ -28,7 +28,7 @@ import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { createSanctuaryServer } from "../../src/index.js";
-import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
+import { AuditLog, BROKER_OPS } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -36,15 +36,15 @@ import {
   buildAgentSearchCorpus,
   AGENT_AUDIT_VIEW_FIELDS,
   AGENT_AUDIT_SEARCHABLE_DETAIL_KEYS,
-} from "../../src/l2-operational/agent-audit-redaction.js";
+} from "../../src/operational/agent-audit-redaction.js";
 import { createSIEMTools } from "../../src/audit/siem-tools.js";
 import { createServer } from "../../src/router.js";
 import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
 import type { ToolDefinition } from "../../src/router.js";
-import { Broker } from "../../src/l3-disclosure/broker/broker.js";
+import { Broker } from "../../src/disclosure/broker/broker.js";
 import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
-import type { Backend } from "../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../src/l3-disclosure/broker/backend-interface.js";
+import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
 
 const ALLOWED_VIEW_KEYS = [...AGENT_AUDIT_VIEW_FIELDS].sort();
 
@@ -527,8 +527,8 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
-    const { StateStore } = await import("../../src/l1-cognitive/state-store.js");
-    const { createL1Tools } = await import("../../src/l1-cognitive/tools.js");
+    const { StateStore } = await import("../../src/cognitive/state-store.js");
+    const { createL1Tools } = await import("../../src/cognitive/tools.js");
     const { createAgentNativeCooperativeTools } = await import(
       "../../src/agent-native/cooperative-surface.js"
     );
@@ -729,8 +729,8 @@ describe("agent-audit-allowlist: HIGH — decision-granularity search oracle (al
     const storage = new MemoryStorage();
     const masterKey = generateRandomKey();
     const auditLog = new AuditLog(storage, masterKey);
-    const { StateStore } = await import("../../src/l1-cognitive/state-store.js");
-    const { createL1Tools } = await import("../../src/l1-cognitive/tools.js");
+    const { StateStore } = await import("../../src/cognitive/state-store.js");
+    const { createL1Tools } = await import("../../src/cognitive/tools.js");
     const { createAgentNativeCooperativeTools } = await import(
       "../../src/agent-native/cooperative-surface.js"
     );
@@ -850,7 +850,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "index.ts", // monitor_audit_log
     "audit/siem-tools.ts", // audit_export_siem
     "agent-native/cooperative-surface.ts", // sanctuary_audit_search / sanctuary_events_read
-    "l3-disclosure/broker/broker.ts", // broker/audit_query (queryAudit)
+    "disclosure/broker/broker.ts", // broker/audit_query (queryAudit)
   ] as const;
 
   // Agent-callable MCP tools that DO read the audit log but never surface audit
@@ -860,7 +860,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   // entries from one of them turns RED instead of silently leaking.
   //   audit/tools.ts — `sovereignty_audit` queries with { limit: 0 } and reads
   //     only result.integrity_findings (audit-chain health); no entries.
-  //   shr/tools.ts   — `shr_generate` (gatherL4Evidence) derives a single
+  //   shr/tools.ts   — `shr_generate` (gatherReputationEvidence) derives a single
   //     boolean (verascore_linked) from a reputation_publish probe; no entries
   //     are returned.
   const AGENT_FACING_NON_ENTRY_AUDIT_READS = [
@@ -990,7 +990,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   });
 
   it("the broker's AGENT-facing audit return type is the allowlist view (TS-enforced, no raw details)", () => {
-    const src = read("l3-disclosure/broker/broker.ts");
+    const src = read("disclosure/broker/broker.ts");
     // The agent-facing AuditSummary entry type is the allowlist view. Because
     // `queryAudit` is typed `Promise<AuditSummary>`, the compiler itself forbids
     // returning a raw `details` field on the agent path — this guard pins the
@@ -1030,7 +1030,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     // `Operator`-named region (OperatorAuditSummary type / queryAuditOperator).
     // We slice the file at the operator symbols and assert no raw-details copy
     // survives OUTSIDE those operator regions.
-    const brokerSrc = read("l3-disclosure/broker/broker.ts");
+    const brokerSrc = read("disclosure/broker/broker.ts");
     const OPERATOR_REGION =
       /(export interface OperatorAuditSummary[\s\S]*?\n\}\n)|(async queryAuditOperator\([\s\S]*?\n  \}\n)/g;
     const outsideOperator = brokerSrc.replace(OPERATOR_REGION, "");

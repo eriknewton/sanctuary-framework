@@ -1,5 +1,5 @@
 /**
- * gatherL4Evidence (v0.9.1)
+ * gatherReputationEvidence (v0.9.1)
  *
  * End-to-end test that the helper assembles `L4Evidence` correctly from
  * a live ReputationStore + AuditLog, including the `verascore_linked`
@@ -7,9 +7,9 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { gatherL4Evidence } from "../../src/shr/tools.js";
-import { ReputationStore } from "../../src/l4-reputation/reputation-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { gatherReputationEvidence } from "../../src/shr/tools.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createIdentity } from "../../src/core/identity.js";
@@ -25,10 +25,10 @@ function setup() {
   return { storage, masterKey, auditLog, store, identity: storedIdentity, encryptionKey };
 }
 
-describe("gatherL4Evidence", () => {
+describe("gatherReputationEvidence", () => {
   it("returns an empty evidence object for a fresh identity", async () => {
     const { store, auditLog, identity } = setup();
-    const ev = await gatherL4Evidence(store, auditLog, identity);
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.attestation_count).toBe(0);
     expect(ev.verascore_linked).toBe(false);
     expect(ev.most_recent_attestation_at).toBeNull();
@@ -47,7 +47,7 @@ describe("gatherL4Evidence", () => {
       undefined,
       "verified-sovereign"
     );
-    const ev = await gatherL4Evidence(store, auditLog, identity);
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.attestation_count).toBe(1);
     expect(ev.tier_distribution["verified-sovereign"]).toBe(1);
     expect(ev.most_recent_attestation_at).toBeTruthy();
@@ -62,7 +62,7 @@ describe("gatherL4Evidence", () => {
       undefined,
       "success"
     );
-    const ev = await gatherL4Evidence(store, auditLog, identity);
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.verascore_linked).toBe(true);
   });
 
@@ -75,7 +75,7 @@ describe("gatherL4Evidence", () => {
       undefined,
       "failure"
     );
-    const ev = await gatherL4Evidence(store, auditLog, identity);
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.verascore_linked).toBe(false);
   });
 
@@ -88,7 +88,7 @@ describe("gatherL4Evidence", () => {
       undefined,
       "success"
     );
-    const ev = await gatherL4Evidence(store, auditLog, identity);
+    const ev = await gatherReputationEvidence(store, auditLog, identity);
     expect(ev.verascore_linked).toBe(false);
   });
 });

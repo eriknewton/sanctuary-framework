@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createIdentity } from "../../src/core/identity.js";

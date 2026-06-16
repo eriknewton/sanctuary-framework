@@ -18,11 +18,11 @@ import {
   ContextGateEnforcer,
   BUILTIN_SENSITIVE_PATTERNS,
   type EnforcerConfig,
-} from "../../src/l2-operational/context-gate-enforcer.js";
-import type { ContextGatePolicyStore } from "../../src/l2-operational/context-gate.js";
-import { ContextGatePolicyStore } from "../../src/l2-operational/context-gate.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/context-gate-enforcer.js";
+import type { ContextGatePolicyStore } from "../../src/operational/context-gate.js";
+import { ContextGatePolicyStore } from "../../src/operational/context-gate.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolHandler } from "../../src/router.js";
 import { toolResult } from "../../src/router.js";
 import { MemoryStorage } from "../../src/storage/memory.js";

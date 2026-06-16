@@ -16,7 +16,7 @@ import {
   INFERENCE_STANDARD,
   LOGGING_STRICT,
   TOOL_API_SCOPED,
-} from "../../src/l2-operational/context-gate-templates.js";
+} from "../../src/operational/context-gate-templates.js";
 
 describe("Context Gate Templates", () => {
   describe("Template Registry", () => {

@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AuditLog, AuditPersistenceError } from "../../../../server/src/l2-operational/audit-log.js";
-import { createL1Tools } from "../../../../server/src/l1-cognitive/tools.js";
-import { StateStore } from "../../../../server/src/l1-cognitive/state-store.js";
+import { AuditLog, AuditPersistenceError } from "../../../../server/src/operational/audit-log.js";
+import { createL1Tools } from "../../../../server/src/cognitive/tools.js";
+import { StateStore } from "../../../../server/src/cognitive/state-store.js";
 import { generateRandomKey } from "../../../../server/src/core/random.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import type { StorageEntryMeta } from "../../../../server/src/storage/interface.js";
@@ -12,7 +12,7 @@ import { captureError, outcome } from "./helpers.js";
 const CLAIM_ID = "3";
 const CLAIM_LABEL = "Critical audit durability (appendCritical)";
 
-// Entrypoint: AuditLog.appendCritical in server/src/l2-operational/audit-log.ts.
+// Entrypoint: AuditLog.appendCritical in server/src/operational/audit-log.ts.
 // Mirrored tests: server/test/l1/audit-durability.test.ts and server/test/audit/critical-followup.test.ts.
 // Matrix claim: Critical audit durability (appendCritical).
 

@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createSIEMTools } from "../../src/audit/siem-tools.js";

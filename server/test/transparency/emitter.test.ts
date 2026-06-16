@@ -16,7 +16,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   AuditIntegrityError,
   AuditLog,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { computeAuditRoot } from "../../src/audit/chain.js";
 import {

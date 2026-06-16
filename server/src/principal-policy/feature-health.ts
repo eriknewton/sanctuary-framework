@@ -62,7 +62,7 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,

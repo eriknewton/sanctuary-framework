@@ -8,8 +8,8 @@ import {
   PrivacyFilterRuntimeError,
   runOpenAIPrivacyFilter,
   type PrivacyFilterRuntimeConfig,
-} from "../../src/l2-operational/privacy-filter-runner.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
+} from "../../src/operational/privacy-filter-runner.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 

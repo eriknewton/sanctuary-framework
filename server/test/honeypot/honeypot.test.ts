@@ -35,7 +35,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import {
   AuditLog,
   type AuditEntry,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { SentinelFindingStore } from "../../src/sentinel/sentinel-finding-store.js";
 
 import {

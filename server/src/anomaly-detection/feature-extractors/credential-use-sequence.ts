@@ -34,7 +34,7 @@
  *    ordinary.
  *
  * Credential token attribution: the broker audit payloads (see
- * `l3-disclosure/broker/token-issuer.ts` and the Phi-2 credential-usage
+ * `disclosure/broker/token-issuer.ts` and the Phi-2 credential-usage
  * watcher) carry the secret id in `details.secret`. When present, that
  * id is the sequence token; otherwise the extractor falls back to the
  * operation name so schema-less entries still contribute to count and
@@ -55,7 +55,7 @@ import type {
   AnomalyContext,
   FeatureVector,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 
 export const CREDENTIAL_USE_SEQUENCE_EXTRACTOR_ID =
   "credential-use-sequence" as const;

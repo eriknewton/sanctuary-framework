@@ -3,7 +3,7 @@ import {
   AuditIntegrityError,
   AuditLog,
   type AuditIntegrityAnomalyEvent,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { bytesToString } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";

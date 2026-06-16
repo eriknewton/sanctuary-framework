@@ -17,7 +17,7 @@ import type {
   FeatureVector,
   TrainingResult,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 import {
   ANOMALY_SENTINEL_ID_PREFIX,
   severityFromAnomalyScore,

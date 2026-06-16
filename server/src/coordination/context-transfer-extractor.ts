@@ -59,7 +59,7 @@ import type {
   HandoffEntry,
   HandoffEntryDetail,
 } from "./handoff-log.js";
-import type { AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
 
 /** Stable category enum. Mirrors the four canonical policy slots. */
 export type ContextItemCategory =

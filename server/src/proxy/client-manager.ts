@@ -14,7 +14,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import type { AuditEntryInput } from "../l2-operational/audit-log.js";
+import type { AuditEntryInput } from "../operational/audit-log.js";
 import type { UpstreamServer } from "../sovereignty-profile.js";
 import { validateUpstreamSseUrl } from "./ssrf-validator.js";
 

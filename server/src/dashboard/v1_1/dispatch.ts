@@ -31,8 +31,8 @@ import {
 import type { V11Bindings } from "./wiring.js";
 import { enforceAuth, type AuthConfig } from "../../console/auth-middleware.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
-import { IdentityManager } from "../../l1-cognitive/tools.js";
-import { AuditLog } from "../../l2-operational/audit-log.js";
+import { IdentityManager } from "../../cognitive/tools.js";
+import { AuditLog } from "../../operational/audit-log.js";
 import { fromBase64url } from "../../core/encoding.js";
 import {
   applyDidWebRotationToRecord,

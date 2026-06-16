@@ -7,8 +7,8 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   generateSHR,
   type SHRGeneratorOptions,
@@ -17,7 +17,7 @@ import {
 import { verifySHR } from "./verifier.js";
 import type { SignedSHR } from "./types.js";
 import { transformSHRForGateway, transformSHRGeneric } from "./gateway-adapter.js";
-import type { ReputationStore } from "../l4-reputation/reputation-store.js";
+import type { ReputationStore } from "../reputation/reputation-store.js";
 
 /**
  * Gather L4 reputation evidence for the signing identity.
@@ -27,7 +27,7 @@ import type { ReputationStore } from "../l4-reputation/reputation-store.js";
  * attributed to the identity. Returns a plain `ReputationEvidence` struct
  * consumed by the SHR generator.
  */
-export async function gatherL4Evidence(
+export async function gatherReputationEvidence(
   reputationStore: ReputationStore,
   auditLog: AuditLog,
   identity: { identity_id: string; did: string }
@@ -85,7 +85,7 @@ export function createSHRTools(
       ? identityManager.get(identityId)
       : identityManager.getDefault();
     if (!identity) return undefined;
-    return gatherL4Evidence(reputationStore, auditLog, identity);
+    return gatherReputationEvidence(reputationStore, auditLog, identity);
   }
 
   const tools: ToolDefinition[] = [

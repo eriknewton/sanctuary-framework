@@ -1,7 +1,7 @@
 /**
  * Publish a quickstart profile to Verascore.
  *
- * Envelope format matches server/src/l4-reputation/tools.ts reputation_publish:
+ * Envelope format matches server/src/reputation/tools.ts reputation_publish:
  *   {
  *     agentId: string,
  *     signature: string (base64url over JSON.stringify(data)),

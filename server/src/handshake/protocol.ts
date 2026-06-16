@@ -21,7 +21,7 @@ import { sign, verify } from "../core/identity.js";
 import { toBase64url, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 
 /**
  * Handshake session time-to-live, in milliseconds.

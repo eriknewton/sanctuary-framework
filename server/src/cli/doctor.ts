@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
+import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";

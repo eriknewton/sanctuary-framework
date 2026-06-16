@@ -12,7 +12,7 @@ import {
 import {
   AuditLog,
   type PersistedAuditEnvelopeV2,
-} from "../../../../server/src/l2-operational/audit-log.js";
+} from "../../../../server/src/operational/audit-log.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import { verifyAuditChainRecords } from "../../../../server/src/cli/audit-chain-verify.js";
 import { registerFixture } from "../../registry.js";

@@ -20,7 +20,7 @@ import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } f
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
 import { extractOperationName, FORCED_TIER3_OPERATIONS } from "./loader.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
 import {

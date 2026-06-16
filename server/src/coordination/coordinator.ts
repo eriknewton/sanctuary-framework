@@ -27,7 +27,7 @@
  * `chain[i].previous_status === chain[i-1].new_status` for i > 0.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { toBase64url } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import {

@@ -40,7 +40,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";

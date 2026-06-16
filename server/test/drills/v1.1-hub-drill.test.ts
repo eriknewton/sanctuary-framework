@@ -34,7 +34,7 @@ import {
 import { randomBytes } from "node:crypto";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { HUB_API_PREFIX } from "../../src/hub/constants.js";
 import {
   HubService,

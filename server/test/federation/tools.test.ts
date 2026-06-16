@@ -11,7 +11,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { createFederationTools } from "../../src/federation/tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey, randomBytes } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   generateIdentityId,
   publicKeyToDid,

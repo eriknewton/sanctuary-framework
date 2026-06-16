@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable, Readable } from "node:stream";
 import { runSecretsCommand } from "../../src/cli/secrets.js";
-import { KeychainBackend } from "../../src/l3-disclosure/broker/keychain-backend.js";
+import { KeychainBackend } from "../../src/disclosure/broker/keychain-backend.js";
 
 const isDarwin = process.platform === "darwin";
 const describeIfDarwin = isDarwin ? describe : describe.skip;

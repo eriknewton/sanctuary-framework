@@ -16,7 +16,7 @@ import { describe, expect, it } from "vitest";
 import {
   AuditLog,
   type PersistedAuditEnvelopeV2,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import {
   bytesToString,
   fromBase64url,

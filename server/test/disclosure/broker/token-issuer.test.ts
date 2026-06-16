@@ -13,8 +13,8 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import type { Backend } from "../../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../../src/l3-disclosure/broker/backend-interface.js";
+import type { Backend } from "../../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../../src/disclosure/broker/backend-interface.js";
 import {
   TokenIssuer,
   BrokerDeniedError,
@@ -23,8 +23,8 @@ import {
   DEFAULT_TOKEN_TTL_SECONDS,
   MAX_TOKEN_TTL_SECONDS,
   type VerifiedBrokerCallerClaims,
-} from "../../../src/l3-disclosure/broker/token-issuer.js";
-import { AuditLog, BROKER_OPS } from "../../../src/l2-operational/audit-log.js";
+} from "../../../src/disclosure/broker/token-issuer.js";
+import { AuditLog, BROKER_OPS } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 

@@ -412,7 +412,7 @@ Commands:
   }
 
   if (args[0] === "broker-server") {
-    const { openBroker } = await import("./l3-disclosure/broker/open.js");
+    const { openBroker } = await import("./disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./broker-mcp/broker-server.js");
     const { loadConfig } = await import("./config.js");
     const { fortressIdFromStoragePath } = await import("./dashboard/v1_1/wiring.js");

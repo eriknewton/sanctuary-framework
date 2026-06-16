@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { ToolDefinition } from "../router.js";
-import { decodeExportBundleNamespaces } from "../l1-cognitive/state-store.js";
+import { decodeExportBundleNamespaces } from "../cognitive/state-store.js";
 import {
   normalizeToolArgsForValidation,
   ToolArgumentValidationError,

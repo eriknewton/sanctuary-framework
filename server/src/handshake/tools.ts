@@ -12,8 +12,8 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
 import { sign as identitySign } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";

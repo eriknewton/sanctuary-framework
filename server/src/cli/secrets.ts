@@ -24,12 +24,12 @@
  */
 
 import { createInterface } from "node:readline";
-import type { SecretScope } from "../l3-disclosure/broker/backend-interface.js";
+import type { SecretScope } from "../disclosure/broker/backend-interface.js";
 import {
   openBroker,
   loadBrokerPolicyRaw,
   saveBrokerPolicy,
-} from "../l3-disclosure/broker/open.js";
+} from "../disclosure/broker/open.js";
 
 export interface SecretsArgs {
   argv: string[];

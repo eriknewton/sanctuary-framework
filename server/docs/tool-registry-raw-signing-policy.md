@@ -33,7 +33,7 @@ and therefore do not trigger the guard.
 
 **Current internal signing helpers:**
 
-- `signTypedPayload()` - Internal function in `l1-cognitive/tools.ts`.
+- `signTypedPayload()` - Internal function in `cognitive/tools.ts`.
   Signs domain-separated payloads for audit events and internal receipts.
 - `signPayload()` - HMAC-SHA256 webhook signature in `principal-policy/webhook.ts`.
 - `signHmacSha256Hex()` - HMAC helper in `principal-policy/aggregator-push-trigger.ts`.

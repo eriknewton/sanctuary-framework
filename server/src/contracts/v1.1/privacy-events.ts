@@ -11,7 +11,7 @@
  *
  * Enclosure-and-signing model:
  * Privacy events are NOT signed objects on their own. They are payloads
- * carried inside an enclosing audit-chain entry (`l2-operational/audit-log`
+ * carried inside an enclosing audit-chain entry (`operational/audit-log`
  * AuditEntry encrypted-at-rest under L1, plus `mesh/audit-batch`
  * SignedAuditBatch where federation propagation applies). The enclosing
  * audit entry carries the signature scheme; this file deliberately does not

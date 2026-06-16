@@ -19,7 +19,7 @@
  * Enclosure-and-signing model:
  * Operator chat events are NOT signed objects on their own. They are
  * payloads carried inside an enclosing audit-chain entry
- * (`l2-operational/audit-log` AuditEntry encrypted-at-rest under L1). The
+ * (`operational/audit-log` AuditEntry encrypted-at-rest under L1). The
  * enclosing audit entry carries the signature scheme; this file
  * deliberately does not declare a signature field on any payload type.
  *

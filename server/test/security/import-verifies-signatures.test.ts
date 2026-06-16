@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -23,7 +23,7 @@ import {
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
-import type { StateEntry } from "../../src/l1-cognitive/state-store.js";
+import type { StateEntry } from "../../src/cognitive/state-store.js";
 
 describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
   let storage: MemoryStorage;

@@ -27,7 +27,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   COORDINATION_VIEW_AUDIT_OPS,
   type HandoffLog,

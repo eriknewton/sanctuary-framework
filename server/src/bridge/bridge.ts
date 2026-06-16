@@ -17,8 +17,8 @@
  * the interface is protocol-agnostic.
  */
 
-import { createCommitment, verifyCommitment } from "../l3-disclosure/commitments.js";
-import { createPedersenCommitment, verifyPedersenCommitment } from "../l3-disclosure/zk-proofs.js";
+import { createCommitment, verifyCommitment } from "../disclosure/commitments.js";
+import { createPedersenCommitment, verifyPedersenCommitment } from "../disclosure/zk-proofs.js";
 import { sign, verify } from "../core/identity.js";
 import { toBase64url, fromBase64url, stringToBytes } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";

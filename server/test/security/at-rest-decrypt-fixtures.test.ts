@@ -50,10 +50,10 @@ import { fileURLToPath } from "node:url";
 
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend } from "../../src/storage/interface.js";
-import { ContextGatePolicyStore } from "../../src/l2-operational/context-gate.js";
-import { PolicyStore as DisclosurePolicyStore } from "../../src/l3-disclosure/policies.js";
-import { CommitmentStore } from "../../src/l3-disclosure/commitments.js";
-import { ReputationStore } from "../../src/l4-reputation/reputation-store.js";
+import { ContextGatePolicyStore } from "../../src/operational/context-gate.js";
+import { PolicyStore as DisclosurePolicyStore } from "../../src/disclosure/policies.js";
+import { CommitmentStore } from "../../src/disclosure/commitments.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
 import { TrapStore } from "../../src/honeypot/trap-store.js";
 import {
   FIXTURE_MASTER_KEY,

@@ -68,7 +68,7 @@ import { execPath } from "node:process";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {

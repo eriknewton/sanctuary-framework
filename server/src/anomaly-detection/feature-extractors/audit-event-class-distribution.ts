@@ -14,7 +14,7 @@ import type {
   AnomalyContext,
   FeatureVector,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 import { SYSTEM_AGENT_BUCKET } from "./per-agent-activity.js";
 
 export const AUDIT_EVENT_CLASS_DISTRIBUTION_EXTRACTOR_ID =

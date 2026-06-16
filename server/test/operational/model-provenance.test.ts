@@ -13,7 +13,7 @@ import {
   InMemoryModelProvenanceStore,
   MODEL_PRESETS,
   type ModelProvenance,
-} from "../../src/l2-operational/model-provenance.js";
+} from "../../src/operational/model-provenance.js";
 
 describe("ModelProvenanceStore", () => {
   let store: InMemoryModelProvenanceStore;

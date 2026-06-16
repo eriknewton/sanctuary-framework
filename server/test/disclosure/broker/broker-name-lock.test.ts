@@ -14,12 +14,12 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { Broker } from "../../../src/l3-disclosure/broker/broker.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { Broker } from "../../../src/disclosure/broker/broker.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
-import type { Backend } from "../../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../../src/l3-disclosure/broker/backend-interface.js";
+import type { Backend } from "../../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../../src/disclosure/broker/backend-interface.js";
 
 /**
  * Fake backend whose mutators do read-then-write across a microtask gap,

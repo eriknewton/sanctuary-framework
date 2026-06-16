@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createSanctuaryServer } from "../../src/index.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import type { AuditEntry } from "../../src/l2-operational/audit-log.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
 import {
   attributeFlows,
   groupFlowsByRule,

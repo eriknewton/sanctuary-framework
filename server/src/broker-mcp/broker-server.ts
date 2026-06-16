@@ -22,14 +22,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { Broker } from "../l3-disclosure/broker/broker.js";
+import type { Broker } from "../disclosure/broker/broker.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import {
   BrokerDeniedError,
   BrokerTokenExpiredError,
   BrokerTokenUnknownError,
   type VerifiedBrokerCallerClaims,
-} from "../l3-disclosure/broker/token-issuer.js";
+} from "../disclosure/broker/token-issuer.js";
 
 // Re-export the shared package version. v0.10.0-rc.2 had an inlined local
 // require of package.json at this file's source depth — correct from src/

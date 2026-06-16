@@ -30,7 +30,7 @@ import { Writable } from "node:stream";
 import {
   AuditLog,
   type AuditEntry,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { SentinelFindingStore } from "../../src/sentinel/sentinel-finding-store.js";

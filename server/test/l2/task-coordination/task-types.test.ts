@@ -9,7 +9,7 @@ import {
   type Task,
   type TaskStatus,
   type UpdateTaskStatusInput,
-} from "../../../src/l2-operational/task-coordination/task-types.js";
+} from "../../../src/operational/task-coordination/task-types.js";
 
 describe("task coordination task types", () => {
   it("exports the complete task status catalog in state-machine order", () => {

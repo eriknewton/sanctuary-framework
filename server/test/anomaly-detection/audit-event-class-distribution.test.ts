@@ -11,7 +11,7 @@
 
 import { describe, it, expect } from "vitest";
 
-import type { AuditEntry, AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { SentinelFindingStore } from "../../src/sentinel/sentinel-finding-store.js";

@@ -67,7 +67,7 @@
  *   Defer to v1.5+; out of scope for v1.3.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HubAgentRegistrySource } from "../hub/types.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 

@@ -11,11 +11,11 @@ import { describe, expect, it, vi } from "vitest";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString } from "../../src/core/encoding.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import type { AuditLog as AuditLogType } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog as AuditLogType } from "../../src/operational/audit-log.js";
 import type { OperatorChatStore } from "../../src/chat/operator-chat-store.js";
 import { OperatorChatService } from "../../src/chat/operator-chat-service.js";
 import type { SubstrateSelector } from "../../src/intelligence/selector.js";

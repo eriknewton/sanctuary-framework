@@ -20,9 +20,9 @@ import { toolResult } from "../router.js";
 import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { CallGovernor } from "../l2-operational/call-governor.js";
-import type { LocalPrivacyEngine, PrivacyPolicy } from "../l2-operational/privacy-core.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { CallGovernor } from "../operational/call-governor.js";
+import type { LocalPrivacyEngine, PrivacyPolicy } from "../operational/privacy-core.js";
 import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────────

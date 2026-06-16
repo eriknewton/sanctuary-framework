@@ -20,24 +20,24 @@
 import { describe, expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
 import {
   LocalPrivacyEngine,
   type PrivacyPolicy,
-} from "../../src/l2-operational/privacy-core.js";
+} from "../../src/operational/privacy-core.js";
 import {
   BUILTIN_SENSITIVE_PATTERNS,
-} from "../../src/l2-operational/context-gate-enforcer.js";
+} from "../../src/operational/context-gate-enforcer.js";
 import {
   filterContext,
   type ContextGatePolicy,
-} from "../../src/l2-operational/context-gate.js";
+} from "../../src/operational/context-gate.js";
 import {
   TEMPLATES,
   listTemplateIds,
   type ContextGateTemplate,
-} from "../../src/l2-operational/context-gate-templates.js";
+} from "../../src/operational/context-gate-templates.js";
 import type {
   PrivacyDestinationCategory,
   PrivacyFilteredPayload,

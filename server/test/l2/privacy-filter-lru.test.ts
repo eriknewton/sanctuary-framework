@@ -13,7 +13,7 @@ import {
   LruCache,
   PRIVACY_VAULT_CACHE_MAX,
   PrivacyPlaceholderVault,
-} from "../../src/l2-operational/privacy-filter.js";
+} from "../../src/operational/privacy-filter.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

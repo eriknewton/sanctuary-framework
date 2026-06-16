@@ -7,7 +7,7 @@
  * restoration.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   PII_CATEGORIES,
   rewritePiiWithLlm,

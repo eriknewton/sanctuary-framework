@@ -38,7 +38,7 @@
 import {
   PrivacyPlaceholderVault,
   detectSensitiveSpans,
-} from "../l2-operational/privacy-filter.js";
+} from "../operational/privacy-filter.js";
 import type { FrontierRedactor } from "./substrates/frontier.js";
 import type { SubstrateSelector } from "./selector.js";
 import type { Surface, SubstrateChoice } from "./types.js";

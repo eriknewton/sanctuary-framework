@@ -11,7 +11,7 @@ import { Writable } from "node:stream";
 
 import { runAnomalyCommand } from "../../src/cli/anomaly.js";
 import { runSentinelCommand } from "../../src/cli/sentinel.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { ANOMALY_CATALOG } from "../../src/anomaly-detection/anomaly-catalog.js";
 import { PHI1_BASELINE_CATALOG } from "../../src/sentinel/sentinels/index.js";
 

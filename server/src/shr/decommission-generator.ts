@@ -5,10 +5,10 @@
  * has been properly decommissioned with zero active credentials.
  */
 
-import type { StateStore } from "../l1-cognitive/state-store.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { StateStore } from "../cognitive/state-store.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
-import type { ReputationStore } from "../l4-reputation/reputation-store.js";
+import type { ReputationStore } from "../reputation/reputation-store.js";
 import type {
   DecommissionCertificateBody,
   SignedDecommissionCertificate,

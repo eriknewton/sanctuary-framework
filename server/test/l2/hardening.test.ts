@@ -17,11 +17,11 @@ import {
   checkFilesystemPermissions,
   checkRuntimeIntegrity,
   assessL2Hardening,
-} from "../../src/l2-operational/hardening.js";
+} from "../../src/operational/hardening.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL2HardeningTools } from "../../src/l2-operational/hardening-tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL2HardeningTools } from "../../src/operational/hardening-tools.js";
 import type { ToolDefinition } from "../../src/router.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";

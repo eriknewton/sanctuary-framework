@@ -80,7 +80,7 @@ import {
   establishWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
@@ -1186,7 +1186,7 @@ export async function runWrap(
         // before the success exit below.
         await enableAnchorTransparencyForWrap(ndStorage, ndDerived.key, ndAuditLog);
 
-        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { IdentityManager } = await import("../cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
         const { derivePurposeKey } = await import("../core/key-derivation.js");
         const identityMgr = new IdentityManager(ndStorage, ndDerived.key);
@@ -1309,7 +1309,7 @@ export async function runWrap(
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {
-        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { IdentityManager } = await import("../cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
         const { derivePurposeKey } = await import("../core/key-derivation.js");
         const identityMgr = new IdentityManager(v11Storage, derived.key);

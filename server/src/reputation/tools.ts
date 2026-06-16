@@ -8,9 +8,9 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import { ReputationStore, type InteractionOutcome } from "./reputation-store.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";

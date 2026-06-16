@@ -30,7 +30,7 @@ import {
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import {
   fixedDenial,
   OpaqueNamespaceRegistry,

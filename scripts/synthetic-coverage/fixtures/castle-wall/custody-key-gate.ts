@@ -3,7 +3,7 @@ import { ApprovalGate } from "../../../../server/src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../../server/src/principal-policy/baseline.js";
 import { AutoApproveChannel, CallbackApprovalChannel } from "../../../../server/src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../../../server/src/principal-policy/loader.js";
-import { AuditLog } from "../../../../server/src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../../server/src/operational/audit-log.js";
 import { generateRandomKey } from "../../../../server/src/core/random.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 

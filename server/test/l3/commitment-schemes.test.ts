@@ -15,7 +15,7 @@ import {
   createCommitment,
   verifyCommitment,
   CommitmentStore,
-} from "../../src/l3-disclosure/commitments.js";
+} from "../../src/disclosure/commitments.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

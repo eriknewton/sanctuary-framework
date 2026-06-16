@@ -15,7 +15,7 @@ import { listTemplates, getTemplate, TEMPLATE_NAMES, isTemplateName } from "./re
 import { buildCompiledPolicyFromTemplate } from "./init.js";
 import { encodePolicyBlob } from "../policy-engine/canonical-policy.js";
 import { findTenant } from "../cli/agents/discovery.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";

@@ -24,7 +24,7 @@ import {
   RECOVERY_KEY_FILENAME,
 } from "../../src/wrap/recovery-key-disclosure.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   deriveMasterKey,
   derivePurposeKey,

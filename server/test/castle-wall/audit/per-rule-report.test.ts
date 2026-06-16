@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { AuditEntry } from "../../../src/l2-operational/audit-log.js";
+import type { AuditEntry } from "../../../src/operational/audit-log.js";
 import {
   DEFAULT_DENY_BUCKET,
   attributeFlows,

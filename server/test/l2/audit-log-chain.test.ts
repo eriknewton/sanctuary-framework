@@ -8,7 +8,7 @@ import {
   AuditLog,
   type AuditEntry,
   type PersistedAuditEnvelopeV2,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import {
   checkpointSigningBytes,
   type AuditCheckpointRecord,

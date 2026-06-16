@@ -13,7 +13,7 @@ import { describe, it, expect, vi } from "vitest";
 import { SovereigntyProfileStore } from "../src/sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "../src/sovereignty-profile-tools.js";
 import { MemoryStorage } from "../src/storage/memory.js";
-import { AuditLog } from "../src/l2-operational/audit-log.js";
+import { AuditLog } from "../src/operational/audit-log.js";
 import { generateRandomKey } from "../src/core/random.js";
 
 class FailingAuditStorage extends MemoryStorage {

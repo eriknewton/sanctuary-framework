@@ -22,7 +22,7 @@ import {
   AuditLog,
   AuditIntegrityError,
   type AuditEntry,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import {
   DEFAULT_DENY_BUCKET,
   attributeFlows,

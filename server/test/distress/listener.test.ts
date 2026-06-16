@@ -41,7 +41,7 @@ import {
   DISTRESS_LOCAL_SECRET_FILENAME,
 } from "../../src/distress/local-secret.js";
 import type { DistressEnvelope } from "../../src/distress/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { canonicalJson, sha256 } from "../../src/agent-native/safety-base.js";

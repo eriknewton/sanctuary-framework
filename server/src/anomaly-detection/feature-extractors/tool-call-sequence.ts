@@ -43,7 +43,7 @@ import type {
   AnomalyContext,
   FeatureVector,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 
 export const TOOL_CALL_SEQUENCE_EXTRACTOR_ID =
   "tool-call-sequence" as const;

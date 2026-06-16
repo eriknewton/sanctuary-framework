@@ -27,7 +27,7 @@ import { join } from "node:path";
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";

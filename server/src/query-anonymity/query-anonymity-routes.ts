@@ -24,7 +24,7 @@
  * soon as the SPA gets a panel for it.
  */
 
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import { QUERY_ANONYMITY_AUDIT_OPS } from "./header-strip.js";
 
 export const QUERY_ANONYMITY_API_PREFIX = "/api/query-anonymity";

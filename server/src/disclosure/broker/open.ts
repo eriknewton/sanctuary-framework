@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { FilesystemStorage } from "../../storage/filesystem.js";
 import { loadConfig } from "../../config.js";
 import { resolveCliMasterKey } from "../../core/master-custody.js";
-import { AuditLog } from "../../l2-operational/audit-log.js";
+import { AuditLog } from "../../operational/audit-log.js";
 import { getOrCreatePassphrase } from "../../wrap/passphrase.js";
 import { KeychainBackend } from "./keychain-backend.js";
 import { Broker } from "./broker.js";

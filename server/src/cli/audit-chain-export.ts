@@ -19,7 +19,7 @@ import { Writable } from "node:stream";
 import { basename, join } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
 import { bytesToString } from "../core/encoding.js";
-import type { PersistedAuditEnvelopeV2 } from "../l2-operational/audit-log.js";
+import type { PersistedAuditEnvelopeV2 } from "../operational/audit-log.js";
 import type { AuditCheckpointRecord } from "../audit/chain.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 

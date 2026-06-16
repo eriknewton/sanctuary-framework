@@ -33,10 +33,10 @@ import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog, type AuditEntry } from "../../src/l2-operational/audit-log.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog, type AuditEntry } from "../../src/operational/audit-log.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import type { ExitBundleManifest } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 import {

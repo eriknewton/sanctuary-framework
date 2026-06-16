@@ -53,7 +53,7 @@ import type { HubService } from "./hub-service.js";
 import {
   TASK_STATUSES,
   type TaskStatus,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 
 export interface HubRouterDeps {
   authConfig: AuthConfig;

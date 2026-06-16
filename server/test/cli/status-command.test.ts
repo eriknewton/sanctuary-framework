@@ -14,7 +14,7 @@ import { randomBytes } from "node:crypto";
 
 import { ed25519 } from "@noble/curves/ed25519";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { runStatusCommand, toYaml } from "../../src/cli/status.js";
 import { toBase64url } from "../../src/core/encoding.js";

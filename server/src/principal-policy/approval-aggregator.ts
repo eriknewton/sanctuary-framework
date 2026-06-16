@@ -28,7 +28,7 @@
 import { randomUUID, createHash } from "node:crypto";
 
 import type { StorageBackend } from "../storage/interface.js";
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";

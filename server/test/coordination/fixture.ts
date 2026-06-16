@@ -16,7 +16,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { generateKeypair } from "../../src/core/identity.js";
 import { randomBytes } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   type CoordinationKeyResolver,
   type CoordinationSigner,

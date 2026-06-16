@@ -36,7 +36,7 @@ import type {
   SentinelFinding,
   SentinelSeverity,
 } from "../../src/sentinel/types.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { SentinelFindingStore } from "../../src/sentinel/sentinel-finding-store.js";
 
 const NOW = new Date("2026-05-10T15:00:00.000Z");

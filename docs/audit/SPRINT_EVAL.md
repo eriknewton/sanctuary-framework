@@ -614,8 +614,8 @@ This is self-contained and clear. A future implementer working on SEC-010 or SEC
 
 Commit `d2fd381` touches exactly 5 files:
 
-1. `server/src/l1-cognitive/state-store.ts` — verification logic added to `import()`
-2. `server/src/l1-cognitive/tools.ts` — resolver callback wired in handler
+1. `server/src/cognitive/state-store.ts` — verification logic added to `import()`
+2. `server/src/cognitive/tools.ts` — resolver callback wired in handler
 3. `server/test/security/import-verifies-signatures.test.ts` — new test file (5 tests)
 4. `SPRINT_CONTRACT.md` — contract for this sprint
 5. `SPRINT_RESULT.md` — result documentation
@@ -1306,7 +1306,7 @@ Actual: 8 files.
 - `SPRINT_RESULT.md` ✓ (expected)
 - `server/src/bridge/tools.ts` ⚠️ UNEXPECTED — adds `_content_trust: "external"` tag (SEC-ADD-03)
 - `server/src/handshake/tools.ts` ⚠️ UNEXPECTED — adds `_content_trust: "external"` tags
-- `server/src/l4-reputation/tools.ts` ⚠️ UNEXPECTED — adds `_content_trust: "external"` tag
+- `server/src/reputation/tools.ts` ⚠️ UNEXPECTED — adds `_content_trust: "external"` tag
 - `server/test/security/prompt-injection-tagging.test.ts` ⚠️ UNEXPECTED — new test file for SEC-ADD-03
 
 **Finding: 4 extra files from a different finding (SEC-ADD-03 / prompt injection output tagging) were bundled into this commit.** The changes are small (3 one-line metadata additions + 1 new test file), non-destructive, and don't interact with the SEC-003 fix. However, this violates the sprint discipline rule: "Do not bundle two findings into one sprint." The SEC-ADD-03 changes should have been in a separate commit.
@@ -1481,7 +1481,7 @@ Sanitization operates on raw Python unicode strings. It does NOT URL-decode (`%0
 | `bridge_verify` | server/src/bridge/tools.ts | 297 | ✓ |
 | `handshake_respond` | server/src/handshake/tools.ts | 141 | ✓ |
 | `handshake_complete` | server/src/handshake/tools.ts | 209 | ✓ |
-| `reputation_query` | server/src/l4-reputation/tools.ts | 196 | ✓ |
+| `reputation_query` | server/src/reputation/tools.ts | 196 | ✓ |
 
 ### 3b. Completeness — FAIL (missing tools)
 
@@ -1492,7 +1492,7 @@ Independent review of all Sanctuary tools that return counterparty-originated da
 | `handshake_status` | handshake/tools.ts | Returns counterparty SHR and verification result | ❌ MISSING |
 | `federation_peers` | federation/tools.ts | Returns counterparty peer metadata (peer_id, peer_did, capabilities) | ❌ MISSING |
 | `federation_trust_evaluate` | federation/tools.ts | Returns PeerTrustEvaluation derived from counterparty HandshakeResult | ❌ MISSING |
-| `reputation_query_weighted` | l4-reputation/tools.ts | Returns weighted scores from counterparty attestations | ⚠️ SHOULD REVIEW |
+| `reputation_query_weighted` | reputation/tools.ts | Returns weighted scores from counterparty attestations | ⚠️ SHOULD REVIEW |
 
 Tools confirmed as NOT needing tags: `bridge_commit` (returns own commitment), `bridge_attest` (returns own attestation), `handshake_initiate` (returns own challenge), `reputation_record` (returns own attestation metadata), `reputation_export` (returns own attestations).
 
@@ -1541,7 +1541,7 @@ All 5 tagged tools have explicit tests. Both sanitization and tagging behaviors 
 
 ### Sanctuary `82f3321` — ACKNOWLEDGED (shared with SEC-003)
 
-Already evaluated in SEC-003 sprint eval. Contains SEC-ADD-03 changes (4 files: bridge/tools.ts, handshake/tools.ts, l4-reputation/tools.ts, prompt-injection-tagging.test.ts) bundled with SEC-003 fix. Previously acknowledged as process violation, condition closed.
+Already evaluated in SEC-003 sprint eval. Contains SEC-ADD-03 changes (4 files: bridge/tools.ts, handshake/tools.ts, reputation/tools.ts, prompt-injection-tagging.test.ts) bundled with SEC-003 fix. Previously acknowledged as process violation, condition closed.
 
 ---
 
@@ -1586,7 +1586,7 @@ All four tools confirmed tagged with `_content_trust: "external"`:
 - `handshake_status` — handshake/tools.ts (status query response)
 - `federation_peers` — federation/tools.ts (peer list response)
 - `federation_trust_evaluate` — federation/tools.ts (trust evaluation response)
-- `reputation_query_weighted` — l4-reputation/tools.ts (weighted query response)
+- `reputation_query_weighted` — reputation/tools.ts (weighted query response)
 
 One regression test per tool in `server/test/security/prompt-injection-tagging.test.ts`: `handshake_status result includes _content_trust: external`, `federation_peers list result includes _content_trust: external`, `federation_trust_evaluate result includes _content_trust: external`, `reputation_query_weighted result includes _content_trust: external`. `reputation_query_weighted` reviewed and confirmed as returning counterparty attestation data — correctly tagged.
 

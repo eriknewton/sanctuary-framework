@@ -4,7 +4,7 @@ import {
   TASK_STATUSES,
   type Task,
   type TaskStatus,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export interface TaskCliArgs {

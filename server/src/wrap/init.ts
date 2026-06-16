@@ -38,7 +38,7 @@ import {
   type CustodyWrap,
 } from "../core/master-custody.js";
 import { getOrCreateKeychainCustodyKey } from "./keychain-custody.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   discloseRecoveryKey,

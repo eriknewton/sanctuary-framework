@@ -25,7 +25,7 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
-import { AuditLog } from "./l2-operational/audit-log.js";
+import { AuditLog } from "./operational/audit-log.js";
 import {
   consumeResetHistoryMarker,
   ResetHistoryMalformedError,
@@ -42,10 +42,10 @@ import {
   CustodyMigrationRefusedError,
   type EstablishMasterResult,
 } from "./core/master-custody.js";
-import { IdentityManager } from "./l1-cognitive/tools.js";
-import { StateStore } from "./l1-cognitive/state-store.js";
+import { IdentityManager } from "./cognitive/tools.js";
+import { StateStore } from "./cognitive/state-store.js";
 import { createIdentity } from "./core/identity.js";
-import { TaskService } from "./l2-operational/task-coordination/index.js";
+import { TaskService } from "./operational/task-coordination/index.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";

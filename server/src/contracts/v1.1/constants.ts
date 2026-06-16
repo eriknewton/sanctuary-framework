@@ -52,7 +52,7 @@ export type PrivacyDetectorClass =
  * enforcement workstream agree on this enum so events compose end-to-end.
  *
  * Categories deliberately mirror the L2 `ProviderCategory` taxonomy in
- * `server/src/l2-operational/context-gate.ts` (hyphen form) so JSON-stable
+ * `server/src/operational/context-gate.ts` (hyphen form) so JSON-stable
  * strings flow through both layers without translation. If the L2 category
  * set grows, keep this v1.1 list in lockstep through coordinator review.
  */

@@ -18,7 +18,7 @@ import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import type { ApprovalGate } from "./principal-policy/gate.js";
 import type { ToolCallTrapRuntime } from "./honeypot/tool-call-trap-runtime.js";
-import type { AuditLog } from "./l2-operational/audit-log.js";
+import type { AuditLog } from "./operational/audit-log.js";
 import { fixedDenial, type SessionBinding } from "./agent-native/safety-base.js";
 import {
   normalizeToolArgsForValidation,

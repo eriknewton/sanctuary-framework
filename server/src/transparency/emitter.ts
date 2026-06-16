@@ -29,7 +29,7 @@ import {
 import { hmacSha256 } from "../core/hashing.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { computeAuditRoot } from "../audit/chain.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type {
   FilesystemStorageCapabilities,
   StorageBackend,

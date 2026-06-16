@@ -14,7 +14,7 @@
 ### BUG-001 — state_export() Returns Empty Bundle on Fresh Server Session
 
 **Severity:** Blocking
-**File:** `server/src/l1-cognitive/state-store.ts:461-470`
+**File:** `server/src/cognitive/state-store.ts:461-470`
 **Description:** The `export()` method discovers namespaces by iterating `this.contentHashes.keys()`, which is a lazily-populated in-memory cache. The cache is populated only when `state_read()`, `state_write()`, or `state_list()` operations are performed. On a fresh server session — where the user starts the server, stores data in a previous session, and then calls `state_export` without first touching any state — the cache is empty and the export returns a bundle with zero namespaces. The actual encrypted data remains on disk but is invisible to the export function.
 
 **Reproduction:**
@@ -31,7 +31,7 @@
 ### BUG-002 — state_import() Creates Version Cache Staleness Leading to Monotonicity Violation
 
 **Severity:** Major
-**File:** `server/src/l1-cognitive/state-store.ts:558-569`
+**File:** `server/src/cognitive/state-store.ts:558-569`
 **Description:** When `import()` skips entries due to version conflict (using `conflictResolution="version"`), the in-memory version cache is not updated with the skipped entry's version. Subsequent `state_write()` calls use the stale cache value to determine the next version number, potentially producing a version lower than what exists on disk. This violates the monotonic version invariant that rollback detection depends on.
 
 **Reproduction:**
@@ -171,7 +171,7 @@ If `a_counterparties == {b}` (a set containing only element `b`), then `len(a_co
 ### BUG-010 — Audit Log Persistence Failure Silently Swallowed
 
 **Severity:** Major
-**File:** `server/src/l2-operational/audit-log.ts:58-61`
+**File:** `server/src/operational/audit-log.ts:58-61`
 **Description:** The `persistEntry()` method's error handler is `.catch(() => {})` — a completely empty catch that swallows all errors silently. If the audit log's encryption or storage write fails (disk full, permission error, encryption failure), the gate still returns its decision, and the audit entry is lost. No warning is emitted, no metric is incremented, and no fallback is attempted. The caller has no indication that audit logging failed.
 
 **Reproduction:**
@@ -191,7 +191,7 @@ If `a_counterparties == {b}` (a set containing only element `b`), then `len(a_co
 ### BUG-011 — state_export() Does Not Filter Reserved Namespaces
 
 **Severity:** Major
-**File:** `server/src/l1-cognitive/state-store.ts:452-513`
+**File:** `server/src/cognitive/state-store.ts:452-513`
 **Description:** When `export()` is called without a specific namespace argument, it iterates all namespaces discovered from the `contentHashes` cache. Unlike the tool-level handlers in `tools.ts` (which call `isReservedNamespace()` before operations), the `export()` method in `StateStore` does not filter reserved namespaces like `_identities`, `_audit`, `_commitments`, `_reputation`, `_principal`, etc. If these namespaces have been accessed during the session (populating the cache), they will be included in the export bundle. This means an export can contain encrypted identity keys, audit logs, and internal system state.
 
 **Reproduction:**
@@ -207,7 +207,7 @@ If `a_counterparties == {b}` (a set containing only element `b`), then `len(a_co
 ### BUG-012 — Range Proof Accepts Degenerate Range (min == max), Producing Trivially Valid Proof
 
 **Severity:** Major
-**File:** `server/src/l3-disclosure/zk-proofs.ts:308-320`
+**File:** `server/src/disclosure/zk-proofs.ts:308-320`
 **Description:** The `createRangeProof()` function computes `numBits = Math.ceil(Math.log2(range + 1))` where `range = max - min`. When `min == max`, `range = 0`, `numBits = Math.ceil(Math.log2(1)) = 0`. The bit decomposition loop runs zero times, producing empty `bit_commitments` and `bit_proofs` arrays. The verifier (`verifyRangeProof`) checks that the array lengths match (0 == 0), that the reconstructed sum equals the shift (0 == 0), and returns `valid: true`. The proof proves nothing — it doesn't verify that the prover knows the value or that the value equals `min`.
 
 **Reproduction:**
@@ -241,7 +241,7 @@ If `a_counterparties == {b}` (a set containing only element `b`), then `len(a_co
 ### BUG-014 — proof_reveal Does Not Mark Commitment as Revealed
 
 **Severity:** Minor
-**File:** `server/src/l3-disclosure/tools.ts:109-126`
+**File:** `server/src/disclosure/tools.ts:109-126`
 **Description:** The `proof_reveal` tool calls `verifyCommitment()` and returns the result, but never calls the `markRevealed()` method on the commitment store. A commitment can be "revealed" (verified) unlimited times. The `revealed` field in the commitment record permanently remains `false`. There is no way for a verifier to distinguish a commitment that has been revealed from one that has not.
 
 **Reproduction:**

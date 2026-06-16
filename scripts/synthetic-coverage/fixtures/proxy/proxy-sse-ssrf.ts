@@ -1,4 +1,4 @@
-import type { AuditEntryInput } from "../../../../server/src/l2-operational/audit-log.js";
+import type { AuditEntryInput } from "../../../../server/src/operational/audit-log.js";
 import {
   SsrfRejectionReason,
   validateUpstreamSseUrl,

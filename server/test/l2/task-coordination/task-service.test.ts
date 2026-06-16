@@ -3,14 +3,14 @@ import { describe, expect, it } from "vitest";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import { createIdentity } from "../../../src/core/identity.js";
 import { generateRandomKey } from "../../../src/core/random.js";
-import { StateStore } from "../../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { StateStore } from "../../../src/cognitive/state-store.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import {
   TASK_STATUSES,
   TaskService,
   TaskStateTransitionError,
   type TaskStatus,
-} from "../../../src/l2-operational/task-coordination/index.js";
+} from "../../../src/operational/task-coordination/index.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 
 function makeService(fortressId = "fortress-a") {

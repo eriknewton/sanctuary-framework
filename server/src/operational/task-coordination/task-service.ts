@@ -3,7 +3,7 @@ import { hashToString } from "../../core/hashing.js";
 import { randomBytes } from "../../core/random.js";
 import { stringToBytes } from "../../core/encoding.js";
 import type { StoredIdentity } from "../../core/identity.js";
-import type { StateStore } from "../../l1-cognitive/state-store.js";
+import type { StateStore } from "../../cognitive/state-store.js";
 import type { AuditLog } from "../audit-log.js";
 import {
   TASK_STATUSES,

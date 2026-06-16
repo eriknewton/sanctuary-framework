@@ -27,7 +27,7 @@
  *   The wiring layer can instantiate the service before the substrate
  *   selector when bootstrap order requires it.
  * - The PII filter is the Tier 1 regex shipped in
- *   `l2-operational/privacy-filter.ts`; Tier 2 NER+LLM redaction lives
+ *   `operational/privacy-filter.ts`; Tier 2 NER+LLM redaction lives
  *   in the substrate-selector layer (substrate-routed), not here.
  */
 
@@ -35,7 +35,7 @@ import { randomUUID } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes } from "../core/encoding.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type {
   SubstrateSelector,
 } from "../intelligence/index.js";

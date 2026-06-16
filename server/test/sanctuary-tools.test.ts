@@ -15,9 +15,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { MemoryStorage } from "../src/storage/memory.js";
 import { generateRandomKey } from "../src/core/random.js";
-import { StateStore } from "../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../src/l2-operational/audit-log.js";
-import { createL1Tools } from "../src/l1-cognitive/tools.js";
+import { StateStore } from "../src/cognitive/state-store.js";
+import { AuditLog } from "../src/operational/audit-log.js";
+import { createL1Tools } from "../src/cognitive/tools.js";
 import { createSanctuaryTools } from "../src/sanctuary-tools.js";
 import { DEFAULT_POLICY } from "../src/principal-policy/loader.js";
 import { defaultConfig } from "../src/config.js";

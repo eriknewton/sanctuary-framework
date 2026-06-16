@@ -10,7 +10,7 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
 import { publicKeyToDid } from "../core/identity.js";
 import { fromBase64url } from "../core/encoding.js";

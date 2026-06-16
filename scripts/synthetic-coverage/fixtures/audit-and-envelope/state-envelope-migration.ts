@@ -16,7 +16,7 @@ import {
   StateStore,
   StateVerificationError,
   type StateEntry,
-} from "../../../../server/src/l1-cognitive/state-store.js";
+} from "../../../../server/src/cognitive/state-store.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import { registerFixture, type FixtureOutcome } from "../../registry.js";
 
