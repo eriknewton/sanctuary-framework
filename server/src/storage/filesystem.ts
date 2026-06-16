@@ -259,7 +259,9 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
             "code" in err &&
             (err as NodeJS.ErrnoException).code === "ENOENT"
           ) {
-            throw new Error("Secure delete target changed before unlink.");
+            throw new Error("Secure delete target changed before unlink.", {
+              cause: err,
+            });
           }
           throw err;
         }
