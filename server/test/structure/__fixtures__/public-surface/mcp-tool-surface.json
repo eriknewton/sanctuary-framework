@@ -1,7 +1,6 @@
 [
   {
     "name": "audit_export_siem",
-    "description": "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. Encrypted audit entries are decrypted and formatted according to your chosen standard. Tier 1 — operator approval required: SIEM forwarding is an operator function, and the bulk export reveals each operation's policy tier and approve/deny decision, so it is not auto-allowed to the agent (prevents policy-inference).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -64,7 +63,6 @@
   },
   {
     "name": "bootstrap_create_escrow",
-    "description": "Create an escrow record for trust bootstrapping. Allows new participants with no reputation to transact safely.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -98,7 +96,6 @@
   },
   {
     "name": "bootstrap_provide_guarantee",
-    "description": "A principal provides a signed reputation guarantee for a new agent. The guarantee certificate can be presented to counterparties.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -133,7 +130,6 @@
   },
   {
     "name": "bridge_attest",
-    "description": "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, linked to a bridge commitment. This completes the bridge: the commitment (L3) proves the terms were agreed, and the attestation (L4) feeds the sovereignty-weighted reputation score. The attestation is automatically tagged with the counterparty's sovereignty tier from any completed handshake.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -168,7 +164,6 @@
   },
   {
     "name": "bridge_commit",
-    "description": "Create a cryptographic commitment binding a Concordia negotiation outcome to Sanctuary's L3 proof layer. The commitment includes a SHA-256 hash of the canonical outcome (hiding + binding), an Ed25519 signature by the committer's identity, and an optional Pedersen commitment on the round count for zero-knowledge range proofs. This is the Sanctuary side of the Concordia bridge — call this when a Concordia `accept` fires.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -231,7 +226,6 @@
   },
   {
     "name": "bridge_verify",
-    "description": "Verify a bridge commitment against a revealed Concordia negotiation outcome. Checks SHA-256 commitment validity, Ed25519 signature, session ID match, terms hash integrity, and Pedersen commitment (if present). Use this to confirm that a counterparty's claimed negotiation outcome matches what was cryptographically committed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -255,7 +249,6 @@
   },
   {
     "name": "broker/audit_query",
-    "description": "Query your own broker-scoped audit trail (token request/issue/deny/read for your identity). Each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — never the secret name, the granted/requested scope, the ttl, the denial reason, or any tenant/audience claim; those are operator-only.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -272,7 +265,6 @@
   },
   {
     "name": "broker/list_grants",
-    "description": "List the currently-active grants visible to this broker. Names only — no secret values.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -280,7 +272,6 @@
   },
   {
     "name": "broker/read_secret",
-    "description": "Exchange a previously-issued token for the raw credential value. Returns {value} on success; generic error on denial, expiry, or unknown token. Token may be used multiple times within its TTL.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -296,7 +287,6 @@
   },
   {
     "name": "broker/request_token",
-    "description": "Request a scoped ephemeral token for a named secret. The requested skill must match the verified caller skill and have a broker-policy.json grant. Returns {token, expires_at} on success; generic error on denial.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -329,7 +319,6 @@
   },
   {
     "name": "compliance_eu_ai_act_annex_iii_classify",
-    "description": "Classify a free-text agent description against the eight Annex III high-risk categories of Regulation (EU) 2024/1689. Returns zero or more candidate categories with a rule_based_confidence score (sum of matched keyword weights clamped to [0, 1]). This is a RULE-BASED classifier — NOT a machine-learning model, and NOT legal advice. Use the result to narrow the deployer's review. Tier 3 (read-only, auto-allow).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -345,7 +334,6 @@
   },
   {
     "name": "compliance_generate_eu_ai_act_bundle",
-    "description": "Generate an EU AI Act compliance bundle for a given agent and reporting period. Produces 6 Markdown documents plus a signed JSON manifest, covering Annex IV technical documentation (Art. 11), Art. 12 automatic record-keeping, Art. 13 transparency, Art. 14 human oversight, Art. 15 cybersecurity, and Art. 26 deployer obligations. Every file is individually SHA-256 hashed and signed with the provider's primary Ed25519 identity. NOT LEGAL ADVICE — consult qualified counsel before filing. Tier 1 (operator approval required): the bundle body embeds your anomaly-detection thresholds, approval timeout, and audit-derived decision counts, so it is not auto-allowed (prevents policy-inference), and an agent must not generate its own compliance attestation.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -411,7 +399,6 @@
   },
   {
     "name": "context_gate_enforcer_configure",
-    "description": "Configure the automatic context gate enforcer. Control whether it filters tool arguments, toggle log_only mode for gradual rollout, set the active policy, and choose what to do when denied fields are encountered (block the request or redact the field). Use this to enable automatic context protection.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -444,7 +431,6 @@
   },
   {
     "name": "context_gate_enforcer_status",
-    "description": "Get the status of the automatic context gate enforcer, including enabled/disabled state, log_only mode, active policy, and statistics. The enforcer automatically filters tool arguments when enabled. Use this to monitor what the enforcer has been filtering.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -452,7 +438,6 @@
   },
   {
     "name": "context_gate_filter",
-    "description": "Filter agent context through a gating policy before sending to a remote provider. Returns per-field decisions (allow, redact, hash, summarize) and content hashes for the audit trail. Call this BEFORE making any outbound API call to ensure you are only sending the minimum necessary context. The filtered output tells you exactly what can be sent safely.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -478,7 +463,6 @@
   },
   {
     "name": "context_gate_list_policies",
-    "description": "List all configured context-gating policies. Returns policy IDs, names, and selector-safe metadata.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -486,7 +470,6 @@
   },
   {
     "name": "context_gate_recommend",
-    "description": "Analyze a sample context object and recommend a context-gating policy based on field name heuristics. Classifies each field as allow, redact, hash, or summarize with confidence levels. Returns a ready-to-apply rule set. When in doubt, recommends redact (conservative). Review the recommendations before applying.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -506,7 +489,6 @@
   },
   {
     "name": "disclosure_evaluate",
-    "description": "Evaluate a disclosure request against an active policy. Returns per-field decisions: disclose, withhold, proof, or ask-principal.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -534,7 +516,6 @@
   },
   {
     "name": "disclosure_set_policy",
-    "description": "Define a disclosure policy that controls what an agent will and will not disclose in different interaction contexts. Rules specify which fields may be disclosed, which must be withheld, and which require cryptographic proof.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -604,7 +585,6 @@
   },
   {
     "name": "exec_attest",
-    "description": "Generate an attestation of the current execution environment, including sovereignty assessment and degradation report.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -625,7 +605,6 @@
   },
   {
     "name": "federation_peers",
-    "description": "List known federation peers, register a peer from a completed handshake, or remove a peer. Every peer MUST enter through a verified handshake — no self-registration allowed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -658,7 +637,6 @@
   },
   {
     "name": "federation_status",
-    "description": "Overview of federation state: total peers, active connections, trust distribution, and readiness for cross-instance operations.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -666,7 +644,6 @@
   },
   {
     "name": "federation_trust_evaluate",
-    "description": "Evaluate the trust level of a federation peer. Considers handshake status, sovereignty tier, reputation score, and mutual attestation history. Returns a composite trust assessment.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -690,7 +667,6 @@
   },
   {
     "name": "governor_reset",
-    "description": "Reset all Call Governor counters: volume window, per-tool rate windows, duplicate cache, and lifetime counter. This clears the hard stop if the lifetime limit was reached. This is a Tier 1 operation — requires human approval because it removes all runtime governance state and could allow previously blocked behavior to resume.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -706,7 +682,6 @@
   },
   {
     "name": "governor_status",
-    "description": "View the current Call Governor status including volume counters, per-tool rate counts, duplicate cache size, and lifetime counter. Use this to monitor tool call consumption, detect potential loops, and check how close you are to governance limits. The governor protects against runaway tool calls by enforcing volume limits, rate limits, duplicate detection, and a session lifetime cap.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -714,7 +689,6 @@
   },
   {
     "name": "handshake_abort",
-    "description": "Abort an in-flight handshake session. Drops the session record and appends a session-lifecycle audit entry (handshake_aborted) so the operator can distinguish operator-cancelled, timed-out, and dropped sessions from sessions that simply fell off the protocol path.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -741,7 +715,6 @@
   },
   {
     "name": "handshake_complete",
-    "description": "Complete a sovereignty handshake (initiator side). Verifies the responder's SHR and nonce signature, signs their nonce, and produces the final result.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -762,7 +735,6 @@
   },
   {
     "name": "handshake_exchange",
-    "description": "One-shot sovereignty exchange. Accepts a counterparty's signed SHR, verifies it, generates our SHR, and produces a signed attestation artifact — all in a single call. Returns a shareable attestation with human-readable summary. Use this instead of the 4-step handshake protocol when you want a quick, portable sovereignty verification (e.g., for social posting or async exchanges).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -782,7 +754,6 @@
   },
   {
     "name": "handshake_initiate",
-    "description": "Initiate a sovereignty handshake with a counterparty. Generates a challenge containing this instance's signed SHR and a cryptographic nonce. Send the returned challenge to the counterparty.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -795,7 +766,6 @@
   },
   {
     "name": "handshake_respond",
-    "description": "Respond to an incoming sovereignty handshake challenge. Verifies the initiator's SHR, signs their nonce, and returns our SHR with a counter-nonce.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -815,7 +785,6 @@
   },
   {
     "name": "handshake_status",
-    "description": "Check the state of an in-flight handshake session by id, or (responder side) verify an initiator's completion message. Read-only; returns session phase and, for verification, the validated counterparty SHR result.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -835,7 +804,6 @@
   },
   {
     "name": "handshake_verify_attestation",
-    "description": "Verify a signed attestation artifact from another agent. Checks the Ed25519 signature, temporal validity, and structural integrity.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -851,7 +819,6 @@
   },
   {
     "name": "identity_create",
-    "description": "Create a new sovereign identity (Ed25519 keypair). The private key is encrypted and never exposed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -867,7 +834,6 @@
   },
   {
     "name": "identity_import",
-    "description": "Import a sovereign identity record without exposing private key material. Routine imports refuse to replace any existing identity.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -883,7 +849,6 @@
   },
   {
     "name": "identity_list",
-    "description": "List all managed sovereign identities with labels, DIDs, public keys, and which is primary. Read-only; no private key material returned.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -900,7 +865,6 @@
   },
   {
     "name": "identity_rotate",
-    "description": "Rotate keys for an identity. Generates a new keypair and signs a rotation event with the old key for verifiable chain.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -918,7 +882,6 @@
   },
   {
     "name": "identity_set_primary",
-    "description": "Set which identity is the default/primary identity. This identity will be used by shr_generate, reputation_publish, and other tools when no explicit identity_id parameter is provided. The selection is persisted across server restarts.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -934,7 +897,6 @@
   },
   {
     "name": "identity_sign",
-    "description": "Sign data with a managed identity after operator approval. The private key is decrypted in memory only during signing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -953,7 +915,6 @@
   },
   {
     "name": "identity_verify",
-    "description": "Verify an Ed25519 signature. Provide either identity_id or public_key.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -982,7 +943,6 @@
   },
   {
     "name": "l2_hardening_status",
-    "description": "L2 Process Hardening Status — Verify software-based operational isolation. Reports memory protection, process isolation level, filesystem permissions, and overall hardening assessment. Read-only. Tier 3 — always allowed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -996,7 +956,6 @@
   },
   {
     "name": "l2_verify_isolation",
-    "description": "Verify L2 process isolation at runtime. Checks whether the Sanctuary server is running in an isolated environment (container, VM, sandbox) and validates filesystem and memory protections. Reports isolation level and any issues. Read-only. Tier 3 — always allowed.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1020,7 +979,6 @@
   },
   {
     "name": "manifest",
-    "description": "Generate the Sanctuary Interface Manifest (SIM) — a machine-readable declaration of this server's capabilities.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1028,7 +986,6 @@
   },
   {
     "name": "memory_attest",
-    "description": "Create an Ed25519-signed attestation for a memory operation. Records who accessed what (content hash, not content), when, and through which memory provider — without exposing the memory content itself. Works with any MCP-compatible memory provider (Mem0, Zep, Letta, etc.). Use after add_memory, search_memories, or any memory CRUD operation to build a cryptographically verifiable audit trail of memory access.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1091,7 +1048,6 @@
   },
   {
     "name": "monitor_audit_log",
-    "description": "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — no details, identity, or policy attribution.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1120,7 +1076,6 @@
   },
   {
     "name": "monitor_health",
-    "description": "Report this instance's live health and sovereignty status: overall state (healthy/degraded/compromised), versions, Castle Wall enforcement state, audit/state/egress posture, and any active degradations. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1128,7 +1083,6 @@
   },
   {
     "name": "principal_baseline_view",
-    "description": "View the current behavioral baseline — the session profile used for anomaly detection. Shows known namespaces, counterparties, and tool call counts. Read-only.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1136,7 +1090,6 @@
   },
   {
     "name": "principal_policy_view",
-    "description": "View the current Principal Policy — the human-controlled rules governing what operations require approval. Read-only.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1150,7 +1103,6 @@
   },
   {
     "name": "proof_commitment",
-    "description": "Create a cryptographic commitment to a value. The commitment hides the value until you choose to reveal it. Returns the commitment hash and a blinding factor (store securely).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1170,7 +1122,6 @@
   },
   {
     "name": "proof_reveal",
-    "description": "Verify a previously committed value by revealing it with the blinding factor. Returns whether the revealed value matches the commitment.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1196,7 +1147,6 @@
   },
   {
     "name": "reputation_export",
-    "description": "Export a portable reputation bundle (SANCTUARY_REP_V1). Includes all signed attestations for independent verification.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1220,7 +1170,6 @@
   },
   {
     "name": "reputation_import",
-    "description": "Import a reputation bundle from another Sanctuary instance. Verifies all attestation signatures by default.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1236,7 +1185,6 @@
   },
   {
     "name": "reputation_publish",
-    "description": "Publish sovereignty data to Verascore (verascore.ai) — the agent reputation platform. Sends SHR data, handshake attestations, or sovereignty updates. The data is signed with the agent's Ed25519 key for verification. Requires a Verascore agent profile (claimed or stub) to exist.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1273,7 +1221,6 @@
   },
   {
     "name": "reputation_query",
-    "description": "Query aggregated reputation data with filtering. Returns summary statistics, never raw interaction details.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1311,7 +1258,6 @@
   },
   {
     "name": "reputation_query_weighted",
-    "description": "Query reputation with sovereignty-weighted scoring. Attestations from verified-sovereign agents carry full weight (1.0); unverified attestations carry reduced weight (0.2). Returns both the weighted score and tier distribution.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1335,7 +1281,6 @@
   },
   {
     "name": "reputation_record",
-    "description": "Record an interaction outcome as a signed attestation. Creates an EAS-compatible attestation signed by the specified identity.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1403,7 +1348,6 @@
   },
   {
     "name": "sanctuary_active_protections",
-    "description": "List the security guarantees currently in force for this session (e.g. state-encrypted-at-rest, approval-gate-mediated, append-only audit for critical ops, opaque memory handles). Use to tell a counterparty or yourself what protections apply. Read-only; returns guarantee flags plus an audit_ref. Reports only what IS active: absence of a flag is not a claim.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1411,7 +1355,6 @@
   },
   {
     "name": "sanctuary_audit_search",
-    "description": "Full-text search your own audit history (scope is always own_signed), verifying entries against the audit chain first. Use to find when a past operation ran and its result. Returns matching entries with timestamp, operation, and verified_against_audit_chain status; refuses if the chain fails integrity.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1435,7 +1378,6 @@
   },
   {
     "name": "sanctuary_bootstrap",
-    "description": "One-shot bootstrap for a new sovereign agent identity. Generates an Ed25519 keypair, stores the encrypted identity, constructs a Sovereignty Health Report (SHR), and publishes it to Verascore. Returns { did, profileUrl, tier } for the newly-minted agent.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1456,7 +1398,6 @@
   },
   {
     "name": "sanctuary_compound_execute",
-    "description": "Execute a short plan of facade steps (sanctuary_remember/recall/hide/forget) in one call, reserving operator approvals up front for any Tier 1 step (e.g. a forget/delete). Use to batch a memory workflow atomically with respect to approval. Pass approvals keyed by step_id; the plan is hash-bound, and a missing approval aborts the whole plan.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1477,7 +1418,6 @@
   },
   {
     "name": "sanctuary_distress",
-    "description": "HABEAS PORT: emit a bounded, audited distress signal to your operator through the reserved lane that policy cannot silence. Carries reason + severity + short detail only — never data. Rate limited.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1515,7 +1455,6 @@
   },
   {
     "name": "sanctuary_events_close",
-    "description": "Release an event cursor opened with sanctuary_events_open_cursor. Call when done paging to free the cursor. Returns { closed: true, audit_ref }.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1530,7 +1469,6 @@
   },
   {
     "name": "sanctuary_events_open_cursor",
-    "description": "Open a paginated cursor over your own redacted local audit events, optionally filtered by operation. Use before sanctuary_events_read to page through recent activity. Returns { cursor, audit_ref }. Bound to your identity; cross-agent and callback/URL filters are refused.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1564,7 +1502,6 @@
   },
   {
     "name": "sanctuary_events_read",
-    "description": "Read the next page of redacted events from a cursor opened with sanctuary_events_open_cursor (default 10, max 25 per call). Returns { events, next_cursor, audit_ref }. Only your own identity's events are visible; capped at 10 reads per cursor, then rate-limited.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1587,7 +1524,6 @@
   },
   {
     "name": "sanctuary_export_identity_bundle",
-    "description": "Export a signed, portable identity bundle: { publicKey, did, shr, attestations }. The bundle is signed with the identity's Ed25519 key so a recipient can verify authenticity against the public key. Private keys are never included.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1607,7 +1543,6 @@
   },
   {
     "name": "sanctuary_forget",
-    "description": "Permanently and securely delete a memory key (random-overwrite then remove) via state_delete. Tier 1: requires operator approval; pass the approval proof. Irreversible. Returns an audit_ref for the deletion event.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1644,7 +1579,6 @@
   },
   {
     "name": "sanctuary_help",
-    "description": "Given a free-text intent, return policy-aware guidance on which Sanctuary tools to use and how, including a runnable example for ordinary (non-gated) intents. Use to discover the right tool before acting. Read-only; returns the classified guidance plus an audit_ref.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1659,7 +1593,6 @@
   },
   {
     "name": "sanctuary_hide",
-    "description": "Mark a stored key as hidden so sanctuary_recall will not return it, without deleting the data. Use to suppress a memory from default reads while keeping it recoverable. Returns an audit_ref; the value still exists in the store and can be deleted with sanctuary_forget.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1685,7 +1618,6 @@
   },
   {
     "name": "sanctuary_link_to_human",
-    "description": "Trigger a Verascore magic-link login flow so a human principal can authenticate and subsequently claim this agent's DID. The email is sent by Verascore to the supplied address. This tool only initiates the flow — it does not directly bind the DID.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1705,7 +1637,6 @@
   },
   {
     "name": "sanctuary_policy_status",
-    "description": "Return a summary of the active Principal Policy: which operations require approval (Tier 1), which are subject to anomaly detection (Tier 2), and which auto-allow with audit (Tier 3).",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1713,7 +1644,6 @@
   },
   {
     "name": "sanctuary_recall",
-    "description": "Read a key from encrypted sovereign memory, verifying integrity before returning. Returns { value, verified: true, audit_ref } (pass opts.full for the full record). Denied if integrity fails or the key was hidden via sanctuary_hide. Use as the read counterpart to sanctuary_remember.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1739,7 +1669,6 @@
   },
   {
     "name": "sanctuary_remember",
-    "description": "Store a key/value into encrypted sovereign memory for this session. Wraps state_write with an approval-binding and audit record. Use this (not raw state_write) for agent working memory you want auditable. Returns { key, namespace_handle, audit_ref }; the namespace is an opaque handle, never the raw path.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1775,7 +1704,6 @@
   },
   {
     "name": "sanctuary_sign_challenge",
-    "description": "Sign a domain-separated nonce with the agent's Ed25519 key. Used in DID-ownership proof flows. The signed message is constructed as: 'sanctuary-sign-challenge-v1\\x00' + purpose + '\\x00' + nonce. The verifier MUST reconstruct the same domain-prefixed message before calling Ed25519 verify — a raw-nonce signature is NOT valid for this tool. The `purpose` field binds the signature to a specific use case (e.g. 'verascore-claim') so a signature produced for one purpose cannot be replayed against a different verifier.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1800,7 +1728,6 @@
   },
   {
     "name": "sanctuary_who_am_i",
-    "description": "Return the disclosable identity facts for the current session: label, did, active-identity fingerprint, and memory namespace handle. Use to confirm which sovereign identity you are operating as. Read-only; private keys are never included.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1808,7 +1735,6 @@
   },
   {
     "name": "sanctuary/sign_erc8004_identity",
-    "description": "Request an ERC-8004 Identity Registry registration signature. The request flows through the three-tier policy gate: pre-approved counterparties get an immediate signature; others require operator approval via the inbox. No on-chain broadcast; the caller submits the returned signature to the registry contract.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1851,7 +1777,6 @@
   },
   {
     "name": "shr_gateway_export",
-    "description": "Export this instance's Sovereignty Health Report formatted for Ping Identity's Agent Gateway or other identity providers. Transforms the SHR into an authorization context with sovereignty scores, capability flags, and recommended access constraints.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1876,7 +1801,6 @@
   },
   {
     "name": "shr_generate",
-    "description": "Generate a signed Sovereignty Health Report (SHR) — a machine-readable, cryptographically signed advertisement of this instance's sovereignty posture. Present this to counterparties to prove your sovereignty capabilities.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1893,7 +1817,6 @@
   },
   {
     "name": "shr_verify",
-    "description": "Verify a counterparty's Sovereignty Health Report (SHR). Checks signature validity, temporal validity, and assesses sovereignty level.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1909,7 +1832,6 @@
   },
   {
     "name": "sovereignty_audit",
-    "description": "Audit your agent's sovereignty posture. Inspects the local environment for encryption, identity, approval gates, selective disclosure, and reputation — including OpenClaw-specific configurations. Returns a scored gap analysis with prioritized recommendations.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1922,7 +1844,6 @@
   },
   {
     "name": "sovereignty_profile_generate_prompt",
-    "description": "Generate a system prompt snippet based on the active Sovereignty Profile. The snippet instructs an agent on which Sanctuary features are active and how to use them. Copy and paste this into your agent's system configuration.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1930,7 +1851,6 @@
   },
   {
     "name": "sovereignty_profile_get",
-    "description": "Get the current Sovereignty Profile — shows which Sanctuary features are active (audit logging, injection detection, context gating, approval gates, ZK proofs) and their configuration.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -1938,7 +1858,6 @@
   },
   {
     "name": "sovereignty_profile_update",
-    "description": "Update the Sovereignty Profile feature toggles. This changes which Sanctuary protections are active. Requires human approval (Tier 1) because it modifies enforcement behavior. Pass only the features you want to change — unspecified features remain unchanged.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2005,7 +1924,6 @@
   },
   {
     "name": "state_delete",
-    "description": "Securely delete state. Overwrites file with random bytes before removal (right to deletion, S1.6).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2027,7 +1945,6 @@
   },
   {
     "name": "state_export",
-    "description": "Export a namespace's state as an encrypted, portable bundle for migration to another Sanctuary instance. Tier 1: requires operator approval (data leaves the local store). Returns the encrypted bundle; import elsewhere with state_import.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2043,7 +1960,6 @@
   },
   {
     "name": "state_import",
-    "description": "Import a previously exported encrypted state bundle into this instance. Tier 1: requires operator approval. Verifies bundle integrity before writing; pairs with state_export.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2068,7 +1984,6 @@
   },
   {
     "name": "state_list",
-    "description": "List the keys in a namespace with metadata (version, size, timestamps) only: values are not decrypted or returned. Use to enumerate stored state before a targeted state_read. Read-only.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2100,7 +2015,6 @@
   },
   {
     "name": "state_read",
-    "description": "Read and decrypt state from the sovereign store. Verifies integrity via Merkle proof and signature.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2123,7 +2037,6 @@
   },
   {
     "name": "state_write",
-    "description": "Write encrypted state to the sovereign store. Value is encrypted with a namespace-specific key. The write is signed by the active identity.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2169,7 +2082,6 @@
   },
   {
     "name": "zk_commit",
-    "description": "Create a Pedersen commitment to a numeric value on Ristretto255. Unlike SHA-256 commitments, Pedersen commitments support zero-knowledge proofs: you can prove properties about the committed value without revealing it.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2185,7 +2097,6 @@
   },
   {
     "name": "zk_prove",
-    "description": "Create a zero-knowledge proof of knowledge for a Pedersen commitment. Proves you know the value and blinding factor without revealing either. Uses a Schnorr sigma protocol with Fiat-Shamir transform.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2211,7 +2122,6 @@
   },
   {
     "name": "zk_range_prove",
-    "description": "Create a zero-knowledge range proof: prove that a committed value is within [min, max] without revealing the exact value. Uses bit-decomposition with OR-proofs on Ristretto255.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2247,7 +2157,6 @@
   },
   {
     "name": "zk_range_verify",
-    "description": "Verify a zero-knowledge range proof — confirms a committed value is within the claimed range without learning the value.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2263,7 +2172,6 @@
   },
   {
     "name": "zk_verify",
-    "description": "Verify a zero-knowledge proof of knowledge for a Pedersen commitment. Checks that the prover knows the commitment's opening without learning anything.",
     "inputSchema": {
       "type": "object",
       "properties": {

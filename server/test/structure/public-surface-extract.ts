@@ -66,10 +66,11 @@ const TSCONFIG = join(SERVER_DIR, "tsconfig.json");
 
 // ── Artifact types ────────────────────────────────────────────────────────
 
-/** The frozen public contract per MCP tool: name + agent-facing prose + schema. */
+/** The frozen public contract per MCP tool: name + input schema. Top-level
+ *  description PROSE is deliberately NOT frozen here (it is iterated agent-facing
+ *  copy); reorg-surface-snapshots.test.ts owns the description-presence guard. */
 export interface ToolSurfaceEntry {
   name: string;
-  description: string;
   inputSchema: Record<string, unknown>;
 }
 
@@ -194,7 +195,7 @@ function snapshotFingerprint(): EnvironmentFingerprint {
 /**
  * The FULL agent-facing MCP tool catalog: the main createSanctuaryServer
  * tools + the standalone broker MCP server's broker/* tools, serialized as
- * {name, description, inputSchema} and SORTED BY NAME. Deterministic
+ * {name, inputSchema} and SORTED BY NAME. Deterministic
  * (in-memory fortress, fixed passphrase, no network).
  */
 export async function extractToolSurface(): Promise<ToolSurfaceEntry[]> {
@@ -225,7 +226,6 @@ export async function extractToolSurface(): Promise<ToolSurfaceEntry[]> {
   return [...mainTools, ...brokerTools]
     .map((t) => ({
       name: t.name,
-      description: typeof t.description === "string" ? t.description : "",
       inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));

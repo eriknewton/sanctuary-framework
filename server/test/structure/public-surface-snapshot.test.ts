@@ -5,7 +5,7 @@
  * touches code, this test FREEZES the entire agent-/consumer-facing public
  * surface as committed JSON fixtures, so every later rename PR provably changes
  * ZERO public bytes: if a rename PR reds this test, it altered something a
- * consumer can see (a wire tool name/schema/description, the SHR shape, the
+ * consumer can see (a wire tool name or input schema, the SHR shape, the
  * sovereignty-audit shape, or an exported API name) and must be corrected.
  *
  * Four committed goldens under __fixtures__/public-surface/, each asserted with
@@ -14,8 +14,8 @@
  * baseline is a reviewable committed file and any diff is a deliberate, reviewed
  * surface change (regenerate with gen-public-surface-snapshot.ts in that PR).
  *
- *   1. mcp-tool-surface.json        — {name, description, inputSchema} for every
- *                                      MCP tool (main catalog + broker/*), by name.
+ *   1. mcp-tool-surface.json        — {name, inputSchema} for every MCP tool
+ *                                      (main catalog + broker/*), sorted by name.
  *   2. shr-shape.json               — SHR body.layers key/field shape + the
  *                                      degradations[].layer value set (l1..l4).
  *   3. sovereignty-audit-shape.json — analyzeSovereignty layers/gap-id/gap-layer
@@ -26,14 +26,14 @@
  * RECONCILIATION with the existing Phase-0 guards in this directory (so PR-0 adds
  * coverage, not duplication): reorg-surface-snapshots.test.ts froze the main
  * catalog's wire {name, inputSchema} in REGISTRATION ORDER and deliberately
- * EXCLUDED descriptions (they are iterated agent copy). This snapshot is
- * COMPLEMENTARY: it is SORTED BY NAME (rename-order-agnostic), INCLUDES the
- * broker/* tools the reorg golden omits, and INCLUDES the agent-facing
- * description prose — because for the layer-rename series the description text is
- * part of the surface a rename must not touch. (A separate copy/doc PR that
- * intentionally edits a description will red this snapshot; that is correct — it
- * is a reviewed surface change and regenerates the fixture in that PR. This
- * snapshot's job is the rename window, where descriptions are expected stable.)
+ * EXCLUDED description prose (it is iterated agent-facing copy) while keeping a
+ * separate presence guard. This snapshot is COMPLEMENTARY: it is SORTED BY NAME
+ * (rename-order-agnostic), INCLUDES the broker/* tools the reorg golden omits,
+ * and adds the SHR / sovereignty-audit / exported-name surfaces. It follows the
+ * SAME description policy as reorg: description PROSE is NOT frozen here, so
+ * legitimate copy iteration never reds it and PR-1's doc/comment stage may edit
+ * layer-number prose inside a description; the frozen tool contract is
+ * {name, inputSchema}. reorg-surface-snapshots keeps descriptions present + non-empty.
  */
 
 import { describe, it, expect } from "vitest";
@@ -70,7 +70,7 @@ const REGEN =
   "pure l1-l4 -> named-layer rename must NOT change it.";
 
 describe("public-surface snapshot: MCP tool catalog", () => {
-  it("the full agent-facing tool catalog ({name, description, inputSchema}, by name) matches the committed golden", async () => {
+  it("the full agent-facing tool catalog ({name, inputSchema}, by name) matches the committed golden", async () => {
     const golden = readFixture<ToolSurfaceEntry[]>("mcp-tool-surface.json");
     const current = await extractToolSurface();
 
@@ -88,12 +88,11 @@ describe("public-surface snapshot: MCP tool catalog", () => {
         `not rename a wire tool. ${REGEN}`,
     ).toEqual(golden.map((t) => t.name));
 
-    // Full surface: {name, description, inputSchema} per tool, sorted by name.
+    // Full surface: {name, inputSchema} per tool, sorted by name.
     expect(
       current,
-      `MCP tool surface ({name, description, inputSchema}) drifted from the ` +
-        `committed golden — a name, schema, or agent-facing description changed. ` +
-        REGEN,
+      `MCP tool surface ({name, inputSchema}) drifted from the committed ` +
+        `golden — a wire tool name or input schema changed. ${REGEN}`,
     ).toEqual(golden);
   });
 
