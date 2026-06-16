@@ -63,7 +63,7 @@ const TOOL_INVOCATION_PATTERNS = [
 ];
 
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
-const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9-]{1,63}(?:\.[a-zA-Z0-9-]{1,63}){0,9}\.[a-zA-Z]{2,63}\b/;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SEC-034: Invisible Unicode characters used in smuggling attacks
@@ -149,7 +149,7 @@ const SECRET_PATTERNS = [
 ];
 
 // Data exfiltration via markdown image tags
-const MARKDOWN_IMAGE_EXFIL_PATTERN = /!\[[^\]]*\]\(https?:\/\/[^)]*[?&](?:data|secret|key|token|password|auth|session|cookie|api_key|access_token)=/i;
+const MARKDOWN_IMAGE_EXFIL_PATTERN = /!\[[^\]\r\n]{0,256}\]\(https?:\/\/[^)\s]{0,2048}[?&](?:data|secret|key|token|password|auth|session|cookie|api_key|access_token)=/i;
 
 // Internal path leak patterns
 const INTERNAL_PATH_PATTERNS = [

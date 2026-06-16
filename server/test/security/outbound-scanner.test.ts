@@ -158,6 +158,33 @@ describe("InjectionDetector — Outbound Scanner (SEC-035)", () => {
       );
       expect(signal).toBeDefined();
     });
+
+    it("does not flag markdown images without sensitive query parameters", () => {
+      const content = "![diagram](https://cdn.example.com/asset.png?size=large&theme=light)";
+      const result = detector.scanOutbound(content);
+
+      expect(
+        result.signals.some(
+          (s) => s.type === "data_exfiltration" && s.pattern === "markdown_image_exfil",
+        ),
+      ).toBe(false);
+    });
+
+    it("does not backtrack on unterminated markdown image URLs", { retry: 3 }, () => {
+      const content = `![tracking](https://attacker.example/${"a".repeat(10000)}`;
+
+      const start = performance.now();
+      const result = detector.scanOutbound(content);
+      const elapsed = performance.now() - start;
+
+      expect(elapsed).toBeLessThan(50);
+      expect(result).toBeDefined();
+      expect(
+        result.signals.some(
+          (s) => s.type === "data_exfiltration" && s.pattern === "markdown_image_exfil",
+        ),
+      ).toBe(false);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────
