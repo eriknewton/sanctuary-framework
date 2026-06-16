@@ -120,6 +120,12 @@ export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boo
   return false;
 }
 
+function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  if (!deps.authToken) return true;
+  const token = extractToken(req, url);
+  return token !== null && constantTimeEquals(token, deps.authToken);
+}
+
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -263,6 +269,10 @@ export async function handleRequest(
   // ── Approval decisions ──────────────────────────────────────────────
   const approvalMatch = /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(path);
   if (method === "POST" && approvalMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const id = decodeURIComponent(approvalMatch[1]!);
     const action = approvalMatch[2] as "allow" | "deny";
     if (!deps.approvals) {
