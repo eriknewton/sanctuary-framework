@@ -22,6 +22,9 @@ import type { TemplateName } from "../templates/registry.js";
 import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import { constantTimeEquals } from "../http/auth.js";
+
+export { constantTimeEquals };
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -94,18 +97,6 @@ export interface StreamEvent {
 }
 
 /**
- * Constant-time token comparison to avoid trivial timing attacks.
- */
-export function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-/**
  * Pull the bearer token from Authorization header only. Long-lived URL
  * query tokens are deliberately ignored; SSE uses short-lived sessions.
  */
@@ -127,6 +118,12 @@ export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boo
   if (sessionId && deps.sessions?.validate(sessionId)) return true;
 
   return false;
+}
+
+function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  if (!deps.authToken) return true;
+  const token = extractToken(req, url);
+  return token !== null && constantTimeEquals(token, deps.authToken);
 }
 
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
@@ -272,6 +269,10 @@ export async function handleRequest(
   // ── Approval decisions ──────────────────────────────────────────────
   const approvalMatch = /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(path);
   if (method === "POST" && approvalMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const id = decodeURIComponent(approvalMatch[1]!);
     const action = approvalMatch[2] as "allow" | "deny";
     if (!deps.approvals) {

@@ -149,13 +149,14 @@ describe("Dashboard HTTP API", () => {
     expect(allowed).toEqual(["abc"]);
   });
 
-  it("accepts approval mutation auth via a valid short-lived session", async () => {
+  it("rejects approval mutations with a valid short-lived session but still accepts SSE", async () => {
     const allowed: string[] = [];
+    const denied: string[] = [];
     handle = await startForTest({
       authToken: "secret-xyz",
       approvals: {
         allow: async (id: string) => { allowed.push(id); return true; },
-        deny: async () => true,
+        deny: async (id: string) => { denied.push(id); return true; },
       },
     });
     const sessionRes = await fetch(`${handle.url}/auth/session`, {
@@ -164,12 +165,24 @@ describe("Dashboard HTTP API", () => {
     });
     expect(sessionRes.status).toBe(200);
     const session = await sessionRes.json() as { session_id: string };
-    const res = await fetch(
+    const allowRes = await fetch(
       `${handle.url}/api/approvals/abc/allow?session=${encodeURIComponent(session.session_id)}`,
       { method: "POST" },
     );
-    expect(res.status).toBe(200);
-    expect(allowed).toEqual(["abc"]);
+    const denyRes = await fetch(
+      `${handle.url}/api/approvals/xyz/deny?session=${encodeURIComponent(session.session_id)}`,
+      { method: "POST" },
+    );
+    expect(allowRes.status).toBe(401);
+    expect(denyRes.status).toBe(401);
+    expect(allowed).toEqual([]);
+    expect(denied).toEqual([]);
+
+    const streamRes = await fetch(
+      `${handle.url}/api/stream?session=${encodeURIComponent(session.session_id)}`,
+    );
+    expect(streamRes.status).toBe(200);
+    await streamRes.body?.cancel();
   });
 
   it("emits an initial 'snapshot' event on SSE connect", async () => {

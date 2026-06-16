@@ -50,6 +50,7 @@ import {
   getProtectionSnapshot,
   type AggregatorSources,
 } from "../dashboard/aggregator.js";
+import { constantTimeEquals } from "../http/auth.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
@@ -1553,7 +1554,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -1597,7 +1602,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -2233,7 +2242,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     const parts = authHeader.split(" ");
-    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+    if (
+      parts.length !== 2 ||
+      parts[0] !== "Bearer" ||
+      !constantTimeEquals(parts[1]!, this.authToken)
+    ) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid bearer token" }));
       return;
