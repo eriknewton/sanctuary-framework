@@ -66,3 +66,7 @@ castle-wall-vmm/Package.resolved
 # dev-scratch PR-prep notes do not belong in the repo root (professionalization 2026-06-14)
 /*_HANDOFF.md
 /*_PR_BODY.md
+
+# macOS/iCloud duplication artifacts, e.g. "settings.local 2.json" (gh-hygiene 2026-06-16)
+* [0-9].json
+* [0-9].md
