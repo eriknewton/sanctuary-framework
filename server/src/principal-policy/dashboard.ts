@@ -51,6 +51,7 @@ import {
   type AggregatorSources,
 } from "../dashboard/aggregator.js";
 import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
@@ -2409,12 +2410,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify(snapshot));
       })
       .catch((err) => {
+        logCaughtError(
+          err,
+          { route: "/api/snapshot", operation: "get_snapshot" },
+          { status: 500 },
+        );
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               error: "snapshot_failed",
-              message: (err as Error).message,
             })
           );
         }
@@ -2824,9 +2829,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ upstream_servers: updated.upstream_servers ?? [] }));
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Invalid request";
+        // The surrounding try covers JSON.parse(body), profileStore.update(),
+        // and broadcastSSE, so `err` can be a raw library/internal error
+        // (SyntaxError carrying request fragments, a profile-store failure
+        // carrying filesystem detail). Return a fixed safe message and keep
+        // the real, redacted detail server-side for operators.
+        logCaughtError(
+          err,
+          { route: "/api/proxy/servers", operation: "update_proxy_servers" },
+          { status: 400 },
+        );
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: message }));
+        res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
   }
