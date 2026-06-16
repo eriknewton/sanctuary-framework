@@ -183,20 +183,20 @@ export interface AggregatorSources {
  * gateway-adapter DEGRADATION_IMPACT table so the dashboard and the SHR
  * gateway export agree on the number.
  */
-const L4_DEGRADATION_IMPACT: Record<"critical" | "warning" | "info", number> = {
+const REPUTATION_DEGRADATION_IMPACT: Record<"critical" | "warning" | "info", number> = {
   critical: 40,
   warning: 25,
   info: 10,
 };
 
-function computeL4LayerScore(
+function computeReputationLayerScore(
   degradations: SHRDegradation[],
   status: LayerState
 ): number {
   if (status === "compromised") return 0;
   let score = 100;
   for (const deg of degradations) {
-    score -= L4_DEGRADATION_IMPACT[deg.severity] ?? 10;
+    score -= REPUTATION_DEGRADATION_IMPACT[deg.severity] ?? 10;
   }
   score = Math.max(0, score);
   if (degradations.length === 0 && score > 50) {
@@ -277,7 +277,7 @@ function buildAgent(
   };
 }
 
-function buildL1(
+function buildCognitive(
   sources: AggregatorSources,
   audit: AuditEntry[]
 ): L1Status {
@@ -295,7 +295,7 @@ function buildL1(
   };
 }
 
-function buildL2(sources: AggregatorSources): L2Status {
+function buildOperational(sources: AggregatorSources): L2Status {
   const teeAvailable = sources.teeAvailable ?? false;
   const state: LayerState = teeAvailable ? "full" : "degraded";
   return {
@@ -311,7 +311,7 @@ function buildL2(sources: AggregatorSources): L2Status {
   };
 }
 
-function buildL3(
+function buildDisclosure(
   sources: AggregatorSources,
   audit: AuditEntry[]
 ): L3Status {
@@ -337,7 +337,7 @@ function buildL3(
   };
 }
 
-function buildL4(sources: AggregatorSources): L4Status {
+function buildReputation(sources: AggregatorSources): L4Status {
   const rep = sources.reputation;
   const hasDid = !!sources.identityManager?.getDefault()?.did;
 
@@ -345,7 +345,7 @@ function buildL4(sources: AggregatorSources): L4Status {
   // reputation store. These do not replace the Verascore score; they
   // complement it so the dashboard can honestly describe the underlying
   // attestation state even when a Verascore score is attached.
-  const evidenceBlock = buildL4EvidenceBlock(sources);
+  const evidenceBlock = buildReputationEvidenceBlock(sources);
 
   const base: L4Status = rep?.score != null
     ? {
@@ -398,21 +398,21 @@ function buildL4(sources: AggregatorSources): L4Status {
   };
 }
 
-interface L4EvidenceBlock {
+interface ReputationEvidenceBlock {
   evidence: NonNullable<L4Status["evidence"]>;
   layer_score: number;
   active_degradations: L4ActiveDegradation[];
 }
 
-function buildL4EvidenceBlock(
+function buildReputationEvidenceBlock(
   sources: AggregatorSources
-): L4EvidenceBlock | null {
+): ReputationEvidenceBlock | null {
   const ev = sources.l4Evidence;
   if (!ev) return null;
 
   const degradations = deriveL4Degradations(ev, sources.l4Now ?? new Date());
   const status: LayerState = degradations.length > 0 ? "degraded" : "full";
-  const layer_score = computeL4LayerScore(degradations, status);
+  const layer_score = computeReputationLayerScore(degradations, status);
 
   return {
     evidence: {
@@ -546,10 +546,10 @@ export async function getProtectionSnapshot(
   }
 
   const agent = buildAgent(sources);
-  const l1 = buildL1(sources, audit);
-  const l2 = buildL2(sources);
-  const l3 = buildL3(sources, audit);
-  const l4 = buildL4(sources);
+  const l1 = buildCognitive(sources, audit);
+  const l2 = buildOperational(sources);
+  const l3 = buildDisclosure(sources, audit);
+  const l4 = buildReputation(sources);
 
   const activity = (sources.activity ?? []).slice(0, MAX_ACTIVITY);
   const pending_approvals = sources.pendingApprovals ?? [];

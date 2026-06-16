@@ -90,7 +90,7 @@ export function createSanctuaryTools(
    * Build L4 evidence for an existing identity. Returns undefined when
    * no reputation store is configured (generator then leaves L4 alone).
    */
-  async function l4EvidenceForIdentity(
+  async function reputationEvidenceForIdentity(
     identity: { identity_id: string; did: string }
   ): Promise<L4Evidence | undefined> {
     if (!reputationStore) return undefined;
@@ -102,7 +102,7 @@ export function createSanctuaryTools(
    * The identity was just created so `NO_REPUTATION_HISTORY` and
    * `NO_VERASCORE_LINK` will always fire — that's the truth of the state.
    */
-  function emptyL4Evidence(): L4Evidence {
+  function emptyReputationEvidence(): L4Evidence {
     return {
       attestation_count: 0,
       tier_distribution: {
@@ -170,7 +170,7 @@ export function createSanctuaryTools(
           config,
           identityManager,
           masterKey,
-          l4Evidence: emptyL4Evidence(),
+          l4Evidence: emptyReputationEvidence(),
         });
         if (typeof shr === "string") {
           return toolResult({
@@ -367,7 +367,7 @@ export function createSanctuaryTools(
           });
         }
 
-        const l4Evidence = await l4EvidenceForIdentity(identity);
+        const l4Evidence = await reputationEvidenceForIdentity(identity);
         const shr = generateSHR(identity.identity_id, {
           config,
           identityManager,

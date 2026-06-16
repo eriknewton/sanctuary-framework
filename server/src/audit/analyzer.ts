@@ -23,33 +23,33 @@ import type {
 // ── Scoring Constants ───────────────────────────────────────────────────
 
 // L1: 35 points max
-const L1_ENCRYPTION_AT_REST = 10;
-const L1_IDENTITY_CRYPTOGRAPHIC = 10;
-const L1_INTEGRITY_VERIFICATION = 8;
-const L1_STATE_PORTABLE = 7;
+const COGNITIVE_ENCRYPTION_AT_REST = 10;
+const COGNITIVE_IDENTITY_CRYPTOGRAPHIC = 10;
+const COGNITIVE_INTEGRITY_VERIFICATION = 8;
+const COGNITIVE_STATE_PORTABLE = 7;
 
 // L2: 30 points max (increased from 25 to accommodate hardening)
-const L2_THREE_TIER_GATE = 10;
-const L2_BINARY_GATE = 3;
-const L2_ANOMALY_DETECTION = 5;
-const L2_ENCRYPTED_AUDIT = 4;
-const L2_TOOL_SANDBOXING = 2;
-const L2_CONTEXT_GATING = 4;
-const L2_PROCESS_HARDENING = 5;
+const OPERATIONAL_THREE_TIER_GATE = 10;
+const OPERATIONAL_BINARY_GATE = 3;
+const OPERATIONAL_ANOMALY_DETECTION = 5;
+const OPERATIONAL_ENCRYPTED_AUDIT = 4;
+const OPERATIONAL_TOOL_SANDBOXING = 2;
+const OPERATIONAL_CONTEXT_GATING = 4;
+const OPERATIONAL_PROCESS_HARDENING = 5;
 
 // L3: 20 points max
 // Note: Schnorr + range proofs ARE genuine zero-knowledge proofs.
 // Non-interactive Fiat-Shamir is superior to interactive protocols for MCP servers
 // (no round-trip latency, offline-verifiable, replay-resistant via domain separation).
-const L3_COMMITMENT_SCHEME = 8;
-const L3_ZK_PROOFS = 7;
-const L3_DISCLOSURE_POLICIES = 5;
+const DISCLOSURE_COMMITMENT_SCHEME = 8;
+const DISCLOSURE_ZK_PROOFS = 7;
+const DISCLOSURE_DISCLOSURE_POLICIES = 5;
 
 // L4: 20 points max
-const L4_PORTABLE_REPUTATION = 6;
-const L4_SIGNED_ATTESTATIONS = 6;
-const L4_SYBIL_DETECTION = 4;
-const L4_SOVEREIGNTY_GATED = 4;
+const REPUTATION_PORTABLE_REPUTATION = 6;
+const REPUTATION_SIGNED_ATTESTATIONS = 6;
+const REPUTATION_SYBIL_DETECTION = 4;
+const REPUTATION_SOVEREIGNTY_GATED = 4;
 
 const AUDIT_INTEGRITY_FINDING_PENALTY = 20;
 const AUDIT_INTEGRITY_FINDING_PENALTY_CAP = 70;
@@ -133,17 +133,17 @@ export function analyzeSovereignty(
   env: EnvironmentFingerprint,
   config: SanctuaryConfig
 ): SovereigntyAuditResult {
-  const l1 = assessL1(env, config);
-  const l2 = assessL2(env, config);
-  const l3 = assessL3(env, config);
-  const l4 = assessL4(env, config);
+  const cognitive = assessCognitive(env, config);
+  const operational = assessOperational(env, config);
+  const disclosure = assessDisclosure(env, config);
+  const reputation = assessReputation(env, config);
 
-  const l1Score = scoreL1(l1);
-  const l2Score = scoreL2(l2);
-  const l3Score = scoreL3(l3);
-  const l4Score = scoreL4(l4);
+  const cognitiveScore = scoreCognitive(cognitive);
+  const operationalScore = scoreOperational(operational);
+  const disclosureScore = scoreDisclosure(disclosure);
+  const reputationScore = scoreReputation(reputation);
 
-  const baseScore = l1Score + l2Score + l3Score + l4Score;
+  const baseScore = cognitiveScore + operationalScore + disclosureScore + reputationScore;
   const auditHealthPenalty = scoreAuditHealthPenalty(env);
   const overallScore = Math.max(0, baseScore - auditHealthPenalty);
 
@@ -155,20 +155,20 @@ export function analyzeSovereignty(
         ? "minimal"
         : "none";
 
-  const gaps = generateGaps(env, l1, l2, l3, l4);
+  const gaps = generateGaps(env, cognitive, operational, disclosure, reputation);
   gaps.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
 
-  const recommendations = generateRecommendations(env, l1, l2, l3, l4);
+  const recommendations = generateRecommendations(env, cognitive, operational, disclosure, reputation);
 
   return {
     version: "1.0",
     audited_at: new Date().toISOString(),
     environment: env,
     layers: {
-      l1_cognitive: l1,
-      l2_operational: l2,
-      l3_selective_disclosure: l3,
-      l4_reputation: l4,
+      l1_cognitive: cognitive,
+      l2_operational: operational,
+      l3_selective_disclosure: disclosure,
+      l4_reputation: reputation,
     },
     overall_score: overallScore,
     sovereignty_level: sovereigntyLevel,
@@ -179,7 +179,7 @@ export function analyzeSovereignty(
 
 // ── Layer Assessment ────────────────────────────────────────────────────
 
-function assessL1(
+function assessCognitive(
   env: EnvironmentFingerprint,
   config: SanctuaryConfig
 ): L1AuditResult {
@@ -226,7 +226,7 @@ function assessL1(
   };
 }
 
-function assessL2(
+function assessOperational(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
 ): L2AuditResult {
@@ -294,7 +294,7 @@ function assessL2(
   };
 }
 
-function assessL3(
+function assessDisclosure(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
 ): L3AuditResult {
@@ -331,7 +331,7 @@ function assessL3(
   };
 }
 
-function assessL4(
+function assessReputation(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
 ): L4AuditResult {
@@ -370,47 +370,47 @@ function assessL4(
 
 // ── Scoring ─────────────────────────────────────────────────────────────
 
-function scoreL1(l1: L1AuditResult): number {
+function scoreCognitive(cognitive: L1AuditResult): number {
   let score = 0;
-  if (l1.encryption_at_rest) score += L1_ENCRYPTION_AT_REST;
-  if (l1.identity_cryptographic) score += L1_IDENTITY_CRYPTOGRAPHIC;
-  if (l1.integrity_verification) score += L1_INTEGRITY_VERIFICATION;
-  if (l1.state_portable) score += L1_STATE_PORTABLE;
+  if (cognitive.encryption_at_rest) score += COGNITIVE_ENCRYPTION_AT_REST;
+  if (cognitive.identity_cryptographic) score += COGNITIVE_IDENTITY_CRYPTOGRAPHIC;
+  if (cognitive.integrity_verification) score += COGNITIVE_INTEGRITY_VERIFICATION;
+  if (cognitive.state_portable) score += COGNITIVE_STATE_PORTABLE;
   return score;
 }
 
-function scoreL2(l2: L2AuditResult): number {
+function scoreOperational(operational: L2AuditResult): number {
   let score = 0;
-  if (l2.approval_gate === "three-tier") score += L2_THREE_TIER_GATE;
-  else if (l2.approval_gate === "binary") score += L2_BINARY_GATE;
-  if (l2.behavioral_anomaly_detection) score += L2_ANOMALY_DETECTION;
-  if (l2.audit_trail_encrypted) score += L2_ENCRYPTED_AUDIT;
-  if (l2.tool_sandboxing === "policy-enforced") score += L2_TOOL_SANDBOXING;
-  else if (l2.tool_sandboxing === "basic") score += 1;
-  if (l2.context_gating) score += L2_CONTEXT_GATING;
+  if (operational.approval_gate === "three-tier") score += OPERATIONAL_THREE_TIER_GATE;
+  else if (operational.approval_gate === "binary") score += OPERATIONAL_BINARY_GATE;
+  if (operational.behavioral_anomaly_detection) score += OPERATIONAL_ANOMALY_DETECTION;
+  if (operational.audit_trail_encrypted) score += OPERATIONAL_ENCRYPTED_AUDIT;
+  if (operational.tool_sandboxing === "policy-enforced") score += OPERATIONAL_TOOL_SANDBOXING;
+  else if (operational.tool_sandboxing === "basic") score += 1;
+  if (operational.context_gating) score += OPERATIONAL_CONTEXT_GATING;
   // Software-based process hardening without TEE
-  if (l2.process_isolation_hardening === "hardened") score += L2_PROCESS_HARDENING;
-  else if (l2.process_isolation_hardening === "basic") score += 2;
+  if (operational.process_isolation_hardening === "hardened") score += OPERATIONAL_PROCESS_HARDENING;
+  else if (operational.process_isolation_hardening === "basic") score += 2;
   return score;
 }
 
-function scoreL3(l3: L3AuditResult): number {
+function scoreDisclosure(disclosure: L3AuditResult): number {
   let score = 0;
   // Pedersen commitments + Schnorr/range proofs = genuine zero-knowledge proofs
   // Full L3 = 20 points (8 commitment + 7 proofs + 5 policies)
-  if (l3.commitment_scheme === "pedersen+sha256") score += L3_COMMITMENT_SCHEME;
-  else if (l3.commitment_scheme === "sha256-only") score += 4;
-  if (l3.zero_knowledge_proofs) score += L3_ZK_PROOFS;
-  if (l3.selective_disclosure_policy) score += L3_DISCLOSURE_POLICIES;
+  if (disclosure.commitment_scheme === "pedersen+sha256") score += DISCLOSURE_COMMITMENT_SCHEME;
+  else if (disclosure.commitment_scheme === "sha256-only") score += 4;
+  if (disclosure.zero_knowledge_proofs) score += DISCLOSURE_ZK_PROOFS;
+  if (disclosure.selective_disclosure_policy) score += DISCLOSURE_DISCLOSURE_POLICIES;
   return score;
 }
 
-function scoreL4(l4: L4AuditResult): number {
+function scoreReputation(reputation: L4AuditResult): number {
   let score = 0;
-  if (l4.reputation_portable) score += L4_PORTABLE_REPUTATION;
-  if (l4.reputation_signed) score += L4_SIGNED_ATTESTATIONS;
-  if (l4.reputation_sybil_detection) score += L4_SYBIL_DETECTION;
-  if (l4.sovereignty_gated_tiers) score += L4_SOVEREIGNTY_GATED;
+  if (reputation.reputation_portable) score += REPUTATION_PORTABLE_REPUTATION;
+  if (reputation.reputation_signed) score += REPUTATION_SIGNED_ATTESTATIONS;
+  if (reputation.reputation_sybil_detection) score += REPUTATION_SYBIL_DETECTION;
+  if (reputation.sovereignty_gated_tiers) score += REPUTATION_SOVEREIGNTY_GATED;
   return score;
 }
 
@@ -437,10 +437,10 @@ function scoreAuditHealthPenalty(env: EnvironmentFingerprint): number {
 
 function generateGaps(
   env: EnvironmentFingerprint,
-  l1: L1AuditResult,
-  l2: L2AuditResult,
-  l3: L3AuditResult,
-  l4: L4AuditResult
+  cognitive: L1AuditResult,
+  operational: L2AuditResult,
+  disclosure: L3AuditResult,
+  reputation: L4AuditResult
 ): SovereigntyGap[] {
   const gaps: SovereigntyGap[] = [];
   const oc = env.openclaw_config;
@@ -541,7 +541,7 @@ function generateGaps(
     });
   }
 
-  if (!l1.identity_cryptographic) {
+  if (!cognitive.identity_cryptographic) {
     gaps.push({
       id: "GAP-L1-003",
       layer: "L1",
@@ -561,7 +561,7 @@ function generateGaps(
   }
 
   // L2 gaps
-  if (l2.approval_gate === "binary" && !l2.behavioral_anomaly_detection) {
+  if (operational.approval_gate === "binary" && !operational.behavioral_anomaly_detection) {
     gaps.push({
       id: "GAP-L2-001",
       layer: "L2",
@@ -583,7 +583,7 @@ function generateGaps(
         "irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect.",
       incident_class: INCIDENT_META_SEV1,
     });
-  } else if (l2.approval_gate === "none") {
+  } else if (operational.approval_gate === "none") {
     gaps.push({
       id: "GAP-L2-001",
       layer: "L2",
@@ -599,7 +599,7 @@ function generateGaps(
     });
   }
 
-  if (l2.tool_sandboxing === "basic") {
+  if (operational.tool_sandboxing === "basic") {
     gaps.push({
       id: "GAP-L2-002",
       layer: "L2",
@@ -620,7 +620,7 @@ function generateGaps(
     });
   }
 
-  if (!l2.context_gating) {
+  if (!operational.context_gating) {
     gaps.push({
       id: "GAP-L2-003",
       layer: "L2",
@@ -645,7 +645,7 @@ function generateGaps(
     });
   }
 
-  if (!l2.audit_trail_exists) {
+  if (!operational.audit_trail_exists) {
     gaps.push({
       id: "GAP-L2-004",
       layer: "L2",
@@ -663,7 +663,7 @@ function generateGaps(
   }
 
   // L3 gaps
-  if (l3.commitment_scheme === "none") {
+  if (disclosure.commitment_scheme === "none") {
     gaps.push({
       id: "GAP-L3-001",
       layer: "L3",
@@ -688,7 +688,7 @@ function generateGaps(
   }
 
   // L4 gaps
-  if (!l4.reputation_portable) {
+  if (!reputation.reputation_portable) {
     gaps.push({
       id: "GAP-L4-001",
       layer: "L4",
@@ -715,10 +715,10 @@ function generateGaps(
 
 function generateRecommendations(
   env: EnvironmentFingerprint,
-  l1: L1AuditResult,
-  l2: L2AuditResult,
-  l3: L3AuditResult,
-  l4: L4AuditResult
+  cognitive: L1AuditResult,
+  operational: L2AuditResult,
+  disclosure: L3AuditResult,
+  reputation: L4AuditResult
 ): Recommendation[] {
   const recs: Recommendation[] = [];
 
@@ -734,7 +734,7 @@ function generateRecommendations(
     });
   }
 
-  if (!l1.identity_cryptographic) {
+  if (!cognitive.identity_cryptographic) {
     recs.push({
       priority: 1,
       action: "Create a cryptographic identity — your agent's foundation for all sovereignty operations",
@@ -744,7 +744,7 @@ function generateRecommendations(
     });
   }
 
-  if (!l1.encryption_at_rest || (env.openclaw_config && !env.openclaw_config.memory_encrypted)) {
+  if (!cognitive.encryption_at_rest || (env.openclaw_config && !env.openclaw_config.memory_encrypted)) {
     recs.push({
       priority: 2,
       action: "Migrate plaintext agent state to Sanctuary's encrypted store",
@@ -762,7 +762,7 @@ function generateRecommendations(
     impact: "high",
   });
 
-  if (l2.approval_gate !== "three-tier") {
+  if (operational.approval_gate !== "three-tier") {
     recs.push({
       priority: 4,
       action: "Enable the three-tier Principal Policy gate for graduated approval",
@@ -772,7 +772,7 @@ function generateRecommendations(
     });
   }
 
-  if (!l2.context_gating) {
+  if (!operational.context_gating) {
     recs.push({
       priority: 5,
       action: "Configure context gating to control what flows to LLM providers",
@@ -782,7 +782,7 @@ function generateRecommendations(
     });
   }
 
-  if (!l4.reputation_signed) {
+  if (!reputation.reputation_signed) {
     recs.push({
       priority: 6,
       action: "Start recording reputation attestations from completed interactions",
@@ -792,7 +792,7 @@ function generateRecommendations(
     });
   }
 
-  if (!l3.selective_disclosure_policy) {
+  if (!disclosure.selective_disclosure_policy) {
     recs.push({
       priority: 7,
       action: "Configure selective disclosure policies for data sharing",
@@ -840,22 +840,22 @@ export function formatAuditReport(result: SovereigntyAuditResult): string {
   report += "\n";
 
   // Layer assessment table
-  const l1Score = scoreL1(layers.l1_cognitive);
-  const l2Score = scoreL2(layers.l2_operational);
-  const l3Score = scoreL3(layers.l3_selective_disclosure);
-  const l4Score = scoreL4(layers.l4_reputation);
+  const cognitiveScore = scoreCognitive(layers.l1_cognitive);
+  const operationalScore = scoreOperational(layers.l2_operational);
+  const disclosureScore = scoreDisclosure(layers.l3_selective_disclosure);
+  const reputationScore = scoreReputation(layers.l4_reputation);
 
   report += "  Layer Assessment:\n";
   report += "  ┌─────────────────────────────┬──────────┬───────┐\n";
   report += "  │ Layer                       │ Status   │ Score │\n";
   report += "  ├─────────────────────────────┼──────────┼───────┤\n";
-  report += `  │ L1 Cognitive Sovereignty    │ ${padStatus(layers.l1_cognitive.status)} │ ${padScore(l1Score, 35)} │\n`;
-  report += `  │ L2 Operational Isolation    │ ${padStatus(layers.l2_operational.status)} │ ${padScore(l2Score, 25)} │\n`;
+  report += `  │ L1 Cognitive Sovereignty    │ ${padStatus(layers.l1_cognitive.status)} │ ${padScore(cognitiveScore, 35)} │\n`;
+  report += `  │ L2 Operational Isolation    │ ${padStatus(layers.l2_operational.status)} │ ${padScore(operationalScore, 25)} │\n`;
   if (layers.l2_operational.context_gating) {
     report += `  │   └ Context Gating          │ ACTIVE   │       │\n`;
   }
-  report += `  │ L3 Selective Disclosure     │ ${padStatus(layers.l3_selective_disclosure.status)} │ ${padScore(l3Score, 20)} │\n`;
-  report += `  │ L4 Verifiable Reputation    │ ${padStatus(layers.l4_reputation.status)} │ ${padScore(l4Score, 20)} │\n`;
+  report += `  │ L3 Selective Disclosure     │ ${padStatus(layers.l3_selective_disclosure.status)} │ ${padScore(disclosureScore, 20)} │\n`;
+  report += `  │ L4 Verifiable Reputation    │ ${padStatus(layers.l4_reputation.status)} │ ${padScore(reputationScore, 20)} │\n`;
   report += "  └─────────────────────────────┴──────────┴───────┘\n";
   report += "\n";
 

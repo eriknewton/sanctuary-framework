@@ -77,7 +77,7 @@ export function createSHRTools(
    * Returns undefined when no identity exists (the generator will
    * surface a clear error) or when the reputation store is absent.
    */
-  async function resolveL4Evidence(
+  async function resolveReputationEvidence(
     identityId: string | undefined
   ): Promise<L4Evidence | undefined> {
     if (!reputationStore) return undefined;
@@ -115,7 +115,7 @@ export function createSHRTools(
           : undefined;
 
         const identityId = args.identity_id as string | undefined;
-        const l4Evidence = await resolveL4Evidence(identityId);
+        const l4Evidence = await resolveReputationEvidence(identityId);
 
         const result = generateSHR(identityId, {
           ...generatorOpts,
@@ -198,7 +198,7 @@ export function createSHRTools(
           : undefined;
 
         const identityId = args.identity_id as string | undefined;
-        const l4Evidence = await resolveL4Evidence(identityId);
+        const l4Evidence = await resolveReputationEvidence(identityId);
 
         // Generate a fresh SHR
         const shrResult = generateSHR(identityId, {
