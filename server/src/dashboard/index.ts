@@ -16,7 +16,7 @@ import type {
   PendingApproval,
   ReputationLookup,
 } from "./aggregator.js";
-import type { L4Evidence } from "../shr/generator.js";
+import type { ReputationEvidence } from "../shr/generator.js";
 import {
   startDashboardServer,
   type DashboardHandle,
@@ -35,7 +35,19 @@ export type {
   ProtectionSnapshot,
   ReputationLookup,
 } from "./aggregator.js";
-export type { AggregatorSources, L1Status, L2Status, L3Status, L4Status } from "./aggregator.js";
+export type {
+  AggregatorSources,
+  CognitiveStatus,
+  OperationalStatus,
+  DisclosureStatus,
+  ReputationStatus,
+  // Back-compat aliases (L1-L4 rename PR-3): kept exported so downstream
+  // imports keep working.
+  L1Status,
+  L2Status,
+  L3Status,
+  L4Status,
+} from "./aggregator.js";
 export type { DashboardHandle, DashboardServerOptions } from "./server.js";
 export type { ApprovalHandlers, StreamEvent } from "./api.js";
 
@@ -63,7 +75,7 @@ export interface StartDashboardOptions {
    * disputes, freshness, active degradations). Typically supplied by the
    * server after L4 tools are constructed.
    */
-  l4Evidence?: L4Evidence;
+  l4Evidence?: ReputationEvidence;
 }
 
 /**

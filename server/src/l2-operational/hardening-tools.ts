@@ -7,10 +7,10 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import { assessL2Hardening } from "./hardening.js";
+import { assessOperationalHardening } from "./hardening.js";
 import type { AuditLog } from "./audit-log.js";
 
-export function createL2HardeningTools(
+export function createOperationalHardeningTools(
   storagePath: string,
   auditLog: AuditLog
 ): ToolDefinition[] {
@@ -35,7 +35,7 @@ export function createL2HardeningTools(
       },
       handler: async (args) => {
         const includeDetails = (args.include_details as boolean) ?? false;
-        const status = assessL2Hardening(storagePath);
+        const status = assessOperationalHardening(storagePath);
 
         void auditLog.append(
           "l2",
@@ -129,7 +129,7 @@ export function createL2HardeningTools(
         const checkMemory = (args.check_memory as boolean) ?? true;
         const checkProcess = (args.check_process as boolean) ?? true;
 
-        const status = assessL2Hardening(storagePath);
+        const status = assessOperationalHardening(storagePath);
 
         void auditLog.append(
           "l2",
@@ -213,3 +213,8 @@ export function createL2HardeningTools(
     },
   ];
 }
+
+// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// The layer-numbered name stays exported so downstream imports keep working.
+// The functional name above is canonical.
+export const createL2HardeningTools = createOperationalHardeningTools;

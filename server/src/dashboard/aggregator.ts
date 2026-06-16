@@ -15,8 +15,8 @@ import type { IdentityManager } from "../l1-cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
-import type { L4Evidence } from "../shr/generator.js";
-import { deriveL4Degradations } from "../shr/generator.js";
+import type { ReputationEvidence } from "../shr/generator.js";
+import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
 import type { SovereigntyTier } from "../l4-reputation/tiers.js";
 
@@ -31,7 +31,7 @@ export interface AgentInfo {
   primary_identity_id: string | null;
 }
 
-export interface L1Status {
+export interface CognitiveStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -40,7 +40,7 @@ export interface L1Status {
   memory_attest_ready: boolean;
 }
 
-export interface L2Status {
+export interface OperationalStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -50,7 +50,7 @@ export interface L2Status {
   sandbox_status: string;
 }
 
-export interface L3Status {
+export interface DisclosureStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -59,15 +59,15 @@ export interface L3Status {
   proofs_today: number;
 }
 
-/** A single L4 degradation surfaced to the dashboard widget. */
-export interface L4ActiveDegradation {
+/** A single reputation-layer degradation surfaced to the dashboard widget. */
+export interface ReputationActiveDegradation {
   code: string;
   severity: "info" | "warning" | "critical";
   description: string;
   mitigation?: string;
 }
 
-export interface L4Status {
+export interface ReputationStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -94,8 +94,17 @@ export interface L4Status {
    */
   layer_score?: number;
   /** Active L4 degradations rendered under the widget. */
-  active_degradations?: L4ActiveDegradation[];
+  active_degradations?: ReputationActiveDegradation[];
 }
+
+// ── Back-compat aliases (L1-L4 rename PR-3) ─────────────────────────────
+// The layer-numbered status type names stay exported as aliases so
+// downstream imports keep working. The functional names above are canonical.
+export type L1Status = CognitiveStatus;
+export type L2Status = OperationalStatus;
+export type L3Status = DisclosureStatus;
+export type L4Status = ReputationStatus;
+export type L4ActiveDegradation = ReputationActiveDegradation;
 
 export interface ActivityEntry {
   timestamp: string;
@@ -135,10 +144,10 @@ export interface ProtectionSnapshot {
   };
   agent: AgentInfo;
   layers: {
-    l1: L1Status;
-    l2: L2Status;
-    l3: L3Status;
-    l4: L4Status;
+    l1: CognitiveStatus;
+    l2: OperationalStatus;
+    l3: DisclosureStatus;
+    l4: ReputationStatus;
   };
   activity: ActivityEntry[];
   pending_approvals: PendingApproval[];
@@ -173,7 +182,7 @@ export interface AggregatorSources {
    * and computes an SHR-aligned L4 layer score. Providers build this
    * via `gatherL4Evidence` from `shr/tools.ts`.
    */
-  l4Evidence?: L4Evidence;
+  l4Evidence?: ReputationEvidence;
   /** Clock override for deterministic staleness rendering in tests. */
   l4Now?: Date;
 }
@@ -280,7 +289,7 @@ function buildAgent(
 function buildCognitive(
   sources: AggregatorSources,
   audit: AuditEntry[]
-): L1Status {
+): CognitiveStatus {
   const hasIdentity = !!sources.identityManager?.getDefault();
   const state: LayerState = hasIdentity ? "full" : "degraded";
   return {
@@ -295,7 +304,7 @@ function buildCognitive(
   };
 }
 
-function buildOperational(sources: AggregatorSources): L2Status {
+function buildOperational(sources: AggregatorSources): OperationalStatus {
   const teeAvailable = sources.teeAvailable ?? false;
   const state: LayerState = teeAvailable ? "full" : "degraded";
   return {
@@ -314,7 +323,7 @@ function buildOperational(sources: AggregatorSources): L2Status {
 function buildDisclosure(
   sources: AggregatorSources,
   audit: AuditEntry[]
-): L3Status {
+): DisclosureStatus {
   /** L4 attestation-producing ops — update when adding new VC tools. */
   const VC_ISSUING_OPS = new Set([
     "reputation_record",
@@ -337,7 +346,7 @@ function buildDisclosure(
   };
 }
 
-function buildReputation(sources: AggregatorSources): L4Status {
+function buildReputation(sources: AggregatorSources): ReputationStatus {
   const rep = sources.reputation;
   const hasDid = !!sources.identityManager?.getDefault()?.did;
 
@@ -347,7 +356,7 @@ function buildReputation(sources: AggregatorSources): L4Status {
   // attestation state even when a Verascore score is attached.
   const evidenceBlock = buildReputationEvidenceBlock(sources);
 
-  const base: L4Status = rep?.score != null
+  const base: ReputationStatus = rep?.score != null
     ? {
         label: "L4 Reputation",
         state: "full",
@@ -399,9 +408,9 @@ function buildReputation(sources: AggregatorSources): L4Status {
 }
 
 interface ReputationEvidenceBlock {
-  evidence: NonNullable<L4Status["evidence"]>;
+  evidence: NonNullable<ReputationStatus["evidence"]>;
   layer_score: number;
-  active_degradations: L4ActiveDegradation[];
+  active_degradations: ReputationActiveDegradation[];
 }
 
 function buildReputationEvidenceBlock(
@@ -410,7 +419,7 @@ function buildReputationEvidenceBlock(
   const ev = sources.l4Evidence;
   if (!ev) return null;
 
-  const degradations = deriveL4Degradations(ev, sources.l4Now ?? new Date());
+  const degradations = deriveReputationDegradations(ev, sources.l4Now ?? new Date());
   const status: LayerState = degradations.length > 0 ? "degraded" : "full";
   const layer_score = computeReputationLayerScore(degradations, status);
 
@@ -434,10 +443,10 @@ function buildReputationEvidenceBlock(
 }
 
 function computeOverall(
-  l1: L1Status,
-  l2: L2Status,
-  l3: L3Status,
-  l4: L4Status
+  l1: CognitiveStatus,
+  l2: OperationalStatus,
+  l3: DisclosureStatus,
+  l4: ReputationStatus
 ): ProtectionSnapshot["overall"] {
   const critical: LayerState[] = [l1.state, l3.state, l4.state];
   if (

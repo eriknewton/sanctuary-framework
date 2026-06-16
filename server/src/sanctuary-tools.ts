@@ -26,7 +26,7 @@ const PASSPHRASE_BACKUP_WARNING =
 import { derivePurposeKey } from "./core/key-derivation.js";
 import { toBase64url } from "./core/encoding.js";
 import { createIdentity } from "./core/identity.js";
-import { generateSHR, type L4Evidence } from "./shr/generator.js";
+import { generateSHR, type ReputationEvidence } from "./shr/generator.js";
 import { gatherL4Evidence } from "./shr/tools.js";
 import type { ReputationStore } from "./l4-reputation/reputation-store.js";
 
@@ -92,7 +92,7 @@ export function createSanctuaryTools(
    */
   async function reputationEvidenceForIdentity(
     identity: { identity_id: string; did: string }
-  ): Promise<L4Evidence | undefined> {
+  ): Promise<ReputationEvidence | undefined> {
     if (!reputationStore) return undefined;
     return gatherL4Evidence(reputationStore, auditLog, identity);
   }
@@ -102,7 +102,7 @@ export function createSanctuaryTools(
    * The identity was just created so `NO_REPUTATION_HISTORY` and
    * `NO_VERASCORE_LINK` will always fire — that's the truth of the state.
    */
-  function emptyReputationEvidence(): L4Evidence {
+  function emptyReputationEvidence(): ReputationEvidence {
     return {
       attestation_count: 0,
       tier_distribution: {

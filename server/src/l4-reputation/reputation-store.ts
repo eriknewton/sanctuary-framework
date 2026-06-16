@@ -88,11 +88,12 @@ export interface ReputationSummary {
 }
 
 /**
- * L4 attestation evidence summary for the SHR degradation emitter and the
- * dashboard evidence widget. Derived from the stored attestations; does not
- * include Verascore-link state (tracked separately via audit log).
+ * Reputation-layer attestation evidence summary for the SHR degradation
+ * emitter and the dashboard evidence widget. Derived from the stored
+ * attestations; does not include Verascore-link state (tracked separately
+ * via audit log).
  */
-export interface L4AttestationSummary {
+export interface ReputationAttestationSummary {
   /** Total number of attestations covered by the summary */
   attestation_count: number;
   /** Count of attestations at each sovereignty tier */
@@ -104,6 +105,11 @@ export interface L4AttestationSummary {
   /** Count of attestations per context label */
   context_breakdown: Record<string, number>;
 }
+
+// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// The layer-numbered name stays exported so downstream imports keep working.
+// The functional name above is canonical.
+export type L4AttestationSummary = ReputationAttestationSummary;
 
 /** Portable reputation bundle */
 export interface ReputationBundle {
@@ -574,7 +580,7 @@ export class ReputationStore {
    * counts, tier distribution, recency, dispute counts, context coverage —
    * without exposing raw attestations. The caller combines this with an
    * audit-log check for Verascore link state to produce the final
-   * `L4Evidence` struct consumed by the SHR generator.
+   * `ReputationEvidence` struct consumed by the SHR generator.
    *
    * @param participantDid - If provided, only count attestations where the
    *   `participant_did` matches. If omitted, covers all attestations in the
@@ -582,7 +588,7 @@ export class ReputationStore {
    */
   async summarizeForSHR(
     participantDid?: string
-  ): Promise<L4AttestationSummary> {
+  ): Promise<ReputationAttestationSummary> {
     const all = await this.loadAll();
     const filtered = participantDid
       ? all.filter((a) => a.attestation.data.participant_did === participantDid)

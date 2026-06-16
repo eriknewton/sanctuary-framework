@@ -27,7 +27,7 @@ import {
   verifyRangeProof,
 } from "./zk-proofs.js";
 
-export function createL3Tools(
+export function createDisclosureTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   auditLog: AuditLog
@@ -541,3 +541,8 @@ export function createL3Tools(
 
   return { tools, commitmentStore, policyStore };
 }
+
+// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// The layer-numbered name stays exported so downstream imports keep working.
+// The functional name above is canonical.
+export const createL3Tools = createDisclosureTools;

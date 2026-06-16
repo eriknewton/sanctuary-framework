@@ -12,10 +12,10 @@ export interface SovereigntyAuditResult {
   audited_at: string;               // ISO 8601
   environment: EnvironmentFingerprint;
   layers: {
-    l1_cognitive: L1AuditResult;
-    l2_operational: L2AuditResult;
-    l3_selective_disclosure: L3AuditResult;
-    l4_reputation: L4AuditResult;
+    l1_cognitive: CognitiveAuditResult;
+    l2_operational: OperationalAuditResult;
+    l3_selective_disclosure: DisclosureAuditResult;
+    l4_reputation: ReputationAuditResult;
   };
   overall_score: number;             // 0–100
   sovereignty_level: "full" | "partial" | "minimal" | "none";
@@ -74,7 +74,7 @@ export interface OpenClawConfigAudit {
 
 // ── Layer Audit Results ─────────────────────────────────────────────────
 
-export interface L1AuditResult {
+export interface CognitiveAuditResult {
   status: "active" | "partial" | "inactive";
   encryption_at_rest: boolean;
   key_custody: "self" | "platform" | "none";
@@ -84,7 +84,7 @@ export interface L1AuditResult {
   findings: string[];
 }
 
-export interface L2AuditResult {
+export interface OperationalAuditResult {
   status: "active" | "partial" | "inactive";
   approval_gate: "three-tier" | "binary" | "none";
   behavioral_anomaly_detection: boolean;
@@ -96,7 +96,7 @@ export interface L2AuditResult {
   findings: string[];
 }
 
-export interface L3AuditResult {
+export interface DisclosureAuditResult {
   status: "active" | "partial" | "inactive";
   commitment_scheme: "pedersen+sha256" | "sha256-only" | "none";
   zero_knowledge_proofs: boolean;
@@ -104,7 +104,7 @@ export interface L3AuditResult {
   findings: string[];
 }
 
-export interface L4AuditResult {
+export interface ReputationAuditResult {
   status: "active" | "partial" | "inactive";
   reputation_portable: boolean;
   reputation_signed: boolean;
@@ -112,6 +112,14 @@ export interface L4AuditResult {
   sovereignty_gated_tiers: boolean;
   findings: string[];
 }
+
+// ── Back-compat aliases (L1-L4 rename PR-3) ─────────────────────────────
+// The layer-numbered names stay exported as aliases so downstream imports
+// keep working. The functional names above are canonical.
+export type L1AuditResult = CognitiveAuditResult;
+export type L2AuditResult = OperationalAuditResult;
+export type L3AuditResult = DisclosureAuditResult;
+export type L4AuditResult = ReputationAuditResult;
 
 // ── Gaps and Recommendations ────────────────────────────────────────────
 

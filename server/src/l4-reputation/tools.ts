@@ -23,7 +23,7 @@ import {
   type SovereigntyTier,
 } from "./tiers.js";
 
-export function createL4Tools(
+export function createReputationTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   identityManager: IdentityManager,
@@ -814,3 +814,8 @@ export function createL4Tools(
 
   return { tools, reputationStore };
 }
+
+// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// The layer-numbered name stays exported so downstream imports keep working.
+// The functional name above is canonical.
+export const createL4Tools = createReputationTools;
