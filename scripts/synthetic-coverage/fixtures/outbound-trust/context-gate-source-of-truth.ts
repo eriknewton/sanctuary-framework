@@ -19,7 +19,7 @@ const CLAIM_ID = "14";
 const CLAIM_LABEL = "Context-gate single source of truth";
 
 // Entrypoints: initializeContextGateEnforcerFromProfile, ContextGateEnforcer.filterArgs, and ProxyRouter contextGateFilter.
-// Mirrored tests: server/test/l2/context-gate-enforcer.test.ts, server/test/proxy/context-gate-filter.test.ts, server/test/integration/context-gate-persist.test.ts.
+// Mirrored tests: server/test/operational/context-gate-enforcer.test.ts, server/test/proxy/context-gate-filter.test.ts, server/test/integration/context-gate-persist.test.ts.
 // Matrix claim: Context-gate single source of truth.
 
 function createMockClientManager() {

@@ -207,8 +207,8 @@ Context gating is a new Operational Isolation (Sentinels) subsystem that control
 - `server/src/operational/context-gate-recommend.ts` — Heuristic recommendation engine with word-boundary matching
 
 **New test files:**
-- `server/test/l2/context-gate.test.ts` — 26 tests for core module
-- `server/test/l2/context-gate-templates.test.ts` — 47 tests for templates and recommendation engine
+- `server/test/operational/context-gate.test.ts` — 26 tests for core module
+- `server/test/operational/context-gate/context-gate-templates.test.ts` — 47 tests for templates and recommendation engine
 
 **Modified files:**
 - `server/src/index.ts` — imports + registration of context gate tools
