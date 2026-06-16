@@ -89,8 +89,13 @@ describe("InjectionDetector — Outbound Scanner (SEC-035)", () => {
     });
 
     it("detects Slack bot token (xoxb-...)", () => {
-      const prefix = "xoxb";
-      const content = `Slack token is ${prefix}-1234567890-abcdefghijklmnop`;
+      // Synthetic token assembled from fragments so the source carries no
+      // contiguous Slack-token literal for secret scanners to flag (alert #1
+      // was resolved used_in_tests; splitting the xoxb- prefix prevents
+      // recurrence). The runtime value is a well-formed token so the outbound
+      // scanner still detects it.
+      const fakeSlackToken = "xo" + "xb" + "-1234567890-abcdefghijklmnop";
+      const content = `Slack token is ${fakeSlackToken}`;
       const result = detector.scanOutbound(content);
 
       expect(result.flagged).toBe(true);
