@@ -23,7 +23,7 @@
  *   - Subscriber unregister on socket close prevents leaks.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createConnection, type Socket } from "node:net";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -595,6 +595,67 @@ describe("MacOSFlowIpcListener", () => {
     expect(stats.framesRejected).toBeGreaterThanOrEqual(2);
     // Connection survives malformed traffic and is still counted active.
     expect(stats.activeConnections).toBe(1);
+  });
+
+  it("escapes control characters in listener route error logs", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const dir = await mkdtemp(join(tmpdir(), "cw-macos-listener-"));
+      tmpDirs.push(dir);
+      const approvals = makeApprovalQueue();
+      const throwingAuditSink: AuditSink = {
+        append() {
+          throw new Error("bad input\nforged log line\rwith bell\u0007");
+        },
+        async flush() {
+          // no-op
+        },
+      };
+      const consumer = new MacOSFlowEventConsumer({
+        manifestProvider: makeManifestProvider([SAMPLE_RULE]),
+        approvalQueue: approvals.queue,
+        auditSink: throwingAuditSink,
+        defaultApprovalTimeoutSeconds: 30,
+      });
+      const listener = new MacOSFlowIpcListener({
+        socketPath: join(dir, "castle.sock"),
+        consumer,
+        generateNonce: () => new Uint8Array(32),
+      });
+      await listener.start();
+      liveListeners.push(listener);
+
+      const { socket, buf } = await connectClient(join(dir, "castle.sock"));
+      track(socket);
+      await nextMessage(buf);
+
+      const notif: FlowDecisionRecordedNotification = {
+        type: "flow_decision_recorded",
+        decision: "drop",
+        destination: {
+          host: "evil.example.com",
+          ip: "1.2.3.4",
+          port: 443,
+          protocol: "tcp",
+          hostname_source: "sni",
+          opaque: false,
+        },
+        agent: { id: "agent-test", template: "coding-assistant" },
+        matched_rule_id: null,
+        recorded_at: "2026-05-12T13:00:00Z",
+      };
+      socket.write(envelope(notif));
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(errorSpy).toHaveBeenCalled();
+      const line = String(errorSpy.mock.calls.at(-1)?.[0] ?? "");
+      expect(line).toContain("\\n");
+      expect(line).toContain("\\r");
+      expect(line).toContain("\\x07");
+      expect(line).not.toMatch(/[\r\n\u0007]/);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("fails fast when start() is called twice without stop()", async () => {
