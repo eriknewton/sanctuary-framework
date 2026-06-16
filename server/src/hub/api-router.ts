@@ -23,6 +23,10 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import {
+  publicCodeForStatus,
+  sendCaughtError,
+} from "../http/error-envelope.js";
 
 import type { LocalHarnessKind } from "../contracts/v1.1/local-agent-records.js";
 import {
@@ -117,17 +121,30 @@ function rejectCrossFortressParams(url: URL): void {
   }
 }
 
-function handleError(res: ServerResponse, err: unknown): void {
+function handleError(
+  res: ServerResponse,
+  err: unknown,
+  opts: { operation: string; suppressPublicDetail?: boolean },
+): void {
   if (err instanceof HubError) {
+    if (opts.suppressPublicDetail === true) {
+      sendCaughtError(res, err.statusCode, publicCodeForStatus(err.statusCode), err, {
+        route: "hub",
+        operation: opts.operation,
+      });
+      return;
+    }
     writeJSON(res, err.statusCode, {
       ok: false,
       error: err.name,
-      detail: err.message,
+      detail: err.publicDetail,
     });
     return;
   }
-  const msg = err instanceof Error ? err.message : String(err);
-  writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+  sendCaughtError(res, 500, "internal_error", err, {
+    route: "hub",
+    operation: opts.operation,
+  });
 }
 
 /**
@@ -740,7 +757,10 @@ export async function handleHubRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    handleError(res, err);
+    handleError(res, err, {
+      operation: `${method} ${path}`,
+      suppressPublicDetail: isApprovalDecision,
+    });
     return true;
   }
 }

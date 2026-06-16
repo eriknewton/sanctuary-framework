@@ -20,6 +20,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { sendCaughtError } from "../http/error-envelope.js";
 import type { DistressInbox } from "./inbox.js";
 
 export const DISTRESS_API_PREFIX = "/api/distress";
@@ -85,8 +86,10 @@ export async function handleDistressRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "distress",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

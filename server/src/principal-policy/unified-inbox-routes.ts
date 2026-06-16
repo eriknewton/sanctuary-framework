@@ -22,6 +22,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import {
   UnifiedInboxBridge,
   type InboxQuery,
@@ -428,8 +429,10 @@ export async function handleUnifiedInboxRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "unified-inbox",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }
