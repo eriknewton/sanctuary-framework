@@ -43,6 +43,11 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import {
+  logCaughtError,
+  sendCaughtError,
+  type PublicErrorCode,
+} from "../http/error-envelope.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { SentinelFindingStore } from "../sentinel/sentinel-finding-store.js";
 import type {
@@ -388,12 +393,16 @@ export async function handleHoneypotRoute(
       // NOT block the operator's deploy (the in-memory registry has
       // already accepted the spec and the trap fires immediately on
       // matching traffic). Failures surface in the audit emission.
-      let persistError: string | null = null;
+      let persistError: PublicErrorCode | null = null;
       if (deps.store) {
         try {
           await deps.store.save(spec);
         } catch (err) {
-          persistError = err instanceof Error ? err.message : String(err);
+          persistError = "internal_error";
+          logCaughtError(err, {
+            route: "honeypot",
+            operation: "deploy.persist",
+          });
         }
       }
       void deps.auditLog.append("l2", HONEYPOT_AUDIT_OPS.DEPLOYED, deps.operatorId, {
@@ -446,12 +455,16 @@ export async function handleHoneypotRoute(
       // the persisted layer and in-memory layer can drift (e.g., after
       // a partial boot reload). Deleting on undeploy is idempotent and
       // converges the two layers.
-      let persistError: string | null = null;
+      let persistError: PublicErrorCode | null = null;
       if (deps.store) {
         try {
           await deps.store.delete(trapMatch.trapId);
         } catch (err) {
-          persistError = err instanceof Error ? err.message : String(err);
+          persistError = "internal_error";
+          logCaughtError(err, {
+            route: "honeypot",
+            operation: "undeploy.persist",
+          });
         }
       }
       if (removed) {
@@ -505,8 +518,10 @@ export async function handleHoneypotRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "honeypot",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

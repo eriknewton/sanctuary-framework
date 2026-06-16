@@ -25,6 +25,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../../console/auth-middleware.js";
+import { sendCaughtError } from "../../http/error-envelope.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import {
   SUBSTRATE_CHOICES,
@@ -68,8 +69,11 @@ class IntelligenceRouterError extends Error {
     message: string,
   ) {
     super(message);
+    this.publicDetail = message;
     this.name = "IntelligenceRouterError";
   }
+
+  public readonly publicDetail: string;
 }
 
 function writeJSON(
@@ -163,12 +167,13 @@ function handleError(res: ServerResponse, err: unknown): void {
     writeJSON(res, err.statusCode, {
       ok: false,
       error: err.code,
-      detail: err.message,
+      detail: err.publicDetail,
     });
     return;
   }
-  const msg = err instanceof Error ? err.message : String(err);
-  writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+  sendCaughtError(res, 500, "internal_error", err, {
+    route: "intelligence",
+  });
 }
 
 /**
@@ -553,8 +558,11 @@ export async function handleIntelligenceRoute(
       try {
         await deps.selector.setHybridRules(rules);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        throw new IntelligenceRouterError(400, "invalid_hybrid_rules", detail);
+        sendCaughtError(res, 400, "bad_request", err, {
+          route: "intelligence",
+          operation: "set_hybrid_rules",
+        });
+        return true;
       }
       writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
       return true;
