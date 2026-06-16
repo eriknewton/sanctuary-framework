@@ -1,0 +1,31 @@
+# Code owners for sanctuary-framework.
+#
+# Sanctuary is currently maintained by a single author (see GOVERNANCE.md), so
+# the catch-all below already covers every path. The explicit entries document
+# ownership intent for the security-sensitive surfaces and make required Code
+# Owner review on those paths meaningful the moment a second maintainer joins.
+# See SECURITY.md and the A+ remediation plan (Codex audit 2026-06-16, F10).
+
+# Default owner for everything in the repo.
+*                                   @eriknewton
+
+# CI / release / supply-chain
+/.github/                           @eriknewton
+/scripts/                           @eriknewton
+**/package.json                     @eriknewton
+**/package-lock.json                @eriknewton
+/sidecars/concordia/requirements.txt @eriknewton
+
+# Security-sensitive subsystems (custody, policy, crypto, enforcement)
+/server/src/castle-wall/            @eriknewton
+/server/src/principal-policy/       @eriknewton
+/server/src/transparency/           @eriknewton
+/server/src/storage/                @eriknewton
+/server/src/wrap/                   @eriknewton
+/server/src/exit/                   @eriknewton
+/castle-wall-daemon/                @eriknewton
+
+# Security & governance docs
+SECURITY.md                         @eriknewton
+AGENTS.md                           @eriknewton
+GOVERNANCE.md                       @eriknewton

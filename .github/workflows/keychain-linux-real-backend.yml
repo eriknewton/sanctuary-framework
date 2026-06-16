@@ -50,6 +50,9 @@ on:
       - ".github/workflows/keychain-linux-real-backend.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   real-backend-test:
     runs-on: ubuntu-24.04
