@@ -160,14 +160,29 @@ os_log re-binds `manifest_received=true arm_lease_received=true` every 5s throug
 
 ## What this does NOT prove (carried forward honestly — do not claim)
 
-- **No rule-attributed per-flow audit trail (the "C4 gap").** The allow/deny differential
-  is genuine external behavioral evidence, but per-flow decisions are autonomous
-  extension/manifest decisions and are NOT recorded to any queryable rule-attributed
-  audit log. The producer-signed per-flow audit trail that would close this is an unbuilt
-  future build (C4), not a current capability. **Do not describe this work as "audited
-  per-rule per-flow."**
+- **No UNFORGEABLE per-flow audit trail (the "C4 gap").** The allow/deny differential is
+  genuine external behavioral evidence. A per-rule-attributed *read-out* DOES exist on the
+  drilled tree (corrected after independent verification): every `egress_allowed`/`egress_blocked`
+  entry stamps the deciding `rule_id` (`server/src/castle-wall/runtime/macos-flow-events.ts`),
+  and `server/src/castle-wall/audit/per-rule-report.ts` is CLI-wired (`sanctuary castle-wall
+  audit-dump --by-rule` / `--rule <id>`). BUT that read-out is **NOT tamper-evidence**: the
+  producer-signed / unforgeable per-flow audit activation is a separate, currently-**inert**
+  capability. So the genuine C4 gap is **unforgeability, not rule-attribution.** Do NOT
+  describe this work as "audited per-rule per-flow" or "tamper-evident per-flow audit." (The
+  most you may say about legibility: the operator can read which rule decided each recorded
+  flow — without implying that record is tamper-proof.) Note: the safe-mode boot-audit segment
+  captured only lifecycle events (`filter_started`/`filter_stopped`), no per-flow `egress_*`
+  events, so for the boot segment specifically "lifecycle, not per-flow verdicts" still holds.
+- **Claim attaches to the drilled tree `053093963dbf`, NOT today's `origin/main`.** As of the
+  drill close, `origin/main` is **5 commits ahead** (`bb673e72`): AGENTS.md (#591) + the L1-L4
+  layer-rename PRs #592–595, which rename castle-wall symbols/dirs/import-paths and touch
+  `macos-daemon.ts` + `per-rule-report.ts` (2-line renames each). Those are **not re-drilled.**
+  Do not silently re-attach "survives reboot" to "current main" without re-confirming the
+  rename is behavior-preserving (the same inference-not-drill caveat the prior doc was careful about).
 - **One host, one OS version.** Single-machine proof on macOS Tahoe 26.5.1.
 - **Not a performance claim.** No overhead numbers captured.
+- **Not bit-reproducible.** Built on the MBA's Swift 6.3.2, not Mini1's CLT 6.1.2 — the invariant
+  is byte-identical **source**, not toolchain-reproducible **output**.
 
 ## DEFECT found during the drill — host app launch crash (does NOT affect enforcement)
 
