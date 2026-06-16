@@ -51,6 +51,7 @@ const ALLOWLIST: ReadonlyArray<string> = [
   ".gitignore",
   ".test-baseline",
   ".test-baseline-overrides.log",
+  "AGENTS.md",
   "ASSURANCE_MATRIX.md",
   "Archive",
   "CHANGELOG.md",
