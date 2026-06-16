@@ -41,7 +41,7 @@ The npm artifact, the git tag, and the GitHub release all bind to the same sourc
 
 | Item | Status | Rationale |
 |---|---|---|
-| Markdown-image-exfil detector caps the URL path at 2048 chars | Accepted | Bound chosen to eliminate the ReDoS. It is a flag-only heuristic and the independent secret-pattern scan still runs. Widening the bound is free given the non-backtracking structure if broader coverage is wanted. |
+| Markdown-image-exfil detector caps the URL path at 8192 chars | Resolved (widened) | Bound exists only to keep matching linear (ReDoS-safe; pathological 50k input matches in 0.156ms). Widened from 2048 to 8192 in PR #607 to cover any realistic exfil URL with margin; the independent secret-pattern scan remains the backstop beyond the cap. |
 | `dashboard/multi-server.ts` keeps a private `constantTimeEquals` duplicate | Tracked | Pre-existing duplication; the shared helper now lives in `http/auth.ts`. Consolidation is a cleanup, not a defect. |
 | Issue #567 safe-mode root-owned socket-dir TOCTOU | Partially done | The boot-guard plist parse is hardened; the socket-path coordination remainder is tracked in #567. |
 | Dev-chain dependency majors (vite, vitest) | Deferred | Break the test harness; dev-and-build-only, nothing shipped. Deferred via Dependabot major-ignore rather than force-migrated. |
