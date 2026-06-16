@@ -72,10 +72,10 @@ describe("Dashboard API", () => {
       expect(extractToken(req, url)).toBe("tok123");
     });
 
-    it("extracts from ?token= query parameter", () => {
+    it("ignores ?token= query parameter", () => {
       const req = mockReq({ url: "/?token=qp-tok" });
       const url = new URL("http://localhost/?token=qp-tok");
-      expect(extractToken(req, url)).toBe("qp-tok");
+      expect(extractToken(req, url)).toBeNull();
     });
 
     it("returns null when no token present", () => {
@@ -84,7 +84,7 @@ describe("Dashboard API", () => {
       expect(extractToken(req, url)).toBeNull();
     });
 
-    it("prefers header over query param", () => {
+    it("uses the header when a query token is also present", () => {
       const req = mockReq({
         url: "/?token=query",
         headers: { authorization: "Bearer header" },
@@ -109,6 +109,24 @@ describe("Dashboard API", () => {
       const deps: APIDeps = { sources: {} as any, authToken: "secret" };
       const req = mockReq({ headers: { authorization: "Bearer secret" } });
       expect(isAuthorized(deps, req, new URL("http://localhost/"))).toBe(true);
+    });
+
+    it("returns true when a valid short-lived session is provided", () => {
+      const deps: APIDeps = {
+        sources: {} as any,
+        authToken: "secret",
+        sessions: { create: vi.fn(), validate: vi.fn((id: string) => id === "sess-ok") },
+      };
+      expect(
+        isAuthorized(deps, mockReq({}), new URL("http://localhost/?session=sess-ok"))
+      ).toBe(true);
+    });
+
+    it("rejects long-lived ?token= query auth", () => {
+      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      expect(
+        isAuthorized(deps, mockReq({ url: "/?token=secret" }), new URL("http://localhost/?token=secret"))
+      ).toBe(false);
     });
 
     it("returns false when token mismatches", () => {
@@ -141,6 +159,43 @@ describe("Dashboard API", () => {
       const deps = makeDeps();
       await handleRequest(deps, mockReq({}), res);
       expect(res._status).toBe(401);
+    });
+
+    it("mints a short-lived session from the Authorization header only", async () => {
+      const res = mockRes();
+      const create = vi.fn(() => ({ id: "sess-created", expiresInSeconds: 300 }));
+      const deps = makeDeps({
+        sessions: { create, validate: vi.fn() },
+      });
+      const req = mockReq({
+        url: "/auth/session",
+        method: "POST",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      expect(create).toHaveBeenCalledOnce();
+      expect(JSON.parse(res._body)).toEqual({
+        session_id: "sess-created",
+        expires_in_seconds: 300,
+      });
+    });
+
+    it("rejects session exchange without a bearer header", async () => {
+      const res = mockRes();
+      const create = vi.fn(() => ({ id: "sess-created", expiresInSeconds: 300 }));
+      const deps = makeDeps({
+        sessions: { create, validate: vi.fn() },
+      });
+      const req = mockReq({
+        url: "/auth/session?token=tok",
+        method: "POST",
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+      expect(create).not.toHaveBeenCalled();
     });
 
     it("serves /api/health", async () => {

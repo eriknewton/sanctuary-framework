@@ -1384,9 +1384,9 @@ export async function runWrap(
           masterKey: derived.key,
         }),
       );
-      // The wrap-auto dashboard always binds 127.0.0.1; the operator
-      // already has the bearer token in the auto-opened URL. Loopback
-      // auto-auth keeps the v1.1 client one-click from the URL.
+      // The wrap-auto dashboard always binds 127.0.0.1. The printed URL
+      // carries only a short-lived session; loopback auto-auth keeps the
+      // v1.1 client one-click without putting the bearer token in a URL.
       dashboard.setV11LoopbackAutoAuth(true);
     } catch (err) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1400,7 +1400,7 @@ export async function runWrap(
 
   failIfAnchorOptInDropped();
 
-  const dashboardUrl = `${dashboard.url}?token=${authToken}`;
+  const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
   // Publish runtime state so `sanctuary agents` + the multi-agent
   // dashboard aggregator can find this tenant's actual port. Best-effort:

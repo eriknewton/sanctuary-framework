@@ -103,7 +103,7 @@ describe("formatWrapSuccess", () => {
     version: "0.9.0-rc.1",
     toolCount: 74,
     serverCount: 2,
-    dashboardUrl: "http://localhost:3501?token=abc",
+    dashboardUrl: "http://localhost:3501?session=short",
     browserOpened: true,
     passphraseLocation: "macOS Keychain",
     passphraseSource: "generated",
@@ -146,10 +146,11 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
-  it("includes the dashboard URL with the token", () => {
+  it("includes the dashboard URL without the long-lived token", () => {
     expect(formatWrapSuccess(baseInfo)).toContain(
-      "http://localhost:3501?token=abc"
+      "http://localhost:3501?session=short"
     );
+    expect(formatWrapSuccess(baseInfo)).not.toContain("?token=");
   });
 });
 

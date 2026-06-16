@@ -9,6 +9,7 @@
  * the server layer needing to know about aggregator internals.
  */
 
+import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type {
   AggregatorSources,
@@ -77,10 +78,24 @@ export interface DashboardHandle {
    * supplies the loaded identity manager and audit log through this hook.
    */
   updateSources: (sources: Partial<AggregatorSources>) => void;
+  /**
+   * Create a one-click URL carrying a short-lived dashboard session.
+   * This replaces legacy `?token=` URLs; the long-lived bearer token is
+   * never emitted into the URL.
+   */
+  createSessionUrl?: () => string;
 }
 
 const DEFAULT_PORT = 3501;
 const DEFAULT_HOST = "127.0.0.1";
+const SESSION_TTL_MS = 5 * 60 * 1000;
+const MAX_SESSIONS = 256;
+
+interface StoredDashboardSession {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+}
 
 export async function startDashboardServer(
   options: DashboardServerOptions
@@ -105,6 +120,44 @@ export async function startDashboardServer(
   const updateSources = (sources: Partial<AggregatorSources>): void => {
     Object.assign(options.sources, sources);
   };
+  const sessions = new Map<string, StoredDashboardSession>();
+  const cleanupSessions = (): void => {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      if (now > session.expiresAt) sessions.delete(id);
+    }
+  };
+  const sessionStore = {
+    create: () => {
+      cleanupSessions();
+      if (sessions.size >= MAX_SESSIONS) {
+        const oldest = [...sessions.entries()].sort(
+          (a, b) => a[1].createdAt - b[1].createdAt,
+        )[0];
+        if (oldest) sessions.delete(oldest[0]);
+      }
+      const now = Date.now();
+      const id = randomBytes(32).toString("hex");
+      sessions.set(id, {
+        id,
+        createdAt: now,
+        expiresAt: now + SESSION_TTL_MS,
+      });
+      return {
+        id,
+        expiresInSeconds: Math.floor(SESSION_TTL_MS / 1000),
+      };
+    },
+    validate: (id: string) => {
+      const session = sessions.get(id);
+      if (!session) return false;
+      if (Date.now() > session.expiresAt) {
+        sessions.delete(id);
+        return false;
+      }
+      return true;
+    },
+  };
 
   // v1.1.2 hotfix (Finding V): mutable per-server state for the v1.1
   // bindings + loopback auto-auth flag. handleRequest sees the latest
@@ -117,6 +170,7 @@ export async function startDashboardServer(
       const deps = {
         sources: options.sources,
         authToken: options.authToken,
+        sessions: sessionStore,
         approvals: options.approvals,
         onEvent,
         v11Bindings,
@@ -152,6 +206,11 @@ export async function startDashboardServer(
   })();
 
   const url = `http://${host}:${actualPort}`;
+  const createSessionUrl = (): string => {
+    if (!options.authToken) return url;
+    const session = sessionStore.create();
+    return `${url}?session=${encodeURIComponent(session.id)}`;
+  };
 
   return {
     url,
@@ -176,5 +235,6 @@ export async function startDashboardServer(
       v11LoopbackAutoAuth = enabled;
     },
     updateSources,
+    createSessionUrl,
   };
 }

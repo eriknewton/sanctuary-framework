@@ -31,6 +31,7 @@ export interface ApprovalHandlers {
 export interface APIDeps {
   sources: AggregatorSources;
   authToken?: string;
+  sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
   /** Register a listener; returns an unsubscribe fn. */
   onEvent?: (listener: (event: StreamEvent) => void) => () => void;
@@ -66,6 +67,16 @@ export interface APIDeps {
   loopbackAutoAuth?: boolean;
 }
 
+export interface DashboardSession {
+  id: string;
+  expiresInSeconds: number;
+}
+
+export interface DashboardSessionStore {
+  create: () => DashboardSession;
+  validate: (id: string) => boolean;
+}
+
 /**
  * SSE event taxonomy.
  *
@@ -95,22 +106,27 @@ export function constantTimeEquals(a: string, b: string): boolean {
 }
 
 /**
- * Pull the bearer token from Authorization header or ?token= query.
+ * Pull the bearer token from Authorization header only. Long-lived URL
+ * query tokens are deliberately ignored; SSE uses short-lived sessions.
  */
 export function extractToken(req: IncomingMessage, url: URL): string | null {
   const header = req.headers.authorization;
   if (header && header.startsWith("Bearer ")) {
     return header.slice(7).trim();
   }
-  const q = url.searchParams.get("token");
-  return q ?? null;
+  void url;
+  return null;
 }
 
 export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
   if (!deps.authToken) return true;
   const token = extractToken(req, url);
-  if (!token) return false;
-  return constantTimeEquals(token, deps.authToken);
+  if (token && constantTimeEquals(token, deps.authToken)) return true;
+
+  const sessionId = url.searchParams.get("session");
+  if (sessionId && deps.sessions?.validate(sessionId)) return true;
+
+  return false;
 }
 
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
@@ -164,6 +180,36 @@ export async function handleRequest(
   const url = new URL(req.url ?? "/", `http://${host}`);
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
+
+  // ── Session exchange ───────────────────────────────────────────────
+  // Header-only by design: this is the only route that mints URL-carryable
+  // short-lived sessions for EventSource and one-click operator URLs.
+  if (method === "POST" && path === "/auth/session") {
+    if (!deps.authToken) {
+      writeJSON(res, 200, { session_id: "no-auth", expires_in_seconds: 0 });
+      return true;
+    }
+    const token = extractToken(req, url);
+    if (!token || !constantTimeEquals(token, deps.authToken)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    if (!deps.sessions) {
+      writeJSON(res, 503, { error: "sessions_unavailable" });
+      return true;
+    }
+    const session = deps.sessions.create();
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Set-Cookie": `sanctuary_session=${session.id}; Path=/; SameSite=Strict; Max-Age=${session.expiresInSeconds}`,
+    });
+    res.end(JSON.stringify({
+      session_id: session.id,
+      expires_in_seconds: session.expiresInSeconds,
+    }));
+    return true;
+  }
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
   // Try v1.1 routes first when bindings are set. Mounted additively at
