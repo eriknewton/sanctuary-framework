@@ -41,7 +41,7 @@ import {
   probeAuditHeadAnchor,
   deriveAuditEpochKeys,
   AUDIT_EPOCH_KEYS_KEY,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import {
   CUSTODY_ENVELOPE_KEY,
   CUSTODY_SENTINEL_KEY,
@@ -53,8 +53,8 @@ import {
   RotationResumeError,
   type RotateMasterOptions,
 } from "../../src/core/master-rotation.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   deriveNamespaceKey,
   derivePurposeKey,

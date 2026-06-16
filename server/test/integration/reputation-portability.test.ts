@@ -14,10 +14,10 @@
 import { describe, it, expect } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 
 async function callTool(

@@ -18,7 +18,7 @@ import {
 } from "../../src/core/encoding.js";
 import { hash } from "../../src/core/hashing.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createBridgeTools } from "../../src/bridge/tools.js";
 import {
   createBridgeCommitment,
@@ -26,7 +26,7 @@ import {
   canonicalize,
 } from "../../src/bridge/bridge.js";
 import type { ConcordiaOutcome, BridgeCommitment } from "../../src/bridge/types.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolDefinition } from "../../src/router.js";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────

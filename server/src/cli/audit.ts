@@ -12,7 +12,7 @@ import {
   AuditLog,
   type AuditEntry,
   type AuditIntegrityFinding,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { resolveStoragePath } from "../paths.js";
 

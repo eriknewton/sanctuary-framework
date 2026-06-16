@@ -8,10 +8,10 @@
  */
 
 import { describe, it, expect } from "vitest";
-import type { Backend } from "../../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../../src/l3-disclosure/broker/backend-interface.js";
-import { Broker } from "../../../src/l3-disclosure/broker/broker.js";
-import { AuditLog, BROKER_OPS } from "../../../src/l2-operational/audit-log.js";
+import type { Backend } from "../../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../../src/disclosure/broker/backend-interface.js";
+import { Broker } from "../../../src/disclosure/broker/broker.js";
+import { AuditLog, BROKER_OPS } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 

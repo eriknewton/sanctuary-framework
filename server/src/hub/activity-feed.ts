@@ -18,7 +18,7 @@
 
 import { createHash } from "node:crypto";
 
-import type { AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
 import type {
   HubActivityFeedEntry,
   HubDisplayTemplateArg,

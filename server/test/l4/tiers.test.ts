@@ -13,7 +13,7 @@ import {
   TIER_WEIGHTS,
   type SovereigntyTier,
   type TieredAttestation,
-} from "../../src/l4-reputation/tiers.js";
+} from "../../src/reputation/tiers.js";
 import type { HandshakeResult } from "../../src/handshake/types.js";
 import type { SignedSHR } from "../../src/shr/types.js";
 import { publicKeyToDid } from "../../src/core/identity.js";

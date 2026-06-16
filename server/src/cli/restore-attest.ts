@@ -43,7 +43,7 @@ import {
   isRollbackFrozen,
   restoreAttest,
 } from "../core/anti-rollback.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 
 export interface RestoreAttestCliArgs {
   argv: string[];

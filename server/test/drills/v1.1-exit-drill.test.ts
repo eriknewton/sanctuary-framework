@@ -56,13 +56,13 @@ import { Writable } from "node:stream";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools, type IdentityManager } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools, type IdentityManager } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import {
   ReputationStore,
-} from "../../src/l4-reputation/reputation-store.js";
+} from "../../src/reputation/reputation-store.js";
 import {
   ExitBundleImportError,
   exitBundleManifestShape,

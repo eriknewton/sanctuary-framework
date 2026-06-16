@@ -18,19 +18,19 @@ import { join } from "node:path";
 import {
   TokenIssuer,
   type SkillSecretGrant,
-} from "../../../src/l3-disclosure/broker/token-issuer.js";
-import { Broker } from "../../../src/l3-disclosure/broker/broker.js";
+} from "../../../src/disclosure/broker/token-issuer.js";
+import { Broker } from "../../../src/disclosure/broker/broker.js";
 import {
   openBroker,
   saveBrokerPolicy,
-} from "../../../src/l3-disclosure/broker/open.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+} from "../../../src/disclosure/broker/open.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import type {
   Backend,
-} from "../../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../../src/l3-disclosure/broker/backend-interface.js";
+} from "../../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../../src/disclosure/broker/backend-interface.js";
 
 function makeFakeBackend(secrets: Record<string, string>): Backend {
   const store = new Map(Object.entries(secrets));

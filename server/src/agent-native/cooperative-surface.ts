@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
-import { buildAgentSearchCorpus } from "../l2-operational/agent-audit-redaction.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
+import { buildAgentSearchCorpus } from "../operational/agent-audit-redaction.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {

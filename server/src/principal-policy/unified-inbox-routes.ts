@@ -51,7 +51,7 @@ export interface UnifiedInboxRouterDeps {
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
   prefsStore?: UnifiedInboxPrefsStore;
-  auditLog?: import("../l2-operational/audit-log.js").AuditLog;
+  auditLog?: import("../operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;
 }

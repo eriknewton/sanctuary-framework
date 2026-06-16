@@ -19,10 +19,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 /**
  * Mirrors the identity bootstrap block in wrap/cli.ts (both the

@@ -87,7 +87,7 @@ import {
   type ListTasksFilter,
   type Task,
   type UpdateTaskStatusInput,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 
 type HubServiceTaskDeps = HubServiceDeps & {
   taskService?: TaskService;

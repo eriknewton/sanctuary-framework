@@ -6,7 +6,7 @@
  * calls acceptRecommendation().
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { AUTO_TRIGGER_AUDIT_OPS, type ActionDispatcher } from "./action-dispatcher.js";
 import type { ThresholdConfigStore } from "./threshold-config-store.js";
 import type {

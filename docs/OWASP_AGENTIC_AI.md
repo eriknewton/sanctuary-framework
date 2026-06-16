@@ -75,7 +75,7 @@ scope, wrong context, or under adversarial prompt influence.
 - Tier 2 flags behavioral anomalies: new namespaces, new
   counterparties, frequency spikes, bulk reads. These escalate to
   approval.
-- The **Call Governor** (`l2-operational/call-governor.ts`) enforces
+- The **Call Governor** (`operational/call-governor.ts`) enforces
   per-tool and per-upstream rate limits.
 - The **Context Gate Enforcer** wraps every tool handler and filters
   outbound arguments per a provider-specific policy.
@@ -157,7 +157,7 @@ compounding errors across an agent mesh.
 **Mechanism.**
 - **Sovereignty-gated reputation tiers** weight attestations from
   verified-sovereign agents (tier 1.0) above self-attested (0.2) and
-  unverified (0.2) sources (`l4-reputation/tiers.ts`).
+  unverified (0.2) sources (`reputation/tiers.ts`).
 - **Reputation queries use tier-weighted scoring** so a claim from a
   low-tier agent does not carry the same authority as one from a
   handshake-verified peer.
@@ -214,7 +214,7 @@ the user, or conceals relevant information.
 **Coverage:** not-addressed (at the intent level); partial (at the audit level)
 
 **Mechanism.**
-- **Tamper-evident audit log** (`l2-operational/audit-log.ts`):
+- **Tamper-evident audit log** (`operational/audit-log.ts`):
   every tool call, approval decision, and denial is appended to an
   encrypted audit trail that can be exported and reviewed.
 - **Signed attestations** (Verifiable Reputation): all reputation attestations are

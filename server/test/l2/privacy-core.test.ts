@@ -3,9 +3,9 @@ import {
   LocalPrivacyEngine,
   PrivacyPolicyStore,
   type PrivacyPolicy,
-} from "../../src/l2-operational/privacy-core.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/privacy-core.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString } from "../../src/core/encoding.js";

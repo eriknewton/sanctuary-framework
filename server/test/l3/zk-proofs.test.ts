@@ -13,7 +13,7 @@ import {
   verifyProofOfKnowledge,
   createRangeProof,
   verifyRangeProof,
-} from "../../src/l3-disclosure/zk-proofs.js";
+} from "../../src/disclosure/zk-proofs.js";
 
 describe("Zero-Knowledge Proofs (Ristretto255)", () => {
   // ── Pedersen Commitments ─────────────────────────────────────────────

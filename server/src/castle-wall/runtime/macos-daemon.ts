@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
-import type { AuditLog } from "../../l2-operational/audit-log.js";
+import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
 import { composeEffectiveRules } from "../allowlist/habeas-port.js";

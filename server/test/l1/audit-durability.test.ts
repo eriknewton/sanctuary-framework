@@ -2,12 +2,12 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 import {
   AuditLog,
   AuditPersistenceError,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
@@ -179,7 +179,7 @@ describe("L1 audit durability", () => {
   it("keeps the L1 critical operation list off best-effort append()", () => {
     const thisDir = dirname(fileURLToPath(import.meta.url));
     const source = readFileSync(
-      join(thisDir, "../../src/l1-cognitive/tools.ts"),
+      join(thisDir, "../../src/cognitive/tools.ts"),
       "utf-8"
     );
     expect(source).toContain('operation: "audit_event_sign" | "internal_receipt_sign"');

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import { runAutoTriggerCommand } from "../../src/cli/auto-trigger.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];

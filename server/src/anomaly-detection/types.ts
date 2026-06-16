@@ -32,7 +32,7 @@
  * detector. Chi-2 through Chi-N expand.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type {
   SentinelFinding,

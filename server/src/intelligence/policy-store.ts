@@ -2,7 +2,7 @@
  * Sanctuary MCP Server — Intelligence Substrate Config Store
  *
  * Encrypted persistence for the operator's substrate selection. Mirrors the
- * ContextGatePolicyStore pattern (`l2-operational/context-gate.ts`) but
+ * ContextGatePolicyStore pattern (`operational/context-gate.ts`) but
  * simpler: substrate config is a single per-fortress record, not a
  * multi-policy collection.
  *

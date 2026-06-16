@@ -7,14 +7,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { createContextGateTools } from "../../src/l2-operational/context-gate-tools.js";
+import { createContextGateTools } from "../../src/operational/context-gate-tools.js";
 import {
   buildContextGateCombinedStatus,
   initializeContextGateEnforcerFromProfile,
-} from "../../src/l2-operational/context-gate-tools.js";
+} from "../../src/operational/context-gate-tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { createDefaultProfile } from "../../src/sovereignty-profile.js";
 
 function setup() {

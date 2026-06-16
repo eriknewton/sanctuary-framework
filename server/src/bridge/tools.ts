@@ -10,12 +10,12 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
-import { ReputationStore } from "../l4-reputation/reputation-store.js";
-import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../l4-reputation/tiers.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../reputation/tiers.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";

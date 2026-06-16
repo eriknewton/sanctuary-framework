@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { aggregateActivity } from "../../src/hub/activity-feed.js";
 
 const IDENTITY_ID = "operator-attestation-projection-001";

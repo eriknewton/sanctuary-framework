@@ -25,11 +25,11 @@ import { generateRandomKey } from "../src/core/random.js";
 import { encrypt } from "../src/core/encryption.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
 import { stringToBytes } from "../src/core/encoding.js";
-import { AuditLog } from "../src/l2-operational/audit-log.js";
+import { AuditLog } from "../src/operational/audit-log.js";
 import {
   bindContextGateEnforcerToProfileStore,
   createContextGateTools,
-} from "../src/l2-operational/context-gate-tools.js";
+} from "../src/operational/context-gate-tools.js";
 import { createSovereigntyProfileTools } from "../src/sovereignty-profile-tools.js";
 
 function createStore(): { store: SovereigntyProfileStore; storage: MemoryStorage; masterKey: Uint8Array } {

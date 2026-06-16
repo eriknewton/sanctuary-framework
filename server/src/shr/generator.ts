@@ -6,7 +6,7 @@
  */
 
 import type { SanctuaryConfig } from "../config.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type {
   SHRBody,
   SignedSHR,
@@ -20,7 +20,7 @@ import { sign } from "../core/identity.js";
 import { toBase64url, stringToBytes, fromBase64url, bytesToString } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 
 /** Default SHR validity window: 1 hour */
 const DEFAULT_VALIDITY_MS = 60 * 60 * 1000;

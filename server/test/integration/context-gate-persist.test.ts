@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { SovereigntyProfileStore } from "../../src/sovereignty-profile.js";
 import {
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
-} from "../../src/l2-operational/context-gate-tools.js";
+} from "../../src/operational/context-gate-tools.js";
 
 describe("context gate restart persistence", () => {
   let tempDir: string | null = null;

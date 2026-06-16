@@ -33,8 +33,8 @@ import { join } from "node:path";
 
 import { defaultConfig, type SanctuaryConfig } from "../../config.js";
 import { exportExitBundle } from "../../exit/bundle.js";
-import type { AuditLog } from "../../l2-operational/audit-log.js";
-import { IdentityManager } from "../../l1-cognitive/tools.js";
+import type { AuditLog } from "../../operational/audit-log.js";
+import { IdentityManager } from "../../cognitive/tools.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
@@ -48,7 +48,7 @@ import {
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
-import type { ReputationStore } from "../../l4-reputation/reputation-store.js";
+import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
 import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StorageBackend } from "../../storage/interface.js";
@@ -67,7 +67,7 @@ import type {
 import {
   detectSensitiveSpans,
   detectorClassForSpan,
-} from "../../l2-operational/privacy-filter.js";
+} from "../../operational/privacy-filter.js";
 import { listTemplates } from "../../templates/registry.js";
 import {
   DID_WEB_AUDIT_OPS,
@@ -632,7 +632,7 @@ function buildConciergeContextLlmAssist(args: {
 /**
  * Tier 1 regex-only PII redactor for the concierge query path. Wraps
  * the existing `detectSensitiveSpans` shipped in
- * `l2-operational/privacy-filter.ts`. Tier 2 NER + LLM redaction lives
+ * `operational/privacy-filter.ts`. Tier 2 NER + LLM redaction lives
  * in the substrate-selector layer (substrate-routed); the concierge
  * surface invokes Tier 1 here as defense-in-depth pre-substrate.
  *

@@ -39,7 +39,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { fixedDenial, normalizedArgsHash } from "../agent-native/safety-base.js";
 import {

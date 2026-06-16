@@ -10,9 +10,9 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
-import { StateStore, isReservedNamespace, type StateEntry } from "../l1-cognitive/state-store.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import { StateStore, isReservedNamespace, type StateEntry } from "../cognitive/state-store.js";
+import type { IdentityManager } from "../cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { SanctuaryConfig } from "../config.js";
 import { defaultConfig, SANCTUARY_VERSION } from "../config.js";
@@ -62,7 +62,7 @@ import {
 import {
   ReputationStore,
   type ReputationBundle,
-} from "../l4-reputation/reputation-store.js";
+} from "../reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
 import {
   partitionByMemoryClass,

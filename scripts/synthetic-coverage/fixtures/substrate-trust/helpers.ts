@@ -1,6 +1,6 @@
-import { AuditLog } from "../../../../server/src/l2-operational/audit-log.js";
-import { createL1Tools } from "../../../../server/src/l1-cognitive/tools.js";
-import { StateStore } from "../../../../server/src/l1-cognitive/state-store.js";
+import { AuditLog } from "../../../../server/src/operational/audit-log.js";
+import { createL1Tools } from "../../../../server/src/cognitive/tools.js";
+import { StateStore } from "../../../../server/src/cognitive/state-store.js";
 import { generateRandomKey } from "../../../../server/src/core/random.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { ToolDefinition } from "../../src/router.js";
 import {

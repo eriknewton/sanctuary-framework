@@ -47,7 +47,7 @@
 
 import { randomUUID, createHash } from "node:crypto";
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type {
   PersistedInboxEntry,
   UnifiedInboxStore,

@@ -34,7 +34,7 @@ import { join } from "node:path";
 
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes } from "../core/encoding.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 
 /** Filename of the reset-history marker, sibling to the fortress storage path. */
 export const RESET_HISTORY_FILENAME = ".reset-history.log";

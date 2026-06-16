@@ -20,8 +20,8 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { IdentityManager } from "../cognitive/tools.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { DefaultPolicyGate } from "../key-17/policy-gate.js";

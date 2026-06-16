@@ -7,10 +7,10 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { createGovernorTools } from "../../src/l2-operational/governor-tools.js";
+import { createGovernorTools } from "../../src/operational/governor-tools.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 function makeGovernor(overrides: Partial<ReturnType<typeof defaultStatus>> = {}) {
   const status = { ...defaultStatus(), ...overrides };

@@ -25,7 +25,7 @@ import {
   MAX_PATTERNS_PER_ARRAY,
   type ContextGatePolicy,
   type ContextGateRule,
-} from "../../src/l2-operational/context-gate.js";
+} from "../../src/operational/context-gate.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

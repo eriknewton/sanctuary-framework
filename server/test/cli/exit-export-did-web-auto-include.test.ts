@@ -53,7 +53,7 @@ import {
 } from "../../src/core/key-derivation.js";
 import { stringToBytes } from "../../src/core/encoding.js";
 import { createIdentity } from "../../src/core/identity.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import type { FortressDidWebRecord } from "../../src/recognition/did-web.js";
 import type { ExitBundleManifest } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 

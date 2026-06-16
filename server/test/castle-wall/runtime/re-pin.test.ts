@@ -25,7 +25,7 @@ import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
   CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
 } from "../../../src/castle-wall/runtime/socket-path.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { encrypt } from "../../../src/core/encryption.js";

@@ -7,7 +7,7 @@
  * instead of the raw state primitives. safety-base.ts is the shared crypto
  * and approval-proof base (canonical JSON, sha256, approval envelopes,
  * session-identity resolution, opaque namespace handles) re-used across
- * distress, l1-cognitive, principal-policy, router, and sdw.
+ * distress, cognitive, principal-policy, router, and sdw.
  *
  * Re-exported here for external consumers; the facade calls primitive
  * tools through their public handlers only and holds no module state of

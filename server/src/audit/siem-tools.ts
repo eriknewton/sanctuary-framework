@@ -13,10 +13,10 @@
  */
 
 import type { ToolDefinition } from "../router.js";
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { SessionBinding } from "../agent-native/safety-base.js";
 import { formatAsCEF, formatAsOCSF, agentDecision } from "./siem-formatter.js";
-import { redactAuditEntryForAgent } from "../l2-operational/agent-audit-redaction.js";
+import { redactAuditEntryForAgent } from "../operational/agent-audit-redaction.js";
 
 export function createSIEMTools(
   auditLog: AuditLog,

@@ -24,7 +24,7 @@ import {
   RESET_HISTORY_FILENAME,
   type ResetHistoryMarker,
 } from "../../src/audit/reset-history.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

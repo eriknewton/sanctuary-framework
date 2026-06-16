@@ -1,4 +1,4 @@
-import type { AuditEntryInput } from "../../../../server/src/l2-operational/audit-log.js";
+import type { AuditEntryInput } from "../../../../server/src/operational/audit-log.js";
 import type { ToolDefinition } from "../../../../server/src/router.js";
 import type { UpstreamServer } from "../../../../server/src/sovereignty-profile.js";
 import type { UpstreamTool } from "../../../../server/src/proxy/client-manager.js";

@@ -64,7 +64,7 @@ import {
 } from "./anomaly-catalog.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "./types.js";
 import { ClassifierStateStore } from "./classifier-state-store.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 
 export const ANOMALY_API_PREFIX = "/api/anomaly";

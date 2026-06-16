@@ -33,7 +33,7 @@ import {
 import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
 import { parsePolicy } from "../../principal-policy/loader.js";
 import { readLockdownStatus } from "../../lockdown/status.js";
-import { AuditLog } from "../../l2-operational/audit-log.js";
+import { AuditLog } from "../../operational/audit-log.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
 import { resolveCliMasterKey } from "../../core/master-custody.js";
 import { readStoredPassphrase } from "../../wrap/passphrase.js";

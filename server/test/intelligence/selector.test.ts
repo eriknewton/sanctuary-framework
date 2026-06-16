@@ -21,7 +21,7 @@ import { describe, it, expect, vi } from "vitest";
 import { SubstrateSelector, IDENTITY_REDACTOR } from "../../src/intelligence/selector.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import { tradeoffTextHash } from "../../src/intelligence/templates.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import type { Surface } from "../../src/intelligence/types.js";

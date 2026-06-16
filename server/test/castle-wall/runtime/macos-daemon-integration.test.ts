@@ -7,7 +7,7 @@ import { Writable } from "node:stream";
 
 import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";
 import type { ArmLeaseNotification } from "../../../src/castle-wall/ipc/messages.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";

@@ -52,7 +52,7 @@ import {
   HABEAS_LOOPBACK_IPS,
 } from "../castle-wall/allowlist/habeas-port.js";
 import { canonicalJson, sha256 } from "../agent-native/safety-base.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { DistressInbox } from "./inbox.js";
 import {
   DISTRESS_REASONS,

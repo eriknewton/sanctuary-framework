@@ -282,7 +282,7 @@ describe("Standalone Dashboard", () => {
       host: "127.0.0.1",
     });
 
-    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
+    const { IdentityManager } = await import("../src/cognitive/tools.js");
     const { FilesystemStorage } = await import("../src/storage/filesystem.js");
     const { derivePurposeKey } = await import("../src/core/key-derivation.js");
     const { createIdentity } = await import("../src/core/identity.js");

@@ -116,7 +116,7 @@ Retention is operator-policy-driven only through `AuditLogConfig` at constructio
 
 Primary implementation files inspected:
 
-- `server/src/l2-operational/audit-log.ts`
+- `server/src/operational/audit-log.ts`
 - `server/src/core/key-derivation.ts`
 - `server/src/core/encryption.ts`
 - `server/src/storage/interface.ts`
@@ -126,7 +126,7 @@ Primary implementation files inspected:
 - `server/src/paths.ts`
 - `server/src/wrap/passphrase.ts`
 - `server/src/wrap/cli.ts`
-- `server/src/l3-disclosure/broker/open.ts`
+- `server/src/disclosure/broker/open.ts`
 - `server/src/cli/secrets.ts`
 - `server/src/audit/siem-tools.ts`
 - `server/src/dashboard/v1_1/wiring.ts`

@@ -28,7 +28,7 @@ import {
 } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import type { ApprovalRequest } from "../../src/principal-policy/types.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";

@@ -14,7 +14,7 @@
  *   - test files under server/test
  *   - barrel coverage: how many module dirs contain an index.ts (X of N)
  *   - top ~20 largest .ts files under server/src by line count (god-files)
- *   - per-layer importer counts for l1-cognitive .. l4-reputation
+ *   - per-layer importer counts for cognitive .. reputation
  *   - the repo-root .test-baseline value (REPO root, not server/)
  *
  * Dependency-free: Node built-ins plus child_process shell-outs to
@@ -43,10 +43,10 @@ const SERVER_TEST = join(SERVER_DIR, "test");
 const TEST_BASELINE_PATH = join(REPO_ROOT, ".test-baseline");
 
 const LAYER_DIRS = [
-  "l1-cognitive",
-  "l2-operational",
-  "l3-disclosure",
-  "l4-reputation",
+  "cognitive",
+  "operational",
+  "disclosure",
+  "reputation",
 ] as const;
 
 // ---- Arg parsing ----------------------------------------------------------
@@ -116,7 +116,7 @@ function lineCount(file: string): number {
 
 /**
  * Count files under server/src and server/test that reference a path string
- * (e.g. "l1-cognitive"). Shells out to grep, which the repo already does in
+ * (e.g. "cognitive"). Shells out to grep, which the repo already does in
  * other scripts. Returns the count of distinct matching files.
  */
 function layerImporterCount(needle: string): number {

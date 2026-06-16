@@ -38,7 +38,7 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
 import {

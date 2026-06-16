@@ -47,7 +47,7 @@ import {
 } from "../anomaly-detection/anomaly-subscription-store.js";
 import { ClassifierStateStore } from "../anomaly-detection/classifier-state-store.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "../anomaly-detection/types.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 
 export interface AnomalyArgs {
   argv: string[];

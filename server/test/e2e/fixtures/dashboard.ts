@@ -23,7 +23,7 @@ import {
 } from "node:http";
 
 import { MemoryStorage } from "../../../src/storage/memory.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { SubstrateSelector } from "../../../src/intelligence/selector.js";
 import { dispatchV11Request } from "../../../src/dashboard/v1_1/dispatch.js";

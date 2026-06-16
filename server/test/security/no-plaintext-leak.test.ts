@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey, deriveNamespaceKey } from "../../src/core/key-derivation.js";

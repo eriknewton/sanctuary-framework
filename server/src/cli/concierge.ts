@@ -6,10 +6,10 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { loadConfig } from "../config.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
-import { StateStore } from "../l1-cognitive/state-store.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
-import { TaskService } from "../l2-operational/task-coordination/index.js";
+import { IdentityManager } from "../cognitive/tools.js";
+import { StateStore } from "../cognitive/state-store.js";
+import { AuditLog } from "../operational/audit-log.js";
+import { TaskService } from "../operational/task-coordination/index.js";
 import {
   ConciergeReadError,
   ConciergeService,

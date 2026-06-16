@@ -13,14 +13,14 @@
  * Windows Credential Manager, Vault, etc.).
  *
  * Audit integration: every issuance, denial, and read generates an
- * AuditEntry at layer "l3". See BROKER_OPS in l2-operational/audit-log
+ * AuditEntry at layer "l3". See BROKER_OPS in operational/audit-log
  * for the operation-name catalog.
  */
 
 import { randomBytes } from "node:crypto";
 import type { Backend, SecretScope } from "./backend-interface.js";
-import type { AuditLog } from "../../l2-operational/audit-log.js";
-import { BROKER_OPS } from "../../l2-operational/audit-log.js";
+import type { AuditLog } from "../../operational/audit-log.js";
+import { BROKER_OPS } from "../../operational/audit-log.js";
 
 export const DEFAULT_TOKEN_TTL_SECONDS = 15 * 60;
 export const MAX_TOKEN_TTL_SECONDS = 60 * 60; // 1 hour cap

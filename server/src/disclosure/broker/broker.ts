@@ -12,12 +12,12 @@
  */
 
 import type { Backend } from "./backend-interface.js";
-import type { AuditLog, AuditEntry } from "../../l2-operational/audit-log.js";
-import { BROKER_OPS } from "../../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../../operational/audit-log.js";
+import { BROKER_OPS } from "../../operational/audit-log.js";
 import {
   redactAuditEntryForAgent,
   type AgentAuditView,
-} from "../../l2-operational/agent-audit-redaction.js";
+} from "../../operational/agent-audit-redaction.js";
 import {
   TokenIssuer,
   type SkillSecretGrant,

@@ -33,7 +33,7 @@ import { encrypt } from "../../src/core/encryption.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import { randomBytes } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const execFileAsync = promisify(execFile);

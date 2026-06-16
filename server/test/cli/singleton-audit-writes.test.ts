@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { runAgentsCommand } from "../../src/cli/agents/cli.js";
 import { runDidWebCommand } from "../../src/cli/did-web.js";
 import { runTemplateCommand } from "../../src/templates/cli.js";

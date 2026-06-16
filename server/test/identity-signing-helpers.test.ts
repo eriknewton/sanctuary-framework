@@ -3,7 +3,7 @@ import { sign as identitySign, verify as identityVerify } from "../src/core/iden
 import { fromBase64url, stringToBytes, toBase64url } from "../src/core/encoding.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
 import { generateRandomKey } from "../src/core/random.js";
-import { StateStore } from "../src/l1-cognitive/state-store.js";
+import { StateStore } from "../src/cognitive/state-store.js";
 import {
   AUDIT_EVENT_SIGNING_DOMAIN,
   INTERNAL_RECEIPT_SIGNING_DOMAIN,
@@ -11,8 +11,8 @@ import {
   domainSeparatedSigningBytes,
   type AuditEventSigningPayload,
   type InternalReceiptSigningPayload,
-} from "../src/l1-cognitive/tools.js";
-import { AuditLog } from "../src/l2-operational/audit-log.js";
+} from "../src/cognitive/tools.js";
+import { AuditLog } from "../src/operational/audit-log.js";
 import { MemoryStorage } from "../src/storage/memory.js";
 
 async function callTool(

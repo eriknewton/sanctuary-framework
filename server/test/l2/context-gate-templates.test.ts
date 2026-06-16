@@ -21,13 +21,13 @@ import {
   INFERENCE_STANDARD,
   LOGGING_STRICT,
   TOOL_API_SCOPED,
-} from "../../src/l2-operational/context-gate-templates.js";
+} from "../../src/operational/context-gate-templates.js";
 import {
   classifyField,
   recommendPolicy,
-} from "../../src/l2-operational/context-gate-recommend.js";
-import { filterContext } from "../../src/l2-operational/context-gate.js";
-import type { ContextGatePolicy } from "../../src/l2-operational/context-gate.js";
+} from "../../src/operational/context-gate-recommend.js";
+import { filterContext } from "../../src/operational/context-gate.js";
+import type { ContextGatePolicy } from "../../src/operational/context-gate.js";
 
 // Helper to create a policy from a template for filterContext testing
 function policyFromTemplate(

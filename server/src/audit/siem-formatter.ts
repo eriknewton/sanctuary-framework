@@ -23,7 +23,7 @@
  * recommendation for the operator (see siem-tools.ts).
  */
 
-import type { AgentAuditView } from "../l2-operational/agent-audit-redaction.js";
+import type { AgentAuditView } from "../operational/agent-audit-redaction.js";
 
 // ── Coarse decision (agent-safe) ────────────────────────────────────────
 

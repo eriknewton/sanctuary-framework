@@ -266,7 +266,7 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
       "../../src/core/master-custody.js"
     );
     const { AuditLog } = await import(
-      "../../src/l2-operational/audit-log.js"
+      "../../src/operational/audit-log.js"
     );
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const { masterKey } = await establishMaster({ storage, recoveryKey });

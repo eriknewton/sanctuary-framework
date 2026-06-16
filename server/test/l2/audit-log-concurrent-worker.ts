@@ -1,4 +1,4 @@
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { fromHex } from "./audit-log-test-encoding.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 

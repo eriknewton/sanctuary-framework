@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CallGovernor } from "../../src/l2-operational/call-governor.js";
+import { CallGovernor } from "../../src/operational/call-governor.js";
 
 describe("CallGovernor", () => {
   let governor: CallGovernor;

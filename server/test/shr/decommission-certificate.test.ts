@@ -20,7 +20,7 @@ import {
 import type {
   SignedDecommissionCertificate,
 } from "../../src/shr/decommission-types.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 
 // Minimal IdentityManager mock
 class TestIdentityManager {

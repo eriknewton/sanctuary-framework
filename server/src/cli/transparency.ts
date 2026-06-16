@@ -26,7 +26,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   AuditIntegrityError,
   AuditLog,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";

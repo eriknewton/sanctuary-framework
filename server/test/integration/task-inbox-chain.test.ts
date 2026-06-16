@@ -3,16 +3,16 @@ import { describe, expect, it } from "vitest";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { TaskService } from "../../src/l2-operational/task-coordination/index.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { TaskService } from "../../src/operational/task-coordination/index.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
   type HubAgentController,
 } from "../../src/hub/index.js";
-import type { Task } from "../../src/l2-operational/task-coordination/index.js";
+import type { Task } from "../../src/operational/task-coordination/index.js";
 
 const controller: HubAgentController = {
   async pause() {

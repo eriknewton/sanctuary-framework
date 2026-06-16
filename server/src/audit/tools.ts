@@ -14,7 +14,7 @@ import {
   AuditIntegrityError,
   type AuditIntegrityFinding,
   type AuditLog,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import { detectEnvironment } from "./detector.js";
 import { analyzeSovereignty, formatAuditReport } from "./analyzer.js";
 import type { AuditSubsystemHealth } from "./types.js";

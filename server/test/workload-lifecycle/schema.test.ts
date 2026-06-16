@@ -11,7 +11,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { canonicalJson, sha256Hex } from "../../src/audit/chain.js";
 import { SANCTUARY_DISTRESS_OPERATION } from "../../src/distress/tools.js";

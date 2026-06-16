@@ -47,10 +47,10 @@ const ALLOWED_BARRELLESS = [
   "cli", // command-handler surface, not a re-exportable module
   "compliance", // nests its code under eu_ai_act/
   "contracts", // per-version barrels only; a top-level one would merge frozen wire versions
-  "l1-cognitive",
-  "l2-operational",
-  "l3-disclosure",
-  "l4-reputation",
+  "cognitive",
+  "disclosure",
+  "operational",
+  "reputation",
   "v1", // versioned HTTP route surface, not a re-exportable module
 ].sort();
 

@@ -102,7 +102,7 @@ describe("CLI audit-write inventory", () => {
 
   it("routes policy changes, egress denials, and identity exports through appendCritical", () => {
     const contextGateTools = readFileSync(
-      resolve(import.meta.dirname, "..", "..", "src", "l2-operational", "context-gate-tools.ts"),
+      resolve(import.meta.dirname, "..", "..", "src", "operational", "context-gate-tools.ts"),
       "utf-8",
     );
     const sanctuaryTools = readFileSync(

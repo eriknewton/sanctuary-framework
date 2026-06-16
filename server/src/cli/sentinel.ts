@@ -33,7 +33,7 @@ import {
 } from "../sentinel/subscription-store.js";
 import { PHI1_BASELINE_CATALOG } from "../sentinel/sentinels/index.js";
 import type { SentinelSeverity } from "../sentinel/types.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 
 export interface SentinelArgs {
   argv: string[];

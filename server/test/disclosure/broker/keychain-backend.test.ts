@@ -24,12 +24,12 @@ import {
   brokerKeychainIdentityFor,
   KeychainBackend,
   legacyBrokerKeychainIdentity,
-} from "../../../src/l3-disclosure/broker/keychain-backend.js";
+} from "../../../src/disclosure/broker/keychain-backend.js";
 import {
   BackendLockedError,
   BackendUnavailableError,
   SecretNotFoundError,
-} from "../../../src/l3-disclosure/broker/backend-interface.js";
+} from "../../../src/disclosure/broker/backend-interface.js";
 
 const isDarwin = process.platform === "darwin";
 const PP = "test-passphrase-93a4e71f";

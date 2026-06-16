@@ -34,8 +34,8 @@ import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
@@ -377,7 +377,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handoffContextTransfer: ContextTransferExtractorDeps | null = null;
   private workflowStateTracker: WorkflowStateTracker | null = null;
   private handoffAuditLog:
-    | import("../l2-operational/audit-log.js").AuditLog
+    | import("../operational/audit-log.js").AuditLog
     | null = null;
   private handoffOperatorId: string | null = null;
   // v1.3 WP-V1.3-5 Pi-1 Honeypot Authoring: per-fortress trap registry
@@ -387,7 +387,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private honeypotRegistry: TrapRegistry | null = null;
   private honeypotFindingStore: SentinelFindingStore | null = null;
   private honeypotAuditLog:
-    | import("../l2-operational/audit-log.js").AuditLog
+    | import("../operational/audit-log.js").AuditLog
     | null = null;
   private honeypotOperatorId: string | null = null;
   private honeypotFortressId: string | null = null;
@@ -531,7 +531,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   setHandoffLog(opts: {
     handoffLog: HandoffLog | null;
     eventBridge?: HandoffEventBridge | null;
-    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    auditLog?: import("../operational/audit-log.js").AuditLog | null;
     operatorId?: string | null;
     /**
      * v1.3 WP-V1.3-3 Omega-2: context-transfer extractor deps. When
@@ -573,7 +573,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   setHoneypotRegistry(opts: {
     registry: TrapRegistry | null;
     findingStore?: SentinelFindingStore | null;
-    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    auditLog?: import("../operational/audit-log.js").AuditLog | null;
     operatorId?: string | null;
     fortressId?: string | null;
     selector?: import("../intelligence/selector.js").SubstrateSelector | null;

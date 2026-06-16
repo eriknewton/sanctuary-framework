@@ -19,14 +19,14 @@ This delta review audited all changes to `server/src/` since the previous full a
 |-----------|-------|------------|
 | Standalone Dashboard | `dashboard-standalone.ts` | Medium — new entry point with auth |
 | Injection Detector | `security/injection-detector.ts` | Medium — security subsystem |
-| Context Gate Enforcer | `l2-operational/context-gate-enforcer.ts` | Medium — wraps all tools |
+| Context Gate Enforcer | `operational/context-gate-enforcer.ts` | Medium — wraps all tools |
 | Handshake Attestation | `handshake/attestation.ts` | Low — Ed25519 signing, well-structured |
-| L2 Hardening | `l2-operational/hardening.ts`, `hardening-tools.ts` | Low — read-only diagnostic |
-| Model Provenance | `l2-operational/model-provenance.ts` | Low — types + in-memory store |
+| L2 Hardening | `operational/hardening.ts`, `hardening-tools.ts` | Low — read-only diagnostic |
+| Model Provenance | `operational/model-provenance.ts` | Low — types + in-memory store |
 | Decommissioning | `shr/decommission-*.ts` | Low — certificate generation |
 | Gateway Adapter | `shr/gateway-adapter.ts` | Low — SHR transformation |
 | Update Checker | `update-check.ts` | Low — hardcoded URL, 32KB cap |
-| Verascore Publish | `l4-reputation/tools.ts` (reputation_publish) | **High** — outbound HTTP, signing |
+| Verascore Publish | `reputation/tools.ts` (reputation_publish) | **High** — outbound HTTP, signing |
 
 ---
 

@@ -47,7 +47,7 @@ source:
 | Property | Mechanism | Verifiable via |
 |---|---|---|
 | Automatic capture on every tool call | `router.ts` wraps all tool invocations through `ApprovalGate.evaluate()`; the gate appends an audit entry on every outcome path (`gate_allow`, `gate_allow_proxy`, `gate_deny`, `gate_escalate`, `gate_unclassified`, `injection_detected`) | Source: `server/src/router.ts`, `server/src/principal-policy/gate.ts` |
-| Append-only API | The `AuditLog` class exposes only `append()` and read methods (`query()`, `size`). No update or delete method is exposed. | Source: `server/src/l2-operational/audit-log.ts` |
+| Append-only API | The `AuditLog` class exposes only `append()` and read methods (`query()`, `size`). No update or delete method is exposed. | Source: `server/src/operational/audit-log.ts` |
 | Confidentiality at rest | AES-256-GCM authenticated encryption with an HKDF-derived per-purpose key (`audit-log` purpose string) | Source: `server/src/core/encryption.ts`, `server/src/core/key-derivation.ts` |
 | SIEM-compatible export | CEF (Common Event Format, newline-delimited) and OCSF (Open Cybersecurity Schema Framework, JSON array) emitted by the `audit_export_siem` tool | Run: `audit_export_siem` with `format: "cef"` or `format: "ocsf"` |
 | Gate decision taxonomy | Every entry carries a structured operation string prefixed with `gate_*` or `injection_detected:`, directly filterable via the `filter_decision` and `operation_type` parameters | Run: `audit_export_siem` with `filter_decision` set |

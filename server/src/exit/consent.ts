@@ -2,7 +2,7 @@
  * Sanctuary exit machinery — Slice 1: first-class consent + exit tombstone.
  *
  * Two first-class, audited surfaces, both anchored into the existing
- * hash-linked audit chain (`l2-operational/audit-log.ts`) so neither can be
+ * hash-linked audit chain (`operational/audit-log.ts`) so neither can be
  * silently removed after the fact:
  *
  *   1. CONSENT RELEASE — the mutual-agreement lever. An operator may deem a
@@ -26,7 +26,7 @@
  * adjacent.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes } from "../core/encoding.js";
 import type { MemoryClass } from "./memory-class.js";

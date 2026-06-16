@@ -18,7 +18,7 @@ import { deepSortKeys } from "../shr/types.js";
 import { sign } from "../core/identity.js";
 import { toBase64url, stringToBytes } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 
 // ── Attestation Types ───────────────────────────────────────────────
 

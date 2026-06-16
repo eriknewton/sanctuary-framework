@@ -30,7 +30,7 @@
  * tool is not and must not call it on raw (unredacted) entries.
  */
 
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 import type { DecisionValue } from "../ipc/messages.js";
 
 /**

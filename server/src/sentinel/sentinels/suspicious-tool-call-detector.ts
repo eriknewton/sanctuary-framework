@@ -72,7 +72,7 @@ import {
   type SentinelFinding,
   type SentinelSeverity,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 
 export const SUSPICIOUS_TOOL_CALL_SENTINEL_ID =
   "suspicious-tool-call" as const;

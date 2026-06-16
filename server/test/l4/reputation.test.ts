@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { ReputationStore } from "../../src/l4-reputation/reputation-store.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {

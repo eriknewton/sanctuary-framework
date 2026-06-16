@@ -5,7 +5,7 @@
  * entry shape while making each operator-attention producer explicit.
  */
 
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import type { CastleWallAuditEvent } from "../castle-wall/audit/events.js";
 import type {
   UnifiedInboxBridge,

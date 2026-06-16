@@ -34,7 +34,7 @@
 
 import type { LifecycleEvent } from "../agent-contract/types.js";
 import type { SignedEvent } from "../mesh/types.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { lifecycleOpForState } from "./constants.js";
 import {
   WORKLOAD_LIFECYCLE_SCHEMA,

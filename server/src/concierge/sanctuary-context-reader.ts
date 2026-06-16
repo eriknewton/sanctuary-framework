@@ -1,14 +1,14 @@
 import type { SanctuaryConfig } from "../config.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { PublicIdentity } from "../core/identity.js";
-import type { StateStore } from "../l1-cognitive/state-store.js";
+import type { StateStore } from "../cognitive/state-store.js";
 import {
   TASK_STATUSES,
   TaskService,
   type Task,
   type TaskStatus,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 import type {
   HubInboxSources,
   HubPolicyAndBudgetSources,

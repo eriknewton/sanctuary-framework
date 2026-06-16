@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runAuditCommand, parseSearchOptions } from "../../src/cli/audit.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import { bytesToString, stringToBytes } from "../../src/core/encoding.js";

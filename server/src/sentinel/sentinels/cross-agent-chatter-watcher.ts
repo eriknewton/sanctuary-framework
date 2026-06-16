@@ -40,7 +40,7 @@
 
 import { Sentinel } from "../sentinel.js";
 import type { SentinelFinding } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 
 export const CROSS_AGENT_CHATTER_SENTINEL_ID = "cross-agent-chatter" as const;
 

@@ -35,7 +35,7 @@ import {
 import {
   AuditLog,
   type AuditEntry,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 
 function stubAuditLog(entries: AuditEntry[]): AuditLog {
   return {

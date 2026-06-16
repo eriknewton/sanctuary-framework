@@ -34,8 +34,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { toolResult, type ToolDefinition } from "../router.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { InternalIdentitySigningHelpers } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { InternalIdentitySigningHelpers } from "../cognitive/tools.js";
 import { canonicalJson, sha256 } from "../agent-native/safety-base.js";
 import { signPayload } from "../principal-policy/webhook.js";
 import type { DistressConfig } from "./config.js";

@@ -21,9 +21,9 @@ import {
 import {
   redactAuditEntryForAgent,
   buildAgentSearchCorpus,
-} from "../../src/l2-operational/agent-audit-redaction.js";
-import type { AuditEntry } from "../../src/l2-operational/audit-log.js";
-import type { AgentAuditView } from "../../src/l2-operational/agent-audit-redaction.js";
+} from "../../src/operational/agent-audit-redaction.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import type { AgentAuditView } from "../../src/operational/agent-audit-redaction.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 

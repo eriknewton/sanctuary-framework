@@ -441,7 +441,7 @@ export async function isRollbackFrozenWithRecompute(
   // master-custody (which dynamically imports this module).
   const { readEnvelopeEpoch } = await import("./master-custody.js");
   const { readCustodyEpochCount, probeAuditHeadAnchor, deriveAuditEpochKeys } =
-    await import("../l2-operational/audit-log.js");
+    await import("../operational/audit-log.js");
 
   const epochKeys = deriveAuditEpochKeys(master);
   let rotationEpochCount = 0;

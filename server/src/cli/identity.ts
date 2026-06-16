@@ -13,7 +13,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
+import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 

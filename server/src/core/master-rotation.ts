@@ -18,7 +18,7 @@
  *  2. HKDF namespace keys (`deriveNamespaceKey`) encrypting user state
  *     entries — whose ciphertext is SIGNED by the writer identity, so each
  *     entry is re-encrypted AND re-signed with the writer's resident key
- *     (l1-cognitive/state-store.ts `rotateStateEntryBytes`).
+ *     (cognitive/state-store.ts `rotateStateEntryBytes`).
  *  3. Master-keyed MACs over plaintext policy records — state version
  *     anchors, audit rotation/head anchors, transparency anchor config +
  *     counter floor → verified under the old master, restamped under the new.
@@ -109,7 +109,7 @@ import {
   readAuditEpochEntries,
   writeAuditEpochRecord,
   AUDIT_EPOCH_KEYS_KEY,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import { writeEpochWitness } from "./anti-rollback.js";
 import {
   rotateStateEntryBytes,
@@ -117,7 +117,7 @@ import {
   STATE_META_PUBLIC_KEYS_KEY,
   STATE_META_VERSION_ANCHORS_KEY,
   type RotationWriterMaterial,
-} from "../l1-cognitive/state-store.js";
+} from "../cognitive/state-store.js";
 import type { StoredIdentity } from "./identity.js";
 
 // ── Errors ──────────────────────────────────────────────────────────

@@ -3,11 +3,11 @@ import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
 import { CallbackApprovalChannel } from "../../src/principal-policy/approval-channel.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
 import {
   classifyApprovalRequest,
   fixedDenial,

@@ -28,7 +28,7 @@ import {
   renderTenantDiscoveryHint,
 } from "../src/dashboard-standalone.js";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
-import { IdentityManager } from "../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../src/cognitive/tools.js";
 import { FilesystemStorage } from "../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../src/core/key-derivation.js";
 import { createIdentity } from "../src/core/identity.js";

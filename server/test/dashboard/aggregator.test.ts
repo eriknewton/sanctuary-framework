@@ -7,9 +7,9 @@
 import { describe, it, expect } from "vitest";
 import { getProtectionSnapshot } from "../../src/dashboard/aggregator.js";
 import type { AggregatorSources } from "../../src/dashboard/aggregator.js";
-import type { AuditEntry } from "../../src/l2-operational/audit-log.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
-import type { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
+import type { IdentityManager } from "../../src/cognitive/tools.js";
 import type { PublicIdentity, StoredIdentity } from "../../src/core/identity.js";
 
 function stubIdentity(overrides: Partial<PublicIdentity> = {}): StoredIdentity {

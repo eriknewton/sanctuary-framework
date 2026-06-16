@@ -24,7 +24,7 @@ import type { AddressInfo } from "node:net";
 import {
   AuditLog,
   type AuditEntry,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import {
   COORDINATION_VIEW_AUDIT_OPS,
   HandoffLog,

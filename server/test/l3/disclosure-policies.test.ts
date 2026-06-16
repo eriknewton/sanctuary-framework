@@ -17,7 +17,7 @@ import {
   PolicyStore,
   type DisclosurePolicy,
   type DisclosureRule,
-} from "../../src/l3-disclosure/policies.js";
+} from "../../src/disclosure/policies.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

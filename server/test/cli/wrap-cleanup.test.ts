@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runWrap, type DashboardStarter, type RunWrapDeps } from "../../src/wrap/cli.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 
 describe("wrap CLI cleanup", () => {
   let tempHome: string | undefined;

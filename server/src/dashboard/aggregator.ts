@@ -10,15 +10,15 @@
  * safe to call repeatedly — callers control freshness.
  */
 
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
 export type OverallStatus = "healthy" | "degraded" | "compromised";
@@ -180,7 +180,7 @@ export interface AggregatorSources {
    * Pre-computed L4 reputation evidence for the primary identity. When
    * present the dashboard renders the evidence widget under the L4 tile
    * and computes an SHR-aligned L4 layer score. Providers build this
-   * via `gatherL4Evidence` from `shr/tools.ts`.
+   * via `gatherReputationEvidence` from `shr/tools.ts`.
    */
   l4Evidence?: ReputationEvidence;
   /** Clock override for deterministic staleness rendering in tests. */

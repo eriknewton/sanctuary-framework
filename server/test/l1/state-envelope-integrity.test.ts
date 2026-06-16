@@ -14,9 +14,9 @@ import {
   StateStore,
   StateVerificationError,
   type StateEntry,
-} from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+} from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 type ToolResult = { content: Array<{ type: string; text: string }> };

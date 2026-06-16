@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/l2-operational/audit-log.js";
+import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import { bytesToString } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";

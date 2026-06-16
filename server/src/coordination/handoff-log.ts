@@ -43,7 +43,7 @@
 
 import { createHash } from "node:crypto";
 
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 
 /** Audit operations the HandoffLog reads. */
 export const HANDOFF_LOG_OBSERVED_OPS = {

@@ -23,7 +23,7 @@ import {
   type TierBAdapterParams,
 } from "../../src/agent-contract/adapters/cline.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { canonicalJson, sha256Hex } from "../../src/audit/chain.js";
 import { buildPolicyBlobBytes, buildTestFortress } from "../agent-contract/fixture.js";

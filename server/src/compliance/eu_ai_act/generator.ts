@@ -34,8 +34,8 @@ function bytesToHex(bytes: Uint8Array): string {
   return hex;
 }
 import type { SanctuaryConfig } from "../../config.js";
-import type { IdentityManager } from "../../l1-cognitive/tools.js";
-import type { AuditLog, AuditEntry } from "../../l2-operational/audit-log.js";
+import type { IdentityManager } from "../../cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../../operational/audit-log.js";
 import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StoredIdentity } from "../../core/identity.js";
 import type { ToolDefinition } from "../../router.js";
@@ -910,7 +910,7 @@ function renderDelta(
 
 /**
  * Allowed Verascore hostnames for the SSRF allow-list. Matches the
- * set used by `reputation_publish` in `src/l4-reputation/tools.ts`.
+ * set used by `reputation_publish` in `src/reputation/tools.ts`.
  * Mirrored here rather than imported so the compliance generator
  * does not couple to the reputation module's internals.
  */

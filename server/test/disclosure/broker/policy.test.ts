@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseBrokerPolicy } from "../../../src/l3-disclosure/broker/policy.js";
+import { parseBrokerPolicy } from "../../../src/disclosure/broker/policy.js";
 
 describe("parseBrokerPolicy", () => {
   it("returns empty when skills section absent", () => {
