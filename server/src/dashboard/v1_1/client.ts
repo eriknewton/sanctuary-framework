@@ -253,6 +253,20 @@ async function autoTriggerApi(path, opts) {
   return body;
 }
 
+async function createStreamSessionQuery() {
+  if (!TOKEN) return "";
+  const res = await fetch("/auth/session", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + TOKEN },
+    cache: "no-store"
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) throw new Error(body && body.error ? body.error : ("HTTP " + res.status));
+  if (!body || !body.session_id || body.session_id === "no-auth") return "";
+  return "?session=" + encodeURIComponent(body.session_id);
+}
+
 function toast(message, kind) {
   const host = document.getElementById("toast-host");
   if (!host) return;
@@ -2576,9 +2590,10 @@ async function onTemplateBind(agentId) {
 function connectStream() {
   let es = null;
   let reconnectTimer = null;
-  function open() {
+  async function open() {
     try {
-      const url = TOKEN ? STREAM + "?token=" + encodeURIComponent(TOKEN) : STREAM;
+      const sessionQuery = await createStreamSessionQuery();
+      const url = STREAM + sessionQuery;
       es = new EventSource(url);
     } catch (e) { schedulePolling(); return; }
     es.addEventListener("snapshot", function () { /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });
@@ -2631,11 +2646,11 @@ function connectStream() {
         reconnectTimer = null;
         await fetchAll();
         rerender();
-        open();
+        void open();
       }, 1000);
     };
   }
-  open();
+  void open();
 }
 
 // Polling fallback compiled-in but not user-facing. Activated by build-time

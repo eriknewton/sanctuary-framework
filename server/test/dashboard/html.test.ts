@@ -263,6 +263,16 @@ describe("renderDashboardHTML", () => {
     expect(html).toContain('AUTH_TOKEN = "tok-abc"');
   });
 
+  it("does not construct long-lived token URLs for API calls or SSE", () => {
+    const html = renderDashboardHTML({
+      snapshot: makeSnapshot(),
+      authToken: "tok-abc",
+    });
+    expect(html).not.toContain("?token=");
+    expect(html).toContain("/auth/session");
+    expect(html).toContain("?session=");
+  });
+
   // ─── v0.9.1: L4 evidence widget ──────────────────────────────────
   describe("L4 evidence widget", () => {
     function snapshotWithEvidence() {

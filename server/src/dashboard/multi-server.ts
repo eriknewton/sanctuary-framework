@@ -58,7 +58,8 @@ function extractToken(
   if (header && header.startsWith("Bearer ")) {
     return header.slice(7).trim();
   }
-  return url.searchParams.get("token");
+  void url;
+  return null;
 }
 
 export async function startMultiDashboardServer(

@@ -87,10 +87,10 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(200);
   });
 
-  it("returns 200 when auth token is provided via ?token= query param", async () => {
+  it("rejects auth token provided via ?token= query param", async () => {
     handle = await startForTest({ authToken: "secret-xyz" });
     const res = await fetch(`${handle.url}/api/snapshot?token=secret-xyz`);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
   });
 
   it("rejects approve/deny when no approval handler is configured", async () => {
@@ -116,6 +116,62 @@ describe("Dashboard HTTP API", () => {
     expect(denied).toEqual(["xyz"]);
   });
 
+  it("rejects approval mutation auth via long-lived ?token= query param", async () => {
+    const allowed: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow?token=secret-xyz`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+    expect(allowed).toEqual([]);
+  });
+
+  it("accepts approval mutation auth via Authorization header", async () => {
+    const allowed: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    expect(allowed).toEqual(["abc"]);
+  });
+
+  it("accepts approval mutation auth via a valid short-lived session", async () => {
+    const allowed: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async () => true,
+      },
+    });
+    const sessionRes = await fetch(`${handle.url}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(sessionRes.status).toBe(200);
+    const session = await sessionRes.json() as { session_id: string };
+    const res = await fetch(
+      `${handle.url}/api/approvals/abc/allow?session=${encodeURIComponent(session.session_id)}`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(200);
+    expect(allowed).toEqual(["abc"]);
+  });
+
   it("emits an initial 'snapshot' event on SSE connect", async () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/api/stream`);
@@ -131,6 +187,31 @@ describe("Dashboard HTTP API", () => {
     }
     expect(buf).toContain("event: snapshot");
     expect(buf).toContain("\"layers\"");
+    await reader.cancel();
+  });
+
+  it("authenticates SSE with a short-lived session URL", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const sessionRes = await fetch(`${handle.url}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(sessionRes.status).toBe(200);
+    const session = await sessionRes.json() as { session_id: string };
+    const res = await fetch(
+      `${handle.url}/api/stream?session=${encodeURIComponent(session.session_id)}`,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") || "").toContain("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (let i = 0; i < 6 && !buf.includes("event: snapshot"); i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    expect(buf).toContain("event: snapshot");
     await reader.cancel();
   });
 

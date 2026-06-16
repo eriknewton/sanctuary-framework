@@ -147,6 +147,8 @@ describe("multi-server", () => {
     expect(no.status).toBe(401);
     const wrong = await fetchText(new URL(h.url + "/"), "wrong-token");
     expect(wrong.status).toBe(401);
+    const query = await fetchText(new URL(h.url + "/?token=secret-token"));
+    expect(query.status).toBe(401);
     const ok = await fetchText(new URL(h.url + "/"), "secret-token");
     expect(ok.status).toBe(200);
   });
