@@ -352,9 +352,10 @@ describe("Principal Dashboard", () => {
       expect(data.error).toContain("Unauthorized");
     });
 
-    it("rejects requests with wrong bearer token", async () => {
+    it("rejects requests with same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
       const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
-        headers: { Authorization: "Bearer wrong-token" },
+        headers: { Authorization: `Bearer ${wrongToken}` },
       });
       expect(res.status).toBe(401);
     });
@@ -366,6 +367,15 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
+    });
+
+    it("rejects session exchange with same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
+      const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${wrongToken}` },
+      });
+      expect(res.status).toBe(401);
     });
 
     it("rejects long-lived token in query parameter (SEC-012)", async () => {

@@ -22,6 +22,9 @@ import type { TemplateName } from "../templates/registry.js";
 import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import { constantTimeEquals } from "../http/auth.js";
+
+export { constantTimeEquals };
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -91,18 +94,6 @@ export interface DashboardSessionStore {
 export interface StreamEvent {
   type: "snapshot" | "activity" | "approval" | "inbox" | "agent_status";
   data: unknown;
-}
-
-/**
- * Constant-time token comparison to avoid trivial timing attacks.
- */
-export function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
 }
 
 /**
