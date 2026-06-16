@@ -308,7 +308,7 @@ export function checkRuntimeIntegrity(): RuntimeIntegrityStatus {
 
 // ── Overall L2 Hardening Status ────────────────────────────────────
 
-export interface L2HardeningStatus {
+export interface OperationalHardeningStatus {
   hardening_level: IsolationLevel;
   memory_protection: MemoryProtectionStatus;
   process_isolation: ProcessIsolationStatus;
@@ -320,10 +320,10 @@ export interface L2HardeningStatus {
 }
 
 /**
- * Comprehensive L2 hardening assessment.
+ * Comprehensive Operational-layer hardening assessment.
  * Combines all hardening checks into a single hardening level.
  */
-export function assessL2Hardening(storagePath: string): L2HardeningStatus {
+export function assessOperationalHardening(storagePath: string): OperationalHardeningStatus {
   const memory = checkMemoryProtection();
   const isolation = checkProcessIsolation();
   const filesystem = checkFilesystemPermissions(storagePath);
@@ -405,3 +405,9 @@ export function assessL2Hardening(storagePath: string): L2HardeningStatus {
     summary,
   };
 }
+
+// ── Back-compat aliases (L1-L4 rename PR-3) ─────────────────────────────
+// The layer-numbered names stay exported so downstream imports keep working.
+// The functional names above are canonical.
+export type L2HardeningStatus = OperationalHardeningStatus;
+export const assessL2Hardening = assessOperationalHardening;

@@ -11,10 +11,10 @@ import type { SanctuaryConfig } from "../config.js";
 import type {
   EnvironmentFingerprint,
   SovereigntyAuditResult,
-  L1AuditResult,
-  L2AuditResult,
-  L3AuditResult,
-  L4AuditResult,
+  CognitiveAuditResult,
+  OperationalAuditResult,
+  DisclosureAuditResult,
+  ReputationAuditResult,
   SovereigntyGap,
   IncidentClass,
   Recommendation,
@@ -182,7 +182,7 @@ export function analyzeSovereignty(
 function assessCognitive(
   env: EnvironmentFingerprint,
   config: SanctuaryConfig
-): L1AuditResult {
+): CognitiveAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
 
@@ -229,7 +229,7 @@ function assessCognitive(
 function assessOperational(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
-): L2AuditResult {
+): OperationalAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
 
@@ -297,7 +297,7 @@ function assessOperational(
 function assessDisclosure(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
-): L3AuditResult {
+): DisclosureAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
 
@@ -334,7 +334,7 @@ function assessDisclosure(
 function assessReputation(
   env: EnvironmentFingerprint,
   _config: SanctuaryConfig
-): L4AuditResult {
+): ReputationAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
 
@@ -370,7 +370,7 @@ function assessReputation(
 
 // ── Scoring ─────────────────────────────────────────────────────────────
 
-function scoreCognitive(cognitive: L1AuditResult): number {
+function scoreCognitive(cognitive: CognitiveAuditResult): number {
   let score = 0;
   if (cognitive.encryption_at_rest) score += COGNITIVE_ENCRYPTION_AT_REST;
   if (cognitive.identity_cryptographic) score += COGNITIVE_IDENTITY_CRYPTOGRAPHIC;
@@ -379,7 +379,7 @@ function scoreCognitive(cognitive: L1AuditResult): number {
   return score;
 }
 
-function scoreOperational(operational: L2AuditResult): number {
+function scoreOperational(operational: OperationalAuditResult): number {
   let score = 0;
   if (operational.approval_gate === "three-tier") score += OPERATIONAL_THREE_TIER_GATE;
   else if (operational.approval_gate === "binary") score += OPERATIONAL_BINARY_GATE;
@@ -394,7 +394,7 @@ function scoreOperational(operational: L2AuditResult): number {
   return score;
 }
 
-function scoreDisclosure(disclosure: L3AuditResult): number {
+function scoreDisclosure(disclosure: DisclosureAuditResult): number {
   let score = 0;
   // Pedersen commitments + Schnorr/range proofs = genuine zero-knowledge proofs
   // Full L3 = 20 points (8 commitment + 7 proofs + 5 policies)
@@ -405,7 +405,7 @@ function scoreDisclosure(disclosure: L3AuditResult): number {
   return score;
 }
 
-function scoreReputation(reputation: L4AuditResult): number {
+function scoreReputation(reputation: ReputationAuditResult): number {
   let score = 0;
   if (reputation.reputation_portable) score += REPUTATION_PORTABLE_REPUTATION;
   if (reputation.reputation_signed) score += REPUTATION_SIGNED_ATTESTATIONS;
@@ -437,10 +437,10 @@ function scoreAuditHealthPenalty(env: EnvironmentFingerprint): number {
 
 function generateGaps(
   env: EnvironmentFingerprint,
-  cognitive: L1AuditResult,
-  operational: L2AuditResult,
-  disclosure: L3AuditResult,
-  reputation: L4AuditResult
+  cognitive: CognitiveAuditResult,
+  operational: OperationalAuditResult,
+  disclosure: DisclosureAuditResult,
+  reputation: ReputationAuditResult
 ): SovereigntyGap[] {
   const gaps: SovereigntyGap[] = [];
   const oc = env.openclaw_config;
@@ -715,10 +715,10 @@ function generateGaps(
 
 function generateRecommendations(
   env: EnvironmentFingerprint,
-  cognitive: L1AuditResult,
-  operational: L2AuditResult,
-  disclosure: L3AuditResult,
-  reputation: L4AuditResult
+  cognitive: CognitiveAuditResult,
+  operational: OperationalAuditResult,
+  disclosure: DisclosureAuditResult,
+  reputation: ReputationAuditResult
 ): Recommendation[] {
   const recs: Recommendation[] = [];
 

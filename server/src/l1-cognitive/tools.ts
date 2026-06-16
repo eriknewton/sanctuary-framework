@@ -725,9 +725,9 @@ async function refuseIdentityOverwrite(
 }
 
 /**
- * Create all L1 tool definitions.
+ * Create all Cognitive-layer tool definitions.
  */
-export function createL1Tools(
+export function createCognitiveTools(
   stateStore: StateStore,
   storage: StorageBackend,
   masterKey: Uint8Array,
@@ -1481,3 +1481,8 @@ export function createL1Tools(
 
   return { tools, identityManager: identityMgr, internalSigning, namespaceRegistry };
 }
+
+// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// The layer-numbered name stays exported so downstream imports keep working.
+// The functional name above is canonical.
+export const createL1Tools = createCognitiveTools;

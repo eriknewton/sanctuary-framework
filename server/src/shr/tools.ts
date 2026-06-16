@@ -12,7 +12,7 @@ import type { AuditLog } from "../l2-operational/audit-log.js";
 import {
   generateSHR,
   type SHRGeneratorOptions,
-  type L4Evidence,
+  type ReputationEvidence,
 } from "./generator.js";
 import { verifySHR } from "./verifier.js";
 import type { SignedSHR } from "./types.js";
@@ -24,14 +24,14 @@ import type { ReputationStore } from "../l4-reputation/reputation-store.js";
  *
  * Pulls attestation summary from the reputation store and checks the
  * audit log for at least one successful `reputation_publish` entry
- * attributed to the identity. Returns a plain `L4Evidence` struct
+ * attributed to the identity. Returns a plain `ReputationEvidence` struct
  * consumed by the SHR generator.
  */
 export async function gatherL4Evidence(
   reputationStore: ReputationStore,
   auditLog: AuditLog,
   identity: { identity_id: string; did: string }
-): Promise<L4Evidence> {
+): Promise<ReputationEvidence> {
   const summary = await reputationStore.summarizeForSHR(identity.did);
 
   // Check the audit log for any successful reputation_publish call
@@ -79,7 +79,7 @@ export function createSHRTools(
    */
   async function resolveReputationEvidence(
     identityId: string | undefined
-  ): Promise<L4Evidence | undefined> {
+  ): Promise<ReputationEvidence | undefined> {
     if (!reputationStore) return undefined;
     const identity = identityId
       ? identityManager.get(identityId)

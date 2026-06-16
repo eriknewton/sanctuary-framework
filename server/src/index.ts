@@ -11,14 +11,14 @@ import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
 import { StateStore } from "./l1-cognitive/state-store.js";
-import { createL1Tools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
+import { createCognitiveTools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
 import { createDistressTools } from "./distress/tools.js";
 import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
 import { AuditLog } from "./l2-operational/audit-log.js";
-import { createL3Tools } from "./l3-disclosure/tools.js";
-import { createL4Tools } from "./l4-reputation/tools.js";
+import { createDisclosureTools } from "./l3-disclosure/tools.js";
+import { createReputationTools } from "./l4-reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 import type { IdentityManager } from "./l1-cognitive/tools.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
@@ -87,7 +87,7 @@ import {
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
 } from "./l2-operational/context-gate-tools.js";
-import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
+import { createOperationalHardeningTools } from "./l2-operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
@@ -412,7 +412,7 @@ export async function createSanctuaryServer(options?: {
   };
 
   // 7. Create L1 tools
-  const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+  const { tools: l1Tools, identityManager, namespaceRegistry } = createCognitiveTools(
     stateStore,
     storage,
     masterKey,
@@ -679,7 +679,7 @@ export async function createSanctuaryServer(options?: {
   };
 
   // 11. Create L3 tools
-  const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
+  const { tools: l3Tools } = createDisclosureTools(storage, masterKey, auditLog);
 
   // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
@@ -697,7 +697,7 @@ export async function createSanctuaryServer(options?: {
   // 13. Create L4 tools (reputation with sovereignty-gated tiers)
   // Produces the ReputationStore that feeds SHR L4 evidence, so create
   // this before the SHR tools.
-  const { tools: l4Tools, reputationStore } = createL4Tools(
+  const { tools: l4Tools, reputationStore } = createReputationTools(
     storage,
     masterKey,
     identityManager,
@@ -756,7 +756,7 @@ export async function createSanctuaryServer(options?: {
   bindContextGateEnforcerToProfileStore(profileStore, auditLog, contextGateEnforcer);
 
   // 14g. Create L2 Process Hardening tools
-  const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
+  const hardeningTools = createOperationalHardeningTools(config.storage_path, auditLog);
 
   // 14h. Create Sovereignty Profile tools
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
@@ -1782,6 +1782,12 @@ export type {
   PendingApproval,
   ReputationLookup,
   AggregatorSources,
+  CognitiveStatus,
+  OperationalStatus,
+  DisclosureStatus,
+  ReputationStatus,
+  // Back-compat aliases (L1-L4 rename PR-3): kept exported so downstream
+  // imports keep working.
   L1Status,
   L2Status,
   L3Status,
