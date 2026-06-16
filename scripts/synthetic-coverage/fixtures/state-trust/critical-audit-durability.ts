@@ -13,7 +13,7 @@ const CLAIM_ID = "3";
 const CLAIM_LABEL = "Critical audit durability (appendCritical)";
 
 // Entrypoint: AuditLog.appendCritical in server/src/operational/audit-log.ts.
-// Mirrored tests: server/test/l1/audit-durability.test.ts and server/test/audit/critical-followup.test.ts.
+// Mirrored tests: server/test/cognitive/audit-durability.test.ts and server/test/audit/critical-followup.test.ts.
 // Matrix claim: Critical audit durability (appendCritical).
 
 class RejectingAuditStorage extends MemoryStorage {
