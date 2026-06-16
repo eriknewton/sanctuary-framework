@@ -12,6 +12,9 @@ on:
       - 'v1.3.*-rc.*'
       - 'v1.3.*'
 
+permissions:
+  contents: read
+
 jobs:
   linux-drill:
     runs-on: ubuntu-22.04

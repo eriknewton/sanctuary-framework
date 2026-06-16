@@ -32,6 +32,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test-baseline-guard:
     name: test-baseline-guard
