@@ -63,15 +63,41 @@ struct ContentView: View {
         .onChange(of: scenePhase) { newPhase in
             // Re-read helper status when the app reactivates so the approval
             // banner clears the moment the operator flips the toggle and returns.
+            //
+            // The mutation is deferred to a later main-queue turn (NOT run
+            // inline). A scenePhase transition to `.active` can be delivered
+            // synchronously inside a SwiftUI view-update pass — notably the one
+            // AppKit drives from `applicationDidChangeScreenParameters` when the
+            // display reconfigures during the boot/login transition.
+            // `refreshStatus()` writes `@Published helperState` on the calling
+            // thread; doing that WHILE the graph is being evaluated trips
+            // AttributeGraph's "Publishing changes from within view updates"
+            // precondition and aborts with SIGABRT. This is the same
+            // screen-parameters-change boot crash that #596 only partly closed:
+            // #596 moved the launch `.onAppear` side-effects to `.task`, but
+            // this `.onChange` body still mutated observed state on the render
+            // path. Deferring past the current render cycle makes it safe.
             if newPhase == .active {
-                signerHelperManager.refreshStatus()
+                DispatchQueue.main.async {
+                    signerHelperManager.refreshStatus()
+                }
             }
         }
         .onChange(of: systemExtensionManager.extensionState) { newState in
+            // Deferred for the same reason as the scenePhase handler above: this
+            // `.onChange` can fire inside a synchronous view-update pass (incl.
+            // the `applicationDidChangeScreenParameters` boot re-render), and
+            // `enableFilter()` synchronously writes `@Published filterState`
+            // (`.enabling`). Mutating observed state during render trips the
+            // AttributeGraph SIGABRT precondition (#596 screen-parameters-change
+            // crash). Dispatching async runs the mutation on a later main-queue
+            // turn, outside the current render cycle.
             if newState == .activated,
                filterConfigurationManager.filterState != .enabled,
                filterConfigurationManager.filterState != .enabling {
-                filterConfigurationManager.enableFilter()
+                DispatchQueue.main.async {
+                    filterConfigurationManager.enableFilter()
+                }
             }
         }
         .alert("Restart Required", isPresented: .init(
