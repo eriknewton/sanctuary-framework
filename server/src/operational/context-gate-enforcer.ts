@@ -31,6 +31,33 @@ import {
   type PrivacyPlaceholderVault,
 } from "./privacy-filter.js";
 
+// ── Errors ──────────────────────────────────────────────────────────────
+
+/**
+ * Thrown by {@link ContextGateEnforcer.filterArgs} (the proxy pre-forward
+ * path) when the active policy's `on_deny: block` decision fires. Unlike the
+ * `wrapHandler` MCP-tool path (which RETURNS the `context_gating_blocked`
+ * toolResult to its caller), the proxy path cannot return a toolResult in place
+ * of filtered args, because doing so would let the original unredacted args
+ * leak upstream (the historical fail-open this error closes). Instead the proxy
+ * filter throws this typed error so the proxy router fails CLOSED with an honest
+ * policy-block reason rather than forwarding everything (invariants #1/#5).
+ */
+export class ContextGateBlockedError extends Error {
+  readonly toolName: string;
+  readonly deniedFields: string[];
+
+  constructor(toolName: string, deniedFields: string[]) {
+    const fieldList = deniedFields.length > 0 ? deniedFields.join(", ") : "<unspecified>";
+    super(`context-gating policy blocked tool ${toolName} (denied fields: ${fieldList})`);
+    this.name = "ContextGateBlockedError";
+    this.toolName = toolName;
+    this.deniedFields = deniedFields;
+    // Preserve prototype chain for instanceof across transpilation targets.
+    Object.setPrototypeOf(this, ContextGateBlockedError.prototype);
+  }
+}
+
 // ── Configuration ───────────────────────────────────────────────────────
 
 export interface EnforcerConfig {
@@ -40,7 +67,7 @@ export interface EnforcerConfig {
   default_policy_id?: string;
   /** Tool name prefixes to skip filtering (e.g., ["*"] to skip all system tools) */
   bypass_prefixes: string[];
-  /** Log but don't filter — for gradual rollout (default: false) */
+  /** Log but don't filter, for gradual rollout (default: false) */
   log_only: boolean;
   /** What to do when a field triggers deny action: "block" or "redact" */
   on_deny: "block" | "redact";
@@ -201,7 +228,22 @@ export class ContextGateEnforcer {
       return toolResult({ ok: true });
     };
 
-    await this.wrapHandlerForFilter(toolName, capture, args);
+    // wrapHandlerForFilter runs the shared filter path. On the redact/allow/
+    // log_only path it INVOKES `capture` (so `filteredArgs` holds the filtered
+    // payload). On an `on_deny:"block"` decision it RETURNS the
+    // `context_gating_blocked` toolResult WITHOUT ever calling `capture`, so we
+    // must inspect the returned result and refuse to return the (untouched)
+    // original args. Returning them here is the fail-open this method closes.
+    const result = await this.wrapHandlerForFilter(toolName, capture, args);
+
+    const blocked = parseBlockMarker(result);
+    if (blocked) {
+      // capture never ran ⇒ filteredArgs would still be the ORIGINAL args.
+      // Throw a typed error so the proxy router fails CLOSED with an honest
+      // policy-block reason instead of forwarding unredacted args upstream.
+      throw new ContextGateBlockedError(toolName, blocked.deniedFields);
+    }
+
     return filteredArgs;
   }
 
@@ -603,6 +645,46 @@ export class ContextGateEnforcer {
   private markFilterSuccess(): void {
     this.lastFilterSuccessAt = new Date().toISOString();
   }
+}
+
+/**
+ * Robustly detect the `context_gating_blocked` marker inside a toolResult.
+ *
+ * The shared block branch ({@link ContextGateEnforcer.filterWithPolicy})
+ * encodes its block decision as `toolResult({ error: "context_gating_blocked",
+ * ... })`, i.e. a JSON object serialized into `content[0].text`. We parse that
+ * structured payload rather than substring-matching the text, so an allowed
+ * field value that merely contains the literal string can never be
+ * mis-detected as a block. Returns the denied-field list on a confirmed block,
+ * or `null` otherwise.
+ */
+function parseBlockMarker(
+  result: { content?: Array<{ type: string; text?: string }> } | null | undefined
+): { deniedFields: string[] } | null {
+  const content = result?.content;
+  if (!Array.isArray(content)) return null;
+
+  for (const part of content) {
+    if (!part || part.type !== "text" || typeof part.text !== "string") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(part.text);
+    } catch {
+      continue;
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      (parsed as { error?: unknown }).error === "context_gating_blocked"
+    ) {
+      const rawDenied = (parsed as { denied_fields?: unknown }).denied_fields;
+      const deniedFields = Array.isArray(rawDenied)
+        ? rawDenied.filter((f): f is string => typeof f === "string")
+        : [];
+      return { deniedFields };
+    }
+  }
+  return null;
 }
 
 /**
