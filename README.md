@@ -240,7 +240,7 @@ Store it securely. It derives the encryption keys for all persistent state. If l
 sovereignty_audit
 ```
 
-Scores your setup 0-100 across security, isolation, and privacy from your live configuration and profile. Optional features that default off (context gating, zero-knowledge proofs) only count toward the score once you enable them, so a fresh install scores below full and the report flags the gaps with the steps to close them. Available as both a CLI command and an MCP tool inside any wrapped harness.
+Scores your setup 0-100 across security, isolation, and privacy from your live configuration and profile. Optional features that default off (context gating, zero-knowledge proofs) only count toward the score once you enable them, and the top "full" verdict is reserved for a posture where those optional layers are actually on, so a fresh install scores below full, reads below the full verdict, and the report flags the gaps with the steps to close them. Available as both a CLI command and an MCP tool inside any wrapped harness.
 
 ---
 

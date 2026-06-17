@@ -168,7 +168,20 @@ export function analyzeSovereignty(
   const auditHealthPenalty = scoreAuditHealthPenalty(env);
   const overallScore = Math.max(0, baseScore - auditHealthPenalty);
 
-  const sovereigntyLevel = overallScore >= 80
+  // Honesty (audit seam #5, level layer): the top "full" level is reserved for a
+  // posture where nothing optional is left off. The numeric score qualifying
+  // (>= 80) is necessary but NOT sufficient — the optional sovereignty layers
+  // that would otherwise be open gaps (context-gating, ZK proofs) must actually
+  // be enabled. Otherwise a default install (context-gating + ZK default OFF)
+  // scores 89 and would have read "full" at the one-word headline verdict,
+  // re-committing a milder form of the exact overclaim the score fix removed: a
+  // reader of the level label would see "full" while optional layers are off.
+  // When the score qualifies numerically but those layers are off, we report the
+  // next band down ("partial"); GAP-L2-003 (and the L3 disclosure gap) still
+  // surface, telling the operator exactly what to enable to reach "full".
+  const optionalLayersFullyEnabled =
+    operational.context_gating === true && disclosure.zero_knowledge_proofs === true;
+  const sovereigntyLevel = overallScore >= 80 && optionalLayersFullyEnabled
     ? "full"
     : overallScore >= 50
       ? "partial"

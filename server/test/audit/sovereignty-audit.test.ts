@@ -98,6 +98,38 @@ describe("Sovereignty Audit", () => {
       expect(result.gaps.map((g) => g.id)).toContain("GAP-L2-003");
     });
 
+    // Honesty (audit seam #5, level layer): even though a fresh install scores
+    // a high 89, the one-word headline verdict must NOT read "full" while the
+    // optional sovereignty layers (context-gating, ZK) are off. "full" is
+    // reserved for a posture where nothing optional is left off; otherwise the
+    // level label re-commits a milder form of the score overclaim.
+    it("does NOT report sovereignty_level 'full' for a fresh default-off install", () => {
+      const env = makeFingerprint();
+      const result = analyzeSovereignty(env, config); // no runtime signals
+
+      // The numeric score is high enough to clear the >= 80 numeric cut, but the
+      // optional layers are off, so the headline verdict must drop a band.
+      expect(result.overall_score).toBeGreaterThanOrEqual(80);
+      expect(result.sovereignty_level).not.toBe("full");
+      expect(result.sovereignty_level).toBe("partial");
+      // The headline verdict and the gaps are mutually consistent: the very
+      // gap that keeps it out of "full" is surfaced for the operator to close.
+      expect(result.gaps.map((g) => g.id)).toContain("GAP-L2-003");
+    });
+
+    // The level gate must NOT make "full" unreachable: a legitimately
+    // fully-configured install (optional layers explicitly enabled) still reads
+    // "full" at both the numeric and level layers.
+    it("reports sovereignty_level 'full' once the optional layers are enabled", () => {
+      const env = makeFingerprint();
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
+
+      expect(result.overall_score).toBe(100);
+      expect(result.layers.l2_operational.context_gating).toBe(true);
+      expect(result.layers.l3_selective_disclosure.zero_knowledge_proofs).toBe(true);
+      expect(result.sovereignty_level).toBe("full");
+    });
+
     // Honesty (audit seam #5): enabling only one optional feature scores
     // between the fresh-install floor and a fully-enabled fortress.
     it("credits each default-off feature only when the live profile enables it", () => {
