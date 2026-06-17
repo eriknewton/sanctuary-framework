@@ -21,6 +21,7 @@ import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
 import type { AuditLog } from "../operational/audit-log.js";
+import { ContextGateBlockedError } from "../operational/context-gate-enforcer.js";
 import type { CallGovernor } from "../operational/call-governor.js";
 import type { LocalPrivacyEngine, PrivacyPolicy } from "../operational/privacy-core.js";
 import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
@@ -220,32 +221,48 @@ export class ProxyRouter {
           try {
             filteredArgs = await this.options.contextGateFilter(proxyName, args);
           } catch (gateErr) {
+            // Distinguish an EXPECTED policy block from a genuine filter error.
+            // A ContextGateBlockedError means the operator's `on_deny:"block"`
+            // policy fired (a designed denial, not infra failure), so we
+            // record the honest `context_gating_blocked` reason. Any other throw
+            // is an infra/runtime fault and keeps `context_gate_filter_error`.
+            // BOTH branches fail CLOSED identically: never forward to upstream,
+            // write a denial audit entry, return the generic agent-facing
+            // denial, and early-return (no success entry). The raw error stays
+            // operator-side in the audit log only (invariant #7 style).
+            const isPolicyBlock = gateErr instanceof ContextGateBlockedError;
+            const reason = isPolicyBlock
+              ? "context_gating_blocked"
+              : "context_gate_filter_error";
+            const operation = isPolicyBlock
+              ? `proxy_context_gating_blocked:${proxyName}`
+              : `proxy_context_gate_error:${proxyName}`;
+            const eventType = isPolicyBlock
+              ? "proxy.context_gating_blocked"
+              : "proxy.context_gate_error";
             const gateErrorMessage =
               gateErr instanceof Error ? gateErr.message : "context gate filter error";
             await this.auditLog.appendCritical({
               layer: "l2",
-              operation: `proxy_context_gate_error:${proxyName}`,
+              operation,
               identity_id: "system",
               result: "failure",
               details: {
-                event_type: "proxy.context_gate_error",
+                event_type: eventType,
                 server: serverName,
                 tool: toolName,
                 tier,
                 decision: "denied",
-                reason: "context_gate_filter_error",
+                reason,
+                ...(isPolicyBlock
+                  ? { denied_fields: (gateErr as ContextGateBlockedError).deniedFields }
+                  : {}),
                 error: gateErrorMessage,
                 latency_ms: Date.now() - start,
               },
             });
 
-            this.notifyProxyCall(
-              proxyName,
-              serverName,
-              "blocked",
-              "context_gate_filter_error",
-              tier
-            );
+            this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
             return toolResult({
               error: "Operation not permitted",
               proxy: true,
