@@ -264,6 +264,16 @@ function countInjectionsToday(audit: AuditEntry[]): number {
   }).length;
 }
 
+/**
+ * Window for treating an L2 gate-adjudication audit entry as evidence the
+ * Principal Policy gate is live. The dashboard re-aggregates on operator view
+ * (not a tight poll), so a 15-minute window keeps a genuinely-busy gate reading
+ * "active" between glances without letting a long-idle (or dead) gate keep the
+ * "active" claim indefinitely. Idle-but-loaded falls back to "configured",
+ * which is still honest.
+ */
+const GATE_ADJUDICATION_WINDOW_MS = 15 * 60 * 1000;
+
 /** Proof-creation ops — update this allowlist when adding new ZK tools. */
 const PROOF_CREATION_OPS = new Set([
   "zk_prove",
@@ -338,19 +348,59 @@ function buildCognitive(
   } else {
     headline = "Encryption configured (no live integrity check)";
   }
+  // `memory_attest_ready` claims the memory-attestation path can actually
+  // produce a verifiable attestation, not merely that an identity exists. A
+  // bare identity with no live audit chain cannot anchor an attestation, so we
+  // gate on the SAME live-integrity evidence that earns the "encrypted at rest"
+  // claim: a signing identity AND an audit chain that was read and verified
+  // clean this snapshot. Absent that, the honest answer is "not ready".
+  const memoryAttestReady = hasIdentity && hasLiveIntegrityEvidence;
   return {
     label: "L1 Cognitive",
     state,
     headline,
     encryption: "AES-256-GCM + HKDF per namespace",
     injection_blocked_today: countInjectionsToday(audit),
-    memory_attest_ready: hasIdentity,
+    memory_attest_ready: memoryAttestReady,
   };
 }
 
-function buildOperational(sources: AggregatorSources): OperationalStatus {
+/**
+ * Recent L2 (Principal Policy gate) adjudication evidence. The gate writes
+ * `layer: "l2"` audit entries every time it actually adjudicates an operation
+ * (gate decisions, injection detections, anomaly checks). A recent such entry
+ * is positive evidence the gate is not just loaded but live and adjudicating.
+ */
+function hasRecentGateAdjudication(audit: AuditEntry[]): boolean {
+  const cutoff = Date.now() - GATE_ADJUDICATION_WINDOW_MS;
+  return audit.some((e) => {
+    if (e.layer !== "l2") return false;
+    const ts = new Date(e.timestamp).getTime();
+    return !isNaN(ts) && ts >= cutoff;
+  });
+}
+
+function buildOperational(
+  sources: AggregatorSources,
+  audit: AuditEntry[]
+): OperationalStatus {
   const teeAvailable = sources.teeAvailable ?? false;
   const state: LayerState = teeAvailable ? "full" : "degraded";
+  // `sandbox_status` previously read the literal "Principal Policy gate active"
+  // unconditionally, even when no policy was loaded. "Active" is an enforcement
+  // claim (the gate is live and adjudicating); a loaded config alone earns only
+  // "configured", and the absence of a policy must read as exactly that. We
+  // reserve "active" for observed adjudication evidence (a recent L2 audit
+  // entry), report "configured" when a policy is loaded but unexercised, and
+  // "No Principal Policy loaded" when nothing gates operations.
+  let sandbox_status: string;
+  if (!sources.policy) {
+    sandbox_status = "No Principal Policy loaded";
+  } else if (hasRecentGateAdjudication(audit)) {
+    sandbox_status = "Principal Policy gate active";
+  } else {
+    sandbox_status = "Principal Policy gate configured (no recent adjudication)";
+  }
   return {
     label: "L2 Operational",
     state,
@@ -360,7 +410,7 @@ function buildOperational(sources: AggregatorSources): OperationalStatus {
     isolation_type: teeAvailable ? "hardware-tee" : "process-level",
     tee_available: teeAvailable,
     tee_status: teeAvailable ? "Attested" : "Not available — normal on local dev",
-    sandbox_status: "Principal Policy gate active",
+    sandbox_status,
   };
 }
 
@@ -659,7 +709,7 @@ export async function getProtectionSnapshot(
 
   const agent = buildAgent(sources);
   const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence);
-  const l2 = buildOperational(sources);
+  const l2 = buildOperational(sources, audit);
   const l3 = buildDisclosure(sources, audit);
   const l4 = buildReputation(sources);
 

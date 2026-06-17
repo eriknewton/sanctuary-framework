@@ -785,4 +785,79 @@ describe("getProtectionSnapshot", () => {
       expect(snap.overall.status).toBe("degraded");
     });
   });
+
+  // Seam #8: L2 sandbox_status and L1 memory_attest_ready must reflect
+  // evidence, not presence.
+  describe("L2 sandbox_status honesty (seam #8)", () => {
+    const loadedPolicy = {
+      version: 1,
+      tier1_always_approve: [],
+      tier3_always_allow: [],
+      tier2_anomaly: {},
+      approval_channel: { type: "stderr", timeout_seconds: 30 },
+    } as unknown as AggregatorSources["policy"];
+
+    function l2AuditEntry(ageMs = 60_000): AuditEntry {
+      return {
+        timestamp: new Date(Date.now() - ageMs).toISOString(),
+        layer: "l2",
+        operation: "principal_policy_view",
+        identity_id: "id-1",
+        result: "success",
+      } as unknown as AuditEntry;
+    }
+
+    it("reads 'No Principal Policy loaded' when no policy is configured", async () => {
+      const snap = await getProtectionSnapshot(baseSources());
+      expect(snap.layers.l2.sandbox_status).toBe("No Principal Policy loaded");
+    });
+
+    it("reads 'configured' when a policy is loaded but no recent adjudication", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({ policy: loadedPolicy, auditLog: stubAuditLog([]) })
+      );
+      expect(snap.layers.l2.sandbox_status).toBe(
+        "Principal Policy gate configured (no recent adjudication)"
+      );
+    });
+
+    it("reads 'active' only with recent L2 adjudication evidence", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          policy: loadedPolicy,
+          auditLog: stubAuditLog([l2AuditEntry()]),
+        })
+      );
+      expect(snap.layers.l2.sandbox_status).toBe("Principal Policy gate active");
+    });
+
+    it("does NOT read 'active' from a long-stale L2 entry", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          policy: loadedPolicy,
+          auditLog: stubAuditLog([l2AuditEntry(60 * 60 * 1000)]),
+        })
+      );
+      expect(snap.layers.l2.sandbox_status).toBe(
+        "Principal Policy gate configured (no recent adjudication)"
+      );
+    });
+
+    it("memory_attest_ready requires live integrity evidence, not bare identity", async () => {
+      // Identity present but no audit log: cannot anchor an attestation.
+      const noChain = await getProtectionSnapshot(
+        baseSources({ identityManager: stubIdentityManager(stubIdentity()) })
+      );
+      expect(noChain.layers.l1.memory_attest_ready).toBe(false);
+
+      // Identity + clean live chain: ready.
+      const withChain = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          auditLog: stubAuditLog([]),
+        })
+      );
+      expect(withChain.layers.l1.memory_attest_ready).toBe(true);
+    });
+  });
 });
