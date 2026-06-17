@@ -307,6 +307,14 @@ export async function startMacOSCastleWallDaemon(
             decision: response.decision,
             learn: response.learn,
             source: "castle-wall-cli",
+            // NB: deliberately NOT stamped with the Castle Wall provenance
+            // marker. An operator CLI decision is broadcast to the extension but
+            // delivery/application is not confirmed here (broadcastDecisionResponse
+            // can reach zero subscribers if the extension disconnected), so it is
+            // not proof of live enforcement. The honest posture arms only from
+            // real adjudicated flows (egress_allowed/egress_blocked via
+            // flow_decision_recorded), never from an unacknowledged operator
+            // decision. Marking this would be a false-green over-claim.
           },
           "success",
         );
