@@ -49,14 +49,17 @@
  *    recomputed by the route layer keyed on the chain head (see
  *    `posture-routes.ts`).
  *
- *  - `policy_loaded` is NOT treated as liveness OR as strong live-adjudication
+ *  - `policy_loaded` is NOT treated as liveness OR as live-adjudication
  *    evidence here. It fires only inside the reload path; a daemon that loaded
  *    policy once but stopped enforcing would otherwise read green for the
  *    freshness window. Only `egress_allowed` / `egress_blocked` /
- *    `operator_decision` prove live adjudication. (`posture.ts:74` currently
- *    still lists `policy_loaded` in `CASTLE_WALL_ENFORCEMENT_OPERATIONS` — a
- *    latent honesty seam tracked for coordinator triage; this slice does not
- *    rely on it and leaves the shipped constant untouched.)
+ *    `operator_decision` prove live adjudication. This live-adjudication set is
+ *    now the SAME frozen object as
+ *    `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS` (imported below): the
+ *    banner reader and this feature-health panel share one definition of
+ *    "armed," so they can never disagree on whether a wall is green. The
+ *    previously-tracked honesty seam (posture armed on `policy_loaded` alone on
+ *    the no-key/channel basis) is now closed at the source.
  *
  * These functions are pure over their injected dependencies so they unit-test
  * without a live HTTP server or a running daemon.
@@ -68,6 +71,7 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../castle-wall/constants.js";
 import {
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   DEFAULT_DIGEST_WINDOW_MS,
@@ -85,16 +89,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Live-adjudication evidence for Castle Wall. Deliberately a STRICTER set than
- * `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS`: only operations that prove
- * the filter adjudicated real traffic. `policy_loaded` is excluded (it proves a
- * manifest was accepted once, not that the wall is still enforcing — see the
- * module header's honesty-seam note).
+ * Live-adjudication evidence for Castle Wall: the operations that prove the
+ * filter adjudicated real traffic (`egress_allowed` / `egress_blocked` /
+ * `operator_decision`). `policy_loaded` is excluded (it proves a manifest was
+ * accepted once, not that the wall is still enforcing).
+ *
+ * This is an ALIAS of `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS`, not a
+ * second copy: both readers consume the one frozen set, so no divergent color
+ * model can drift back in (the convergence this slice landed). The
+ * live-adjudication name is retained for the existing call sites and tests that
+ * import it.
  */
 export const CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS: ReadonlySet<string> =
-  Object.freeze(
-    new Set<string>(["egress_allowed", "egress_blocked", "operator_decision"]),
-  );
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS;
 
 /**
  * How a feature proves it is alive.

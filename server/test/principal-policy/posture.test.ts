@@ -8,9 +8,11 @@ import {
   buildAuditDigest,
   buildUnwrappedRoster,
   buildAgentReach,
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
 } from "../../src/principal-policy/posture.js";
+import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 
 const FORTRESS = "fortress:test";
 
@@ -169,6 +171,99 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       now,
     });
     expect(posture.arm_state).toBe("unknown");
+  });
+
+  it("does NOT arm on a fresh policy_loaded alone, no key (manifest-accepted is not flow-adjudicated)", async () => {
+    // The honesty fix: a wall that loaded a policy but has adjudicated zero
+    // flows must render amber/unknown, never green. Before the arm-set
+    // narrowing this case armed on the channel basis (the closed SLICE R seam).
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      // No pinnedProducerKeyB64url: the NO-KEY / macOS-floor / channel basis.
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).not.toBe("fresh_enforcement_evidence");
+    expect(posture.producer_authenticity).toBe("not_applicable");
+  });
+
+  it("does NOT arm on a fresh policy_loaded alone, key present (regression guard for the key path)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      // A pinned key is configured: policy_loaded was already not arm-eligible
+      // here via Slice R (it re-verifies as channel basis); assert it stays so
+      // now that it is also dropped at the arm-set gate.
+      pinnedProducerKeyB64url: "anyKeyTriggersTheKeyPresentPath",
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).not.toBe("fresh_enforcement_evidence");
+  });
+
+  it("a fresh egress_allowed still arms even when a policy_loaded is also present (real evidence wins)", async () => {
+    // Removing policy_loaded from the arm set must IGNORE it, not poison a wall
+    // that also has genuine fresh adjudication evidence.
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 45_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+    // policy_loaded never inflates verdict counts; only the real allow does.
+    expect(posture.verdict_counts.allowed).toBe(1);
+  });
+
+  it("a STALE egress with a FRESH policy_loaded does NOT arm (the discriminating over-claim case)", async () => {
+    // The sharpest never-overclaim case: a wall that stopped adjudicating (its
+    // only real verdict is stale) but re-loaded a manifest recently. Under the
+    // old arm set the fresh policy_loaded carried fresh_enforcement_evidence and
+    // the banner showed armed; now it correctly reads unknown/stale_evidence.
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // A real allow 30 minutes ago: stale (outside the 10-minute window).
+    await appendCW(log, "egress_allowed", new Date(now - 30 * 60_000).toISOString());
+    // A manifest reload 1 minute ago: fresh, but manifest-load is not adjudication.
+    await appendCW(log, "policy_loaded", new Date(now - 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("stale_evidence");
+    // The stale allow still counts in the 24h digest window.
+    expect(posture.verdict_counts.allowed).toBe(1);
+  });
+
+  it("write-side enforcement-evidence set stays in lockstep with the read-side arm set (no third-copy drift)", () => {
+    // audit-consumer's ENFORCEMENT_EVIDENCE_EVENT_TYPES gates which events REQUIRE
+    // a producer signature on WRITE; posture's CASTLE_WALL_ENFORCEMENT_OPERATIONS
+    // gates which ops ARM the banner on READ. They are the same concept and MUST
+    // agree, else write-side signing and read-side arming could desync (a third
+    // copy the alias drift-guard in feature-health.test.ts does not cover). The
+    // two modules are deliberately not import-coupled across the read/write
+    // boundary (one is typed over the event-type enum), so a contents test is the
+    // lockstep mechanism.
+    expect([...ENFORCEMENT_EVIDENCE_EVENT_TYPES].sort()).toEqual(
+      [...CASTLE_WALL_ENFORCEMENT_OPERATIONS].sort(),
+    );
   });
 
   it("renders DEGRADED on fresh not-enforcing evidence (e.g. provider_unbound)", async () => {
