@@ -17,6 +17,7 @@ import type {
   PendingApproval,
 } from "./aggregator.js";
 import { handleRequest, type ApprovalHandlers, type StreamEvent } from "./api.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 
 export interface DashboardServerOptions {
@@ -183,8 +184,9 @@ export async function startDashboardServer(
       }
     } catch (err) {
       try {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "internal", message: (err as Error).message }));
+        sendCaughtError(res, 500, "internal_error", err, {
+          route: req.url ?? undefined,
+        });
       } catch {
         // already partially written
       }

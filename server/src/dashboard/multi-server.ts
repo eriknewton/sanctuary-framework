@@ -13,6 +13,7 @@
 import { createServer, type Server } from "node:http";
 import { getMultiTenantSnapshot } from "./multi-aggregator.js";
 import { renderMultiAgentHTML } from "./multi-html.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 
 export interface MultiDashboardOptions {
   /** HTTP port. Default 3500 (distinct from single-tenant default 3501). */
@@ -127,10 +128,9 @@ export async function startMultiDashboardServer(
       res.end(JSON.stringify({ error: "not_found", path }));
     } catch (err) {
       try {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "internal", message: (err as Error).message })
-        );
+        sendCaughtError(res, 500, "internal_error", err, {
+          route: req.url ?? undefined,
+        });
       } catch {
         // already partially written
       }

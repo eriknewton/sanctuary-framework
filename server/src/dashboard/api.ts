@@ -23,6 +23,7 @@ import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
 
 export { constantTimeEquals };
 
@@ -284,7 +285,12 @@ export async function handleRequest(
       const ok = await handler(id);
       writeJSON(res, ok ? 200 : 404, { id, action, ok });
     } catch (err) {
-      writeJSON(res, 500, { error: "approval_failed", message: (err as Error).message });
+      logCaughtError(
+        err,
+        { route: "/api/approvals/:id/:action", operation: action },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "approval_failed" });
     }
     return true;
   }
@@ -301,10 +307,12 @@ export async function handleRequest(
       const templates = listTemplates();
       writeJSON(res, 200, { templates });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates", operation: "list_templates" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -320,10 +328,12 @@ export async function handleRequest(
       }
       writeJSON(res, 200, entry);
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name", operation: "get_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -408,10 +418,12 @@ export async function handleRequest(
         attestation_panel_url: `/console#agent_roster`,
       });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_init_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name/init", operation: "init_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_init_failed" });
     }
     return true;
   }
