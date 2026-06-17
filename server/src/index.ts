@@ -641,7 +641,14 @@ export async function createSanctuaryServer(options?: {
               "S1.3_integrity_verification": "full",
               "S1.4_selective_state_sharing": "full",
               "S1.5_state_portability": "full",
-              "S1.6_deletion_rights": "full",
+              // Honest grade: deletion is best-effort random-byte overwrite
+              // before unlink; on copy-on-write/SSD media original bytes may
+              // survive, so at-rest confidentiality rests on encryption, not on
+              // the overwrite. The live delete tools (state_delete,
+              // sanctuary_forget, memory_delete) describe it this way and there
+              // is no "proven" ASSURANCE_MATRIX row backing a "full"
+              // right-to-deletion claim, so "partial" is the honest level.
+              "S1.6_deletion_rights": "partial",
               "S1.7_identity_anchoring": "partial",
             },
           },
@@ -669,10 +676,16 @@ export async function createSanctuaryServer(options?: {
             interfaces: ["ReputationStore", "TrustBootstrap"],
             modes: [config.reputation.mode],
             properties: {
-              "S4.1_earned_reputation": "full",
+              // Honest grades: the reputation/SHR/attestation surfaces now
+              // report "unknown" when telemetry is unavailable, and there is no
+              // "proven" ASSURANCE_MATRIX row for earned-reputation or
+              // trust-bootstrapping. "partial" matches the live surfaces rather
+              // than over-declaring a fully-realized capability the human-facing
+              // tools were just corrected to stop claiming.
+              "S4.1_earned_reputation": "partial",
               "S4.2_participant_owned": "full",
               "S4.5_sybil_resistance": "basic",
-              "S4.7_trust_bootstrapping": "full",
+              "S4.7_trust_bootstrapping": "partial",
             },
           },
         },

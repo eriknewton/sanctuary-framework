@@ -47,7 +47,7 @@ describe("v1.1 remote-bound privacy enforcement (fail-closed)", () => {
     expect(denied!.details!.denial_reason_class).toBe("fail_closed_no_policy");
   });
 
-  it("policy resolver throws: treated as missing policy and denies", async () => {
+  it("policy resolver throws (vault outage): denies with the DISTINCT fail_closed_filter_error reason, NOT fail_closed_no_policy (audit S2)", async () => {
     const ctx = setup();
     ctx.bindPolicyResolver(async () => {
       throw new Error("vault-reachability-test-only");
@@ -56,13 +56,19 @@ describe("v1.1 remote-bound privacy enforcement (fail-closed)", () => {
     const handler = ctx.makeHandler();
     const result = await handler({ prompt: `Reach out to ${MAGIC}.` });
 
+    // Still fails closed: no wire bytes leave.
     expect(ctx.captured).toHaveLength(0);
     expect(result.content[0]!.text).toContain("Operation not permitted");
 
-    const denied = (await ctx.queryPrivacyEvents()).find(
-      (e) => e.details!.kind === "denied"
+    // The router denies directly (rather than collapsing the rejection to a
+    // null policy, which the engine would mislabel as "no policy bound"). The
+    // audit entry is the router's own proxy_privacy_denied record.
+    const denied = (await ctx.queryPrivacyEvents()).find((e) =>
+      e.operation.startsWith("proxy_privacy_denied:")
     );
-    expect(denied!.details!.denial_reason_class).toBe("fail_closed_no_policy");
+    expect(denied).toBeDefined();
+    expect(denied!.details!.denial_reason_class).toBe("fail_closed_filter_error");
+    expect(denied!.details!.denial_reason_class).not.toBe("fail_closed_no_policy");
   });
 
   it("filter error (oversized payload): denies", async () => {
