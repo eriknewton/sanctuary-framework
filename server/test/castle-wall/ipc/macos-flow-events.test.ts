@@ -40,6 +40,14 @@ import {
 } from "../../../src/castle-wall/runtime/index.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+} from "../../../src/castle-wall/constants.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../../src/storage/memory.js";
+import { generateRandomKey } from "../../../src/core/random.js";
+import { buildCastleWallPosture } from "../../../src/principal-policy/posture.js";
 
 const SAMPLE_RULE: AllowlistRule = {
   id: "rule-anthropic",
@@ -266,8 +274,54 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     // dropping the id at write time -- see cred-return-hardening.test.ts.
     expect(entry?.details?.rule_id).toBe("rule-anthropic");
     expect(entry?.details?.source).toBe("macos_extension");
+    // 2026-06-17 provenance fix: the macOS writer must stamp the Castle Wall
+    // provenance marker so the honest posture readers count this as real
+    // enforcement evidence (without it, an enforcing macOS wall reads amber).
+    expect(entry?.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
     expect(consumer.getStats().decisionsRecorded).toBe(1);
     expect(consumer.getStats().decisionsRejected).toBe(0);
+  });
+
+  it("a REAL macOS allow flow arms buildCastleWallPosture (end-to-end, marker from the writer not the test)", async () => {
+    // The gold regression for the 2026-06-17 macOS under-claim: run the actual
+    // writer into a real AuditLog (so cw_source is stamped by the writer, NOT
+    // pre-set by the test), then prove the honest posture reader arms from it.
+    // Before the fix this returned arm_state "unknown" on a genuinely-enforcing
+    // macOS wall (the demo platform).
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: log as unknown as AuditSink,
+      defaultApprovalTimeoutSeconds: 30,
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: new Date().toISOString(),
+    };
+    await consumer.handleFlowDecisionRecorded(notification);
+    await log.flush();
+
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: "fortress-test",
+      platform: "darwin",
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
   });
 
   it("translates drop with null matched_rule_id to egress_blocked audit event", async () => {
