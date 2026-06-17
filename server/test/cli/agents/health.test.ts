@@ -108,7 +108,10 @@ describe("cli/agents/health probeTenantDashboard", () => {
     expect(result.reason).toContain("not a confirmed Sanctuary build");
   });
 
-  it("reports running on a 401 (token-protected dashboard)", async () => {
+  it("reports answered_unconfirmed (not running) on a bare 401 — auth-gated, but not provably Sanctuary", async () => {
+    // We send no Authorization header, so any auth-gated foreign server returns
+    // 401 identically. A bare 401 proves only that something auth-gated is
+    // listening, never that it is Sanctuary, so it must not be 'confirmed'.
     const port = await startServer((_req, res) => {
       res.writeHead(401);
       res.end();
@@ -125,8 +128,10 @@ describe("cli/agents/health probeTenantDashboard", () => {
         },
       })
     );
-    expect(result.running).toBe(true);
+    expect(result.running).toBe(false);
+    expect(result.state).toBe("answered_unconfirmed");
     expect(result.status).toBe(401);
+    expect(result.reason).toContain("not confirmed Sanctuary");
   });
 
   it("reports not-running on 500", async () => {

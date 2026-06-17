@@ -12,9 +12,12 @@
  *
  *   - status 200 AND a body shaped `{ ok: true, mode }` (the contract this
  *     endpoint serves) → confirmed Sanctuary tenant.
- *   - status 401 → the endpoint is token-gated; the body is withheld but only a
- *     Sanctuary dashboard answers `/api/health` with 401 when
- *     `SANCTUARY_DASHBOARD_AUTH_TOKEN` is set, so we treat it as confirmed.
+ *   - status 401 → SOMETHING auth-gated is listening, but a bare 401 proves only
+ *     that, not that the responder is Sanctuary. This probe sends no
+ *     Authorization header, so any auth-gated foreign server (nginx basic-auth,
+ *     an unrelated token-gated API) returns 401 identically. We therefore treat
+ *     401 as "port answered, not confirmed Sanctuary", symmetric with how a
+ *     foreign 200/404 is handled — never as confirmed.
  *   - any other answer (200 with a foreign/missing body, a bare 404 that proves
  *     the responder is not a current build, a 3xx, etc.) → "port answered, not
  *     confirmed Sanctuary": something is listening, but it is not provably this
@@ -104,15 +107,17 @@ export async function probeTenantDashboard(
       (res: IncomingMessage) => {
         const status = res.statusCode ?? 0;
 
-        // 401: token-gated Sanctuary dashboard. The body is withheld by design,
-        // but only a Sanctuary build answers /api/health with 401, so confirmed.
+        // 401: an auth-gated responder is listening, but we sent no Authorization
+        // header — any token-gated foreign server (nginx basic-auth, an unrelated
+        // API) returns 401 identically, so a bare 401 does NOT prove Sanctuary.
+        // Downgrade to answered_unconfirmed, symmetric with foreign 200/404.
         if (status === 401) {
           res.resume();
           resolve({
-            running: true,
-            state: "confirmed",
+            running: false,
+            state: "answered_unconfirmed",
             status,
-            reason: null,
+            reason: "port answered 401 (auth-gated), not confirmed Sanctuary",
           });
           return;
         }
