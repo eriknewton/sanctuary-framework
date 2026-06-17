@@ -85,7 +85,11 @@ function makeAgent(
       monthly: { unit: "usd", cap: 100, used: 12, soft_warn: 0.75 },
       last_refreshed_at: "2026-04-25T00:00:00.000Z",
     },
-    last_activity_at: "2026-04-25T00:00:00.000Z",
+    // Fresh activity so an "active" agent reads genuinely live. The hub
+    // read-projection ages a stale `active` (last_activity_at past the liveness
+    // window) down to `unknown`; this fixture models a currently-live agent, so
+    // its activity must be recent. See contracts/v1.1/liveness.ts.
+    last_activity_at: new Date().toISOString(),
     wrapped_at: "2026-04-20T00:00:00.000Z",
     capabilities: {
       can_pause: true,
@@ -672,6 +676,32 @@ describe("Hub agent registry list (Test 3)", () => {
     expect(a.policy_id).toBe("policy-default");
     expect(a.budget_summary.daily?.cap).toBe(100_000);
     expect(a.capabilities.can_pause).toBe(true);
+  });
+
+  it("ages a stale active agent to unknown in the list (seam #10 liveness)", async () => {
+    // Seed an agent whose stored status is `active` but whose last activity is
+    // far in the past: a crashed/dead agent. The list read-projection must age
+    // it to `unknown` so the fleet view stops showing "Running / protected".
+    rig.registry.put(
+      makeAgent({
+        agent_id: "agent-dead",
+        status: "active",
+        last_activity_at: "2020-01-01T00:00:00.000Z",
+      }),
+    );
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/agents`, {
+      headers: withAuth({}, rig.authToken),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: true;
+      data: { agents: LocalAgentRecord[] };
+    };
+    const dead = body.data.agents.find((x) => x.agent_id === "agent-dead");
+    const alpha = body.data.agents.find((x) => x.agent_id === "agent-alpha");
+    expect(dead?.status).toBe("unknown");
+    // The freshly-seeded default agent (recent activity) stays active.
+    expect(alpha?.status).toBe("active");
   });
 
   it("GET /api/hub/agents/:id returns the record + status snapshot", async () => {
