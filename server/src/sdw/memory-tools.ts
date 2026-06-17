@@ -348,7 +348,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     name: "memory_delete",
     description:
       "Permanently delete a passage from your sovereign memory vault (secure " +
-      "3-pass overwrite). Tier 1: irreversible, so it requires operator approval " +
+      "overwrite where the storage backend supports it; a plain delete otherwise). " +
+      "Tier 1: irreversible, so it requires operator approval " +
       "before execution and fails closed.",
     tool_class: "write",
     inputSchema: {
