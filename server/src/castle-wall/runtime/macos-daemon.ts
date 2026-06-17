@@ -14,6 +14,10 @@ import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+} from "../constants.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
   ArmLeaseNotification,
@@ -307,6 +311,10 @@ export async function startMacOSCastleWallDaemon(
             decision: response.decision,
             learn: response.learn,
             source: "castle-wall-cli",
+            // Provenance marker stamped LAST so the honest posture readers count
+            // this operator decision as genuine Castle Wall enforcement evidence
+            // (the 2026-06-17 macOS under-claim fix). See macos-flow-events.ts.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
           },
           "success",
         );
