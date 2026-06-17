@@ -21,6 +21,7 @@ import {
 import {
   probeTenantDashboard,
   type HealthProbeResult,
+  type HealthProbeState,
 } from "../cli/agents/health.js";
 
 export interface MultiTenantTenantRow {
@@ -36,8 +37,18 @@ export interface MultiTenantTenantRow {
   pid: number | null;
   started_at: string | null;
   mode: "wrap" | "standalone" | "co-located" | null;
-  /** `/api/health` probe result. */
+  /**
+   * `/api/health` probe result. `running` is true ONLY when the responder was
+   * confirmed to be a current Sanctuary build. A port that answers HTTP but does
+   * not identify itself as Sanctuary is NOT running; see `probe_state`.
+   */
   running: boolean;
+  /**
+   * Full probe state. `answered_unconfirmed` means a port answered but is not a
+   * provable Sanctuary tenant (foreign server on a reused port, bare 404 from a
+   * non-current build). Distinct from both `confirmed` and `not_running`.
+   */
+  probe_state: HealthProbeState;
   probe_reason: string | null;
   last_activity: string | null;
 }
@@ -46,7 +57,10 @@ export interface MultiTenantSnapshot {
   version: 1;
   generated_at: string;
   tenant_count: number;
+  /** Tenants confirmed to be a current Sanctuary build (probe_state confirmed). */
   running_count: number;
+  /** Ports that answered HTTP but did not prove they are a Sanctuary tenant. */
+  answered_unconfirmed_count: number;
   tenants: MultiTenantTenantRow[];
 }
 
@@ -78,6 +92,7 @@ function toRow(
     started_at: rt?.started_at ?? null,
     mode: rt?.mode ?? null,
     running: probe.running,
+    probe_state: probe.state,
     probe_reason: probe.reason,
     last_activity: tenant.last_activity,
   };
@@ -95,6 +110,9 @@ export async function getMultiTenantSnapshot(
     generated_at: new Date().toISOString(),
     tenant_count: rows.length,
     running_count: rows.filter((r) => r.running).length,
+    answered_unconfirmed_count: rows.filter(
+      (r) => r.probe_state === "answered_unconfirmed"
+    ).length,
     tenants: rows,
   };
 }

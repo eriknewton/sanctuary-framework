@@ -50,31 +50,62 @@ describe("cli/agents/health probeTenantDashboard", () => {
     return addr.port;
   }
 
+  function runtimeFor(port: number): TenantDescriptor["runtime"] {
+    return {
+      version: "x",
+      pid: 1,
+      started_at: "2026-04-17T00:00:00.000Z",
+      dashboard_host: "127.0.0.1",
+      dashboard_port: port,
+      mode: "wrap",
+    } as TenantDescriptor["runtime"];
+  }
+
   it("reports not-running when runtime is null", async () => {
     const result = await probeTenantDashboard(baseTenant({ runtime: null }));
     expect(result.running).toBe(false);
+    expect(result.state).toBe("not_running");
     expect(result.reason).toContain("no runtime.json");
   });
 
-  it("reports running on a 200 response", async () => {
+  it("confirms running on a 200 with a Sanctuary health body", async () => {
+    const port = await startServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, mode: "co-located" }));
+    });
+    const result = await probeTenantDashboard(
+      baseTenant({ runtime: runtimeFor(port) })
+    );
+    expect(result.running).toBe(true);
+    expect(result.state).toBe("confirmed");
+    expect(result.status).toBe(200);
+  });
+
+  it("does NOT confirm a 200 without the Sanctuary health body (foreign server on a reused port)", async () => {
     const port = await startServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end("{}");
     });
     const result = await probeTenantDashboard(
-      baseTenant({
-        runtime: {
-          version: "x",
-          pid: 1,
-          started_at: "2026-04-17T00:00:00.000Z",
-          dashboard_host: "127.0.0.1",
-          dashboard_port: port,
-          mode: "wrap",
-        },
-      })
+      baseTenant({ runtime: runtimeFor(port) })
     );
-    expect(result.running).toBe(true);
+    expect(result.running).toBe(false);
+    expect(result.state).toBe("answered_unconfirmed");
     expect(result.status).toBe(200);
+  });
+
+  it("renders a bare 404 as port-answered-not-confirmed, NOT running", async () => {
+    const port = await startServer((_req, res) => {
+      res.writeHead(404);
+      res.end("not found");
+    });
+    const result = await probeTenantDashboard(
+      baseTenant({ runtime: runtimeFor(port) })
+    );
+    expect(result.running).toBe(false);
+    expect(result.state).toBe("answered_unconfirmed");
+    expect(result.status).toBe(404);
+    expect(result.reason).toContain("not a confirmed Sanctuary build");
   });
 
   it("reports running on a 401 (token-protected dashboard)", async () => {
