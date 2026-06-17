@@ -11,10 +11,10 @@ name = "sanctuary_menubar_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "=2.6.0", features = [] }
+tauri-build = { version = "=2.6.1", features = [] }
 
 [dependencies]
-tauri = { version = "=2.11.0", features = ["tray-icon", "image-png"] }
+tauri = { version = "=2.11.1", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "=2.3.3"
 tauri-plugin-http = "=2.5.8"
 serde = { version = "=1.0.228", features = ["derive"] }

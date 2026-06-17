@@ -275,4 +275,36 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/does-not-exist`);
     expect(res.status).toBe(404);
   });
+
+  // ERROR-DETAIL-001: completes the #604 error-envelope sweep. The legacy
+  // dashboard 500-paths used to serialize `(err as Error).message` to the
+  // client. The fix keeps the specific public error code but emits no
+  // exception message, stack, or internal path. Operators still get the
+  // redacted detail via logCaughtError (server-side only).
+  it("does not leak the caught-exception message on a 500 approval failure", async () => {
+    const leakyMessage =
+      "ENOENT: /Users/eriknewton/secret/path/.sanctuary/state at innerHandler";
+    handle = await startForTest({
+      approvals: {
+        allow: async () => {
+          throw new Error(leakyMessage);
+        },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(500);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    // Specific public code is preserved.
+    expect(body.error).toBe("approval_failed");
+    // No exception detail field, and nothing from the raw error reaches the wire.
+    expect(body).not.toHaveProperty("message");
+    expect(raw).not.toContain(leakyMessage);
+    expect(raw).not.toContain("ENOENT");
+    expect(raw).not.toContain("/Users/eriknewton/secret/path");
+    expect(raw).not.toContain("innerHandler");
+  });
 });
