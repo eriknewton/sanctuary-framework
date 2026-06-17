@@ -208,4 +208,30 @@ describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
     const viewed = await applyAnthropicMemoryCommand(adapter, { command: "view", path: "/memories/leak.md" });
     expect(viewed.ok).toBe(false);
   });
+
+  it("str_replace inserts new_str LITERALLY (no $-pattern interpretation, no silent corruption) [F1 regression]", async () => {
+    const adapter = makeAdapter();
+    await applyAnthropicMemoryCommand(adapter, {
+      command: "create",
+      path: "/memories/dollar.md",
+      file_text: "alpha OLD omega",
+    });
+    // new_str carries every JS String.replace special: $&, $`, $', $$, $1.
+    // A plain string replacer would expand them ($& -> "OLD", $` -> "alpha ",
+    // $' -> " omega", $$ -> "$") and silently corrupt the stored content while
+    // the original was securely overwritten. They must survive verbatim.
+    const newStr = "$& $` $' $$ $1 NEW";
+    const replaced = await applyAnthropicMemoryCommand(adapter, {
+      command: "str_replace",
+      path: "/memories/dollar.md",
+      old_str: "OLD",
+      new_str: newStr,
+    });
+    expect(replaced.ok).toBe(true);
+    const viewed = await applyAnthropicMemoryCommand(adapter, {
+      command: "view",
+      path: "/memories/dollar.md",
+    });
+    expect(viewed.content).toBe("alpha " + newStr + " omega");
+  });
 });

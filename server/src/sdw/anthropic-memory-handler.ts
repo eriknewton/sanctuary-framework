@@ -134,7 +134,11 @@ export async function applyAnthropicMemoryCommand(
       if (!passage.text.includes(command.old_str)) {
         return fail("no_match", `old_str not found in ${command.path}`);
       }
-      const next = passage.text.replace(command.old_str, command.new_str);
+      // Use a function replacer so new_str is inserted LITERALLY. A plain
+      // string replacement makes String.prototype.replace interpret $-patterns
+      // ($&, $`, $', $$, $1) in new_str, which would silently corrupt stored
+      // content (the original is then securely overwritten -> irreversible).
+      const next = passage.text.replace(command.old_str, () => command.new_str);
       // NON-ATOMIC on the insert/delete-only backend: delete then re-insert.
       return mutateByReplace(adapter, command.path, next);
     }
