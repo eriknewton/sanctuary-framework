@@ -118,13 +118,27 @@ export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): Heal
         attestation_available: input.config.execution.attestation,
       },
       l3: {
-        status: "active",
-        evidence: `${input.config.disclosure.proof_system} disclosure proof system configured`,
+        // Honesty (audit seam #4): a configured proof system is presence, not
+        // enforcement evidence. No detector observes a proof being emitted or
+        // verified in this server process, so report "unknown" (configured,
+        // unverified) rather than "active". "active" is reserved for an
+        // observed disclosure operation, matching the Castle Wall discipline.
+        status: l3StatusFromConfig(input.config.disclosure.proof_system),
+        evidence:
+          input.config.disclosure.proof_system === "commitment-only"
+            ? "commitment-only disclosure configured (no zero-knowledge proof system); no proof emitted in this window"
+            : `${input.config.disclosure.proof_system} disclosure proof system configured; no proof emitted in this window`,
         proof_system: input.config.disclosure.proof_system,
+        proof_emitted_in_window: false,
       },
       l4: {
-        status: "active",
-        evidence: `${input.config.reputation.mode} reputation mode configured; interaction telemetry unavailable`,
+        // Honesty (audit seam #4 / #11): reputation telemetry is unavailable,
+        // so reserve "active" for an observed reputation operation. Report
+        // "unknown" (configured, unverified) while nothing has exercised the
+        // layer. This is the self-claim ASSURANCE_MATRIX row 16 said was
+        // removed, now actually removed from the evidence report.
+        status: "unknown",
+        evidence: `${input.config.reputation.mode} reputation mode configured; interaction telemetry unavailable (configured, unverified)`,
         mode: input.config.reputation.mode,
         interaction_count: "unknown",
         reputation_exportable: true,
@@ -231,6 +245,20 @@ function cognitiveStatusFromCastleWall(status: RuntimeStatus): RuntimeStatus {
   if (status === "active") return "active";
   if (status === "unknown") return "unknown";
   return "degraded";
+}
+
+/**
+ * Honesty (audit seam #4): derive the L3 disclosure status from config
+ * presence without claiming enforcement. A "commitment-only" proof_system has
+ * no zero-knowledge proof system configured at all (not_configured); any other
+ * configured proof system is present but unverified by this process (unknown).
+ * Neither is "active"; that label is reserved for an observed disclosure
+ * operation, which no detector reports here.
+ */
+function l3StatusFromConfig(
+  proofSystem: SanctuaryConfig["disclosure"]["proof_system"]
+): RuntimeStatus {
+  return proofSystem === "commitment-only" ? "not_configured" : "unknown";
 }
 
 function buildDegradations(

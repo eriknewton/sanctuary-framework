@@ -91,4 +91,42 @@ describe("health evidence", () => {
     expect(report.layers.l1.status).toBe("unknown");
     expect(report.layers.l4.interaction_count).toBe("unknown");
   });
+
+  // Honesty (audit seam #4): L3/L4 must NOT report "active" on config
+  // presence. "active" means observed enforcement; no detector observes a
+  // disclosure proof emitted or a reputation interaction in this process.
+  it("does not claim L3/L4 active on config presence (configured-not-verified)", () => {
+    const report = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "MemoryStorage",
+    });
+
+    // Default config has a ZK proof system (schnorr-pedersen) configured, but
+    // no proof was emitted, so L3 is "unknown" (configured, unverified).
+    expect(report.layers.l3.status).not.toBe("active");
+    expect(report.layers.l3.status).toBe("unknown");
+    expect(report.layers.l3.proof_emitted_in_window).toBe(false);
+    expect(report.layers.l3.evidence).toContain("no proof emitted");
+
+    // Reputation telemetry is unavailable, so L4 is "unknown", never "active".
+    expect(report.layers.l4.status).not.toBe("active");
+    expect(report.layers.l4.status).toBe("unknown");
+    expect(report.layers.l4.evidence).toContain("configured, unverified");
+  });
+
+  // Honesty (audit seam #4): commitment-only disclosure has no ZK proof
+  // system at all — L3 is "not_configured", never "active".
+  it("reports L3 not_configured when only commitment-only disclosure is set", () => {
+    const config = defaultConfig();
+    config.disclosure.proof_system = "commitment-only";
+    const report = buildHealthEvidenceReport({
+      config,
+      identityCount: 0,
+      storageBackendName: "MemoryStorage",
+    });
+
+    expect(report.layers.l3.status).toBe("not_configured");
+    expect(report.layers.l3.evidence).toContain("no zero-knowledge proof system");
+  });
 });

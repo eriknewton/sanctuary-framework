@@ -500,11 +500,21 @@ export async function createSanctuaryServer(options?: {
             },
             isolation_level: "process",
             sovereignty_assessment: {
-              l1_state_encrypted: true,
+              // Honesty (audit seam #4): these were literal `true`s asserting
+              // runtime-verified encryption and available proofs on config
+              // presence. Derive from real config and surface the unverified
+              // posture: encryption is *configured* (no runtime integrity check
+              // proves bytes on disk are encrypted), and zero-knowledge proofs
+              // are only "available" when a ZK proof system is configured
+              // (commitment-only has none). The verification status is unknown.
+              l1_state_encrypted: config.state.encryption === "aes-256-gcm",
+              l1_state_encryption_verified: "unknown",
               l1_status: evidence.layers.l1.status,
               l2_execution_isolated: evidence.layers.l2.status,
               l2_isolation_type: "process-level",
-              l3_proofs_available: true,
+              l3_proofs_available:
+                config.disclosure.proof_system !== "commitment-only",
+              l3_status: evidence.layers.l3.status,
               l4_reputation_status: evidence.layers.l4.status,
               overall_level: "mvs",
               degradations: evidence.degradations.map((d) => d.description),
@@ -517,8 +527,13 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_health",
+      // Honesty (audit seam #4): the prior copy promised a "live Castle Wall
+      // enforcement state" that no detector feeds. Castle Wall status reflects
+      // whatever runtime snapshot is wired in (often "unknown" when none is),
+      // and the disclosure/reputation layers report configured-vs-verified, not
+      // observed enforcement. Describe what the tool actually returns.
       description:
-        "Report this instance's live health and sovereignty status: overall state (healthy/degraded/compromised), versions, Castle Wall enforcement state, audit/state/egress posture, and any active degradations. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
+        "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
