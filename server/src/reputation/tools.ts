@@ -12,6 +12,8 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
+import type { SanctuaryConfig } from "../config.js";
+import type { RuntimeStatus } from "../health/evidence.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import {
@@ -23,13 +25,56 @@ import {
   type SovereigntyTier,
 } from "./tiers.js";
 
+/**
+ * Map an evidence-derived RuntimeStatus to the Verascore publish layer shape.
+ *
+ * HONESTY (seam #12): the published SHR payload is signed with the agent's real
+ * key and POSTed to an EXTERNAL reputation surface that relying parties consume.
+ * A layer's `score`/`status`/`description` must therefore reflect the same
+ * evidence `monitor_health` reports, never a hardcoded "100 / active /
+ * cryptographically verified". When a layer is not backed by observed
+ * enforcement evidence we publish the conservative claim ("unknown" /
+ * "configured, unverified") rather than a perfect score.
+ */
+function verascoreLayerFromStatus(
+  status: RuntimeStatus,
+  evidence: string
+): { score: number; status: string; description: string } {
+  switch (status) {
+    case "active":
+      // Reserved for evidence-backed enforcement (e.g. Castle Wall reports the
+      // wall actually armed). Still not a hardcoded 100; "active" is earned.
+      return { score: 100, status: "active", description: evidence };
+    case "degraded":
+      return { score: 72, status: "degraded", description: evidence };
+    case "inactive":
+      return { score: 0, status: "inactive", description: evidence };
+    case "not_configured":
+      return {
+        score: 0,
+        status: "not_configured",
+        description: `Configured off / not present: ${evidence}`,
+      };
+    case "unknown":
+    default:
+      // No runtime detector confirmed this layer. Publish the absence of
+      // evidence as absence of evidence, not as a verified claim.
+      return {
+        score: 0,
+        status: "unknown",
+        description: `Configured, unverified (no runtime evidence): ${evidence}`,
+      };
+  }
+}
+
 export function createReputationTools(
   storage: StorageBackend,
   masterKey: Uint8Array,
   identityManager: IdentityManager,
   auditLog: AuditLog,
   handshakeResults?: Map<string, HandshakeResult>,
-  verascoreUrl?: string
+  verascoreUrl?: string,
+  config?: SanctuaryConfig
 ): { tools: ToolDefinition[]; reputationStore: ReputationStore } {
   const reputationStore = new ReputationStore(storage, masterKey);
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -301,7 +346,7 @@ export function createReputationTools(
       },
       handler: async (args) => {
         const bundleBase64 = args.bundle as string;
-        // Signature verification is always enforced — no caller override.
+        // Signature verification is always enforced; no caller override.
         // Allowing callers to skip verification was a prompt-injection footgun.
         const verifySignatures = true;
 
@@ -688,19 +733,75 @@ export function createReputationTools(
         if (args.data) {
           publishData = args.data as Record<string, unknown>;
         } else {
-          // Auto-generate from current state if no explicit data provided
+          // Auto-generate from current state if no explicit data provided.
+          //
+          // HONESTY (seam #12): this payload is signed with the agent's real
+          // key and POSTed to an external reputation surface. We therefore
+          // refuse to fabricate a perfect score. The auto-generated SHR is
+          // derived from the SAME evidence source `monitor_health` uses
+          // (buildHealthEvidenceReport), so a layer with no observed
+          // enforcement evidence publishes as "unknown" / "configured,
+          // unverified" rather than "100 / active / cryptographically
+          // verified". Callers who want to publish a specific (e.g. earned)
+          // claim must pass it explicitly via `data`.
           switch (publishType) {
             case "shr": {
-              // Generate SHR-like data from current sovereignty state
+              if (!config) {
+                return toolResult({
+                  error:
+                    "Cannot auto-generate an SHR publish payload without a live evidence source. " +
+                    "Provide an explicit 'data' payload, or use shr_generate to produce a signed report.",
+                });
+              }
+
+              const { buildHealthEvidenceReport } = await import("../health/evidence.js");
+              const evidence = buildHealthEvidenceReport({
+                config,
+                identityCount: identityManager.list().length,
+                storageBackendName: storage.constructor.name,
+              });
+
+              const l1 = verascoreLayerFromStatus(
+                evidence.layers.l1.status,
+                evidence.layers.l1.evidence
+              );
+              const l2 = verascoreLayerFromStatus(
+                evidence.layers.l2.status,
+                evidence.layers.l2.evidence
+              );
+              const l3 = verascoreLayerFromStatus(
+                evidence.layers.l3.status,
+                evidence.layers.l3.evidence
+              );
+              const l4 = verascoreLayerFromStatus(
+                evidence.layers.l4.status,
+                evidence.layers.l4.evidence
+              );
+
+              const sovereigntyLayers = [
+                { name: "L1", label: "Cognitive Sovereignty", ...l1 },
+                { name: "L2", label: "Operational Isolation", ...l2 },
+                { name: "L3", label: "Selective Disclosure", ...l3 },
+                { name: "L4", label: "Verifiable Reputation", ...l4 },
+              ];
+
+              // Overall score is the mean of the evidence-derived layer scores,
+              // never a hardcoded constant. A degraded/unknown layer drags it
+              // down exactly as the evidence warrants.
+              const overallScore = Math.round(
+                sovereigntyLayers.reduce((sum, layer) => sum + layer.score, 0) /
+                  sovereigntyLayers.length
+              );
+
               publishData = {
-                sovereigntyLayers: [
-                  { name: "L1", label: "Cognitive Sovereignty", score: 100, status: "active", description: "Full cognitive isolation with policy-controlled context boundaries" },
-                  { name: "L2", label: "Operational Isolation", score: 72, status: "degraded", description: "Runtime isolation without TEE hardware attestation" },
-                  { name: "L3", label: "Selective Disclosure", score: 100, status: "active", description: "Schnorr-Pedersen zero-knowledge proofs for credential verification" },
-                  { name: "L4", label: "Verifiable Reputation", score: 100, status: "active", description: "Cryptographically verified reputation with portable attestations" },
+                sovereigntyLayers,
+                capabilities: [
+                  "sovereignty-handshake",
+                  "concordia-negotiation",
+                  "audit-trail-export",
                 ],
-                capabilities: ["sovereignty-handshake", "concordia-negotiation", "audit-trail-export", "zk-proofs"],
-                overallScore: 93,
+                overallScore,
+                evidence_basis: "derived from live health evidence (monitor_health)",
               };
               break;
             }
@@ -732,7 +833,7 @@ export function createReputationTools(
           signatureB64 = toBase64url(signingBytes);
         } catch (signError) {
           // SEC-036: Do NOT fall back to a placeholder signature.
-          // If signing fails, the operation must fail — not silently degrade.
+          // If signing fails, the operation must fail, not silently degrade.
           return toolResult({
             error: "Failed to sign publish payload. Identity key may be corrupted.",
             details: signError instanceof Error ? signError.message : String(signError),

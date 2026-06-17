@@ -223,7 +223,7 @@
 2	server/src/proxy/client-manager.ts
 3	server/src/proxy/proxy-router.ts
 3	server/src/reputation/reputation-store.ts
-2	server/src/reputation/tools.ts
+1	server/src/reputation/tools.ts
 5	server/src/router.ts
 6	server/src/sanctuary-tools.ts
 4	server/src/sdw/export.ts

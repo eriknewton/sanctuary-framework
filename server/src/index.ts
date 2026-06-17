@@ -718,7 +718,8 @@ export async function createSanctuaryServer(options?: {
     identityManager,
     auditLog,
     handshakeResults,
-    config.verascore.url
+    config.verascore.url,
+    config
   );
 
   // 14. Create SHR tools (machine-readable sovereignty health report).
