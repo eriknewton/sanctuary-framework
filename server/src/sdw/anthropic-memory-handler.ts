@@ -93,9 +93,12 @@ function fail(error_code: string, content: string): AnthropicMemoryResult {
 
 /**
  * Apply one Memory-tool command against the sovereign passage adapter. The
- * adapter enforces all custody invariants (write-gate secret rejection,
- * encryption at rest, audit). This handler only translates the file contract
- * onto passage ops and surfaces the insert/delete-only mismatch.
+ * adapter enforces the custody invariants it owns (write-gate secret rejection,
+ * encryption at rest). NOTE: this synthetic spike does NOT itself write audit
+ * entries for its ops; tool-level audit is wired when the handler is registered
+ * into the live server (see Company_Brain_Registration_Followups). This handler
+ * only translates the file contract onto passage ops and surfaces the
+ * insert/delete-only mismatch.
  */
 export async function applyAnthropicMemoryCommand(
   adapter: MemoryBackendAdapter,
