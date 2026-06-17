@@ -58,33 +58,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Castle Wall audit operations that constitute ENFORCEMENT EVIDENCE — i.e.
+ * Castle Wall audit operations that constitute ENFORCEMENT EVIDENCE, i.e.
  * events that could only have been emitted by the enforcing extension/daemon
- * acting on a real flow or policy. These are written to the encrypted audit
- * log with `layer: "l1"` and `operation === <CastleWallEventType>` by
- * `castle-wall/runtime/audit-consumer.ts`.
+ * acting on a real flow or operator decision. These are written to the
+ * encrypted audit log with `layer: "l1"` and `operation === <CastleWallEventType>`
+ * by `castle-wall/runtime/audit-consumer.ts`.
  *
  * `egress_allowed` / `egress_blocked` / `operator_decision` prove the filter
- * adjudicated live traffic. `policy_loaded` proves the extension accepted a
- * manifest. We deliberately EXCLUDE pure lifecycle/diagnostic events
- * (`filter_started`, `filter_stopped`, `filter_crashed`, `provider_unbound`,
- * `no_wall_engaged`, ...) from the "armed" determination: a started filter is
- * not a filtering filter, which is exactly the divergence H3 forbids us from
- * papering over.
+ * adjudicated live traffic. We deliberately EXCLUDE pure lifecycle/diagnostic
+ * events (`filter_started`, `filter_stopped`, `filter_crashed`,
+ * `provider_unbound`, `no_wall_engaged`, ...) from the "armed" determination: a
+ * started filter is not a filtering filter, which is exactly the divergence H3
+ * forbids us from papering over.
  *
- * SLICE R BOUNDARY (disclosed, deliberately not changed here): `policy_loaded`
- * is NOT per-event-signed enforcement evidence — it attests "a manifest was
- * accepted," not "the wall is live-adjudicating now." Under Slice R, when a
- * pinned producer key IS configured, a `policy_loaded` entry re-verifies as
- * channel-basis and therefore does NOT arm (only re-verified producer-signed
- * live-adjudication evidence does). On the NO-KEY path (macOS today /
- * pre-provision), `policy_loaded` can still arm on the CHANNEL basis — this is
- * the pre-existing shipped `posture.ts` behavior and is honestly surfaced as
- * `producer_authenticity: "channel_authenticated"`, never as per-event
- * authenticity. Narrowing the no-key arm set (to mirror feature-health's
- * stricter `CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS`, which already excludes
- * `policy_loaded`) is a macOS-channel-floor change outside this slice's scope;
- * Slice M closes per-event authenticity on macOS.
+ * `policy_loaded` is also EXCLUDED, on EVERY basis (no-key/channel and
+ * key-present/producer-signed). It attests only "a manifest was accepted once,"
+ * not "the wall is live-adjudicating now," so by itself it must never render the
+ * banner green. A wall that loaded a policy but has adjudicated zero flows in
+ * the freshness window renders `unknown` (amber), never `armed`. This is the
+ * never-overclaim invariant applied to the no-key floor: previously a
+ * `policy_loaded`-only wall armed on the channel basis (the now-closed
+ * "SLICE R BOUNDARY" seam), which contradicted the sibling reader
+ * `feature-health.ts:CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS`. Both readers now
+ * consume THIS single frozen set as their one definition of live adjudication
+ * (feature-health imports it as an alias), so no second, more-permissive color
+ * model can drift back in. The write-side gate
+ * (`castle-wall/runtime/audit-consumer.ts:ENFORCEMENT_EVIDENCE_EVENT_TYPES`,
+ * i.e. which events REQUIRE a producer signature) is the same concept typed over
+ * the event-type enum; it is kept in lockstep by a drift-guard test rather than
+ * a shared object, since the two modules are deliberately not import-coupled
+ * across the read/write boundary. (`policy_loaded` remains a recorded lifecycle
+ * event in the audit vocabulary; only its eligibility to ARM the posture reader
+ * is removed.) Slice M closes per-event authenticity on macOS; this slice closes
+ * the no-key arm-set honesty residual.
  */
 export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
   Object.freeze(
@@ -92,7 +98,6 @@ export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
       "egress_allowed",
       "egress_blocked",
       "operator_decision",
-      "policy_loaded",
     ]),
   );
 
@@ -229,7 +234,8 @@ export interface BuildCastleWallPostureInput {
  * The arm-state determination is intentionally conservative:
  *
  *   armed     ← at least one enforcement-evidence operation
- *               (egress_allowed/blocked, operator_decision, policy_loaded)
+ *               (egress_allowed/blocked, operator_decision; NOT policy_loaded,
+ *               which proves only manifest-acceptance, not live adjudication)
  *               appears within the freshness window.
  *   degraded  ← no fresh enforcement evidence, but a fresh "not enforcing"
  *               event (filter_crashed, provider_unbound, no_wall_engaged,
@@ -349,8 +355,9 @@ export async function buildCastleWallPosture(
     // unsigned enforcement evidence. So a key-bearing reader counts an
     // arm-eligible Castle Wall entry ONLY if it re-verifies as
     // `producer_signed_verified`; a `channel_authenticated`/absent-basis entry
-    // (including a forged marker-only entry, or a `policy_loaded` entry the
-    // daemon does not sign) does NOT count — fail closed (codex HIGH #1/#2).
+    // (including a forged marker-only entry) does NOT count, fail closed (codex
+    // HIGH #1/#2). (`policy_loaded` is excluded from arm-eligibility upstream on
+    // EVERY basis, so it never reaches this count regardless of the key state.)
     // When NO key is configured, the channel basis counts (the honest legacy /
     // macOS floor).
     const keyPresent = pinnedProducerKey !== null;

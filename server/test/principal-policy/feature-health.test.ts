@@ -11,6 +11,7 @@ import {
   type FeatureHealthRow,
   type FeatureRegistryEntry,
 } from "../../src/principal-policy/feature-health.js";
+import { CASTLE_WALL_ENFORCEMENT_OPERATIONS } from "../../src/principal-policy/posture.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
 
 const FORTRESS = "fortress:test";
@@ -79,6 +80,20 @@ describe("feature-health registry — integrity invariants", () => {
     expect(CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS.has("egress_allowed")).toBe(
       true,
     );
+  });
+
+  it("both readers share ONE live-adjudication set (drift guard: the banner and panel cannot diverge)", () => {
+    // The honesty-seam fix collapsed the two formerly-separate sets into one
+    // frozen object. If a future change re-forks them, this fails loudly.
+    expect(CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS).toBe(
+      CASTLE_WALL_ENFORCEMENT_OPERATIONS,
+    );
+    expect([...CASTLE_WALL_ENFORCEMENT_OPERATIONS].sort()).toEqual([
+      "egress_allowed",
+      "egress_blocked",
+      "operator_decision",
+    ]);
+    expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has("policy_loaded")).toBe(false);
   });
 
   it("the plugin_failure_surge fault class is DORMANT (no #508 S4 producer yet)", () => {
