@@ -107,6 +107,16 @@ describe("seam #12: SHR publish payload is evidence-based, not a hardcoded perfe
 
     const l2 = layers.find((l) => l.name === "L2")!;
     expect(l2.status).toBe("degraded");
+
+    // F2 (seam #12 review): L3/L4 inherit seam #4's honest derivation and must never
+    // publish the pre-#4 hardcoded active/100 to the signed external surface. Asserting
+    // this turns the "#4 must be in the merge base" dependency into an enforced gate.
+    const l3 = layers.find((l) => l.name === "L3")!;
+    expect(l3.status).not.toBe("active");
+    expect(l3.score).toBe(0);
+    const l4 = layers.find((l) => l.name === "L4")!;
+    expect(l4.status).not.toBe("active");
+    expect(l4.score).toBe(0);
   });
 
   it("overall score is the mean of evidence-derived layer scores, not a hardcoded constant", async () => {
@@ -123,7 +133,7 @@ describe("seam #12: SHR publish payload is evidence-based, not a hardcoded perfe
       data.sovereigntyLayers.reduce((s, l) => s + l.score, 0) / data.sovereigntyLayers.length
     );
     expect(data.overallScore).toBe(mean);
-    expect(data.overallScore).toBeLessThan(93);
+    expect(data.overallScore).toBeLessThanOrEqual(25);
   });
 
   it("does not unconditionally advertise the zk-proofs capability", async () => {
