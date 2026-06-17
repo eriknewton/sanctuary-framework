@@ -646,7 +646,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_forget",
-      description: "Permanently and securely delete a memory key (random-overwrite then remove) via state_delete. Tier 1: requires operator approval; pass the approval proof. Irreversible. Returns an audit_ref for the deletion event.",
+      description: "Permanently delete a memory key via state_delete: the entry is removed and its file gets a best-effort random-byte overwrite before unlinking. On copy-on-write/SSD media (APFS, ext4, flash) the original bytes may persist, so at-rest confidentiality rests on encryption (data is stored as ciphertext), not on the overwrite. Tier 1: requires operator approval; pass the approval proof. Returns an audit_ref for the deletion event.",
       tool_class: "write",
       approvalTargetToolName: "state_delete",
       approvalTargetArgs: deletePrimitiveArgs,
