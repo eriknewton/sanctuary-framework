@@ -40,8 +40,11 @@ async function buildMockTenant(
   await writeFile(join(dir, "wrap-profile.json"), JSON.stringify({ version: 1 }));
   const server = createServer((req, res) => {
     if (req.url === "/api/health") {
+      // Match the real /api/health contract (`{ ok: true, mode }`) so the probe
+      // confirms this is a Sanctuary build. A body missing `mode` is, by the
+      // honesty fix, "port answered, not confirmed Sanctuary" rather than running.
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, tenant: name }));
+      res.end(JSON.stringify({ ok: true, mode: "wrap", tenant: name }));
       return;
     }
     res.writeHead(404);
