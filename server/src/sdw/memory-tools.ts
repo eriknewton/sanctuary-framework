@@ -33,10 +33,12 @@
  * go to the audit log only. No silent degrade.
  */
 
+import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { fixedDenial } from "../agent-native/safety-base.js";
+import { toBase64url } from "../core/encoding.js";
 import type { PersistableTaint } from "./provenance.js";
 import type {
   MemoryBackendAdapter,
@@ -44,6 +46,7 @@ import type {
   MemorySearchResult,
 } from "./adapters/memory-backend.js";
 import { SdwValidationError } from "./errors.js";
+import { isSdwIdentifier } from "./grammar.js";
 
 const MAX_TEXT_BYTES = 1024 * 1024;
 const PERSISTABLE_TAINTS: readonly PersistableTaint[] = [
@@ -101,6 +104,10 @@ function asPositiveInt(value: unknown): number | null {
     : Number.NaN; // sentinel for "present but invalid"
 }
 
+function generateMemoryPassageId(): string {
+  return toBase64url(new Uint8Array(randomBytes(15)));
+}
+
 export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
 
@@ -145,7 +152,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           description:
             "Provenance of the text: user_content (conversation-derived), " +
             "agent_derived_clean (agent summary), or system_generated. " +
-            "Forbidden taints and secret-classifier hits are rejected before encryption.",
+            "This is a hint, not a secret-free guarantee: forbidden taints " +
+            "and secret-classifier hits are rejected before encryption.",
         },
         tags: {
           type: "array",
@@ -184,25 +192,46 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         await auditFailure("memory_insert_denied", { denial_class: "invalid_passage_id" });
         return deny("memory_insert");
       }
+      if (typeof passageId === "string" && !isSdwIdentifier(passageId)) {
+        await auditFailure("memory_insert_denied", { denial_class: "invalid_passage_id" });
+        return deny("memory_insert");
+      }
+      const auditedPassageId = passageId ?? generateMemoryPassageId();
       try {
-        const passage = await adapter.insertPassage(
-          { text, tags, passage_id: passageId },
+        await auditSuccess("memory_insert_intent", {
+          phase: "intent",
+          passage_id: auditedPassageId,
+          text_bytes: Buffer.byteLength(text, "utf8"),
+          tag_count: tags.length,
+        });
+      } catch {
+        return deny("memory_insert");
+      }
+      let passage: MemoryPassage;
+      try {
+        passage = await adapter.insertPassage(
+          { text, tags, passage_id: auditedPassageId },
           taint,
         );
-        await auditSuccess("memory_insert_completed", {
-          passage_id: passage.passage_id,
-          owner_ref: passage.owner_ref,
-          content_hash: passage.content_hash,
-          chunk_count: passage.chunk_count,
-        });
-        return toolResult({ inserted: true, passage: publicPassage(passage) });
       } catch (error) {
         // SdwValidationError (e.g. classifier_reject, duplicate_passage,
         // invalid identifier) -> fixed denial; category to audit only.
         const category = error instanceof SdwValidationError ? error.category : "insert_failed";
-        await auditFailure("memory_insert_denied", { denial_class: category });
+        await auditFailure("memory_insert_denied", {
+          phase: "outcome",
+          denial_class: category,
+          passage_id: auditedPassageId,
+        });
         return deny("memory_insert");
       }
+      await auditSuccess("memory_insert", {
+        phase: "outcome",
+        passage_id: passage.passage_id,
+        owner_ref: passage.owner_ref,
+        content_hash: passage.content_hash,
+        chunk_count: passage.chunk_count,
+      });
+      return toolResult({ inserted: true, passage: publicPassage(passage) });
     },
   };
 
@@ -228,7 +257,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       }
       try {
         const passage = await adapter.getPassage(passageId);
-        if (passage === null) return toolResult({ found: false });
+        if (passage === null) {
+          await auditSuccess("memory_get", { passage_id: passageId, result_count: 0 });
+          return toolResult({ found: false });
+        }
+        await auditSuccess("memory_get", { passage_id: passageId, result_count: 1 });
         return toolResult({ found: true, passage: publicPassage(passage) });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "get_failed";
@@ -277,6 +310,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           tag: typeof tag === "string" ? tag : undefined,
           limit: limit ?? undefined,
         });
+        await auditSuccess("memory_search", {
+          result_count: results.length,
+          limited: limit ?? null,
+          tag_filter: typeof tag === "string",
+        });
         return toolResult({ results: results.map(publicSearchResult) });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "search_failed";
@@ -316,6 +354,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           limit: limit ?? undefined,
           after: typeof after === "string" ? after : undefined,
         });
+        await auditSuccess("memory_list", {
+          result_count: passages.length,
+          limited: limit ?? null,
+          after_provided: typeof after === "string",
+        });
         return toolResult({ passages: passages.map(publicPassage) });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "list_failed";
@@ -334,6 +377,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     handler: async () => {
       try {
         const count = await adapter.countPassages();
+        await auditSuccess("memory_count", { count });
         return toolResult({ count });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "count_failed";
@@ -366,15 +410,32 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         return deny("memory_delete");
       }
       try {
-        const deleted = await adapter.deletePassage(passageId);
-        if (!deleted) return toolResult({ deleted: false, found: false });
-        await auditSuccess("memory_delete_completed", { passage_id: passageId });
-        return toolResult({ deleted: true });
-      } catch (error) {
-        const category = error instanceof SdwValidationError ? error.category : "delete_failed";
-        await auditFailure("memory_delete_denied", { denial_class: category });
+        await auditSuccess("memory_delete_intent", { phase: "intent", passage_id: passageId });
+      } catch {
         return deny("memory_delete");
       }
+      let deleted: boolean;
+      try {
+        deleted = await adapter.deletePassage(passageId);
+      } catch (error) {
+        const category = error instanceof SdwValidationError ? error.category : "delete_failed";
+        await auditFailure("memory_delete_denied", {
+          phase: "outcome",
+          denial_class: category,
+          passage_id: passageId,
+        });
+        return deny("memory_delete");
+      }
+      if (!deleted) {
+        await auditFailure("memory_delete_denied", {
+          phase: "outcome",
+          denial_class: "not_found",
+          passage_id: passageId,
+        });
+        return toolResult({ deleted: false, found: false });
+      }
+      await auditSuccess("memory_delete", { phase: "outcome", passage_id: passageId });
+      return toolResult({ deleted: true });
     },
   };
 

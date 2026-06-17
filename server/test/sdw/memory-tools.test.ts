@@ -49,23 +49,28 @@ interface AuditCall {
   details?: Record<string, unknown>;
 }
 
-function makeAuditLog(): { log: AuditLog; calls: AuditCall[] } {
+function makeAuditLog(failOperations: readonly string[] = []): { log: AuditLog; calls: AuditCall[] } {
   const calls: AuditCall[] = [];
+  const failSet = new Set(failOperations);
   const log = {
     async appendCritical(entry: {
       operation: string;
       result: "success" | "failure";
       details?: Record<string, unknown>;
     }): Promise<void> {
+      if (failSet.has(entry.operation)) {
+        throw new Error(`audit failed for ${entry.operation}`);
+      }
       calls.push({ operation: entry.operation, result: entry.result, details: entry.details });
     },
   } as unknown as AuditLog;
   return { log, calls };
 }
 
-function makeTools(): {
+function makeTools(options: { failAuditOperations?: readonly string[] } = {}): {
   tools: Map<string, ToolDefinition>;
   storage: MemoryStorage;
+  adapter: SdwMemoryBackendAdapter;
   calls: AuditCall[];
 } {
   const storage = new MemoryStorage();
@@ -76,9 +81,9 @@ function makeTools(): {
     ownerRef: "tools-archive",
     now: () => NOW,
   });
-  const { log, calls } = makeAuditLog();
+  const { log, calls } = makeAuditLog(options.failAuditOperations);
   const defs = createSdwMemoryTools({ adapter, auditLog: log });
-  return { tools: new Map(defs.map((tool) => [tool.name, tool])), storage, calls };
+  return { tools: new Map(defs.map((tool) => [tool.name, tool])), storage, adapter, calls };
 }
 
 function parse(result: { content: Array<{ type: "text"; text: string }> }): Record<string, unknown> {
@@ -201,6 +206,91 @@ describe("SDW memory tools: custody + denial discipline", () => {
     );
   });
 
+  it("does not insert when the pre-commit intent audit write fails", async () => {
+    const { tools, storage } = makeTools({ failAuditOperations: ["memory_insert_intent"] });
+    const result = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "must not persist",
+        taint: "agent_derived_clean",
+        passage_id: "audit-fail-insert",
+      }),
+    );
+    expect(result.denied).toBe(true);
+    expect(storage.data.size).toBe(0);
+  });
+
+  it("pre-audits generated passage ids with the id that is actually persisted", async () => {
+    const { tools, calls } = makeTools();
+    const result = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "generated id audit trail",
+        taint: "agent_derived_clean",
+      }),
+    );
+    const passageId = (result.passage as Record<string, unknown>).passage_id;
+    const insertAudit = calls.find((c) => c.operation === "memory_insert_intent");
+    expect(result.inserted).toBe(true);
+    expect(typeof passageId).toBe("string");
+    expect(insertAudit?.details?.passage_id).toBe(passageId);
+  });
+
+  it("does not leave a success outcome audit when insert mutation fails", async () => {
+    const { tools, adapter, calls } = makeTools();
+    await adapter.insertPassage(
+      { passage_id: "duplicate-outcome", text: "already here" },
+      "user_content",
+    );
+    calls.length = 0;
+    const result = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "must fail",
+        taint: "agent_derived_clean",
+        passage_id: "duplicate-outcome",
+      }),
+    );
+    expect(result.denied).toBe(true);
+    expect(calls.find((c) => c.operation === "memory_insert_intent")).toMatchObject({
+      result: "success",
+    });
+    expect(calls.some((c) => c.operation === "memory_insert" && c.result === "success")).toBe(
+      false,
+    );
+    expect(calls.find((c) => c.operation === "memory_insert_denied")).toMatchObject({
+      result: "failure",
+    });
+  });
+
+  it("does not delete when the pre-commit intent audit write fails", async () => {
+    const { tools, adapter } = makeTools({ failAuditOperations: ["memory_delete_intent"] });
+    await adapter.insertPassage(
+      { passage_id: "audit-fail-delete", text: "must survive" },
+      "user_content",
+    );
+    const result = parse(
+      await tools.get("memory_delete")!.handler({ passage_id: "audit-fail-delete" }),
+    );
+    expect(result.denied).toBe(true);
+    await expect(adapter.getPassage("audit-fail-delete")).resolves.toMatchObject({
+      text: "must survive",
+    });
+  });
+
+  it("audits a missing delete as not found after the pre-delete intent", async () => {
+    const { tools, calls } = makeTools();
+    const result = parse(await tools.get("memory_delete")!.handler({ passage_id: "missing-delete" }));
+    const intent = calls.find((c) => c.operation === "memory_delete_intent");
+    const notFound = calls.find((c) => c.operation === "memory_delete_denied");
+    expect(result).toMatchObject({ deleted: false, found: false });
+    expect(intent?.details?.passage_id).toBe("missing-delete");
+    expect(notFound?.details).toMatchObject({
+      denial_class: "not_found",
+      passage_id: "missing-delete",
+    });
+    expect(calls.some((c) => c.operation === "memory_delete" && c.result === "success")).toBe(
+      false,
+    );
+  });
+
   it("an invalid taint is denied with the fixed schema, details go to audit only (MUST-NEVER #7)", async () => {
     const { tools, calls } = makeTools();
     const result = parse(
@@ -220,5 +310,25 @@ describe("SDW memory tools: custody + denial discipline", () => {
     });
     const searched = parse(await tools.get("memory_search")!.handler({ text: "" }));
     expect((searched.results as unknown[]).length).toBe(0);
+  });
+
+  it("audits successful read paths with result counts", async () => {
+    const { tools, calls } = makeTools();
+    await tools.get("memory_insert")!.handler({
+      text: "hello searchable world",
+      taint: "agent_derived_clean",
+      passage_id: "read-audit",
+    });
+    calls.length = 0;
+
+    await tools.get("memory_get")!.handler({ passage_id: "read-audit" });
+    await tools.get("memory_search")!.handler({ text: "searchable" });
+    await tools.get("memory_list")!.handler({});
+    await tools.get("memory_count")!.handler({});
+
+    expect(calls.find((c) => c.operation === "memory_get")?.details?.result_count).toBe(1);
+    expect(calls.find((c) => c.operation === "memory_search")?.details?.result_count).toBe(1);
+    expect(calls.find((c) => c.operation === "memory_list")?.details?.result_count).toBe(1);
+    expect(calls.find((c) => c.operation === "memory_count")?.details?.count).toBe(1);
   });
 });

@@ -44,14 +44,26 @@ class MemoryStorage implements StorageBackend {
   }
 }
 
+function makeAdapterWithStorage(): { adapter: SdwMemoryBackendAdapter; storage: MemoryStorage } {
+  const storage = new MemoryStorage();
+  return {
+    storage,
+    adapter: new SdwMemoryBackendAdapter({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+      ownerRef: "am-worker",
+      now: () => NOW,
+    }),
+  };
+}
+
 function makeAdapter(): SdwMemoryBackendAdapter {
-  return new SdwMemoryBackendAdapter({
-    storage: new MemoryStorage(),
-    masterKey: MASTER_KEY,
-    fortressId: FORTRESS_ID,
-    ownerRef: "am-worker",
-    now: () => NOW,
-  });
+  return makeAdapterWithStorage().adapter;
+}
+
+function parseResultTextSize(text: string): number {
+  return Buffer.byteLength(text, "utf8");
 }
 
 describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
@@ -78,6 +90,59 @@ describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
     expect(viewed.ok).toBe(true);
     expect(viewed.content).toBe("the company brain dogfoods on SDW");
   });
+
+  it("rejects oversized multi-chunk creates before writing storage", async () => {
+    const { adapter, storage } = makeAdapterWithStorage();
+    const oversized = "x".repeat(1024 * 1024 + 1);
+    expect(parseResultTextSize(oversized)).toBeGreaterThan(1024 * 1024);
+    const created = await applyAnthropicMemoryCommand(adapter, {
+      command: "create",
+      path: "/memories/huge.md",
+      file_text: oversized,
+    });
+    expect(created.ok).toBe(false);
+    expect(created.error_code).toBe("too_large");
+    expect(storage.data.size).toBe(0);
+  });
+
+  it("does not echo raw caller paths in model-visible errors", async () => {
+    const adapter = makeAdapter();
+    const path = "/memories/-----BEGIN PRIVATE KEY-----.md";
+    const viewed = await applyAnthropicMemoryCommand(adapter, { command: "view", path });
+    expect(viewed.ok).toBe(false);
+    expect(viewed.content).not.toContain(path);
+    expect(viewed.content).not.toContain("PRIVATE KEY");
+  });
+
+  it("does not echo write-gate categories in model-visible errors", async () => {
+    const adapter = makeAdapter();
+    const created = await applyAnthropicMemoryCommand(adapter, {
+      command: "create",
+      path: "/memories/leak-category.md",
+      file_text:
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----",
+    });
+    expect(created.ok).toBe(false);
+    expect(created.error_code).toBe("write_rejected");
+    expect(created.content).not.toContain("classifier_reject");
+    expect(created.content).not.toContain("PRIVATE KEY");
+  });
+});
+
+/*
+ * Keep the behavioral coverage below in a separate describe so the new safety
+ * checks above can stay focused and small.
+ */
+describe("Anthropic Memory-tool -> SDW handler operations", () => {
+  function makeAdapter(): SdwMemoryBackendAdapter {
+    return new SdwMemoryBackendAdapter({
+      storage: new MemoryStorage(),
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+      ownerRef: "am-worker",
+      now: () => NOW,
+    });
+  }
 
   it("create on an existing path is a conflict, not a silent overwrite", async () => {
     const adapter = makeAdapter();
@@ -171,7 +236,7 @@ describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
       new_path: "/memories/new.md",
     });
     expect(renamed.ok).toBe(true);
-    expect(renamed.mutation_strategy).toBe("delete_then_insert");
+    expect(renamed.mutation_strategy).toBe("insert_then_delete");
     const oldView = await applyAnthropicMemoryCommand(adapter, { command: "view", path: "/memories/old.md" });
     expect(oldView.ok).toBe(false);
     const newView = await applyAnthropicMemoryCommand(adapter, { command: "view", path: "/memories/new.md" });

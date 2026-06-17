@@ -24,6 +24,14 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
 const SDW_REPLAY_MAC_INFO = "sdw-replay-anchor-mac";
+const SECRET_CLASSIFIER_PROBES: readonly RegExp[] = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
+  /\bBEGIN [A-Z0-9 ]*PRIVATE KEY\b/i,
+  /principal[_ -]?policy/i,
+  /\brecovery[_ -]?key\b/i,
+  /\bed25519\b.{0,80}\b(private|secret)\b/i,
+  /\bSANCTUARY_RECOVERY_KEY\b/i,
+];
 
 export type Taint =
   | "user_content"
@@ -144,6 +152,11 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
     storageKey,
     data: new Uint8Array(data),
   });
+}
+
+export function assertSdwClassifierCleanText(text: string): void {
+  if (text.length === 0) return;
+  classifyText(text, text.replace(/[^A-Za-z0-9]+/g, ""));
 }
 
 export async function writeReplayAnchor(
@@ -491,16 +504,12 @@ function classifyRecord(record: SdwRecord): void {
   // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
   // values-only compact reassembles a marker fragmented across non-adjacent fields.
   const compact = collectClassifierValues(record).replace(/[^A-Za-z0-9]+/g, "");
-  const probes: readonly RegExp[] = [
-    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i,
-    /\bBEGIN [A-Z0-9 ]*PRIVATE KEY\b/i,
-    /principal[_ -]?policy/i,
-    /\brecovery[_ -]?key\b/i,
-    /\bed25519\b.{0,80}\b(private|secret)\b/i,
-    /\bSANCTUARY_RECOVERY_KEY\b/i,
-  ];
+  classifyText(text, compact, normalized);
+}
+
+function classifyText(text: string, compact: string, normalized = normalizeClassifierText(text)): void {
   if (
-    probes.some((probe) => probe.test(text) || probe.test(normalized)) ||
+    SECRET_CLASSIFIER_PROBES.some((probe) => probe.test(text) || probe.test(normalized)) ||
     containsSplitPrivateKeyMarker(compact) ||
     containsEncodedEd25519Pkcs8PrivateKey(text) ||
     containsKnownSecretToken(text) ||
