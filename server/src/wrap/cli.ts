@@ -1223,6 +1223,10 @@ export async function runWrap(
       serverCount: upstreamServers.length,
       passphraseLocation,
       passphraseSource,
+      // Honest arm outcome: castleWallDaemon is only defined when
+      // startCastleWallForWrap succeeded; on a start failure the catch above
+      // ran warnCastleWallDaemonNotStarted and left it undefined.
+      castleWallArmed: castleWallDaemon !== undefined,
     });
     return;
   }
@@ -1458,6 +1462,8 @@ export async function runWrap(
     passphraseSource,
     intelligenceHealthy,
     intelligenceError,
+    // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
+    castleWallArmed: castleWallDaemon !== undefined,
   });
 }
 
@@ -1544,6 +1550,15 @@ interface WrapSuccessInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /**
+   * Whether the Castle Wall enforcement daemon actually armed during this
+   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
+   * fired and traffic is not being filtered; `undefined` => no arm signal was
+   * threaded into the banner (treated conservatively as not-confirmed, never
+   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
+   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   */
+  castleWallArmed?: boolean;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1577,8 +1592,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
+  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
+  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
+  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
+  // that is the exact overclaim the audit flagged (a green hero printed
+  // seconds after the loud "traffic NOT filtered" warning).
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
@@ -1589,6 +1614,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   }
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Render the Castle Wall segment of the wrap success banner from the real arm
+ * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
+ * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
+ * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ */
+function renderCastleWallBannerLabel(armed: boolean | undefined): string {
+  if (armed === true) return "Castle Wall Full";
+  if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
+  return "Castle Wall status unknown (not confirmed armed)";
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1605,6 +1642,8 @@ interface WrapSuccessNoDashboardInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
+  castleWallArmed?: boolean;
 }
 
 /**
@@ -1639,8 +1678,14 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
+  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
