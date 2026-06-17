@@ -367,14 +367,24 @@ function buildCognitive(
 
 /**
  * Recent L2 (Principal Policy gate) adjudication evidence. The gate writes
- * `layer: "l2"` audit entries every time it actually adjudicates an operation
- * (gate decisions, injection detections, anomaly checks). A recent such entry
- * is positive evidence the gate is not just loaded but live and adjudicating.
+ * `layer: "l2"` audit entries with a `gate_*` operation every time it actually
+ * adjudicates an operation (`gate_allow`, `gate_deny`, `gate_injection_block`,
+ * `gate_allow_proxy`, `gate_unclassified`, `gate_approval_proof`, etc.). A
+ * recent such entry is positive evidence the gate is not just loaded but live
+ * and adjudicating.
+ *
+ * Not every `layer: "l2"` entry is an adjudication: boot-time custody/rollback
+ * envelope writes (e.g. `custody_rollback_suspected`) and `principal_policy_view`
+ * (a policy *read*, not an enforcement decision) also carry `layer: "l2"`.
+ * Counting those as adjudications would flip an unexercised or merely-viewed
+ * policy to "active", overclaiming enforcement. We therefore require the
+ * `gate_` operation prefix that only genuine gate decisions emit.
  */
 function hasRecentGateAdjudication(audit: AuditEntry[]): boolean {
   const cutoff = Date.now() - GATE_ADJUDICATION_WINDOW_MS;
   return audit.some((e) => {
     if (e.layer !== "l2") return false;
+    if (!e.operation?.startsWith("gate_")) return false;
     const ts = new Date(e.timestamp).getTime();
     return !isNaN(ts) && ts >= cutoff;
   });

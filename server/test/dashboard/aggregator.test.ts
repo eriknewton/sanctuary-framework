@@ -797,11 +797,16 @@ describe("getProtectionSnapshot", () => {
       approval_channel: { type: "stderr", timeout_seconds: 30 },
     } as unknown as AggregatorSources["policy"];
 
-    function l2AuditEntry(ageMs = 60_000): AuditEntry {
+    // A genuine gate adjudication: only `gate_*` operations count as
+    // enforcement evidence.
+    function l2AuditEntry(
+      ageMs = 60_000,
+      operation = "gate_allow:state_read"
+    ): AuditEntry {
       return {
         timestamp: new Date(Date.now() - ageMs).toISOString(),
         layer: "l2",
-        operation: "principal_policy_view",
+        operation,
         identity_id: "id-1",
         result: "success",
       } as unknown as AuditEntry;
@@ -821,7 +826,7 @@ describe("getProtectionSnapshot", () => {
       );
     });
 
-    it("reads 'active' only with recent L2 adjudication evidence", async () => {
+    it("reads 'active' only with recent L2 gate adjudication evidence", async () => {
       const snap = await getProtectionSnapshot(
         baseSources({
           policy: loadedPolicy,
@@ -829,6 +834,34 @@ describe("getProtectionSnapshot", () => {
         })
       );
       expect(snap.layers.l2.sandbox_status).toBe("Principal Policy gate active");
+    });
+
+    it("does NOT read 'active' from a recent principal_policy_view (a policy read, not an adjudication)", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          policy: loadedPolicy,
+          auditLog: stubAuditLog([
+            l2AuditEntry(60_000, "principal_policy_view"),
+          ]),
+        })
+      );
+      expect(snap.layers.l2.sandbox_status).toBe(
+        "Principal Policy gate configured (no recent adjudication)"
+      );
+    });
+
+    it("does NOT read 'active' from a recent custody/rollback L2 envelope write", async () => {
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          policy: loadedPolicy,
+          auditLog: stubAuditLog([
+            l2AuditEntry(60_000, "custody_rollback_suspected"),
+          ]),
+        })
+      );
+      expect(snap.layers.l2.sandbox_status).toBe(
+        "Principal Policy gate configured (no recent adjudication)"
+      );
     });
 
     it("does NOT read 'active' from a long-stale L2 entry", async () => {
