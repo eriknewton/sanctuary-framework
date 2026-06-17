@@ -15,6 +15,10 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
+import {
+  buildCastleWallPosture,
+  type CastleWallArmState,
+} from "../principal-policy/posture.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
@@ -185,6 +189,31 @@ export interface AggregatorSources {
   l4Evidence?: ReputationEvidence;
   /** Clock override for deterministic staleness rendering in tests. */
   l4Now?: Date;
+  /**
+   * The reader's pinned producer public key (base64url-no-pad), resolved lazily
+   * so post-provision wiring is observed. Threaded straight into
+   * `buildCastleWallPosture` so the dashboard hero shield arms on the SAME
+   * cryptographic basis as `/v1` G4 (posture-routes). When it returns null
+   * (macOS today / pre-provision) the wall reader falls back to the honest
+   * channel-authenticated basis, never claimed as per-producer authenticated.
+   *
+   * The HIGH never-overclaim fix this closes: without this, a key-bearing host
+   * read the wall posture on the channel basis, so a forged marker-only audit
+   * entry (an in-process writer that stamped `cw_source` but could not sign)
+   * would arm the shield green. With the key present, the reader re-verifies the
+   * producer signature and a forgery fails closed to amber. The dashboard MUST
+   * supply the same key the consumer wrote with, never a weaker basis.
+   */
+  resolvePinnedProducerKey?: () => string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
+   * daemon published one) but the dashboard could NOT load it (present but
+   * unreadable / malformed). When true the wall reader refuses to render green on
+   * the channel basis (the posture forces `degraded`, not armed), so the hero
+   * shield goes amber rather than claiming a weaker basis than the consumer wrote
+   * with. Mutually exclusive with a non-null `resolvePinnedProducerKey()`.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
 }
 
 /**
@@ -288,16 +317,31 @@ function buildAgent(
 
 function buildCognitive(
   sources: AggregatorSources,
-  audit: AuditEntry[]
+  audit: AuditEntry[],
+  /**
+   * True only when a live audit chain was read AND verified clean this snapshot.
+   * "State encrypted at rest" is an enforcement claim (the namespaces are
+   * encrypted and the tamper-evident chain confirms it); we may assert it only
+   * with live integrity evidence. Absent that (no audit log wired, or a read that
+   * could not confirm the chain) we downgrade to the honest "Encryption
+   * configured" (the crypto is set up, but nothing live confirms it right now).
+   */
+  hasLiveIntegrityEvidence: boolean
 ): CognitiveStatus {
   const hasIdentity = !!sources.identityManager?.getDefault();
   const state: LayerState = hasIdentity ? "full" : "degraded";
+  let headline: string;
+  if (!hasIdentity) {
+    headline = "No sovereign identity — run sanctuary_bootstrap";
+  } else if (hasLiveIntegrityEvidence) {
+    headline = "State encrypted at rest";
+  } else {
+    headline = "Encryption configured (no live integrity check)";
+  }
   return {
     label: "L1 Cognitive",
     state,
-    headline: hasIdentity
-      ? "State encrypted at rest"
-      : "No sovereign identity — run sanctuary_bootstrap",
+    headline,
     encryption: "AES-256-GCM + HKDF per namespace",
     injection_blocked_today: countInjectionsToday(audit),
     memory_attest_ready: hasIdentity,
@@ -446,8 +490,19 @@ function computeOverall(
   l1: CognitiveStatus,
   l2: OperationalStatus,
   l3: DisclosureStatus,
-  l4: ReputationStatus
+  l4: ReputationStatus,
+  enforcement: { wallArmState: CastleWallArmState; auditIntegrityOk: boolean }
 ): ProtectionSnapshot["overall"] {
+  // Fail closed on a tamper-flagged or unreadable audit chain: the evidence the
+  // overall light would be judged from is itself untrustworthy, so it can never
+  // render green (mirrors posture.ts chain_verified gating).
+  if (!enforcement.auditIntegrityOk) {
+    return {
+      status: "compromised",
+      light: "red",
+      headline: "Audit chain integrity check failed",
+    };
+  }
   const critical: LayerState[] = [l1.state, l3.state, l4.state];
   if (
     critical.includes("compromised") ||
@@ -460,18 +515,31 @@ function computeOverall(
     };
   }
   const allCriticalFull = critical.every((s) => s === "full");
-  if (allCriticalFull && l2.state === "full") {
+  const wallArmed = enforcement.wallArmState === "armed";
+
+  // GREEN requires the ENFORCING layer to be proven armed, not just the
+  // config-present layers (identity / DID / Verascore). A wall that is dead,
+  // not-enforcing, or never wired keeps the overall light amber even when the
+  // configured layers are all present. Never fake green: a green shield asserts
+  // the agent is being enforced, which the configured layers alone do not prove.
+  if (allCriticalFull && wallArmed && (l2.state === "full" || l2.state === "degraded")) {
     return {
       status: "healthy",
       light: "green",
-      headline: "All layers full",
+      headline:
+        l2.state === "full"
+          ? "All layers full, Castle Wall enforcing"
+          : "Castle Wall enforcing, L2 degraded (no TEE on this host)",
     };
   }
-  if (allCriticalFull && l2.state === "degraded") {
+  if (allCriticalFull && !wallArmed) {
+    // The configured layers are present but enforcement is not confirmed. The
+    // honest amber: identity/disclosure/reputation are set up, but the one
+    // enforcing layer is not proving it is on.
     return {
-      status: "healthy",
-      light: "green",
-      headline: "L1·L3·L4 full — L2 degraded (no TEE on this host)",
+      status: "degraded",
+      light: "yellow",
+      headline: castleWallNotEnforcingHeadline(enforcement.wallArmState),
     };
   }
   return {
@@ -479,6 +547,18 @@ function computeOverall(
     light: "yellow",
     headline: "One or more layers degraded",
   };
+}
+
+/** Honest headline for the configured-but-enforcement-not-confirmed amber. */
+function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
+  switch (arm) {
+    case "degraded":
+      return "Layers configured, Castle Wall degraded (not enforcing)";
+    case "not_installed":
+      return "Layers configured, Castle Wall not installed on this host";
+    default:
+      return "Layers configured, Castle Wall enforcement not confirmed";
+  }
 }
 
 function buildUpstreamServers(
@@ -545,20 +625,74 @@ export async function getProtectionSnapshot(
   sources: AggregatorSources
 ): Promise<ProtectionSnapshot> {
   let audit: AuditEntry[] = [];
+  // A tamper-flagged or unreadable audit chain must NEVER let the rollup render
+  // green: the evidence the overall light is judged from would itself be
+  // untrustworthy. Track integrity here and fail closed in computeOverall.
+  let auditIntegrityOk = true;
+  // POSITIVE integrity evidence: a live audit chain was read AND its
+  // integrity_findings came back present-and-empty THIS snapshot. Unlike
+  // `auditIntegrityOk` (which defaults true so the overall light is not falsely
+  // red with no audit log), this defaults FALSE and is earned only by a clean
+  // live read; it gates the L1 "State encrypted at rest" enforcement claim,
+  // which must never be asserted from config-presence alone (never-overclaim).
+  let hasLiveIntegrityEvidence = false;
   if (sources.auditLog) {
     try {
       const result = await sources.auditLog.query({ limit: MAX_AUDIT });
       audit = result.entries;
+      // A real AuditLog.query always returns integrity_findings; treat an absent
+      // field (non-conforming stub) as "no findings" rather than a false red. A
+      // THROWN read still fails closed below.
+      auditIntegrityOk = (result.integrity_findings?.length ?? 0) === 0;
+      // Only a real, present, empty integrity_findings array is positive
+      // evidence the chain verified clean. An absent field (non-conforming stub)
+      // is NOT live evidence and must not earn the "encrypted at rest" claim.
+      hasLiveIntegrityEvidence =
+        Array.isArray(result.integrity_findings) &&
+        result.integrity_findings.length === 0;
     } catch {
       audit = [];
+      auditIntegrityOk = false;
+      hasLiveIntegrityEvidence = false;
     }
   }
 
   const agent = buildAgent(sources);
-  const l1 = buildCognitive(sources, audit);
+  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence);
   const l2 = buildOperational(sources);
   const l3 = buildDisclosure(sources, audit);
   const l4 = buildReputation(sources);
+
+  // Castle Wall is the one ENFORCING layer (the thesis-gate). The overall light
+  // must never claim a healthy, enforced posture from the config-present layers
+  // (identity/DID/Verascore) alone while the wall is dead, not-enforcing, or
+  // never wired. Reuse the honest, enforcement-evidenced posture reader (the
+  // SAME signal posture-routes serves at /v1 G4) rather than a second copy.
+  // The producer-key state is threaded straight into the posture reader so the
+  // hero shield arms on the SAME cryptographic basis as /v1 G4: a key-bearing
+  // host re-verifies the producer signature (a forged marker-only entry fails
+  // closed to amber), and an expected-but-unreadable key forces non-green rather
+  // than silently dropping to the weaker channel basis. Mirrors the
+  // posture-routes / dispatchPosture wiring.
+  let wallArmState: CastleWallArmState = "unknown";
+  if (sources.auditLog) {
+    try {
+      const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
+        ? sources.resolvePinnedProducerKey()
+        : null;
+      const wall = await buildCastleWallPosture({
+        auditLog: sources.auditLog,
+        originMachine: agent.primary_identity_id ?? "local",
+        pinnedProducerKeyB64url,
+        ...(sources.producerKeyExpectedButUnavailable
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      });
+      wallArmState = wall.arm_state;
+    } catch {
+      wallArmState = "unknown";
+    }
+  }
 
   const activity = (sources.activity ?? []).slice(0, MAX_ACTIVITY);
   const pending_approvals = sources.pendingApprovals ?? [];
@@ -566,7 +700,7 @@ export async function getProtectionSnapshot(
   const upstream_servers = buildUpstreamServers(sources);
 
   return {
-    overall: computeOverall(l1, l2, l3, l4),
+    overall: computeOverall(l1, l2, l3, l4, { wallArmState, auditIntegrityOk }),
     agent,
     layers: { l1, l2, l3, l4 },
     activity,
