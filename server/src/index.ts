@@ -748,9 +748,6 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
-  // 14d. Create Sovereignty Audit tools (read-only diagnostic)
-  const { tools: auditTools } = createAuditTools(config, auditLog);
-
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
   const { tools: siemTools } = createSIEMTools(auditLog, currentSessionBinding);
 
@@ -758,6 +755,23 @@ export async function createSanctuaryServer(options?: {
   // the persisted source of truth for the runtime context gate enforcer.
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   const loadedProfile = await profileStore.load();
+
+  // 14d (moved below profile load). Create Sovereignty Audit tools (read-only
+  // diagnostic). Honesty (audit seam #5): the audit reads the LIVE profile so
+  // it credits context-gating and zero-knowledge proofs only when they are
+  // actually enabled (both default OFF) rather than from a hardcoded
+  // sanctuary_installed flag. Moved after profileStore.load() so the getter is
+  // bound to the live store; auditTools is only consumed in the tool registry
+  // far below, so the reorder is behavior-preserving.
+  const { tools: auditTools } = createAuditTools(config, auditLog, {
+    getRuntimeSignals: () => {
+      const p = profileStore.get();
+      return {
+        contextGatingEnabled: p.features.context_gating.enabled,
+        zkProofsEnabled: p.features.zk_proofs.enabled,
+      };
+    },
+  });
 
   // 14f. Create Context Gating tools (L2 outbound context control) and bind
   // the live enforcer to the persisted profile state before any proxy tools are

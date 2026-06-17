@@ -7,8 +7,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { defaultConfig } from "../../src/config.js";
 import type { SanctuaryConfig } from "../../src/config.js";
-import { analyzeSovereignty, formatAuditReport } from "../../src/audit/analyzer.js";
+import {
+  analyzeSovereignty,
+  formatAuditReport,
+  type SovereigntyRuntimeSignals,
+} from "../../src/audit/analyzer.js";
 import { detectEnvironment } from "../../src/audit/detector.js";
+
+// Honesty (audit seam #5): context-gating and zero-knowledge proofs default
+// OFF and are only credited from the live profile. Tests that intend a
+// FULLY-configured fortress must pass these explicitly enabled — the analyzer
+// no longer auto-credits them from `sanctuary_installed`.
+const ALL_FEATURES_ON: SovereigntyRuntimeSignals = {
+  contextGatingEnabled: true,
+  zkProofsEnabled: true,
+};
 import type {
   EnvironmentFingerprint,
   OpenClawConfigAudit,
@@ -58,12 +71,46 @@ describe("Sovereignty Audit", () => {
   describe("Scoring", () => {
     it("scores high for fully configured Sanctuary (no OpenClaw)", () => {
       const env = makeFingerprint();
-      const result = analyzeSovereignty(env, config);
+      // Honesty (audit seam #5): "fully configured" now means the optional,
+      // default-off features (context-gating, ZK) are explicitly enabled.
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       // Sanctuary provides all four layers → score should be 100
       expect(result.overall_score).toBe(100);
       expect(result.sovereignty_level).toBe("full");
       expect(result.gaps).toHaveLength(0);
+    });
+
+    // Honesty (audit seam #5): a fresh install (context-gating + ZK default OFF)
+    // must NOT score 100, must surface the gaps, and must not credit the
+    // disabled features as active. The diagnostic that is supposed to catch a
+    // degraded setup previously could not report any drop at all.
+    it("does NOT score 100 for a fresh install with default-off features", () => {
+      const env = makeFingerprint();
+      const result = analyzeSovereignty(env, config); // no runtime signals
+
+      expect(result.overall_score).toBeLessThan(100);
+      // The fresh install surfaces the context-gating gap and a non-active L3,
+      // and does not credit the disabled features.
+      expect(result.layers.l2_operational.context_gating).toBe(false);
+      expect(result.layers.l3_selective_disclosure.zero_knowledge_proofs).toBe(false);
+      expect(result.layers.l3_selective_disclosure.status).not.toBe("active");
+      expect(result.gaps.map((g) => g.id)).toContain("GAP-L2-003");
+    });
+
+    // Honesty (audit seam #5): enabling only one optional feature scores
+    // between the fresh-install floor and a fully-enabled fortress.
+    it("credits each default-off feature only when the live profile enables it", () => {
+      const env = makeFingerprint();
+      const fresh = analyzeSovereignty(env, config).overall_score;
+      const ctxOnly = analyzeSovereignty(env, config, {
+        contextGatingEnabled: true,
+      }).overall_score;
+      const both = analyzeSovereignty(env, config, ALL_FEATURES_ON).overall_score;
+
+      expect(ctxOnly).toBeGreaterThan(fresh);
+      expect(both).toBeGreaterThan(ctxOnly);
+      expect(both).toBe(100);
     });
 
     it("scores near-zero for OpenClaw-only (no Sanctuary layers)", () => {
@@ -127,7 +174,7 @@ describe("Sovereignty Audit", () => {
         }),
       });
 
-      const result = analyzeSovereignty(env, config);
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       expect(result.overall_score).toBe(100);
       expect(result.sovereignty_level).toBe("full");
@@ -153,7 +200,9 @@ describe("Sovereignty Audit", () => {
         },
       });
 
-      const result = analyzeSovereignty(env, config);
+      // ALL_FEATURES_ON isolates the audit-penalty math from the default-off
+      // feature scoring (audit seam #5): base 100, single finding -20 -> 80.
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       expect(result.overall_score).toBeLessThanOrEqual(80);
       expect(result.overall_score).toBeLessThan(100);
@@ -174,7 +223,8 @@ describe("Sovereignty Audit", () => {
         },
       });
 
-      const result = analyzeSovereignty(env, config);
+      // ALL_FEATURES_ON: base 100, four findings cap penalty at 70 -> 30.
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       expect(result.overall_score).toBe(30);
       expect(result.sovereignty_level).toBe("minimal");
@@ -192,7 +242,9 @@ describe("Sovereignty Audit", () => {
         },
       });
 
-      const result = analyzeSovereignty(env, config);
+      // ALL_FEATURES_ON: base 100; 1 finding (-20) + export abort (-25) +
+      // bricked tools (-25) = -70 -> 30.
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       expect(result.overall_score).toBe(30);
       expect(result.overall_score).toBeLessThan(100);
@@ -351,14 +403,16 @@ describe("Sovereignty Audit", () => {
   });
 
   describe("L3 ZK Proofs Scoring", () => {
-    it("scores L3 as Full (20/20) with Schnorr + range proofs", () => {
+    it("scores L3 as Full (20/20) with Schnorr + range proofs when ZK is enabled", () => {
       const env = makeFingerprint({
         sanctuary_installed: true,
       });
-      const result = analyzeSovereignty(env, config);
+      // Honesty (audit seam #5): ZK proofs are credited only when the live
+      // profile enables them; they default OFF.
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
       const l3 = result.layers.l3_selective_disclosure;
 
-      // With Sanctuary, L3 should be active with full score
+      // With ZK enabled, L3 should be active with full score
       expect(l3.status).toBe("active");
       expect(l3.commitment_scheme).toBe("pedersen+sha256");
       expect(l3.zero_knowledge_proofs).toBe(true);
@@ -373,11 +427,25 @@ describe("Sovereignty Audit", () => {
       expect(l3.findings.join(" ")).toContain("Fiat-Shamir");
     });
 
-    it("L3 findings clarify that Schnorr + range proofs are genuine ZK proofs", () => {
+    // Honesty (audit seam #5): with ZK disabled (the default), L3 is NOT active
+    // and zero_knowledge_proofs is false even though Sanctuary is installed.
+    it("does not credit ZK proofs when the profile toggle is OFF (default)", () => {
+      const env = makeFingerprint({ sanctuary_installed: true });
+      const result = analyzeSovereignty(env, config); // ZK default OFF
+      const l3 = result.layers.l3_selective_disclosure;
+
+      expect(l3.status).not.toBe("active");
+      expect(l3.zero_knowledge_proofs).toBe(false);
+      // Commitment primitives are still available, so the scheme is present.
+      expect(l3.commitment_scheme).toBe("pedersen+sha256");
+      expect(l3.findings.join(" ")).toContain("NOT enabled");
+    });
+
+    it("L3 findings clarify that Schnorr + range proofs are genuine ZK proofs when enabled", () => {
       const env = makeFingerprint({
         sanctuary_installed: true,
       });
-      const result = analyzeSovereignty(env, config);
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
       const l3 = result.layers.l3_selective_disclosure;
 
       const findingsText = l3.findings.join(" ");
@@ -387,11 +455,11 @@ describe("Sovereignty Audit", () => {
       expect(findingsText).toContain("domain separation");
     });
 
-    it("does not generate L3 gap when commitments + proofs are active", () => {
+    it("does not generate L3 gap when commitments are available (proofs optional)", () => {
       const env = makeFingerprint({
         sanctuary_installed: true,
       });
-      const result = analyzeSovereignty(env, config);
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       // Should NOT have GAP-L3-001 (no selective disclosure)
       const l3Gaps = result.gaps.filter((g) => g.id === "GAP-L3-001");
@@ -514,7 +582,7 @@ describe("Sovereignty Audit", () => {
 
     it("does not include incident class for full Sanctuary (no gaps)", () => {
       const env = makeFingerprint();
-      const result = analyzeSovereignty(env, config);
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
       expect(result.gaps).toHaveLength(0);
     });
   });
@@ -526,7 +594,7 @@ describe("Sovereignty Audit", () => {
         openclaw_config: null,
       });
 
-      const result = analyzeSovereignty(env, config);
+      const result = analyzeSovereignty(env, config, ALL_FEATURES_ON);
 
       expect(result.overall_score).toBe(100);
       expect(result.sovereignty_level).toBe("full");

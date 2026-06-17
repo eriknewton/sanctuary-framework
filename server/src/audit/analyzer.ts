@@ -127,15 +127,36 @@ const INCIDENT_CLAUDE_CODE_LEAK: IncidentClass = {
 };
 
 /**
+ * Honesty (audit seam #5): live runtime signals the audit must consult instead
+ * of crediting features from a hardcoded `sanctuary_installed: true`. Both
+ * context-gating and zero-knowledge proofs default OFF on a fresh install, so
+ * the audit may only credit them when the live SovereigntyProfile says they
+ * are enabled. When `undefined` (no profile threaded, e.g. legacy callers and
+ * unit tests), the audit falls back to the CONSERVATIVE reading: these
+ * optional, default-off features are treated as OFF, never auto-credited.
+ */
+export interface SovereigntyRuntimeSignals {
+  /** Live profile toggle: context-gating enforcement (default OFF). */
+  contextGatingEnabled?: boolean;
+  /** Live profile toggle: zero-knowledge proofs (default OFF). */
+  zkProofsEnabled?: boolean;
+}
+
+/**
  * Analyze sovereignty posture and produce a full audit result.
+ *
+ * `runtime` carries live profile signals; when omitted, default-off optional
+ * features (context-gating, ZK proofs) are read conservatively as OFF rather
+ * than auto-credited (audit seam #5).
  */
 export function analyzeSovereignty(
   env: EnvironmentFingerprint,
-  config: SanctuaryConfig
+  config: SanctuaryConfig,
+  runtime?: SovereigntyRuntimeSignals
 ): SovereigntyAuditResult {
   const cognitive = assessCognitive(env, config);
-  const operational = assessOperational(env, config);
-  const disclosure = assessDisclosure(env, config);
+  const operational = assessOperational(env, config, runtime);
+  const disclosure = assessDisclosure(env, config, runtime);
   const reputation = assessReputation(env, config);
 
   const cognitiveScore = scoreCognitive(cognitive);
@@ -228,7 +249,8 @@ function assessCognitive(
 
 function assessOperational(
   env: EnvironmentFingerprint,
-  _config: SanctuaryConfig
+  _config: SanctuaryConfig,
+  runtime?: SovereigntyRuntimeSignals
 ): OperationalAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
@@ -241,15 +263,29 @@ function assessOperational(
   let contextGating = false;
 
   if (sanctuaryActive) {
+    // SEC-057: the approval gate is core enforcement and is always on, and the
+    // encrypted audit trail and baseline tracker are constructed at boot, so
+    // crediting these on a live Sanctuary process is honest. Context-gating is
+    // NOT: it defaults OFF and is an opt-in profile toggle.
     approvalGate = "three-tier";
     behavioralAnomalyDetection = true;
     auditTrailEncrypted = true;
     auditTrailExists = true;
-    contextGating = true;
     findings.push("Three-tier Principal Policy gate active");
     findings.push("Behavioral anomaly detection (BaselineTracker) enabled");
     findings.push("Encrypted audit trail active");
-    findings.push("Context gating available (sanctuary/context_gate_set_policy)");
+    // Honesty (audit seam #5): context-gating is credited only when the live
+    // profile toggle says it is enabled. It defaults OFF; the prior code
+    // hardcoded it ON, scoring a fresh install as if outbound context were
+    // being filtered when nothing was.
+    contextGating = runtime?.contextGatingEnabled === true;
+    if (contextGating) {
+      findings.push("Context gating ENABLED (live profile: context_gate policy active)");
+    } else {
+      findings.push(
+        "Context gating available but NOT enabled (default OFF; enable via sanctuary/context_gate_set_policy)"
+      );
+    }
   }
 
   if (env.openclaw_detected && env.openclaw_config) {
@@ -296,7 +332,8 @@ function assessOperational(
 
 function assessDisclosure(
   env: EnvironmentFingerprint,
-  _config: SanctuaryConfig
+  _config: SanctuaryConfig,
+  runtime?: SovereigntyRuntimeSignals
 ): DisclosureAuditResult {
   const findings: string[] = [];
   const sanctuaryActive = env.sanctuary_installed;
@@ -306,14 +343,26 @@ function assessDisclosure(
   let selectiveDisclosurePolicy = false;
 
   if (sanctuaryActive) {
+    // The commitment primitives ship with Sanctuary and are always available;
+    // crediting the commitment scheme is honest.
     commitmentScheme = "pedersen+sha256";
-    zkProofs = true; // Schnorr proofs + range proofs
     selectiveDisclosurePolicy = true;
-    findings.push("SHA-256 + Pedersen commitment schemes active");
-    findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) enabled — genuine ZK proofs");
-    findings.push("Range proofs (bit-decomposition + OR-proofs) enabled — genuine ZK proofs");
+    findings.push("SHA-256 + Pedersen commitment schemes available");
     findings.push("Selective disclosure policies configurable");
-    findings.push("Non-interactive proofs with replay-resistant domain separation");
+    // Honesty (audit seam #5): zero-knowledge proofs are credited only when the
+    // live profile toggle (zk_proofs) is enabled. It defaults OFF; the prior
+    // code hardcoded it ON, so a fresh install scored full L3 disclosure as if
+    // ZK proofs were operating when the feature was disabled.
+    zkProofs = runtime?.zkProofsEnabled === true;
+    if (zkProofs) {
+      findings.push("Schnorr zero-knowledge proofs (Fiat-Shamir) ENABLED (live profile) — genuine ZK proofs");
+      findings.push("Range proofs (bit-decomposition + OR-proofs) enabled — genuine ZK proofs");
+      findings.push("Non-interactive proofs with replay-resistant domain separation");
+    } else {
+      findings.push(
+        "Zero-knowledge proofs available but NOT enabled (default OFF; enable zk_proofs in the sovereignty profile)"
+      );
+    }
   }
 
   const status = commitmentScheme === "pedersen+sha256" && zkProofs
