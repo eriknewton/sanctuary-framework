@@ -108,6 +108,32 @@ function generateMemoryPassageId(): string {
   return toBase64url(new Uint8Array(randomBytes(15)));
 }
 
+/**
+ * Approval-channel projection for `memory_insert` (Hard Constraint #1 / C4).
+ *
+ * The approval gate's context can be delivered to an EXTERNAL webhook or
+ * dashboard BEFORE the operator approves, so the passage BODY must never reach
+ * it. This projects the caller args down to operation METADATA only: the body
+ * (`text`) and the self-asserted `taint` are dropped; only the byte length, an
+ * explicit `text_redacted` marker, and the (non-secret) optional passage id and
+ * tag count are surfaced. The router attaches this as the wired tool's
+ * `approvalTargetArgs`, so the gate, the approval prompt, and the args-binding
+ * hash all see the redacted shape, never the body. Exported so the wiring uses
+ * the SAME projection the redaction regression test asserts (no drift).
+ */
+export function memoryInsertApprovalArgs(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const text = args.text;
+  const projected: Record<string, unknown> = {
+    text_redacted: true,
+    text_bytes: typeof text === "string" ? Buffer.byteLength(text, "utf8") : 0,
+  };
+  if (typeof args.passage_id === "string") projected.passage_id = args.passage_id;
+  if (Array.isArray(args.tags)) projected.tag_count = args.tags.length;
+  return projected;
+}
+
 export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
 

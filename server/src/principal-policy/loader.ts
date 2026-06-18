@@ -151,6 +151,17 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sdw_export",
     "sdw_import",
     "sdw_export_delete",
+    // SDW memory substrate (company-brain phase 1, wired 2026-06-18). Both the
+    // write and the irreversible delete require operator approval: a passage
+    // insert commits operator data to the sovereign vault, and the delete is a
+    // secure-overwrite (where the backend supports it) that cannot be undone.
+    // memory_delete is ALSO in FORCED_TIER1_OPERATIONS so a hand-authored
+    // policy cannot relax it (the insert MAY be relaxed to Tier 3 by an
+    // operator who wants unattended writes; the irreversible delete may not).
+    // memory_insert's body is redacted from the approval channel by the tool's
+    // approvalTargetArgs (Hard Constraint #1: no pre-approval body to an
+    // external channel).
+    "memory_insert",
     "memory_delete",
   ],
   tier2_anomaly: DEFAULT_TIER2,
