@@ -140,6 +140,8 @@ describe("GET /v1/agents", () => {
           node_id: "node-1",
           label: "a1",
           harness: "claude_code",
+          policy_protected: true,
+          enforcement_active: "unknown",
           protected: true,
           policy_id: "p9",
           last_activity_at: "2026-06-10T00:00:00.000Z",
@@ -148,9 +150,46 @@ describe("GET /v1/agents", () => {
     });
   });
 
-  it("reports an unwrapping agent as not protected", () => {
+  it("reports an unwrapping agent as not policy_protected", () => {
     const summary = toAgentSummary(makeRecord({ status: "unwrapping" }), "node-1");
+    expect(summary.policy_protected).toBe(false);
+    // Deprecated alias tracks policy_protected exactly.
     expect(summary.protected).toBe(false);
+  });
+
+  // ── Honesty split: policy_protected vs enforcement_active ────────────────
+  //
+  // The old single `protected` boolean over-claimed: it was `true` for any
+  // status except "unwrapping", so a DEAD ("error") or indeterminate
+  // ("unknown") agent still read protected:true, and a federation peer would read
+  // that as "alive and actively guarded". These cases pin the honest split:
+  // policy_protected stays true (operator intent / present in the roster), but
+  // enforcement_active is "unknown" because no live liveness/enforcement signal
+  // exists yet. Each asserts the deprecated alias equals policy_protected.
+  //
+  // REGRESSION GUARD: under the old single-boolean behavior there was no
+  // enforcement_active field at all, so these `enforcement_active === "unknown"`
+  // assertions FAIL against it, exactly the honesty carve-out required.
+
+  it("reports a DEAD (error) agent as policy_protected but enforcement_active unknown", () => {
+    const summary = toAgentSummary(makeRecord({ status: "error" }), "node-1");
+    expect(summary.policy_protected).toBe(true);
+    expect(summary.enforcement_active).toBe("unknown");
+    expect(summary.protected).toBe(summary.policy_protected);
+  });
+
+  it("reports an UNKNOWN-status agent as policy_protected but enforcement_active unknown", () => {
+    const summary = toAgentSummary(makeRecord({ status: "unknown" }), "node-1");
+    expect(summary.policy_protected).toBe(true);
+    expect(summary.enforcement_active).toBe("unknown");
+    expect(summary.protected).toBe(summary.policy_protected);
+  });
+
+  it("never fabricates a live enforcement_active for an active agent (always unknown today)", () => {
+    const summary = toAgentSummary(makeRecord({ status: "active" }), "node-1");
+    expect(summary.policy_protected).toBe(true);
+    // Honesty: presence in the roster is NOT proof of live enforcement.
+    expect(summary.enforcement_active).toBe("unknown");
   });
 
   it("filters by harness", async () => {
