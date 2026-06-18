@@ -58,6 +58,7 @@ approval_channel:
         "context_gate_apply_template",
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -204,6 +205,7 @@ approval_channel:
         "context_gate_apply_template",
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
     });
 
@@ -228,6 +230,7 @@ approval_channel:
         "context_gate_apply_template",
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -265,6 +268,7 @@ approval_channel:
         "context_gate_apply_template",
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
@@ -341,6 +345,7 @@ approval_channel:
           "context_gate_apply_template",
           "audit_export_siem",
           "compliance_generate_eu_ai_act_bundle",
+          "memory_delete",
         ];
 
         for (const tool of forcedTier1Tools) {

@@ -75,6 +75,8 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   different door (no-read invariant). It is also a governance conflict of
  *   interest: an agent must not self-generate its own compliance attestation.
  *   So it must require operator approval. (CISO NEW-1.)
+ * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
+ *   hand-authored policy once the inert memory tool factory is wired.
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
@@ -85,6 +87,7 @@ const FORCED_TIER1_OPERATIONS = [
   "context_gate_apply_template",
   "audit_export_siem",
   "compliance_generate_eu_ai_act_bundle",
+  "memory_delete",
 ] as const;
 
 /**
@@ -148,6 +151,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sdw_export",
     "sdw_import",
     "sdw_export_delete",
+    "memory_delete",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

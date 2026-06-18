@@ -99,6 +99,7 @@ approval_channel:
       "context_gate_apply_template",
       "audit_export_siem",
       "compliance_generate_eu_ai_act_bundle",
+      "memory_delete",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -119,6 +120,7 @@ approval_channel:
       "context_gate_apply_template",
       "audit_export_siem",
       "compliance_generate_eu_ai_act_bundle",
+      "memory_delete",
     ]);
   });
 

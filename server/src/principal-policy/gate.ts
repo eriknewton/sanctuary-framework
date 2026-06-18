@@ -45,6 +45,8 @@ export type InjectionAlertCallback = (alert: {
 /** Resolver for proxy tool tiers — provided by the ProxyRouter */
 export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 
+const FORCED_TIER1_OPERATIONS = ["memory_delete"] as const;
+
 /**
  * Approval-lifecycle callback. Wired in v1.3 Upsilon-1 by the Cross-
  * Harness Approval Inbox aggregator. The gate fires this callback before
@@ -426,6 +428,13 @@ export class ApprovalGate {
     unclassified?: boolean;
   } {
     const operation = extractOperationName(toolName);
+
+    if ((FORCED_TIER1_OPERATIONS as readonly string[]).includes(operation)) {
+      return {
+        tier: 1,
+        reason: `"${operation}" is a forced Tier 1 operation (always requires approval)`,
+      };
+    }
 
     if (this.policy.tier1_always_approve.includes(operation)) {
       return {

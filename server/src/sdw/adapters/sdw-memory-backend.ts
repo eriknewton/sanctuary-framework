@@ -20,6 +20,8 @@ import { stringToBytes, toBase64url } from "../../core/encoding.js";
 import { hash } from "../../core/hashing.js";
 import {
   SdwDocumentCorpusStore,
+  type SdwCorpusTxn,
+  documentChunkStorageKey,
   padChunkOrdinal,
 } from "../document-corpus-store.js";
 import { SdwValidationError } from "../errors.js";
@@ -35,6 +37,7 @@ import {
   type SdwDocumentRecord,
 } from "../records.js";
 import type { PersistableTaint } from "../provenance.js";
+import { assertSdwClassifierCleanText } from "../write-gate.js";
 import type {
   MemoryBackendAdapter,
   MemoryListOptions,
@@ -73,6 +76,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly ownerRef: string;
   private readonly maxChunkChars: number;
   private readonly now: () => string;
+  /**
+   * Process-local duplicate-insert guard for non-transactional backends. This
+   * does not coordinate with another Sanctuary process pointed at the same
+   * filesystem storage path; cross-process duplicate prevention must come from
+   * a backend-level atomic conditional write or transaction.
+   */
+  private readonly insertLocks = new Map<string, Promise<void>>();
 
   constructor(options: SdwMemoryBackendAdapterOptions) {
     assertSdwIdentifier(options.ownerRef, "owner_ref");
@@ -110,34 +120,26 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   ): Promise<MemoryPassage> {
     const passageId = input.passage_id ?? generatePassageId();
     const documentId = this.documentId(passageId);
-    if (await this.storage.exists(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId))) {
-      throw new SdwValidationError(
-        "duplicate_passage",
-        "SDW memory passage already exists",
-      );
-    }
     const createdAt = input.created_at ?? this.now();
     const tags = input.tags ?? [];
     const metadata = input.metadata ?? [];
+    validatePassageText(input.text);
+    validatePassageDecorators(tags, metadata);
+    assertSdwClassifierCleanText(input.text);
     const contentHash = passageContentHash(input.text);
     const chunks = chunkText(input.text, this.maxChunkChars);
-
-    // Chunks first, document record last: the document record is the commit
-    // point, so a partial failure can never leave a listed passage with
-    // missing chunks (an unreferenced chunk is unreachable and harmless).
-    for (let ordinal = 0; ordinal < chunks.length; ordinal++) {
-      const chunkRecord: SdwDocumentChunkRecord = {
+    const chunkRecords = chunks.map(
+      (text, ordinal): SdwDocumentChunkRecord => ({
         kind: "document_chunk",
         version: 1,
         chunk_id: chunkId(ordinal),
         document_id: documentId,
         chunk_ordinal: ordinal,
-        text: chunks[ordinal]!,
-        content_hash: passageContentHash(chunks[ordinal]!),
+        text,
+        content_hash: passageContentHash(text),
         created_at: createdAt,
-      };
-      await this.corpus.putChunk(chunkRecord, taint);
-    }
+      }),
+    );
     const documentRecord: SdwDocumentRecord = {
       kind: "document",
       version: 1,
@@ -151,7 +153,32 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       tags,
       metadata,
     };
-    await this.corpus.putDocument(documentRecord, taint);
+
+    const transactional = asSdwTransactional(this.storage);
+    if (transactional !== null) {
+      await transactional.sdwTransaction(async (txn) => {
+        await this.assertDocumentAbsent(documentId, txn);
+        for (const chunkRecord of chunkRecords) {
+          await this.corpus.putChunk(chunkRecord, taint, txn);
+        }
+        await this.corpus.putDocument(documentRecord, taint, txn);
+      });
+    } else {
+      await this.withDocumentLock(documentId, async () => {
+        await this.assertDocumentAbsent(documentId);
+        const writtenChunkKeys: string[] = [];
+        try {
+          for (const chunkRecord of chunkRecords) {
+            writtenChunkKeys.push(documentChunkStorageKey(chunkRecord));
+            await this.corpus.putChunk(chunkRecord, taint);
+          }
+          await this.corpus.putDocument(documentRecord, taint);
+        } catch (error) {
+          await this.rollbackInsert(documentId, writtenChunkKeys);
+          throw error;
+        }
+      });
+    }
     return this.toPassage(documentRecord, input.text);
   }
 
@@ -242,6 +269,52 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   private documentKeyPrefix(): string {
     return `doc.${MEMORY_PASSAGE_DOCUMENT_PREFIX}.${this.ownerRef}.`;
+  }
+
+  private async assertDocumentAbsent(documentId: string, txn?: SdwCorpusTxn): Promise<void> {
+    const raw = await (txn ?? this.storage).read(
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentKey(documentId),
+    );
+    if (raw !== null) {
+      throw new SdwValidationError(
+        "duplicate_passage",
+        "SDW memory passage already exists",
+      );
+    }
+  }
+
+  private async withDocumentLock<T>(documentId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.insertLocks.get(documentId) ?? Promise.resolve();
+    const run = previous.catch(() => {}).then(fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.insertLocks.set(documentId, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.insertLocks.get(documentId) === tail) {
+        this.insertLocks.delete(documentId);
+      }
+    }
+  }
+
+  private async rollbackInsert(documentId: string, writtenChunkKeys: readonly string[]): Promise<void> {
+    for (const key of [...writtenChunkKeys].reverse()) {
+      try {
+        await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, key, true);
+      } catch {
+        // Best effort: keep deleting other rollback targets and preserve the
+        // original insert error.
+      }
+    }
+    try {
+      await this.storage.delete(SDW_DOCUMENT_CORPUS_NAMESPACE, documentKey(documentId), true);
+    } catch {
+      // Best effort: rollback failures must not replace the insert failure.
+    }
   }
 
   private async listDocuments(): Promise<readonly SdwDocumentRecord[]> {
@@ -336,4 +409,43 @@ function generatePassageId(): string {
     throw new SdwValidationError("invalid_identifier", "Invalid SDW identifier: passage_id");
   }
   return id;
+}
+
+interface SdwTransactionalStorage {
+  sdwTransaction<T>(fn: (txn: SdwCorpusTxn) => Promise<T>): Promise<T>;
+}
+
+function asSdwTransactional(storage: StorageBackend): SdwTransactionalStorage | null {
+  const candidate = storage as { readonly sdwTransaction?: unknown };
+  return typeof candidate.sdwTransaction === "function"
+    ? (candidate as SdwTransactionalStorage)
+    : null;
+}
+
+function validatePassageDecorators(
+  tags: readonly string[],
+  metadata: readonly { readonly key: string }[],
+): void {
+  for (const tag of tags) assertSdwIdentifier(tag, "tag");
+  for (const entry of metadata) assertSdwIdentifier(entry.key, "metadata.key");
+}
+
+function validatePassageText(text: string): void {
+  if (hasUnpairedSurrogate(text)) {
+    throw new SdwValidationError("invalid_text", "SDW memory passage text contains unpaired surrogate code units");
+  }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) return true;
+      index++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
 }
