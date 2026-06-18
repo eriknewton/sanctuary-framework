@@ -94,6 +94,12 @@ generate_minimal_host_info_plist() {
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <!-- Window-state restoration hygiene only (mirrors source Info.plist). Does
+         NOT prevent relaunch-at-login and does NOT mitigate the #596 boot crash;
+         see the source Info.plist comment. This fallback heredoc only fires when
+         the source plist is missing; it is not the live copy path. -->
+    <key>NSQuitAlwaysKeepsWindows</key>
+    <false/>
 </dict>
 </plist>
 EOF

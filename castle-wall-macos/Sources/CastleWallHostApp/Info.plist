@@ -26,5 +26,17 @@
     <string>13.0</string>
     <key>NSSystemExtensionUsageDescription</key>
     <string>Sanctuary uses a system extension to enforce network security policies for AI agents.</string>
+    <!-- Disables AppKit window-state restoration (the "Resume" / reopen-windows
+         feature) so a relaunch does not try to rebuild prior window state. This
+         is window-restoration hygiene only; it does NOT prevent macOS from
+         relaunching the process at login (that path is governed by the
+         loginwindow's TALAppsToRelaunchAtLogin / "Reopen windows when logging
+         back in" setting, which is system/user-scoped and cannot be opted out
+         of via an app Info.plist). The #596 boot/login crash fires in
+         applicationWillFinishLaunching when the process is relaunched, so this
+         key does NOT mitigate the #596 trigger. The fix rests on the app-owned
+         NSApplicationDelegate (Candidate A) in CastleWallHostApp.swift. -->
+    <key>NSQuitAlwaysKeepsWindows</key>
+    <false/>
 </dict>
 </plist>

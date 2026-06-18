@@ -1,8 +1,43 @@
 import SwiftUI
+import AppKit
+
+/// App-owned NSApplicationDelegate. Its sole job is to displace SwiftUI's
+/// IMPLICIT delegate, whose `applicationDidChangeScreenParameters` runs an
+/// unsafe AttributeGraph value_set during `applicationWillFinishLaunching` at
+/// boot/login when the display reconfigures (#596 SIGABRT, zero app frames).
+/// By providing our own delegate we own that notification; our handler does
+/// NO AttributeGraph work synchronously and defers anything real to a later
+/// runloop turn, after launch completes.
+///
+/// This (Candidate A) is the load-bearing #596 fix. There is no working
+/// "Candidate C": no Info.plist key can stop macOS from relaunching the app at
+/// login, so the boot trigger cannot be suppressed from the app side. Efficacy
+/// of A is DRILL-GATED — SwiftUI may still attach scene-bound screen-parameter
+/// observers independent of this delegate, so only an Erik-present N>=3 reboot +
+/// console-login drill confirms neutralization. If A fails the drill, the memo's
+/// Candidate B (AppKit NSHostingController, window built in
+/// applicationDidFinishLaunching) is the fallback that removes the SwiftUI scene
+/// delegate from the process entirely.
+final class CastleWallAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        // Intentionally no synchronous AttributeGraph / scene work here. If any
+        // screen-reconfig handling is ever needed, schedule it OFF the launch
+        // call-out so it cannot run inside applicationWillFinishLaunching.
+        DispatchQueue.main.async {
+            // no-op today; reserved for post-launch screen handling.
+        }
+    }
+}
 
 // Entry point lives in CastleWallMain (no @main here): headless `--headless`
 // invocations must be routed before SwiftUI initializes.
 struct CastleWallHostApp: App {
+    // App-owned NSApplicationDelegate (Candidate A, #596). Declaring the adaptor
+    // makes SwiftUI use this instance as NSApplication.delegate instead of
+    // synthesizing its own implicit delegate — the one whose early
+    // screen-parameters handler triggers the boot/login SIGABRT.
+    @NSApplicationDelegateAdaptor(CastleWallAppDelegate.self) private var appDelegate
+
     @StateObject private var systemExtensionManager = SystemExtensionManager()
     @StateObject private var filterConfigurationManager = FilterConfigurationManager()
     @StateObject private var signerHelperManager = SignerHelperManager()
