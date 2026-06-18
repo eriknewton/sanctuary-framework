@@ -101,6 +101,9 @@ import { CallGovernor } from "./operational/call-governor.js";
 import { createGovernorTools } from "./operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
+import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
+import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
+import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
@@ -1286,6 +1289,45 @@ export async function createSanctuaryServer(options?: {
     auditLog
   );
 
+  // 16b1. SDW sovereign-memory substrate (company-brain phase 1, wired
+  // 2026-06-18). Exposes the shipped passage store (PR #484) over MCP so a
+  // fleet agent on THIS machine can reach its own sovereign passages. This is
+  // LOCAL-ONLY: the LMDB/filesystem-backed custody store never leaves the
+  // machine. The Anthropic Memory bridge (a real API round-trip, MUST-NEVER
+  // #1) is a SEPARATE, Erik-present phase and is deliberately NOT wired here.
+  //
+  // owner_ref scopes these passages to one engine instance under this fortress
+  // (SDW identifier grammar, no '.'); a single-machine substrate uses one
+  // stable scope. memory_insert/memory_delete are Tier-1 in DEFAULT_POLICY
+  // (the delete additionally force-pinned, un-relaxable); memory_insert's body
+  // is redacted from the approval channel below (Hard Constraint #1).
+  const sdwMemoryAdapter = new SdwMemoryBackendAdapter({
+    storage,
+    masterKey,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    ownerRef: "fleet-self",
+  });
+  const sdwMemoryTools = createSdwMemoryTools({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+  }).map((tool) =>
+    tool.name === "memory_insert"
+      ? {
+          ...tool,
+          // Hard Constraint #1 / C4: redact the passage body from the approval
+          // channel. memoryInsertApprovalArgs projects to operation metadata
+          // only (the body and self-asserted taint are dropped). Shared with
+          // the redaction regression test so the wiring and the test never
+          // drift.
+          approvalTargetArgs: memoryInsertApprovalArgs,
+        }
+      : tool,
+  );
+  const sdwMemoryProvenanceTool = createSdwMemoryProvenanceTool({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+  });
+
   // 16b2. Create EU AI Act compliance bundle tools (Tier 3 auto-allow —
   // read-only; emits Annex IV/Art. 12/13/14/15/26 artifacts signed by
   // the primary identity)
@@ -1390,6 +1432,8 @@ export async function createSanctuaryServer(options?: {
     ...profileTools,
     ...sanctuaryMetaTools,
     ...memoryAttestTools,
+    ...sdwMemoryTools,
+    sdwMemoryProvenanceTool,
     ...complianceTools,
     ...erc8004Tools,
     ...agentNativeTools,
@@ -1589,6 +1633,8 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "identity_set_primary",
   "identity_sign",
   "memory_attest",
+  "memory_delete",
+  "memory_insert",
   "proof_reveal",
   "reputation_export",
   "reputation_import",
@@ -1633,6 +1679,10 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "l2_hardening_status",
   "l2_verify_isolation",
   "manifest",
+  "memory_count",
+  "memory_get",
+  "memory_list",
+  "memory_search",
   "monitor_audit_log",
   "monitor_health",
   "principal_baseline_view",
@@ -1641,6 +1691,7 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "reputation_query",
   "reputation_query_weighted",
   "sanctuary_policy_status",
+  "sdw_memory_provenance",
   "shr_verify",
   "sovereignty_audit",
   "sovereignty_profile_get",

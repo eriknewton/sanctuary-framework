@@ -206,8 +206,8 @@ describe("SDW memory tools: custody + denial discipline", () => {
     );
   });
 
-  it("does not insert when the pre-commit intent audit write fails", async () => {
-    const { tools, storage } = makeTools({ failAuditOperations: ["memory_insert_intent"] });
+  it("does not insert when the pre-commit operation audit write fails (fail closed)", async () => {
+    const { tools, storage } = makeTools({ failAuditOperations: ["memory_insert"] });
     const result = parse(
       await tools.get("memory_insert")!.handler({
         text: "must not persist",
@@ -228,13 +228,17 @@ describe("SDW memory tools: custody + denial discipline", () => {
       }),
     );
     const passageId = (result.passage as Record<string, unknown>).passage_id;
-    const insertAudit = calls.find((c) => c.operation === "memory_insert_intent");
+    // The single durable operation record is written BEFORE the mutation
+    // (core state_write invariant); it carries the id that is actually persisted.
+    const insertAudit = calls.find(
+      (c) => c.operation === "memory_insert" && c.result === "success",
+    );
     expect(result.inserted).toBe(true);
     expect(typeof passageId).toBe("string");
     expect(insertAudit?.details?.passage_id).toBe(passageId);
   });
 
-  it("does not leave a success outcome audit when insert mutation fails", async () => {
+  it("records the operation audit before a failed mutation, then a denial (no double success)", async () => {
     const { tools, adapter, calls } = makeTools();
     await adapter.insertPassage(
       { passage_id: "duplicate-outcome", text: "already here" },
@@ -249,19 +253,18 @@ describe("SDW memory tools: custody + denial discipline", () => {
       }),
     );
     expect(result.denied).toBe(true);
-    expect(calls.find((c) => c.operation === "memory_insert_intent")).toMatchObject({
-      result: "success",
-    });
-    expect(calls.some((c) => c.operation === "memory_insert" && c.result === "success")).toBe(
-      false,
-    );
+    // Exactly ONE success operation record (the pre-mutation one). The reordered
+    // handler does NOT write a second post-commit success audit, so a failed
+    // mutation leaves the pre-mutation record + a denial, never two successes.
+    const successes = calls.filter((c) => c.operation === "memory_insert" && c.result === "success");
+    expect(successes).toHaveLength(1);
     expect(calls.find((c) => c.operation === "memory_insert_denied")).toMatchObject({
       result: "failure",
     });
   });
 
-  it("does not delete when the pre-commit intent audit write fails", async () => {
-    const { tools, adapter } = makeTools({ failAuditOperations: ["memory_delete_intent"] });
+  it("does not delete when the pre-commit operation audit write fails (fail closed)", async () => {
+    const { tools, adapter } = makeTools({ failAuditOperations: ["memory_delete"] });
     await adapter.insertPassage(
       { passage_id: "audit-fail-delete", text: "must survive" },
       "user_content",
@@ -275,20 +278,20 @@ describe("SDW memory tools: custody + denial discipline", () => {
     });
   });
 
-  it("audits a missing delete as not found after the pre-delete intent", async () => {
+  it("audits a missing delete as not found after the pre-delete operation record", async () => {
     const { tools, calls } = makeTools();
     const result = parse(await tools.get("memory_delete")!.handler({ passage_id: "missing-delete" }));
-    const intent = calls.find((c) => c.operation === "memory_delete_intent");
+    // One pre-mutation success operation record, then a not-found failure.
+    const op = calls.find((c) => c.operation === "memory_delete" && c.result === "success");
     const notFound = calls.find((c) => c.operation === "memory_delete_denied");
     expect(result).toMatchObject({ deleted: false, found: false });
-    expect(intent?.details?.passage_id).toBe("missing-delete");
+    expect(op?.details?.passage_id).toBe("missing-delete");
     expect(notFound?.details).toMatchObject({
       denial_class: "not_found",
       passage_id: "missing-delete",
     });
-    expect(calls.some((c) => c.operation === "memory_delete" && c.result === "success")).toBe(
-      false,
-    );
+    const successes = calls.filter((c) => c.operation === "memory_delete" && c.result === "success");
+    expect(successes).toHaveLength(1);
   });
 
   it("an invalid taint is denied with the fixed schema, details go to audit only (MUST-NEVER #7)", async () => {
