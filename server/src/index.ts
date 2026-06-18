@@ -500,11 +500,21 @@ export async function createSanctuaryServer(options?: {
             },
             isolation_level: "process",
             sovereignty_assessment: {
-              l1_state_encrypted: true,
+              // Honesty (audit seam #4): these were literal `true`s asserting
+              // runtime-verified encryption and available proofs on config
+              // presence. Derive from real config and surface the unverified
+              // posture: encryption is *configured* (no runtime integrity check
+              // proves bytes on disk are encrypted), and zero-knowledge proofs
+              // are only "available" when a ZK proof system is configured
+              // (commitment-only has none). The verification status is unknown.
+              l1_state_encrypted: config.state.encryption === "aes-256-gcm",
+              l1_state_encryption_verified: "unknown",
               l1_status: evidence.layers.l1.status,
               l2_execution_isolated: evidence.layers.l2.status,
               l2_isolation_type: "process-level",
-              l3_proofs_available: true,
+              l3_proofs_available:
+                config.disclosure.proof_system !== "commitment-only",
+              l3_status: evidence.layers.l3.status,
               l4_reputation_status: evidence.layers.l4.status,
               overall_level: "mvs",
               degradations: evidence.degradations.map((d) => d.description),
@@ -517,8 +527,13 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_health",
+      // Honesty (audit seam #4): the prior copy promised a "live Castle Wall
+      // enforcement state" that no detector feeds. Castle Wall status reflects
+      // whatever runtime snapshot is wired in (often "unknown" when none is),
+      // and the disclosure/reputation layers report configured-vs-verified, not
+      // observed enforcement. Describe what the tool actually returns.
       description:
-        "Report this instance's live health and sovereignty status: overall state (healthy/degraded/compromised), versions, Castle Wall enforcement state, audit/state/egress posture, and any active degradations. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
+        "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
@@ -626,7 +641,14 @@ export async function createSanctuaryServer(options?: {
               "S1.3_integrity_verification": "full",
               "S1.4_selective_state_sharing": "full",
               "S1.5_state_portability": "full",
-              "S1.6_deletion_rights": "full",
+              // Honest grade: deletion is best-effort random-byte overwrite
+              // before unlink; on copy-on-write/SSD media original bytes may
+              // survive, so at-rest confidentiality rests on encryption, not on
+              // the overwrite. The live delete tools (state_delete,
+              // sanctuary_forget, memory_delete) describe it this way and there
+              // is no "proven" ASSURANCE_MATRIX row backing a "full"
+              // right-to-deletion claim, so "partial" is the honest level.
+              "S1.6_deletion_rights": "partial",
               "S1.7_identity_anchoring": "partial",
             },
           },
@@ -654,10 +676,16 @@ export async function createSanctuaryServer(options?: {
             interfaces: ["ReputationStore", "TrustBootstrap"],
             modes: [config.reputation.mode],
             properties: {
-              "S4.1_earned_reputation": "full",
+              // Honest grades: the reputation/SHR/attestation surfaces now
+              // report "unknown" when telemetry is unavailable, and there is no
+              // "proven" ASSURANCE_MATRIX row for earned-reputation or
+              // trust-bootstrapping. "partial" matches the live surfaces rather
+              // than over-declaring a fully-realized capability the human-facing
+              // tools were just corrected to stop claiming.
+              "S4.1_earned_reputation": "partial",
               "S4.2_participant_owned": "full",
               "S4.5_sybil_resistance": "basic",
-              "S4.7_trust_bootstrapping": "full",
+              "S4.7_trust_bootstrapping": "partial",
             },
           },
         },
@@ -703,7 +731,8 @@ export async function createSanctuaryServer(options?: {
     identityManager,
     auditLog,
     handshakeResults,
-    config.verascore.url
+    config.verascore.url,
+    config
   );
 
   // 14. Create SHR tools (machine-readable sovereignty health report).
@@ -733,9 +762,6 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
-  // 14d. Create Sovereignty Audit tools (read-only diagnostic)
-  const { tools: auditTools } = createAuditTools(config, auditLog);
-
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
   const { tools: siemTools } = createSIEMTools(auditLog, currentSessionBinding);
 
@@ -743,6 +769,23 @@ export async function createSanctuaryServer(options?: {
   // the persisted source of truth for the runtime context gate enforcer.
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   const loadedProfile = await profileStore.load();
+
+  // 14d (moved below profile load). Create Sovereignty Audit tools (read-only
+  // diagnostic). Honesty (audit seam #5): the audit reads the LIVE profile so
+  // it credits context-gating and zero-knowledge proofs only when they are
+  // actually enabled (both default OFF) rather than from a hardcoded
+  // sanctuary_installed flag. Moved after profileStore.load() so the getter is
+  // bound to the live store; auditTools is only consumed in the tool registry
+  // far below, so the reorder is behavior-preserving.
+  const { tools: auditTools } = createAuditTools(config, auditLog, {
+    getRuntimeSignals: () => {
+      const p = profileStore.get();
+      return {
+        contextGatingEnabled: p.features.context_gating.enabled,
+        zkProofsEnabled: p.features.zk_proofs.enabled,
+      };
+    },
+  });
 
   // 14f. Create Context Gating tools (L2 outbound context control) and bind
   // the live enforcer to the persisted profile state before any proxy tools are

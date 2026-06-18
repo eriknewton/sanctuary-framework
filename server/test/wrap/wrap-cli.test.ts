@@ -107,6 +107,10 @@ describe("formatWrapSuccess", () => {
     browserOpened: true,
     passphraseLocation: "macOS Keychain",
     passphraseSource: "generated",
+    // Honesty (audit seam #1): the "Your agent is protected / Castle Wall Full"
+    // hero is now reserved for an observed daemon arm. The baseline fixture
+    // models the armed case; the not-armed case is covered separately below.
+    castleWallArmed: true,
   };
 
   it("includes wrapped tool name and version", () => {
@@ -135,7 +139,7 @@ describe("formatWrapSuccess", () => {
     );
   });
 
-  it("includes the agent-protected summary line", () => {
+  it("includes the agent-protected summary line when Castle Wall armed", () => {
     const out = formatWrapSuccess(baseInfo);
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
@@ -144,6 +148,27 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Heralds Full");
     // L1-L4 numbering was MANDATORY-retired 2026-05-24; it must not reappear.
     expect(out).not.toMatch(/\bL[1-4]\b/);
+  });
+
+  // Honesty (audit seam #1): when the Castle Wall daemon failed to arm, the
+  // banner must NOT claim "protected" / "Castle Wall Full" — that contradicted
+  // the loud "traffic NOT filtered" warning printed seconds earlier.
+  it("does NOT claim protected / Full when Castle Wall did not arm", () => {
+    const out = formatWrapSuccess({ ...baseInfo, castleWallArmed: false });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("enforcement is not confirmed");
+  });
+
+  // Honesty (audit seam #1): with no arm signal threaded, default conservative —
+  // never render "Full" on presence/absence of a field alone.
+  it("renders unknown (never Full) when no arm signal is threaded", () => {
+    const { castleWallArmed: _omit, ...noSignal } = baseInfo;
+    const out = formatWrapSuccess(noSignal);
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall status unknown");
+    expect(out).not.toContain("Your agent is protected");
   });
 
   it("includes the dashboard URL without the long-lived token", () => {

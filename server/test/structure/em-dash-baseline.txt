@@ -158,7 +158,7 @@
 34	server/src/core/master-custody.ts
 19	server/src/core/master-rotation.ts
 15	server/src/dashboard-standalone.ts
-9	server/src/dashboard/aggregator.ts
+8	server/src/dashboard/aggregator.ts
 1	server/src/dashboard/api.ts
 1	server/src/dashboard/html.ts
 5	server/src/dashboard/multi-html.ts
@@ -221,9 +221,9 @@
 2	server/src/principal-policy/tools.ts
 1	server/src/principal-policy/webhook.ts
 2	server/src/proxy/client-manager.ts
-3	server/src/proxy/proxy-router.ts
+2	server/src/proxy/proxy-router.ts
 3	server/src/reputation/reputation-store.ts
-2	server/src/reputation/tools.ts
+1	server/src/reputation/tools.ts
 5	server/src/router.ts
 6	server/src/sanctuary-tools.ts
 4	server/src/sdw/export.ts

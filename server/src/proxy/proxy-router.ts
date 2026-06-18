@@ -21,6 +21,7 @@ import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
 import type { AuditLog } from "../operational/audit-log.js";
+import { ContextGateBlockedError } from "../operational/context-gate-enforcer.js";
 import type { CallGovernor } from "../operational/call-governor.js";
 import type { LocalPrivacyEngine, PrivacyPolicy } from "../operational/privacy-core.js";
 import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
@@ -48,7 +49,10 @@ export interface ProxyRouterOptions {
    * - `policyResolver` returns null when no policy is bound for the server;
    *   the privacy engine treats that as `fail_closed_no_policy` and denies.
    * - `policyResolver` rejecting (vault unreachable, decrypt failure, etc.)
-   *   is treated as `fail_closed_filter_error` and denies.
+   *   is an infra outage, not a missing policy: the router denies directly with
+   *   the distinct `fail_closed_filter_error` reason class (it does NOT collapse
+   *   the rejection to a null policy, which would mislabel the outage as
+   *   "no policy bound").
    * - Operator overrides on the policy (`operator_override.allow_on_*`)
    *   are honored by the engine itself.
    */
@@ -201,13 +205,68 @@ export class ProxyRouter {
         }
 
         // Step 2: Context gating (if configured)
+        //
+        // Fail CLOSED on a gate-filter error. The context gate is a redaction
+        // control the operator configured to strip denied fields before any
+        // payload leaves to the upstream server; the tool copy promises
+        // "'deny' blocks the entire request." If the filter throws (policy-store
+        // read failure, malformed policy, runtime exception) we must NOT forward
+        // the original unredacted args, since doing so would silently degrade a
+        // configured block control to "send everything" (invariant #5/#1). We
+        // deny the request, record a critical gate-error denial in the audit
+        // trail, and return a generic denial. The raw error is recorded in the
+        // audit log only, never leaked to the agent response (invariant #7 style).
         let filteredArgs = args;
         if (this.options.contextGateFilter) {
           try {
             filteredArgs = await this.options.contextGateFilter(proxyName, args);
-          } catch {
-            // Context gate failure — proceed with original args
-            // (defense in depth: the gate is advisory, not blocking for proxy calls)
+          } catch (gateErr) {
+            // Distinguish an EXPECTED policy block from a genuine filter error.
+            // A ContextGateBlockedError means the operator's `on_deny:"block"`
+            // policy fired (a designed denial, not infra failure), so we
+            // record the honest `context_gating_blocked` reason. Any other throw
+            // is an infra/runtime fault and keeps `context_gate_filter_error`.
+            // BOTH branches fail CLOSED identically: never forward to upstream,
+            // write a denial audit entry, return the generic agent-facing
+            // denial, and early-return (no success entry). The raw error stays
+            // operator-side in the audit log only (invariant #7 style).
+            const isPolicyBlock = gateErr instanceof ContextGateBlockedError;
+            const reason = isPolicyBlock
+              ? "context_gating_blocked"
+              : "context_gate_filter_error";
+            const operation = isPolicyBlock
+              ? `proxy_context_gating_blocked:${proxyName}`
+              : `proxy_context_gate_error:${proxyName}`;
+            const eventType = isPolicyBlock
+              ? "proxy.context_gating_blocked"
+              : "proxy.context_gate_error";
+            const gateErrorMessage =
+              gateErr instanceof Error ? gateErr.message : "context gate filter error";
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation,
+              identity_id: "system",
+              result: "failure",
+              details: {
+                event_type: eventType,
+                server: serverName,
+                tool: toolName,
+                tier,
+                decision: "denied",
+                reason,
+                ...(isPolicyBlock
+                  ? { denied_fields: (gateErr as ContextGateBlockedError).deniedFields }
+                  : {}),
+                error: gateErrorMessage,
+                latency_ms: Date.now() - start,
+              },
+            });
+
+            this.notifyProxyCall(proxyName, serverName, "blocked", reason, tier);
+            return toolResult({
+              error: "Operation not permitted",
+              proxy: true,
+            });
           }
         }
 
@@ -267,13 +326,52 @@ export class ProxyRouter {
             (serverConfig?.destination_category as PrivacyDestinationCategory | undefined) ??
             "tool-api";
           const identityId = serverConfig?.privacy_identity_id;
+          let resolverFailed = false;
           try {
             privacyPolicy = await this.options.privacyEnforcement.policyResolver(
               serverName,
               identityId
             );
           } catch {
+            // Resolver rejection means the vault was unreachable or a decrypt
+            // failed (an INFRA outage, not a missing/unbound policy). Passing
+            // `policy: null` to the engine below would have it emit
+            // `fail_closed_no_policy` ("no policy bound"), mislabeling the
+            // outage as a configuration gap and losing the distinct
+            // `fail_closed_filter_error` reason the router doc promises. We
+            // still fail closed (deny, never forward) but with the honest
+            // reason class.
             privacyPolicy = null;
+            resolverFailed = true;
+          }
+
+          if (resolverFailed) {
+            await this.auditLog.appendCritical({
+              layer: "l2",
+              operation: `proxy_privacy_denied:${proxyName}`,
+              identity_id: "system",
+              result: "failure",
+              details: {
+                event_type: "proxy.privacy_denied",
+                server: serverName,
+                tool: toolName,
+                tier,
+                denial_reason_class: "fail_closed_filter_error",
+                latency_ms: Date.now() - start,
+              },
+            });
+            this.notifyProxyCall(
+              proxyName,
+              serverName,
+              "blocked",
+              "privacy_denied",
+              tier
+            );
+            return toolResult({
+              error: "Operation not permitted",
+              proxy: true,
+              privacy_denied: true,
+            });
           }
 
           const decision = await this.options.privacyEnforcement.engine.filterOutbound({

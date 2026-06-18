@@ -26,8 +26,62 @@ describe("Fortress View", () => {
     });
 
     expect(html).toContain("status-banner");
-    expect(html).toContain("Agent Protected");
     expect(html).toContain("2 servers monitored");
+  });
+
+  it("defaults the banner to amber 'enforcement not confirmed', NOT green 'protected' (never-overclaim)", () => {
+    const html = generateFortressViewHTML({
+      serverVersion: "0.7.0",
+      upstreamServerCount: 2,
+    });
+
+    // The default/initial banner (before any Castle Wall posture evidence) must
+    // be amber and must NOT claim protection or "All systems nominal".
+    expect(html).toContain('<div class="status-indicator amber" id="status-indicator">');
+    expect(html).toContain("Wrapped, enforcement not confirmed");
+    // The legacy overclaiming default must be gone from the static banner.
+    expect(html).not.toContain("All systems nominal");
+  });
+
+  it("only renders green 'Agent Protected' when Castle Wall posture is armed", () => {
+    const html = generateFortressViewHTML({
+      serverVersion: "0.7.0",
+      upstreamServerCount: 2,
+    });
+
+    // Green is gated on the enforcement-evidenced arm state, consumed from the
+    // G4 posture endpoint. The legitimate green path is preserved.
+    expect(html).toContain("/api/posture/castle-wall");
+    expect(html).toContain("arm_state");
+    expect(html).toContain("wallArmState === 'armed'");
+    // The green branch sets the protected copy and the enforcing subtitle.
+    expect(html).toContain("Agent Protected");
+    expect(html).toContain("Castle Wall enforcing.");
+    // Green must be guarded by the armed check, not set unconditionally.
+    expect(html).toContain("const wallArmed = wallArmState === 'armed'");
+  });
+
+  it("renders a red 'enforcement not active' banner when posture is degraded", () => {
+    const html = generateFortressViewHTML({
+      serverVersion: "0.7.0",
+      upstreamServerCount: 2,
+    });
+
+    // A degraded wall (present but not enforcing) is a red, not-protected state.
+    expect(html).toContain("wallArmState === 'degraded'");
+    expect(html).toContain("Enforcement not active");
+    expect(html).toContain("wrapped but not protected");
+  });
+
+  it("treats an unreachable posture endpoint as unproven, never protected", () => {
+    const html = generateFortressViewHTML({
+      serverVersion: "0.7.0",
+      upstreamServerCount: 2,
+    });
+
+    // Posture fetch failure / non-OK falls back to an unproven (amber) state.
+    expect(html).toContain("wallArmState = 'unavailable'");
+    expect(html).toContain("Castle Wall enforcement not confirmed.");
   });
 
   it("handles singular server count", () => {

@@ -121,7 +121,10 @@ describe("Sovereignty Audit Tool", () => {
           mcp_tools_bricked_by_integrity_gate: true,
         },
       }),
-      expect.anything()
+      expect.anything(),
+      // Honesty (audit seam #5): the handler now also passes live runtime
+      // signals (undefined here — no runtimeDeps wired in this test).
+      undefined
     );
   });
 

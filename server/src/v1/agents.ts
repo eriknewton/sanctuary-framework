@@ -62,12 +62,60 @@ export const V1_AGENTS_MAX_LIMIT = 100;
 /** Default page size when the caller omits `limit`. */
 export const V1_AGENTS_DEFAULT_LIMIT = 50;
 
+/**
+ * Whether protection is observed live + actively enforcing for an agent.
+ *
+ * HONESTY CONTRACT: this is a tri-state, and it is `"unknown"` for EVERY agent
+ * today. Asserting a live value requires a real liveness/enforcement signal that
+ * does not yet exist:
+ *
+ *   - `last_activity_at` is a touch-timestamp stamped on operator mutations, NOT
+ *     a heartbeat. A crashed agent's last stamp lingers, so it cannot prove an
+ *     agent is alive right now.
+ *   - Nothing in this read path observes Castle Wall actually enforcing the
+ *     agent's policy at the OS layer; presence in the roster says only that
+ *     protection was REQUESTED, never that it is being ENFORCED.
+ *
+ * So `enforcement_active` is reserved for a future heartbeat + enforcement probe
+ * (see liveness.ts and the federation roadmap). Until that signal lands we emit
+ * `"unknown"` rather than fabricate `true`/`false`. A federation peer must read
+ * `"unknown"` as "this node cannot currently attest live enforcement," never as
+ * a denial of protection.
+ *
+ *   - `"active"`:   observed live AND enforcing (NOT emitted yet; needs the probe).
+ *   - `"inactive"`: observed NOT enforcing (NOT emitted yet; needs the probe).
+ *   - `"unknown"`:  no live signal available (the only value emitted today).
+ */
+export type EnforcementActive = "active" | "inactive" | "unknown";
+
 /** Canonical AgentSummary (API Parity Catalog §2 "Shared Type Sketches"). */
 export interface AgentSummary {
   agent_id: string;
   node_id: string;
   label: string;
   harness: string;
+  /**
+   * Policy intent: the operator requested protection for this agent and it is
+   * present in the wrapped roster (not mid-teardown). Computable now from the
+   * stored status. This is NOT a liveness or enforcement claim; see
+   * `enforcement_active` for whether protection is observed live + enforcing.
+   */
+  policy_protected: boolean;
+  /**
+   * Whether protection is observed live + enforcing. `"unknown"` for every
+   * agent today; requires a real liveness/enforcement signal that does not
+   * exist yet (future work). See {@link EnforcementActive}.
+   */
+  enforcement_active: EnforcementActive;
+  /**
+   * @deprecated Misleading alias of {@link policy_protected}: a `true` value
+   * here means only "present in the wrapped roster (policy intent)," NOT that
+   * the agent is alive or that Castle Wall is enforcing. Kept as a same-value
+   * alias for back-compat with federation peers that parse `protected`; new
+   * consumers MUST read `policy_protected` (policy intent) and
+   * `enforcement_active` (live enforcement) instead. Removal is a future
+   * federation-protocol version bump.
+   */
   protected: boolean;
   policy_id: string | null;
   last_activity_at: string | null;
@@ -289,6 +337,21 @@ export function toAgentSummary(
   record: LocalAgentRecord,
   nodeId: string,
 ): AgentSummary {
+  // HONEST SPLIT (federation contract). The old single `protected` boolean
+  // conflated two different claims and over-claimed both:
+  //   policy_protected: the operator REQUESTED protection and the agent is in
+  //     the wrapped roster (not mid-teardown). This is policy intent and is the
+  //     only thing computable from the stored record. A dead/errored/unknown
+  //     agent is still `policy_protected: true` because the operator's request
+  //     stands until an explicit unwrap; that is honest for an intent field.
+  //   enforcement_active: whether protection is observed LIVE + ENFORCING.
+  //     There is no liveness or Castle-Wall-enforcement signal in this read
+  //     path (last_activity_at is a touch-timestamp, not a heartbeat; nothing
+  //     here observes the OS-layer policy actually enforcing), so we emit
+  //     "unknown" for every agent rather than fabricate a live value.
+  // `protected` is retained as a DEPRECATED same-value alias of policy_protected
+  // for federation peers that still parse it; new consumers read the split.
+  const policyProtected = record.status !== "unwrapping";
   return {
     agent_id: record.agent_id,
     node_id: nodeId,
@@ -296,8 +359,10 @@ export function toAgentSummary(
     // stable human-facing handle until a label field exists.
     label: record.agent_id,
     harness: record.harness,
-    // Present in the hub roster ⇒ wrapped, unless mid-teardown.
-    protected: record.status !== "unwrapping",
+    policy_protected: policyProtected,
+    // No live liveness/enforcement signal exists yet; never fabricate one.
+    enforcement_active: "unknown",
+    protected: policyProtected, // DEPRECATED alias of policy_protected.
     policy_id: record.policy_id ?? null,
     last_activity_at: record.last_activity_at ?? null,
   };

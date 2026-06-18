@@ -102,7 +102,7 @@ describe("formatWrapSuccessNoDashboard", () => {
     expect(out).not.toContain("Sovereignty Dashboard running at");
   });
 
-  it("preserves the protected-status footer", () => {
+  it("preserves the protected-status footer when Castle Wall armed", () => {
     const out = formatWrapSuccessNoDashboard({
       toolName: "Claude Code",
       version: "1.1.5",
@@ -110,11 +110,30 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 0,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
+      // Honesty (audit seam #1): the protected/Full footer is reserved for an
+      // observed daemon arm.
+      castleWallArmed: true,
     });
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
     // L1-L4 numbering was MANDATORY-retired 2026-05-24.
     expect(out).not.toMatch(/\bL[1-4]\b/);
+  });
+
+  // Honesty (audit seam #1): a failed arm must not print protected/Full.
+  it("downgrades the footer when Castle Wall did not arm", () => {
+    const out = formatWrapSuccessNoDashboard({
+      toolName: "Claude Code",
+      version: "1.1.5",
+      toolCount: 0,
+      serverCount: 0,
+      passphraseLocation: "fixture-keychain",
+      passphraseSource: "generated",
+      castleWallArmed: false,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
   });
 
   it("pluralizes 'server' correctly", () => {

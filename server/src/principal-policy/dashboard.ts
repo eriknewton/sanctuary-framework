@@ -2375,7 +2375,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * co-located server (dashboard/server.ts) receives at construction, so
    * /api/snapshot returns the same document shape in both modes.
    */
-  private buildAggregatorSources(): AggregatorSources {
+  private async buildAggregatorSources(): Promise<AggregatorSources> {
+    // Slice R + P: resolve the pinned producer key the SAME way dispatchPosture
+    // does, so the dashboard hero shield arms the wall on the identical
+    // cryptographic basis as /v1 G4. `present` → re-verify producer signatures
+    // (a forged marker-only entry cannot arm green); `absent` → channel basis
+    // (honest macOS / pre-provision); `unreadable` → fail honestly via
+    // `producerKeyExpectedButUnavailable` (the shield goes amber, never green on
+    // a weaker basis than the consumer wrote with).
+    await this.ensureProducerKeyLoaded();
+    const load = this._producerKeyLoad;
     return {
       mode: this._standaloneMode ? "standalone" : "co-located",
       server_version: PKG_VERSION,
@@ -2384,6 +2393,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...(this.baseline ? { baseline: this.baseline } : {}),
       ...(this.policy ? { policy: this.policy } : {}),
       ...(this.clientManager ? { clientManager: this.clientManager } : {}),
+      resolvePinnedProducerKey: () =>
+        load?.status === "present" ? load.keyB64url : null,
+      ...(load?.status === "unreadable"
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,
@@ -2401,7 +2415,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * legacy /api/* route.
    */
   private handleSnapshot(res: ServerResponse): void {
-    getProtectionSnapshot(this.buildAggregatorSources())
+    this.buildAggregatorSources()
+      .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
         res.writeHead(200, {
           "Content-Type": "application/json",

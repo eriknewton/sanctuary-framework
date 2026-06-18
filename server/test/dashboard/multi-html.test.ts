@@ -9,7 +9,33 @@
 
 import { describe, it, expect } from "vitest";
 import { renderMultiAgentHTML } from "../../src/dashboard/multi-html.js";
-import type { MultiTenantSnapshot } from "../../src/dashboard/multi-aggregator.js";
+import type {
+  MultiTenantSnapshot,
+  MultiTenantTenantRow,
+} from "../../src/dashboard/multi-aggregator.js";
+
+function row(
+  overrides: Partial<MultiTenantTenantRow> & Pick<MultiTenantTenantRow, "name">
+): MultiTenantTenantRow {
+  const running = overrides.running ?? false;
+  return {
+    storage_path: "/x",
+    initialized: true,
+    passphrase_status: "keychain",
+    keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
+    dashboard_url: null,
+    dashboard_port: null,
+    webhook_callback_port: null,
+    pid: null,
+    started_at: null,
+    mode: null,
+    running,
+    probe_state: running ? "confirmed" : "not_running",
+    probe_reason: null,
+    last_activity: null,
+    ...overrides,
+  };
+}
 
 function snapshot(
   tenants: MultiTenantSnapshot["tenants"] = []
@@ -19,6 +45,9 @@ function snapshot(
     generated_at: "2026-04-17T12:00:00.000Z",
     tenant_count: tenants.length,
     running_count: tenants.filter((t) => t.running).length,
+    answered_unconfirmed_count: tenants.filter(
+      (t) => t.probe_state === "answered_unconfirmed"
+    ).length,
     tenants,
   };
 }
@@ -34,12 +63,9 @@ describe("renderMultiAgentHTML", () => {
   it("renders a running tenant with a deep-link to its dashboard", () => {
     const html = renderMultiAgentHTML({
       snapshot: snapshot([
-        {
+        row({
           name: "nsa",
           storage_path: "/home/e/.sanctuary/nsa",
-          initialized: true,
-          passphrase_status: "keychain",
-          keychain_service: "sanctuary-passphrase-aaaaaaaaaaaaaaaa",
           dashboard_url: "http://127.0.0.1:3501",
           dashboard_port: 3501,
           webhook_callback_port: 3511,
@@ -47,9 +73,8 @@ describe("renderMultiAgentHTML", () => {
           started_at: "2026-04-17T11:59:00.000Z",
           mode: "wrap",
           running: true,
-          probe_reason: null,
           last_activity: "2026-04-17T11:59:50.000Z",
-        },
+        }),
       ]),
     });
     expect(html).toContain('href="http://127.0.0.1:3501"');
@@ -59,25 +84,41 @@ describe("renderMultiAgentHTML", () => {
     expect(html).toContain("Keychain");
   });
 
+  it("renders a port-answered-not-confirmed tenant (foreign responder), never 'running'", () => {
+    const html = renderMultiAgentHTML({
+      snapshot: snapshot([
+        row({
+          name: "ghost",
+          storage_path: "/home/e/.sanctuary/ghost",
+          dashboard_url: "http://127.0.0.1:3505",
+          dashboard_port: 3505,
+          running: false,
+          probe_state: "answered_unconfirmed",
+          probe_reason: "port answered 404, not a confirmed Sanctuary build",
+        }),
+      ]),
+    });
+    expect(html).toContain("pill-unconfirmed");
+    expect(html).toContain("port answered, not confirmed");
+    // The row pill must NOT render the "running" label/class (the CSS block
+    // always defines .pill-running, so assert on the rendered pill markup).
+    expect(html).not.toContain('class="pill pill-running"');
+    expect(html).not.toContain(">running<");
+    expect(html).toContain("Port answered, not confirmed</strong>1");
+  });
+
   it("renders a stopped tenant without a deep-link (no runtime)", () => {
     const html = renderMultiAgentHTML({
       snapshot: snapshot([
-        {
+        row({
           name: "standards",
           storage_path: "/home/e/.sanctuary/standards",
-          initialized: true,
           passphrase_status: "fallback-file",
           keychain_service: "sanctuary-passphrase-bbbbbbbbbbbbbbbb",
-          dashboard_url: null,
-          dashboard_port: null,
-          webhook_callback_port: null,
-          pid: null,
-          started_at: null,
-          mode: null,
           running: false,
+          probe_state: "not_running",
           probe_reason: "no runtime.json",
-          last_activity: null,
-        },
+        }),
       ]),
     });
     expect(html).toContain("pill-stopped");
@@ -89,22 +130,11 @@ describe("renderMultiAgentHTML", () => {
   it("escapes adversarial tenant names / storage paths into HTML entities", () => {
     const html = renderMultiAgentHTML({
       snapshot: snapshot([
-        {
+        row({
           name: "<img src=x onerror=alert(1)>",
           storage_path: "/tmp/<script>/",
-          initialized: true,
-          passphrase_status: "keychain",
           keychain_service: "sanctuary-passphrase-cccccccccccccccc",
-          dashboard_url: null,
-          dashboard_port: null,
-          webhook_callback_port: null,
-          pid: null,
-          started_at: null,
-          mode: null,
-          running: false,
-          probe_reason: null,
-          last_activity: null,
-        },
+        }),
       ]),
     });
     expect(html).not.toContain("<img src=x onerror=alert(1)>");
@@ -114,11 +144,8 @@ describe("renderMultiAgentHTML", () => {
 
   it("embeds a parseable snapshot JSON block", () => {
     const snap = snapshot([
-      {
+      row({
         name: "t1",
-        storage_path: "/x",
-        initialized: true,
-        passphrase_status: "keychain",
         keychain_service: "sanctuary-passphrase-dddddddddddddddd",
         dashboard_url: "http://127.0.0.1:3502",
         dashboard_port: 3502,
@@ -127,9 +154,8 @@ describe("renderMultiAgentHTML", () => {
         started_at: "2026-04-17T11:00:00.000Z",
         mode: "wrap",
         running: true,
-        probe_reason: null,
         last_activity: "2026-04-17T11:59:00.000Z",
-      },
+      }),
     ]);
     const html = renderMultiAgentHTML({ snapshot: snap });
     const match = /<script id="snapshot-data" type="application\/json">([\s\S]*?)<\/script>/.exec(
@@ -146,22 +172,14 @@ describe("renderMultiAgentHTML", () => {
   it("uses pill-empty for an uninitialized tenant", () => {
     const html = renderMultiAgentHTML({
       snapshot: snapshot([
-        {
+        row({
           name: "fresh",
           storage_path: "/x/fresh",
           initialized: false,
           passphrase_status: "not-initialized",
           keychain_service: "sanctuary-passphrase-eeeeeeeeeeeeeeee",
-          dashboard_url: null,
-          dashboard_port: null,
-          webhook_callback_port: null,
-          pid: null,
-          started_at: null,
-          mode: null,
-          running: false,
           probe_reason: "no runtime.json",
-          last_activity: null,
-        },
+        }),
       ]),
     });
     expect(html).toContain("pill-empty");
@@ -172,22 +190,10 @@ describe("renderMultiAgentHTML", () => {
   it("pluralizes 'tenants' correctly in the header", () => {
     const html1 = renderMultiAgentHTML({
       snapshot: snapshot([
-        {
+        row({
           name: "only",
-          storage_path: "/x",
-          initialized: true,
-          passphrase_status: "keychain",
           keychain_service: "sanctuary-passphrase-ffffffffffffffff",
-          dashboard_url: null,
-          dashboard_port: null,
-          webhook_callback_port: null,
-          pid: null,
-          started_at: null,
-          mode: null,
-          running: false,
-          probe_reason: null,
-          last_activity: null,
-        },
+        }),
       ]),
     });
     expect(html1).toContain("1 tenant discovered");
