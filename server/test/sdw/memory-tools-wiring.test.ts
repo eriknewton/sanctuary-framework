@@ -6,8 +6,12 @@
  * reach: that the irreversible delete cannot be relaxed by a hand-authored
  * policy at the LOADER layer, that the passage body is redacted from the
  * approval channel (Hard Constraint #1 / C4) end-to-end through the router
- * order, and that the live catalog actually exposes all seven tools with the
- * correct read/write class.
+ * order, that the live catalog actually exposes all seven tools with the
+ * correct read/write class, and that the live handlers honor the core
+ * audit-BEFORE-commit invariant against the SHIPPED adapter: with a failing
+ * audit sink injected, memory_insert / memory_delete deny AND do not mutate
+ * the real backend (no persisted passage / no delete without a preceding
+ * durable operation record), mirroring state_write / state_delete.
  */
 
 import { describe, expect, it } from "vitest";
@@ -70,6 +74,18 @@ class WiringStorage implements StorageBackend {
 }
 
 function makeWiredTools(): ToolDefinition[] {
+  return buildWiredTools().tools;
+}
+
+/**
+ * Build the wired tools against the SHIPPED adapter (real encryption + storage),
+ * optionally with an audit sink that THROWS on the named operations. Returns the
+ * adapter so a test can assert the real backend state after a denial.
+ */
+function buildWiredTools(failAuditOperations: readonly string[] = []): {
+  tools: ToolDefinition[];
+  adapter: SdwMemoryBackendAdapter;
+} {
   const storage = new WiringStorage();
   const adapter = new SdwMemoryBackendAdapter({
     storage,
@@ -77,14 +93,35 @@ function makeWiredTools(): ToolDefinition[] {
     fortressId: FORTRESS_ID,
     ownerRef: "fleet-self",
   });
-  const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+  let auditLog: AuditLog;
+  if (failAuditOperations.length === 0) {
+    auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+  } else {
+    const failSet = new Set(failAuditOperations);
+    auditLog = {
+      async appendCritical(entry: { operation: string }): Promise<void> {
+        if (failSet.has(entry.operation)) {
+          throw new Error(`audit sink down for ${entry.operation}`);
+        }
+      },
+    } as unknown as AuditLog;
+  }
   // Mirror the index.ts wiring: attach the redaction projection to memory_insert.
   const memoryTools = createSdwMemoryTools({ adapter, auditLog }).map((tool) =>
     tool.name === "memory_insert"
       ? { ...tool, approvalTargetArgs: memoryInsertApprovalArgs }
       : tool,
   );
-  return [...memoryTools, createSdwMemoryProvenanceTool({ adapter, auditLog })];
+  return {
+    tools: [...memoryTools, createSdwMemoryProvenanceTool({ adapter, auditLog })],
+    adapter,
+  };
+}
+
+function parseToolResult(result: {
+  content: Array<{ type: "text"; text: string }>;
+}): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }
 
 describe("company-brain wiring: irreversible delete is un-relaxable at the loader", () => {
@@ -221,5 +258,65 @@ describe("company-brain wiring: catalog surface + classification", () => {
     expect(() => assertToolClasses(tools)).not.toThrow();
     const writes = tools.filter((t) => t.tool_class === "write").map((t) => t.name).sort();
     expect(writes).toEqual(["memory_delete", "memory_insert"]);
+  });
+});
+
+describe("company-brain wiring: audit-before-commit holds against the shipped adapter", () => {
+  it("memory_insert with a failing audit sink denies AND persists nothing (fail closed)", async () => {
+    // Stub the durable critical-audit sink to THROW for the operation record.
+    const { tools, adapter } = buildWiredTools(["memory_insert"]);
+    const insert = tools.find((t) => t.name === "memory_insert")!;
+
+    const result = parseToolResult(
+      await insert.handler({
+        text: "must never persist without a durable audit",
+        taint: "agent_derived_clean",
+        passage_id: "wiring-audit-fail-insert",
+      }),
+    );
+
+    // (a) the handler returns a denial...
+    expect(result.denied).toBe(true);
+    // (b) ...and the SHIPPED backend holds no passage: the mutation was never
+    //     attempted because the pre-commit audit threw first.
+    await expect(adapter.getPassage("wiring-audit-fail-insert")).resolves.toBeNull();
+    await expect(adapter.countPassages()).resolves.toBe(0);
+  });
+
+  it("memory_delete with a failing audit sink denies AND leaves the passage intact (fail closed)", async () => {
+    // First seed a real passage with a working audit sink, then re-wire the
+    // SAME shipped adapter behind a sink that throws only on memory_delete.
+    const storage = new WiringStorage();
+    const adapter = new SdwMemoryBackendAdapter({
+      storage,
+      masterKey: MASTER_KEY,
+      fortressId: FORTRESS_ID,
+      ownerRef: "fleet-self",
+    });
+    await adapter.insertPassage(
+      { passage_id: "wiring-audit-fail-delete", text: "must survive a downed audit" },
+      "user_content",
+    );
+
+    const failingAudit = {
+      async appendCritical(entry: { operation: string }): Promise<void> {
+        if (entry.operation === "memory_delete") {
+          throw new Error("audit sink down for memory_delete");
+        }
+      },
+    } as unknown as AuditLog;
+    const del = createSdwMemoryTools({ adapter, auditLog: failingAudit }).find(
+      (t) => t.name === "memory_delete",
+    )!;
+
+    const result = parseToolResult(
+      await del.handler({ passage_id: "wiring-audit-fail-delete" }),
+    );
+
+    // (a) denial, and (b) the irreversible delete never ran against the backend.
+    expect(result.denied).toBe(true);
+    await expect(adapter.getPassage("wiring-audit-fail-delete")).resolves.toMatchObject({
+      text: "must survive a downed audit",
+    });
   });
 });

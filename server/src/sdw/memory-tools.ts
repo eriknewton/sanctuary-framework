@@ -223,9 +223,15 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         return deny("memory_insert");
       }
       const auditedPassageId = passageId ?? generateMemoryPassageId();
+      // Core invariant (mirror state_write, cognitive/tools.ts): the durable
+      // critical operation record is written BEFORE the mutation. If that audit
+      // write throws, fail CLOSED - return the fixed denial and never mutate, so
+      // there is never a persisted passage without a preceding durable record.
+      // There is no separate post-commit success audit (that ordering is exactly
+      // the residual gap: a mutation that lands but whose completion record can
+      // still fail). Adapter-side rejections still record a failure audit below.
       try {
-        await auditSuccess("memory_insert_intent", {
-          phase: "intent",
+        await auditSuccess("memory_insert", {
           passage_id: auditedPassageId,
           text_bytes: Buffer.byteLength(text, "utf8"),
           tag_count: tags.length,
@@ -244,19 +250,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         // invalid identifier) -> fixed denial; category to audit only.
         const category = error instanceof SdwValidationError ? error.category : "insert_failed";
         await auditFailure("memory_insert_denied", {
-          phase: "outcome",
           denial_class: category,
           passage_id: auditedPassageId,
         });
         return deny("memory_insert");
       }
-      await auditSuccess("memory_insert", {
-        phase: "outcome",
-        passage_id: passage.passage_id,
-        owner_ref: passage.owner_ref,
-        content_hash: passage.content_hash,
-        chunk_count: passage.chunk_count,
-      });
       return toolResult({ inserted: true, passage: publicPassage(passage) });
     },
   };
@@ -435,8 +433,13 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         await auditFailure("memory_delete_denied", { denial_class: "invalid_passage_id" });
         return deny("memory_delete");
       }
+      // Core invariant (mirror state_delete, cognitive/tools.ts): the durable
+      // critical operation record is written BEFORE the secure-overwrite. Fail
+      // CLOSED if that audit write throws - no irreversible delete without a
+      // preceding durable record. No separate post-commit success audit (the
+      // residual gap closed). Adapter rejections record a failure audit below.
       try {
-        await auditSuccess("memory_delete_intent", { phase: "intent", passage_id: passageId });
+        await auditSuccess("memory_delete", { passage_id: passageId });
       } catch {
         return deny("memory_delete");
       }
@@ -446,7 +449,6 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "delete_failed";
         await auditFailure("memory_delete_denied", {
-          phase: "outcome",
           denial_class: category,
           passage_id: passageId,
         });
@@ -454,13 +456,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       }
       if (!deleted) {
         await auditFailure("memory_delete_denied", {
-          phase: "outcome",
           denial_class: "not_found",
           passage_id: passageId,
         });
         return toolResult({ deleted: false, found: false });
       }
-      await auditSuccess("memory_delete", { phase: "outcome", passage_id: passageId });
       return toolResult({ deleted: true });
     },
   };
