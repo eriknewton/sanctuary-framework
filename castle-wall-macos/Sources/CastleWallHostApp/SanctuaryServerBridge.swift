@@ -16,10 +16,37 @@ final class SanctuaryServerBridge: ObservableObject {
     private let dashboardPort: Int = 3501
 
     init() {
-        resolveSanctuaryBinary()
+        // Resolve the CLI OFF the calling thread. Resolution probes candidate
+        // paths and may spawn a login shell (`resolveViaLoginShell` ->
+        // `Process.waitUntilExit`), which pumps a nested run loop. Doing that
+        // synchronously here is fatal (#596): SwiftUI constructs this
+        // @StateObject DURING AttributeGraph evaluation (window restoration at
+        // login), so a nested main-thread run loop delivers a queued
+        // screen-parameters notification that re-enters AttributeGraph
+        // mid-update -> AG precondition abort (the crash had zero app frames,
+        // entirely inside SwiftUI's implicit screen-params delegate). Resolving
+        // on a background queue keeps init non-blocking, so no run loop is
+        // pumped on the main thread during view construction.
+        resolveSanctuaryBinaryAsync()
     }
 
     // MARK: - Binary resolution
+
+    /// Resolve the `sanctuary` CLI off the main thread, then publish the result
+    /// on the main actor. Unlike `resolveSanctuaryBinary()` this never blocks or
+    /// pumps a run loop on the calling thread, so it is safe to invoke during
+    /// SwiftUI view construction (see `init`, #596 boot/login crash).
+    func resolveSanctuaryBinaryAsync() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let resolved = Self.resolveSanctuaryBinary(
+                candidates: Self.candidateSanctuaryPaths(),
+                isValidBinary: Self.isOwnerTrustedExecutable
+            )
+            DispatchQueue.main.async {
+                self?.sanctuaryPath = resolved
+            }
+        }
+    }
 
     /// Resolve the `sanctuary` CLI binary.
     ///
