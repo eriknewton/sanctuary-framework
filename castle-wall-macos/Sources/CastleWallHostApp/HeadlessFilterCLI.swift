@@ -318,31 +318,45 @@ enum HeadlessFilterCLI {
         case timedOut
     }
 
-    /// Block the calling thread on an NEFilterManager completion handler.
-    /// Safe here because headless mode runs no main run loop the callback
-    /// could depend on (NE completion handlers arrive on an internal queue).
+    /// Wait for an NEFilterManager completion handler while keeping the calling
+    /// (main) run loop live.
+    ///
+    /// W7-1 (2026-06-17): a bare `DispatchSemaphore.wait` parks this thread and
+    /// services nothing, so a completion handler that Tahoe delivers to the MAIN
+    /// queue/run loop can never fire — the thread that must drain the callback is
+    /// the thread parked on the semaphore. That self-deadlock produced the
+    /// deterministic 30s `loadFromPreferences timed out` on Mini1's first arm.
+    ///
+    /// Spinning a bounded `RunLoop.current.run(mode:before:)` instead keeps the
+    /// run loop draining, so a main-queue-delivered handler executes and the
+    /// wedge disappears. It cannot self-deadlock, preserves the exact return
+    /// contract (`.timedOut` at the deadline, `.completed(error)` on completion)
+    /// and the `timeoutSeconds` bound, and is behavior-identical on the fast
+    /// path: an internal-queue delivery flips the flag and exits immediately.
     private static func waitFor(
         _ timeoutSeconds: Double,
         _ body: (@escaping (Error?) -> Void) -> Void
     ) -> SyncResult {
-        let semaphore = DispatchSemaphore(value: 0)
         let captured = LockedErrorBox()
+        let done = LockedFlag()
         body { error in
             captured.store(error)
-            semaphore.signal()
+            done.set()
         }
-        switch semaphore.wait(timeout: .now() + timeoutSeconds) {
-        case .success:
-            return .completed(captured.load())
-        case .timedOut:
-            return .timedOut
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !done.isSet() {
+            if Date() >= deadline {
+                return .timedOut
+            }
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
+        return .completed(captured.load())
     }
 }
 
 /// Minimal lock-guarded box so the completion-handler write and the post-wait
-/// read are formally synchronized (the semaphore already orders them, but the
-/// box keeps the Sendable checker satisfied without @unchecked on CLI state).
+/// read are formally synchronized (the run-loop spin orders them, but the box
+/// keeps the Sendable checker satisfied without @unchecked on CLI state).
 private final class LockedErrorBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Error?
@@ -357,5 +371,26 @@ private final class LockedErrorBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return value
+    }
+}
+
+/// Lock-guarded completion flag set on the NE completion handler's thread and
+/// polled by the run-loop wait spin (W7-1, 2026-06-17). NSLock-guarded so the
+/// cross-thread set/read is formally synchronized without `@unchecked` leaking
+/// onto a bare `Bool`.
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func set() {
+        lock.lock()
+        flag = true
+        lock.unlock()
+    }
+
+    func isSet() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
     }
 }
