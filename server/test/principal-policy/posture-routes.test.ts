@@ -104,7 +104,7 @@ describe("posture route layer", () => {
     expect(body).toContain("/api/posture/home");
   });
 
-  it("composes the home payload (G1+G2+G4 + protected count)", async () => {
+  it("composes the home payload (G1+G2+G4 + honest protection split)", async () => {
     const log = newLog();
     const now = Date.now();
     await log.appendCritical({
@@ -119,7 +119,16 @@ describe("posture route layer", () => {
     const res = await fetch(`${base}${POSTURE_API_PREFIX}/home`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.protected_agent_count).toBe(1);
+    // #634 honest split: an active agent is "protection requested" (policy
+    // intent), but enforcement is NOT confirmed per-agent, so the confirmed
+    // count is 0 and the agent row never claims green enforcement even though
+    // the machine-level wall is armed.
+    expect(body.protection_requested_count).toBe(1);
+    expect(body.enforcement_confirmed_count).toBe(0);
+    expect(body.protected_agent_count).toBeUndefined();
+    expect(body.agents).toHaveLength(1);
+    expect(body.agents[0].policy_protected).toBe(true);
+    expect(body.agents[0].enforcement_active).toBe("unknown");
     expect(body.castle_wall.arm_state).toBe("armed");
     expect(body.unwrapped.unwrapped[0].harness).toBe("cursor");
     expect(body.digest.kernel_allows).toBe(1);

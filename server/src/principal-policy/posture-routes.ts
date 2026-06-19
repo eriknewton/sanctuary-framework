@@ -32,6 +32,7 @@ import {
   buildAuditDigest,
   buildUnwrappedRoster,
   buildAgentReach,
+  buildPostureAgentRows,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -39,6 +40,7 @@ import {
   type AuditDigest,
   type UnwrappedRoster,
   type AgentEffectiveReach,
+  type PostureAgentRow,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -305,10 +307,25 @@ export interface PostureHome {
   unwrapped: UnwrappedRoster;
   /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
   feature_health: FeatureHealthPanel;
-  /** Protected-agent count for the banner. */
-  protected_agent_count: number;
-  /** Wrapped-agent roster (the green cards). */
-  agents: LocalAgentRecord[];
+  /**
+   * Count of agents the operator has REQUESTED protection for (policy intent).
+   * This is the honest banner number: it counts policy_protected, NOT confirmed
+   * enforcement. Renamed in intent from the old flat "protected" count, which
+   * implied enforcement it could not prove (#634 fake-green fix).
+   */
+  protection_requested_count: number;
+  /**
+   * Count of agents with CONFIRMED live enforcement (`enforcement_active ===
+   * "active"`). `0` today: no per-agent enforcement signal exists yet, so the
+   * banner never overstates confirmed enforcement.
+   */
+  enforcement_confirmed_count: number;
+  /**
+   * Derived agent rows carrying the honest policy-vs-enforcement split (#634).
+   * Replaces the raw `LocalAgentRecord[]`: the UI must render green only on
+   * confirmed enforcement, amber on policy-only protection.
+   */
+  agents: PostureAgentRow[];
 }
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
@@ -318,14 +335,27 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     buildUnwrapped(deps),
     buildFeatureHealth(deps),
   ]);
-  const agents = deps.listAgents();
+  // Derive the honest agent rows from the roster ALONE. Deliberately not passed
+  // the wall posture: there is no path by which the machine-level arm-state can
+  // leak into a per-agent enforcement claim (the #634 fake-green).
+  const agents = buildPostureAgentRows({
+    originMachine: deps.originMachine,
+    records: deps.listAgents(),
+  });
+  const protectionRequestedCount = agents.filter(
+    (a) => a.policy_protected,
+  ).length;
+  const enforcementConfirmedCount = agents.filter(
+    (a) => a.enforcement_active === "active",
+  ).length;
   return {
     origin_machine: deps.originMachine,
     castle_wall: castleWall,
     digest,
     unwrapped,
     feature_health: featureHealth,
-    protected_agent_count: agents.length,
+    protection_requested_count: protectionRequestedCount,
+    enforcement_confirmed_count: enforcementConfirmedCount,
     agents,
   };
 }

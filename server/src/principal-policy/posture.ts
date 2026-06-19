@@ -772,6 +772,94 @@ export async function buildAuditDigest(
   };
 }
 
+// ── Posture agent rows (honest policy-vs-enforcement split, #634) ─────
+
+/**
+ * Per-agent enforcement state for the Home agent grid. Mirrors the
+ * `EnforcementActive` tri-state from `v1/agents.ts`:
+ *
+ *   - `"active"`:   protection observed live AND enforcing for THIS agent
+ *                   (requires a real per-agent enforcement signal — none exists
+ *                   in this read path today, so it is never emitted here).
+ *   - `"inactive"`: protection observed NOT enforcing for this agent (likewise
+ *                   needs a per-agent signal; never emitted today).
+ *   - `"unknown"`:  no per-agent live enforcement signal available (the only
+ *                   value emitted today).
+ *
+ * HONESTY CONTRACT (the #634 fake-green fix): `enforcement_active` is
+ * deliberately NOT derived from the machine-level Castle Wall arm-state. The
+ * wall posture is machine-scoped; a machine that is `armed` proves the wall
+ * adjudicated SOME flow recently, not that it is enforcing THIS agent's policy.
+ * Inheriting the machine arm-state per agent would reintroduce exactly the
+ * overclaim #634 was merged to eliminate. Until a real per-agent enforcement
+ * probe lands we emit `"unknown"` rather than fabricate a green per-agent value.
+ */
+export type AgentEnforcementActive = "active" | "inactive" | "unknown";
+
+/**
+ * A single Home agent-grid row, carrying the honest policy-vs-enforcement split
+ * instead of a flat `protected` boolean. The UI renders GREEN only when
+ * `enforcement_active === "active"`; a `policy_protected`-only agent renders
+ * amber ("protection requested"), never green.
+ */
+export interface PostureAgentRow {
+  origin_machine: string;
+  agent_id: string;
+  harness: string;
+  /** Current lifecycle status as surfaced by the hub registry. */
+  status: string;
+  /**
+   * Policy intent: the operator REQUESTED protection and the agent is present
+   * in the wrapped roster (not mid-teardown). Computable now from the stored
+   * status. NOT a liveness or enforcement claim.
+   */
+  policy_protected: boolean;
+  /**
+   * Whether protection is observed live + enforcing for this agent. `"unknown"`
+   * for every agent today (no per-agent enforcement signal exists). Never the
+   * machine-level wall arm-state.
+   */
+  enforcement_active: AgentEnforcementActive;
+}
+
+export interface BuildPostureAgentRowsInput {
+  originMachine: string;
+  /** Wrapped agents from the hub registry. */
+  records: LocalAgentRecord[];
+}
+
+/**
+ * Derive the Home agent-grid rows with the honest #634 split.
+ *
+ * `policy_protected` mirrors the canonical mapping in `v1/agents.ts`
+ * (`toAgentSummary`): an agent is policy-protected when its status is not
+ * `unwrapping` (the operator's protection request stands until an explicit
+ * unwrap completes). `enforcement_active` is `"unknown"` for every agent
+ * because no per-agent live enforcement signal exists in this read path; it is
+ * NOT inherited from the machine-level Castle Wall arm-state (that inheritance
+ * is the fake-green this fix removes).
+ *
+ * Pure over its inputs (no I/O, no machine-arm bleed-through) so it unit-tests
+ * without a live server. Takes only the roster: deliberately accepts no wall
+ * posture, so there is no path by which a machine-level signal could leak into
+ * a per-agent enforcement claim.
+ */
+export function buildPostureAgentRows(
+  input: BuildPostureAgentRowsInput,
+): PostureAgentRow[] {
+  return input.records.map((record) => ({
+    origin_machine: input.originMachine,
+    agent_id: record.agent_id,
+    harness: record.harness,
+    status: record.status,
+    // Mirror v1/agents.ts:toAgentSummary — policy intent, not liveness.
+    policy_protected: record.status !== "unwrapping",
+    // No per-agent live enforcement signal exists yet; never fabricate one and
+    // never inherit the machine-level wall arm-state (the #634 fake-green).
+    enforcement_active: "unknown",
+  }));
+}
+
 // ── G1: detected-but-unwrapped agent roster ──────────────────────────
 
 /**
