@@ -357,8 +357,7 @@ async function buildQueryPrivacy(
   deps: PostureRouteDeps,
   featureHealth: FeatureHealthPanel,
 ): Promise<QueryPrivacySection> {
-  let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null =
-    null;
+  let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null;
   try {
     const computed = await computeQueryAnonymityStats({
       auditLog: deps.auditLog as AuditLog,
