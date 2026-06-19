@@ -13,6 +13,10 @@
 
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
+import {
+  ACTIVE_LIVENESS_STALENESS_MS,
+  effectiveLivenessStatus,
+} from "../../contracts/v1.1/liveness.js";
 
 /** UI presence glyph value space. Stable enum the CSS layer keys against. */
 export type UiPresenceGlyph = "online" | "idle" | "offline" | "away" | "unknown";
@@ -51,6 +55,24 @@ export const STATUS_MAPPING: Record<HubAgentStatus, UiStatusEntry> = {
  */
 export function resolveStatus(status: HubAgentStatus): UiStatusEntry {
   return STATUS_MAPPING[status] ?? STATUS_MAPPING.unknown;
+}
+
+// Liveness-staleness aging is defined once in the contracts layer (the hub
+// read-projection ages the status it serves; this module renders it). Re-export
+// so dashboard-side callers and tests have a single import surface.
+export { ACTIVE_LIVENESS_STALENESS_MS, effectiveLivenessStatus };
+
+/**
+ * Liveness-aware variant of {@link resolveStatus}: ages a stale `active` agent
+ * to the `unknown` label + glyph before mapping, so the fleet view never shows
+ * "Running / online" for an agent we have not heard from recently.
+ */
+export function resolveStatusWithLiveness(
+  status: HubAgentStatus,
+  lastActivityAt: string | null | undefined,
+  now: number = Date.now(),
+): UiStatusEntry {
+  return resolveStatus(effectiveLivenessStatus(status, lastActivityAt, now));
 }
 
 /**

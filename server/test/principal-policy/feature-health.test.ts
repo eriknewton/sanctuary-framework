@@ -11,6 +11,7 @@ import {
   type FeatureHealthRow,
   type FeatureRegistryEntry,
 } from "../../src/principal-policy/feature-health.js";
+import { CASTLE_WALL_ENFORCEMENT_OPERATIONS } from "../../src/principal-policy/posture.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
 
 const FORTRESS = "fortress:test";
@@ -79,6 +80,20 @@ describe("feature-health registry — integrity invariants", () => {
     expect(CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS.has("egress_allowed")).toBe(
       true,
     );
+  });
+
+  it("both readers share ONE live-adjudication set (drift guard: the banner and panel cannot diverge)", () => {
+    // The honesty-seam fix collapsed the two formerly-separate sets into one
+    // frozen object. If a future change re-forks them, this fails loudly.
+    expect(CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS).toBe(
+      CASTLE_WALL_ENFORCEMENT_OPERATIONS,
+    );
+    expect([...CASTLE_WALL_ENFORCEMENT_OPERATIONS].sort()).toEqual([
+      "egress_allowed",
+      "egress_blocked",
+      "operator_decision",
+    ]);
+    expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has("policy_loaded")).toBe(false);
   });
 
   it("the plugin_failure_surge fault class is DORMANT (no #508 S4 producer yet)", () => {
@@ -505,5 +520,98 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     // Behavior asserted explicitly so the boundary is visible and deliberate,
     // never an unexamined gap: a correctly-marked fresh entry renders green.
     expect(row(panel, "castle_wall_egress").status).toBe("active");
+  });
+});
+
+describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the always-on feature that actually fires)", () => {
+  // Context: the registry's only OTHER privacy row (`privacy_strips`) counts the
+  // Tier B PII-rewrite op, which is NOT wired into the live selector path, so it
+  // can only ever read `unconfirmed`. The Tier A header strip, by contrast, fires
+  // `query_anonymity_headers_stripped` on EVERY outbound substrate call. Before
+  // this slice the panel ignored the privacy feature that runs and counted one
+  // that does not - a lying-by-omission. These cases lock the honest behavior in.
+
+  it("the header_strip row exists, is event-driven, and keys on the op that actually fires (NOT pii_rewritten)", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    const hs = row(panel, "header_strip");
+    expect(hs.liveness).toBe("event_driven");
+    // Keys on the always-on event, never the never-firing pii_rewritten op.
+    const entry = SLICE1_FEATURE_REGISTRY.find((f) => f.id === "header_strip");
+    expect(entry?.invocationOps.has("query_anonymity_headers_stripped")).toBe(
+      true,
+    );
+    expect(entry?.invocationOps.has("query_anonymity_pii_rewritten")).toBe(false);
+  });
+
+  it("HONESTY: the label describes metadata/header stripping and never claims anonymity or privacy guarantees", () => {
+    const entry = SLICE1_FEATURE_REGISTRY.find((f) => f.id === "header_strip");
+    expect(entry).toBeDefined();
+    const label = entry!.label.toLowerCase();
+    // Must name what it is: header / metadata stripping.
+    expect(label).toMatch(/header|metadata/);
+    // Must NOT overclaim. Header stripping is metadata hygiene; the provider
+    // still sees the query content and the API key (Phase 2 design §2.1 C).
+    expect(label).not.toContain("anonym");
+    expect(label).not.toContain("private");
+    expect(label).not.toMatch(/\bprivacy\b.*guarantee|guarantee.*privacy/);
+  });
+
+  it("a window with real header-strip evidence renders the row ACTIVE/green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l2",
+      operation: "query_anonymity_headers_stripped",
+      identity_id: FORTRESS,
+      result: "success",
+      details: { stripped_count: 22 },
+      timestamp: new Date(now - 5 * 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    const hs = row(panel, "header_strip");
+    expect(hs.status).toBe("active");
+    expect(hs.basis).toBe("activity_in_window");
+    expect(hs.invocation_count).toBe(1);
+  });
+
+  it("a QUIET window renders the row UNCONFIRMED (amber), never a fake green", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    const hs = row(panel, "header_strip");
+    // Broken-zero is undetectable for an event-driven feature: absence of calls
+    // is NOT evidence of health, so it stays non-green.
+    expect(hs.status).toBe("unconfirmed");
+    expect(hs.basis).toBe("no_activity_event_driven");
+    expect(hs.status).not.toBe("active");
+    expect(hs.broken_zero_detectable).toBe(false);
+  });
+
+  it("a tainted audit read forces the row to UNKNOWN, never green", async () => {
+    const throwingLog = {
+      query: async () => {
+        throw new Error("storage unavailable");
+      },
+    } as unknown as AuditLog;
+    const panel = await buildFeatureHealthPanel({
+      auditLog: throwingLog,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    const hs = row(panel, "header_strip");
+    expect(hs.status).toBe("unknown");
+    expect(hs.basis).toBe("integrity_tainted");
   });
 });

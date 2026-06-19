@@ -306,8 +306,10 @@ describe("ProxyRouter", () => {
       );
     });
 
-    it("proceeds with original args when context gate throws", async () => {
-      const contextGateFilter = vi.fn().mockRejectedValue(new Error("gate error"));
+    it("FAILS CLOSED when context gate throws (audit S1): never forwards original args, audits gate error, denies", async () => {
+      const contextGateFilter = vi
+        .fn()
+        .mockRejectedValue(new Error("gate error: malformed policy"));
 
       router = new ProxyRouter(
         mockClientManager as any,
@@ -318,14 +320,29 @@ describe("ProxyRouter", () => {
 
       const tools = router.getProxiedTools();
       const handler = tools[0]!.handler;
-      await handler({ original: "data" });
+      const result = await handler({ original: "data" });
 
-      // Should fall back to original args
-      expect(mockClientManager.callTool).toHaveBeenCalledWith(
-        "test-server",
-        "list_files",
-        { original: "data" }
+      // MUST NOT forward the original (unredacted) args upstream on a gate error.
+      expect(mockClientManager.callTool).not.toHaveBeenCalled();
+
+      // Records a critical gate-error denial in the audit trail (raw error
+      // preserved operator-side), not a silent success.
+      expect(mockAuditLog.appendCritical).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: "proxy_context_gate_error:proxy/test-server/list_files",
+          result: "failure",
+          details: expect.objectContaining({
+            decision: "denied",
+            reason: "context_gate_filter_error",
+            error: expect.stringContaining("gate error"),
+          }),
+        })
       );
+
+      // Generic denial to the caller; raw error never leaked into the response.
+      const parsed = JSON.parse((result as any).content[0].text);
+      expect(parsed.error).toBe("Operation not permitted");
+      expect(JSON.stringify(parsed)).not.toContain("malformed policy");
     });
 
     it("blocks when governor denies (rate exceeded)", async () => {

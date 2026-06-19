@@ -58,33 +58,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Castle Wall audit operations that constitute ENFORCEMENT EVIDENCE — i.e.
+ * Castle Wall audit operations that constitute ENFORCEMENT EVIDENCE, i.e.
  * events that could only have been emitted by the enforcing extension/daemon
- * acting on a real flow or policy. These are written to the encrypted audit
- * log with `layer: "l1"` and `operation === <CastleWallEventType>` by
- * `castle-wall/runtime/audit-consumer.ts`.
+ * acting on a real flow or operator decision. These are written to the
+ * encrypted audit log with `layer: "l1"` and `operation === <CastleWallEventType>`
+ * by `castle-wall/runtime/audit-consumer.ts`.
  *
  * `egress_allowed` / `egress_blocked` / `operator_decision` prove the filter
- * adjudicated live traffic. `policy_loaded` proves the extension accepted a
- * manifest. We deliberately EXCLUDE pure lifecycle/diagnostic events
- * (`filter_started`, `filter_stopped`, `filter_crashed`, `provider_unbound`,
- * `no_wall_engaged`, ...) from the "armed" determination: a started filter is
- * not a filtering filter, which is exactly the divergence H3 forbids us from
- * papering over.
+ * adjudicated live traffic. We deliberately EXCLUDE pure lifecycle/diagnostic
+ * events (`filter_started`, `filter_stopped`, `filter_crashed`,
+ * `provider_unbound`, `no_wall_engaged`, ...) from the "armed" determination: a
+ * started filter is not a filtering filter, which is exactly the divergence H3
+ * forbids us from papering over.
  *
- * SLICE R BOUNDARY (disclosed, deliberately not changed here): `policy_loaded`
- * is NOT per-event-signed enforcement evidence — it attests "a manifest was
- * accepted," not "the wall is live-adjudicating now." Under Slice R, when a
- * pinned producer key IS configured, a `policy_loaded` entry re-verifies as
- * channel-basis and therefore does NOT arm (only re-verified producer-signed
- * live-adjudication evidence does). On the NO-KEY path (macOS today /
- * pre-provision), `policy_loaded` can still arm on the CHANNEL basis — this is
- * the pre-existing shipped `posture.ts` behavior and is honestly surfaced as
- * `producer_authenticity: "channel_authenticated"`, never as per-event
- * authenticity. Narrowing the no-key arm set (to mirror feature-health's
- * stricter `CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS`, which already excludes
- * `policy_loaded`) is a macOS-channel-floor change outside this slice's scope;
- * Slice M closes per-event authenticity on macOS.
+ * `policy_loaded` is also EXCLUDED, on EVERY basis (no-key/channel and
+ * key-present/producer-signed). It attests only "a manifest was accepted once,"
+ * not "the wall is live-adjudicating now," so by itself it must never render the
+ * banner green. A wall that loaded a policy but has adjudicated zero flows in
+ * the freshness window renders `unknown` (amber), never `armed`. This is the
+ * never-overclaim invariant applied to the no-key floor: previously a
+ * `policy_loaded`-only wall armed on the channel basis (the now-closed
+ * "SLICE R BOUNDARY" seam), which contradicted the sibling reader
+ * `feature-health.ts:CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS`. Both readers now
+ * consume THIS single frozen set as their one definition of live adjudication
+ * (feature-health imports it as an alias), so no second, more-permissive color
+ * model can drift back in. The write-side gate
+ * (`castle-wall/runtime/audit-consumer.ts:ENFORCEMENT_EVIDENCE_EVENT_TYPES`,
+ * i.e. which events REQUIRE a producer signature) is the same concept typed over
+ * the event-type enum; it is kept in lockstep by a drift-guard test rather than
+ * a shared object, since the two modules are deliberately not import-coupled
+ * across the read/write boundary. (`policy_loaded` remains a recorded lifecycle
+ * event in the audit vocabulary; only its eligibility to ARM the posture reader
+ * is removed.) Slice M closes per-event authenticity on macOS; this slice closes
+ * the no-key arm-set honesty residual.
  */
 export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
   Object.freeze(
@@ -92,7 +98,6 @@ export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
       "egress_allowed",
       "egress_blocked",
       "operator_decision",
-      "policy_loaded",
     ]),
   );
 
@@ -229,7 +234,8 @@ export interface BuildCastleWallPostureInput {
  * The arm-state determination is intentionally conservative:
  *
  *   armed     ← at least one enforcement-evidence operation
- *               (egress_allowed/blocked, operator_decision, policy_loaded)
+ *               (egress_allowed/blocked, operator_decision; NOT policy_loaded,
+ *               which proves only manifest-acceptance, not live adjudication)
  *               appears within the freshness window.
  *   degraded  ← no fresh enforcement evidence, but a fresh "not enforcing"
  *               event (filter_crashed, provider_unbound, no_wall_engaged,
@@ -349,8 +355,9 @@ export async function buildCastleWallPosture(
     // unsigned enforcement evidence. So a key-bearing reader counts an
     // arm-eligible Castle Wall entry ONLY if it re-verifies as
     // `producer_signed_verified`; a `channel_authenticated`/absent-basis entry
-    // (including a forged marker-only entry, or a `policy_loaded` entry the
-    // daemon does not sign) does NOT count — fail closed (codex HIGH #1/#2).
+    // (including a forged marker-only entry) does NOT count, fail closed (codex
+    // HIGH #1/#2). (`policy_loaded` is excluded from arm-eligibility upstream on
+    // EVERY basis, so it never reaches this count regardless of the key state.)
     // When NO key is configured, the channel basis counts (the honest legacy /
     // macOS floor).
     const keyPresent = pinnedProducerKey !== null;
@@ -762,6 +769,365 @@ export async function buildAuditDigest(
     by_agent: byAgent,
     chain_verified: integrityFindings.length === 0,
     integrity_finding_count: integrityFindings.length,
+  };
+}
+
+// ── Posture agent rows (honest policy-vs-enforcement split, #634) ─────
+
+/**
+ * Per-agent enforcement state for the Home agent grid. Mirrors the
+ * `EnforcementActive` tri-state from `v1/agents.ts`:
+ *
+ *   - `"active"`:   protection observed live AND enforcing for THIS agent
+ *                   (requires a real per-agent enforcement signal — none exists
+ *                   in this read path today, so it is never emitted here).
+ *   - `"inactive"`: protection observed NOT enforcing for this agent (likewise
+ *                   needs a per-agent signal; never emitted today).
+ *   - `"unknown"`:  no per-agent live enforcement signal available (the only
+ *                   value emitted today).
+ *
+ * HONESTY CONTRACT (the #634 fake-green fix): `enforcement_active` is
+ * deliberately NOT derived from the machine-level Castle Wall arm-state. The
+ * wall posture is machine-scoped; a machine that is `armed` proves the wall
+ * adjudicated SOME flow recently, not that it is enforcing THIS agent's policy.
+ * Inheriting the machine arm-state per agent would reintroduce exactly the
+ * overclaim #634 was merged to eliminate. Until a real per-agent enforcement
+ * probe lands we emit `"unknown"` rather than fabricate a green per-agent value.
+ */
+export type AgentEnforcementActive = "active" | "inactive" | "unknown";
+
+/**
+ * A single Home agent-grid row, carrying the honest policy-vs-enforcement split
+ * instead of a flat `protected` boolean. The UI renders GREEN only when
+ * `enforcement_active === "active"`; a `policy_protected`-only agent renders
+ * amber ("protection requested"), never green.
+ */
+export interface PostureAgentRow {
+  origin_machine: string;
+  agent_id: string;
+  harness: string;
+  /** Current lifecycle status as surfaced by the hub registry. */
+  status: string;
+  /**
+   * Policy intent: the operator REQUESTED protection and the agent is present
+   * in the wrapped roster (not mid-teardown). Computable now from the stored
+   * status. NOT a liveness or enforcement claim.
+   */
+  policy_protected: boolean;
+  /**
+   * Whether protection is observed live + enforcing for this agent. `"unknown"`
+   * for every agent today (no per-agent enforcement signal exists). Never the
+   * machine-level wall arm-state.
+   */
+  enforcement_active: AgentEnforcementActive;
+}
+
+export interface BuildPostureAgentRowsInput {
+  originMachine: string;
+  /** Wrapped agents from the hub registry. */
+  records: LocalAgentRecord[];
+}
+
+/**
+ * Derive the Home agent-grid rows with the honest #634 split.
+ *
+ * `policy_protected` mirrors the canonical mapping in `v1/agents.ts`
+ * (`toAgentSummary`): an agent is policy-protected when its status is not
+ * `unwrapping` (the operator's protection request stands until an explicit
+ * unwrap completes). `enforcement_active` is `"unknown"` for every agent
+ * because no per-agent live enforcement signal exists in this read path; it is
+ * NOT inherited from the machine-level Castle Wall arm-state (that inheritance
+ * is the fake-green this fix removes).
+ *
+ * Pure over its inputs (no I/O, no machine-arm bleed-through) so it unit-tests
+ * without a live server. Takes only the roster: deliberately accepts no wall
+ * posture, so there is no path by which a machine-level signal could leak into
+ * a per-agent enforcement claim.
+ */
+export function buildPostureAgentRows(
+  input: BuildPostureAgentRowsInput,
+): PostureAgentRow[] {
+  return input.records.map((record) => ({
+    origin_machine: input.originMachine,
+    agent_id: record.agent_id,
+    harness: record.harness,
+    status: record.status,
+    // Mirror v1/agents.ts:toAgentSummary — policy intent, not liveness.
+    policy_protected: record.status !== "unwrapping",
+    // No per-agent live enforcement signal exists yet; never fabricate one and
+    // never inherit the machine-level wall arm-state (the #634 fake-green).
+    enforcement_active: "unknown",
+  }));
+}
+
+// ── Custody & Exit panel (Slice 3 — the Custody + Exit principles) ────
+
+/**
+ * Audit operations that constitute negative CUSTODY evidence — they prove the
+ * fortress's key-custody chain is damaged or under suspected attack, so the
+ * custody tile must render RED/amber, never green. These are written to the
+ * encrypted audit log at boot / by the anti-rollback + master-rotation paths:
+ *
+ *  - `castle_pin_custody_mismatch` (core/index.ts): the Castle Wall pinned
+ *    private key does NOT decrypt under the established master — the dual-path
+ *    damage signature from the 2026-06-12 incident.
+ *  - `custody_rollback_suspected` (core/anti-rollback.ts): a suspected custody
+ *    rollback has FROZEN trust-bearing writes (on-disk epoch older than a
+ *    surviving witness). The fortress is in the freeze state until an audited
+ *    `restore-attest`.
+ *
+ * A FRESH instance of either inside the freshness window forces the custody
+ * tile out of green. Anything else (no negative evidence) is NOT proof of
+ * health — custody establishment is a boot-time fact the dashboard cannot
+ * re-derive without the transient master — so the tile renders amber
+ * "unconfirmed", never a fabricated green (#617 honesty contract).
+ */
+export const CUSTODY_DAMAGE_OPERATIONS: ReadonlySet<string> = Object.freeze(
+  new Set<string>(["castle_pin_custody_mismatch", "custody_rollback_suspected"]),
+);
+
+/**
+ * Audit operations that prove a custody establishment / continuity event
+ * happened — they are POSITIVE provenance the dashboard can honestly surface
+ * (install mode, verified-factor count) but they are NOT a freshness or
+ * health proof on their own. They let the panel show "custody established"
+ * provenance without claiming the chain is currently healthy.
+ */
+export const CUSTODY_ESTABLISHMENT_OPERATIONS: ReadonlySet<string> =
+  Object.freeze(
+    new Set<string>([
+      "custody_envelope_created",
+      "custody_legacy_migrated",
+      "custody_master_rotated",
+      "custody_restore_attested",
+    ]),
+  );
+
+/**
+ * The custody-posture verdict. `unconfirmed` is the honest default and renders
+ * amber — the dashboard cannot prove custody HEALTH from in-process state (the
+ * master that would re-derive the envelope MAC / two-factor floor / pin custody
+ * is transient and not held at request time), so it never renders green.
+ * `damaged` (RED) is the ONLY non-amber state and is earned solely by fresh
+ * negative evidence (pin-custody mismatch or a suspected rollback freeze).
+ */
+export type CustodyState = "damaged" | "unconfirmed";
+
+/**
+ * Exit / portability posture. Honestly labeled per the 2026-06-18 delta review:
+ * the exit machinery exists as a Tier-1-gated CLI command (`sanctuary exit`),
+ * but the FULL clean-exit guarantee is NOT yet earned (Slice 1 of exit shipped
+ * memory-class minting + consent only). So the panel reports `export_available`
+ * — a true capability statement — and never claims `clean_exit_guaranteed`.
+ */
+export type ExitState = "export_available";
+
+export interface CustodyExitPanel {
+  origin_machine: string;
+  /** Custody chain posture (never green; amber unconfirmed or red damaged). */
+  custody_state: CustodyState;
+  /** Stable basis enum the UI renders human copy from; never leaks internals. */
+  custody_basis:
+    | "fresh_custody_damage_evidence"
+    | "rollback_freeze_active"
+    | "integrity_tainted"
+    | "no_negative_evidence_unconfirmed";
+  /** True when a suspected-rollback freeze is fresh in the window. */
+  rollback_freeze_suspected: boolean;
+  /** True when a fresh Castle Wall pin-custody mismatch was observed. */
+  pin_custody_mismatch: boolean;
+  /**
+   * Custody establishment provenance, when a fresh-enough establishment event
+   * is on the audit chain. Null when none is in the window — the dashboard does
+   * NOT claim "established" from absence. Provenance only; never a health claim.
+   */
+  establishment: {
+    operation: string;
+    install_mode: string | null;
+    verified_wraps: number | null;
+    observed_at: string;
+  } | null;
+  /** ISO8601 of the most recent custody-damage event, if any. */
+  last_damage_evidence_at: string | null;
+  /** Freshness window (ms) used to judge "recent" custody evidence. */
+  freshness_window_ms: number;
+  /** True when an integrity finding tainted the audit read backing this. */
+  audit_integrity_ok: boolean;
+  /**
+   * Exit / portability posture. Always `export_available` today (the CLI export
+   * exists, Tier-1 gated); the panel surfaces the honest disclaimer that the
+   * full clean-exit guarantee is not yet earned.
+   */
+  exit_state: ExitState;
+  /** The operator-facing command that performs the gated export. */
+  exit_command: string;
+  /**
+   * HONEST: true when the full clean-exit claim is earned. Always false today —
+   * exit Slice 1 shipped memory-class minting + consent, not the full guarantee.
+   */
+  clean_exit_guaranteed: boolean;
+}
+
+export interface BuildCustodyExitPanelInput {
+  auditLog: AuditLog;
+  originMachine: string;
+  now?: number;
+  /** Window over which custody evidence is read (defaults to the digest window). */
+  windowMs?: number;
+  /**
+   * Freshness window for custody-damage evidence (defaults to the enforcement
+   * freshness window). A pin mismatch / rollback freeze older than this is not
+   * treated as a fresh "damaged" signal (the operator may have already
+   * remediated), but it is never silently upgraded to green either.
+   */
+  freshnessWindowMs?: number;
+}
+
+/**
+ * Build the Custody & Exit panel — the Slice-3 surface for the Custody and Exit
+ * principles of sovereignty.
+ *
+ * HONESTY CONTRACT (the #617 lesson, identical to the wall + feature-health
+ * shapers): the custody tile is GREEN never. The facts that would PROVE custody
+ * health — the two-factor floor being met, the envelope MAC verifying, the
+ * anti-rollback epoch matching its witnesses, the pinned key being non-
+ * extractable — are all derived inside `establishMaster` at boot, under the
+ * TRANSIENT master that the dashboard does not hold at request time. So this
+ * read-only shaper does NOT re-derive them and does NOT fabricate a green from
+ * their absence. What it CAN honestly surface, from the audit chain it already
+ * reads:
+ *
+ *  - DAMAGE (red): a fresh `castle_pin_custody_mismatch` or
+ *    `custody_rollback_suspected` proves the custody chain is broken / frozen.
+ *  - PROVENANCE (neutral): a custody establishment event carries the honest
+ *    install mode + verified-factor count, shown as provenance, NOT as health.
+ *  - everything else: amber `unconfirmed` — the honest default.
+ *
+ * A tainted/unreadable audit read fails closed to `unconfirmed` with integrity
+ * flagged (never "no damage, therefore healthy").
+ *
+ * Exit posture is a true capability statement: the Tier-1-gated `sanctuary exit`
+ * export exists, so `export_available` is honest; `clean_exit_guaranteed` is
+ * `false` because the full clean-exit claim is not yet earned (delta review).
+ */
+export async function buildCustodyExitPanel(
+  input: BuildCustodyExitPanelInput,
+): Promise<CustodyExitPanel> {
+  const now = input.now ?? Date.now();
+  const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
+  const freshnessWindowMs =
+    input.freshnessWindowMs ?? DEFAULT_ENFORCEMENT_FRESHNESS_MS;
+  const since = new Date(now - windowMs).toISOString();
+
+  // The honest exit half is constant today; compute once.
+  const exitFields = {
+    exit_state: "export_available" as const,
+    exit_command: "sanctuary exit",
+    clean_exit_guaranteed: false,
+  };
+
+  let entries;
+  let integrityOk: boolean;
+  try {
+    const result = await input.auditLog.query({ since, limit: 50_000 });
+    entries = result.entries;
+    integrityOk = result.integrity_findings.length === 0;
+  } catch {
+    // A failed/tainted read must NOT read as "no damage, therefore fine".
+    // Fail closed to unconfirmed with integrity flagged.
+    return {
+      origin_machine: input.originMachine,
+      custody_state: "unconfirmed",
+      custody_basis: "integrity_tainted",
+      rollback_freeze_suspected: false,
+      pin_custody_mismatch: false,
+      establishment: null,
+      last_damage_evidence_at: null,
+      freshness_window_ms: freshnessWindowMs,
+      audit_integrity_ok: false,
+      ...exitFields,
+    };
+  }
+
+  const freshnessFloor = now - freshnessWindowMs;
+  let latestDamageMs: number | null = null;
+  let rollbackSuspected = false;
+  let pinMismatch = false;
+  let latestEstablishmentMs: number | null = null;
+  let establishment: CustodyExitPanel["establishment"] = null;
+
+  for (const entry of entries) {
+    const ts = Date.parse(entry.timestamp);
+    // Reject future-dated evidence beyond the small skew, exactly like the wall:
+    // a future timestamp must not keep a damage signal "fresh" forever, nor
+    // promote a stale establishment event.
+    const tsValid =
+      !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+    if (!tsValid) continue;
+
+    if (CUSTODY_DAMAGE_OPERATIONS.has(entry.operation)) {
+      if (latestDamageMs === null || ts > latestDamageMs) latestDamageMs = ts;
+      if (ts >= freshnessFloor) {
+        if (entry.operation === "custody_rollback_suspected") {
+          rollbackSuspected = true;
+        } else if (entry.operation === "castle_pin_custody_mismatch") {
+          pinMismatch = true;
+        }
+      }
+      continue;
+    }
+
+    if (CUSTODY_ESTABLISHMENT_OPERATIONS.has(entry.operation)) {
+      if (latestEstablishmentMs === null || ts > latestEstablishmentMs) {
+        latestEstablishmentMs = ts;
+        const details = isRecord(entry.details) ? entry.details : {};
+        const installMode =
+          typeof details.install_mode === "string" ? details.install_mode : null;
+        const verifiedWraps =
+          typeof details.verified_wraps === "number"
+            ? details.verified_wraps
+            : null;
+        establishment = {
+          operation: entry.operation,
+          install_mode: installMode,
+          verified_wraps: verifiedWraps,
+          observed_at: new Date(ts).toISOString(),
+        };
+      }
+    }
+  }
+
+  let custodyState: CustodyState;
+  let custodyBasis: CustodyExitPanel["custody_basis"];
+  if (!integrityOk) {
+    // A tainted audit read can NEVER read as clean custody.
+    custodyState = "unconfirmed";
+    custodyBasis = "integrity_tainted";
+  } else if (rollbackSuspected) {
+    custodyState = "damaged";
+    custodyBasis = "rollback_freeze_active";
+  } else if (pinMismatch) {
+    custodyState = "damaged";
+    custodyBasis = "fresh_custody_damage_evidence";
+  } else {
+    // No fresh negative evidence is NOT proof of health: custody health is a
+    // boot-time fact under the transient master. Honest amber, never green.
+    custodyState = "unconfirmed";
+    custodyBasis = "no_negative_evidence_unconfirmed";
+  }
+
+  return {
+    origin_machine: input.originMachine,
+    custody_state: custodyState,
+    custody_basis: custodyBasis,
+    rollback_freeze_suspected: rollbackSuspected,
+    pin_custody_mismatch: pinMismatch,
+    establishment,
+    last_damage_evidence_at:
+      latestDamageMs !== null ? new Date(latestDamageMs).toISOString() : null,
+    freshness_window_ms: freshnessWindowMs,
+    audit_integrity_ok: integrityOk,
+    ...exitFields,
   };
 }
 

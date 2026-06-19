@@ -89,8 +89,13 @@ describe("InjectionDetector — Outbound Scanner (SEC-035)", () => {
     });
 
     it("detects Slack bot token (xoxb-...)", () => {
-      const prefix = "xoxb";
-      const content = `Slack token is ${prefix}-1234567890-abcdefghijklmnop`;
+      // Synthetic token assembled from fragments so the source carries no
+      // contiguous Slack-token literal for secret scanners to flag (alert #1
+      // was resolved used_in_tests; splitting the xoxb- prefix prevents
+      // recurrence). The runtime value is a well-formed token so the outbound
+      // scanner still detects it.
+      const fakeSlackToken = "xo" + "xb" + "-1234567890-abcdefghijklmnop";
+      const content = `Slack token is ${fakeSlackToken}`;
       const result = detector.scanOutbound(content);
 
       expect(result.flagged).toBe(true);
@@ -152,6 +157,33 @@ describe("InjectionDetector — Outbound Scanner (SEC-035)", () => {
         (s) => s.type === "data_exfiltration" && s.pattern === "markdown_image_exfil"
       );
       expect(signal).toBeDefined();
+    });
+
+    it("does not flag markdown images without sensitive query parameters", () => {
+      const content = "![diagram](https://cdn.example.com/asset.png?size=large&theme=light)";
+      const result = detector.scanOutbound(content);
+
+      expect(
+        result.signals.some(
+          (s) => s.type === "data_exfiltration" && s.pattern === "markdown_image_exfil",
+        ),
+      ).toBe(false);
+    });
+
+    it("does not backtrack on unterminated markdown image URLs", { retry: 3 }, () => {
+      const content = `![tracking](https://attacker.example/${"a".repeat(10000)}`;
+
+      const start = performance.now();
+      const result = detector.scanOutbound(content);
+      const elapsed = performance.now() - start;
+
+      expect(elapsed).toBeLessThan(50);
+      expect(result).toBeDefined();
+      expect(
+        result.signals.some(
+          (s) => s.type === "data_exfiltration" && s.pattern === "markdown_image_exfil",
+        ),
+      ).toBe(false);
     });
   });
 

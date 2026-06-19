@@ -24,7 +24,7 @@ into a private advisory as soon as practical.
 
 Please include, to the extent you can:
 
-- the affected component and version (for example `@sanctuary-framework/mcp-server@1.3.3`, the Castle Wall daemon, or the macOS system extension),
+- the affected component and version (for example `@sanctuary-framework/mcp-server@1.4.0`, the Castle Wall daemon, or the macOS system extension),
 - a description of the vulnerability and its impact,
 - step-by-step reproduction instructions or a proof-of-concept,
 - any relevant logs, configuration, or environment details, and
@@ -54,9 +54,9 @@ reporting an issue you cannot reproduce on it.
 
 | Version | Supported |
 |---|---|
-| `1.3.x` | :white_check_mark: |
-| `1.2.x` | :warning: critical fixes only, best effort |
-| `< 1.2` | :x: |
+| `1.4.x` | :white_check_mark: |
+| `1.3.x` | :warning: critical fixes only, best effort |
+| `< 1.3` | :x: |
 
 The npm `latest` dist-tag is the authoritative pointer to the currently
 supported release. Pre-release (`-rc`) and `next`-tagged builds are not covered

@@ -18,6 +18,9 @@ on:
       - "castle-wall-vmm/**"
       - ".github/workflows/castle-wall-vmm.yml"
 
+permissions:
+  contents: read
+
 jobs:
   castle-wall-vmm:
     # macOS 26 runner required: castle-wall-vmm/Package.swift declares

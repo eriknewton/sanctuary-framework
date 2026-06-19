@@ -49,6 +49,7 @@ const ALLOWLIST: ReadonlyArray<string> = [
   ".githooks",
   ".github",
   ".gitignore",
+  ".gitleaks.toml",
   ".test-baseline",
   ".test-baseline-overrides.log",
   "AGENTS.md",

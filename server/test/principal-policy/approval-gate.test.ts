@@ -221,6 +221,25 @@ describe("Approval Gate", () => {
       expect(result.allowed).toBe(false);
       expect(result.approval_required).toBe(true);
     });
+
+    it("forces memory_delete to Tier 1 even if a hand-built policy lists it as Tier 3", async () => {
+      const policy = createTestPolicy({
+        tier1_always_approve: [],
+        tier3_always_allow: ["memory_delete"],
+      });
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(policy, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("memory_delete", { passage_id: "p1" });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+    });
   });
 
   describe("Tier 2 — behavioral anomaly detection", () => {

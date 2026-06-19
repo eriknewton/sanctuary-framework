@@ -22,6 +22,10 @@ import type { TemplateName } from "../templates/registry.js";
 import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
+
+export { constantTimeEquals };
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -31,6 +35,7 @@ export interface ApprovalHandlers {
 export interface APIDeps {
   sources: AggregatorSources;
   authToken?: string;
+  sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
   /** Register a listener; returns an unsubscribe fn. */
   onEvent?: (listener: (event: StreamEvent) => void) => () => void;
@@ -66,6 +71,16 @@ export interface APIDeps {
   loopbackAutoAuth?: boolean;
 }
 
+export interface DashboardSession {
+  id: string;
+  expiresInSeconds: number;
+}
+
+export interface DashboardSessionStore {
+  create: () => DashboardSession;
+  validate: (id: string) => boolean;
+}
+
 /**
  * SSE event taxonomy.
  *
@@ -83,34 +98,33 @@ export interface StreamEvent {
 }
 
 /**
- * Constant-time token comparison to avoid trivial timing attacks.
- */
-export function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-/**
- * Pull the bearer token from Authorization header or ?token= query.
+ * Pull the bearer token from Authorization header only. Long-lived URL
+ * query tokens are deliberately ignored; SSE uses short-lived sessions.
  */
 export function extractToken(req: IncomingMessage, url: URL): string | null {
   const header = req.headers.authorization;
   if (header && header.startsWith("Bearer ")) {
     return header.slice(7).trim();
   }
-  const q = url.searchParams.get("token");
-  return q ?? null;
+  void url;
+  return null;
 }
 
 export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
   if (!deps.authToken) return true;
   const token = extractToken(req, url);
-  if (!token) return false;
-  return constantTimeEquals(token, deps.authToken);
+  if (token && constantTimeEquals(token, deps.authToken)) return true;
+
+  const sessionId = url.searchParams.get("session");
+  if (sessionId && deps.sessions?.validate(sessionId)) return true;
+
+  return false;
+}
+
+function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  if (!deps.authToken) return true;
+  const token = extractToken(req, url);
+  return token !== null && constantTimeEquals(token, deps.authToken);
 }
 
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
@@ -164,6 +178,36 @@ export async function handleRequest(
   const url = new URL(req.url ?? "/", `http://${host}`);
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
+
+  // ── Session exchange ───────────────────────────────────────────────
+  // Header-only by design: this is the only route that mints URL-carryable
+  // short-lived sessions for EventSource and one-click operator URLs.
+  if (method === "POST" && path === "/auth/session") {
+    if (!deps.authToken) {
+      writeJSON(res, 200, { session_id: "no-auth", expires_in_seconds: 0 });
+      return true;
+    }
+    const token = extractToken(req, url);
+    if (!token || !constantTimeEquals(token, deps.authToken)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    if (!deps.sessions) {
+      writeJSON(res, 503, { error: "sessions_unavailable" });
+      return true;
+    }
+    const session = deps.sessions.create();
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Set-Cookie": `sanctuary_session=${session.id}; Path=/; SameSite=Strict; Max-Age=${session.expiresInSeconds}`,
+    });
+    res.end(JSON.stringify({
+      session_id: session.id,
+      expires_in_seconds: session.expiresInSeconds,
+    }));
+    return true;
+  }
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
   // Try v1.1 routes first when bindings are set. Mounted additively at
@@ -226,6 +270,10 @@ export async function handleRequest(
   // ── Approval decisions ──────────────────────────────────────────────
   const approvalMatch = /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(path);
   if (method === "POST" && approvalMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const id = decodeURIComponent(approvalMatch[1]!);
     const action = approvalMatch[2] as "allow" | "deny";
     if (!deps.approvals) {
@@ -237,7 +285,12 @@ export async function handleRequest(
       const ok = await handler(id);
       writeJSON(res, ok ? 200 : 404, { id, action, ok });
     } catch (err) {
-      writeJSON(res, 500, { error: "approval_failed", message: (err as Error).message });
+      logCaughtError(
+        err,
+        { route: "/api/approvals/:id/:action", operation: action },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "approval_failed" });
     }
     return true;
   }
@@ -254,10 +307,12 @@ export async function handleRequest(
       const templates = listTemplates();
       writeJSON(res, 200, { templates });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates", operation: "list_templates" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -273,10 +328,12 @@ export async function handleRequest(
       }
       writeJSON(res, 200, entry);
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name", operation: "get_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -361,10 +418,12 @@ export async function handleRequest(
         attestation_panel_url: `/console#agent_roster`,
       });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_init_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name/init", operation: "init_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_init_failed" });
     }
     return true;
   }

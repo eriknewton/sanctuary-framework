@@ -1337,8 +1337,11 @@ export function createCognitiveTools(
     {
       name: "state_delete",
       description:
-        "Securely delete state. Overwrites file with random bytes " +
-        "before removal (right to deletion, S1.6).",
+        "Permanently delete state: removes the entry with a best-effort " +
+        "random-byte overwrite before unlinking. On copy-on-write/SSD media " +
+        "the original bytes may survive, so at-rest confidentiality rests on " +
+        "encryption (data is stored as ciphertext), not on the overwrite. " +
+        "Satisfies right-to-deletion (S1.6) by removing the entry.",
       inputSchema: {
         type: "object",
         properties: {

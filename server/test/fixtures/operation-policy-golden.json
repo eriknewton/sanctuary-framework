@@ -15,6 +15,8 @@
     "identity_rotate",
     "identity_sign",
     "lockdown",
+    "memory_delete",
+    "memory_insert",
     "policy_change",
     "principal_baseline_view",
     "principal_policy_view",

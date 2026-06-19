@@ -542,6 +542,54 @@ describe("L2 Context Gate Enforcer", () => {
       // other field is not mentioned in policy, so default action (redact) applies
       expect(parsed.received.other).toBe("[REDACTED]");
     });
+
+    it("MCP-wrapper path UNCHANGED: wrapHandler RETURNS the context_gating_blocked toolResult on a block (must not throw, must not call handler)", async () => {
+      // Regression guard for the block-fail-open fix: the proxy path (filterArgs)
+      // now THROWS on block, but the direct MCP-tool path (wrapHandler) must keep
+      // its designed behavior — RETURN the context_gating_blocked toolResult to
+      // its caller and NEVER invoke the wrapped handler.
+      const policy = await policyStore.create(
+        "block-policy",
+        [
+          {
+            provider: "tool-api",
+            allow: ["task"],
+            redact: [],
+            hash: [],
+            summarize: [],
+          },
+        ],
+        "deny"
+      );
+
+      const config: EnforcerConfig = {
+        enabled: true,
+        default_policy_id: policy.policy_id,
+        bypass_prefixes: [""],
+        log_only: false,
+        on_deny: "block",
+      };
+      const enforcer = new ContextGateEnforcer(policyStore, auditLog, config);
+
+      let handlerCalled = false;
+      const originalHandler: ToolHandler = async (args) => {
+        handlerCalled = true;
+        return toolResult({ received: args });
+      };
+
+      const wrapped = enforcer.wrapHandler("tool/api", originalHandler);
+
+      // api_key is not allowed → deny → on_deny "block".
+      const result = await wrapped({ api_key: "secret", task: "work" });
+
+      // The wrapped handler MUST NOT run (no upstream execution on a block).
+      expect(handlerCalled).toBe(false);
+
+      // The caller receives the context_gating_blocked toolResult (NOT a throw).
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.error).toBe("context_gating_blocked");
+      expect(parsed.denied_fields).toContain("api_key");
+    });
   });
 
   // ── Control Methods ─────────────────────────────────────────────────

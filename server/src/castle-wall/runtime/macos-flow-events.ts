@@ -27,7 +27,11 @@
 
 import type { AllowlistRule } from "../allowlist/schema.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
-import { CASTLE_WALL_AUDIT_LAYER } from "../constants.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+} from "../constants.js";
 import type {
   AuditEmitNotification,
   FlowDecisionRecordedNotification,
@@ -249,6 +253,13 @@ export class MacOSFlowEventConsumer {
         rule_id: notification.matched_rule_id ?? null,
         recorded_at: notification.recorded_at,
         source: "macos_extension",
+        // Provenance marker stamped LAST: this entry is genuine Castle Wall
+        // enforcement evidence, so the honest posture readers (posture.ts G4,
+        // the ARMED banner, the dashboard shield) count it as armed. Without
+        // this, a genuinely-enforcing macOS wall reads amber/"not confirmed"
+        // (the 2026-06-17 under-claim). Stamped last + from constructed fields
+        // only (no untrusted spread), so an inbound forged cw_source cannot win.
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
       "success"
     );

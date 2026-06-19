@@ -1223,6 +1223,10 @@ export async function runWrap(
       serverCount: upstreamServers.length,
       passphraseLocation,
       passphraseSource,
+      // Honest arm outcome: castleWallDaemon is only defined when
+      // startCastleWallForWrap succeeded; on a start failure the catch above
+      // ran warnCastleWallDaemonNotStarted and left it undefined.
+      castleWallArmed: castleWallDaemon !== undefined,
     });
     return;
   }
@@ -1289,6 +1293,39 @@ export async function runWrap(
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+
+      // HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): resolve the
+      // pinned producer key over the SAME canonical storage path the wrap-auto
+      // Castle Wall daemon publishes it to (`<storagePath>/policy/egress/
+      // audit-producer.pub`, via loadFortressProducerKey) and feed it into the
+      // snapshot server's sources. Without this the wrap-auto dashboard read the
+      // wall posture on the bare channel basis, so on a key-bearing host a forged
+      // marker-only audit entry would arm the hero shield green. With the key
+      // present the reader re-verifies the producer signature and a forgery fails
+      // closed to amber, identical to the DashboardApprovalChannel path. `absent`
+      // (macOS / pre-provision) → honest channel basis; `unreadable` (a key is
+      // expected but malformed/locked) → fail honestly to amber via
+      // producerKeyExpectedButUnavailable, never the weaker channel basis.
+      try {
+        const { loadFortressProducerKey } = await import(
+          "../castle-wall/runtime/producer-signature.js"
+        );
+        const producerKeyLoad = await loadFortressProducerKey(storagePath);
+        dashboard.updateSources?.({
+          resolvePinnedProducerKey: () =>
+            producerKeyLoad.status === "present"
+              ? producerKeyLoad.keyB64url
+              : null,
+          ...(producerKeyLoad.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        });
+      } catch {
+        // Never let the producer-key probe fail wrap. On any unexpected throw the
+        // snapshot server keeps its honest default (no producer key → channel
+        // basis); it never silently arms green on a forged entry because the
+        // aggregator's wall reader treats absent-key as the channel floor.
+      }
       // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
       // Linux when the fortress-scoped socket dir requires root, or any
       // platform where the pinned key is unavailable) does not fail wrap.
@@ -1384,9 +1421,9 @@ export async function runWrap(
           masterKey: derived.key,
         }),
       );
-      // The wrap-auto dashboard always binds 127.0.0.1; the operator
-      // already has the bearer token in the auto-opened URL. Loopback
-      // auto-auth keeps the v1.1 client one-click from the URL.
+      // The wrap-auto dashboard always binds 127.0.0.1. The printed URL
+      // carries only a short-lived session; loopback auto-auth keeps the
+      // v1.1 client one-click without putting the bearer token in a URL.
       dashboard.setV11LoopbackAutoAuth(true);
     } catch (err) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1400,7 +1437,7 @@ export async function runWrap(
 
   failIfAnchorOptInDropped();
 
-  const dashboardUrl = `${dashboard.url}?token=${authToken}`;
+  const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
   // Publish runtime state so `sanctuary agents` + the multi-agent
   // dashboard aggregator can find this tenant's actual port. Best-effort:
@@ -1458,6 +1495,8 @@ export async function runWrap(
     passphraseSource,
     intelligenceHealthy,
     intelligenceError,
+    // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
+    castleWallArmed: castleWallDaemon !== undefined,
   });
 }
 
@@ -1544,6 +1583,15 @@ interface WrapSuccessInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /**
+   * Whether the Castle Wall enforcement daemon actually armed during this
+   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
+   * fired and traffic is not being filtered; `undefined` => no arm signal was
+   * threaded into the banner (treated conservatively as not-confirmed, never
+   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
+   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   */
+  castleWallArmed?: boolean;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1577,8 +1625,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
+  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
+  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
+  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
+  // that is the exact overclaim the audit flagged (a green hero printed
+  // seconds after the loud "traffic NOT filtered" warning).
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
@@ -1589,6 +1647,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   }
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Render the Castle Wall segment of the wrap success banner from the real arm
+ * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
+ * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
+ * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ */
+function renderCastleWallBannerLabel(armed: boolean | undefined): string {
+  if (armed === true) return "Castle Wall Full";
+  if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
+  return "Castle Wall status unknown (not confirmed armed)";
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1605,6 +1675,8 @@ interface WrapSuccessNoDashboardInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
+  castleWallArmed?: boolean;
 }
 
 /**
@@ -1639,8 +1711,14 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
+  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;

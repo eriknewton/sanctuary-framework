@@ -8,9 +8,13 @@ import {
   buildAuditDigest,
   buildUnwrappedRoster,
   buildAgentReach,
+  buildPostureAgentRows,
+  buildCustodyExitPanel,
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
 } from "../../src/principal-policy/posture.js";
+import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 
 const FORTRESS = "fortress:test";
 
@@ -169,6 +173,99 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       now,
     });
     expect(posture.arm_state).toBe("unknown");
+  });
+
+  it("does NOT arm on a fresh policy_loaded alone, no key (manifest-accepted is not flow-adjudicated)", async () => {
+    // The honesty fix: a wall that loaded a policy but has adjudicated zero
+    // flows must render amber/unknown, never green. Before the arm-set
+    // narrowing this case armed on the channel basis (the closed SLICE R seam).
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      // No pinnedProducerKeyB64url: the NO-KEY / macOS-floor / channel basis.
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).not.toBe("fresh_enforcement_evidence");
+    expect(posture.producer_authenticity).toBe("not_applicable");
+  });
+
+  it("does NOT arm on a fresh policy_loaded alone, key present (regression guard for the key path)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      // A pinned key is configured: policy_loaded was already not arm-eligible
+      // here via Slice R (it re-verifies as channel basis); assert it stays so
+      // now that it is also dropped at the arm-set gate.
+      pinnedProducerKeyB64url: "anyKeyTriggersTheKeyPresentPath",
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).not.toBe("fresh_enforcement_evidence");
+  });
+
+  it("a fresh egress_allowed still arms even when a policy_loaded is also present (real evidence wins)", async () => {
+    // Removing policy_loaded from the arm set must IGNORE it, not poison a wall
+    // that also has genuine fresh adjudication evidence.
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "policy_loaded", new Date(now - 45_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+    // policy_loaded never inflates verdict counts; only the real allow does.
+    expect(posture.verdict_counts.allowed).toBe(1);
+  });
+
+  it("a STALE egress with a FRESH policy_loaded does NOT arm (the discriminating over-claim case)", async () => {
+    // The sharpest never-overclaim case: a wall that stopped adjudicating (its
+    // only real verdict is stale) but re-loaded a manifest recently. Under the
+    // old arm set the fresh policy_loaded carried fresh_enforcement_evidence and
+    // the banner showed armed; now it correctly reads unknown/stale_evidence.
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // A real allow 30 minutes ago: stale (outside the 10-minute window).
+    await appendCW(log, "egress_allowed", new Date(now - 30 * 60_000).toISOString());
+    // A manifest reload 1 minute ago: fresh, but manifest-load is not adjudication.
+    await appendCW(log, "policy_loaded", new Date(now - 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("stale_evidence");
+    // The stale allow still counts in the 24h digest window.
+    expect(posture.verdict_counts.allowed).toBe(1);
+  });
+
+  it("write-side enforcement-evidence set stays in lockstep with the read-side arm set (no third-copy drift)", () => {
+    // audit-consumer's ENFORCEMENT_EVIDENCE_EVENT_TYPES gates which events REQUIRE
+    // a producer signature on WRITE; posture's CASTLE_WALL_ENFORCEMENT_OPERATIONS
+    // gates which ops ARM the banner on READ. They are the same concept and MUST
+    // agree, else write-side signing and read-side arming could desync (a third
+    // copy the alias drift-guard in feature-health.test.ts does not cover). The
+    // two modules are deliberately not import-coupled across the read/write
+    // boundary (one is typed over the event-type enum), so a contents test is the
+    // lockstep mechanism.
+    expect([...ENFORCEMENT_EVIDENCE_EVENT_TYPES].sort()).toEqual(
+      [...CASTLE_WALL_ENFORCEMENT_OPERATIONS].sort(),
+    );
   });
 
   it("renders DEGRADED on fresh not-enforcing evidence (e.g. provider_unbound)", async () => {
@@ -472,5 +569,302 @@ describe("G5 — per-agent effective reach", () => {
     });
     expect(reach.has_wall_policy).toBe(true);
     expect(reach.default_deny).toBe(false);
+  });
+});
+
+// ── Posture agent rows (honest #634 policy-vs-enforcement split) ──────
+//
+// The Home agent grid must never render solid green "protected" for an agent
+// that is only policy_protected. These tests pin the never-fake-green invariant
+// at the pure-function boundary: enforcement_active is honestly "unknown" per
+// agent and is NEVER inherited from the machine-level wall arm-state.
+
+function agentWithStatus(
+  id: string,
+  harness: string,
+  status: LocalAgentRecord["status"],
+): LocalAgentRecord {
+  const record = agent(id, harness);
+  record.status = status;
+  return record;
+}
+
+describe("buildPostureAgentRows — honest protected-semantics split (#634)", () => {
+  it("never yields a green/active enforcement state for a policy-protected agent", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [agentWithStatus("a1", "claude_code", "active")],
+    });
+    expect(rows).toHaveLength(1);
+    // policy intent is honored ...
+    expect(rows[0].policy_protected).toBe(true);
+    // ... but enforcement is NOT confirmed per-agent: the value the green pill
+    // requires ("active") is never emitted. This is the fake-green fix.
+    expect(rows[0].enforcement_active).toBe("unknown");
+    expect(rows[0].enforcement_active).not.toBe("active");
+  });
+
+  it("mirrors v1/agents.ts policy_protected: unwrapping is not policy-protected", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("alive", "claude_code", "active"),
+        agentWithStatus("tearing-down", "cursor", "unwrapping"),
+        agentWithStatus("errored", "cline", "error"),
+      ],
+    });
+    const byId = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+    // active + errored: the operator's protection request stands (policy intent).
+    expect(byId["alive"].policy_protected).toBe(true);
+    expect(byId["errored"].policy_protected).toBe(true);
+    // unwrapping: protection is being torn down, so it is NOT policy-protected.
+    expect(byId["tearing-down"].policy_protected).toBe(false);
+    // none of them claim confirmed enforcement.
+    for (const r of rows) expect(r.enforcement_active).toBe("unknown");
+  });
+
+  it("derives banner counts that split protection-requested from enforcement-confirmed", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "paused"),
+        agentWithStatus("a3", "cline", "unwrapping"),
+      ],
+    });
+    // The route layer derives the two banner numbers exactly this way.
+    const protectionRequested = rows.filter((r) => r.policy_protected).length;
+    const enforcementConfirmed = rows.filter(
+      (r) => r.enforcement_active === "active",
+    ).length;
+    // active + paused are policy-protected; unwrapping is not.
+    expect(protectionRequested).toBe(2);
+    // No agent has confirmed live enforcement today, so the confirmed count is
+    // 0 and the banner cannot overstate enforcement.
+    expect(enforcementConfirmed).toBe(0);
+    // The two numbers genuinely differ — the split is not cosmetic.
+    expect(enforcementConfirmed).toBeLessThan(protectionRequested);
+  });
+
+  it("is pure: no machine arm-state can bleed into a per-agent enforcement claim", () => {
+    // buildPostureAgentRows takes ONLY the roster; there is no wall-posture
+    // parameter, so an `armed` machine cannot make any agent read green. Even an
+    // all-active roster yields zero confirmed-enforcement rows regardless of any
+    // machine-level signal the caller might hold.
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "active"),
+      ],
+    });
+    expect(rows.every((r) => r.enforcement_active === "unknown")).toBe(true);
+    expect(rows.some((r) => r.enforcement_active === "active")).toBe(false);
+    // Pure over inputs: identical input yields identical output.
+    const again = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "active"),
+      ],
+    });
+    expect(again).toEqual(rows);
+    // origin_machine is propagated onto every row.
+    expect(rows.every((r) => r.origin_machine === FORTRESS)).toBe(true);
+  });
+});
+
+describe("Slice 3 — Custody & Exit panel (evidence-based, honest)", () => {
+  // Custody-class audit entries are written at l2 by the boot / anti-rollback /
+  // rotation paths (core/index.ts, core/anti-rollback.ts). Mirror that here.
+  async function appendCustody(
+    log: AuditLog,
+    operation: string,
+    timestamp: string,
+    details: Record<string, unknown> = {},
+    result: "success" | "failure" = "success",
+  ): Promise<void> {
+    await log.appendCritical({
+      layer: "l2",
+      operation,
+      identity_id: FORTRESS,
+      result,
+      details,
+      timestamp,
+    });
+  }
+
+  it("custody is UNCONFIRMED (amber), never green, with no negative evidence", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("no_negative_evidence_unconfirmed");
+    expect(panel.rollback_freeze_suspected).toBe(false);
+    expect(panel.pin_custody_mismatch).toBe(false);
+    // There is no green custody state by construction.
+    expect(panel.custody_state).not.toBe("damaged" satisfies typeof panel.custody_state);
+  });
+
+  it("custody is DAMAGED on a fresh suspected-rollback freeze", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "custody_rollback_suspected",
+      new Date(now - 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("damaged");
+    expect(panel.custody_basis).toBe("rollback_freeze_active");
+    expect(panel.rollback_freeze_suspected).toBe(true);
+    expect(panel.last_damage_evidence_at).not.toBeNull();
+  });
+
+  it("custody is DAMAGED on a fresh Castle Wall pin-custody mismatch", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "castle_pin_custody_mismatch",
+      new Date(now - 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("damaged");
+    expect(panel.custody_basis).toBe("fresh_custody_damage_evidence");
+    expect(panel.pin_custody_mismatch).toBe(true);
+  });
+
+  it("a STALE pin mismatch (outside the freshness window) does not force DAMAGED, but never reads green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // 30 minutes ago — older than the 10-minute freshness window.
+    await appendCustody(
+      log,
+      "castle_pin_custody_mismatch",
+      new Date(now - 30 * 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    // Not a fresh damage signal, so not forced to damaged — but the honest
+    // default is still amber unconfirmed, never a fabricated green.
+    expect(panel.pin_custody_mismatch).toBe(false);
+    expect(panel.custody_state).toBe("unconfirmed");
+    // The stale event is still recorded as last-seen damage evidence.
+    expect(panel.last_damage_evidence_at).not.toBeNull();
+  });
+
+  it("surfaces custody-establishment provenance WITHOUT promoting custody to green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "custody_envelope_created",
+      new Date(now - 5 * 60_000).toISOString(),
+      { install_mode: "interactive", verified_wraps: 2 },
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.establishment).not.toBeNull();
+    expect(panel.establishment?.operation).toBe("custody_envelope_created");
+    expect(panel.establishment?.install_mode).toBe("interactive");
+    expect(panel.establishment?.verified_wraps).toBe(2);
+    // Provenance is NOT a health claim: custody stays unconfirmed (never green).
+    expect(panel.custody_state).toBe("unconfirmed");
+  });
+
+  it("a tainted audit read fails closed to UNCONFIRMED with integrity flagged (never 'no damage therefore fine')", async () => {
+    const now = Date.now();
+    const taintedLog = {
+      query: async () => ({
+        entries: [],
+        total: 0,
+        integrity_findings: [{ kind: "tamper" } as unknown],
+      }),
+    };
+    const panel = await buildCustodyExitPanel({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      auditLog: taintedLog as any,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("integrity_tainted");
+    expect(panel.audit_integrity_ok).toBe(false);
+  });
+
+  it("a query that throws fails closed to UNCONFIRMED, integrity flagged", async () => {
+    const now = Date.now();
+    const throwingLog = {
+      query: async () => {
+        throw new Error("audit read failed");
+      },
+    };
+    const panel = await buildCustodyExitPanel({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      auditLog: throwingLog as any,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("integrity_tainted");
+    expect(panel.audit_integrity_ok).toBe(false);
+  });
+
+  it("exit posture is the honest CLI export capability, NOT a clean-exit guarantee", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    expect(panel.exit_state).toBe("export_available");
+    expect(panel.exit_command).toBe("sanctuary exit");
+    // The full clean-exit claim is NOT yet earned (delta review): never claimed.
+    expect(panel.clean_exit_guaranteed).toBe(false);
+  });
+
+  it("a future-dated damage event (beyond skew) does not keep custody DAMAGED", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // 10 minutes in the future — beyond the 60s skew. Must be rejected for
+    // arming the damage signal (mirrors the wall's future-skew rejection).
+    await appendCustody(
+      log,
+      "custody_rollback_suspected",
+      new Date(now + 10 * 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.rollback_freeze_suspected).toBe(false);
+    expect(panel.custody_state).toBe("unconfirmed");
   });
 });

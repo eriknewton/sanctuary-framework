@@ -8,9 +8,11 @@
 
 export class HubError extends Error {
   readonly statusCode: number;
-  constructor(message: string, statusCode = 400) {
+  readonly publicDetail: string;
+  constructor(message: string, statusCode = 400, publicDetail = message) {
     super(message);
     this.statusCode = statusCode;
+    this.publicDetail = publicDetail;
     Object.defineProperty(this, "name", {
       value: "HubError",
       enumerable: false,

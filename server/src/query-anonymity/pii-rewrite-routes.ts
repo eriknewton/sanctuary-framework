@@ -42,6 +42,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import type { AuditLog } from "../operational/audit-log.js";
 
 import {
@@ -256,8 +257,10 @@ export async function handlePiiRewriteRoute(
     writeJSON(res, 404, { ok: false, error: "not_found" });
     return true;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", message });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "query-anonymity",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

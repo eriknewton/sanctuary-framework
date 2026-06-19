@@ -10,6 +10,9 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: read
+
 jobs:
   build-sign-notarize:
     # macOS 26 runner required: castle-wall-macos/Package.swift declares
