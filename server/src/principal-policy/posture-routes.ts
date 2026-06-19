@@ -1,5 +1,5 @@
 /**
- * Sovereignty Posture Dashboard — Phase 1 route layer.
+ * Sovereignty Posture Dashboard - Phase 1 route layer.
  *
  * Mounts the four gap endpoints (G1, G2, G4, G5) and the posture-home HTML
  * under `/api/posture/*` and `/posture`. The route layer is the IMPURE seam:
@@ -8,17 +8,18 @@
  * delegates the actual shaping to the pure functions in `posture.ts`.
  *
  * Auth: every route here is dispatched only AFTER the dashboard's own
- * `checkAuth` gate has passed — the same gate `/api/audit-log` uses (binding
+ * `checkAuth` gate has passed - the same gate `/api/audit-log` uses (binding
  * amendment: "do not invent a weaker gate"). The dashboard owns that check;
  * this module assumes the caller is authenticated.
  *
  * Endpoints:
- *   GET /api/posture/home        — one composed payload for the home screen.
- *   GET /api/posture/castle-wall — G4 (enforcement-evidenced arm state).
- *   GET /api/posture/digest      — G2 (today's audit story).
- *   GET /api/posture/unwrapped   — G1 (detected-but-unwrapped roster).
- *   GET /api/posture/reach/:id   — G5 (per-agent effective reach).
- *   GET /posture                 — the posture home HTML.
+ *   GET /api/posture/home        - one composed payload for the home screen.
+ *   GET /api/posture/castle-wall - G4 (enforcement-evidenced arm state).
+ *   GET /api/posture/digest      - G2 (today's audit story).
+ *   GET /api/posture/unwrapped   - G1 (detected-but-unwrapped roster).
+ *   GET /api/posture/reach/:id   - G5 (per-agent effective reach).
+ *   GET /api/posture/custody-exit - Slice 3 (Custody + Exit panel).
+ *   GET /posture                 - the posture home HTML.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -33,6 +34,7 @@ import {
   buildUnwrappedRoster,
   buildAgentReach,
   buildPostureAgentRows,
+  buildCustodyExitPanel,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -41,6 +43,7 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
   type PostureAgentRow,
+  type CustodyExitPanel,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -53,7 +56,7 @@ export const POSTURE_HOME_PATH = "/posture";
 
 /**
  * Dependencies the route layer needs from the dashboard. All are resolved
- * lazily per request (via closures) so post-unlock wiring is always observed —
+ * lazily per request (via closures) so post-unlock wiring is always observed -
  * mirrors the `buildV1AgentsDeps` pattern.
  */
 export interface PostureRouteDeps {
@@ -86,7 +89,7 @@ export interface PostureRouteDeps {
    * SAME source the audit consumer uses (`<policy_dir>/audit-producer.pub`).
    * Resolved lazily per request so post-provision wiring is observed. When it
    * returns null (macOS today / pre-provision), the readers fall back to the
-   * honest channel-authenticated basis — never claimed as per-producer
+   * honest channel-authenticated basis - never claimed as per-producer
    * authenticated. The dashboard MUST supply the same key the consumer wrote
    * with, never a weaker basis (Slice R, R-4).
    */
@@ -95,7 +98,7 @@ export interface PostureRouteDeps {
    * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
    * daemon published one) but the dashboard could NOT load it (present but
    * unreadable / malformed). When true, the readers refuse to render green on the
-   * channel basis — the wall posture forces `degraded`, the digest reports an
+   * channel basis - the wall posture forces `degraded`, the digest reports an
    * unverified chain, and feature-health rows render `unknown`. Mutually
    * exclusive with a non-null `resolvePinnedProducerKey()`.
    */
@@ -136,7 +139,7 @@ export async function handlePostureRoute(
   const om = deps.originMachine;
 
   // Every JSON posture route needs the audit log to be unlocked. Without it we
-  // cannot prove enforcement or count operations — fail closed to a 503 that
+  // cannot prove enforcement or count operations - fail closed to a 503 that
   // says so honestly (never an empty-but-green payload).
   if (deps.auditLog === null) {
     writeJSON(res, 503, {
@@ -162,6 +165,12 @@ export async function handlePostureRoute(
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/feature-health`) {
       const panel = await buildFeatureHealth(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/custody-exit`) {
+      const panel = await buildCustodyExit(deps);
       writeJSON(res, 200, panel);
       return true;
     }
@@ -207,7 +216,7 @@ export async function handlePostureRoute(
       return true;
     }
 
-    // Within the posture namespace but no match — 404 here (do not fall
+    // Within the posture namespace but no match - 404 here (do not fall
     // through to legacy routing for an unknown /api/posture path).
     writeJSON(res, 404, { error: "not_found", origin_machine: om });
     return true;
@@ -253,7 +262,7 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
  * panel is recomputed from the audit chain on every request via
  * `buildFeatureHealthPanel`, which reads `AuditLog.query` fresh and re-scans for
  * integrity findings each call. Because each response reflects the current
- * chain head, a post-fault refresh can never show stale green — there is no
+ * chain head, a post-fault refresh can never show stale green - there is no
  * cross-request cache to invalidate at this layer.
  */
 async function buildFeatureHealth(
@@ -269,6 +278,24 @@ async function buildFeatureHealth(
     ...(deps.producerKeyExpectedButUnavailable
       ? { producerKeyExpectedButUnavailable: true }
       : {}),
+  });
+}
+
+/**
+ * Custody & Exit panel (Slice 3). Read-only over the audit chain the dashboard
+ * already reads: it surfaces NEGATIVE custody evidence (pin-custody mismatch /
+ * suspected-rollback freeze) and custody-establishment provenance, plus the
+ * honest CLI-gated exit-export capability. It never re-derives custody HEALTH
+ * (that lives under the transient master at boot), so the custody tile is never
+ * green - amber unconfirmed or red damaged only.
+ */
+async function buildCustodyExit(
+  deps: PostureRouteDeps,
+): Promise<CustodyExitPanel> {
+  return buildCustodyExitPanel({
+    auditLog: deps.auditLog as AuditLog,
+    originMachine: deps.originMachine,
+    ...(deps.now ? { now: deps.now() } : {}),
   });
 }
 
@@ -308,6 +335,12 @@ export interface PostureHome {
   /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
   feature_health: FeatureHealthPanel;
   /**
+   * Custody & Exit posture (Slice 3). Custody is never green (amber unconfirmed
+   * or red damaged); exit is the honest CLI-gated export capability without a
+   * clean-exit guarantee.
+   */
+  custody_exit: CustodyExitPanel;
+  /**
    * Count of agents the operator has REQUESTED protection for (policy intent).
    * This is the honest banner number: it counts policy_protected, NOT confirmed
    * enforcement. Renamed in intent from the old flat "protected" count, which
@@ -329,12 +362,14 @@ export interface PostureHome {
 }
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
-  const [castleWall, digest, unwrapped, featureHealth] = await Promise.all([
-    buildWallPosture(deps),
-    buildDigest(deps),
-    buildUnwrapped(deps),
-    buildFeatureHealth(deps),
-  ]);
+  const [castleWall, digest, unwrapped, featureHealth, custodyExit] =
+    await Promise.all([
+      buildWallPosture(deps),
+      buildDigest(deps),
+      buildUnwrapped(deps),
+      buildFeatureHealth(deps),
+      buildCustodyExit(deps),
+    ]);
   // Derive the honest agent rows from the roster ALONE. Deliberately not passed
   // the wall posture: there is no path by which the machine-level arm-state can
   // leak into a per-agent enforcement claim (the #634 fake-green).
@@ -354,6 +389,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     digest,
     unwrapped,
     feature_health: featureHealth,
+    custody_exit: custodyExit,
     protection_requested_count: protectionRequestedCount,
     enforcement_confirmed_count: enforcementConfirmedCount,
     agents,
