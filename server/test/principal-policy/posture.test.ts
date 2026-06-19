@@ -9,6 +9,7 @@ import {
   buildUnwrappedRoster,
   buildAgentReach,
   buildPostureAgentRows,
+  buildCustodyExitPanel,
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
@@ -670,5 +671,200 @@ describe("buildPostureAgentRows — honest protected-semantics split (#634)", ()
     expect(again).toEqual(rows);
     // origin_machine is propagated onto every row.
     expect(rows.every((r) => r.origin_machine === FORTRESS)).toBe(true);
+  });
+});
+
+describe("Slice 3 — Custody & Exit panel (evidence-based, honest)", () => {
+  // Custody-class audit entries are written at l2 by the boot / anti-rollback /
+  // rotation paths (core/index.ts, core/anti-rollback.ts). Mirror that here.
+  async function appendCustody(
+    log: AuditLog,
+    operation: string,
+    timestamp: string,
+    details: Record<string, unknown> = {},
+    result: "success" | "failure" = "success",
+  ): Promise<void> {
+    await log.appendCritical({
+      layer: "l2",
+      operation,
+      identity_id: FORTRESS,
+      result,
+      details,
+      timestamp,
+    });
+  }
+
+  it("custody is UNCONFIRMED (amber), never green, with no negative evidence", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("no_negative_evidence_unconfirmed");
+    expect(panel.rollback_freeze_suspected).toBe(false);
+    expect(panel.pin_custody_mismatch).toBe(false);
+    // There is no green custody state by construction.
+    expect(panel.custody_state).not.toBe("damaged" satisfies typeof panel.custody_state);
+  });
+
+  it("custody is DAMAGED on a fresh suspected-rollback freeze", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "custody_rollback_suspected",
+      new Date(now - 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("damaged");
+    expect(panel.custody_basis).toBe("rollback_freeze_active");
+    expect(panel.rollback_freeze_suspected).toBe(true);
+    expect(panel.last_damage_evidence_at).not.toBeNull();
+  });
+
+  it("custody is DAMAGED on a fresh Castle Wall pin-custody mismatch", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "castle_pin_custody_mismatch",
+      new Date(now - 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("damaged");
+    expect(panel.custody_basis).toBe("fresh_custody_damage_evidence");
+    expect(panel.pin_custody_mismatch).toBe(true);
+  });
+
+  it("a STALE pin mismatch (outside the freshness window) does not force DAMAGED, but never reads green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // 30 minutes ago — older than the 10-minute freshness window.
+    await appendCustody(
+      log,
+      "castle_pin_custody_mismatch",
+      new Date(now - 30 * 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    // Not a fresh damage signal, so not forced to damaged — but the honest
+    // default is still amber unconfirmed, never a fabricated green.
+    expect(panel.pin_custody_mismatch).toBe(false);
+    expect(panel.custody_state).toBe("unconfirmed");
+    // The stale event is still recorded as last-seen damage evidence.
+    expect(panel.last_damage_evidence_at).not.toBeNull();
+  });
+
+  it("surfaces custody-establishment provenance WITHOUT promoting custody to green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCustody(
+      log,
+      "custody_envelope_created",
+      new Date(now - 5 * 60_000).toISOString(),
+      { install_mode: "interactive", verified_wraps: 2 },
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.establishment).not.toBeNull();
+    expect(panel.establishment?.operation).toBe("custody_envelope_created");
+    expect(panel.establishment?.install_mode).toBe("interactive");
+    expect(panel.establishment?.verified_wraps).toBe(2);
+    // Provenance is NOT a health claim: custody stays unconfirmed (never green).
+    expect(panel.custody_state).toBe("unconfirmed");
+  });
+
+  it("a tainted audit read fails closed to UNCONFIRMED with integrity flagged (never 'no damage therefore fine')", async () => {
+    const now = Date.now();
+    const taintedLog = {
+      query: async () => ({
+        entries: [],
+        total: 0,
+        integrity_findings: [{ kind: "tamper" } as unknown],
+      }),
+    };
+    const panel = await buildCustodyExitPanel({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      auditLog: taintedLog as any,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("integrity_tainted");
+    expect(panel.audit_integrity_ok).toBe(false);
+  });
+
+  it("a query that throws fails closed to UNCONFIRMED, integrity flagged", async () => {
+    const now = Date.now();
+    const throwingLog = {
+      query: async () => {
+        throw new Error("audit read failed");
+      },
+    };
+    const panel = await buildCustodyExitPanel({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      auditLog: throwingLog as any,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.custody_state).toBe("unconfirmed");
+    expect(panel.custody_basis).toBe("integrity_tainted");
+    expect(panel.audit_integrity_ok).toBe(false);
+  });
+
+  it("exit posture is the honest CLI export capability, NOT a clean-exit guarantee", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+    expect(panel.exit_state).toBe("export_available");
+    expect(panel.exit_command).toBe("sanctuary exit");
+    // The full clean-exit claim is NOT yet earned (delta review): never claimed.
+    expect(panel.clean_exit_guaranteed).toBe(false);
+  });
+
+  it("a future-dated damage event (beyond skew) does not keep custody DAMAGED", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // 10 minutes in the future — beyond the 60s skew. Must be rejected for
+    // arming the damage signal (mirrors the wall's future-skew rejection).
+    await appendCustody(
+      log,
+      "custody_rollback_suspected",
+      new Date(now + 10 * 60_000).toISOString(),
+      {},
+      "failure",
+    );
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    expect(panel.rollback_freeze_suspected).toBe(false);
+    expect(panel.custody_state).toBe("unconfirmed");
   });
 });

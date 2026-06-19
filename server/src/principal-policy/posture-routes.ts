@@ -18,6 +18,7 @@
  *   GET /api/posture/digest      — G2 (today's audit story).
  *   GET /api/posture/unwrapped   — G1 (detected-but-unwrapped roster).
  *   GET /api/posture/reach/:id   — G5 (per-agent effective reach).
+ *   GET /api/posture/custody-exit — Slice 3 (Custody + Exit panel).
  *   GET /posture                 — the posture home HTML.
  */
 
@@ -33,6 +34,7 @@ import {
   buildUnwrappedRoster,
   buildAgentReach,
   buildPostureAgentRows,
+  buildCustodyExitPanel,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -41,6 +43,7 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
   type PostureAgentRow,
+  type CustodyExitPanel,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -166,6 +169,12 @@ export async function handlePostureRoute(
       return true;
     }
 
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/custody-exit`) {
+      const panel = await buildCustodyExit(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/unwrapped`) {
       const roster = await buildUnwrapped(deps);
       writeJSON(res, 200, roster);
@@ -272,6 +281,24 @@ async function buildFeatureHealth(
   });
 }
 
+/**
+ * Custody & Exit panel (Slice 3). Read-only over the audit chain the dashboard
+ * already reads: it surfaces NEGATIVE custody evidence (pin-custody mismatch /
+ * suspected-rollback freeze) and custody-establishment provenance, plus the
+ * honest CLI-gated exit-export capability. It never re-derives custody HEALTH
+ * (that lives under the transient master at boot), so the custody tile is never
+ * green — amber unconfirmed or red damaged only.
+ */
+async function buildCustodyExit(
+  deps: PostureRouteDeps,
+): Promise<CustodyExitPanel> {
+  return buildCustodyExitPanel({
+    auditLog: deps.auditLog as AuditLog,
+    originMachine: deps.originMachine,
+    ...(deps.now ? { now: deps.now() } : {}),
+  });
+}
+
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
   const detected = deps.detectInstalledHarnesses
     ? await deps.detectInstalledHarnesses()
@@ -308,6 +335,12 @@ export interface PostureHome {
   /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
   feature_health: FeatureHealthPanel;
   /**
+   * Custody & Exit posture (Slice 3). Custody is never green (amber unconfirmed
+   * or red damaged); exit is the honest CLI-gated export capability without a
+   * clean-exit guarantee.
+   */
+  custody_exit: CustodyExitPanel;
+  /**
    * Count of agents the operator has REQUESTED protection for (policy intent).
    * This is the honest banner number: it counts policy_protected, NOT confirmed
    * enforcement. Renamed in intent from the old flat "protected" count, which
@@ -329,12 +362,14 @@ export interface PostureHome {
 }
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
-  const [castleWall, digest, unwrapped, featureHealth] = await Promise.all([
-    buildWallPosture(deps),
-    buildDigest(deps),
-    buildUnwrapped(deps),
-    buildFeatureHealth(deps),
-  ]);
+  const [castleWall, digest, unwrapped, featureHealth, custodyExit] =
+    await Promise.all([
+      buildWallPosture(deps),
+      buildDigest(deps),
+      buildUnwrapped(deps),
+      buildFeatureHealth(deps),
+      buildCustodyExit(deps),
+    ]);
   // Derive the honest agent rows from the roster ALONE. Deliberately not passed
   // the wall posture: there is no path by which the machine-level arm-state can
   // leak into a per-agent enforcement claim (the #634 fake-green).
@@ -354,6 +389,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     digest,
     unwrapped,
     feature_health: featureHealth,
+    custody_exit: custodyExit,
     protection_requested_count: protectionRequestedCount,
     enforcement_confirmed_count: enforcementConfirmedCount,
     agents,

@@ -21,6 +21,7 @@
  */
 
 import type { FeatureHealthStatus } from "./feature-health.js";
+import type { CustodyState } from "./posture.js";
 
 /**
  * "Never fake green" for the feature-health panel, as a PURE mapper so the
@@ -51,6 +52,34 @@ export function featureHealthPill(status: FeatureHealthStatus): {
     default:
       // Fail closed: any unrecognized status is non-green by construction.
       return { cls: "amber", label: "unknown" };
+  }
+}
+
+/**
+ * "Never fake green" for the Custody tile (Slice 3), as a PURE mapper so the
+ * honesty contract is unit-testable without a browser. The custody tile is
+ * GREEN never: the facts that would prove custody HEALTH (two-factor floor,
+ * envelope MAC, anti-rollback epoch, pinned-key non-extraction) live under the
+ * transient master at boot and are not re-derivable from the dashboard's
+ * request-time view. So `unconfirmed` is amber (the honest default), `damaged`
+ * is red (earned by fresh negative evidence), and there is no green branch — a
+ * future edit that introduced one would fail a test.
+ *
+ * The client-side `custodyPill` below embeds the exact same mapping (the page is
+ * a self-contained string); this exported function is the canonical definition
+ * the renderer mirrors and the tests pin.
+ */
+export function custodyPill(state: CustodyState): {
+  cls: "amber" | "red";
+  label: string;
+} {
+  switch (state) {
+    case "damaged":
+      return { cls: "red", label: "damaged" };
+    case "unconfirmed":
+    default:
+      // Fail closed: never green. Custody health is unprovable from this view.
+      return { cls: "amber", label: "unconfirmed" };
   }
 }
 
@@ -164,6 +193,11 @@ export function renderPostureHomeHTML(): string {
     <div class="panel" id="features"><span class="empty">Loading…</span></div>
   </section>
 
+  <section>
+    <h2>Custody and Exit</h2>
+    <div class="panel" id="custody"><span class="empty">Loading…</span></div>
+  </section>
+
   <div class="footer">
     <strong>Your data, your machine.</strong>
     State: encrypted at rest (AES-256-GCM) under <code>~/.sanctuary</code> on this machine.
@@ -274,6 +308,79 @@ export function renderPostureHomeHTML(): string {
         'A feature only reads active on real evidence in the window.</div>'
       : "";
     el.innerHTML = rows + note;
+  }
+
+  // "Never fake green" for the Custody tile. Mirrors the canonical pure mapper
+  // exported from this module (custodyPill). There is NO green branch: custody
+  // HEALTH is a boot-time fact under the transient master and is not re-derivable
+  // from the dashboard's request-time view, so "unconfirmed" is amber and
+  // "damaged" is red. The panel never claims custody is healthy from absence of
+  // damage evidence (the #617 honesty contract).
+  function custodyPill(state) {
+    if (state === "damaged") return '<span class="pill red">DAMAGED</span>';
+    return '<span class="pill amber">UNCONFIRMED</span>';
+  }
+
+  // Plain-English copy from the panel's stable basis enum. Never leaks internals.
+  function custodyWhy(basis) {
+    switch (basis) {
+      case "rollback_freeze_active":
+        return "A suspected custody rollback has FROZEN trust-bearing writes. Acknowledge with 'sanctuary restore-attest'.";
+      case "fresh_custody_damage_evidence":
+        return "The Castle Wall pinned key does not decrypt under the current master (dual-path custody damage). Re-pin when ready.";
+      case "integrity_tainted":
+        return "Audit integrity finding present; custody state cannot be trusted from this read.";
+      case "no_negative_evidence_unconfirmed":
+      default:
+        return "No custody damage observed. Custody health (two-factor floor, key non-extraction, anti-rollback epoch) is established at boot under your key and cannot be re-proven from this screen, so it is shown as unconfirmed, never green.";
+    }
+  }
+
+  function renderCustodyExit(panel) {
+    var el = document.getElementById("custody");
+    if (!panel) {
+      el.innerHTML = '<span class="empty">No custody and exit data.</span>';
+      return;
+    }
+    var html =
+      "<div>" + custodyPill(panel.custody_state) + " &nbsp;" + esc(custodyWhy(panel.custody_basis)) + "</div>";
+    // Establishment provenance, when a fresh-enough event is on the chain. Shown
+    // as provenance only (install mode + verified-factor count), never as a
+    // health claim.
+    if (panel.establishment) {
+      var e = panel.establishment;
+      html +=
+        '<div class="evidence">Custody event: <code>' + esc(e.operation) + "</code>" +
+        (e.install_mode ? " · install mode " + esc(e.install_mode) : "") +
+        (e.verified_wraps !== null && e.verified_wraps !== undefined
+          ? " · " + esc(e.verified_wraps) + " verified recovery factor(s)"
+          : "") +
+        " · observed " + esc(e.observed_at) + "</div>";
+    }
+    if (panel.last_damage_evidence_at) {
+      html += '<div class="evidence">Last custody-damage evidence: ' +
+        esc(panel.last_damage_evidence_at) + "</div>";
+    }
+    if (!panel.audit_integrity_ok) {
+      html += '<div class="err">Audit integrity finding present - custody read may be incomplete.</div>';
+    }
+    // Exit / portability: the honest capability statement. The Tier-1-gated CLI
+    // export exists; the FULL clean-exit guarantee is NOT yet earned, so we say
+    // "export available" and never assert the full clean-exit claim on Home.
+    html +=
+      '<div class="evidence" style="margin-top:10px">Exit and portability: ' +
+      (panel.exit_state === "export_available"
+        ? '<span class="pill amber">export available</span> ' +
+          "Export your fortress as a portable bundle with <code>" +
+          esc(panel.exit_command || "sanctuary exit") +
+          "</code> (a Tier-1 operation: it requires your approval before it runs)."
+        : "unknown") +
+      "</div>";
+    html +=
+      '<div class="fh-note">Export available does not yet mean a guaranteed clean exit: ' +
+      "the portable-bundle export ships, but the full clean-exit guarantee (complete, " +
+      "verifiable handover with nothing left behind) is not yet earned, so it is not claimed here.</div>";
+    el.innerHTML = html;
   }
 
   function renderBanner(home, pending, anomalies) {
@@ -413,6 +520,7 @@ export function renderPostureHomeHTML(): string {
           renderAnomalies(findings);
           renderWall(home.castle_wall);
           renderFeatures(home.feature_health);
+          renderCustodyExit(home.custody_exit);
         });
       })
       .catch(function (e) {

@@ -860,6 +860,277 @@ export function buildPostureAgentRows(
   }));
 }
 
+// ── Custody & Exit panel (Slice 3 — the Custody + Exit principles) ────
+
+/**
+ * Audit operations that constitute negative CUSTODY evidence — they prove the
+ * fortress's key-custody chain is damaged or under suspected attack, so the
+ * custody tile must render RED/amber, never green. These are written to the
+ * encrypted audit log at boot / by the anti-rollback + master-rotation paths:
+ *
+ *  - `castle_pin_custody_mismatch` (core/index.ts): the Castle Wall pinned
+ *    private key does NOT decrypt under the established master — the dual-path
+ *    damage signature from the 2026-06-12 incident.
+ *  - `custody_rollback_suspected` (core/anti-rollback.ts): a suspected custody
+ *    rollback has FROZEN trust-bearing writes (on-disk epoch older than a
+ *    surviving witness). The fortress is in the freeze state until an audited
+ *    `restore-attest`.
+ *
+ * A FRESH instance of either inside the freshness window forces the custody
+ * tile out of green. Anything else (no negative evidence) is NOT proof of
+ * health — custody establishment is a boot-time fact the dashboard cannot
+ * re-derive without the transient master — so the tile renders amber
+ * "unconfirmed", never a fabricated green (#617 honesty contract).
+ */
+export const CUSTODY_DAMAGE_OPERATIONS: ReadonlySet<string> = Object.freeze(
+  new Set<string>(["castle_pin_custody_mismatch", "custody_rollback_suspected"]),
+);
+
+/**
+ * Audit operations that prove a custody establishment / continuity event
+ * happened — they are POSITIVE provenance the dashboard can honestly surface
+ * (install mode, verified-factor count) but they are NOT a freshness or
+ * health proof on their own. They let the panel show "custody established"
+ * provenance without claiming the chain is currently healthy.
+ */
+export const CUSTODY_ESTABLISHMENT_OPERATIONS: ReadonlySet<string> =
+  Object.freeze(
+    new Set<string>([
+      "custody_envelope_created",
+      "custody_legacy_migrated",
+      "custody_master_rotated",
+      "custody_restore_attested",
+    ]),
+  );
+
+/**
+ * The custody-posture verdict. `unconfirmed` is the honest default and renders
+ * amber — the dashboard cannot prove custody HEALTH from in-process state (the
+ * master that would re-derive the envelope MAC / two-factor floor / pin custody
+ * is transient and not held at request time), so it never renders green.
+ * `damaged` (RED) is the ONLY non-amber state and is earned solely by fresh
+ * negative evidence (pin-custody mismatch or a suspected rollback freeze).
+ */
+export type CustodyState = "damaged" | "unconfirmed";
+
+/**
+ * Exit / portability posture. Honestly labeled per the 2026-06-18 delta review:
+ * the exit machinery exists as a Tier-1-gated CLI command (`sanctuary exit`),
+ * but the FULL clean-exit guarantee is NOT yet earned (Slice 1 of exit shipped
+ * memory-class minting + consent only). So the panel reports `export_available`
+ * — a true capability statement — and never claims `clean_exit_guaranteed`.
+ */
+export type ExitState = "export_available";
+
+export interface CustodyExitPanel {
+  origin_machine: string;
+  /** Custody chain posture (never green; amber unconfirmed or red damaged). */
+  custody_state: CustodyState;
+  /** Stable basis enum the UI renders human copy from; never leaks internals. */
+  custody_basis:
+    | "fresh_custody_damage_evidence"
+    | "rollback_freeze_active"
+    | "integrity_tainted"
+    | "no_negative_evidence_unconfirmed";
+  /** True when a suspected-rollback freeze is fresh in the window. */
+  rollback_freeze_suspected: boolean;
+  /** True when a fresh Castle Wall pin-custody mismatch was observed. */
+  pin_custody_mismatch: boolean;
+  /**
+   * Custody establishment provenance, when a fresh-enough establishment event
+   * is on the audit chain. Null when none is in the window — the dashboard does
+   * NOT claim "established" from absence. Provenance only; never a health claim.
+   */
+  establishment: {
+    operation: string;
+    install_mode: string | null;
+    verified_wraps: number | null;
+    observed_at: string;
+  } | null;
+  /** ISO8601 of the most recent custody-damage event, if any. */
+  last_damage_evidence_at: string | null;
+  /** Freshness window (ms) used to judge "recent" custody evidence. */
+  freshness_window_ms: number;
+  /** True when an integrity finding tainted the audit read backing this. */
+  audit_integrity_ok: boolean;
+  /**
+   * Exit / portability posture. Always `export_available` today (the CLI export
+   * exists, Tier-1 gated); the panel surfaces the honest disclaimer that the
+   * full clean-exit guarantee is not yet earned.
+   */
+  exit_state: ExitState;
+  /** The operator-facing command that performs the gated export. */
+  exit_command: string;
+  /**
+   * HONEST: true when the full clean-exit claim is earned. Always false today —
+   * exit Slice 1 shipped memory-class minting + consent, not the full guarantee.
+   */
+  clean_exit_guaranteed: boolean;
+}
+
+export interface BuildCustodyExitPanelInput {
+  auditLog: AuditLog;
+  originMachine: string;
+  now?: number;
+  /** Window over which custody evidence is read (defaults to the digest window). */
+  windowMs?: number;
+  /**
+   * Freshness window for custody-damage evidence (defaults to the enforcement
+   * freshness window). A pin mismatch / rollback freeze older than this is not
+   * treated as a fresh "damaged" signal (the operator may have already
+   * remediated), but it is never silently upgraded to green either.
+   */
+  freshnessWindowMs?: number;
+}
+
+/**
+ * Build the Custody & Exit panel — the Slice-3 surface for the Custody and Exit
+ * principles of sovereignty.
+ *
+ * HONESTY CONTRACT (the #617 lesson, identical to the wall + feature-health
+ * shapers): the custody tile is GREEN never. The facts that would PROVE custody
+ * health — the two-factor floor being met, the envelope MAC verifying, the
+ * anti-rollback epoch matching its witnesses, the pinned key being non-
+ * extractable — are all derived inside `establishMaster` at boot, under the
+ * TRANSIENT master that the dashboard does not hold at request time. So this
+ * read-only shaper does NOT re-derive them and does NOT fabricate a green from
+ * their absence. What it CAN honestly surface, from the audit chain it already
+ * reads:
+ *
+ *  - DAMAGE (red): a fresh `castle_pin_custody_mismatch` or
+ *    `custody_rollback_suspected` proves the custody chain is broken / frozen.
+ *  - PROVENANCE (neutral): a custody establishment event carries the honest
+ *    install mode + verified-factor count, shown as provenance, NOT as health.
+ *  - everything else: amber `unconfirmed` — the honest default.
+ *
+ * A tainted/unreadable audit read fails closed to `unconfirmed` with integrity
+ * flagged (never "no damage, therefore healthy").
+ *
+ * Exit posture is a true capability statement: the Tier-1-gated `sanctuary exit`
+ * export exists, so `export_available` is honest; `clean_exit_guaranteed` is
+ * `false` because the full clean-exit claim is not yet earned (delta review).
+ */
+export async function buildCustodyExitPanel(
+  input: BuildCustodyExitPanelInput,
+): Promise<CustodyExitPanel> {
+  const now = input.now ?? Date.now();
+  const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
+  const freshnessWindowMs =
+    input.freshnessWindowMs ?? DEFAULT_ENFORCEMENT_FRESHNESS_MS;
+  const since = new Date(now - windowMs).toISOString();
+
+  // The honest exit half is constant today; compute once.
+  const exitFields = {
+    exit_state: "export_available" as const,
+    exit_command: "sanctuary exit",
+    clean_exit_guaranteed: false,
+  };
+
+  let entries;
+  let integrityOk: boolean;
+  try {
+    const result = await input.auditLog.query({ since, limit: 50_000 });
+    entries = result.entries;
+    integrityOk = result.integrity_findings.length === 0;
+  } catch {
+    // A failed/tainted read must NOT read as "no damage, therefore fine".
+    // Fail closed to unconfirmed with integrity flagged.
+    return {
+      origin_machine: input.originMachine,
+      custody_state: "unconfirmed",
+      custody_basis: "integrity_tainted",
+      rollback_freeze_suspected: false,
+      pin_custody_mismatch: false,
+      establishment: null,
+      last_damage_evidence_at: null,
+      freshness_window_ms: freshnessWindowMs,
+      audit_integrity_ok: false,
+      ...exitFields,
+    };
+  }
+
+  const freshnessFloor = now - freshnessWindowMs;
+  let latestDamageMs: number | null = null;
+  let rollbackSuspected = false;
+  let pinMismatch = false;
+  let latestEstablishmentMs: number | null = null;
+  let establishment: CustodyExitPanel["establishment"] = null;
+
+  for (const entry of entries) {
+    const ts = Date.parse(entry.timestamp);
+    // Reject future-dated evidence beyond the small skew, exactly like the wall:
+    // a future timestamp must not keep a damage signal "fresh" forever, nor
+    // promote a stale establishment event.
+    const tsValid =
+      !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+    if (!tsValid) continue;
+
+    if (CUSTODY_DAMAGE_OPERATIONS.has(entry.operation)) {
+      if (latestDamageMs === null || ts > latestDamageMs) latestDamageMs = ts;
+      if (ts >= freshnessFloor) {
+        if (entry.operation === "custody_rollback_suspected") {
+          rollbackSuspected = true;
+        } else if (entry.operation === "castle_pin_custody_mismatch") {
+          pinMismatch = true;
+        }
+      }
+      continue;
+    }
+
+    if (CUSTODY_ESTABLISHMENT_OPERATIONS.has(entry.operation)) {
+      if (latestEstablishmentMs === null || ts > latestEstablishmentMs) {
+        latestEstablishmentMs = ts;
+        const details = isRecord(entry.details) ? entry.details : {};
+        const installMode =
+          typeof details.install_mode === "string" ? details.install_mode : null;
+        const verifiedWraps =
+          typeof details.verified_wraps === "number"
+            ? details.verified_wraps
+            : null;
+        establishment = {
+          operation: entry.operation,
+          install_mode: installMode,
+          verified_wraps: verifiedWraps,
+          observed_at: new Date(ts).toISOString(),
+        };
+      }
+    }
+  }
+
+  let custodyState: CustodyState;
+  let custodyBasis: CustodyExitPanel["custody_basis"];
+  if (!integrityOk) {
+    // A tainted audit read can NEVER read as clean custody.
+    custodyState = "unconfirmed";
+    custodyBasis = "integrity_tainted";
+  } else if (rollbackSuspected) {
+    custodyState = "damaged";
+    custodyBasis = "rollback_freeze_active";
+  } else if (pinMismatch) {
+    custodyState = "damaged";
+    custodyBasis = "fresh_custody_damage_evidence";
+  } else {
+    // No fresh negative evidence is NOT proof of health: custody health is a
+    // boot-time fact under the transient master. Honest amber, never green.
+    custodyState = "unconfirmed";
+    custodyBasis = "no_negative_evidence_unconfirmed";
+  }
+
+  return {
+    origin_machine: input.originMachine,
+    custody_state: custodyState,
+    custody_basis: custodyBasis,
+    rollback_freeze_suspected: rollbackSuspected,
+    pin_custody_mismatch: pinMismatch,
+    establishment,
+    last_damage_evidence_at:
+      latestDamageMs !== null ? new Date(latestDamageMs).toISOString() : null,
+    freshness_window_ms: freshnessWindowMs,
+    audit_integrity_ok: integrityOk,
+    ...exitFields,
+  };
+}
+
 // ── G1: detected-but-unwrapped agent roster ──────────────────────────
 
 /**
