@@ -58,6 +58,7 @@ import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
+  POSTURE_AGENT_PATH_PREFIX,
   type PostureRouteDeps,
 } from "./posture-routes.js";
 import {
@@ -201,7 +202,12 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/v1.0" ||
     path === "/fortress" ||
     path === "/events" ||
-    path === POSTURE_HOME_PATH
+    path === POSTURE_HOME_PATH ||
+    // The per-agent drill-down HTML page is a dashboard view route too (an
+    // operator page load), so it is exempt from the general rate limit the
+    // same way `/posture` and `/fortress` are. Its data fetches still hit the
+    // throttled JSON endpoints.
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   );
 }
 
@@ -2117,6 +2123,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // true, otherwise we fall through to the legacy table below.
     if (
       url.pathname === POSTURE_HOME_PATH ||
+      url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`)
     ) {

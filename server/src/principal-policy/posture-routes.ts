@@ -20,6 +20,7 @@
  *   GET /api/posture/reach/:id   - G5 (per-agent effective reach).
  *   GET /api/posture/custody-exit - Slice 3 (Custody + Exit panel).
  *   GET /posture                 - the posture home HTML.
+ *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -50,9 +51,17 @@ import {
   type FeatureHealthPanel,
 } from "./feature-health.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
+import { renderPostureAgentHTML } from "./posture-agent-html.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
+/**
+ * Per-agent drill-down HTML page prefix (Slice 4): `/posture/agent/:id`. The
+ * page is a static shell that fetches `/api/posture/reach/:id` (G5) and
+ * `/api/posture/home` client-side behind the same auth gate; the id is parsed
+ * from the path in the browser, so the route only matches the prefix here.
+ */
+export const POSTURE_AGENT_PATH_PREFIX = "/posture/agent/";
 
 /**
  * Dependencies the route layer needs from the dashboard. All are resolved
@@ -127,6 +136,20 @@ export async function handlePostureRoute(
       "Cache-Control": "no-cache",
     });
     res.end(renderPostureHomeHTML());
+    return true;
+  }
+
+  // Per-agent drill-down HTML (Slice 4). The page is a static shell; it parses
+  // the :id from the path and fetches `/api/posture/reach/:id` + `/api/posture/
+  // home` client-side behind this same auth gate. An unknown id renders an
+  // honest not-found state (driven by the reach endpoint's 404), so the HTML
+  // shell is served for any non-empty id and the data layer owns existence.
+  if (method === "GET" && path.startsWith(POSTURE_AGENT_PATH_PREFIX)) {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureAgentHTML());
     return true;
   }
 

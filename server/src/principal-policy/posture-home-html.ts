@@ -406,10 +406,15 @@ export function renderPostureHomeHTML(): string {
   function renderAgents(home) {
     var html = "";
     (home.agents || []).forEach(function (a) {
+      // Each card title links to the per-agent drill-down page (Slice 4):
+      // reach + the honest Standing section. The raw reach JSON stays available
+      // as a secondary link for operators who want the payload directly.
+      var drill = "/posture/agent/" + encodeURIComponent(a.agent_id);
       html +=
-        '<div class="card"><h3>' + esc(a.agent_id) + ' ' + agentPill(a) + '</h3>' +
+        '<div class="card"><h3><a href="' + drill + '">' + esc(a.agent_id) + "</a> " + agentPill(a) + "</h3>" +
         '<div class="meta">' + esc(a.harness) + " · status " + esc(a.status) + "</div>" +
-        '<div class="reach"><a href="/api/posture/reach/' + encodeURIComponent(a.agent_id) + '">Effective reach &rarr;</a></div></div>';
+        '<div class="reach"><a href="' + drill + '">View posture &rarr;</a>' +
+        ' · <a href="/api/posture/reach/' + encodeURIComponent(a.agent_id) + '">raw reach</a></div></div>';
     });
     (home.unwrapped.unwrapped || []).forEach(function (u) {
       html +=
