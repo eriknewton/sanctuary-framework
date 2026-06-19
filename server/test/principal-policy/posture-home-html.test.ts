@@ -227,3 +227,115 @@ describe("posture home - Query-privacy section honesty", () => {
     expect(fnSource).toContain('<span class="pill amber">unconfirmed');
   });
 });
+
+/**
+ * SEC-012 stream handshake (this PR). The posture board's live-refresh SSE
+ * stream cannot authenticate in a REMOTE token-hash session (EventSource cannot
+ * set an Authorization header, and checkAuth rejects the long-lived ?token= in
+ * the URL). The fix reuses the dashboard's EXISTING short-lived session mint
+ * (POST /auth/session) and ?session= acceptance: the client exchanges the bearer
+ * (in the POST header, never a URL) for a short-lived session id, then connects
+ * via ?session=<id>. These tests pin the invariants:
+ *  - the mint is performed ONLY for a remote token-hash session (token in hash,
+ *    no session cookie); the loopback / cookie path is unchanged (no mint);
+ *  - any mint failure / 401 / expiry degrades to honest polling, never blocks;
+ *  - the long-lived bearer NEVER appears in any URL (only the Authorization
+ *    header of the POST);
+ *  - the static page still renders.
+ *
+ * The client is a self-contained string, so (matching the convention in the
+ * panels above) these assert on the embedded source rather than running a DOM.
+ */
+describe("posture home - SEC-012 SSE ?session= handshake", () => {
+  it("the static page still renders (progressive enhancement, never blocked)", () => {
+    const html = renderPostureHomeHTML();
+    expect(html.length).toBeGreaterThan(0);
+    // The boot path still renders once and only attaches the stream as an
+    // enhancement (poll-only fallback survives if SSE is unavailable).
+    expect(html).toContain("function connectStream()");
+    expect(html).toContain("function pollOnce()");
+  });
+
+  it("reuses the EXISTING POST /auth/session mint with the bearer in the header, never a URL", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function mintStreamSession()");
+    expect(start).toBeGreaterThan(-1);
+    const end = html.indexOf("function esc(");
+    expect(end).toBeGreaterThan(start);
+    const fn = html.slice(start, end);
+    // The existing mint endpoint and method.
+    expect(fn).toContain('fetch("/auth/session", {');
+    expect(fn).toContain('method: "POST"');
+    // The long-lived bearer travels in the Authorization header of the POST,
+    // NOT in any URL (SEC-012).
+    expect(fn).toContain('"Authorization": "Bearer " + token');
+    // It consumes the existing response shape and emits a ?session= query.
+    expect(fn).toContain("body.session_id");
+    expect(fn).toContain('"?session=" + encodeURIComponent(body.session_id)');
+  });
+
+  it("mints ONLY for a remote token-hash session - no token or a session cookie means no mint (loopback/cookie path unchanged)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function mintStreamSession()");
+    const end = html.indexOf("function esc(");
+    const fn = html.slice(start, end);
+    // The guard: no bearer token in the hash, OR a session cookie already
+    // authorizes -> resolve "" and attempt NO mint. This is what keeps the
+    // loopback / cookie path byte-for-byte unchanged.
+    expect(fn).toContain("if (!token || hasSessionCookie()) return Promise.resolve");
+    // The cookie probe looks for the EXISTING sanctuary_session cookie name.
+    const cookieStart = html.indexOf("function hasSessionCookie()");
+    expect(cookieStart).toBeGreaterThan(-1);
+    const cookieFn = html.slice(cookieStart, cookieStart + 260);
+    expect(cookieFn).toContain("sanctuary_session=");
+    expect(cookieFn).toContain("document.cookie");
+  });
+
+  it("connects the stream via ?session=<id> when one was minted, and never appends the long-lived token to the stream URL", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function connectStream()");
+    expect(start).toBeGreaterThan(-1);
+    const end = html.indexOf("function wireStream()");
+    expect(end).toBeGreaterThan(start);
+    const fn = html.slice(start, end);
+    // The handshake runs first; the minted ?session= query is appended to the
+    // stream URL (empty string when no mint, so the bare URL is unchanged).
+    expect(fn).toContain("mintStreamSession().then(function (sessionQuery)");
+    expect(fn).toContain('"/api/posture/stream" + (sessionQuery || "")');
+    expect(fn).toContain("new EventSource(url, { withCredentials: true })");
+    // The long-lived token is NEVER placed on the stream URL anywhere on the page.
+    expect(html).not.toMatch(/posture\/stream[^"]*token=/);
+    // And no ?token= query is ever constructed for any stream URL.
+    expect(html).not.toContain('"/api/posture/stream?token=');
+  });
+
+  it("degrades to honest polling on mint failure / 401 / expiry - the mint never throws and reconnect re-mints", () => {
+    const html = renderPostureHomeHTML();
+    const mStart = html.indexOf("function mintStreamSession()");
+    const mEnd = html.indexOf("function esc(");
+    const mintFn = html.slice(mStart, mEnd);
+    // A non-ok mint response (e.g. 401) resolves to "" rather than throwing, so
+    // the caller falls through to opening the bare stream and the existing
+    // onerror -> scheduleReconnect -> startPolling path keeps the board honest.
+    expect(mintFn).toContain("if (!r.ok) return");
+    // Both the network-reject and json-parse-reject branches resolve to "".
+    expect(mintFn).toContain('function () { return ""; }');
+    // The reconnect path keeps polling while disconnected (honest staleness) and
+    // re-enters connectStream (which re-mints), handling session expiry.
+    const sStart = html.indexOf("function scheduleReconnect()");
+    expect(sStart).toBeGreaterThan(-1);
+    const sEnd = html.indexOf("function connectStream()");
+    expect(sEnd).toBeGreaterThan(sStart);
+    const sFn = html.slice(sStart, sEnd);
+    expect(sFn).toContain("startPolling()");
+    expect(sFn).toContain("connectStream()");
+  });
+
+  it("uses no em-dashes in the handshake client source", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function hasSessionCookie()");
+    const end = html.indexOf("function esc(");
+    const region = html.slice(start, end);
+    expect(region).not.toContain("—");
+  });
+});
