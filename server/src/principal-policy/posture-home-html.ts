@@ -20,6 +20,40 @@
  * `generateDashboardHTML`).
  */
 
+import type { FeatureHealthStatus } from "./feature-health.js";
+
+/**
+ * "Never fake green" for the feature-health panel, as a PURE mapper so the
+ * honesty contract is unit-testable without a browser. The color model is the
+ * one the feature-health endpoint already emits (`feature-health.ts`): GREEN is
+ * earned ONLY by `active` (fresh evidence for self-reporting features, or real
+ * activity for event-driven ones). `fault` is red. `unconfirmed` and `unknown`
+ * are amber and MUST NEVER render green - that is the #617/#634 invariant the
+ * endpoint enforces and the surface must not weaken.
+ *
+ * The client-side `renderFeatureHealth` function below embeds the exact same
+ * mapping (the page is a self-contained string); this exported function is the
+ * canonical definition the renderer mirrors and the tests pin, so a future edit
+ * that introduced a green path for a non-`active` status would fail a test.
+ */
+export function featureHealthPill(status: FeatureHealthStatus): {
+  cls: "green" | "amber" | "red";
+  label: string;
+} {
+  switch (status) {
+    case "active":
+      return { cls: "green", label: "active" };
+    case "fault":
+      return { cls: "red", label: "fault" };
+    case "unconfirmed":
+      return { cls: "amber", label: "unconfirmed" };
+    case "unknown":
+    default:
+      // Fail closed: any unrecognized status is non-green by construction.
+      return { cls: "amber", label: "unknown" };
+  }
+}
+
 export function renderPostureHomeHTML(): string {
   // Inline everything (no external assets) so the page works on a locked-down
   // loopback dashboard with a strict CSP and no network egress.
@@ -71,6 +105,11 @@ export function renderPostureHomeHTML(): string {
   a:hover { text-decoration: underline; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
   .story-line { margin: 4px 0; }
+  .fh-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .fh-row:last-child { border-bottom: 0; }
+  .fh-row .name { flex: 1; }
+  .fh-row .why { color: var(--muted); font-size: 12px; }
+  .fh-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
   .footer {
     margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
     border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
@@ -118,6 +157,11 @@ export function renderPostureHomeHTML(): string {
   <section>
     <h2>Castle Wall</h2>
     <div class="panel" id="wall"><span class="empty">Loading…</span></div>
+  </section>
+
+  <section>
+    <h2>Security features</h2>
+    <div class="panel" id="features"><span class="empty">Loading…</span></div>
   </section>
 
   <div class="footer">
@@ -172,6 +216,64 @@ export function renderPostureHomeHTML(): string {
     if (row.policy_protected && row.enforcement_active !== "active")
       return '<span class="pill amber">protection requested</span>';
     return '<span class="pill red">not enforcing</span>';
+  }
+
+  // "Never fake green" for the feature-health panel. Mirrors the canonical
+  // pure mapper exported from this module (featureHealthPill). GREEN is earned
+  // ONLY by "active"; "fault" is red; "unconfirmed" and "unknown" are amber and
+  // are NEVER green. This is the same color model the /api/posture/feature-health
+  // endpoint enforces (feature-health.ts) - the surface must not weaken it.
+  function featurePill(status) {
+    if (status === "active") return '<span class="pill green">active</span>';
+    if (status === "fault") return '<span class="pill red">fault</span>';
+    if (status === "unconfirmed") return '<span class="pill amber">unconfirmed</span>';
+    return '<span class="pill amber">unknown</span>';
+  }
+
+  // Plain-English reason copy, derived from the endpoint's stable basis enum.
+  // Never leaks rule internals; phrases the honest non-green cases plainly.
+  function featureWhy(row) {
+    switch (row.basis) {
+      case "fresh_enforcement_evidence":
+        return "Confirmed by fresh enforcement evidence.";
+      case "activity_in_window":
+        return "Activity observed in the last 24h.";
+      case "fault_evidence":
+        return "A fault event was observed; not enforcing.";
+      case "stale_evidence":
+        return "Evidence is stale; recent state cannot be confirmed.";
+      case "no_evidence_self_reporting":
+        return "No recent evidence; working state cannot be confirmed.";
+      case "no_activity_event_driven":
+        return row.broken_zero_detectable === false
+          ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
+          : "No activity in the window.";
+      case "integrity_tainted":
+        return "Audit integrity finding present; status cannot be trusted.";
+      case "freshness_scan_incomplete":
+        return "Recent-evidence scan could not be proven complete; not shown green by design.";
+      default:
+        return "";
+    }
+  }
+
+  function renderFeatures(panel) {
+    var el = document.getElementById("features");
+    if (!panel || !panel.rows || !panel.rows.length) {
+      el.innerHTML = '<span class="empty">No feature-health data.</span>';
+      return;
+    }
+    var rows = panel.rows.map(function (r) {
+      return '<div class="fh-row">' + featurePill(r.status) +
+        '<span class="name">' + esc(r.label) + "</span>" +
+        '<span class="why">' + esc(featureWhy(r)) + "</span></div>";
+    }).join("");
+    var note = (panel.disclosure && panel.disclosure.broken_zero_undetectable_for_event_driven)
+      ? '<div class="fh-note">For activity-only features, a feature that was silently turned off cannot be ' +
+        'distinguished from one that is simply quiet, so quiet reads as unconfirmed (never green). ' +
+        'A feature only reads active on real evidence in the window.</div>'
+      : "";
+    el.innerHTML = rows + note;
   }
 
   function renderBanner(home, pending, anomalies) {
@@ -310,6 +412,7 @@ export function renderPostureHomeHTML(): string {
           renderStory(home.digest);
           renderAnomalies(findings);
           renderWall(home.castle_wall);
+          renderFeatures(home.feature_health);
         });
       })
       .catch(function (e) {

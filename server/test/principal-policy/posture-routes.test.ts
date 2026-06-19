@@ -162,10 +162,18 @@ describe("posture route layer", () => {
     expect(broker.status).toBe("unconfirmed");
     expect(panel.disclosure.broken_zero_undetectable_for_event_driven).toBe(true);
 
-    // The home payload carries the same panel.
+    // The home payload carries the same panel, so the Home surface can render
+    // the feature-health rows without a second fetch (Slice 2).
     const homeRes = await fetch(`${base}${POSTURE_API_PREFIX}/home`);
     const home = await homeRes.json();
     expect(home.feature_health.rows.length).toBe(panel.rows.length);
+    // Each row carries a status the surface maps to a chip; a quiet event-driven
+    // feature is honestly non-green ("unconfirmed"), never reported as active.
+    const homeBroker = home.feature_health.rows.find(
+      (r: { feature_id: string }) => r.feature_id === "secret_broker",
+    );
+    expect(homeBroker.status).toBe("unconfirmed");
+    expect(homeBroker.status).not.toBe("active");
   });
 
   it("serves per-agent reach (G5) and 404s an unknown agent", async () => {
