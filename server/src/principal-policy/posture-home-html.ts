@@ -774,12 +774,13 @@ export function renderPostureHomeHTML(): string {
     if (!supportsSSE) { startPolling(); return; }
     if (es) { try { es.close(); } catch (e) {} es = null; }
     var url = "/api/posture/stream";
-    // EventSource cannot set an Authorization header; same-origin loopback
-    // auto-auth (or the session cookie) carries the credential, matching the
-    // rest of this page's same-origin fetches. When a bearer token was pasted
-    // in the URL hash, pass it as a query param the server's auth gate accepts
-    // for the stream the same way it does for the page.
-    if (token) url += "?token=" + encodeURIComponent(token);
+    // EventSource cannot set an Authorization header, so the stream authenticates
+    // via same-origin loopback auto-auth or the session cookie (withCredentials
+    // sends it). We deliberately do NOT append the long-lived token as a query
+    // param: checkAuth rejects ?token= (SEC-012, to keep tokens out of access
+    // logs, proxy logs, and browser history). In a remote token-hash session with
+    // no cookie the stream stays unauthenticated and the page degrades to polling
+    // (honest), pending a short-lived ?session= handshake (follow-up).
     try {
       es = new EventSource(url, { withCredentials: true });
     } catch (e) {
