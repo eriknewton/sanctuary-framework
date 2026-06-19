@@ -18,6 +18,10 @@
  *   GET /api/posture/digest      - G2 (today's audit story).
  *   GET /api/posture/unwrapped   - G1 (detected-but-unwrapped roster).
  *   GET /api/posture/reach/:id   - G5 (per-agent effective reach).
+ *   GET /api/posture/stream      - SSE live-refresh: pushes the SAME `buildHome`
+ *                                  payload as `/home` on a cadence + heartbeat
+ *                                  (additive, behind the same checkAuth +
+ *                                  audit-null guards; concurrency-capped).
  *   GET /api/posture/custody-exit - Slice 3 (Custody + Exit panel).
  *   GET /api/posture/composition - Recognition precursor: the composition render
  *                                  gate flag (config, NOT evidence-gated). Carries
@@ -47,7 +51,6 @@ import {
   type AuditDigest,
   type UnwrappedRoster,
   type AgentEffectiveReach,
-  type PostureAgentRow,
   type CustodyExitPanel,
 } from "./posture.js";
 import {
@@ -66,9 +69,25 @@ import {
 } from "../query-anonymity/query-anonymity-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
+import {
+  handlePostureStream,
+  type PostureStreamRegistry,
+} from "./posture-stream.js";
+// `PostureHome` lives in a neutral type module so `posture-stream.ts` can import
+// the payload shape without closing a `posture-routes` <-> `posture-stream`
+// cycle (this module imports the stream handler above).
+import type { PostureHome } from "./posture-home-types.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
+/**
+ * SSE live-refresh stream path (additive, Phase 2): `/api/posture/stream`.
+ * Pushes the SAME `buildHome` payload as `/api/posture/home` on a cadence plus
+ * a heartbeat. Mounted behind the SAME checkAuth gate + audit-null 503 guard as
+ * the rest of the posture API. Exported so the dashboard can classify it as a
+ * long-lived view route (rate-limit exempt), mirroring the v1.0 `/events` stream.
+ */
+export const POSTURE_STREAM_PATH = `${POSTURE_API_PREFIX}/stream`;
 /**
  * Per-agent drill-down HTML page prefix (Slice 4): `/posture/agent/:id`. The
  * page is a static shell that fetches `/api/posture/reach/:id` (G5) and
@@ -136,6 +155,24 @@ export interface PostureRouteDeps {
    * exclusive with a non-null `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /**
+   * Shared active-stream registry for the SSE live-refresh endpoint
+   * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
+   * enforced across all open streams on the server. When ABSENT, the stream
+   * endpoint is disabled (404 within the namespace) and the page falls back to
+   * its poll loop - the endpoint is purely additive, so an unwired dashboard
+   * simply has no live stream rather than a broken one.
+   */
+  streamRegistry?: PostureStreamRegistry;
+  /** Override the SSE push cadence (ms). Tests inject a deterministic value. */
+  streamIntervalMs?: number;
+  /** Override the SSE heartbeat cadence (ms). Tests inject a deterministic value. */
+  streamHeartbeatMs?: number;
+  /** Override the concurrent-stream cap. Tests inject a small value to exercise it. */
+  streamMaxConcurrent?: number;
+  /** Injectable timer hooks so tests can drive the stream cadence synchronously. */
+  streamSetInterval?: (handler: () => void, ms: number) => NodeJS.Timeout;
+  streamClearInterval?: (handle: NodeJS.Timeout) => void;
 }
 
 /**
@@ -241,6 +278,43 @@ export async function handlePostureRoute(
       error: "posture_unavailable",
       reason: "audit log not unlocked; posture cannot be evidenced",
       origin_machine: om,
+    });
+    return true;
+  }
+
+  // SSE live-refresh stream (additive, Phase 2). Reaches here only AFTER the
+  // audit-null 503 guard above, so the stream is never opened against a locked
+  // audit log (it would otherwise have to fabricate a green-or-empty payload).
+  // It pushes the SAME `buildHome` payload as `/home` on a cadence plus a
+  // heartbeat, with a concurrency cap + per-connection cleanup in the stream
+  // handler. Disabled (404 within the namespace) when no registry is wired, so
+  // the page falls back to polling. NOTE: this branch is deliberately OUTSIDE the
+  // try/catch below - the handler owns its own try/catch and, once the SSE head
+  // is written, an error must not also try to write a JSON 500 onto the same
+  // already-sent response.
+  if (method === "GET" && path === POSTURE_STREAM_PATH) {
+    if (!deps.streamRegistry) {
+      writeJSON(res, 404, { error: "not_found", origin_machine: om });
+      return true;
+    }
+    await handlePostureStream(res, {
+      buildHome: () => buildHome(deps),
+      registry: deps.streamRegistry,
+      ...(deps.streamIntervalMs !== undefined
+        ? { intervalMs: deps.streamIntervalMs }
+        : {}),
+      ...(deps.streamHeartbeatMs !== undefined
+        ? { heartbeatMs: deps.streamHeartbeatMs }
+        : {}),
+      ...(deps.streamMaxConcurrent !== undefined
+        ? { maxConcurrent: deps.streamMaxConcurrent }
+        : {}),
+      ...(deps.streamSetInterval !== undefined
+        ? { setIntervalFn: deps.streamSetInterval }
+        : {}),
+      ...(deps.streamClearInterval !== undefined
+        ? { clearIntervalFn: deps.streamClearInterval }
+        : {}),
     });
     return true;
   }
@@ -458,46 +532,11 @@ function buildReach(
   });
 }
 
-export interface PostureHome {
-  origin_machine: string;
-  castle_wall: CastleWallPosture;
-  digest: AuditDigest;
-  unwrapped: UnwrappedRoster;
-  /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
-  feature_health: FeatureHealthPanel;
-  /**
-   * Custody & Exit posture (Slice 3). Custody is never green (amber unconfirmed
-   * or red damaged); exit is the honest CLI-gated export capability without a
-   * clean-exit guarantee.
-   */
-  custody_exit: CustodyExitPanel;
-  /**
-   * Query-privacy posture (Phase 2, Opacity principle 4). Tier A header-strip
-   * count (metadata hygiene, NOT anonymity) from real audit evidence, plus the
-   * Tier B PII-rewrite state (never green from config; `unconfirmed` until the
-   * deferred rewrite emitter wiring lands).
-   */
-  query_privacy: QueryPrivacySection;
-  /**
-   * Count of agents the operator has REQUESTED protection for (policy intent).
-   * This is the honest banner number: it counts policy_protected, NOT confirmed
-   * enforcement. Renamed in intent from the old flat "protected" count, which
-   * implied enforcement it could not prove (#634 fake-green fix).
-   */
-  protection_requested_count: number;
-  /**
-   * Count of agents with CONFIRMED live enforcement (`enforcement_active ===
-   * "active"`). `0` today: no per-agent enforcement signal exists yet, so the
-   * banner never overstates confirmed enforcement.
-   */
-  enforcement_confirmed_count: number;
-  /**
-   * Derived agent rows carrying the honest policy-vs-enforcement split (#634).
-   * Replaces the raw `LocalAgentRecord[]`: the UI must render green only on
-   * confirmed enforcement, amber on policy-only protection.
-   */
-  agents: PostureAgentRow[];
-}
+// `PostureHome` is defined in `./posture-home-types.js` (imported above) so the
+// SSE stream handler can share the payload shape without a `posture-routes` <->
+// `posture-stream` cycle. Re-exported here to preserve the historical import
+// site (`import type { PostureHome } from "./posture-routes.js"`).
+export type { PostureHome };
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const [castleWall, digest, unwrapped, featureHealth, custodyExit] =

@@ -8,8 +8,17 @@
  * data-sovereignty affordances lead; agent-welfare content is deliberately
  * absent from Home (it lives in the agent drill-down's secondary section).
  *
- * The page polls the Phase-1 endpoints (no SSE in standalone mode yet) and
- * authenticates via the same loopback/bearer model as the rest of the
+ * Live refresh (Phase 2, additive): the page subscribes to the SSE stream at
+ * `/api/posture/stream`, which pushes the SAME `buildHome` payload on a cadence
+ * plus a heartbeat. On a drop, error, or staleness the page reconnects (capped
+ * backoff) AND falls back to polling, so it keeps working exactly as before if
+ * SSE never connects (progressive enhancement). The connection indicator is the
+ * honesty surface (#617): "Live" (green dot) is shown ONLY when a fresh frame
+ * arrived inside the staleness window; any drop or silence flips it to
+ * "Reconnecting…" (amber) while keeping a "last updated <time>" so a stale view
+ * can never be mistaken for a live green-all-well.
+ *
+ * The page authenticates via the same loopback/bearer model as the rest of the
  * dashboard. Every tile drills to evidence: counts link into the audit feed,
  * the wall panel exposes its evidence basis, reach links to the per-agent
  * reach endpoint. "Never fake green" is enforced in the renderer — the banner
@@ -184,12 +193,26 @@ export function renderPostureHomeHTML(): string {
     border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
   }
   button.guided:hover { border-color: var(--accent); }
+  /* Live-refresh connection indicator. The dot color is the at-a-glance honesty
+     signal: green = a fresh frame arrived inside the staleness window; amber =
+     reconnecting / no recent frame (the data on screen may be stale). It is
+     NEVER green merely because a stream socket is open. */
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .conn.live .dot { background: var(--green); }
+  .conn.reconnecting .dot { background: var(--amber); }
+  .conn .updated { color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>Sanctuary — Sovereignty Posture</h1>
   <div class="sub" id="origin">Loading…</div>
+  <div class="conn" id="conn">
+    <span class="dot"></span>
+    <span id="conn-label">Connecting…</span>
+    <span class="updated" id="conn-updated"></span>
+  </div>
 </header>
 <main>
   <div class="banner" id="banner"><span class="empty">Loading posture…</span></div>
@@ -602,35 +625,201 @@ export function renderPostureHomeHTML(): string {
       (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present — arm-state read may be incomplete.</div>');
   }
 
-  function load() {
-    api("/api/posture/home")
-      .then(function (home) {
-        // Pending approvals + anomaly findings come from existing endpoints.
-        Promise.all([
-          api("/api/pending").catch(function () { return { pending: [] }; }),
-          api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
-        ]).then(function (rest) {
-          var pending = rest[0].pending || rest[0] || [];
-          var findings = rest[1].findings || rest[1] || [];
-          renderBanner(home, pending, findings);
-          renderAgents(home);
-          renderApprovals(pending);
-          renderStory(home.digest);
-          renderAnomalies(findings);
-          renderWall(home.castle_wall);
-          renderFeatures(home.feature_health);
-          renderCustodyExit(home.custody_exit);
-          renderQueryPrivacy(home.query_privacy);
-        });
-      })
+  // ── Render the whole board from one honest home payload ─────────────────
+  // Both the SSE live path and the poll fallback call this with the SAME shape,
+  // so there is ONE rendering path and no second, weaker green model. The
+  // pending-approvals + anomaly findings come from the existing endpoints (not
+  // carried on the home payload), so the caller passes the most recent values it
+  // has; both default to empty arrays when never fetched.
+  function renderHome(home, pending, findings) {
+    pending = pending || [];
+    findings = findings || [];
+    renderBanner(home, pending, findings);
+    renderAgents(home);
+    renderApprovals(pending);
+    renderStory(home.digest);
+    renderAnomalies(findings);
+    renderWall(home.castle_wall);
+    renderFeatures(home.feature_health);
+    renderCustodyExit(home.custody_exit);
+    renderQueryPrivacy(home.query_privacy);
+  }
+
+  // ── Honest connection indicator (#617) ──────────────────────────────────
+  // The single most important honesty rule on this surface: a stale view must
+  // NEVER be mistaken for a live green-all-well. The indicator has exactly two
+  // colors: "live" (green dot) is shown ONLY when a fresh frame arrived inside
+  // the staleness window; any drop, error, or simply going quiet past the window
+  // flips it to "reconnecting" (amber dot) and keeps the "last updated <time>"
+  // so the operator can see the data on screen may be stale. The tile colors
+  // (wall pill, agent pills, etc.) are NEVER touched here - they keep whatever
+  // honest value the last real frame produced - but the connection banner makes
+  // the freshness of that frame unmistakable.
+  var lastFrameAt = null; // ms epoch of the last successful render, or null.
+  // If no fresh frame arrives within this window, the view is treated as stale
+  // even if a socket is nominally open. Comfortably larger than the server push
+  // cadence (5s) + heartbeat (15s) so a single missed tick is not flapped.
+  var STALENESS_WINDOW_MS = 20000;
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function fmtTime(ms) {
+    var d = new Date(ms);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function setConn(stateName) {
+    var el = document.getElementById("conn");
+    var label = document.getElementById("conn-label");
+    var updated = document.getElementById("conn-updated");
+    if (!el || !label || !updated) return;
+    el.classList.remove("live", "reconnecting");
+    if (stateName === "live") {
+      el.classList.add("live");
+      label.textContent = "Live";
+    } else {
+      // reconnecting / connecting / stale all read as "reconnecting" amber so a
+      // stale screen can never look like a healthy live one.
+      el.classList.add("reconnecting");
+      label.textContent = "Reconnecting…";
+    }
+    updated.textContent = lastFrameAt
+      ? " · last updated " + fmtTime(lastFrameAt)
+      : " · no data received yet";
+  }
+  // Watchdog: if the last fresh frame is older than the staleness window, force
+  // the indicator to "reconnecting" regardless of socket state. This is what
+  // makes silence honest - an open-but-quiet socket cannot keep a green "Live".
+  function tickStaleness() {
+    if (lastFrameAt === null) return;
+    if (Date.now() - lastFrameAt > STALENESS_WINDOW_MS) setConn("reconnecting");
+  }
+  setInterval(tickStaleness, 3000);
+
+  // ── Auxiliary fetches (pending approvals + anomaly findings) ────────────
+  // Not carried on the home payload, so refreshed alongside each home frame.
+  // Failures degrade to empty (never block the home render); these are honest
+  // empties, not green claims.
+  var lastPending = [];
+  var lastFindings = [];
+  function refreshAuxiliary() {
+    return Promise.all([
+      api("/api/pending").catch(function () { return { pending: [] }; }),
+      api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
+    ]).then(function (rest) {
+      lastPending = rest[0].pending || rest[0] || [];
+      lastFindings = rest[1].findings || rest[1] || [];
+    });
+  }
+
+  // Apply a fresh home payload: refresh auxiliaries, render, stamp the frame
+  // time, and mark the connection Live. This is the ONLY place lastFrameAt is
+  // advanced, so the "Live" indicator is earned by a real, fully-rendered frame.
+  function applyHome(home) {
+    return refreshAuxiliary().then(function () {
+      renderHome(home, lastPending, lastFindings);
+      lastFrameAt = Date.now();
+      setConn("live");
+    });
+  }
+
+  // ── Poll fallback (progressive enhancement) ─────────────────────────────
+  // Used when EventSource is unavailable in the browser, OR while the SSE
+  // stream is down (so the board keeps updating even with no live stream). The
+  // page therefore works exactly as before if SSE never connects. A failed poll
+  // surfaces an honest error in the banner and leaves the indicator amber.
+  function pollOnce() {
+    return api("/api/posture/home")
+      .then(function (home) { return applyHome(home); })
       .catch(function (e) {
+        setConn("reconnecting");
         document.getElementById("banner").innerHTML =
           '<span class="err">Could not load posture: ' + esc(e.message) + "</span>";
       });
   }
 
-  load();
-  setInterval(load, 15000); // poll; SSE parity is Phase 2
+  var pollTimer = null;
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollOnce();
+    pollTimer = setInterval(pollOnce, 15000);
+  }
+  function stopPolling() {
+    if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ── SSE live stream with reconnect-and-restore ──────────────────────────
+  // Mirrors the v1.1 dashboard reconnect pattern: on error, close the source,
+  // schedule a reconnect via reconnectTimer (capped backoff, never a tight
+  // loop), and fall back to polling in the meantime so the board still updates.
+  // An "error" event from the server (a failed buildHome read) is treated like
+  // a drop - the indicator goes amber, the stale data is never relabeled fresh.
+  var es = null;
+  var reconnectTimer = null;
+  var reconnectDelayMs = 1000;
+  var RECONNECT_MAX_MS = 30000;
+  var supportsSSE = typeof window !== "undefined" && "EventSource" in window;
+
+  function scheduleReconnect() {
+    setConn("reconnecting");
+    // Keep polling while disconnected so the board stays current (and honest:
+    // each poll advances lastFrameAt only on success).
+    startPolling();
+    if (reconnectTimer !== null) return;
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+      connectStream();
+    }, reconnectDelayMs);
+  }
+
+  function connectStream() {
+    if (!supportsSSE) { startPolling(); return; }
+    if (es) { try { es.close(); } catch (e) {} es = null; }
+    var url = "/api/posture/stream";
+    // EventSource cannot set an Authorization header, so the stream authenticates
+    // via same-origin loopback auto-auth or the session cookie (withCredentials
+    // sends it). We deliberately do NOT append the long-lived token as a query
+    // param: checkAuth rejects ?token= (SEC-012, to keep tokens out of access
+    // logs, proxy logs, and browser history). In a remote token-hash session with
+    // no cookie the stream stays unauthenticated and the page degrades to polling
+    // (honest), pending a short-lived ?session= handshake (follow-up).
+    try {
+      es = new EventSource(url, { withCredentials: true });
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    es.addEventListener("home", function (ev) {
+      var home;
+      try { home = JSON.parse(ev.data); } catch (e) { return; }
+      // A good frame: stop the poll fallback (the stream is healthy), reset the
+      // backoff, render, and mark Live.
+      reconnectDelayMs = 1000;
+      stopPolling();
+      applyHome(home);
+    });
+    // Server-emitted honest failure frame (buildHome read failed). Do NOT render
+    // anything - keep the last data but flip the indicator to reconnecting so the
+    // operator knows it is not fresh. The watchdog will keep it amber.
+    es.addEventListener("error", function () {
+      // EventSource fires 'error' both for server "error" events and for socket
+      // drops; in both cases the honest action is the same: go amber + reconnect.
+      setConn("reconnecting");
+    });
+    es.onerror = function () {
+      // Transport-level drop. Close and reconnect with backoff + poll fallback.
+      if (es) { try { es.close(); } catch (e) {} es = null; }
+      scheduleReconnect();
+    };
+  }
+
+  // ── Boot ────────────────────────────────────────────────────────────────
+  // Progressive enhancement: render once immediately (so the page is correct on
+  // first paint even before the stream connects), then attach the live stream.
+  // If SSE is unavailable, this degrades to the prior poll-only behavior.
+  setConn("reconnecting");
+  pollOnce().then(function () {
+    if (supportsSSE) connectStream();
+    else startPolling();
+  });
 })();
 </script>
 </body>
