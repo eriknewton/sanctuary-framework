@@ -435,9 +435,18 @@ export function renderPostureHomeHTML(): string {
   // that is unconfirmed until its emitter is wired into the live call path.
   function queryPrivacyWhy(row) {
     if (row.tier === "A") {
-      return row.status === "active"
-        ? "Fingerprintable headers were stripped on outbound calls in the last 24h."
-        : "No outbound calls observed in the last 24h, so the strip cannot be confirmed from evidence. Shown amber, never green.";
+      // Key the copy on the honesty discriminator, NOT just the status, so the
+      // three Tier-A cases each read distinctly (#617). Green active means
+      // headers were actually stripped; calls-but-nothing-to-strip and no-calls
+      // are both amber but say plainly that NO stripping happened, so a viewer
+      // can never read a 0-stripped window as stripping-happened.
+      if (row.tier_a_evidence === "stripped") {
+        return "Fingerprintable headers were stripped on outbound calls in the last 24h.";
+      }
+      if (row.tier_a_evidence === "none_to_strip") {
+        return "Outbound calls were observed, but none carried a fingerprintable header to strip, so nothing was stripped in the last 24h. Shown amber, never green.";
+      }
+      return "No outbound calls observed in the last 24h, so the strip cannot be confirmed from evidence. Shown amber, never green.";
     }
     return "Off by default. PII rewrite is not yet wired into the live call path, so it reads unconfirmed until a real rewrite fires. It is never shown green from configuration alone.";
   }

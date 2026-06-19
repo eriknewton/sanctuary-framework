@@ -229,6 +229,49 @@ describe("posture route layer", () => {
     expect(res.status).toBe(404);
   });
 
+  it("GET /api/posture/composition reports the gate flag ON when composition is enabled", async () => {
+    const base = await serve({
+      ...baseDeps(newLog(), []),
+      compositionEnabled: true,
+    });
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/composition`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.composition_enabled).toBe(true);
+    expect(body.origin_machine).toBe(FORTRESS);
+    // ONLY the gate flag + origin_machine - no Concordia/Verascore data.
+    expect(Object.keys(body).sort()).toEqual(
+      ["composition_enabled", "origin_machine"].sort(),
+    );
+  });
+
+  it("GET /api/posture/composition reports OFF (honest default) when the flag is absent/false", async () => {
+    // Absent compositionEnabled is treated as the honest default-off; the flag is
+    // config, never evidence, so `false` is the truthful answer, not amber.
+    const baseOff = await serve(baseDeps(newLog(), []));
+    const offRes = await fetch(`${baseOff}${POSTURE_API_PREFIX}/composition`);
+    expect(offRes.status).toBe(200);
+    expect((await offRes.json()).composition_enabled).toBe(false);
+
+    const baseExplicit = await serve({
+      ...baseDeps(newLog(), []),
+      compositionEnabled: false,
+    });
+    const explicitRes = await fetch(
+      `${baseExplicit}${POSTURE_API_PREFIX}/composition`,
+    );
+    expect((await explicitRes.json()).composition_enabled).toBe(false);
+  });
+
+  it("GET /api/posture/composition is config, not evidence: served even when the audit log is locked", async () => {
+    // The gate flag carries no audit-derived evidence, so a locked vault must NOT
+    // 503 it (unlike the evidence-bearing posture routes).
+    const base = await serve({ ...baseDeps(null, []), compositionEnabled: true });
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/composition`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).composition_enabled).toBe(true);
+  });
+
   it("returns 400 (not 500) for a malformed percent-encoded agent id, with origin_machine", async () => {
     const base = await serve(baseDeps(newLog(), []));
     // %ZZ is not valid percent-encoding; decodeURIComponent throws.

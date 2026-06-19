@@ -19,6 +19,10 @@
  *   GET /api/posture/unwrapped   - G1 (detected-but-unwrapped roster).
  *   GET /api/posture/reach/:id   - G5 (per-agent effective reach).
  *   GET /api/posture/custody-exit - Slice 3 (Custody + Exit panel).
+ *   GET /api/posture/composition - Recognition precursor: the composition render
+ *                                  gate flag (config, NOT evidence-gated). Carries
+ *                                  NO Concordia/Verascore data - only the flag and
+ *                                  origin_machine. Behind the SAME checkAuth gate.
  *   GET /posture                 - the posture home HTML.
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  */
@@ -83,6 +87,16 @@ export interface PostureRouteDeps {
   auditLog: AuditLog | null;
   /** Origin-machine attribution for `/v1`-compatible shapes. */
   originMachine: string;
+  /**
+   * Recognition precursor: the resolved `composition_enabled` flag (default-off
+   * via `resolveCompositionConfig()`). This is CONFIG, not evidence: it is the
+   * render gate the Recognition panel will key on so the panel is absent (never
+   * implies a Concordia/Verascore dependency) when composition is off. Resolved
+   * by the dashboard and passed through verbatim; the route exposes ONLY the
+   * boolean + origin_machine, never any Concordia/Verascore data. Optional;
+   * absent is treated as `false` (honest default-off).
+   */
+  compositionEnabled?: boolean;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
   /**
@@ -202,6 +216,22 @@ export async function handlePostureRoute(
   // Every error payload carries origin_machine too, so the `/v1`-compatible
   // shape constraint ("every payload") holds on the unhappy paths as well.
   const om = deps.originMachine;
+
+  // Composition gate flag (Recognition precursor). This is CONFIG, not evidence:
+  // the Recognition panel keys its render on this flag so the panel is ABSENT
+  // (never implies a Concordia/Verascore dependency) when composition is off.
+  // Deliberately served BEFORE the audit-log unlock gate below: it carries no
+  // audit-derived evidence, so an honest config flag must not 503 just because
+  // the audit log is locked. The payload is ONLY `{ composition_enabled,
+  // origin_machine }` - no Concordia/Verascore data, no score, no fetch. Honest:
+  // `false` when off (the default), which is config, not absence-of-evidence.
+  if (method === "GET" && path === `${POSTURE_API_PREFIX}/composition`) {
+    writeJSON(res, 200, {
+      composition_enabled: deps.compositionEnabled === true,
+      origin_machine: om,
+    });
+    return true;
+  }
 
   // Every JSON posture route needs the audit log to be unlocked. Without it we
   // cannot prove enforcement or count operations - fail closed to a 503 that
