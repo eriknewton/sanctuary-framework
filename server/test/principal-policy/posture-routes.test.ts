@@ -189,6 +189,61 @@ describe("posture route layer", () => {
     expect(missing.status).toBe(404);
   });
 
+  it("reach reports enforcement_confirmed=false when enforcement is not confirmed (#641)", async () => {
+    // The default per-agent read has no live enforcement signal, so the reach
+    // payload must say enforcement is NOT confirmed - the renderer keys all
+    // OS-enforcement coloring + the default-deny claim on this flag.
+    const base = await serve(baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]));
+    const reach = await (await fetch(`${base}${POSTURE_API_PREFIX}/reach/a1`)).json();
+    expect(reach.enforcement_confirmed).toBe(false);
+    // A configured wall rule is present (the test override supplies one), but
+    // enforcement is still not confirmed: configured != enforced.
+    expect(reach.has_wall_policy).toBe(true);
+  });
+
+  it("with no enabled curated manifest, reach reports the honest no-wall gap, not a fabricated default-deny (#641)", async () => {
+    // Build deps WITHOUT a listReachRules override and WITHOUT enabled curated
+    // rule ids - the production default-off shape. The curated catalog must NOT
+    // be mapped wholesale into a fabricated kernel-enforced default-deny.
+    const deps: PostureRouteDeps = {
+      auditLog: newLog(),
+      originMachine: FORTRESS,
+      listAgents: () => [wrappedAgent("a1", "claude_code")],
+      detectInstalledHarnesses: async () => [],
+      platform: "darwin",
+    };
+    const base = await serve(deps);
+    const reach = await (await fetch(`${base}${POSTURE_API_PREFIX}/reach/a1`)).json();
+    // No enabled ruleset readable => honest red gap, never a default-deny claim.
+    expect(reach.has_wall_policy).toBe(false);
+    expect(reach.default_deny).toBe(false);
+    expect(reach.destinations).toHaveLength(0);
+    expect(reach.enforcement_confirmed).toBe(false);
+  });
+
+  it("reach sources rules from the operator's ENABLED curated ids, not the whole catalog (#641)", async () => {
+    // When the operator has enabled exactly one curated rule, reach reflects
+    // that one rule - never the full curated set. Rules on disk are still only
+    // CONFIGURATION (enforcement_confirmed stays false).
+    const deps: PostureRouteDeps = {
+      auditLog: newLog(),
+      originMachine: FORTRESS,
+      listAgents: () => [wrappedAgent("a1", "claude_code")],
+      detectInstalledHarnesses: async () => [],
+      listEnabledCuratedRuleIds: () => ["curated-anthropic-api"],
+      platform: "darwin",
+    };
+    const base = await serve(deps);
+    const reach = await (await fetch(`${base}${POSTURE_API_PREFIX}/reach/a1`)).json();
+    expect(reach.has_wall_policy).toBe(true);
+    const dests = reach.destinations.map((d: { destination: string }) => d.destination);
+    expect(dests).toContain("api.anthropic.com");
+    // The non-enabled curated entries (e.g. OpenAI) must NOT appear.
+    expect(dests).not.toContain("api.openai.com");
+    // Still configuration, not confirmed enforcement.
+    expect(reach.enforcement_confirmed).toBe(false);
+  });
+
   it("serves the per-agent drill-down HTML at /posture/agent/:id (Slice 4)", async () => {
     const base = await serve(baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]));
     const res = await fetch(`${base}${POSTURE_AGENT_PATH_PREFIX}a1`);

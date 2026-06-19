@@ -36,7 +36,7 @@ import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
-import { CURATED_ALLOWLIST } from "../castle-wall/runtime/curated-allowlist.js";
+import { resolveCuratedRules } from "../castle-wall/runtime/curated-allowlist.js";
 import {
   buildCastleWallPosture,
   buildAuditDigest,
@@ -125,6 +125,18 @@ export interface PostureRouteDeps {
    * this later without changing the shape. Optional override for tests.
    */
   listReachRules?: () => ReachRule[];
+  /**
+   * The curated rule ids the operator has ACTUALLY enabled on disk (#641). The
+   * default `curatedReachRules()` shaper sources reach lines from these ids via
+   * `resolveCuratedRules`, instead of mapping the entire curated catalog, so a
+   * never-configured fortress reports NO wall rules (an honest red gap) rather
+   * than a fabricated default-deny over the full curated set. When this returns
+   * `null` / an empty list, or when it is absent (no enabled manifest readable),
+   * the reach view shows the honest "No Castle Wall ruleset applies" gap.
+   * Resolved lazily per request so post-provision wiring is observed. Ignored
+   * when `listReachRules` is supplied (the explicit override wins, e.g. tests).
+   */
+  listEnabledCuratedRuleIds?: () => readonly string[] | null;
   /**
    * Scan for installed harnesses by config-file presence. Optional override so
    * tests inject a deterministic detection set instead of touching the real
@@ -523,12 +535,29 @@ function buildReach(
   if (!agent) return null;
   const rules = deps.listReachRules
     ? deps.listReachRules()
-    : curatedReachRules();
+    : curatedReachRules(
+        deps.listEnabledCuratedRuleIds
+          ? deps.listEnabledCuratedRuleIds()
+          : null,
+      );
+  // #641 honesty gate: derive enforcement_confirmed from the SAME per-agent
+  // signal the agent pill uses, via the canonical row shaper (single source of
+  // truth: never re-implement the policy-vs-enforcement split). Today this is
+  // always false (no per-agent live enforcement signal exists), so the reach
+  // view renders rules as configured, not as confirmed OS enforcement. Routing
+  // it through `buildPostureAgentRows` means any future per-agent enforcement
+  // probe lights up the pill AND the reach view together, with no second path.
+  const [row] = buildPostureAgentRows({
+    originMachine: deps.originMachine,
+    records: [agent],
+  });
+  const enforcementConfirmed = row?.enforcement_active === "active";
   return buildAgentReach({
     originMachine: deps.originMachine,
     agentId,
     harness: agent.harness,
     rules,
+    enforcementConfirmed,
   });
 }
 
@@ -625,25 +654,36 @@ async function scanInstalledHarnesses(
 }
 
 /**
- * Phase 1 reach rules from the curated allowlist. Every curated entry is a
- * Castle Wall (kernel-enforced) rule. When a daemon-sourced live manifest
- * becomes readable from the dashboard, this becomes the live ruleset with the
- * same shape.
+ * Reach rules from the curated allowlist, scoped to the rules the operator has
+ * ACTUALLY enabled (#641). Phase 1 read-only source for the dashboard (no daemon
+ * dependency). Curated entries are `default_enabled: false` and are NOT
+ * auto-applied at install; mapping the entire catalog would have shown
+ * never-enabled rules as an operator-enabled, kernel-enforced default-deny: the
+ * fabricated posture #641 fixes. Instead we source via `resolveCuratedRules`
+ * over the operator's enabled rule ids: an empty / null id set yields NO rules,
+ * so the reach view reports `has_wall_policy=false` and surfaces the honest red
+ * "No Castle Wall ruleset applies to this agent" gap rather than a fabricated
+ * default-deny. The `castle_wall` enforcing layer is a CONFIGURATION fact (these
+ * rules target the wall); whether the OS is actually enforcing them is gated
+ * separately by `enforcement_confirmed` on the payload.
  */
-function curatedReachRules(): ReachRule[] {
-  return CURATED_ALLOWLIST.map((entry) => {
+function curatedReachRules(
+  enabledRuleIds: readonly string[] | null,
+): ReachRule[] {
+  if (!enabledRuleIds || enabledRuleIds.length === 0) return [];
+  return resolveCuratedRules(enabledRuleIds).map((allowRule) => {
     const rule: ReachRule = {
-      rule_id: entry.rule.id,
-      disposition: entry.rule.disposition,
+      rule_id: allowRule.id,
+      disposition: allowRule.disposition,
       enforcing_layer: "castle_wall",
     };
-    const match = entry.rule.match;
+    const match = allowRule.match;
     if (match.host !== undefined) rule.host = match.host;
     if (match.host_pattern !== undefined) rule.host_pattern = match.host_pattern;
     if (match.ip !== undefined) rule.ip = match.ip;
     if (match.cidr !== undefined) rule.cidr = match.cidr;
-    if (entry.rule.scope?.agent_ids !== undefined) {
-      rule.agent_ids = entry.rule.scope.agent_ids;
+    if (allowRule.scope?.agent_ids !== undefined) {
+      rule.agent_ids = allowRule.scope.agent_ids;
     }
     return rule;
   });

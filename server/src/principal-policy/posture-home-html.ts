@@ -31,6 +31,7 @@
 
 import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
+import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
 
 /**
  * "Never fake green" + "never imply anonymity" for the Query-privacy section
@@ -341,13 +342,9 @@ export function renderPostureHomeHTML(): string {
   // green. A no-longer-protected agent (mid-unwrap, or observed not enforcing)
   // is red. This mirrors the wall pill's evidence-gated color model so the most-
   // screenshotted tile can no longer overclaim enforcement from policy intent.
-  function agentPill(row) {
-    if (row.enforcement_active === "active")
-      return '<span class="pill green">enforcement active</span>';
-    if (row.policy_protected && row.enforcement_active !== "active")
-      return '<span class="pill amber">protection requested</span>';
-    return '<span class="pill red">not enforcing</span>';
-  }
+  // The function body is the SHARED source of truth (posture-html-shared.ts) so
+  // the drill-down cannot weaken this color model independently (#641).
+  ${AGENT_PILL_FN_SOURCE}
 
   // "Never fake green" for the feature-health panel. Mirrors the canonical
   // pure mapper exported from this module (featureHealthPill). GREEN is earned
