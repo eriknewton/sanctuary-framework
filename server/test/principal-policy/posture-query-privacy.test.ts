@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildQueryPrivacySection,
   tierAStatusFromCount,
+  tierAEvidence,
   TIER_B_FEATURE_ID,
   type QueryAnonymityStatsView,
 } from "../../src/principal-policy/posture-query-privacy.js";
@@ -60,13 +61,31 @@ describe("query-privacy section - never imply anonymity", () => {
 });
 
 describe("query-privacy section - Tier A header strip honesty", () => {
-  it("green only on real strip evidence in the window", () => {
-    expect(tierAStatusFromCount(5)).toBe("active");
-    expect(tierAStatusFromCount(0)).toBe("unconfirmed");
-    expect(tierAStatusFromCount(null)).toBe("unconfirmed");
-    // Absence is never green.
-    expect(tierAStatusFromCount(0)).not.toBe("active");
-    expect(tierAStatusFromCount(null)).not.toBe("active");
+  it("green only when headers were ACTUALLY stripped in the window", () => {
+    // Green is keyed on stripped > 0, NOT calls-observed (#617).
+    expect(tierAStatusFromCount(5, 12)).toBe("active");
+    // Calls observed but nothing stripped: NEVER green (the #617 misread).
+    expect(tierAStatusFromCount(5, 0)).toBe("unconfirmed");
+    expect(tierAStatusFromCount(5, 0)).not.toBe("active");
+    // No calls / failed read: never green.
+    expect(tierAStatusFromCount(0, 0)).toBe("unconfirmed");
+    expect(tierAStatusFromCount(null, null)).toBe("unconfirmed");
+    expect(tierAStatusFromCount(0, 0)).not.toBe("active");
+    expect(tierAStatusFromCount(null, null)).not.toBe("active");
+  });
+
+  it("tierAEvidence classifies the three windows distinctly", () => {
+    expect(tierAEvidence(5, 12)).toBe("stripped");
+    expect(tierAEvidence(5, 0)).toBe("none_to_strip");
+    expect(tierAEvidence(0, 0)).toBe("no_calls");
+    expect(tierAEvidence(null, null)).toBe("no_calls");
+    // The three are mutually distinct - no two windows collapse to one class.
+    const classes = [
+      tierAEvidence(5, 12),
+      tierAEvidence(5, 0),
+      tierAEvidence(0, 0),
+    ];
+    expect(new Set(classes).size).toBe(3);
   });
 
   it("a quiet 24h window renders Tier A unconfirmed, never green", () => {
@@ -102,6 +121,57 @@ describe("query-privacy section - Tier A header strip honesty", () => {
     const tierA = section.rows.find((r) => r.tier === "A");
     expect(tierA!.status).toBe("unconfirmed");
     expect(section.header_strip_calls_24h).toBe(0);
+  });
+
+  // #617 HARD REQUIREMENT: a window where outbound calls fired but NO headers
+  // were stripped (calls > 0, stripped = 0) must be visually + semantically
+  // DISTINGUISHABLE from a window where headers were actually stripped. A viewer
+  // must never be able to mistake the 0-stripped state for "stripping happened".
+  it("the 0-headers-stripped window is distinguishable from the N>0-stripped window", () => {
+    // Window 1: 30 calls fired, but NONE carried a strippable header.
+    const noneStripped = buildQueryPrivacySection({
+      originMachine: OM,
+      headerStripStats: statsView(30, 0),
+      tierBRow: tierBRow("unconfirmed", 0),
+    });
+    // Window 2: 30 calls fired, 90 headers actually stripped.
+    const stripped = buildQueryPrivacySection({
+      originMachine: OM,
+      headerStripStats: statsView(30, 90),
+      tierBRow: tierBRow("unconfirmed", 0),
+    });
+
+    const noneRow = noneStripped.rows.find((r) => r.tier === "A")!;
+    const strippedRow = stripped.rows.find((r) => r.tier === "A")!;
+
+    // Same calls count, so the ONLY thing distinguishing them is the strip
+    // evidence - which is exactly what the honesty fix keys the green chip on.
+    expect(noneStripped.header_strip_calls_24h).toBe(
+      stripped.header_strip_calls_24h,
+    );
+
+    // 1) The status itself differs: green `active` ONLY when stripping happened.
+    expect(strippedRow.status).toBe("active");
+    expect(noneRow.status).toBe("unconfirmed");
+    expect(noneRow.status).not.toBe(strippedRow.status);
+
+    // 2) The section-level green discriminator differs - the renderer keys the
+    //    green chip on `tier_a_strip_observed`, so a 0-stripped window can never
+    //    light green.
+    expect(stripped.tier_a_strip_observed).toBe(true);
+    expect(noneStripped.tier_a_strip_observed).toBe(false);
+
+    // 3) The honesty discriminator on the row differs, so the rendered copy
+    //    cannot collapse the two cases.
+    expect(strippedRow.tier_a_evidence).toBe("stripped");
+    expect(noneRow.tier_a_evidence).toBe("none_to_strip");
+    expect(noneRow.tier_a_evidence).not.toBe(strippedRow.tier_a_evidence);
+
+    // 4) Belt-and-suspenders: the 0-stripped state can NEVER co-occur with the
+    //    green chip - i.e. there is no input where headers_stripped_24h === 0 and
+    //    tier_a_strip_observed === true. This is the misread the #617 fix forbids.
+    expect(noneStripped.headers_stripped_24h).toBe(0);
+    expect(noneStripped.tier_a_strip_observed).toBe(false);
   });
 });
 

@@ -62,6 +62,7 @@ import {
   type PostureRouteDeps,
 } from "./posture-routes.js";
 import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
+import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
   V1IdempotencyStore,
   type V1AgentsDeps,
@@ -957,9 +958,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `producerKeyExpectedButUnavailable`), never the channel basis.
     await this.ensureProducerKeyLoaded();
     const load = this._producerKeyLoad;
+    // Recognition precursor: resolve the composition render-gate flag via the
+    // canonical resolver (default-off). The fortress config carries no composition
+    // input today, so this resolves to the honest `false` default; when an input
+    // is added later the same resolver picks it up without a shape change. This is
+    // CONFIG, not evidence - the composition endpoint exposes only this boolean.
+    const compositionEnabled =
+      resolveCompositionConfig().composition_enabled;
     const deps: PostureRouteDeps = {
       auditLog: this.auditLog ?? null,
       originMachine,
+      compositionEnabled,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,

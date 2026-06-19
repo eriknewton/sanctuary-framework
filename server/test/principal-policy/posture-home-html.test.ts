@@ -191,6 +191,30 @@ describe("posture home - Query-privacy section honesty", () => {
     expect(region).not.toContain("—");
   });
 
+  it("the Tier-A copy distinguishes 'stripped' from 'nothing to strip' from 'no calls' (#617)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function queryPrivacyWhy(row)");
+    expect(start).toBeGreaterThan(-1);
+    const end = html.indexOf("function renderQueryPrivacy(qp)");
+    const region = html.slice(start, end);
+    // Three distinct branches keyed on the honesty discriminator, so a viewer
+    // never reads a 0-stripped window as stripping-happened.
+    expect(region).toContain('row.tier_a_evidence === "stripped"');
+    expect(region).toContain('row.tier_a_evidence === "none_to_strip"');
+    // The "calls observed but nothing stripped" copy plainly says NOTHING was
+    // stripped - it cannot be misread as the affirmative stripped-headers copy.
+    expect(region).toContain("none carried a fingerprintable header to strip");
+    expect(region).toContain("nothing was stripped");
+    // The affirmative stripped copy stays gated to the "stripped" branch only.
+    const strippedIdx = region.indexOf("Fingerprintable headers were stripped");
+    const noneIdx = region.indexOf("none carried a fingerprintable header");
+    expect(strippedIdx).toBeGreaterThan(-1);
+    expect(noneIdx).toBeGreaterThan(-1);
+    expect(strippedIdx).not.toBe(noneIdx);
+    // No em-dash in the new copy.
+    expect(region).not.toContain("—");
+  });
+
   it("the client-side query-privacy pill never maps a non-active status to green", () => {
     const html = renderPostureHomeHTML();
     const start = html.indexOf("function queryPrivacyPill(status)");
