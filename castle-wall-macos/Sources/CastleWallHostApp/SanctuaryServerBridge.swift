@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Bridge between the host app and the `sanctuary` CLI / server.
 /// All agent protection actions delegate to `sanctuary wrap`; the host
@@ -162,6 +165,51 @@ final class SanctuaryServerBridge: ObservableObject {
         } catch {
             serverStatus = .unreachable
         }
+    }
+
+    // MARK: - Sovereignty Posture dashboard handoff
+
+    /// The read-only web posture surface this app hands off to. Loopback only,
+    /// fixed dashboard port. Deliberately carries NO auth token: the dashboard's
+    /// loopback auto-auth covers the read-only posture page, and a token in the
+    /// URL would leak into browser history / referer / shoulder-surf. The
+    /// posture page reads `#token=` from the URL hash, so we must never populate
+    /// it here (Phase 2 design, native seam Option 1).
+    static func dashboardPostureURL(port: Int) -> URL {
+        // Loopback host + fixed path; force-unwrap is safe for this constant.
+        return URL(string: "http://127.0.0.1:\(port)/posture")!
+    }
+
+    /// The posture URL for this bridge's configured dashboard port.
+    var dashboardPostureURL: URL {
+        Self.dashboardPostureURL(port: dashboardPort)
+    }
+
+    /// True only when the local server has been confirmed reachable. The
+    /// "Open Sovereignty Dashboard" affordance is gated on this so we never hand
+    /// the operator a connection-refused page (Phase 2 design, server-down
+    /// fallback).
+    var canOpenDashboard: Bool {
+        serverStatus == .reachable
+    }
+
+    /// Open the read-only Sovereignty Posture dashboard in the operator's
+    /// default browser. This is the native-to-web seam (Option 1, browser
+    /// handoff): the app does NOT reimplement the posture surface, it links to
+    /// the one web board that owns posture truth. No-op if the server is not
+    /// reachable, so a button bound to this can never produce a broken link.
+    ///
+    /// Invoked only from a user action (a button tap), never from view
+    /// construction or `@StateObject` init, so it cannot reintroduce the #596
+    /// boot-crash class (no run loop pumped during AttributeGraph evaluation).
+    @discardableResult
+    func openSovereigntyDashboard() -> Bool {
+        guard canOpenDashboard else { return false }
+        #if canImport(AppKit)
+        return NSWorkspace.shared.open(dashboardPostureURL)
+        #else
+        return false
+        #endif
     }
 
     // MARK: - Protect / Unprotect

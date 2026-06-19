@@ -102,10 +102,36 @@ struct ContentView: View {
 
             Spacer()
 
+            dashboardButton
+
             sysextStatusBadge
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// Opens the read-only Sovereignty Posture dashboard in the default browser
+    /// (native-to-web seam, Option 1). Disabled with a "Dashboard offline" label
+    /// when the local server is not reachable, so the operator never lands on a
+    /// connection-refused page. Opening on a tap stays off the view-construction
+    /// path, so the #596 boot-crash fix is untouched.
+    private var dashboardButton: some View {
+        Button {
+            serverBridge.openSovereigntyDashboard()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "chart.bar.doc.horizontal")
+                    .font(.caption)
+                Text(serverBridge.canOpenDashboard ? "Open Sovereignty Dashboard" : "Dashboard offline")
+                    .font(.caption)
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(serverBridge.canOpenDashboard ? .accentColor : .secondary)
+        .disabled(!serverBridge.canOpenDashboard)
+        .help(serverBridge.canOpenDashboard
+            ? "View the full Sovereignty Posture dashboard in your browser."
+            : "Start the Sanctuary server to view the full posture dashboard.")
     }
 
     private var sysextStatusBadge: some View {
