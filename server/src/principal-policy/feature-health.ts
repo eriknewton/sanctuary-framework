@@ -281,14 +281,51 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       brokenZeroDetectable: false,
     },
     {
-      id: "privacy_strips",
-      label: "Query-privacy strips",
+      // The ALWAYS-ON Tier A query-privacy feature: fingerprintable HTTP
+      // headers are stripped from every outbound substrate call, structurally
+      // unconditional (no operator opt-out), emitting
+      // `query_anonymity_headers_stripped` on every wrapped fetch
+      // (`query-anonymity/header-strip.ts`; wired in `intelligence/selector.ts`).
+      //
+      // HONESTY (do NOT relabel to "anonymity"): this is metadata hygiene, not
+      // anonymity. Stripping fingerprintable headers reduces what the substrate
+      // provider can correlate, but the provider still sees the query CONTENT
+      // and the authenticated API key. The row label and any panel copy must say
+      // "header strip" / "metadata", never imply the queries are anonymous. See
+      // the Phase 2 design overclaim flag (2026-06-19 §2.1 C).
+      //
+      // It is `event_driven`: it only writes to the audit log when a call
+      // actually went out, so a quiet window is genuinely ambiguous (no calls vs
+      // silently bypassed are indistinguishable from counts alone). Quiet renders
+      // the distinct non-green `unconfirmed` chip, NEVER green - the broker is
+      // broken-zero-undetectable, so absence is not evidence of health.
+      id: "header_strip",
+      label: "Query-privacy header strip (metadata)",
       layer: "l2",
       liveness: "event_driven",
-      // ONLY the actual rewrite proves the privacy stripper DID something. A
-      // config update or a consent record is administrative housekeeping, not a
-      // strip — counting them as activity would render the feature green without
-      // a single query ever having been stripped (codex HIGH 2026-06-13).
+      invocationOps: Object.freeze(
+        new Set<string>(["query_anonymity_headers_stripped"]),
+      ),
+      brokenZeroDetectable: false,
+    },
+    {
+      // Tier B PII rewrite (OPT-IN, off by default). Distinct from the Tier A
+      // `header_strip` row above: this row intentionally counts ONLY the actual
+      // rewrite op (`query_anonymity_pii_rewritten`), so a config update or a
+      // consent record (administrative housekeeping, not a strip) can never
+      // render it green without a single query having been rewritten (codex HIGH
+      // 2026-06-13).
+      //
+      // KNOWN STANDING (documentation only - do NOT change behavior to force
+      // green): the PII-rewrite emitter is not yet wired into the live selector
+      // path (the deferred Rho-2.5 boot-wiring), so `query_anonymity_pii_rewritten`
+      // does not fire in production today. This row therefore reads `unconfirmed`
+      // (amber) until that wiring lands. That is the honest state; the always-on
+      // privacy feature that DOES fire on every call is the `header_strip` row.
+      id: "privacy_strips",
+      label: "Query-privacy PII rewrite (opt-in)",
+      layer: "l2",
+      liveness: "event_driven",
       invocationOps: Object.freeze(
         new Set<string>(["query_anonymity_pii_rewritten"]),
       ),
