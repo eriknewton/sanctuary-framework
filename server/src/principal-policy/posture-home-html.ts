@@ -160,13 +160,31 @@ export function renderPostureHomeHTML(): string {
     return '<span class="pill amber">UNKNOWN</span>';
   }
 
+  // "Never fake green" for the agent grid (#634 honesty split). GREEN is earned
+  // only by CONFIRMED live enforcement for the agent; a policy-protected agent
+  // whose enforcement we cannot observe is amber "protection requested", never
+  // green. A no-longer-protected agent (mid-unwrap, or observed not enforcing)
+  // is red. This mirrors the wall pill's evidence-gated color model so the most-
+  // screenshotted tile can no longer overclaim enforcement from policy intent.
+  function agentPill(row) {
+    if (row.enforcement_active === "active")
+      return '<span class="pill green">enforcement active</span>';
+    if (row.policy_protected && row.enforcement_active !== "active")
+      return '<span class="pill amber">protection requested</span>';
+    return '<span class="pill red">not enforcing</span>';
+  }
+
   function renderBanner(home, pending, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
     var pendingCount = (pending && pending.length) || 0;
     document.getElementById("origin").textContent =
       "Machine: " + home.origin_machine + " · single-machine view (federation off)";
     document.getElementById("banner").innerHTML =
-      stat(home.protected_agent_count, "Agents protected") +
+      // Honest split (#634): "protection requested" is policy intent; "enforcement
+      // confirmed" is the observed-live count. Reporting only a flat "protected"
+      // number overstated enforcement the server cannot prove.
+      stat(home.protection_requested_count, "Protection requested") +
+      stat(home.enforcement_confirmed_count, "Enforcement confirmed") +
       stat(wallPill(home.castle_wall.arm_state), "Castle Wall") +
       stat(pendingCount, "Approvals waiting") +
       stat(openAnomalies, "Open anomalies") +
@@ -180,7 +198,7 @@ export function renderPostureHomeHTML(): string {
     var html = "";
     (home.agents || []).forEach(function (a) {
       html +=
-        '<div class="card"><h3>' + esc(a.agent_id) + ' <span class="pill green">protected</span></h3>' +
+        '<div class="card"><h3>' + esc(a.agent_id) + ' ' + agentPill(a) + '</h3>' +
         '<div class="meta">' + esc(a.harness) + " · status " + esc(a.status) + "</div>" +
         '<div class="reach"><a href="/api/posture/reach/' + encodeURIComponent(a.agent_id) + '">Effective reach &rarr;</a></div></div>';
     });

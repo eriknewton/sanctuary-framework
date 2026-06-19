@@ -8,6 +8,7 @@ import {
   buildAuditDigest,
   buildUnwrappedRoster,
   buildAgentReach,
+  buildPostureAgentRows,
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
@@ -567,5 +568,107 @@ describe("G5 — per-agent effective reach", () => {
     });
     expect(reach.has_wall_policy).toBe(true);
     expect(reach.default_deny).toBe(false);
+  });
+});
+
+// ── Posture agent rows (honest #634 policy-vs-enforcement split) ──────
+//
+// The Home agent grid must never render solid green "protected" for an agent
+// that is only policy_protected. These tests pin the never-fake-green invariant
+// at the pure-function boundary: enforcement_active is honestly "unknown" per
+// agent and is NEVER inherited from the machine-level wall arm-state.
+
+function agentWithStatus(
+  id: string,
+  harness: string,
+  status: LocalAgentRecord["status"],
+): LocalAgentRecord {
+  const record = agent(id, harness);
+  record.status = status;
+  return record;
+}
+
+describe("buildPostureAgentRows — honest protected-semantics split (#634)", () => {
+  it("never yields a green/active enforcement state for a policy-protected agent", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [agentWithStatus("a1", "claude_code", "active")],
+    });
+    expect(rows).toHaveLength(1);
+    // policy intent is honored ...
+    expect(rows[0].policy_protected).toBe(true);
+    // ... but enforcement is NOT confirmed per-agent: the value the green pill
+    // requires ("active") is never emitted. This is the fake-green fix.
+    expect(rows[0].enforcement_active).toBe("unknown");
+    expect(rows[0].enforcement_active).not.toBe("active");
+  });
+
+  it("mirrors v1/agents.ts policy_protected: unwrapping is not policy-protected", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("alive", "claude_code", "active"),
+        agentWithStatus("tearing-down", "cursor", "unwrapping"),
+        agentWithStatus("errored", "cline", "error"),
+      ],
+    });
+    const byId = Object.fromEntries(rows.map((r) => [r.agent_id, r]));
+    // active + errored: the operator's protection request stands (policy intent).
+    expect(byId["alive"].policy_protected).toBe(true);
+    expect(byId["errored"].policy_protected).toBe(true);
+    // unwrapping: protection is being torn down, so it is NOT policy-protected.
+    expect(byId["tearing-down"].policy_protected).toBe(false);
+    // none of them claim confirmed enforcement.
+    for (const r of rows) expect(r.enforcement_active).toBe("unknown");
+  });
+
+  it("derives banner counts that split protection-requested from enforcement-confirmed", () => {
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "paused"),
+        agentWithStatus("a3", "cline", "unwrapping"),
+      ],
+    });
+    // The route layer derives the two banner numbers exactly this way.
+    const protectionRequested = rows.filter((r) => r.policy_protected).length;
+    const enforcementConfirmed = rows.filter(
+      (r) => r.enforcement_active === "active",
+    ).length;
+    // active + paused are policy-protected; unwrapping is not.
+    expect(protectionRequested).toBe(2);
+    // No agent has confirmed live enforcement today, so the confirmed count is
+    // 0 and the banner cannot overstate enforcement.
+    expect(enforcementConfirmed).toBe(0);
+    // The two numbers genuinely differ — the split is not cosmetic.
+    expect(enforcementConfirmed).toBeLessThan(protectionRequested);
+  });
+
+  it("is pure: no machine arm-state can bleed into a per-agent enforcement claim", () => {
+    // buildPostureAgentRows takes ONLY the roster; there is no wall-posture
+    // parameter, so an `armed` machine cannot make any agent read green. Even an
+    // all-active roster yields zero confirmed-enforcement rows regardless of any
+    // machine-level signal the caller might hold.
+    const rows = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "active"),
+      ],
+    });
+    expect(rows.every((r) => r.enforcement_active === "unknown")).toBe(true);
+    expect(rows.some((r) => r.enforcement_active === "active")).toBe(false);
+    // Pure over inputs: identical input yields identical output.
+    const again = buildPostureAgentRows({
+      originMachine: FORTRESS,
+      records: [
+        agentWithStatus("a1", "claude_code", "active"),
+        agentWithStatus("a2", "cursor", "active"),
+      ],
+    });
+    expect(again).toEqual(rows);
+    // origin_machine is propagated onto every row.
+    expect(rows.every((r) => r.origin_machine === FORTRESS)).toBe(true);
   });
 });
