@@ -51,7 +51,6 @@ import {
   type AuditDigest,
   type UnwrappedRoster,
   type AgentEffectiveReach,
-  type PostureAgentRow,
   type CustodyExitPanel,
 } from "./posture.js";
 import {
@@ -74,6 +73,10 @@ import {
   handlePostureStream,
   type PostureStreamRegistry,
 } from "./posture-stream.js";
+// `PostureHome` lives in a neutral type module so `posture-stream.ts` can import
+// the payload shape without closing a `posture-routes` <-> `posture-stream`
+// cycle (this module imports the stream handler above).
+import type { PostureHome } from "./posture-home-types.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
@@ -529,46 +532,11 @@ function buildReach(
   });
 }
 
-export interface PostureHome {
-  origin_machine: string;
-  castle_wall: CastleWallPosture;
-  digest: AuditDigest;
-  unwrapped: UnwrappedRoster;
-  /** Per-feature usage health (evidence-based; unknown when unconfirmed). */
-  feature_health: FeatureHealthPanel;
-  /**
-   * Custody & Exit posture (Slice 3). Custody is never green (amber unconfirmed
-   * or red damaged); exit is the honest CLI-gated export capability without a
-   * clean-exit guarantee.
-   */
-  custody_exit: CustodyExitPanel;
-  /**
-   * Query-privacy posture (Phase 2, Opacity principle 4). Tier A header-strip
-   * count (metadata hygiene, NOT anonymity) from real audit evidence, plus the
-   * Tier B PII-rewrite state (never green from config; `unconfirmed` until the
-   * deferred rewrite emitter wiring lands).
-   */
-  query_privacy: QueryPrivacySection;
-  /**
-   * Count of agents the operator has REQUESTED protection for (policy intent).
-   * This is the honest banner number: it counts policy_protected, NOT confirmed
-   * enforcement. Renamed in intent from the old flat "protected" count, which
-   * implied enforcement it could not prove (#634 fake-green fix).
-   */
-  protection_requested_count: number;
-  /**
-   * Count of agents with CONFIRMED live enforcement (`enforcement_active ===
-   * "active"`). `0` today: no per-agent enforcement signal exists yet, so the
-   * banner never overstates confirmed enforcement.
-   */
-  enforcement_confirmed_count: number;
-  /**
-   * Derived agent rows carrying the honest policy-vs-enforcement split (#634).
-   * Replaces the raw `LocalAgentRecord[]`: the UI must render green only on
-   * confirmed enforcement, amber on policy-only protection.
-   */
-  agents: PostureAgentRow[];
-}
+// `PostureHome` is defined in `./posture-home-types.js` (imported above) so the
+// SSE stream handler can share the payload shape without a `posture-routes` <->
+// `posture-stream` cycle. Re-exported here to preserve the historical import
+// site (`import type { PostureHome } from "./posture-routes.js"`).
+export type { PostureHome };
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const [castleWall, digest, unwrapped, featureHealth, custodyExit] =

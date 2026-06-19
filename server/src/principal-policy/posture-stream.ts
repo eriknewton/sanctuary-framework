@@ -33,7 +33,11 @@
  */
 
 import type { ServerResponse } from "node:http";
-import type { PostureHome } from "./posture-routes.js";
+// Import the payload shape from the neutral type module, NOT from
+// `posture-routes.js`: `posture-routes` imports this stream handler, so
+// importing back from it would close a `posture-routes` <-> `posture-stream`
+// cycle. The neutral module sits strictly lower in the dependency DAG.
+import type { PostureHome } from "./posture-home-types.js";
 
 /** Default cadence for pushing a fresh home payload (5s). */
 export const DEFAULT_STREAM_INTERVAL_MS = 5_000;
