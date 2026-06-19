@@ -98,6 +98,11 @@ export function renderPostureAgentHTML(): string {
   </section>
 
   <section>
+    <h2>Distress channel</h2>
+    <div class="panel" id="distress"><span class="empty">Loading...</span></div>
+  </section>
+
+  <section>
     <h2>Effective reach</h2>
     <div class="panel" id="reach"><span class="empty">Loading...</span></div>
   </section>
@@ -215,6 +220,60 @@ export function renderPostureAgentHTML(): string {
     el.innerHTML = lines.join("");
   }
 
+  // "Never fake green" for the distress tile (Phase 2 design 2.4 C). FACTS ONLY:
+  // a count + most-recent time + the static habeas guaranteed-egress policy fact.
+  // There is NO green "channel healthy/active" state - no listener-bound evidence
+  // exists on this read - so the tile uses neutral pills only. Absence of signals
+  // is "no distress signals recorded", never a fabricated green "all well". The
+  // inbox is operator-global today (per-agent filtering is deferred); it is
+  // framed here as the operator distress channel, surfaced in the agent's
+  // secondary Standing section per the CISO-first ordering (never on Home).
+  function renderDistress(inbox) {
+    var el = document.getElementById("distress");
+    var entries = (inbox && inbox.data && inbox.data.entries) || [];
+    var count = (inbox && inbox.data && typeof inbox.data.count === "number")
+      ? inbox.data.count
+      : entries.length;
+    var lines = [];
+    if (count > 0) {
+      var newest = entries[0];
+      var when = newest && newest.received_at ? newest.received_at : "unknown time";
+      var reason = newest && newest.envelope ? newest.envelope.reason : "";
+      var severity = newest && newest.envelope ? newest.envelope.severity : "";
+      lines.push(
+        '<div class="standing-row">' +
+          '<span class="pill amber">' + esc(count) + " received</span>" +
+          '<span class="name">Distress signals</span>' +
+          '<span class="why">Most recent ' + esc(when) +
+          (severity ? " (severity " + esc(severity) + ", " + esc(reason) + ")" : "") +
+          ". A received signal is a fact, not a health state.</span></div>"
+      );
+    } else {
+      lines.push(
+        '<div class="standing-row">' +
+          '<span class="pill neutral">none recorded</span>' +
+          '<span class="name">Distress signals</span>' +
+          '<span class="why">No distress signals recorded. Absence is not a ' +
+          'green "all well": a quiet channel and a listener that never bound ' +
+          "look the same here, so this is shown neutrally, never green.</span></div>"
+      );
+    }
+    // Static, structural guaranteed-egress fact (always true, verifiable from the
+    // curated allowlist / composer): the reserved loopback habeas rule is injected
+    // into every manifest and policy cannot remove or shadow it. This is a policy
+    // fact, NOT a listener-liveness or welfare guarantee.
+    lines.push(
+      '<div class="standing-row">' +
+        '<span class="pill neutral">guaranteed egress</span>' +
+        '<span class="name">Habeas lane</span>' +
+        '<span class="why">The wall policy always permits a wrapped agent to ' +
+        "reach the operator at the loopback habeas port (8741): a reserved rule " +
+        "that policy cannot remove or shadow. This is a structural policy fact, " +
+        "not a claim that the listener is currently bound.</span></div>"
+    );
+    el.innerHTML = lines.join("");
+  }
+
   function renderReach(reach) {
     var el = document.getElementById("reach");
     var head =
@@ -288,6 +347,12 @@ export function renderPostureAgentHTML(): string {
             };
           }
           renderStanding(row);
+          // Distress channel (Phase 2): best-effort over the already-mounted,
+          // durable /api/distress/inbox. A failure or absent inbox renders the
+          // honest "none recorded" state, never a fabricated green.
+          api("/api/distress/inbox?limit=1")
+            .then(function (inbox) { renderDistress(inbox); })
+            .catch(function () { renderDistress({ data: { entries: [], count: 0 } }); });
         });
       })
       .catch(function (e) {

@@ -61,6 +61,7 @@ import {
   POSTURE_AGENT_PATH_PREFIX,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
 import {
   V1IdempotencyStore,
   type V1AgentsDeps,
@@ -2125,7 +2126,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       url.pathname === POSTURE_HOME_PATH ||
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
-      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`)
+      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
+      // Phase 2: the query-privacy stats endpoint is dispatched through the
+      // posture router so it shares the SAME checkAuth gate as `/api/posture/*`.
+      url.pathname.startsWith(`${QUERY_ANONYMITY_API_PREFIX}/`)
     ) {
       // JSON posture routes get the general rate limit; the HTML view is
       // exempt (it is a dashboard view route, like `/` and `/fortress`).

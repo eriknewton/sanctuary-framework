@@ -24,6 +24,37 @@ import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
 
 /**
+ * "Never fake green" + "never imply anonymity" for the Query-privacy section
+ * (Phase 2), as a PURE mapper so the honesty contract is unit-testable without a
+ * browser. The status color model is the same one the feature-health endpoint
+ * emits: GREEN is earned ONLY by `active` (real strip/rewrite evidence in the
+ * window). `unconfirmed` and `unknown` are amber and MUST NEVER render green -
+ * that includes the Tier B PII-rewrite row, which is `unconfirmed` until the
+ * deferred rewrite emitter wiring lands. `fault` is red.
+ *
+ * The client-side `queryPrivacyPill` below embeds the exact same mapping (the
+ * page is a self-contained string); this exported function is the canonical
+ * definition the renderer mirrors and the tests pin.
+ */
+export function queryPrivacyPill(status: FeatureHealthStatus): {
+  cls: "green" | "amber" | "red";
+  label: string;
+} {
+  switch (status) {
+    case "active":
+      return { cls: "green", label: "active" };
+    case "fault":
+      return { cls: "red", label: "fault" };
+    case "unconfirmed":
+      return { cls: "amber", label: "unconfirmed" };
+    case "unknown":
+    default:
+      // Fail closed: any unrecognized status is non-green by construction.
+      return { cls: "amber", label: "unconfirmed" };
+  }
+}
+
+/**
  * "Never fake green" for the feature-health panel, as a PURE mapper so the
  * honesty contract is unit-testable without a browser. The color model is the
  * one the feature-health endpoint already emits (`feature-health.ts`): GREEN is
@@ -196,6 +227,11 @@ export function renderPostureHomeHTML(): string {
   <section>
     <h2>Custody and Exit</h2>
     <div class="panel" id="custody"><span class="empty">Loading…</span></div>
+  </section>
+
+  <section>
+    <h2>Query privacy</h2>
+    <div class="panel" id="queryprivacy"><span class="empty">Loading…</span></div>
   </section>
 
   <div class="footer">
@@ -383,6 +419,55 @@ export function renderPostureHomeHTML(): string {
     el.innerHTML = html;
   }
 
+  // "Never fake green" for the Query-privacy section. Mirrors the canonical pure
+  // mapper exported from this module (queryPrivacyPill). GREEN is earned ONLY by
+  // "active" (real strip/rewrite evidence); "unconfirmed"/"unknown" are amber and
+  // NEVER green; "fault" is red. The Tier B PII-rewrite row stays amber
+  // unconfirmed (its emitter is unwired), so it can never show green from config.
+  function queryPrivacyPill(status) {
+    if (status === "active") return '<span class="pill green">active</span>';
+    if (status === "fault") return '<span class="pill red">fault</span>';
+    return '<span class="pill amber">unconfirmed</span>';
+  }
+
+  // Plain-English row copy keyed on the tier. Tier A is the always-on header
+  // strip (metadata hygiene, never anonymity); Tier B is the opt-in PII rewrite
+  // that is unconfirmed until its emitter is wired into the live call path.
+  function queryPrivacyWhy(row) {
+    if (row.tier === "A") {
+      return row.status === "active"
+        ? "Fingerprintable headers were stripped on outbound calls in the last 24h."
+        : "No outbound calls observed in the last 24h, so the strip cannot be confirmed from evidence. Shown amber, never green.";
+    }
+    return "Off by default. PII rewrite is not yet wired into the live call path, so it reads unconfirmed until a real rewrite fires. It is never shown green from configuration alone.";
+  }
+
+  function renderQueryPrivacy(qp) {
+    var el = document.getElementById("queryprivacy");
+    if (!qp || !qp.rows) {
+      el.innerHTML = '<span class="empty">No query-privacy data.</span>';
+      return;
+    }
+    // HONEST HEADLINE (#617 overclaim flag): header stripping is metadata
+    // hygiene, NOT anonymity. Say the boundary plainly: the substrate provider
+    // still sees the query content and the authenticated API key.
+    var headline =
+      '<div>Fingerprintable headers stripped on every call; PII rewrite available opt-in. ' +
+      "<strong>" + esc(qp.headers_stripped_24h) + "</strong> headers stripped across " +
+      "<strong>" + esc(qp.header_strip_calls_24h) + "</strong> outbound calls in the last 24h.</div>";
+    var rows = qp.rows.map(function (r) {
+      return '<div class="fh-row">' + queryPrivacyPill(r.status) +
+        '<span class="name">' + esc(r.label) + "</span>" +
+        '<span class="why">' + esc(queryPrivacyWhy(r)) + "</span></div>";
+    }).join("");
+    var note =
+      '<div class="fh-note">Header stripping is metadata hygiene, not anonymity: ' +
+      "the substrate provider still sees the query content and your authenticated " +
+      "API key. This reduces what can be correlated across calls; it does not make " +
+      "your queries anonymous.</div>";
+    el.innerHTML = headline + rows + note;
+  }
+
   function renderBanner(home, pending, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
     var pendingCount = (pending && pending.length) || 0;
@@ -526,6 +611,7 @@ export function renderPostureHomeHTML(): string {
           renderWall(home.castle_wall);
           renderFeatures(home.feature_health);
           renderCustodyExit(home.custody_exit);
+          renderQueryPrivacy(home.query_privacy);
         });
       })
       .catch(function (e) {

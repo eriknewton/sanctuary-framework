@@ -246,4 +246,41 @@ describe("posture route layer", () => {
     const body = await res.json();
     expect(body.origin_machine).toBe(FORTRESS);
   });
+
+  // ── Phase 2: query-privacy (Opacity) ───────────────────────────────
+
+  it("includes an honest query-privacy section in the home payload (Tier A unconfirmed when quiet, Tier B never green)", async () => {
+    const base = await serve(baseDeps(newLog(), []));
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/home`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.query_privacy).toBeDefined();
+    // Overclaim guard: header stripping is metadata hygiene, NEVER anonymity.
+    expect(body.query_privacy.header_strip_is_anonymity).toBe(false);
+    // No header-strip evidence on a fresh log -> Tier A unconfirmed (not green).
+    const tierA = body.query_privacy.rows.find((r: { tier: string }) => r.tier === "A");
+    expect(tierA.status).toBe("unconfirmed");
+    // Tier B PII rewrite is never green from config (emitter unwired).
+    const tierB = body.query_privacy.rows.find((r: { tier: string }) => r.tier === "B");
+    expect(tierB.status).not.toBe("active");
+  });
+
+  it("mounts the previously-orphaned /api/query-anonymity/stats behind the posture router", async () => {
+    const base = await serve(baseDeps(newLog(), []));
+    const res = await fetch(`${base}/api/query-anonymity/stats`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.window).toBe("24h");
+    expect(body.total_outbound_calls).toBe(0);
+    expect(body.total_headers_stripped).toBe(0);
+  });
+
+  it("fails closed with 503 on the stats endpoint when the audit log is locked (never empty-green)", async () => {
+    const base = await serve(baseDeps(null, []));
+    const res = await fetch(`${base}/api/query-anonymity/stats`);
+    expect(res.status).toBe(503);
+    const body = await res.json();
+    expect(body.error).toBe("query_privacy_unavailable");
+    expect(body.origin_machine).toBe(FORTRESS);
+  });
 });

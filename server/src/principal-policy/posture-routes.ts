@@ -50,6 +50,16 @@ import {
   buildFeatureHealthPanel,
   type FeatureHealthPanel,
 } from "./feature-health.js";
+import {
+  buildQueryPrivacySection,
+  TIER_B_FEATURE_ID,
+  type QueryPrivacySection,
+} from "./posture-query-privacy.js";
+import {
+  computeQueryAnonymityStats,
+  handleQueryAnonymityStatsRequest,
+  QUERY_ANONYMITY_API_PREFIX,
+} from "../query-anonymity/query-anonymity-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
 
@@ -150,6 +160,38 @@ export async function handlePostureRoute(
       "Cache-Control": "no-cache",
     });
     res.end(renderPostureAgentHTML());
+    return true;
+  }
+
+  // Query-privacy stats (Phase 2): mount the previously-orphaned
+  // `/api/query-anonymity/stats` endpoint behind the SAME checkAuth gate as the
+  // rest of the posture surface (the caller ran it before dispatch). It
+  // aggregates 24h `query_anonymity_headers_stripped` audit evidence (Tier A
+  // header-metadata strip). Read-only. Served here so the dashboard can light up
+  // the Query-privacy section without inventing a second, weaker auth path.
+  if (
+    method === "GET" &&
+    path === `${QUERY_ANONYMITY_API_PREFIX}/stats`
+  ) {
+    if (deps.auditLog === null) {
+      writeJSON(res, 503, {
+        error: "query_privacy_unavailable",
+        reason: "audit log not unlocked; query-privacy stats cannot be evidenced",
+        origin_machine: deps.originMachine,
+      });
+      return true;
+    }
+    try {
+      const result = await handleQueryAnonymityStatsRequest({
+        auditLog: deps.auditLog,
+      });
+      writeJSON(res, result.status, result.body);
+    } catch {
+      writeJSON(res, 500, {
+        error: "internal_error",
+        origin_machine: deps.originMachine,
+      });
+    }
     return true;
   }
 
@@ -305,6 +347,43 @@ async function buildFeatureHealth(
 }
 
 /**
+ * Query-privacy section (Phase 2). Reads the Tier A 24h header-strip stats from
+ * the same audit chain (a failed read passes null, which the shaper renders as
+ * `unconfirmed`, never green) and carries the Tier B PII-rewrite feature-health
+ * row through verbatim. The shaper hard-asserts header stripping is metadata
+ * hygiene, not anonymity.
+ */
+async function buildQueryPrivacy(
+  deps: PostureRouteDeps,
+  featureHealth: FeatureHealthPanel,
+): Promise<QueryPrivacySection> {
+  let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null =
+    null;
+  try {
+    const computed = await computeQueryAnonymityStats({
+      auditLog: deps.auditLog as AuditLog,
+      ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
+    });
+    stats = {
+      window: computed.window,
+      total_outbound_calls: computed.total_outbound_calls,
+      total_headers_stripped: computed.total_headers_stripped,
+    };
+  } catch {
+    // A failed stats read is NOT evidence of health: leave stats null so the
+    // Tier-A row renders `unconfirmed` (amber), never green.
+    stats = null;
+  }
+  const tierBRow =
+    featureHealth.rows.find((r) => r.feature_id === TIER_B_FEATURE_ID) ?? null;
+  return buildQueryPrivacySection({
+    originMachine: deps.originMachine,
+    headerStripStats: stats,
+    tierBRow,
+  });
+}
+
+/**
  * Custody & Exit panel (Slice 3). Read-only over the audit chain the dashboard
  * already reads: it surfaces NEGATIVE custody evidence (pin-custody mismatch /
  * suspected-rollback freeze) and custody-establishment provenance, plus the
@@ -364,6 +443,13 @@ export interface PostureHome {
    */
   custody_exit: CustodyExitPanel;
   /**
+   * Query-privacy posture (Phase 2, Opacity principle 4). Tier A header-strip
+   * count (metadata hygiene, NOT anonymity) from real audit evidence, plus the
+   * Tier B PII-rewrite state (never green from config; `unconfirmed` until the
+   * deferred rewrite emitter wiring lands).
+   */
+  query_privacy: QueryPrivacySection;
+  /**
    * Count of agents the operator has REQUESTED protection for (policy intent).
    * This is the honest banner number: it counts policy_protected, NOT confirmed
    * enforcement. Renamed in intent from the old flat "protected" count, which
@@ -406,6 +492,10 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const enforcementConfirmedCount = agents.filter(
     (a) => a.enforcement_active === "active",
   ).length;
+  // Query-privacy depends on the feature-health panel (it carries the Tier B
+  // `privacy_strips` row through verbatim), so it is computed after the parallel
+  // block rather than inside it.
+  const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
   return {
     origin_machine: deps.originMachine,
     castle_wall: castleWall,
@@ -413,6 +503,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     unwrapped,
     feature_health: featureHealth,
     custody_exit: custodyExit,
+    query_privacy: queryPrivacy,
     protection_requested_count: protectionRequestedCount,
     enforcement_confirmed_count: enforcementConfirmedCount,
     agents,

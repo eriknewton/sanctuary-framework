@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   custodyPill,
   featureHealthPill,
+  queryPrivacyPill,
   renderPostureHomeHTML,
 } from "../../src/principal-policy/posture-home-html.js";
 import type { FeatureHealthStatus } from "../../src/principal-policy/feature-health.js";
@@ -135,5 +136,70 @@ describe("posture home — Custody and Exit panel honesty", () => {
     expect(end).toBeGreaterThan(start);
     const region = html.slice(start, end);
     expect(region).not.toContain("—"); // em-dash
+  });
+});
+
+/**
+ * Phase 2 query-privacy section (design 2026-06-19 2.1). Surfaces the Opacity
+ * principle from real header-strip evidence. Honesty contract:
+ *  - it must NEVER imply anonymity (header stripping is metadata hygiene; the
+ *    provider still sees content + the API key);
+ *  - Tier A is never green from absence; Tier B PII rewrite is never green from
+ *    config (it stays unconfirmed until its emitter is wired).
+ */
+describe("posture home - Query-privacy section honesty", () => {
+  it("queryPrivacyPill: green is reserved exclusively for active", () => {
+    const statuses: FeatureHealthStatus[] = [
+      "active",
+      "fault",
+      "unconfirmed",
+      "unknown",
+    ];
+    for (const s of statuses) {
+      const isGreen = queryPrivacyPill(s).cls === "green";
+      expect(isGreen).toBe(s === "active");
+    }
+    // unconfirmed/unknown never green (Tier B PII-rewrite stays here).
+    expect(queryPrivacyPill("unconfirmed").cls).toBe("amber");
+    expect(queryPrivacyPill("unknown").cls).toBe("amber");
+  });
+
+  it("renders a Query privacy section on the Home page fed by the home payload", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain("Query privacy");
+    expect(html).toContain('id="queryprivacy"');
+    expect(html).toContain("renderQueryPrivacy(home.query_privacy)");
+  });
+
+  it("the headline is metadata-hygiene, never an anonymity claim", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderQueryPrivacy(qp)");
+    expect(start).toBeGreaterThan(-1);
+    const end = html.indexOf("function renderBanner(home");
+    const region = html.slice(start, end);
+    // The honest boundary statement is present.
+    expect(region).toContain("metadata hygiene, not anonymity");
+    expect(region).toContain("still sees the query content");
+    expect(region).toContain("does not make");
+    // It must NOT make an AFFIRMATIVE anonymity claim. The honest negation
+    // ("does not make your queries anonymous") is allowed; the affirmative is not.
+    const lower = region.toLowerCase();
+    expect(lower).not.toContain("your queries are anonymous");
+    expect(lower).not.toContain("queries are anonymous");
+    expect(lower).not.toContain("makes your queries anonymous");
+    // No em-dash in the user-facing query-privacy copy.
+    expect(region).not.toContain("—");
+  });
+
+  it("the client-side query-privacy pill never maps a non-active status to green", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function queryPrivacyPill(status)");
+    expect(start).toBeGreaterThan(-1);
+    const fnSource = html.slice(start, start + 400);
+    expect(fnSource).toContain('status === "active") return \'<span class="pill green">');
+    expect(fnSource).not.toMatch(/unconfirmed[^\n]*pill green/);
+    expect(fnSource).not.toMatch(/unknown[^\n]*pill green/);
+    // The default (covers unconfirmed/unknown, including Tier B) is amber.
+    expect(fnSource).toContain('<span class="pill amber">unconfirmed');
   });
 });
