@@ -9,6 +9,7 @@ import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
+  POSTURE_AGENT_PATH_PREFIX,
   type PostureRouteDeps,
 } from "../../src/principal-policy/posture-routes.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
@@ -186,6 +187,32 @@ describe("posture route layer", () => {
 
     const missing = await fetch(`${base}${POSTURE_API_PREFIX}/reach/nope`);
     expect(missing.status).toBe(404);
+  });
+
+  it("serves the per-agent drill-down HTML at /posture/agent/:id (Slice 4)", async () => {
+    const base = await serve(baseDeps(newLog(), [wrappedAgent("a1", "claude_code")]));
+    const res = await fetch(`${base}${POSTURE_AGENT_PATH_PREFIX}a1`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const body = await res.text();
+    // The shell renders the Standing + reach sections and reuses the existing
+    // reach endpoint client-side (no duplicated shaper on the surface).
+    expect(body).toContain("Standing");
+    expect(body).toContain("Effective reach");
+    expect(body).toContain("/api/posture/reach/");
+    expect(body).toContain("/api/posture/home");
+    // Never-fake-green discipline visible in the renderer: green is keyed on
+    // confirmed enforcement, not policy intent.
+    expect(body).toContain('enforcement_active === "active"');
+  });
+
+  it("serves the agent drill-down shell even when the audit log is locked (it is a static page)", async () => {
+    // The shell is served before the audit-null guard, mirroring /posture, so a
+    // locked vault still renders the page; its data fetches fail honestly.
+    const base = await serve(baseDeps(null, []));
+    const res = await fetch(`${base}${POSTURE_AGENT_PATH_PREFIX}whoever`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
   });
 
   it("fails closed with 503 when the audit log is not unlocked (never empty-green)", async () => {
