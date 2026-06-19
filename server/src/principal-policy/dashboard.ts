@@ -59,8 +59,13 @@ import {
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
   POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import {
+  createPostureStreamRegistry,
+  type PostureStreamRegistry,
+} from "./posture-stream.js";
 import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
 import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
@@ -205,6 +210,12 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/fortress" ||
     path === "/events" ||
     path === POSTURE_HOME_PATH ||
+    // The posture SSE live-refresh stream is a single long-lived connection per
+    // operator tab, exactly like the v1.0 `/events` stream. It must be exempt
+    // from the per-IP general rate limit so a normal reconnect (after a laptop
+    // sleep, say) does not 429 the operator out of their own live board. The
+    // stream handler enforces its OWN bound: a concurrency cap on open streams.
+    path === POSTURE_STREAM_PATH ||
     // The per-agent drill-down HTML page is a dashboard view route too (an
     // operator page load), so it is exempt from the general rate limit the
     // same way `/posture` and `/fortress` are. Its data fetches still hit the
@@ -215,6 +226,14 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
 
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
+  /**
+   * Shared active-stream registry for the posture SSE live-refresh endpoint
+   * (`/api/posture/stream`). One per server instance so the concurrency cap is
+   * enforced across every open stream. Created eagerly (cheap) so the live
+   * stream is available as soon as the dashboard serves the posture surface.
+   */
+  private postureStreamRegistry: PostureStreamRegistry =
+    createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
   private httpServer: ReturnType<typeof createHttpServer> | null = null;
@@ -973,6 +992,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      // Wire the shared registry so the SSE live-refresh stream is available and
+      // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
+      // (no new data, no new green paths) on a cadence plus a heartbeat.
+      streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
   }

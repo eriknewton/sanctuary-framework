@@ -18,6 +18,10 @@
  *   GET /api/posture/digest      - G2 (today's audit story).
  *   GET /api/posture/unwrapped   - G1 (detected-but-unwrapped roster).
  *   GET /api/posture/reach/:id   - G5 (per-agent effective reach).
+ *   GET /api/posture/stream      - SSE live-refresh: pushes the SAME `buildHome`
+ *                                  payload as `/home` on a cadence + heartbeat
+ *                                  (additive, behind the same checkAuth +
+ *                                  audit-null guards; concurrency-capped).
  *   GET /api/posture/custody-exit - Slice 3 (Custody + Exit panel).
  *   GET /api/posture/composition - Recognition precursor: the composition render
  *                                  gate flag (config, NOT evidence-gated). Carries
@@ -66,9 +70,21 @@ import {
 } from "../query-anonymity/query-anonymity-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
+import {
+  handlePostureStream,
+  type PostureStreamRegistry,
+} from "./posture-stream.js";
 
 export const POSTURE_API_PREFIX = "/api/posture";
 export const POSTURE_HOME_PATH = "/posture";
+/**
+ * SSE live-refresh stream path (additive, Phase 2): `/api/posture/stream`.
+ * Pushes the SAME `buildHome` payload as `/api/posture/home` on a cadence plus
+ * a heartbeat. Mounted behind the SAME checkAuth gate + audit-null 503 guard as
+ * the rest of the posture API. Exported so the dashboard can classify it as a
+ * long-lived view route (rate-limit exempt), mirroring the v1.0 `/events` stream.
+ */
+export const POSTURE_STREAM_PATH = `${POSTURE_API_PREFIX}/stream`;
 /**
  * Per-agent drill-down HTML page prefix (Slice 4): `/posture/agent/:id`. The
  * page is a static shell that fetches `/api/posture/reach/:id` (G5) and
@@ -136,6 +152,24 @@ export interface PostureRouteDeps {
    * exclusive with a non-null `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /**
+   * Shared active-stream registry for the SSE live-refresh endpoint
+   * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
+   * enforced across all open streams on the server. When ABSENT, the stream
+   * endpoint is disabled (404 within the namespace) and the page falls back to
+   * its poll loop - the endpoint is purely additive, so an unwired dashboard
+   * simply has no live stream rather than a broken one.
+   */
+  streamRegistry?: PostureStreamRegistry;
+  /** Override the SSE push cadence (ms). Tests inject a deterministic value. */
+  streamIntervalMs?: number;
+  /** Override the SSE heartbeat cadence (ms). Tests inject a deterministic value. */
+  streamHeartbeatMs?: number;
+  /** Override the concurrent-stream cap. Tests inject a small value to exercise it. */
+  streamMaxConcurrent?: number;
+  /** Injectable timer hooks so tests can drive the stream cadence synchronously. */
+  streamSetInterval?: (handler: () => void, ms: number) => NodeJS.Timeout;
+  streamClearInterval?: (handle: NodeJS.Timeout) => void;
 }
 
 /**
@@ -241,6 +275,43 @@ export async function handlePostureRoute(
       error: "posture_unavailable",
       reason: "audit log not unlocked; posture cannot be evidenced",
       origin_machine: om,
+    });
+    return true;
+  }
+
+  // SSE live-refresh stream (additive, Phase 2). Reaches here only AFTER the
+  // audit-null 503 guard above, so the stream is never opened against a locked
+  // audit log (it would otherwise have to fabricate a green-or-empty payload).
+  // It pushes the SAME `buildHome` payload as `/home` on a cadence plus a
+  // heartbeat, with a concurrency cap + per-connection cleanup in the stream
+  // handler. Disabled (404 within the namespace) when no registry is wired, so
+  // the page falls back to polling. NOTE: this branch is deliberately OUTSIDE the
+  // try/catch below - the handler owns its own try/catch and, once the SSE head
+  // is written, an error must not also try to write a JSON 500 onto the same
+  // already-sent response.
+  if (method === "GET" && path === POSTURE_STREAM_PATH) {
+    if (!deps.streamRegistry) {
+      writeJSON(res, 404, { error: "not_found", origin_machine: om });
+      return true;
+    }
+    await handlePostureStream(res, {
+      buildHome: () => buildHome(deps),
+      registry: deps.streamRegistry,
+      ...(deps.streamIntervalMs !== undefined
+        ? { intervalMs: deps.streamIntervalMs }
+        : {}),
+      ...(deps.streamHeartbeatMs !== undefined
+        ? { heartbeatMs: deps.streamHeartbeatMs }
+        : {}),
+      ...(deps.streamMaxConcurrent !== undefined
+        ? { maxConcurrent: deps.streamMaxConcurrent }
+        : {}),
+      ...(deps.streamSetInterval !== undefined
+        ? { setIntervalFn: deps.streamSetInterval }
+        : {}),
+      ...(deps.streamClearInterval !== undefined
+        ? { clearIntervalFn: deps.streamClearInterval }
+        : {}),
     });
     return true;
   }
