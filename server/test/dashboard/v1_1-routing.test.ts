@@ -161,19 +161,23 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET / serves the v1.1 SPA (v1.1.7 root-route flip)", async () => {
+  it("GET / serves the posture board (one-surface root-flip 2026-06-19)", async () => {
+    // The one-surface correction flips the default page at `/` to the posture
+    // board (the same shell `/posture` serves), even with v1.1 bindings wired.
+    // The v1.1 SPA is preserved at /dashboard and /v1.1 (asserted below).
     const res = await fetch(`${rig.baseUrl}/`, {
       headers: { Authorization: `Bearer ${rig.authToken}` },
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    // SPA marker: the inline client mounts on #main and #fortress.
-    expect(html).toContain('id="main"');
-    expect(html).toContain('id="fortress"');
+    // Posture-board marker: the shell fetches the posture API client-side. It is
+    // NOT the v1.1 SPA (which mounts on #main / #fortress).
+    expect(html).toContain("/api/posture/home");
+    expect(html).not.toContain('id="fortress"');
   });
 
-  it("GET /dashboard serves the v1.1 SPA (v1.1.7 alias)", async () => {
+  it("GET /dashboard serves the v1.1 SPA (v1.1.7 alias, preserved post root-flip)", async () => {
     const res = await fetch(`${rig.baseUrl}/dashboard`, {
       headers: { Authorization: `Bearer ${rig.authToken}` },
     });

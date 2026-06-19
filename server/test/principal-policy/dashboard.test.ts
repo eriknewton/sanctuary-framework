@@ -837,4 +837,122 @@ describe("Principal Dashboard", () => {
       expect(results.every((s) => s === 200)).toBe(true);
     });
   });
+
+  // ── One-surface root-flip (Piece C) ─────────────────────────────────
+
+  describe("Root-flip: posture board served at /", () => {
+    it("GET / serves the posture board HTML (the one posture surface)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const body = await res.text();
+      // The posture-home shell fetches the posture API client-side; that string
+      // is the durable signature of the posture board (not the legacy/v1.1 SPA).
+      expect(body).toContain("/api/posture/home");
+    });
+
+    it("GET / and GET /posture serve byte-for-byte the same posture board", async () => {
+      const [rootRes, postureRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/`),
+        fetch(`http://127.0.0.1:${port}/posture`),
+      ]);
+      expect(rootRes.status).toBe(200);
+      expect(postureRes.status).toBe(200);
+      const [rootBody, postureBody] = await Promise.all([
+        rootRes.text(),
+        postureRes.text(),
+      ]);
+      // /posture remains a working alias of the same one surface.
+      expect(rootBody).toBe(postureBody);
+    });
+
+    it("root-flip does NOT regress the approval-channel routes", async () => {
+      // /api/pending still answers (the pending-approvals inbox source).
+      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      expect(pendingRes.status).toBe(200);
+      expect(await pendingRes.json()).toEqual([]);
+
+      // An Approve still round-trips through /api/approve/:id and resolves the
+      // blocked Tier-1 call (the same approval behavior, reached via the board).
+      const approvePromise = dashboard.requestApproval({
+        operation: "state_export",
+        tier: 1,
+        reason: "root-flip approval round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const approveList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(approveList).toHaveLength(1);
+      const approveRes = await fetch(
+        `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
+        { method: "POST" },
+      );
+      expect(approveRes.status).toBe(200);
+      expect((await approvePromise).decision).toBe("approve");
+
+      // A Deny still round-trips through /api/deny/:id.
+      const denyPromise = dashboard.requestApproval({
+        operation: "identity_rotate",
+        tier: 1,
+        reason: "root-flip deny round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const denyList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(denyList).toHaveLength(1);
+      const denyRes = await fetch(
+        `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
+        { method: "POST" },
+      );
+      expect(denyRes.status).toBe(200);
+      expect((await denyPromise).decision).toBe("deny");
+    });
+
+    it("root-flip leaves /v1.0 and unknown routes intact", async () => {
+      // The legacy four-panel dashboard is still reachable at its own URL.
+      const v10 = await fetch(`http://127.0.0.1:${port}/v1.0`);
+      expect(v10.status).toBe(200);
+      expect(await v10.text()).toContain("Principal Dashboard");
+      // The flip matches ONLY the bare root path; unknown routes still 404.
+      const unknown = await fetch(`http://127.0.0.1:${port}/nonexistent`);
+      expect(unknown.status).toBe(404);
+    });
+  });
+
+  // ── Honest /api/health castle_wall source (Delta Review A3) ──────────
+
+  describe("/api/health reports the evidence-gated castle_wall arm-state", () => {
+    it("preserves the { ok, mode } shape AND adds an honest castle_wall", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      // Back-compat: the CLI health probe + external monitors key on these.
+      expect(data.ok).toBe(true);
+      expect(data.mode).toBe("principal-policy");
+      // A3 fix: castle_wall is now the full evidence-gated posture object, not
+      // the dead `{ status: "unknown" }` placeholder.
+      expect(data.castle_wall).toBeDefined();
+      expect(data.castle_wall.arm_state).toBeDefined();
+    });
+
+    it("never fakes green: no audit evidence ⇒ arm_state unknown, not armed", async () => {
+      // This bare rig has no unlocked audit log, so there is no enforcement
+      // evidence to read. The honest answer is `unknown` (amber), never `armed`.
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const data = await res.json();
+      expect(data.castle_wall.arm_state).toBe("unknown");
+      expect(data.castle_wall.arm_state).not.toBe("armed");
+      // The producer authenticity basis is honestly "not_applicable" off-green.
+      expect(data.castle_wall.producer_authenticity).toBe("not_applicable");
+    });
+
+    it("/api/health keeps its no-store cache header after the A3 change", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+  });
 });

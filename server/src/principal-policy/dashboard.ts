@@ -62,6 +62,12 @@ import {
   POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import { renderPostureHomeHTML } from "./posture-home-html.js";
+import {
+  buildCastleWallPosture,
+  mapPlatform,
+  type CastleWallPosture,
+} from "./posture.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
@@ -1001,6 +1007,107 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * One-surface root-flip: the posture board is the default page served at `/`.
+   *
+   * Serves the posture-home HTML at the server root, byte-for-byte the same
+   * shell `/posture` serves (`renderPostureHomeHTML`). This is the one posture
+   * surface the embedded native web view and any browser both land on. The HTML
+   * is a static shell that negotiates its own auth and fetches `/api/posture/*`
+   * client-side (those JSON routes stay behind `checkAuth`), exactly like the
+   * v1.1 SPA shell it replaces at `/` — so the shell itself is served without a
+   * server-side auth gate here, while every data route remains gated.
+   *
+   * Scope: this matches ONLY the bare root path (`/`). `/dashboard`, `/v1.0`,
+   * `/v1.1`, `/fortress`, and every `/api/*` route (including the approval
+   * channel) are untouched and keep their existing handlers. `/posture` keeps
+   * working as the explicit alias via the posture router.
+   *
+   * Returns true when it served the root posture board; false to fall through
+   * to the existing v1.1 / legacy dispatch ladder (any non-`GET /` request).
+   */
+  private dispatchRootPosture(
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): boolean {
+    if (method !== "GET" || url.pathname !== "/") return false;
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureHomeHTML());
+    return true;
+  }
+
+  /**
+   * Delta Review A3 fix: build the evidence-gated Castle Wall arm-state the
+   * SAME way `/api/posture/castle-wall` derives it, so `/api/health` (and the
+   * `/v1/status` document) can report ONE honest arm-state the native badge can
+   * adopt — instead of the dead `{ status: "unknown" }` placeholder.
+   *
+   * Resolves dependencies exactly as {@link dispatchPosture} does (origin
+   * machine, the pinned producer key load, the unlocked audit log) and calls
+   * the canonical {@link buildCastleWallPosture} shaper — there is no second
+   * arm-state code path. Honesty is preserved end-to-end: when the audit log is
+   * locked/absent, or the producer key is expected-but-unreadable, or evidence
+   * is stale, the shaper returns `unknown` / `degraded` (never `armed`). Green
+   * (`armed`) is only ever returned for fresh, observed enforcement evidence.
+   *
+   * Never throws into the request path: any unexpected failure resolves to an
+   * honest `unknown` posture so `/api/health` always answers.
+   */
+  private async buildHealthCastleWall(): Promise<CastleWallPosture> {
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    try {
+      // Reuse the same producer-key load + audit log + origin attribution the
+      // posture dispatcher uses, so the two surfaces can never diverge on green.
+      await this.ensureProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      if (this.auditLog === null) {
+        // No unlocked audit log ⇒ no enforcement evidence to read. Honest
+        // `unknown` (amber), never green, never a fabricated placeholder.
+        return {
+          origin_machine: originMachine,
+          arm_state: "unknown",
+          platform: mapPlatform(process.platform),
+          evidence_basis: "no_evidence",
+          last_enforcement_evidence_at: null,
+          freshness_window_ms: 0,
+          verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+          audit_integrity_ok: true,
+          producer_authenticity: "not_applicable",
+        };
+      }
+      return await buildCastleWallPosture({
+        auditLog: this.auditLog,
+        originMachine,
+        pinnedProducerKeyB64url:
+          load?.status === "present" ? load.keyB64url : null,
+        ...(load?.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      });
+    } catch {
+      // Defensive: a health probe must never fail. Fall back to an honest
+      // `unknown` posture rather than throwing or claiming green.
+      return {
+        origin_machine: originMachine,
+        arm_state: "unknown",
+        platform: mapPlatform(process.platform),
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: 0,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        producer_authenticity: "not_applicable",
+      };
+    }
+  }
+
+  /**
    * Load + cache the read-side producer-key state for signature re-verification
    * (Slice R + Slice P). The key file is published by the daemon at
    * `<storage_path>/policy/egress/audit-producer.pub` and resolved through the
@@ -1052,11 +1159,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * the stored identity — never a spread, so the encrypted private key
    * blob can never ride along into an HTTP response (CLAUDE.md
    * constraint 6). Federation is honestly `enabled: false` until the
-   * PR-A3 listener work; castle_wall reports `unknown` until status
-   * wiring lands later in the stack.
+   * PR-A3 listener work.
+   *
+   * Delta Review A3: `castle_wall` now carries the SAME evidence-gated arm-state
+   * `/api/posture/castle-wall` and `/api/health` derive (via the canonical
+   * {@link buildHealthCastleWall} → {@link buildCastleWallPosture} path), not the
+   * old dead `{ status: "unknown" }` placeholder. Honesty is preserved: the
+   * shaper returns `unknown` / `degraded` (never `armed`) whenever there is no
+   * fresh, verified enforcement evidence.
    */
-  private buildV1FullStatus(): Record<string, unknown> {
+  private async buildV1FullStatus(): Promise<Record<string, unknown>> {
     const identity = this.identityManager?.getDefault();
+    const castleWall = await this.buildHealthCastleWall();
     return {
       ok: true,
       version: PKG_VERSION,
@@ -1083,7 +1197,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             created_at: identity.created_at,
           }
         : null,
-      castle_wall: { status: "unknown" },
+      castle_wall: castleWall,
     };
   }
 
@@ -1882,6 +1996,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _origin: string | undefined,
     _selfOrigin: string,
   ): void {
+    // One-surface root-flip: the posture board is the default page at `/`.
+    // Intercepted here, BEFORE the v1.1 SPA dispatch (which previously owned
+    // `/`) and the legacy route table, so the server root serves the one
+    // posture surface. Matches ONLY the bare root path — `/dashboard`, `/v1.0`,
+    // `/v1.1`, `/fortress`, `/posture`, and every `/api/*` route (the approval
+    // channel included) fall through untouched.
+    if (this.dispatchRootPosture(res, url, method)) return;
+
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
     // and never falls through to legacy routing — fail-closed 401 for
@@ -2093,12 +2215,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v1.3.0 (XXXXX): /api/health is exempt from auth AND rate limiting.
     // Health checks must always respond so the multi-aggregator health probe
     // pattern (multi-server.ts) and external monitoring work reliably.
+    //
+    // Delta Review A3: the health payload now carries the SAME evidence-gated
+    // Castle Wall arm-state `/api/posture/castle-wall` derives, so the native
+    // badge has one honest source to adopt instead of the dead `"unknown"`
+    // placeholder. The `{ ok, mode }` shape is preserved (the CLI health probe
+    // and external monitors key on it); `castle_wall` is purely additive. The
+    // build is async + fail-safe (it resolves to an honest `unknown` posture on
+    // any error), so the health probe still always answers.
     if (method === "GET" && url.pathname === "/api/health") {
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-      });
-      res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+      this.buildHealthCastleWall()
+        .then((castleWall) => {
+          if (res.headersSent) return;
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              mode: "principal-policy",
+              castle_wall: castleWall,
+            }),
+          );
+        })
+        .catch(() => {
+          // buildHealthCastleWall already swallows its own errors, but keep the
+          // health endpoint alive even if response serialization throws.
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            });
+            res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+          }
+        });
       return;
     }
 

@@ -489,7 +489,7 @@ export async function buildCastleWallPosture(
   };
 }
 
-function mapPlatform(platform: NodeJS.Platform): "macos" | "linux" | "other" {
+export function mapPlatform(platform: NodeJS.Platform): "macos" | "linux" | "other" {
   if (platform === "darwin") return "macos";
   if (platform === "linux") return "linux";
   return "other";
