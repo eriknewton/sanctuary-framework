@@ -50,14 +50,24 @@ import {
   getProtectionSnapshot,
   type AggregatorSources,
 } from "../dashboard/aggregator.js";
+import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
+  POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import {
+  createPostureStreamRegistry,
+  type PostureStreamRegistry,
+} from "./posture-stream.js";
+import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
+import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
   V1IdempotencyStore,
   type V1AgentsDeps,
@@ -199,12 +209,31 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/v1.0" ||
     path === "/fortress" ||
     path === "/events" ||
-    path === POSTURE_HOME_PATH
+    path === POSTURE_HOME_PATH ||
+    // The posture SSE live-refresh stream is a single long-lived connection per
+    // operator tab, exactly like the v1.0 `/events` stream. It must be exempt
+    // from the per-IP general rate limit so a normal reconnect (after a laptop
+    // sleep, say) does not 429 the operator out of their own live board. The
+    // stream handler enforces its OWN bound: a concurrency cap on open streams.
+    path === POSTURE_STREAM_PATH ||
+    // The per-agent drill-down HTML page is a dashboard view route too (an
+    // operator page load), so it is exempt from the general rate limit the
+    // same way `/posture` and `/fortress` are. Its data fetches still hit the
+    // throttled JSON endpoints.
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   );
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
+  /**
+   * Shared active-stream registry for the posture SSE live-refresh endpoint
+   * (`/api/posture/stream`). One per server instance so the concurrency cap is
+   * enforced across every open stream. Created eagerly (cheap) so the live
+   * stream is available as soon as the dashboard serves the posture surface.
+   */
+  private postureStreamRegistry: PostureStreamRegistry =
+    createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
   private httpServer: ReturnType<typeof createHttpServer> | null = null;
@@ -948,13 +977,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `producerKeyExpectedButUnavailable`), never the channel basis.
     await this.ensureProducerKeyLoaded();
     const load = this._producerKeyLoad;
+    // Recognition precursor: resolve the composition render-gate flag via the
+    // canonical resolver (default-off). The fortress config carries no composition
+    // input today, so this resolves to the honest `false` default; when an input
+    // is added later the same resolver picks it up without a shape change. This is
+    // CONFIG, not evidence - the composition endpoint exposes only this boolean.
+    const compositionEnabled =
+      resolveCompositionConfig().composition_enabled;
     const deps: PostureRouteDeps = {
       auditLog: this.auditLog ?? null,
       originMachine,
+      compositionEnabled,
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      // Wire the shared registry so the SSE live-refresh stream is available and
+      // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
+      // (no new data, no new green paths) on a cadence plus a heartbeat.
+      streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
   }
@@ -1553,7 +1594,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -1597,7 +1642,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -2107,8 +2156,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // true, otherwise we fall through to the legacy table below.
     if (
       url.pathname === POSTURE_HOME_PATH ||
+      url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
-      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`)
+      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
+      // Phase 2: the query-privacy stats endpoint is dispatched through the
+      // posture router so it shares the SAME checkAuth gate as `/api/posture/*`.
+      url.pathname.startsWith(`${QUERY_ANONYMITY_API_PREFIX}/`)
     ) {
       // JSON posture routes get the general rate limit; the HTML view is
       // exempt (it is a dashboard view route, like `/` and `/fortress`).
@@ -2233,7 +2286,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     const parts = authHeader.split(" ");
-    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+    if (
+      parts.length !== 2 ||
+      parts[0] !== "Bearer" ||
+      !constantTimeEquals(parts[1]!, this.authToken)
+    ) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid bearer token" }));
       return;
@@ -2361,7 +2418,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * co-located server (dashboard/server.ts) receives at construction, so
    * /api/snapshot returns the same document shape in both modes.
    */
-  private buildAggregatorSources(): AggregatorSources {
+  private async buildAggregatorSources(): Promise<AggregatorSources> {
+    // Slice R + P: resolve the pinned producer key the SAME way dispatchPosture
+    // does, so the dashboard hero shield arms the wall on the identical
+    // cryptographic basis as /v1 G4. `present` → re-verify producer signatures
+    // (a forged marker-only entry cannot arm green); `absent` → channel basis
+    // (honest macOS / pre-provision); `unreadable` → fail honestly via
+    // `producerKeyExpectedButUnavailable` (the shield goes amber, never green on
+    // a weaker basis than the consumer wrote with).
+    await this.ensureProducerKeyLoaded();
+    const load = this._producerKeyLoad;
     return {
       mode: this._standaloneMode ? "standalone" : "co-located",
       server_version: PKG_VERSION,
@@ -2370,6 +2436,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...(this.baseline ? { baseline: this.baseline } : {}),
       ...(this.policy ? { policy: this.policy } : {}),
       ...(this.clientManager ? { clientManager: this.clientManager } : {}),
+      resolvePinnedProducerKey: () =>
+        load?.status === "present" ? load.keyB64url : null,
+      ...(load?.status === "unreadable"
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,
@@ -2387,7 +2458,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * legacy /api/* route.
    */
   private handleSnapshot(res: ServerResponse): void {
-    getProtectionSnapshot(this.buildAggregatorSources())
+    this.buildAggregatorSources()
+      .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
         res.writeHead(200, {
           "Content-Type": "application/json",
@@ -2396,12 +2468,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify(snapshot));
       })
       .catch((err) => {
+        logCaughtError(
+          err,
+          { route: "/api/snapshot", operation: "get_snapshot" },
+          { status: 500 },
+        );
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               error: "snapshot_failed",
-              message: (err as Error).message,
             })
           );
         }
@@ -2811,9 +2887,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ upstream_servers: updated.upstream_servers ?? [] }));
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Invalid request";
+        // The surrounding try covers JSON.parse(body), profileStore.update(),
+        // and broadcastSSE, so `err` can be a raw library/internal error
+        // (SyntaxError carrying request fragments, a profile-store failure
+        // carrying filesystem detail). Return a fixed safe message and keep
+        // the real, redacted detail server-side for operators.
+        logCaughtError(
+          err,
+          { route: "/api/proxy/servers", operation: "update_proxy_servers" },
+          { status: 400 },
+        );
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: message }));
+        res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
   }

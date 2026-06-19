@@ -40,8 +40,10 @@
  *   pairs; they are forward-only by design.
  */
 
-import { mkdir, open, readFile, unlink, readdir, rename, stat } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { mkdir, open, unlink, readdir, stat, lstat } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
 import {
   assertSdwRawWriteAuthorized,
@@ -52,6 +54,7 @@ import type {
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
+import { readFileCustody, writeFileCustody } from "./custody-fs.js";
 
 const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 
@@ -141,27 +144,8 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     data: Uint8Array,
     syncFile: boolean
   ): Promise<void> {
-    const dirPath = dirname(filePath);
-    const tempPath = join(
-      dirPath,
-      `.${basename(filePath)}.${process.pid}.${Date.now()}.${Math.random()
-        .toString(16)
-        .slice(2)}.tmp`
-    );
-    const handle = await open(tempPath, "wx", 0o600);
-    try {
-      await handle.writeFile(data);
-      if (syncFile) await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await rename(tempPath, filePath);
-      if (syncFile) await this.fsyncDirectory(dirPath);
-    } catch (err) {
-      await unlink(tempPath).catch(() => undefined);
-      throw err;
-    }
+    await writeFileCustody(filePath, data, { mode: 0o600, parentMode: 0o700 });
+    if (syncFile) await this.fsyncDirectory(dirname(filePath));
   }
 
   private async fsyncDirectory(dirPath: string): Promise<void> {
@@ -189,7 +173,7 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
 
   private async readAtPath(filePath: string): Promise<Uint8Array | null> {
     try {
-      const buf = await readFile(filePath);
+      const buf = await readFileCustody(filePath);
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     } catch (err: unknown) {
       if (
@@ -221,22 +205,30 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     secureOverwrite: boolean
   ): Promise<boolean> {
     try {
+      let openedStats: Stats | null = null;
       if (secureOverwrite) {
-        // Read the file to determine its size
-        const fileStat = await stat(filePath);
-        const size = fileStat.size;
+        const noFollow =
+          typeof fsConstants.O_NOFOLLOW === "number"
+            ? fsConstants.O_NOFOLLOW
+            : 0;
+        const fileHandle = await open(filePath, fsConstants.O_RDWR | noFollow);
+        try {
+          const fileStat = await fileHandle.stat();
+          if (!fileStat.isFile()) {
+            throw new Error("Secure delete target is not a regular file.");
+          }
+          openedStats = fileStat;
+          const size = fileStat.size;
 
-        // A zero-byte file has no content to overwrite (and randomBytes(0)
-        // rejects a non-positive length); skip straight to unlink.
-        // Overwrite with random bytes (3 passes for defense in depth). Each
-        // pass is fsync'd so the bytes are flushed to the medium rather than
-        // left in the page cache; this is best-effort durability, not a
-        // guarantee of in-place overwrite on CoW / journaled / flash-FTL
-        // filesystems (see the header comment).
-        for (let pass = 0; size > 0 && pass < 3; pass++) {
-          const randomData = randomBytes(size);
-          const fileHandle = await open(filePath, "r+");
-          try {
+          // A zero-byte file has no content to overwrite (and randomBytes(0)
+          // rejects a non-positive length); skip straight to unlink.
+          // Overwrite with random bytes (3 passes for defense in depth). Each
+          // pass is fsync'd so the bytes are flushed to the medium rather than
+          // left in the page cache; this is best-effort durability, not a
+          // guarantee of in-place overwrite on CoW / journaled / flash-FTL
+          // filesystems (see the header comment).
+          for (let pass = 0; size > 0 && pass < 3; pass++) {
+            const randomData = randomBytes(size);
             // write() may short-write, so loop until every byte is on the fd
             // before fsync; otherwise a pass could flush only a prefix and
             // leave the suffix as prior ciphertext.
@@ -248,13 +240,37 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
                 randomData.length - offset,
                 offset
               );
-              if (bytesWritten === 0) break;
+              if (bytesWritten === 0) {
+                throw new Error("Secure delete overwrite made no progress.");
+              }
               offset += bytesWritten;
             }
             await fileHandle.sync();
-          } finally {
-            await fileHandle.close();
           }
+        } finally {
+          await fileHandle.close();
+        }
+        let pathStats: Stats;
+        try {
+          pathStats = await lstat(filePath);
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            "code" in err &&
+            (err as NodeJS.ErrnoException).code === "ENOENT"
+          ) {
+            throw new Error("Secure delete target changed before unlink.", {
+              cause: err,
+            });
+          }
+          throw err;
+        }
+        if (
+          pathStats.isSymbolicLink() ||
+          pathStats.dev !== openedStats.dev ||
+          pathStats.ino !== openedStats.ino
+        ) {
+          throw new Error("Secure delete target changed before unlink.");
         }
       }
 

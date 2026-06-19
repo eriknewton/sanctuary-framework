@@ -12,8 +12,8 @@
  *   rather than silently substituting a default (operator intent preservation).
  */
 
-import { readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import type {
   PrincipalPolicy,
   Tier2Config,
@@ -75,6 +75,8 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   different door (no-read invariant). It is also a governance conflict of
  *   interest: an agent must not self-generate its own compliance attestation.
  *   So it must require operator approval. (CISO NEW-1.)
+ * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
+ *   hand-authored policy once the inert memory tool factory is wired.
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
@@ -85,6 +87,7 @@ const FORCED_TIER1_OPERATIONS = [
   "context_gate_apply_template",
   "audit_export_siem",
   "compliance_generate_eu_ai_act_bundle",
+  "memory_delete",
 ] as const;
 
 /**
@@ -148,6 +151,18 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sdw_export",
     "sdw_import",
     "sdw_export_delete",
+    // SDW memory substrate (company-brain phase 1, wired 2026-06-18). Both the
+    // write and the irreversible delete require operator approval: a passage
+    // insert commits operator data to the sovereign vault, and the delete is a
+    // secure-overwrite (where the backend supports it) that cannot be undone.
+    // memory_delete is ALSO in FORCED_TIER1_OPERATIONS so a hand-authored
+    // policy cannot relax it (the insert MAY be relaxed to Tier 3 by an
+    // operator who wants unattended writes; the irreversible delete may not).
+    // memory_insert's body is redacted from the approval channel by the tool's
+    // approvalTargetArgs (Hard Constraint #1: no pre-approval body to an
+    // external channel).
+    "memory_insert",
+    "memory_delete",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -555,15 +570,20 @@ export async function loadPrincipalPolicy(
 
   let content: string;
   try {
-    content = await readFile(policyPath, "utf-8");
+    content = await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") {
       // Expected on first boot; generate default
       const defaultYaml = generateDefaultPolicyYaml();
       try {
-        await writeFile(policyPath, defaultYaml, "utf-8");
-        await chmod(policyPath, 0o600);
+        await writeFileCustody(policyPath, defaultYaml, {
+          mode: 0o600,
+          createParent: false,
+        });
       } catch (writeErr) {
         // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.warn(

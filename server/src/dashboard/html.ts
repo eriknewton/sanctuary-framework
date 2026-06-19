@@ -667,7 +667,6 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   const INITIAL_SNAPSHOT = ${initialSnapshot};
   const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
   const AUTH_HEADER = AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
-  const AUTH_QS = AUTH_TOKEN ? "?token=" + encodeURIComponent(AUTH_TOKEN) : "";
 
   let snapshot = INITIAL_SNAPSHOT;
 
@@ -797,7 +796,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         const action = btn.dataset.action;
         btn.disabled = true;
         try {
-          await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action + AUTH_QS, {
+          await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
             method: "POST", headers: AUTH_HEADER
           });
         } catch {}
@@ -818,16 +817,26 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 
   async function refreshSnapshot() {
     try {
-      const res = await fetch("/api/snapshot" + AUTH_QS, { headers: AUTH_HEADER });
+      const res = await fetch("/api/snapshot", { headers: AUTH_HEADER });
       if (!res.ok) return;
       const snap = await res.json();
       renderAll(snap);
     } catch {}
   }
 
-  function connectSSE() {
+  async function createSessionQuery() {
+    if (!AUTH_TOKEN) return "";
+    const res = await fetch("/auth/session", { method: "POST", headers: AUTH_HEADER });
+    if (!res.ok) throw new Error("session_exchange_failed");
+    const body = await res.json();
+    if (!body || !body.session_id || body.session_id === "no-auth") return "";
+    return "?session=" + encodeURIComponent(body.session_id);
+  }
+
+  async function connectSSE() {
     try {
-      const es = new EventSource("/api/stream" + AUTH_QS);
+      const sessionQuery = await createSessionQuery();
+      const es = new EventSource("/api/stream" + sessionQuery);
       es.addEventListener("snapshot", (ev) => {
         try { renderAll(JSON.parse(ev.data)); } catch {}
       });

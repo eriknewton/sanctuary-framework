@@ -25,6 +25,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import {
   constantTimeEquals,
 } from "../dashboard/api.js";
@@ -263,16 +264,20 @@ export async function handleEnglishPolicyRoute(
       try {
         body = await readBody(req);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        writeJSON(res, 413, { ok: false, error: "payload_too_large", detail });
+        sendCaughtError(res, 413, "payload_too_large", err, {
+          route: "policy-engine",
+          operation: "compile.read_body",
+        });
         return true;
       }
       let parsed: unknown;
       try {
         parsed = JSON.parse(body);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        writeJSON(res, 400, { ok: false, error: "invalid_json", detail });
+        sendCaughtError(res, 400, "invalid_json", err, {
+          route: "policy-engine",
+          operation: "compile.parse_json",
+        });
         return true;
       }
       if (!parsed || typeof parsed !== "object") {
@@ -540,8 +545,11 @@ export async function handleEnglishPolicyRoute(
 
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
-  } catch {
-    writeJSON(res, 500, { ok: false, error: "internal" });
+  } catch (err) {
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "policy-engine",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

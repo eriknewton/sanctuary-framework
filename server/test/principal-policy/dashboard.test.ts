@@ -352,9 +352,10 @@ describe("Principal Dashboard", () => {
       expect(data.error).toContain("Unauthorized");
     });
 
-    it("rejects requests with wrong bearer token", async () => {
+    it("rejects requests with same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
       const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
-        headers: { Authorization: "Bearer wrong-token" },
+        headers: { Authorization: `Bearer ${wrongToken}` },
       });
       expect(res.status).toBe(401);
     });
@@ -366,6 +367,49 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
+    });
+
+    it("gates GET /api/posture/composition behind the SAME checkAuth gate", async () => {
+      // Recognition precursor: the composition gate endpoint must sit behind the
+      // same bearer gate as the rest of /api/posture/*, never a weaker path.
+      const noAuth = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/composition`,
+      );
+      expect(noAuth.status).toBe(401);
+
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
+      const badAuth = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/composition`,
+        { headers: { Authorization: `Bearer ${wrongToken}` } },
+      );
+      expect(badAuth.status).toBe(401);
+    });
+
+    it("GET /api/posture/composition returns ONLY the gate flag (off, no Concordia/Verascore data)", async () => {
+      const res = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/composition`,
+        { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Honest default-off: composition is disabled by default, so the gate
+      // reports false (config, not absence-of-evidence).
+      expect(body.composition_enabled).toBe(false);
+      expect(typeof body.origin_machine).toBe("string");
+      // The payload carries ONLY the gate flag + origin_machine - never a score,
+      // a fetch result, or any Concordia/Verascore field.
+      expect(Object.keys(body).sort()).toEqual(
+        ["composition_enabled", "origin_machine"].sort(),
+      );
+    });
+
+    it("rejects session exchange with same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
+      const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${wrongToken}` },
+      });
+      expect(res.status).toBe(401);
     });
 
     it("rejects long-lived token in query parameter (SEC-012)", async () => {

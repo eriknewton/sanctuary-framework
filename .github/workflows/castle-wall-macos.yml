@@ -26,6 +26,9 @@ on:
       - "server/src/castle-wall/**"
       - ".github/workflows/castle-wall-macos.yml"
 
+permissions:
+  contents: read
+
 jobs:
   castle-wall-macos:
     # The enforcement package (sysext, host app, packet filter, IPC library)

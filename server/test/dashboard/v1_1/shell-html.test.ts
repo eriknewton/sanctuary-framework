@@ -51,6 +51,14 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(client).toContain("sessionStorage");
   });
 
+  it("uses short-lived sessions, not long-lived token URLs, for SSE", () => {
+    const client = getClientScript();
+    expect(client).not.toContain("?token=");
+    expect(client).toContain("/auth/session");
+    expect(client).toContain("?session=");
+    expect(client).toContain("new EventSource(url)");
+  });
+
   it("no em-dashes in operator-visible HTML strings", () => {
     const html = renderDashboardV11Html({});
     // The shell HTML body must not include the U+2014 em-dash. Internal

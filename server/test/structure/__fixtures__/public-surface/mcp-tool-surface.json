@@ -1047,6 +1047,118 @@
     }
   },
   {
+    "name": "memory_count",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "memory_delete",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "passage_id": {
+          "type": "string",
+          "description": "Passage id to delete"
+        }
+      },
+      "required": [
+        "passage_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_get",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "passage_id": {
+          "type": "string",
+          "description": "Passage id to fetch"
+        }
+      },
+      "required": [
+        "passage_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_insert",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Passage text to store"
+        },
+        "taint": {
+          "type": "string",
+          "enum": [
+            "user_content",
+            "agent_derived_clean",
+            "system_generated"
+          ],
+          "description": "Provenance of the text: user_content (conversation-derived), agent_derived_clean (agent summary), or system_generated. This is a hint, not a secret-free guarantee: forbidden taints and secret-classifier hits are rejected before encryption."
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional tags (SDW identifier grammar)"
+        },
+        "passage_id": {
+          "type": "string",
+          "description": "Optional caller-supplied id (SDW identifier grammar); generated if absent"
+        }
+      },
+      "required": [
+        "text",
+        "taint"
+      ]
+    }
+  },
+  {
+    "name": "memory_list",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "number",
+          "description": "Optional max results"
+        },
+        "after": {
+          "type": "string",
+          "description": "Optional cursor: return ids strictly after this one"
+        }
+      }
+    }
+  },
+  {
+    "name": "memory_search",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Case-insensitive substring to match"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Optional: restrict to passages carrying this tag"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Optional max results"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
     "name": "monitor_audit_log",
     "inputSchema": {
       "type": "object",
@@ -1772,6 +1884,21 @@
         "chain_id",
         "agent_id",
         "nonce"
+      ]
+    }
+  },
+  {
+    "name": "sdw_memory_provenance",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "passage_id": {
+          "type": "string",
+          "description": "Passage id to inspect provenance for"
+        }
+      },
+      "required": [
+        "passage_id"
       ]
     }
   },

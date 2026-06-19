@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { getServers } from "node:dns";
-import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
@@ -26,6 +26,12 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
+import {
+  isCustodyFsError,
+  readFileCustody,
+  readFileCustodyWithStats,
+  writeFileCustody,
+} from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import {
@@ -301,6 +307,14 @@ export async function startMacOSCastleWallDaemon(
             decision: response.decision,
             learn: response.learn,
             source: "castle-wall-cli",
+            // NB: deliberately NOT stamped with the Castle Wall provenance
+            // marker. An operator CLI decision is broadcast to the extension but
+            // delivery/application is not confirmed here (broadcastDecisionResponse
+            // can reach zero subscribers if the extension disconnected), so it is
+            // not proof of live enforcement. The honest posture arms only from
+            // real adjudicated flows (egress_allowed/egress_blocked via
+            // flow_decision_recorded), never from an unacknowledged operator
+            // decision. Marking this would be a false-green over-claim.
           },
           "success",
         );
@@ -490,7 +504,10 @@ async function resolveAgentOrigin(
   }
   const filePath = join(fortressPath, "policy", "egress", AGENT_ORIGIN_FILENAME);
   try {
-    const raw = await readFile(filePath, "utf8");
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(raw) as unknown;
     const validated = validateAgentOrigin(parsed);
     if (validated === null) {
@@ -519,15 +536,11 @@ async function resolveOperatorBaseline(
   }
   const filePath = join(fortressPath, "policy", "egress", OPERATOR_BASELINE_FILENAME);
   try {
-    const fileStat = await stat(filePath);
-    if ((fileStat.mode & 0o077) !== 0) {
-      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
-      console.warn(
-        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} must be mode 0600/0700-equivalent for non-owner bits; ignoring`,
-      );
-      return undefined;
-    }
-    const raw = await readFile(filePath, "utf8");
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      mode: { rejectGroupOrOther: true },
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(raw) as unknown;
     const validated = validateOperatorBaseline(parsed);
     if (validated === null) {
@@ -543,6 +556,13 @@ async function resolveOperatorBaseline(
       ? (err as NodeJS.ErrnoException).code
       : undefined;
     if (code === "ENOENT") return undefined;
+    if (isCustodyFsError(err) && err.code === "mode_rejected") {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} must be mode 0600/0700-equivalent for non-owner bits; ignoring`,
+      );
+      return undefined;
+    }
     throw err;
   }
 }
@@ -595,12 +615,17 @@ async function loadLocalSigningKey(
   fortressPath: string,
   masterKey: Uint8Array,
 ): Promise<DaemonSigner> {
-  const publicKey = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+  const publicKey = await readFileCustody(join(fortressPath, CASTLE_PINNED_PUBKEY), {
+    verifyPathIdentity: true,
+  });
   if (publicKey.length !== 32) {
     throw new Error(`Pinned public key must be 32 bytes (found ${publicKey.length}).`);
   }
   let encryptedPrivateKey = JSON.parse(
-    await readFile(join(fortressPath, CASTLE_PINNED_PRIVKEY), "utf8"),
+    await readFileCustody(join(fortressPath, CASTLE_PINNED_PRIVKEY), {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    }),
   ) as EncryptedPayload;
   const privateKey = decrypt(encryptedPrivateKey, masterKey);
   try {
@@ -646,8 +671,10 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
       recursive: true,
       mode: 0o755,
     });
-    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, { mode: 0o644 });
-    await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
+    await writeFileCustody(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, {
+      mode: 0o644,
+      createParent: false,
+    });
   } catch (error) {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.warn(
@@ -695,9 +722,10 @@ async function assertGlobalPinMatchesLiveKey(
 ): Promise<void> {
   let pin: { uid: number; bytes: Uint8Array } | null;
   try {
-    const uid = (await stat(pinPath)).uid;
-    const bytes = await readFile(pinPath);
-    pin = { uid, bytes };
+    const { data, stats } = await readFileCustodyWithStats(pinPath, {
+      verifyPathIdentity: true,
+    });
+    pin = { uid: stats.uid, bytes: data };
   } catch {
     // absent / unreadable — additive check, skip
     return;
@@ -738,7 +766,9 @@ async function loadManifestState(input: {
   }
   filenames.sort();
   for (const filename of filenames) {
-    const raw = await readFile(join(rulesDir, filename));
+    const raw = await readFileCustody(join(rulesDir, filename), {
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(bytesToString(raw)) as AllowlistRule;
     const issues = validateRule(parsed);
     if (issues.length > 0) {
@@ -912,12 +942,10 @@ async function writeActiveConfigAt(
   if (createDir) {
     await mkdir(dirname(configPath), { recursive: true, mode: 0o755 });
   }
-  const tempPath = `${configPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(config)}\n`, {
-    encoding: "utf8",
+  await writeFileCustody(configPath, `${JSON.stringify(config)}\n`, {
     mode: 0o644,
+    createParent: false,
   });
-  await rename(tempPath, configPath);
   return configPath;
 }
 
@@ -948,7 +976,10 @@ async function readActiveConfig(
 ): Promise<ActiveCastleWallConfig | null> {
   let raw: string;
   try {
-    raw = await readFile(configPath, "utf8");
+    raw = await readFileCustody(configPath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
     const code = err instanceof Error && "code" in err
       ? (err as NodeJS.ErrnoException).code

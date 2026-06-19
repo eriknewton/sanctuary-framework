@@ -7,7 +7,10 @@
  * build step, CSP-friendly.
  */
 
-import type { MultiTenantSnapshot } from "./multi-aggregator.js";
+import type {
+  MultiTenantSnapshot,
+  MultiTenantTenantRow,
+} from "./multi-aggregator.js";
 
 function escHtml(value: unknown): string {
   if (value == null) return "";
@@ -35,10 +38,18 @@ function formatRelative(iso: string | null, now: Date = new Date()): string {
 }
 
 function statusPill(
-  running: boolean,
+  probeState: MultiTenantTenantRow["probe_state"],
   initialized: boolean
 ): { label: string; cls: string } {
-  if (running) return { label: "running", cls: "pill-running" };
+  if (probeState === "confirmed") {
+    return { label: "running", cls: "pill-running" };
+  }
+  // A port answered HTTP but did not prove it is a Sanctuary tenant. Never claim
+  // "running" here: it may be a foreign process on a reused port or an older
+  // build. Surface the honest "port answered, not confirmed" state.
+  if (probeState === "answered_unconfirmed") {
+    return { label: "port answered, not confirmed", cls: "pill-unconfirmed" };
+  }
   if (initialized) return { label: "stopped", cls: "pill-stopped" };
   return { label: "empty", cls: "pill-empty" };
 }
@@ -57,7 +68,7 @@ export function renderMultiAgentHTML(options: MultiAgentHTMLOptions): string {
       ? `<tr class="empty"><td colspan="6">No tenants found — run <code>sanctuary wrap</code> with <code>SANCTUARY_STORAGE_PATH</code> to create one.</td></tr>`
       : snapshot.tenants
           .map((t) => {
-            const pill = statusPill(t.running, t.initialized);
+            const pill = statusPill(t.probe_state, t.initialized);
             const link = t.dashboard_url
               ? `<a href="${escHtml(t.dashboard_url)}" target="_blank" rel="noopener">${escHtml(t.dashboard_url)}</a>`
               : `<span class="muted">—</span>`;
@@ -194,6 +205,7 @@ td a:hover { text-decoration: underline; }
 }
 .pill-running { background: rgba(94, 228, 182, 0.12); color: var(--ok); }
 .pill-stopped { background: rgba(245, 195, 113, 0.12); color: var(--warn); }
+.pill-unconfirmed { background: rgba(245, 195, 113, 0.12); color: var(--warn); }
 .pill-empty { background: rgba(85, 94, 128, 0.2); color: var(--muted); }
 footer {
   max-width: 1080px;
@@ -211,6 +223,9 @@ code { background: var(--surface-2); padding: 1px 6px; border-radius: 4px; }
   <div class="summary">
     <span class="chip"><strong>Tenants</strong>${escHtml(snapshot.tenant_count)}</span>
     <span class="chip"><strong>Running</strong>${escHtml(snapshot.running_count)}</span>
+    ${snapshot.answered_unconfirmed_count > 0
+      ? `<span class="chip"><strong>Port answered, not confirmed</strong>${escHtml(snapshot.answered_unconfirmed_count)}</span>`
+      : ""}
     <span class="chip"><strong>Updated</strong>${escHtml(new Date(snapshot.generated_at).toLocaleTimeString())}</span>
   </div>
 </header>

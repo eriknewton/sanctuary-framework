@@ -49,14 +49,17 @@
  *    recomputed by the route layer keyed on the chain head (see
  *    `posture-routes.ts`).
  *
- *  - `policy_loaded` is NOT treated as liveness OR as strong live-adjudication
+ *  - `policy_loaded` is NOT treated as liveness OR as live-adjudication
  *    evidence here. It fires only inside the reload path; a daemon that loaded
  *    policy once but stopped enforcing would otherwise read green for the
  *    freshness window. Only `egress_allowed` / `egress_blocked` /
- *    `operator_decision` prove live adjudication. (`posture.ts:74` currently
- *    still lists `policy_loaded` in `CASTLE_WALL_ENFORCEMENT_OPERATIONS` — a
- *    latent honesty seam tracked for coordinator triage; this slice does not
- *    rely on it and leaves the shipped constant untouched.)
+ *    `operator_decision` prove live adjudication. This live-adjudication set is
+ *    now the SAME frozen object as
+ *    `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS` (imported below): the
+ *    banner reader and this feature-health panel share one definition of
+ *    "armed," so they can never disagree on whether a wall is green. The
+ *    previously-tracked honesty seam (posture armed on `policy_loaded` alone on
+ *    the no-key/channel basis) is now closed at the source.
  *
  * These functions are pure over their injected dependencies so they unit-test
  * without a live HTTP server or a running daemon.
@@ -68,6 +71,7 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../castle-wall/constants.js";
 import {
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   DEFAULT_DIGEST_WINDOW_MS,
@@ -85,16 +89,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Live-adjudication evidence for Castle Wall. Deliberately a STRICTER set than
- * `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS`: only operations that prove
- * the filter adjudicated real traffic. `policy_loaded` is excluded (it proves a
- * manifest was accepted once, not that the wall is still enforcing — see the
- * module header's honesty-seam note).
+ * Live-adjudication evidence for Castle Wall: the operations that prove the
+ * filter adjudicated real traffic (`egress_allowed` / `egress_blocked` /
+ * `operator_decision`). `policy_loaded` is excluded (it proves a manifest was
+ * accepted once, not that the wall is still enforcing).
+ *
+ * This is an ALIAS of `posture.ts:CASTLE_WALL_ENFORCEMENT_OPERATIONS`, not a
+ * second copy: both readers consume the one frozen set, so no divergent color
+ * model can drift back in (the convergence this slice landed). The
+ * live-adjudication name is retained for the existing call sites and tests that
+ * import it.
  */
 export const CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS: ReadonlySet<string> =
-  Object.freeze(
-    new Set<string>(["egress_allowed", "egress_blocked", "operator_decision"]),
-  );
+  CASTLE_WALL_ENFORCEMENT_OPERATIONS;
 
 /**
  * How a feature proves it is alive.
@@ -274,14 +281,51 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       brokenZeroDetectable: false,
     },
     {
-      id: "privacy_strips",
-      label: "Query-privacy strips",
+      // The ALWAYS-ON Tier A query-privacy feature: fingerprintable HTTP
+      // headers are stripped from every outbound substrate call, structurally
+      // unconditional (no operator opt-out), emitting
+      // `query_anonymity_headers_stripped` on every wrapped fetch
+      // (`query-anonymity/header-strip.ts`; wired in `intelligence/selector.ts`).
+      //
+      // HONESTY (do NOT relabel to "anonymity"): this is metadata hygiene, not
+      // anonymity. Stripping fingerprintable headers reduces what the substrate
+      // provider can correlate, but the provider still sees the query CONTENT
+      // and the authenticated API key. The row label and any panel copy must say
+      // "header strip" / "metadata", never imply the queries are anonymous. See
+      // the Phase 2 design overclaim flag (2026-06-19 §2.1 C).
+      //
+      // It is `event_driven`: it only writes to the audit log when a call
+      // actually went out, so a quiet window is genuinely ambiguous (no calls vs
+      // silently bypassed are indistinguishable from counts alone). Quiet renders
+      // the distinct non-green `unconfirmed` chip, NEVER green - the broker is
+      // broken-zero-undetectable, so absence is not evidence of health.
+      id: "header_strip",
+      label: "Query-privacy header strip (metadata)",
       layer: "l2",
       liveness: "event_driven",
-      // ONLY the actual rewrite proves the privacy stripper DID something. A
-      // config update or a consent record is administrative housekeeping, not a
-      // strip — counting them as activity would render the feature green without
-      // a single query ever having been stripped (codex HIGH 2026-06-13).
+      invocationOps: Object.freeze(
+        new Set<string>(["query_anonymity_headers_stripped"]),
+      ),
+      brokenZeroDetectable: false,
+    },
+    {
+      // Tier B PII rewrite (OPT-IN, off by default). Distinct from the Tier A
+      // `header_strip` row above: this row intentionally counts ONLY the actual
+      // rewrite op (`query_anonymity_pii_rewritten`), so a config update or a
+      // consent record (administrative housekeeping, not a strip) can never
+      // render it green without a single query having been rewritten (codex HIGH
+      // 2026-06-13).
+      //
+      // KNOWN STANDING (documentation only - do NOT change behavior to force
+      // green): the PII-rewrite emitter is not yet wired into the live selector
+      // path (the deferred Rho-2.5 boot-wiring), so `query_anonymity_pii_rewritten`
+      // does not fire in production today. This row therefore reads `unconfirmed`
+      // (amber) until that wiring lands. That is the honest state; the always-on
+      // privacy feature that DOES fire on every call is the `header_strip` row.
+      id: "privacy_strips",
+      label: "Query-privacy PII rewrite (opt-in)",
+      layer: "l2",
+      liveness: "event_driven",
       invocationOps: Object.freeze(
         new Set<string>(["query_anonymity_pii_rewritten"]),
       ),

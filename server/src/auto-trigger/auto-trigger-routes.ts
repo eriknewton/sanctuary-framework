@@ -42,6 +42,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 
 import {
   ActionDispatcher,
@@ -386,8 +387,10 @@ export async function handleAutoTriggerRoute(
           );
           writeJSON(res, 200, { ok: true, data: accepted });
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          writeJSON(res, 404, { ok: false, error: "recommendation_not_found", message: msg });
+          sendCaughtError(res, 404, "not_found", err, {
+            route: "auto-trigger",
+            operation: "accept-recommendation",
+          });
         }
         return true;
       }
@@ -413,8 +416,10 @@ export async function handleAutoTriggerRoute(
           );
           writeJSON(res, 200, { ok: true, data: rejected });
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          writeJSON(res, 404, { ok: false, error: "rule_not_found", message: msg });
+          sendCaughtError(res, 404, "not_found", err, {
+            route: "auto-trigger",
+            operation: "reject-recommendation",
+          });
         }
         return true;
       }
@@ -436,8 +441,10 @@ export async function handleAutoTriggerRoute(
     writeJSON(res, 404, { ok: false, error: "not_found" });
     return true;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", message });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "auto-trigger",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

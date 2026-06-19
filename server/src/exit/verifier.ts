@@ -18,7 +18,7 @@ export class InvalidExitBundleError extends Error {
   }
 }
 
-import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
@@ -37,6 +37,10 @@ import {
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
+import {
+  readFileCustody,
+  readFileCustodyWithStats,
+} from "../storage/custody-fs.js";
 
 export interface ExitBundleDetailedVerifierResult
   extends ExitBundleVerifierResult {
@@ -194,7 +198,9 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
 }
 
 export async function readManifest(bundleDir: string): Promise<ExitBundleManifest> {
-  const bytes = await readFile(join(bundleDir, "manifest.json"));
+  const bytes = await readFileCustody(join(bundleDir, "manifest.json"), {
+    verifyPathIdentity: true,
+  });
   return JSON.parse(Buffer.from(bytes).toString("utf8")) as ExitBundleManifest;
 }
 
@@ -206,7 +212,9 @@ export async function loadExitArtifact<T = unknown>(
   const entry = manifest.body.artifacts.find((artifact) => artifact.kind === kind);
   if (!entry) return null;
   const artifactPath = join(bundleDir, entry.path);
-  const bytes = await readFile(artifactPath);
+  const bytes = await readFileCustody(artifactPath, {
+    verifyPathIdentity: true,
+  });
   return {
     entry,
     path: artifactPath,
@@ -338,7 +346,9 @@ export async function verifyExitBundle(
   let manifest: ExitBundleManifest;
   let manifestBytes: Uint8Array;
   try {
-    const raw = await readFile(join(root, "manifest.json"));
+    const raw = await readFileCustody(join(root, "manifest.json"), {
+      verifyPathIdentity: true,
+    });
     manifestBytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
     manifest = JSON.parse(Buffer.from(raw).toString("utf8")) as ExitBundleManifest;
   } catch {
@@ -425,9 +435,11 @@ export async function verifyExitBundle(
         });
         continue;
       }
-      const fileStat = await stat(artifactPath);
+      const { data: raw, stats: fileStat } = await readFileCustodyWithStats(
+        artifactPath,
+        { verifyPathIdentity: true },
+      );
       fileSize = fileStat.size;
-      const raw = await readFile(artifactPath);
       bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
     } catch {
       artifactFailure = "artifact_missing";

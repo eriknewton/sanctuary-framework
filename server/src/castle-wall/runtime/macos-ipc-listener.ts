@@ -61,6 +61,31 @@ import type {
 } from "../ipc/messages.js";
 import type { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 
+function sanitizeLogValue(value: string): string {
+  let sanitized = "";
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (!((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f))) {
+      sanitized += ch;
+      continue;
+    }
+    switch (ch) {
+      case "\n":
+        sanitized += "\\n";
+        break;
+      case "\r":
+        sanitized += "\\r";
+        break;
+      case "\t":
+        sanitized += "\\t";
+        break;
+      default:
+        sanitized += `\\x${code.toString(16).padStart(2, "0")}`;
+    }
+  }
+  return sanitized;
+}
+
 /** Wire envelope shape. Mirrors `wrapEnvelope` in `ipc-client.ts`. */
 interface JsonRpcEnvelope {
   jsonrpc: "2.0";
@@ -87,14 +112,14 @@ export interface MacOSFlowIpcListenerOptions {
   /**
    * Re-own the bound socket to this uid after binding (F1 #450 item 3). The
    * safe-mode BOOT daemon runs as ROOT, so it creates a root-owned socket the
-   * operator CLI (notably the dead-man `disable` lever) cannot connect to —
+   * operator CLI (notably the dead-man `disable` lever) cannot connect to:
    * EPERM on a 0600 root socket as a non-root uid. Set this to the operator
    * (fortress owner) uid so the operator owns the socket while mode stays 0600:
    * root (the daemon + a root-running extension) still reaches it via superuser
    * bypass, and no other local user can. Undefined (the full operator daemon,
    * already operator-owned) leaves ownership untouched. Best-effort: a failed
    * chown warns but does not abort startup (the socket stays secure root:0600
-   * and the GUI dead-man toggle remains the backstop — aborting would drop to a
+   * and the GUI dead-man toggle remains the backstop; aborting would drop to a
    * worse daemon-less brick).
    */
   socketOwnerUid?: number;
@@ -483,11 +508,13 @@ export class MacOSFlowIpcListener {
     const message = envelope.params as CastleWallMessage;
     this.stats.framesDecoded += 1;
     void this.routeMessage(state, message).catch((error) => {
+      const type = sanitizeLogValue(String(message.type));
+      const reason = sanitizeLogValue(
+        error instanceof Error ? error.message : String(error),
+      );
       // SAFETY: listener route failures must surface in daemon stderr.
       console.error(
-        `[castle-wall] listener routeMessage failed for type=${message.type}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `[castle-wall] listener routeMessage failed for type=${type}: ${reason}`,
       );
     });
   }

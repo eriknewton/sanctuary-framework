@@ -37,6 +37,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import type { AggregatedApprovalStatus, ApprovalAggregator } from "./approval-aggregator.js";
 
 /** URL prefix for the cross-harness approval inbox surface. */
@@ -141,6 +142,10 @@ function isStateChangingApprovalPath(path: string): boolean {
     match.action !== null &&
     STATE_CHANGING_APPROVAL_ACTIONS.has(match.action)
   );
+}
+
+function isAggregatorNotFound(err: unknown): boolean {
+  return err instanceof Error && err.message === "approval-aggregator: not_found";
 }
 
 async function handleStream(
@@ -389,11 +394,16 @@ export async function handleApprovalInboxRoute(
         );
         writeJSON(res, 200, { ok: true, data: { entry } });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg === "approval-aggregator: not_found") {
-          writeJSON(res, 404, { ok: false, error: "not_found" });
+        if (isAggregatorNotFound(err)) {
+          sendCaughtError(res, 404, "not_found", err, {
+            route: "approval-inbox",
+            operation: entryMatch.action,
+          });
         } else {
-          writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+          sendCaughtError(res, 500, "internal_error", err, {
+            route: "approval-inbox",
+            operation: entryMatch.action,
+          });
         }
       }
       return true;
@@ -402,8 +412,10 @@ export async function handleApprovalInboxRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "approval-inbox",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

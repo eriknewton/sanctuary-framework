@@ -1,0 +1,91 @@
+# Sanctuary secret-scanning policy (gitleaks)
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# SECRETS-POLICY-001: a repo-local, runnable secret policy so a developer
+# catches secrets BEFORE pushing, not just on GitHub's secret-scanning after
+# the fact. Run locally with `gitleaks detect --config .gitleaks.toml
+# --no-banner` (install: `brew install gitleaks`). CI runs the same config on
+# every PR and push to main via .github/workflows/secret-scan.yml.
+#
+# `useDefault = true` pulls in the full upstream gitleaks ruleset (AWS keys,
+# Slack/GitHub/GitLab/Stripe tokens, private keys, JWTs, etc). On top of that we
+# make two precise, evidence-driven narrowings so the gate is meaningful and
+# green on a clean tree instead of permanently red on synthetic test data:
+#
+#   1. Disable ONE rule by name - `generic-api-key`. It is an entropy heuristic
+#      that matches any key/token/secret-shaped assignment. On this repository
+#      it produced 63 findings (verified with gitleaks 8.30.1 against the
+#      tracked tree), every one a synthetic fixture in the EU AI Act example
+#      bundle, the SIEM-export / honeypot / context-gate tests, or
+#      privacy-filter source comments - zero real credentials. A rule that is
+#      63-for-63 false on a clean tree trains reviewers to ignore the gate; the
+#      high-signal provider rules (AWS, Slack, GitHub, GitLab, Stripe live keys,
+#      private keys, JWTs) stay ON and still catch real leaks.
+#
+#   2. Allowlist a small set of KNOWN synthetic fixtures by value/path so the
+#      remaining provider rules do not re-flag intentional test data.
+#
+# This is deliberately tight: no real source directory is blanket-allowlisted.
+# Each allowlist entry names a specific synthetic value or a specific test file.
+
+title = "Sanctuary gitleaks policy"
+
+[extend]
+# Inherit the upstream default ruleset, then disable only the noisy entropy
+# heuristic by its rule id (see rationale #1 above). Everything else stays on.
+useDefault = true
+disabledRules = ["generic-api-key"]
+
+[allowlist]
+description = "Known-synthetic security-detector, honeypot, and test fixtures (not real credentials)."
+
+# regexTarget = "line" widens each match to the whole source line so the
+# de-shaped (string-concatenated) fixtures are covered alongside contiguous
+# literals.
+regexTarget = "line"
+
+regexes = [
+  # --- Provider-token fixtures (GitHub secret-scanning alert #1 family) ---
+  # AWS docs canonical example key. Literal in the SDW write-gate placeholder
+  # allowlist (server/src/sdw/write-gate.ts) and the outbound-scanner test.
+  # This exact value is AWS's own public documentation sample, never live.
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # Synthetic Slack bot token (outbound-scanner test) resolved as alert #1
+  # (used_in_tests). Source assembles it from fragments; this covers the
+  # contiguous form if a future edit re-joins it.
+  '''xoxb-1234567890-abcdefghijklmnop''',
+  # Synthetic GitHub PAT honeypot / secret-gate fixtures: obviously-fake
+  # sequential placeholder strings that exist to drive the detectors.
+  '''ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ''',
+  '''ghp_1234567890abcdef1234567890abcdef''',
+  '''github_pat_ABC123DEF456GHI789JKL0''',
+  # Synthetic OpenAI-style key (provider-matrix privacy drill).
+  '''sk-drill7f2aZZZ9f8e7d6c5b4a3210''',
+
+  # --- Stripe TEST-mode placeholders (synthetic; sk_test_, never sk_live_) ---
+  # server/test/cli/secrets.test.ts and server/test/sdw/sdw-m1-provenance.test.ts
+  # use Stripe's own test-mode prefix to exercise the CLI/provenance paths.
+  # Allowlist the test-mode shape only; live keys (sk_live_) remain flagged.
+  '''sk_test_[0-9A-Za-z_]+''',
+]
+
+# Path-scoped fixtures: these test files legitimately embed truncated
+# private-key blocks and provider-shaped strings to exercise the scanners.
+# Test files only; no production secret path is listed here.
+paths = [
+  # Outbound secret-scanner unit tests: AWS/Slack/GitHub/Bearer/private-key
+  # detection fixtures (truncated, synthetic).
+  '''server/test/security/outbound-scanner\.test\.ts''',
+  # SDW write-gate adversarial fixtures: provider-shaped strings that must trip
+  # the entropy/secret heuristics under test.
+  '''server/test/sdw/sdw-secret-gate-adversarial\.test\.ts''',
+  # SDW memory-backend adapter test: truncated synthetic private-key fragment.
+  '''server/test/sdw/sdw-memory-backend-adapter\.test\.ts''',
+  # Honeypot tests: deliberately-fake credential values served as bait.
+  '''server/test/honeypot/honeypot\.test\.ts''',
+  '''server/test/honeypot/pi4-credential-honeypot\.test\.ts''',
+  # Provider-matrix privacy drill: synthetic per-provider credential fixtures.
+  '''server/test/drills/v1\.x-provider-matrix-privacy-drill\.test\.ts''',
+]

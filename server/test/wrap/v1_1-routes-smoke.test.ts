@@ -16,7 +16,7 @@
  * exercise the binding contract `runWrap` now establishes after Commit
  * 2: `setV11Bindings` + `setV11LoopbackAutoAuth(true)` against the
  * returned handle. Asserts /v1.1, /api/hub/*, and /api/identities all
- * serve content; legacy / continues to serve.
+ * serve content; root continues to serve the current v1.1 shell.
  *
  * Critical: this exercises the dashboard server `runWrap` actually
  * starts (server/src/dashboard/{server,api}.ts), NOT the standalone
@@ -164,10 +164,10 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(await aliasRes.json()).toEqual(await directRes.json());
   });
 
-  it("GET / (legacy v1.0 dashboard) still serves 200 (additive mount preserved)", async () => {
-    const res = await fetch(
-      `${rig.baseUrl}/?token=${encodeURIComponent(rig.authToken)}`,
-    );
+  it("GET / with a short-lived session URL still serves 200", async () => {
+    const sessionUrl = rig.handle.createSessionUrl?.() ?? rig.baseUrl;
+    expect(sessionUrl).not.toContain("?token=");
+    const res = await fetch(sessionUrl);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
   });
