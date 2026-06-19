@@ -283,6 +283,44 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
+  // SEC-012 stream handshake: EventSource cannot set an Authorization header,
+  // and checkAuth rejects the long-lived ?token= in the URL (to keep tokens out
+  // of access logs, proxy logs, and browser history). The dashboard already
+  // mints a SHORT-LIVED session from the bearer at POST /auth/session (the same
+  // endpoint and TTL the v1.1 client uses) and accepts it via ?session=. We only
+  // perform the handshake when (a) a bearer token is present in the URL hash and
+  // (b) there is no existing session cookie - i.e. a remote token-hash session
+  // with no cookie, where the stream would otherwise stay unauthenticated and
+  // the page degrade to polling. On loopback / cookie auth no token is in the
+  // hash (or a cookie already authorizes), so NO mint is attempted and the prior
+  // behavior is unchanged. The long-lived bearer goes in the Authorization
+  // header of the POST, NEVER in any URL.
+  function hasSessionCookie() {
+    if (typeof document === "undefined" || !document.cookie) return false;
+    return /(?:^|;\\s*)sanctuary_session=/.test(document.cookie);
+  }
+
+  // Returns a "?session=<id>" query string to append to the stream URL, or "" if
+  // no handshake is needed or it could not complete. Never throws: any mint
+  // failure, 401, or malformed body resolves to "" so the caller falls back to
+  // polling honestly. Reuses the dashboard's existing session TTL (we do not
+  // lengthen it) and never puts the long-lived token in a URL.
+  function mintStreamSession() {
+    if (!token || hasSessionCookie()) return Promise.resolve("");
+    return fetch("/auth/session", {
+      method: "POST",
+      // Bearer goes in the header, NOT the URL.
+      headers: { "Authorization": "Bearer " + token },
+      cache: "no-store",
+    }).then(function (r) {
+      if (!r.ok) return "";
+      return r.json().then(function (body) {
+        if (!body || !body.session_id || body.session_id === "no-auth") return "";
+        return "?session=" + encodeURIComponent(body.session_id);
+      }, function () { return ""; });
+    }, function () { return ""; });
+  }
+
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
@@ -773,20 +811,34 @@ export function renderPostureHomeHTML(): string {
   function connectStream() {
     if (!supportsSSE) { startPolling(); return; }
     if (es) { try { es.close(); } catch (e) {} es = null; }
-    var url = "/api/posture/stream";
-    // EventSource cannot set an Authorization header, so the stream authenticates
-    // via same-origin loopback auto-auth or the session cookie (withCredentials
-    // sends it). We deliberately do NOT append the long-lived token as a query
-    // param: checkAuth rejects ?token= (SEC-012, to keep tokens out of access
-    // logs, proxy logs, and browser history). In a remote token-hash session with
-    // no cookie the stream stays unauthenticated and the page degrades to polling
-    // (honest), pending a short-lived ?session= handshake (follow-up).
-    try {
-      es = new EventSource(url, { withCredentials: true });
-    } catch (e) {
-      scheduleReconnect();
-      return;
-    }
+    // EventSource cannot set an Authorization header. On loopback / cookie auth
+    // the bare stream URL authenticates via same-origin loopback auto-auth or the
+    // session cookie (withCredentials sends it), and mintStreamSession() returns
+    // "" so nothing changes. In a remote token-hash session with no cookie,
+    // mintStreamSession() exchanges the bearer (in the POST header, never a URL)
+    // for a SHORT-LIVED session id and we connect via ?session=<id> - the SEC-012
+    // handshake. Any mint failure / 401 resolves to "" (no throw); we still open
+    // the bare stream, and if that cannot authenticate the existing onerror path
+    // schedules a reconnect and keeps polling, so the board stays honest and the
+    // page never blocks. The long-lived token is NEVER placed in a URL.
+    mintStreamSession().then(function (sessionQuery) {
+      // Guard against a connectStream() that was superseded while the async mint
+      // was in flight (e.g. a reconnect fired): only open if we still have no es.
+      if (es) return;
+      var url = "/api/posture/stream" + (sessionQuery || "");
+      try {
+        es = new EventSource(url, { withCredentials: true });
+      } catch (e) {
+        scheduleReconnect();
+        return;
+      }
+      wireStream();
+    });
+  }
+
+  // Attach the SSE listeners to the live EventSource. Split out of connectStream
+  // so the async mint handshake can open the source first.
+  function wireStream() {
     es.addEventListener("home", function (ev) {
       var home;
       try { home = JSON.parse(ev.data); } catch (e) { return; }
