@@ -10,6 +10,7 @@ import {
   buildAgentReach,
   buildPostureAgentRows,
   buildCustodyExitPanel,
+  buildRecognitionPanel,
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
@@ -866,5 +867,114 @@ describe("Slice 3 — Custody & Exit panel (evidence-based, honest)", () => {
     });
     expect(panel.rollback_freeze_suspected).toBe(false);
     expect(panel.custody_state).toBe("unconfirmed");
+  });
+});
+
+// ── P5 Recognition shaper: local-evidence-only + impartiality ────────────────
+describe("buildRecognitionPanel — local-evidence-only", () => {
+  async function appendBridge(
+    log: AuditLog,
+    op: "bridge_commit" | "bridge_verify" | "bridge_attest",
+    details: Record<string, unknown>,
+  ): Promise<void> {
+    if (op === "bridge_verify") {
+      await log.append("l3", op, FORTRESS, details);
+    } else {
+      await log.appendCritical({
+        layer: op === "bridge_attest" ? "l4" : "l3",
+        operation: op,
+        identity_id: FORTRESS,
+        result: "success",
+        details,
+      });
+    }
+  }
+
+  it("derives receipt counts from the audit log with NO Concordia process; verify split honored", async () => {
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    await appendBridge(log, "bridge_verify", { bridge_commitment_id: "bc-1", valid: true });
+    await appendBridge(log, "bridge_verify", { bridge_commitment_id: "bc-2", valid: false });
+    await appendBridge(log, "bridge_attest", { bridge_commitment_id: "bc-1" });
+
+    const panel = await buildRecognitionPanel({ auditLog: log, originMachine: FORTRESS });
+    // committed falls back to the bridge_commit event count when no storage list
+    // is injected — an honest lower bound, never fabricated.
+    expect(panel.receipts.committed).toBe(1);
+    expect(panel.receipts.verified_true).toBe(1);
+    expect(panel.receipts.verified_false).toBe(1);
+    expect(panel.receipts.attested).toBe(1);
+    expect(panel.receipts.verification_basis).toBe("local_bridge_crypto");
+    expect(panel.composition_enabled).toBe(true);
+  });
+
+  it("prefers the injected storage-list committed count over the audit-event lower bound", async () => {
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    const panel = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      committedReceiptCount: 5,
+    });
+    expect(panel.receipts.committed).toBe(5);
+  });
+
+  it("NEVER renders a score; reputation evidence is counts-only and amber from absence", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildRecognitionPanel({ auditLog: log, originMachine: FORTRESS });
+    expect(panel.reputation_evidence).toBeNull();
+    expect(panel.reputation_state).toBe("amber");
+    // No `score` field anywhere on the shape.
+    expect(JSON.stringify(panel)).not.toContain('"score"');
+    // The portable-identity export is an amber capability, named by tool.
+    expect(panel.export_state).toBe("export_available");
+    expect(panel.export_tool).toBe("sanctuary_export_identity_bundle");
+  });
+
+  it("present reputation evidence (>=1 attestation) earns green; zero stays amber", async () => {
+    const { log } = newAuditLog();
+    const present = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      reputationEvidence: {
+        attestation_count: 3,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: new Date().toISOString(),
+        dispute_count: 0,
+        verascore_linked: true,
+      },
+    });
+    expect(present.reputation_state).toBe("present");
+    // verascore_linked is a LOCAL boolean, not a number/score.
+    expect(present.reputation_evidence?.verascore_linked).toBe(true);
+
+    const empty = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      reputationEvidence: {
+        attestation_count: 0,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: null,
+        dispute_count: 0,
+        verascore_linked: false,
+      },
+    });
+    expect(empty.reputation_state).toBe("amber");
+  });
+
+  it("fails closed on a tainted audit read: zeroed counts, integrity flagged, never green", async () => {
+    const brokenLog = {
+      query: async () => {
+        throw new Error("tainted audit read");
+      },
+    } as unknown as AuditLog;
+    const panel = await buildRecognitionPanel({
+      auditLog: brokenLog,
+      originMachine: FORTRESS,
+    });
+    expect(panel.audit_integrity_ok).toBe(false);
+    expect(panel.receipts.committed).toBe(0);
+    expect(panel.receipts.verified_true).toBe(0);
+    expect(panel.reputation_state).toBe("amber");
   });
 });

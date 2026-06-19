@@ -41,6 +41,7 @@
 import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -1128,6 +1129,235 @@ export async function buildCustodyExitPanel(
     freshness_window_ms: freshnessWindowMs,
     audit_integrity_ok: integrityOk,
     ...exitFields,
+  };
+}
+
+// ── P5: Recognition + portability panel ──────────────────────────────
+
+/**
+ * Local reputation evidence shape, copied minimally from `ReputationEvidence`
+ * (`shr/generator.ts`) so the shaper does not import the SHR generator. This is
+ * the EVIDENCE the local attestation store already aggregates; it is NOT a
+ * score, and it is NOT a Verascore value. `verascore_linked` is a LOCAL boolean
+ * meaning "the operator successfully ran `reputation_publish` at least once" —
+ * it carries no externally-fetched reputation and no number.
+ */
+export interface RecognitionReputationEvidence {
+  attestation_count: number;
+  tier_distribution: Record<SovereigntyTier, number>;
+  most_recent_attestation_at: string | null;
+  dispute_count: number;
+  /** LOCAL boolean: a publish was performed. NOT a fetched score. */
+  verascore_linked: boolean;
+}
+
+/**
+ * Counterparty-receipt counts derived from the Concordia bridge. These prove how
+ * many negotiations were committed / locally re-verified / attested THROUGH the
+ * bridge — protocol-agnostic counts that derive with NO Concordia process
+ * running. `verified_true` counts only `bridge_verify` audit events whose
+ * recorded `valid === true`; verification is LOCAL bridge cryptography
+ * (signature + commitment recomputation + terms-hash match), never a claim made
+ * "by Concordia" or "by Verascore".
+ */
+export interface RecognitionReceiptCounts {
+  /** Bridge commitments persisted in `_bridge` storage (committed receipts). */
+  committed: number;
+  /** `bridge_verify` events whose recorded outcome was `valid === true`. */
+  verified_true: number;
+  /** `bridge_verify` events whose recorded outcome was `valid === false`. */
+  verified_false: number;
+  /** `bridge_attest` events (committed → reputation attestation linked). */
+  attested: number;
+  /**
+   * HONESTY: counterparty verification is LOCAL bridge cryptography, never a
+   * third-party attestation. The UI keys its label off this constant so the
+   * "verified locally" wording can never silently drift to "by Concordia /
+   * Verascore". Frozen literal — asserted by an impartiality test.
+   */
+  verification_basis: "local_bridge_crypto";
+}
+
+/** Tile colour state for the Recognition panel. Green is earned by evidence. */
+export type RecognitionTileState = "present" | "amber" | "red";
+
+/** Portable-identity export capability — the Slice-3 amber treatment, reused. */
+export type RecognitionExportState = "export_available";
+
+export interface RecognitionPanel {
+  origin_machine: string;
+  /**
+   * The composition render gate, echoed onto the payload for symmetry with the
+   * `/composition` endpoint and so a client that fetched this directly can still
+   * see the gate. ALWAYS `true` on a served panel — the route only builds the
+   * panel when composition is enabled (the panel is ABSENT, not greyed, when
+   * off). Never implies a Concordia/Verascore dependency.
+   */
+  composition_enabled: true;
+  /** Counterparty-receipt counts from the local bridge audit/storage evidence. */
+  receipts: RecognitionReceiptCounts;
+  /**
+   * Local reputation EVIDENCE (counts only), or `null` when no reputation store
+   * is wired / readable. NEVER a score, NEVER a fetched Verascore value. Null
+   * renders amber ("no reputation evidence yet"), never green-from-absence.
+   */
+  reputation_evidence: RecognitionReputationEvidence | null;
+  /** Tile state for the local-reputation row. Amber unless evidence is present. */
+  reputation_state: RecognitionTileState;
+  /**
+   * Portable-identity export capability (reuses Slice 3's amber capability
+   * treatment): the Tier-1-gated `sanctuary_export_identity_bundle` exists, so
+   * `export_available` is honest; it is rendered amber, never green, because the
+   * capability is not the same as a completed, verified portable handover.
+   */
+  export_state: RecognitionExportState;
+  /** The operator-facing tool that performs the gated portable-identity export. */
+  export_tool: string;
+  /** True when an integrity finding tainted the audit read backing the counts. */
+  audit_integrity_ok: boolean;
+}
+
+export interface BuildRecognitionPanelInput {
+  auditLog: AuditLog;
+  originMachine: string;
+  now?: number;
+  /** Window over which bridge receipt evidence is read (defaults to ALL time). */
+  windowMs?: number;
+  /**
+   * Count of persisted bridge commitments (`storage.list("_bridge")`). Injected
+   * by the route layer so the shaper stays pure (it never touches raw storage or
+   * the master key). When absent, the committed count falls back to the count of
+   * `bridge_commit` audit events — an honest lower bound, never fabricated.
+   */
+  committedReceiptCount?: number;
+  /**
+   * Pre-gathered LOCAL reputation evidence (counts only). Injected by the route
+   * layer, which already holds the identity + master key needed to read the
+   * local attestation store. `null`/absent renders the reputation row amber
+   * ("no evidence yet"), never green. This is NOT a Verascore score and there is
+   * NO score-fetch path: the panel records counts, not a vendor number.
+   */
+  reputationEvidence?: RecognitionReputationEvidence | null;
+}
+
+/** Audit operations that constitute Concordia-bridge receipt evidence. */
+const BRIDGE_RECEIPT_OPERATIONS: ReadonlySet<string> = Object.freeze(
+  new Set<string>(["bridge_commit", "bridge_verify", "bridge_attest"]),
+);
+
+/**
+ * Build the Recognition + portability panel (P5) — the LAST sovereignty
+ * principle on the posture dashboard, and the single most impartiality-loaded
+ * surface in it.
+ *
+ * IMPARTIALITY CONTRACT (each clause is encoded as a test):
+ *
+ *  1. NO SCORE. The panel never fetches or renders a Verascore (or any vendor)
+ *     reputation score. There is no score-fetch path in the codebase and this
+ *     shaper creates none: it surfaces LOCAL attestation COUNTS only, and the
+ *     `verascore_linked` boolean (a local "did publish" flag, not a number).
+ *  2. LOCAL VERIFICATION. Counterparty verification is LOCAL bridge cryptography
+ *     (`receipts.verification_basis === "local_bridge_crypto"`); the panel never
+ *     labels it "by Concordia" or "by Verascore".
+ *  3. NEVER FAKE GREEN (#617). Every row is evidence-based. The reputation row is
+ *     amber unless real attestation evidence is present; a tainted/unreadable
+ *     audit read fails closed (counts zeroed, integrity flagged), never green.
+ *
+ * The render gate (composition-enabled) lives in the route layer: this shaper is
+ * only called when composition is on, so the panel is ABSENT (not greyed) when
+ * off, and its mere presence never implies a Concordia/Verascore dependency.
+ */
+export async function buildRecognitionPanel(
+  input: BuildRecognitionPanelInput,
+): Promise<RecognitionPanel> {
+  const now = input.now ?? Date.now();
+  const since =
+    input.windowMs !== undefined
+      ? new Date(now - input.windowMs).toISOString()
+      : undefined;
+
+  const exportFields = {
+    export_state: "export_available" as const,
+    export_tool: "sanctuary_export_identity_bundle",
+  };
+
+  let entries;
+  let integrityOk: boolean;
+  try {
+    const result = await input.auditLog.query({
+      ...(since !== undefined ? { since } : {}),
+      limit: 50_000,
+    });
+    entries = result.entries;
+    integrityOk = result.integrity_findings.length === 0;
+  } catch {
+    // A failed/tainted read must NOT read as "no receipts, therefore healthy".
+    // Fail closed: zeroed counts + integrity flagged + reputation amber.
+    return {
+      origin_machine: input.originMachine,
+      composition_enabled: true,
+      receipts: {
+        committed: 0,
+        verified_true: 0,
+        verified_false: 0,
+        attested: 0,
+        verification_basis: "local_bridge_crypto",
+      },
+      reputation_evidence: null,
+      reputation_state: "amber",
+      audit_integrity_ok: false,
+      ...exportFields,
+    };
+  }
+
+  let commitEvents = 0;
+  let verifiedTrue = 0;
+  let verifiedFalse = 0;
+  let attested = 0;
+  for (const entry of entries) {
+    if (!BRIDGE_RECEIPT_OPERATIONS.has(entry.operation)) continue;
+    if (entry.operation === "bridge_commit") {
+      commitEvents += 1;
+    } else if (entry.operation === "bridge_verify") {
+      const details = isRecord(entry.details) ? entry.details : {};
+      if (details.valid === true) verifiedTrue += 1;
+      else verifiedFalse += 1;
+    } else if (entry.operation === "bridge_attest") {
+      attested += 1;
+    }
+  }
+
+  // Prefer the injected storage-list count for "committed"; fall back to the
+  // audit-event count (an honest lower bound) when the route could not list
+  // `_bridge`. Never fabricate a count from absence.
+  const committed =
+    input.committedReceiptCount !== undefined
+      ? input.committedReceiptCount
+      : commitEvents;
+
+  // Reputation row: amber unless real attestation evidence is present. A tainted
+  // read already returned above; here a present evidence block with at least one
+  // attestation earns "present" (green), zero attestations stays amber, and a
+  // missing evidence block (no store wired) is amber — never green-from-absence.
+  const ev =
+    input.reputationEvidence !== undefined ? input.reputationEvidence : null;
+  const reputationState: RecognitionTileState =
+    ev !== null && ev.attestation_count > 0 ? "present" : "amber";
+
+  return {
+    origin_machine: input.originMachine,
+    composition_enabled: true,
+    receipts: {
+      committed,
+      verified_true: verifiedTrue,
+      verified_false: verifiedFalse,
+      attested,
+      verification_basis: "local_bridge_crypto",
+    },
+    reputation_evidence: ev,
+    reputation_state: reputationState,
+    audit_integrity_ok: integrityOk,
+    ...exportFields,
   };
 }
 

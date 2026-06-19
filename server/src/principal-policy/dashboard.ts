@@ -39,6 +39,10 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import { gatherReputationEvidence } from "../shr/tools.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import type { StorageBackend } from "../storage/interface.js";
+import type { RecognitionReputationEvidence } from "./posture.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
@@ -243,6 +247,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private identityManager: IdentityManager | null = null;
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
+  /**
+   * Storage backend, injected for the Recognition panel (P5) so the dashboard
+   * can list persisted Concordia-bridge commitments (`storage.list("_bridge")`)
+   * and read the local attestation store for reputation EVIDENCE (counts, not a
+   * score). Optional: when absent (standalone / un-wired), the Recognition panel
+   * falls back to audit-event counts and a `null` (amber) reputation row. Never
+   * used to fetch any external reputation score — there is no such path.
+   */
+  private storage: StorageBackend | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
@@ -491,6 +504,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
     clientManager?: ClientManager;
+    /** Storage backend for the Recognition panel (bridge list + reputation read). */
+    storage?: StorageBackend;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -498,6 +513,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+    if (deps.storage) this.storage = deps.storage;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
     if (deps.clientManager) this.clientManager = deps.clientManager;
@@ -988,6 +1004,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       auditLog: this.auditLog ?? null,
       originMachine,
       compositionEnabled,
+      // Recognition panel (P5) impure sources, resolved lazily per request so
+      // post-unlock wiring is observed. Both are LOCAL reads only: a count of
+      // persisted bridge commitments, and the local attestation-store evidence
+      // (COUNTS, never a score). They are only consulted when the route builds
+      // the panel (composition-enabled); the panel is absent otherwise.
+      countBridgeCommitments: () => this.countBridgeCommitments(),
+      gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
@@ -998,6 +1021,50 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
+  }
+
+  /**
+   * Recognition panel (P5): count persisted Concordia-bridge commitments by
+   * listing the reserved `_bridge` namespace. This is the "committed receipts"
+   * count — a LOCAL storage read with NO Concordia process running and NO
+   * external fetch. Returns 0 when no storage backend is wired (the shaper then
+   * falls back to the `bridge_commit` audit-event lower bound). A list failure
+   * propagates so the route layer's try/catch degrades to the audit-event count
+   * rather than fabricating a number.
+   */
+  private async countBridgeCommitments(): Promise<number> {
+    if (!this.storage) return 0;
+    const entries = await this.storage.list("_bridge");
+    return entries.length;
+  }
+
+  /**
+   * Recognition panel (P5): gather LOCAL reputation EVIDENCE (attestation counts,
+   * tier distribution, dispute count, most-recent timestamp, and the local
+   * `verascore_linked` publish flag) for the primary identity. This reads the
+   * local attestation store ONLY — it never fetches a Verascore (or any vendor)
+   * score, and it returns COUNTS, not a number-on-a-scale. Returns `null` when
+   * the storage backend, master key, or a primary identity is unavailable, which
+   * the panel renders as an amber "no evidence yet" row (never green).
+   */
+  private async gatherRecognitionReputation(): Promise<RecognitionReputationEvidence | null> {
+    if (!this.storage || !this.shrOpts || !this.identityManager) return null;
+    const identity = this.identityManager.getDefault();
+    if (!identity) return null;
+    const reputationStore = new ReputationStore(this.storage, this.shrOpts.masterKey);
+    if (this.auditLog === null) return null;
+    const evidence = await gatherReputationEvidence(reputationStore, this.auditLog, {
+      identity_id: identity.identity_id,
+      did: identity.did,
+    });
+    // Project to the panel's evidence shape (counts only; never a score).
+    return {
+      attestation_count: evidence.attestation_count,
+      tier_distribution: evidence.tier_distribution,
+      most_recent_attestation_at: evidence.most_recent_attestation_at,
+      dispute_count: evidence.dispute_count,
+      verascore_linked: evidence.verascore_linked,
+    };
   }
 
   /**

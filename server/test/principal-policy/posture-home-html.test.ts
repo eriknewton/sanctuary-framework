@@ -339,3 +339,69 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(region).not.toContain("—");
   });
 });
+
+/**
+ * Recognition + portability panel (P5) renderer honesty. The panel is the most
+ * impartiality-loaded surface: these assert the rendered HTML/source honors the
+ * contract — the panel is hidden until the composition gate is confirmed, it
+ * never fetches a vendor score, and counterparty verification is labeled local
+ * bridge crypto. The client is a self-contained string, so (per the convention
+ * above) we assert on the embedded source rather than running a DOM.
+ */
+describe("posture home - Recognition panel (P5) impartiality", () => {
+  it("renders the Recognition section hidden by default (absent until composition gate confirmed)", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain('id="recognition-section"');
+    // The section markup carries display:none so the panel is absent (never a
+    // greyed shell) until /api/posture/recognition returns 200.
+    const idx = html.indexOf('id="recognition-section"');
+    const sectionTag = html.slice(idx - 40, idx + 60);
+    expect(sectionTag).toContain('style="display:none"');
+  });
+
+  it("reveals the section only on a 200 and hides it on any error (404 = composition off)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognitionOnce()");
+    const end = html.indexOf("function renderRecognition") > start
+      ? html.length
+      : html.length;
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    // On success the section is revealed; on catch it is hidden (absent).
+    expect(region).toContain('section.style.display = ""');
+    expect(region).toContain('section.style.display = "none"');
+    expect(region).toContain("/api/posture/recognition");
+  });
+
+  it("never fetches a vendor reputation score: no score-fetch path in the page source", () => {
+    const html = renderPostureHomeHTML();
+    // There is no Verascore (or any vendor) score-fetch URL anywhere in the page.
+    expect(html).not.toContain("verascore.ai/api");
+    expect(html).not.toContain("api.verascore");
+    expect(html).not.toMatch(/fetch\([^)]*score/i);
+  });
+
+  it("labels counterparty verification as LOCAL bridge crypto, never 'by Concordia/Verascore'", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderRecognition");
+    const end = html.indexOf("function loadRecognitionOnce");
+    const region = html.slice(start, end);
+    expect(region).toContain("local_bridge_crypto");
+    expect(region).toContain("verified locally");
+    expect(region.toLowerCase()).not.toContain("verified by concordia");
+    expect(region.toLowerCase()).not.toContain("verified by verascore");
+  });
+
+  it("never-fake-green: the reputation pill is amber unless evidence is present", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function recognitionRepPill");
+    const end = html.indexOf("function renderRecognition");
+    const region = html.slice(start, end);
+    // Green is returned ONLY for "present"; everything else is amber.
+    expect(region).toContain('"present"');
+    expect(region).toContain('pill green');
+    expect(region).toContain('pill amber');
+    // The amber "no evidence yet" copy must be the default branch.
+    expect(region).toContain("no evidence yet");
+  });
+});

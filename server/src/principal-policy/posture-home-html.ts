@@ -258,6 +258,18 @@ export function renderPostureHomeHTML(): string {
     <div class="panel" id="queryprivacy"><span class="empty">Loading…</span></div>
   </section>
 
+  <!--
+    Recognition + portability (P5). Hidden by default and only revealed when the
+    composition gate is ON (the /api/posture/recognition endpoint returns 200).
+    When composition is OFF the endpoint 404s and this section stays display:none
+    so the panel is ABSENT, never a greyed shell that would imply a Concordia /
+    Verascore dependency.
+  -->
+  <section id="recognition-section" style="display:none">
+    <h2>Recognition and portability</h2>
+    <div class="panel" id="recognition"><span class="empty">Loading…</span></div>
+  </section>
+
   <div class="footer">
     <strong>Your data, your machine.</strong>
     State: encrypted at rest (AES-256-GCM) under <code>~/.sanctuary</code> on this machine.
@@ -475,6 +487,102 @@ export function renderPostureHomeHTML(): string {
       "the portable-bundle export ships, but the full clean-exit guarantee (complete, " +
       "verifiable handover with nothing left behind) is not yet earned, so it is not claimed here.</div>";
     el.innerHTML = html;
+  }
+
+  // ── Recognition + portability (P5) ──────────────────────────────────────
+  // The single most impartiality-loaded panel. Hard rules, all visible here:
+  //   - NO SCORE: this renderer never reads or shows a Verascore (or any vendor)
+  //     reputation score. It shows LOCAL attestation COUNTS only, plus the local
+  //     "published?" boolean. There is no score field on the payload to render.
+  //   - LOCAL VERIFICATION: counterparty verification is labeled as LOCAL bridge
+  //     cryptography, keyed off panel.receipts.verification_basis. It is NEVER
+  //     labeled "verified by Concordia" or "verified by Verascore".
+  //   - NEVER FAKE GREEN: the reputation row is green ONLY when real attestation
+  //     evidence is present (reputation_state === "present"); otherwise amber.
+  //     The portable-identity export is an amber capability, never green.
+  function recognitionRepPill(state) {
+    if (state === "present") return '<span class="pill green">on record</span>';
+    if (state === "red") return '<span class="pill red">unavailable</span>';
+    return '<span class="pill amber">no evidence yet</span>';
+  }
+  function renderRecognition(panel) {
+    var section = document.getElementById("recognition-section");
+    var el = document.getElementById("recognition");
+    if (!el || !section) return;
+    if (!panel) {
+      el.innerHTML = '<span class="empty">No recognition data.</span>';
+      return;
+    }
+    var r = panel.receipts || {};
+    // Counterparty receipts. The verification label is keyed strictly off the
+    // payload's frozen basis constant so it can never drift to a vendor claim.
+    var verifyLabel =
+      r.verification_basis === "local_bridge_crypto"
+        ? "verified locally by Sanctuary's bridge cryptography (signature + commitment recomputation + terms-hash match)"
+        : "verification basis unknown";
+    var html =
+      '<div class="evidence">Counterparty receipts (Concordia bridge): ' +
+      '<code>' + esc(r.committed) + '</code> committed · ' +
+      '<code>' + esc(r.verified_true) + '</code> ' + esc(verifyLabel) +
+      (r.verified_false ? ' · <code>' + esc(r.verified_false) + '</code> failed verification' : '') +
+      ' · <code>' + esc(r.attested) + '</code> attested to reputation.</div>';
+    html +=
+      '<div class="fh-note">These counts come from your local bridge audit and storage with no Concordia process running. ' +
+      'A receipt proves the revealed terms match what was committed and is bound to the named parties; it is not a full counterparty track record.</div>';
+    // Local reputation EVIDENCE (counts only; NEVER a score).
+    var ev = panel.reputation_evidence;
+    html +=
+      '<div style="margin-top:10px">' + recognitionRepPill(panel.reputation_state) +
+      ' &nbsp;Local reputation evidence (counts from your own attestation store, not a score)</div>';
+    if (ev) {
+      html +=
+        '<div class="evidence"><code>' + esc(ev.attestation_count) + '</code> attestation(s) · ' +
+        '<code>' + esc(ev.dispute_count) + '</code> dispute(s)' +
+        (ev.most_recent_attestation_at ? ' · most recent ' + esc(ev.most_recent_attestation_at) : '') +
+        ' · external publish: ' +
+        (ev.verascore_linked
+          ? '<span class="pill amber">published</span> (you ran reputation_publish; this is a local flag, not a fetched score)'
+          : '<span class="pill amber">not published</span>') +
+        '.</div>';
+    } else {
+      html +=
+        '<div class="fh-note">No local reputation evidence yet, so this row is amber, not green. ' +
+        'Sanctuary never fetches or displays an external reputation score.</div>';
+    }
+    // Portable identity: the Slice-3 amber capability treatment, reused.
+    html +=
+      '<div class="evidence" style="margin-top:10px">Portable identity: ' +
+      (panel.export_state === "export_available"
+        ? '<span class="pill amber">export available</span> ' +
+          'Export your portable identity bundle with <code>' +
+          esc(panel.export_tool || "sanctuary_export_identity_bundle") +
+          '</code> (a Tier-1 operation: it requires your approval before it runs).'
+        : 'unknown') +
+      '</div>';
+    if (!panel.audit_integrity_ok) {
+      html += '<div class="err">Audit integrity finding present - receipt counts may be incomplete.</div>';
+    }
+    el.innerHTML = html;
+  }
+
+  // Fetch the Recognition panel once, behind the composition render gate. A 200
+  // reveals the section; a 404 (composition OFF) leaves it hidden so the panel is
+  // ABSENT, never a greyed shell that implies a dependency. Any other failure
+  // also leaves it hidden (an honest absence, not a green claim). This runs once
+  // at boot rather than on every home frame because the gate flag is config and
+  // does not change within a session.
+  function loadRecognitionOnce() {
+    var section = document.getElementById("recognition-section");
+    if (!section) return;
+    api("/api/posture/recognition").then(function (panel) {
+      // composition_enabled is always true on a served panel; reveal + render.
+      section.style.display = "";
+      renderRecognition(panel);
+    }).catch(function () {
+      // 404 (composition off) or any error: keep the panel absent. Do NOT show a
+      // greyed/empty card - absence is the honest non-dependency signal.
+      section.style.display = "none";
+    });
   }
 
   // "Never fake green" for the Query-privacy section. Mirrors the canonical pure
@@ -869,6 +977,10 @@ export function renderPostureHomeHTML(): string {
     if (supportsSSE) connectStream();
     else startPolling();
   });
+  // Recognition + portability (P5) is a separate, composition-gated fetch (it is
+  // NOT on the home payload, so an off-fortress never receives any of its data).
+  // Loaded once at boot: the gate flag is config and stable within a session.
+  loadRecognitionOnce();
 })();
 </script>
 </body>
