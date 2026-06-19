@@ -1265,6 +1265,19 @@ export interface AgentEffectiveReach {
   default_deny: boolean;
   /** Whether a Castle Wall ruleset was found at all for this agent/fortress. */
   has_wall_policy: boolean;
+  /**
+   * Whether the OS-level Castle Wall is CONFIRMED to be enforcing these rules for
+   * this agent: the SAME enforcement evidence the Home/drill-down agent pill
+   * keys on (`enforcement_active === "active"`). The #641 honesty gate: when
+   * false (today: always, since no per-agent live enforcement signal exists), the
+   * reach view must render the Castle Wall layer / deny pills as amber
+   * "configured (not confirmed enforcing)" and MUST NOT claim default-deny is in
+   * effect. Green OS-enforcement coloring + the default-deny-in-effect claim are
+   * reserved for the case where enforcement is actually proven. This separates a
+   * CONFIGURED rule from a CONFIRMED-ENFORCING one (the #634/#638 evidence
+   * pattern), so curated/never-armed rules can never read as kernel-enforced.
+   */
+  enforcement_confirmed: boolean;
 }
 
 /**
@@ -1291,6 +1304,16 @@ export interface BuildAgentReachInput {
   harness: string;
   /** All reach rules visible for the fortress. */
   rules: ReachRule[];
+  /**
+   * Whether the OS-level Castle Wall is CONFIRMED to be enforcing for this agent
+   * (the #641 honesty gate). The impure caller derives this from the SAME signal
+   * the agent pill uses (`enforcement_active === "active"`), today always false,
+   * because no per-agent live enforcement signal exists. Threaded onto the
+   * payload so the reach renderer downgrades all OS-enforcement coloring + the
+   * default-deny narrative to "configured" whenever enforcement is not proven.
+   * Optional; absent is treated as `false` (honest, never-fake-green default).
+   */
+  enforcementConfirmed?: boolean;
 }
 
 /**
@@ -1306,6 +1329,12 @@ export interface BuildAgentReachInput {
  * treated as defeating default-deny. With no wall ruleset at all,
  * `has_wall_policy` is false and `default_deny` is false (the wall is not
  * restricting this agent), so the UI surfaces the gap honestly in red.
+ *
+ * `enforcement_confirmed` is threaded through unchanged from the caller (#641):
+ * the shaper does NOT infer enforcement from the rules: having a rule on disk
+ * is configuration, not proof the OS is enforcing it. The caller supplies the
+ * confirmed signal (the same one the agent pill uses); the renderer renders
+ * OS-enforcement coloring + the default-deny claim ONLY when it is true.
  */
 export function buildAgentReach(
   input: BuildAgentReachInput,
@@ -1362,6 +1391,10 @@ export function buildAgentReach(
     destinations,
     default_deny: defaultDeny,
     has_wall_policy: hasWallPolicy,
+    // #641: never-fake-green default. Enforcement is "confirmed" only when the
+    // caller proves it from the same per-agent signal the agent pill uses;
+    // absent ⇒ false ⇒ the reach view renders rules as configured, not enforced.
+    enforcement_confirmed: input.enforcementConfirmed === true,
   };
 }
 
