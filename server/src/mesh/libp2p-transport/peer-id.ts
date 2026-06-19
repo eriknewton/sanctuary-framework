@@ -29,6 +29,53 @@ import type {
 import { fromBase64url } from "../../core/encoding.js";
 
 /**
+ * Cross-`@libp2p/interface`-major key bridges.
+ *
+ * The dependency graph deliberately carries two `@libp2p/interface` majors at
+ * once during the libp2p 2.x -> 3.x migration. The core transport stack
+ * (`libp2p` 2.10.x, `@libp2p/peer-id` 5.x, `@chainsafe/libp2p-noise`,
+ * `it-length-prefixed`) pins `@libp2p/interface` ^2.11 / `uint8arraylist` ^2,
+ * while `@libp2p/crypto` 5.1.20 (and `kad-dht`/`ping`) pin `@libp2p/interface`
+ * ^3.2.4 / `uint8arraylist` ^3. The two majors are mutually exclusive at the
+ * `uint8arraylist` peer range, so a single deduped `@libp2p/interface` is not
+ * expressible without dragging an incompatible major onto the other half of
+ * the stack (it breaks `transport.ts`). This module sits exactly on the seam:
+ * it gets key objects from `@libp2p/crypto` (interface 3.x types) and hands
+ * them to `@libp2p/peer-id` 5.x (interface 2.x types).
+ *
+ * The `Ed25519PrivateKey` / `Ed25519PublicKey` interface bodies are
+ * byte-for-byte identical across the two majors; the ONLY type-level delta is
+ * that `verify`/`sign` reference `uint8arraylist`, which became generic
+ * (`Uint8ArrayList<ArrayBufferLike>` with a branded `[symbol]`) in v3. TS
+ * therefore treats the two copies as distinct nominal types (TS2322) even
+ * though they are structurally and behaviourally the same. We verified the
+ * runtime interop directly: a `generateKeyPairFromSeed` key (3.x) passed to
+ * `peerIdFromPrivateKey` (2.x) yields the same peer-id as the matching public
+ * key passed to `peerIdFromPublicKey`.
+ *
+ * These bridges re-type the crypto-produced key as the consumer-side
+ * (`@libp2p/interface` 2.x) key the peer-id functions expect. The cast goes
+ * through `unknown` so it is a single, named, intentional seam crossing rather
+ * than a silent `any` - it does NOT loosen any validation: callers still gate
+ * on `seed.length === 32`, `raw.length === 32`, and `publicKey.type ===
+ * "Ed25519"` before any key crosses the bridge. Delete these bridges once the
+ * whole libp2p stack is on a single interface major.
+ */
+// The crypto-side key types are captured from the call site (see the two
+// helpers below) so we never have to name the `@libp2p/interface` 3.x copy
+// directly; the generic input infers whatever `@libp2p/crypto` produced.
+function asConsumerPrivateKey<T extends { readonly type: "Ed25519" }>(
+  key: T
+): Ed25519PrivateKey {
+  return key as unknown as Ed25519PrivateKey;
+}
+function asConsumerPublicKey<T extends { readonly type: string }>(
+  key: T
+): Ed25519PublicKey {
+  return key as unknown as Ed25519PublicKey;
+}
+
+/**
  * Convert the 32-byte Ed25519 private-key seed from Sanctuary's identity
  * layer into a libp2p Ed25519PrivateKey. The returned key's public component
  * matches the Ed25519 public key Sanctuary's `generateKeypair()` produced.
@@ -41,7 +88,7 @@ export async function libp2pPrivateKeyFromSanctuarySeed(
       `libp2pPrivateKeyFromSanctuarySeed: expected 32-byte Ed25519 seed; got ${seed.length}`
     );
   }
-  return await generateKeyPairFromSeed("Ed25519", seed);
+  return asConsumerPrivateKey(await generateKeyPairFromSeed("Ed25519", seed));
 }
 
 /**
@@ -70,11 +117,11 @@ export function peerIdFromSanctuaryPubkey(pubkeyBase64url: string): PeerId {
       `peerIdFromSanctuaryPubkey: expected 32-byte Ed25519 pubkey; got ${raw.length}`
     );
   }
-  const publicKey = publicKeyFromRaw(raw) as Ed25519PublicKey;
-  if (publicKey.type !== "Ed25519") {
+  const cryptoPublicKey = publicKeyFromRaw(raw);
+  if (cryptoPublicKey.type !== "Ed25519") {
     throw new Error(
-      `peerIdFromSanctuaryPubkey: expected Ed25519 public key; got ${publicKey.type}`
+      `peerIdFromSanctuaryPubkey: expected Ed25519 public key; got ${cryptoPublicKey.type}`
     );
   }
-  return peerIdFromPublicKey(publicKey);
+  return peerIdFromPublicKey(asConsumerPublicKey(cryptoPublicKey));
 }
