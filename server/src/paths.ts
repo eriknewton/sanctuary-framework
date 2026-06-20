@@ -38,12 +38,46 @@ export function resolveStoragePath(
 }
 
 /**
+ * Strictly parse a whole-string TCP port from an env var.
+ *
+ * `parseInt("80abc", 10)` returns `80`: it stops at the first non-digit and
+ * silently TRUNCATES, which would bind the dashboard to a port the operator
+ * never typed. This mirrors the strict env parse in `config.ts` (the
+ * `loadConfig` reader): accept ASCII digits only, then enforce the valid TCP
+ * range 1..65535. Any non-clean-integer or out-of-range value yields
+ * `undefined` so the caller falls back to the documented default rather than
+ * binding a truncated or out-of-spec port.
+ *
+ * Returns `undefined` for "", "80abc", "0x10", "3501 5", "70000", "0", "-1",
+ * or any value that is not a clean in-range integer.
+ */
+function parseStrictPortEnv(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    return undefined;
+  }
+  return parsed;
+}
+
+/**
  * Resolve the dashboard starting port.
  *
  * Precedence (highest wins):
  *   1. Explicit port argument (e.g. `--port` CLI flag)
- *   2. `SANCTUARY_DASHBOARD_PORT` env var
+ *   2. `SANCTUARY_DASHBOARD_PORT` env var (strict whole-string parse,
+ *      validated to the 1..65535 TCP range)
  *   3. Default 3501
+ *
+ * The env-var read is strict and range-checked so an invalid value (e.g.
+ * "80abc", which the old lenient `parseInt` truncated to 80, or "70000",
+ * which is out of the TCP range) does NOT silently bind a wrong port. Such
+ * values fall back to the default: the same invalid-port hole that the
+ * `loadConfig` reader closes by failing closed, closed here on the wrap
+ * (Protect) boot path by ignoring the bad value.
  *
  * Auto-fallback (chosen port, then the next PORT_FALLBACK_ATTEMPTS-1
  * consecutive ports) is handled downstream once a port is chosen.
@@ -57,8 +91,8 @@ export function resolveDashboardPort(
   }
   const envPort = env.SANCTUARY_DASHBOARD_PORT;
   if (envPort) {
-    const parsed = parseInt(envPort, 10);
-    if (!Number.isNaN(parsed)) return parsed;
+    const parsed = parseStrictPortEnv(envPort);
+    if (parsed !== undefined) return parsed;
   }
   return DEFAULT_DASHBOARD_PORT;
 }

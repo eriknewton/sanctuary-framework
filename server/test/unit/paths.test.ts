@@ -75,6 +75,39 @@ describe("resolveDashboardPort", () => {
     ).toBe(DEFAULT_DASHBOARD_PORT);
   });
 
+  it("does NOT silently truncate a non-integer port (80abc -> 80 hole closed)", () => {
+    // Old lenient parseInt("80abc", 10) returned 80, binding the dashboard to
+    // a port the operator never typed. Strict parse rejects it and falls back
+    // to the default rather than binding the truncated port.
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "80abc" })
+    ).toBe(DEFAULT_DASHBOARD_PORT);
+  });
+
+  it("rejects an out-of-range port and falls back to the default", () => {
+    // 70000 is above the 65535 TCP ceiling; the old reader returned it
+    // unchecked. Strict range guard rejects it.
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "70000" })
+    ).toBe(DEFAULT_DASHBOARD_PORT);
+    // 0 and negative values are not valid TCP ports either.
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "0" })
+    ).toBe(DEFAULT_DASHBOARD_PORT);
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "-1" })
+    ).toBe(DEFAULT_DASHBOARD_PORT);
+  });
+
+  it("accepts a clean in-range port at the boundaries", () => {
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "1" })
+    ).toBe(1);
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "65535" })
+    ).toBe(65535);
+  });
+
   it("returns distinct ports for two tenants with distinct env values", () => {
     const a = resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "3501" });
     const b = resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "3502" });

@@ -47,6 +47,21 @@ function strictParseIntEnv(raw: string): number {
 /** Package version, exported for use by other modules (avoids duplicate require paths). */
 export const SANCTUARY_VERSION = PKG_VERSION;
 
+/**
+ * Marker prefix thrown by `validateConfig` when the ONLY problems are
+ * out-of-range / non-integer scalar VALUES on a structurally-valid file (e.g.
+ * dashboard.port = 70000). The file-load path keys off this to fail closed
+ * WITHOUT quarantining: a value typo is not corruption.
+ */
+const CONFIG_VALUE_ERROR_PREFIX = "Sanctuary configuration has an invalid value";
+/**
+ * Marker prefix thrown by `validateConfig` when the config references a feature
+ * this build cannot honor (genuine schema mismatch). The file-load path
+ * quarantines on this. Kept byte-stable for the existing error contract.
+ */
+const CONFIG_FEATURE_ERROR_PREFIX =
+  "Sanctuary configuration references unimplemented features";
+
 export interface SanctuaryConfig {
   version: string;
   storage_path: string;
@@ -242,6 +257,20 @@ export async function loadConfig(
         quarantinedPath,
         cause: err,
       });
+    } else if (isConfigValueError(err)) {
+      // A structurally-valid, well-typed config file with only an out-of-range
+      // or non-integer scalar VALUE (e.g. dashboard.port = 70000). Fail CLOSED
+      // (the server must not start with an invalid value) but do NOT
+      // quarantine: a value typo is not corruption, and renaming the operator's
+      // file away from under them is surprising and destructive. The file is
+      // left in place so the operator can read the error and fix the value.
+      throw new ConfigLoadError({
+        path,
+        classification: "invalid-value",
+        detail: `${err instanceof Error ? err.message : "The config has an invalid value."} The file was left in place (not quarantined); a value typo is not corruption.`,
+        recovery: "Correct the invalid value in the config file in place, then retry. Sanctuary did not start and did not move your file.",
+        cause: err,
+      });
     } else if (isConfigSchemaError(err)) {
       const quarantinedPath = await quarantineConfigFile(path);
       throw new ConfigLoadError({
@@ -381,10 +410,21 @@ function isConfigSchemaError(err: unknown): boolean {
   return (
     err instanceof Error &&
     (
-      err.message.includes("Sanctuary configuration references unimplemented features") ||
+      err.message.includes(CONFIG_FEATURE_ERROR_PREFIX) ||
       err.message.startsWith("Sanctuary config field")
     )
   );
+}
+
+/**
+ * True when validateConfig rejected ONLY scalar-value typos (out-of-range or
+ * non-integer dashboard.port, sub-floor privacy_filter.timeout_ms) on an
+ * otherwise structurally-valid, well-typed config file. The file-load path
+ * uses this to fail closed WITHOUT quarantining: a value typo is not
+ * corruption and the operator's file must not be moved away.
+ */
+function isConfigValueError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith(CONFIG_VALUE_ERROR_PREFIX);
 }
 
 async function quarantineConfigFile(path: string): Promise<string | undefined> {
@@ -434,12 +474,32 @@ export async function saveConfig(
 }
 
 /**
- * Validate that config does not reference unimplemented features.
- * Throws a descriptive error if any unimplemented value is found.
+ * Validate that config does not reference unimplemented features and that its
+ * scalar values are in range.
+ *
+ * Two distinct failure kinds are tracked so the file-load path can react
+ * appropriately:
+ *
+ *  - `featureErrors`: the config references a feature this build cannot honor
+ *    (e.g. an unimplemented proof_system or key_protection) or has a malformed
+ *    shape. This is a genuine schema mismatch; the loader QUARANTINES the file.
+ *  - `valueErrors`: a structurally-valid, well-typed config whose only problem
+ *    is an out-of-range / non-integer scalar VALUE (e.g. dashboard.port = 70000
+ *    or a sub-floor privacy_filter.timeout_ms). This is a recoverable input
+ *    typo, so the loader fails CLOSED (refuses to start) but does NOT
+ *    quarantine; the operator fixes the value in their file in place.
+ *
+ * The REFUSAL is unconditional for both kinds (fail-closed); only the
+ * destructive quarantine side effect is suppressed for pure value typos.
+ *
  * This prevents silent security degradation (SEC-019).
  */
 export function validateConfig(config: SanctuaryConfig): void {
-  const errors: string[] = [];
+  const featureErrors: string[] = [];
+  const valueErrors: string[] = [];
+  // Back-compat alias: existing checks below push schema/feature problems into
+  // `errors`. Pure scalar-range checks push into `valueErrors` explicitly.
+  const errors = featureErrors;
 
   // Implemented key_protection values: "passphrase", "none"
   // Unimplemented: "hardware-key" (planned for future FIDO2/WebAuthn support)
@@ -514,7 +574,8 @@ export function validateConfig(config: SanctuaryConfig): void {
   }
 
   if (!Number.isFinite(config.privacy_filter.timeout_ms) || config.privacy_filter.timeout_ms < 100) {
-    errors.push(
+    // Pure scalar-range typo on a structurally-valid file: refuse, do not quarantine.
+    valueErrors.push(
       `Invalid config value: privacy_filter.timeout_ms = "${config.privacy_filter.timeout_ms}". ` +
       `Use an integer timeout of at least 100 ms.`
     );
@@ -542,15 +603,30 @@ export function validateConfig(config: SanctuaryConfig): void {
     config.dashboard.port < 1 ||
     config.dashboard.port > 65535
   ) {
-    errors.push(
+    // Pure scalar-range typo on a structurally-valid file: refuse to start, but
+    // do NOT quarantine. A port typo is not config corruption; moving the
+    // operator's file out from under them is the defect this routing fixes.
+    valueErrors.push(
       `Invalid config value: dashboard.port = "${config.dashboard.port}". ` +
       `Use an integer TCP port in the range 1-65535.`
     );
   }
 
-  if (errors.length > 0) {
+  // Feature/schema errors take precedence: a config that references an
+  // unimplemented feature (or has a malformed shape) is a genuine schema
+  // mismatch and the loader quarantines it. A value typo alongside a feature
+  // error is reported together under the feature message (the file is going to
+  // be quarantined regardless).
+  if (featureErrors.length > 0) {
     throw new Error(
-      `Sanctuary configuration references unimplemented features:\n${errors.join("\n")}`
+      `${CONFIG_FEATURE_ERROR_PREFIX}:\n${[...featureErrors, ...valueErrors].join("\n")}`
+    );
+  }
+
+  // Only scalar-value typos: fail closed (refuse to start) WITHOUT quarantine.
+  if (valueErrors.length > 0) {
+    throw new Error(
+      `${CONFIG_VALUE_ERROR_PREFIX}:\n${valueErrors.join("\n")}`
     );
   }
 }

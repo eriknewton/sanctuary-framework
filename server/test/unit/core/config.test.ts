@@ -358,6 +358,74 @@ describe("loadConfig", () => {
       await expect(loadConfig(path)).rejects.toThrow(/dashboard\.port/);
     });
 
+    it("refuses an out-of-range FILE port WITHOUT quarantining (a port typo is not corruption)", async () => {
+      // Regression guard: an out-of-range dashboard.port in a structurally-valid
+      // config FILE must fail CLOSED (server refuses to start) but must NOT
+      // destructively rename the operator's file to .corrupted.<ts>. A value
+      // typo is recoverable in place; moving the file away from under the
+      // operator is the defect this guards against.
+      const path = join(tempDir, "typo-port.json");
+      const original = JSON.stringify(
+        { dashboard: { enabled: true, port: 70000, host: "127.0.0.1" } },
+        null,
+        2
+      );
+      await writeFile(path, original);
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "invalid-value",
+      });
+
+      // The original file is still present and byte-identical.
+      expect(await readFile(path, "utf-8")).toBe(original);
+      // No quarantine copy was created.
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.includes(".corrupted."))).toBe(false);
+    });
+
+    it("STILL quarantines a genuine schema mismatch in a config FILE (unimplemented feature)", async () => {
+      // The non-quarantine carve-out is scoped to scalar VALUE typos only. A
+      // config that references an unimplemented feature is a genuine schema
+      // mismatch and must still be quarantined (pre-existing behavior).
+      const path = join(tempDir, "bad-feature.json");
+      await writeFile(
+        path,
+        JSON.stringify({
+          disclosure: { proof_system: "groth16", default_policy: "minimum-necessary" },
+        })
+      );
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "schema-mismatch",
+      });
+
+      await expect(readFile(path, "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.startsWith("bad-feature.json.corrupted."))).toBe(true);
+    });
+
+    it("quarantines when a value typo coexists with a feature mismatch (feature wins)", async () => {
+      // If a file has BOTH a feature mismatch and a value typo, the file is
+      // going to be quarantined regardless, and both problems are reported.
+      const path = join(tempDir, "mixed-bad.json");
+      await writeFile(
+        path,
+        JSON.stringify({
+          disclosure: { proof_system: "groth16", default_policy: "minimum-necessary" },
+          dashboard: { enabled: true, port: 70000, host: "127.0.0.1" },
+        })
+      );
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "schema-mismatch",
+      });
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.startsWith("mixed-bad.json.corrupted."))).toBe(true);
+    });
+
     it("accepts a valid in-range env port (boundary 65535)", async () => {
       process.env.SANCTUARY_DASHBOARD_PORT = "65535";
       const config = await loadConfig(join(tempDir, "nonexistent.json"));
