@@ -502,7 +502,6 @@ export function renderPostureHomeHTML(): string {
   //     The portable-identity export is an amber capability, never green.
   function recognitionRepPill(state) {
     if (state === "present") return '<span class="pill green">on record</span>';
-    if (state === "red") return '<span class="pill red">unavailable</span>';
     return '<span class="pill amber">no evidence yet</span>';
   }
   function renderRecognition(panel) {

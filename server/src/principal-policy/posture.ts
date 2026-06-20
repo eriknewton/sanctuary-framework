@@ -1192,7 +1192,7 @@ export interface RecognitionReceiptCounts {
 }
 
 /** Tile colour state for the Recognition panel. Green is earned by evidence. */
-export type RecognitionTileState = "present" | "amber" | "red";
+export type RecognitionTileState = "present" | "amber";
 
 /** Portable-identity export capability — the Slice-3 amber treatment, reused. */
 export type RecognitionExportState = "export_available";
