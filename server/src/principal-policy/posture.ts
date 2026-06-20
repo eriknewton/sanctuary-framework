@@ -1253,18 +1253,35 @@ export interface BuildRecognitionPanelInput {
   reputationEvidence?: RecognitionReputationEvidence | null;
 }
 
-/** Audit operations that constitute Concordia-bridge receipt evidence. */
-const BRIDGE_RECEIPT_OPERATIONS: ReadonlySet<string> = Object.freeze(
-  new Set<string>(["bridge_commit", "bridge_verify", "bridge_attest"]),
+/**
+ * Audit operations that constitute Concordia-bridge receipt evidence, in a
+ * deterministic order. We query each operation type SEPARATELY (the audit
+ * `query` filters on a single `operation_type`) so the per-op `total` is the
+ * true bridge-event population for that op, never the all-operations total. The
+ * cap flag below is then derived from bridge-event truncation alone.
+ */
+const BRIDGE_RECEIPT_OPERATIONS = Object.freeze([
+  "bridge_commit",
+  "bridge_verify",
+  "bridge_attest",
+] as const);
+
+/** Set form of the bridge ops, for the O(1) defensive guard in the tally loop. */
+const BRIDGE_RECEIPT_OPERATION_SET: ReadonlySet<string> = new Set(
+  BRIDGE_RECEIPT_OPERATIONS,
 );
 
 /**
  * Cap on the audit-read backing the bridge-receipt counts. The audit `query`
  * returns the most-recent `limit` in-window entries plus a `total` of the
  * post-filter population, so a fortress with more than this many in-window
- * entries truncates and the counts undercount. We surface that truncation
- * honestly via `receipts.receipts_capped` rather than silently undercounting
- * (#651 LOW). Sized to match the sibling posture shapers.
+ * BRIDGE events truncates and the counts undercount. Because we query each
+ * bridge `operation_type` on its own (see `BRIDGE_RECEIPT_OPERATIONS`), `total`
+ * is the per-op bridge population — NOT the all-operations audit total — so the
+ * cap flag fires only on genuine bridge-event truncation, never on a fortress
+ * that is merely busy with non-bridge audit traffic (#651 MEDIUM). We surface
+ * that truncation honestly via `receipts.receipts_capped` rather than silently
+ * undercounting (#651 LOW). Sized to match the sibling posture shapers.
  */
 const RECOGNITION_RECEIPT_QUERY_CAP = 50_000;
 
@@ -1308,17 +1325,32 @@ export async function buildRecognitionPanel(
   let integrityOk: boolean;
   let receiptsCapped: boolean;
   try {
-    const result = await input.auditLog.query({
-      ...(since !== undefined ? { since } : {}),
-      limit: RECOGNITION_RECEIPT_QUERY_CAP,
-    });
-    entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
-    // Honest cap disclosure (#651 LOW): `total` is the post-filter population;
-    // `entries` is at most the most-recent `cap` of it. When `total` exceeds the
-    // returned entries, older bridge events were dropped and the counts below
+    // Query each bridge operation type SEPARATELY so each `total` is the true
+    // per-op bridge-event population — NOT the all-operations audit total. The
+    // earlier all-ops read made `receipts_capped` fire on any fortress holding
+    // more than the cap of NON-bridge entries (state reads, wall enforcement,
+    // etc.), emitting a false "incomplete tally" warning even when every bridge
+    // event sat comfortably inside the most-recent slice (#651 MEDIUM).
+    const results = await Promise.all(
+      BRIDGE_RECEIPT_OPERATIONS.map((operation_type) =>
+        input.auditLog.query({
+          ...(since !== undefined ? { since } : {}),
+          operation_type,
+          limit: RECOGNITION_RECEIPT_QUERY_CAP,
+        }),
+      ),
+    );
+    entries = results.flatMap((r) => r.entries);
+    // Integrity findings are chain-level state (the same snapshot is returned by
+    // every query), so any one result reflects the whole chain; OR across all is
+    // belt-and-suspenders.
+    integrityOk = results.every((r) => r.integrity_findings.length === 0);
+    // Honest cap disclosure (#651 LOW + MEDIUM): for each bridge op, `total` is
+    // that op's full in-window population and the returned `entries` are at most
+    // the most-recent `cap` of it. When any op's `total` exceeds its returned
+    // entries, older events of that op were dropped and the counts below
     // UNDERCOUNT — surface that rather than presenting an undercount as complete.
-    receiptsCapped = result.total > entries.length;
+    receiptsCapped = results.some((r) => r.total > r.entries.length);
   } catch {
     // A failed/tainted read must NOT read as "no receipts, therefore healthy".
     // Fail closed: zeroed counts + integrity flagged + reputation amber.
@@ -1374,7 +1406,9 @@ export async function buildRecognitionPanel(
   let verifiedFalse = 0;
   let attested = 0;
   for (const entry of entries) {
-    if (!BRIDGE_RECEIPT_OPERATIONS.has(entry.operation)) continue;
+    // Entries are already pre-filtered to bridge ops by the per-op queries; this
+    // guard is defense-in-depth so a malformed audit row can never be tallied.
+    if (!BRIDGE_RECEIPT_OPERATION_SET.has(entry.operation)) continue;
     if (entry.operation === "bridge_commit") {
       commitEvents += 1;
     } else if (entry.operation === "bridge_verify") {

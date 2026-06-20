@@ -1031,20 +1031,26 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
   });
 
   it("honestly flags a CAPPED audit read so receipt counts are disclosed as a lower bound, not silently undercounted", async () => {
-    // total exceeds the returned entries => the read was truncated by the cap, so
-    // the counts UNDERCOUNT. The shaper must surface this (receipts_capped=true)
-    // rather than presenting an undercount as a complete tally (#651 LOW).
+    // When a BRIDGE op's own population exceeds the cap, that op's read was
+    // truncated and its counts UNDERCOUNT. The shaper must surface this
+    // (receipts_capped=true) rather than presenting an undercount as a complete
+    // tally (#651 LOW). The shaper queries each bridge op separately, so the mock
+    // is argument-aware: `total` is the PER-OP bridge population, not all-ops.
     const cappedLog = {
-      query: async () => ({
-        entries: [
-          {
-            layer: "l3",
-            operation: "bridge_commit",
-            identity_id: FORTRESS,
-            details: { bridge_commitment_id: "bc-1" },
-          },
-        ],
-        total: 80_000,
+      query: async ({ operation_type }: { operation_type?: string }) => ({
+        entries:
+          operation_type === "bridge_commit"
+            ? [
+                {
+                  layer: "l3",
+                  operation: "bridge_commit",
+                  identity_id: FORTRESS,
+                  details: { bridge_commitment_id: "bc-1" },
+                },
+              ]
+            : [],
+        // bridge_commit alone has 80k events in-window => truncated by the cap.
+        total: operation_type === "bridge_commit" ? 80_000 : 0,
         integrity_findings: [],
       }),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1064,5 +1070,46 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
       originMachine: FORTRESS,
     });
     expect(complete.receipts.receipts_capped).toBe(false);
+  });
+
+  it("does NOT flag capped on a busy fortress whose huge audit total is NON-bridge traffic (#651 MEDIUM)", async () => {
+    // The regression the per-op query fixes: a mature fortress holds far more
+    // than the cap of NON-bridge audit entries (state reads/writes, castle-wall
+    // enforcement, ...), yet only a handful of bridge events, all inside the
+    // most-recent slice. The cap flag MUST stay false — the bridge tally is
+    // complete. The earlier all-ops read fired a false "incomplete tally"
+    // warning here because it compared the all-operations total against the
+    // returned bridge entries.
+    const busyLog = {
+      query: async ({ operation_type }: { operation_type?: string }) => {
+        // Every bridge op returns its full (tiny) population in the slice; no
+        // bridge op exceeds the cap, so nothing was truncated.
+        const bridgeEntries =
+          operation_type === "bridge_attest"
+            ? [
+                {
+                  layer: "l4",
+                  operation: "bridge_attest",
+                  identity_id: FORTRESS,
+                  details: { bridge_commitment_id: "bc-1" },
+                },
+              ]
+            : [];
+        return {
+          entries: bridgeEntries,
+          // total == returned bridge entries for that op => NOT truncated, even
+          // though the fortress as a whole has > 50k non-bridge entries.
+          total: bridgeEntries.length,
+          integrity_findings: [],
+        };
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const panel = await buildRecognitionPanel({
+      auditLog: busyLog,
+      originMachine: FORTRESS,
+    });
+    expect(panel.receipts.receipts_capped).toBe(false);
+    expect(panel.receipts.attested).toBe(1);
   });
 });
