@@ -182,7 +182,13 @@ async function appendForgedHeartbeat(
   });
 }
 
-/** A channel-basis (no producer signature) heartbeat — the honest macOS / no-key shape. */
+/**
+ * A channel-basis (no producer signature) heartbeat — the SHAPE THE REAL
+ * PRODUCER EMITS on every host. `macos-daemon.ts:emitAuditHeartbeat` writes a
+ * direct `auditLog.append` with the `cw_source` marker and NO signature fields
+ * (it is not routed through the signing audit consumer), so this is the genuine
+ * production beat on both macOS (no key) and Linux (key present).
+ */
 async function appendChannelHeartbeat(log: AuditLog, tsMs: number): Promise<void> {
   await log.appendCritical({
     layer: "l1",
@@ -192,6 +198,42 @@ async function appendChannelHeartbeat(log: AuditLog, tsMs: number): Promise<void
     timestamp: new Date(tsMs).toISOString(),
     details: {
       socket_path: "/tmp/x",
+      daemon_mode: "local-sign",
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    },
+  });
+}
+
+/**
+ * A RELABEL attack: a GENUINE daemon-signed heartbeat (the signature is over a
+ * `castle_wall_heartbeat` body) re-appended with its TOP-LEVEL operation forged
+ * to `egress_blocked`. The signature re-verifies (the canonical body is genuine),
+ * but the signed body attests only to LIVENESS, not adjudication. A reader that
+ * counts by the forgeable top-level op would count this as fresh enforcement and
+ * render the wall GREEN when it only proved the daemon is alive. The signed-op
+ * binding must reject it.
+ */
+async function appendSignedHeartbeatRelabeledAsBlock(
+  log: AuditLog,
+  tsMs: number,
+  seq: number,
+): Promise<void> {
+  const canonical = heartbeatWalBody(); // signed body: operation === castle_wall_heartbeat
+  const sig = ed25519.sign(producerSigningBytes(canonical, tsMs, seq), daemonPriv);
+  await log.appendCritical({
+    layer: "l1",
+    // FORGED top-level op: the re-appender claims this is an enforcement block.
+    operation: "egress_blocked",
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details: {
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toB64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: tsMs,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -431,6 +473,113 @@ describe("Slice 2 — freshness/skew: a future-dated or stale heartbeat is not f
     });
     const cw = cwRow(panel);
     expect(cw.basis).not.toBe("alive_no_recent_enforcement");
+    expect(cw.basis).toBe("dead_no_heartbeat");
+  });
+});
+
+describe("Slice 2 — the GENUINE channel-basis beat (real producer shape) drives the alarm on a KEY-BEARING (Linux) host", () => {
+  // Regression for the harden finding: the real producer
+  // (macos-daemon.ts:emitAuditHeartbeat) writes a DIRECT channel-basis beat (no
+  // producer signature) on EVERY host. Gating it with the enforcement signature
+  // path dropped it on a key-bearing host and rendered the silent-death alarm
+  // inert on Linux — the platform the thesis-gate designates as the one that
+  // matters. The liveness gate must count a genuine channel beat even when a key
+  // is present.
+
+  it("fresh channel-basis beat + no enforcement, KEY PRESENT → alive-but-idle (NOT dropped, NOT green)", async () => {
+    const log = newLog();
+    await appendChannelHeartbeat(log, FRESH_TS);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = cwRow(panel);
+    // Before the fix this read no_evidence_self_reporting (beat silently dropped).
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("alive_no_recent_enforcement");
+    expect(cw.invocation_count).toBe(0);
+  });
+
+  it("stale channel-basis beat, NO fresh beat, KEY PRESENT → dead_no_heartbeat / fault (the Linux alarm fires)", async () => {
+    const log = newLog();
+    // The real producer beat the channel basis earlier, then the daemon died.
+    await appendChannelHeartbeat(log, STALE_TS);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = cwRow(panel);
+    // Before the fix everSawHeartbeat stayed false on a key-bearing host, so this
+    // could NEVER reach the dead_no_heartbeat alarm — it fell back to Slice-1
+    // no_evidence/stale unknown. The alarm must now fire on Linux.
+    expect(cw.status).toBe("fault");
+    expect(cw.basis).toBe("dead_no_heartbeat");
+  });
+
+  it("genuine signed block THEN a channel-basis beat (mixed real shapes), KEY PRESENT → green from the block, beat counts as liveness", async () => {
+    const log = newLog();
+    await appendGenuineBlock(log, FRESH_TS, 1);
+    await appendChannelHeartbeat(log, FRESH_TS);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = cwRow(panel);
+    // The block earns green (signature-gated); the channel beat is recognized as
+    // liveness but never upgrades or downgrades the presence case.
+    expect(cw.status).toBe("active");
+    expect(cw.basis).toBe("fresh_enforcement_evidence");
+  });
+});
+
+describe("Slice 2 — signed-operation binding: a verified signature over a HEARTBEAT cannot be relabeled into enforcement (finding #2)", () => {
+  it("a genuine signed heartbeat re-appended as egress_blocked does NOT count as fresh enforcement → never green", async () => {
+    const log = newLog();
+    await appendSignedHeartbeatRelabeledAsBlock(log, FRESH_TS, 1);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = cwRow(panel);
+    // The signature re-verifies, but the signed body says castle_wall_heartbeat,
+    // not egress_blocked. The signed-op binding drops it from the invocation
+    // tally, so it earns NO green and does not inflate invocation_count. (It is
+    // not a valid liveness entry under the egress_blocked top-level op either,
+    // since the heartbeat lives under its own op, so there is no prior-liveness
+    // signal → honest unknown/no_evidence.)
+    expect(cw.status).not.toBe("active");
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("no_evidence_self_reporting");
+    expect(cw.invocation_count).toBe(0);
+  });
+
+  it("the relabel attack cannot manufacture green even alongside a stale genuine beat", async () => {
+    const log = newLog();
+    // A genuine stale beat establishes the producer WAS running; the relabeled
+    // signed heartbeat tries to forge fresh enforcement to flip the wall green.
+    await appendGenuineHeartbeat(log, STALE_TS, 1);
+    await appendSignedHeartbeatRelabeledAsBlock(log, FRESH_TS, 2);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const cw = cwRow(panel);
+    // The relabeled "block" is rejected by the signed-op binding, so there is no
+    // fresh enforcement and no fresh heartbeat (the relabeled entry is filed under
+    // egress_blocked, so it is not a liveness entry). The producer was provably
+    // running and went silent → the honest silent-death alarm, NEVER green.
+    expect(cw.status).not.toBe("active");
+    expect(cw.status).toBe("fault");
     expect(cw.basis).toBe("dead_no_heartbeat");
   });
 });

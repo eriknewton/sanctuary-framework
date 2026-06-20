@@ -84,12 +84,50 @@ import {
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  livenessEntryCounts,
   producerSignedDedupKey,
+  signedCanonicalOperation,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
+import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../castle-wall/constants.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Map from the daemon's SIGNED WAL `operation` vocabulary to the read-side
+ * `entry.operation` this reader keys features on. Mirrors `WAL_OPERATION_TO_*`
+ * in the audit consumer and `SIGNED_WAL_OP_TO_ENTRY_OP` in `posture.ts`, plus
+ * the Slice-2 heartbeat (identity: the daemon signs and files the beat under the
+ * same `castle_wall_heartbeat` op). Used to bind a re-verified signed body's
+ * operation to the entry it is filed under, so a genuine signed tuple cannot be
+ * relabeled into a different feature slot — e.g. a signed liveness heartbeat
+ * stapled onto an `egress_blocked` entry to manufacture green (the sibling
+ * posture reader binds the same way; feature-health must not be the weaker
+ * surface).
+ */
+const SIGNED_WAL_OP_TO_FEATURE_OP: Readonly<Record<string, string>> =
+  Object.freeze({
+    egress_approved: "egress_allowed",
+    egress_blocked: "egress_blocked",
+    egress_pending: "operator_decision",
+    [CASTLE_WALL_HEARTBEAT_OPERATION]: CASTLE_WALL_HEARTBEAT_OPERATION,
+  });
+
+/**
+ * True iff a re-verified producer-signed entry's SIGNED canonical body attests
+ * to the same read-side operation the entry is filed under. Fail closed on any
+ * parse failure / unknown signed op / mismatch: a verified signature over one
+ * operation must NOT count toward a DIFFERENT operation's tally.
+ */
+function signedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const signedOp = signedCanonicalOperation(details);
+  if (signedOp === null) return false;
+  return SIGNED_WAL_OP_TO_FEATURE_OP[signedOp] === entryOperation;
 }
 
 /**
@@ -496,13 +534,23 @@ export function evaluateFeatureHealth(args: {
     // gate fault recognition. (For Castle Wall, invocationOps / faultOps /
     // livenessOps are mutually disjoint, so a fault entry is never dropped here.)
     //
-    // A LIVENESS heartbeat is gated with the SAME teeth as an invocation
-    // (provenance marker + producer-signature re-verify) so a forged "I am alive"
-    // beat — right op + `cw_source` marker but a bad/missing producer signature —
-    // can NEVER register as fresh on a key-bearing host (invariant: no weaker
-    // trust basis than `egress_blocked`). The ONLY difference from an invocation
-    // is downstream: a verified heartbeat proves the daemon is alive, it does NOT
-    // earn green.
+    // INVOCATIONS and LIVENESS heartbeats both pass the provenance marker + the
+    // producer-signature re-verify, but their COUNT rules differ because they are
+    // different kinds of evidence:
+    //
+    //  - An INVOCATION is green-earning enforcement evidence: on a key-bearing
+    //    host the audit consumer never persists a genuine one on the channel
+    //    basis, so only `producer_signed_verified` counts (`enforcementEntryCounts`).
+    //  - A LIVENESS heartbeat is NOT green-earning. The real producer
+    //    (`macos-daemon.ts:emitAuditHeartbeat`) writes it as a DIRECT
+    //    `auditLog.append`, never through the signing consumer, so a GENUINE beat
+    //    is channel-basis on EVERY host (Linux included). Gating it with
+    //    `enforcementEntryCounts` would drop every genuine beat on a key-bearing
+    //    host and render the silent-death alarm inert on the platform that
+    //    matters. It is gated with `livenessEntryCounts`: a genuine channel beat
+    //    counts, but a forged `producer_signed`-CLAIMING beat with a bad signature
+    //    (`producer_signed_rejected`) still does NOT — the one way an in-process
+    //    forger could fake "I am alive" to suppress the alarm.
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
     if (feature.requireCastleWallProvenance && (isInvocation || isLiveness)) {
@@ -512,20 +560,32 @@ export function evaluateFeatureHealth(args: {
           CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
       if (!hasProvenance) return null;
       // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
-      // authority for a green-earning invocation (or a liveness heartbeat) is the
-      // producer signature, RE-verified here against the pinned key. When a key
-      // IS configured, only a `producer_signed_verified` entry counts — a
-      // channel/absent-basis or forged entry is dropped (the consumer never
-      // persists genuine enforcement evidence on the channel basis when a key is
-      // set; codex HIGH #1). When NO key is configured, the channel basis counts
-      // (honest macOS floor). Fault ops are NOT routed here (they fail toward
-      // RED), so this never drops a real fault.
+      // authority is the producer signature, RE-verified here against the pinned
+      // key. Fault ops are NOT routed here (they fail toward RED), so this never
+      // drops a real fault.
       const reResult = reverifyEntryProducerSignature(
         entry.details,
         pinnedProducerKey,
         args.verifyProducerSignature,
       );
-      if (!enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null)) {
+      const basisCounts = isLiveness
+        ? livenessEntryCounts(reResult.basis)
+        : enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null);
+      if (!basisCounts) {
+        return null;
+      }
+      // OPERATION BINDING (parity with `posture.ts`): for a verified producer
+      // signature the signed canonical body's operation is authoritative, NOT the
+      // forgeable top-level `entry.operation`. Require they match so a genuine
+      // signed tuple cannot be relabeled into a different feature slot — e.g. a
+      // signed liveness heartbeat re-appended as `egress_blocked` to manufacture
+      // green when it only proved liveness. Channel-basis entries have no signed
+      // op to bind, so they keep the honest no-key floor (the entry op).
+      if (
+        reResult.basis === "producer_signed_verified" &&
+        isRecord(entry.details) &&
+        !signedOperationMatchesEntry(entry.details, op)
+      ) {
         return null;
       }
       signedTs = reResult.signedCapturedAtMs;

@@ -419,9 +419,16 @@ export async function startMacOSCastleWallDaemon(
     // Provenance: stamped with the SAME `cw_source` marker the audit consumer
     // stamps on enforcement evidence (`egress_blocked`), built from constructed
     // fields only (no untrusted spread) and stamped LAST, so a forger cannot mint
-    // a fake "I am alive" beat that out-ranks the marker. On a host with a pinned
-    // producer key the reader re-verifies the producer signature exactly as it
-    // does for `egress_blocked`, so a marker-only forgery fails closed there too.
+    // a fake "I am alive" beat that out-ranks the marker.
+    //
+    // BASIS HONESTY: this is a DIRECT audit append, NOT routed through the signing
+    // audit consumer, so a genuine beat is CHANNEL-basis (marker only, no producer
+    // signature) on EVERY host, Linux included. The reader gates the heartbeat
+    // with `livenessEntryCounts` (a genuine channel beat counts on a key-bearing
+    // host; only a forged `producer_signed`-claiming beat with a bad signature is
+    // dropped), so the silent-death alarm stays functional on Linux. It does NOT
+    // require the stricter enforcement-evidence signature gate `egress_blocked`
+    // uses (see `principal-policy/feature-health.ts`).
     //
     // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
     // real flow, so the reader keeps it OUT of the green/armed determination.
