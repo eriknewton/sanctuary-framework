@@ -2314,13 +2314,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     )
       return;
 
-    // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
-    // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER
-    // checkAuth (same gate as `/api/audit-log`) and before the legacy route
-    // table. The dispatch is async; when it serves the request it returns
-    // true, otherwise we fall through to the legacy table below.
+    // Sovereignty Posture Dashboard: the authenticated posture surface, namely
+    // the per-agent drill-down HTML at `/posture/agent/:id` and the JSON gap
+    // endpoints at `/api/posture/*`. Dispatched AFTER checkAuth (same gate as
+    // `/api/audit-log`) and before the legacy route table. The dispatch is
+    // async; when it serves the request it returns true, otherwise we fall
+    // through to the legacy table below.
+    //
+    // NOTE (root-flip): the `/posture` HOME HTML is NOT served here. `GET /`
+    // and `GET /posture` are intercepted earlier by `dispatchRootPosture`
+    // (BEFORE checkAuth) and serve the one unauthenticated static shell, and
+    // `handlePostureRoute` no longer carries a `/posture` HTML branch. So
+    // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
-      url.pathname === POSTURE_HOME_PATH ||
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
