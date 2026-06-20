@@ -635,12 +635,17 @@ describe("Principal Dashboard", () => {
     // gate under loopback auto-auth, otherwise the badge sticks on "Checking
     // enforcement…" and the embed renders a raw 401 page. This locks the
     // posture-read route as a read-only route the auto-auth fast path covers
-    // (NOT a `requireToken` approval-decision route). The `sanctuary
-    // --dashboard` boot path (index.ts) now enables this fast path the same way
-    // `sanctuary dashboard` does. Its companion above
+    // (NOT a `requireToken` approval-decision route). Its companion above
     // (`rejects a tokenless loopback POST /api/approve/:id (401)`) locks the
     // opposite half: the approval-decision surface stays 401 even with auto-auth
-    // on. Together they bracket the `--dashboard` boot fix.
+    // on. Scope note: this `beforeEach` toggles the flag directly via
+    // `setAutoAuthLocalhost(true)`, so what is locked here is the routing-layer
+    // (`checkAuth`) carve-out — posture reads pass, approve/deny stay 401 — NOT
+    // the wiring that turns the flag on. The `sanctuary --dashboard` boot path
+    // (`createSanctuaryServer` in index.ts) enables this fast path the same way
+    // `sanctuary dashboard` does, but that boot wiring is a 1:1 copy of the
+    // proven dashboard-standalone guard and is not directly exercised by this
+    // test; reverting the index.ts change would not fail these cases.
     it("tokenless loopback GET /api/posture/castle-wall is NOT 401 under auto-auth (native embed read)", async () => {
       const res = await fetch(
         `http://127.0.0.1:${autoPort}/api/posture/castle-wall`,
