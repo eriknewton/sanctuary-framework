@@ -1069,13 +1069,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * derives the same shape behind checkAuth). The native badge sources from
    * `/api/posture/castle-wall`, never from `/api/health`.
    *
-   * Resolves dependencies exactly as {@link dispatchPosture} does (origin
-   * machine, the pinned producer key load, the unlocked audit log) and calls
-   * the canonical {@link buildCastleWallPosture} shaper — there is no second
-   * arm-state code path. Honesty is preserved end-to-end: when the audit log is
-   * locked/absent, or the producer key is expected-but-unreadable, or evidence
-   * is stale, the shaper returns `unknown` / `degraded` (never `armed`). Green
-   * (`armed`) is only ever returned for fresh, observed enforcement evidence.
+   * Resolves dependencies the same way {@link dispatchPosture} does (origin
+   * machine, the pinned producer key load, the unlocked audit log): green
+   * (`armed`) is derived by the ONE canonical {@link buildCastleWallPosture}
+   * shaper and nowhere else. The only divergence from the `/api/posture/...`
+   * route is the locked/absent-audit case: that route 503s (it need not answer
+   * when it cannot evidence posture), whereas a status document must answer 200,
+   * so this builder returns an honest `unknown` placeholder instead of routing
+   * through the shaper (whose `auditLog` input is typed non-null, so the null
+   * case genuinely cannot reach it). Honesty is preserved end-to-end: when the
+   * audit log is locked/absent, or the producer key is expected-but-unreadable,
+   * or evidence is stale, the result is `unknown` / `degraded` (never `armed`).
+   * Green (`armed`) is only ever returned for fresh, observed enforcement
+   * evidence, and only from the canonical shaper.
    *
    * Never throws into the request path: any unexpected failure resolves to an
    * honest `unknown` posture so the status document always answers.
