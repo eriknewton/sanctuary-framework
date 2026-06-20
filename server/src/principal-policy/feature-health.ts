@@ -92,6 +92,43 @@ import {
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../castle-wall/constants.js";
+import {
+  BROKER_DAEMON_HEARTBEAT_OPERATION,
+  BROKER_DAEMON_STAND_DOWN_OPERATION,
+  BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
+  BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
+} from "../broker-mcp/liveness-constants.js";
+
+/**
+ * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
+ * A frozen single-element set, mirroring `CASTLE_WALL_LIVENESS_OPERATIONS`. Kept
+ * DISJOINT from the event-driven `secret_broker` row's invocation ops
+ * (`broker_token_issued` / `broker_token_denied`): a liveness beat proves the
+ * PROCESS is up, NOT that a token decision happened.
+ */
+const BROKER_DAEMON_LIVENESS_OPERATIONS: ReadonlySet<string> = Object.freeze(
+  new Set<string>([BROKER_DAEMON_HEARTBEAT_OPERATION]),
+);
+
+/**
+ * Stand-down op set for the broker daemon (Option C false-RED parity with the
+ * corrected Castle Wall Slice-2 pattern): a clean operator stop records this so a
+ * deliberate shutdown is NOT misread as a silent death.
+ */
+const BROKER_DAEMON_STAND_DOWN_OPERATIONS: ReadonlySet<string> = Object.freeze(
+  new Set<string>([BROKER_DAEMON_STAND_DOWN_OPERATION]),
+);
+
+/**
+ * The broker daemon row's `invocationOps` is the EMPTY frozen set. A liveness
+ * heartbeat is NOT request-correctness evidence, so this row can NEVER reach the
+ * green `active` branch (which requires a fresh invocation) - green is
+ * STRUCTURALLY impossible, not merely policy. Exported-by-reference as a single
+ * frozen empty set to make that intent explicit and unforgeable.
+ */
+const BROKER_DAEMON_NO_INVOCATION_OPS: ReadonlySet<string> = Object.freeze(
+  new Set<string>(),
+);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -441,6 +478,59 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
         new Set<string>(["broker_token_issued", "broker_token_denied"]),
       ),
       brokenZeroDetectable: false,
+    },
+    {
+      // Observability (Option C, Erik-ratified): PROCESS-LIVENESS of the
+      // long-running `sanctuary broker-server` MCP daemon. ADDITIVE on the
+      // event-driven `secret_broker` row above (which stays UNCHANGED): that row
+      // counts token decisions; THIS row answers only "is the broker daemon
+      // process still alive, or did it silently die in a quiet window?".
+      //
+      // HONEST SCOPE (the multi-angle review hammers this): a heartbeat proves
+      // ONLY that this daemon PROCESS is up. It does NOT prove the broker would
+      // correctly mint or deny a token (no enforcement evidence exists for that),
+      // NOT that the keychain backend is reachable, and says NOTHING about the
+      // per-invocation `sanctuary secrets` CLI / in-server tool path. The UI copy
+      // reads "broker daemon alive" / process liveness, NEVER "broker healthy" or
+      // green.
+      //
+      // `invocationOps` is the EMPTY set, so green (`active`) is STRUCTURALLY
+      // impossible: the `active` branch requires a fresh invocation, and there is
+      // no invocation vocabulary here. A heartbeat can only move the
+      // absence-of-evidence case from `unknown` toward an honest
+      // daemon-alive-but-idle vs silently-dead split; it never earns green.
+      //
+      // CHANNEL/MARKER basis only (NO `producerSignatureScheme`): the broker has
+      // no per-event producer-signing infra, so recognition rests on the broker
+      // provenance marker via the generalized per-feature gate from #658 - the
+      // SAME basis a genuine Castle Wall heartbeat uses on a non-key-bearing
+      // host. The in-process-writer boundary the Castle Wall channel heartbeat
+      // discloses applies here UNCHANGED: an L3 writer holding `AuditLog.append`
+      // could forge a fresh beat to suppress the alarm red -> non-green
+      // `unknown`, but NEVER manufacture green.
+      id: "secret_broker_daemon",
+      label: "Secret broker daemon (process liveness)",
+      layer: "l3",
+      liveness: "self_reporting",
+      // EMPTY by design: a heartbeat never proves request-correctness, so this
+      // row can never read `active`/green.
+      invocationOps: BROKER_DAEMON_NO_INVOCATION_OPS,
+      // The periodic process-liveness heartbeat.
+      livenessOps: BROKER_DAEMON_LIVENESS_OPERATIONS,
+      // A clean operator stop relabels the otherwise-silent quiet window as an
+      // honest intentional stand-down (false-RED parity with Castle Wall #657).
+      standDownOps: BROKER_DAEMON_STAND_DOWN_OPERATIONS,
+      // Channel/marker basis: provenance marker, NO signature scheme.
+      provenanceMarker: {
+        key: BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
+        value: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
+      },
+      // Silent death of the broker DAEMON process is now detectable from a
+      // missing heartbeat (true). NOTE: this is detectable for the long-running
+      // DAEMON only; the event-driven `secret_broker` row's broken-zero (a
+      // silently-disabled broker that emits no token events) remains UNDETECTABLE
+      // - both facts coexist and the disclosure block states both honestly.
+      brokenZeroDetectable: true,
     },
     {
       id: "approval_gates",
@@ -1029,11 +1119,33 @@ export interface FeatureHealthPanel {
    * alarm to this `unknown` — but NEVER to green (the suppression can only move
    * red -> non-green `unknown`). This is the same forgeable in-process-writer
    * boundary the heartbeat itself discloses; it adds no weaker trust path.
+   *
+   * Broker Option C update: the long-running `broker-server` DAEMON now emits the
+   * same kind of process-liveness heartbeat + stand-down, so a broker daemon that
+   * silently dies in a quiet window reads `dead_no_heartbeat`/red on the new
+   * `secret_broker_daemon` row (`broker_daemon_silent_death_detectable` true).
+   * CRITICALLY, this does NOT make the EVENT-DRIVEN `secret_broker` row's
+   * broken-zero detectable: a broker that is silently disabled but emits no token
+   * events is still indistinguishable from one that is simply quiet
+   * (`broken_zero_undetectable_for_event_driven` stays true). Both facts coexist:
+   * DAEMON process-death is detectable; event-driven broken-zero is not. The
+   * daemon heartbeat is channel/marker basis (no producer signature), so it
+   * carries the SAME in-process-writer caveat as the Castle Wall channel
+   * heartbeat - it can only move red -> non-green `unknown`, never to green.
    */
   disclosure: {
     broken_zero_undetectable_for_event_driven: true;
     castle_wall_silent_death_is_unknown_not_green: false;
     silent_death_distinguished_from_intentional_stop: true;
+    /**
+     * The long-running broker DAEMON process now emits a liveness heartbeat, so
+     * its silent death (process killed / wedged) is detectable as
+     * `dead_no_heartbeat`/red on the `secret_broker_daemon` row. Process-liveness
+     * only: NOT token-mint/deny correctness, NOT keychain-reachability. Coexists
+     * with `broken_zero_undetectable_for_event_driven` (the event-driven
+     * `secret_broker` row's broken-zero stays undetectable).
+     */
+    broker_daemon_silent_death_detectable: true;
   };
 }
 
@@ -1159,6 +1271,12 @@ export async function buildFeatureHealthPanel(
       // false red `dead_no_heartbeat`. The alarm is distinguished from an
       // intentional stand-down.
       silent_death_distinguished_from_intentional_stop: true,
+      // Broker Option C: the long-running broker DAEMON process now emits a
+      // liveness heartbeat, so its silent death is detectable on the
+      // `secret_broker_daemon` row. Process-liveness only - this does NOT make
+      // the event-driven `secret_broker` row's broken-zero detectable (that flag
+      // above stays true). Both honest facts coexist.
+      broker_daemon_silent_death_detectable: true,
     },
   };
 }

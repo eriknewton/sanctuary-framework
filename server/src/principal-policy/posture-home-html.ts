@@ -372,7 +372,17 @@ export function renderPostureHomeHTML(): string {
 
   // Plain-English reason copy, derived from the endpoint's stable basis enum.
   // Never leaks rule internals; phrases the honest non-green cases plainly.
+  //
+  // HONESTY: the liveness bases (alive_no_recent_enforcement / dead_no_heartbeat
+  // / intentionally_stopped / no_evidence_self_reporting) are SHARED between the
+  // Castle Wall row and the broker DAEMON row, but they mean different things.
+  // For Castle Wall, a fresh heartbeat means "armed but idle" (no flow filtered).
+  // For the broker daemon it means ONLY "the process is up" - NOT that it would
+  // mint/deny a token correctly, NOT that the keychain is reachable. So the
+  // broker daemon row gets PROCESS-LIVENESS copy ("broker daemon alive"), never
+  // "healthy"/green. Branch on the stable feature_id to keep both honest.
   function featureWhy(row) {
+    var isBrokerDaemon = row.feature_id === "secret_broker_daemon";
     switch (row.basis) {
       case "fresh_enforcement_evidence":
         return "Confirmed by fresh enforcement evidence.";
@@ -383,13 +393,21 @@ export function renderPostureHomeHTML(): string {
       case "stale_evidence":
         return "Evidence is stale; recent state cannot be confirmed.";
       case "no_evidence_self_reporting":
-        return "No recent evidence; working state cannot be confirmed.";
+        return isBrokerDaemon
+          ? "No recent heartbeat ever seen; cannot tell a never-started daemon from one that stopped long ago."
+          : "No recent evidence; working state cannot be confirmed.";
       case "alive_no_recent_enforcement":
-        return "The wall is alive (recent heartbeat) but has not filtered a flow in the window.";
+        return isBrokerDaemon
+          ? "Broker daemon alive (recent heartbeat). Process liveness only - this does NOT confirm it would correctly mint or deny a token, nor that the keychain is reachable."
+          : "The wall is alive (recent heartbeat) but has not filtered a flow in the window.";
       case "dead_no_heartbeat":
-        return "The wall was running but its heartbeat stopped; it appears to have silently died.";
+        return isBrokerDaemon
+          ? "The broker daemon was running but its heartbeat stopped; the process appears to have silently died."
+          : "The wall was running but its heartbeat stopped; it appears to have silently died.";
       case "intentionally_stopped":
-        return "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
+        return isBrokerDaemon
+          ? "The broker daemon was intentionally stopped (clean shutdown); it is off on purpose, not dead."
+          : "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."

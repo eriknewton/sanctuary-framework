@@ -60,11 +60,21 @@ describe("feature-health registry — integrity invariants", () => {
     }
   });
 
-  it("exactly one self-reporting feature (Castle Wall); the rest are event-driven", () => {
+  it("the self-reporting features are Castle Wall + the broker daemon (process liveness); the rest are event-driven", () => {
+    // Broker Option C added the `secret_broker_daemon` process-liveness row. It
+    // is self_reporting (it has a heartbeat producer) but carries an EMPTY
+    // invocationOps set, so it can never read green - unlike Castle Wall, which
+    // has real live-adjudication invocation ops.
     const selfReporting = SLICE1_FEATURE_REGISTRY.filter(
       (f) => f.liveness === "self_reporting",
     );
-    expect(selfReporting.map((f) => f.id)).toEqual(["castle_wall_egress"]);
+    expect(selfReporting.map((f) => f.id).sort()).toEqual(
+      ["castle_wall_egress", "secret_broker_daemon"].sort(),
+    );
+    const brokerDaemon = selfReporting.find(
+      (f) => f.id === "secret_broker_daemon",
+    );
+    expect(brokerDaemon?.invocationOps.size).toBe(0);
   });
 
   it("only self-reporting features advertise broken-zero as detectable", () => {
