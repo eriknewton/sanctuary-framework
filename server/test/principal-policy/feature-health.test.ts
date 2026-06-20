@@ -294,9 +294,11 @@ describe("feature-health — green is earned correctly", () => {
       now: Date.now(),
     });
     expect(panel.disclosure.broken_zero_undetectable_for_event_driven).toBe(true);
+    // Slice 2: silent death is now DETECTED (a missing heartbeat reads
+    // `fault`/red, not `unknown`), so this honesty caveat is now false.
     expect(
       panel.disclosure.castle_wall_silent_death_is_unknown_not_green,
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("future-dated Castle Wall evidence beyond skew does NOT keep the wall green", async () => {

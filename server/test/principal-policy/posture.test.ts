@@ -12,9 +12,12 @@ import {
   buildCustodyExitPanel,
   buildRecognitionPanel,
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
+  CASTLE_WALL_LIVENESS_OPERATIONS,
+  CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
 } from "../../src/principal-policy/posture.js";
+import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../../src/castle-wall/constants.js";
 import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 
 const FORTRESS = "fortress:test";
@@ -267,6 +270,19 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     expect([...ENFORCEMENT_EVIDENCE_EVENT_TYPES].sort()).toEqual(
       [...CASTLE_WALL_ENFORCEMENT_OPERATIONS].sort(),
     );
+  });
+
+  it("Slice 2: the liveness set is STRICTLY DISJOINT from the enforcement set (a heartbeat is never adjudication)", () => {
+    // A heartbeat proves the daemon is ALIVE, not that it adjudicated a flow, so
+    // it must NEVER share an op with the enforcement set (which would let a beat
+    // earn the green/armed light). It is also disjoint from the fault set.
+    expect([...CASTLE_WALL_LIVENESS_OPERATIONS]).toEqual([
+      CASTLE_WALL_HEARTBEAT_OPERATION,
+    ]);
+    for (const op of CASTLE_WALL_LIVENESS_OPERATIONS) {
+      expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op)).toBe(false);
+      expect(CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op)).toBe(false);
+    }
   });
 
   it("renders DEGRADED on fresh not-enforcing evidence (e.g. provider_unbound)", async () => {

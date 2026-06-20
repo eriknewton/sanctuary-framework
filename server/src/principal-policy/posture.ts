@@ -45,6 +45,7 @@ import type { SovereigntyTier } from "../reputation/tiers.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
 } from "../castle-wall/constants.js";
 import {
@@ -101,6 +102,25 @@ export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
       "operator_decision",
     ]),
   );
+
+/**
+ * Castle Wall audit operations that prove the daemon is ALIVE but do NOT prove
+ * it adjudicated a real flow (observability Slice 2). The periodic
+ * `castle_wall_heartbeat` is the only member: it is written on an audit-cadence
+ * interval by a running daemon, stamped with the `cw_source` provenance marker
+ * and the same producer-signature basis as enforcement evidence.
+ *
+ * This set is kept STRICTLY SEPARATE from `CASTLE_WALL_ENFORCEMENT_OPERATIONS`:
+ * a heartbeat proves liveness, NOT live adjudication, so it may NEVER earn the
+ * green `armed`/`active` light on its own. Its only job is to let a reader tell
+ * an alive-but-idle wall from one that silently died in a quiet window — it
+ * moves the ABSENCE-of-enforcement-evidence case from `unknown` toward an honest
+ * dead-vs-idle distinction, and never moves the PRESENCE case to green. No
+ * operation string appears in both this set and the enforcement set (asserted by
+ * a disjointness test), so a heartbeat can never be mistaken for adjudication.
+ */
+export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
+  Object.freeze(new Set<string>([CASTLE_WALL_HEARTBEAT_OPERATION]));
 
 /**
  * Castle Wall audit operations that prove the wall is present but NOT

@@ -18,6 +18,11 @@ import {
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../../../src/castle-wall/constants.js";
 
 const silent = new Writable({
   write(_chunk, _encoding, callback) {
@@ -283,6 +288,69 @@ describe("Castle Wall macOS daemon integration", () => {
 
     expect(broadcasts).toEqual([revoke]);
     await handle.stop();
+  });
+
+  it("emits a provenance-marked castle_wall_heartbeat audit entry on its audit-cadence interval (Slice 2)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      // A tiny audit-heartbeat cadence so the test does not wait the 45s default.
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+
+    // Let the startup beat plus a couple of interval beats land.
+    await wait(40);
+    await handle.stop();
+
+    const q = await auditLog.query({ layer: "l1", limit: 1000 });
+    const beats = q.entries.filter(
+      (e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION,
+    );
+    // At least the startup beat (and almost certainly several interval beats).
+    expect(beats.length).toBeGreaterThanOrEqual(1);
+    // Every beat carries the SAME cw_source provenance marker enforcement
+    // evidence carries, so the reader treats it as genuine Castle Wall liveness.
+    for (const beat of beats) {
+      const details = beat.details as Record<string, unknown>;
+      expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      );
+      expect(beat.result).toBe("success");
+    }
+  });
+
+  it("stops emitting heartbeats after the daemon is stopped (same teardown as the lease heartbeat)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(40);
+    await handle.stop();
+
+    const afterStop = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION).length;
+    // Give any leaked interval a chance to fire post-stop.
+    await wait(40);
+    const later = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION).length;
+    expect(later).toBe(afterStop);
   });
 
   it("rejects a second daemon for the same fortress with the Phase 3 message", async () => {

@@ -26,6 +26,27 @@ export const CASTLE_WALL_AUDIT_PROVENANCE_KEY = "cw_source" as const;
 export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
   "castle_wall_audit_consumer" as const;
 
+/**
+ * Audit operation name for the periodic Castle Wall daemon LIVENESS heartbeat
+ * (observability Slice 2). The daemon appends an `l1` audit entry under this
+ * operation on an audit-cadence interval (~30-60s), stamped with the same
+ * `cw_source` provenance marker and producer-signature basis that enforcement
+ * evidence uses, so the reader can tell an alive-but-idle wall from one that
+ * silently died in a quiet window.
+ *
+ * HONESTY: a heartbeat proves the daemon process is ALIVE, NOT that it
+ * adjudicated a real flow. It is deliberately kept OUT of
+ * `CASTLE_WALL_ENFORCEMENT_OPERATIONS` so it can NEVER earn the green
+ * `armed`/`active` light on its own (green stays gated on
+ * `egress_allowed`/`egress_blocked`/`operator_decision`). It only moves the
+ * ABSENCE-of-evidence case from `unknown` toward an honest dead-vs-idle split.
+ *
+ * This is a NEW at-rest audit operation string (documented per the
+ * frozen-surface rule); it is not a wire message type and does not alter any
+ * existing display string.
+ */
+export const CASTLE_WALL_HEARTBEAT_OPERATION = "castle_wall_heartbeat" as const;
+
 /** Ed25519 signature scheme tag used in manifest envelopes (matches federation v0.1). */
 export const CASTLE_WALL_SIGNATURE_SCHEME_V1 = "ed25519-v1" as const;
 
