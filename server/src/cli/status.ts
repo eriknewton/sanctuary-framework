@@ -147,6 +147,13 @@ function renderFailure(cause: unknown, err: Writable): number {
   return 2;
 }
 
+/**
+ * Render the default `sanctuary status` table (the human-readable output when no
+ * `--output json|yaml` is given). Reads the `/v1/status` document shape, including
+ * the evidence-gated `castle_wall.arm_state` line. Exported so the status-command
+ * tests can assert the rendered table values directly (e.g. the castle-wall line
+ * reflects the honest arm-state, not a stale field); not part of the public CLI API.
+ */
 export function renderTable(status: Record<string, unknown>): string {
   const daemon = asRecord(status.daemon);
   const listener = asRecord(status.listener);

@@ -27,6 +27,13 @@
  *                                  gate flag (config, NOT evidence-gated). Carries
  *                                  NO Concordia/Verascore data - only the flag and
  *                                  origin_machine. Behind the SAME checkAuth gate.
+ *   GET /api/posture/recognition - Recognition + portability panel (P5). GATED on
+ *                                  composition-enabled (404 when off, so the panel
+ *                                  is ABSENT not greyed). LOCAL-evidence only:
+ *                                  bridge receipt counts + local reputation
+ *                                  EVIDENCE (counts, never a score) + the portable-
+ *                                  identity export capability. No score-fetch path;
+ *                                  counterparty verification is local bridge crypto.
  *   GET /posture                 - the posture home HTML.
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  */
@@ -44,6 +51,7 @@ import {
   buildAgentReach,
   buildPostureAgentRows,
   buildCustodyExitPanel,
+  buildRecognitionPanel,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -52,6 +60,8 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
   type CustodyExitPanel,
+  type RecognitionPanel,
+  type RecognitionReputationEvidence,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -115,6 +125,29 @@ export interface PostureRouteDeps {
    * absent is treated as `false` (honest default-off).
    */
   compositionEnabled?: boolean;
+  /**
+   * Recognition panel (P5): count of persisted Concordia-bridge commitments
+   * (`storage.list("_bridge")`). Supplied by the dashboard, which holds the
+   * storage backend; resolved lazily per request so post-unlock wiring is
+   * observed. Optional - when absent, OR when it resolves to `undefined` (no
+   * storage backend wired, so the count is unknowable), the recognition shaper
+   * falls back to the count of `bridge_commit` audit events (an honest lower
+   * bound, never a fabricated count). A resolved `0` is a real "zero persisted
+   * commitments" fact and is used as-is. Carries NO Concordia/Verascore data
+   * beyond a local count.
+   */
+  countBridgeCommitments?: () => Promise<number | undefined>;
+  /**
+   * Recognition panel (P5): pre-gathered LOCAL reputation EVIDENCE (counts only)
+   * for the primary identity - NOT a score and NOT a fetched Verascore value.
+   * Supplied by the dashboard, which holds the identity + master key needed to
+   * read the local attestation store. Resolved lazily per request. Returns
+   * `null` when no reputation store is wired / readable, which renders the
+   * reputation row amber ("no evidence yet"), never green-from-absence. There is
+   * NO score-fetch path anywhere in this flow; this is the only reputation input
+   * the panel ever sees.
+   */
+  gatherRecognitionReputation?: () => Promise<RecognitionReputationEvidence | null>;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
   /**
@@ -354,6 +387,32 @@ export async function handlePostureRoute(
       return true;
     }
 
+    // Recognition + portability panel (P5). GATED on composition-enabled: when
+    // composition is OFF the panel is ABSENT entirely (404 within the namespace,
+    // NOT a greyed/empty payload), so its mere existence never implies a
+    // Concordia/Verascore dependency. When ON it returns LOCAL-evidence-only
+    // receipt counts + local reputation evidence (counts, NOT a score) + the
+    // portable-identity export capability. It reaches here only after the
+    // audit-null 503 guard above, so it is never built against a locked log.
+    // IMPARTIALITY: there is no score-fetch path; counterparty verification is
+    // labeled local bridge crypto; rows are amber unless evidence is present.
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/recognition`) {
+      if (deps.compositionEnabled !== true) {
+        // Honest absence: composition off => the Recognition panel does not
+        // exist on this fortress. 404 (not an empty 200) so the page omits the
+        // panel rather than rendering a greyed/implied-dependency shell.
+        writeJSON(res, 404, {
+          error: "recognition_unavailable",
+          reason: "composition is disabled; the recognition panel is absent",
+          origin_machine: om,
+        });
+        return true;
+      }
+      const panel = await buildRecognition(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/unwrapped`) {
       const roster = await buildUnwrapped(deps);
       writeJSON(res, 200, roster);
@@ -511,6 +570,47 @@ async function buildCustodyExit(
     auditLog: deps.auditLog as AuditLog,
     originMachine: deps.originMachine,
     ...(deps.now ? { now: deps.now() } : {}),
+  });
+}
+
+/**
+ * Recognition + portability panel (P5). The route already enforced the
+ * composition-enabled render gate and the audit-unlock 503 before we reach here,
+ * so this helper only shapes evidence. It resolves the two optional impure
+ * sources defensively: a failed bridge-commitment list or a failed reputation
+ * gather degrades to the honest fallback (audit-event lower bound / `null` amber
+ * row) rather than throwing, so a partial-evidence fortress still renders an
+ * honest panel instead of a 500. There is NO score fetch on any of these paths.
+ */
+async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPanel> {
+  let committedReceiptCount: number | undefined;
+  if (deps.countBridgeCommitments) {
+    try {
+      committedReceiptCount = await deps.countBridgeCommitments();
+    } catch {
+      // A failed `_bridge` list is not evidence of zero receipts: leave it
+      // undefined so the shaper falls back to the audit-event lower bound.
+      committedReceiptCount = undefined;
+    }
+  }
+
+  let reputationEvidence: RecognitionReputationEvidence | null = null;
+  if (deps.gatherRecognitionReputation) {
+    try {
+      reputationEvidence = await deps.gatherRecognitionReputation();
+    } catch {
+      // A failed reputation read is NOT evidence of health: null renders the
+      // reputation row amber ("no evidence yet"), never green.
+      reputationEvidence = null;
+    }
+  }
+
+  return buildRecognitionPanel({
+    auditLog: deps.auditLog as AuditLog,
+    originMachine: deps.originMachine,
+    ...(deps.now ? { now: deps.now() } : {}),
+    ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
+    reputationEvidence,
   });
 }
 

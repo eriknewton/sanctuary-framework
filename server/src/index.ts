@@ -862,6 +862,9 @@ export async function createSanctuaryServer(options?: {
       shrOpts: { config, identityManager, masterKey },
       sanctuaryConfig: config,
       profileStore,
+      // Recognition panel (P5): storage for the local bridge-commitment list +
+      // local attestation-store reputation evidence (counts, never a score).
+      storage,
     });
     // v1.1.1 hotfix: bind the v1.1 dashboard at /v1.1 + hub API at
     // /api/hub/* on the embedded dashboard path so operators see the

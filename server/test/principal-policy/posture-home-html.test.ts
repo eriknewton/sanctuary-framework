@@ -339,3 +339,100 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(region).not.toContain("—");
   });
 });
+
+/**
+ * Recognition + portability panel (P5) renderer honesty. The panel is the most
+ * impartiality-loaded surface: these assert the rendered HTML/source honors the
+ * contract — the panel is hidden until the composition gate is confirmed, it
+ * never fetches a vendor score, and counterparty verification is labeled local
+ * bridge crypto. The client is a self-contained string, so (per the convention
+ * above) we assert on the embedded source rather than running a DOM.
+ */
+describe("posture home - Recognition panel (P5) impartiality", () => {
+  it("renders the Recognition section hidden by default (absent until composition gate confirmed)", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain('id="recognition-section"');
+    // The section markup carries display:none so the panel is absent (never a
+    // greyed shell) until /api/posture/recognition returns 200.
+    const idx = html.indexOf('id="recognition-section"');
+    const sectionTag = html.slice(idx - 40, idx + 60);
+    expect(sectionTag).toContain('style="display:none"');
+  });
+
+  it("reveals the section only on a 200 and hides it on any error (404 = composition off)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // On success the section is revealed; on catch it is hidden (absent).
+    expect(region).toContain('section.style.display = ""');
+    expect(region).toContain('section.style.display = "none"');
+    expect(region).toContain("/api/posture/recognition");
+  });
+
+  it("retries on a locked (503) first response so the panel appears after unlock, but a 404 (composition off) is a permanent absence (#651)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    // A 404 stops retrying (composition off is a config fact, not a transient
+    // lock): the catch returns early on a 404.
+    expect(region).toMatch(/404\$/);
+    expect(region).toContain("return;");
+    // Any non-404 error schedules a retry via setTimeout + backoff so a locked /
+    // booting fortress recovers the panel after unlock. The first one-shot fetch
+    // alone would have left the panel hidden forever.
+    expect(region).toContain("setTimeout(");
+    expect(region).toContain("loadRecognition(");
+    // The retry never renders a greyed shell while waiting: the section stays
+    // display:none until a 200, so there is exactly one reveal path.
+    expect(region).toContain('section.style.display = "none"');
+  });
+
+  it("never fetches a vendor reputation score: no score-fetch path in the page source", () => {
+    const html = renderPostureHomeHTML();
+    // There is no Verascore (or any vendor) score-fetch URL anywhere in the page.
+    expect(html).not.toContain("verascore.ai/api");
+    expect(html).not.toContain("api.verascore");
+    expect(html).not.toMatch(/fetch\([^)]*score/i);
+  });
+
+  it("labels counterparty verification as LOCAL bridge crypto, never 'by Concordia/Verascore'", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderRecognition");
+    const end = html.indexOf("function loadRecognitionOnce");
+    const region = html.slice(start, end);
+    expect(region).toContain("local_bridge_crypto");
+    expect(region).toContain("verified locally");
+    expect(region.toLowerCase()).not.toContain("verified by concordia");
+    expect(region.toLowerCase()).not.toContain("verified by verascore");
+  });
+
+  it("never-fake-green: the reputation pill is amber unless evidence is present", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function recognitionRepPill");
+    const end = html.indexOf("function renderRecognition");
+    const region = html.slice(start, end);
+    // Green is returned ONLY for "present"; everything else is amber.
+    expect(region).toContain('"present"');
+    expect(region).toContain('pill green');
+    expect(region).toContain('pill amber');
+    // The amber "no evidence yet" copy must be the default branch.
+    expect(region).toContain("no evidence yet");
+    // NEGATIVE GUARD (#651 LOW): green must bind STRICTLY to the "present" state.
+    // Mirror featureHealthPill's guards: no branch keyed on a non-present state
+    // (the "red" branch, or the default "no evidence yet" branch) may emit a
+    // green pill. The `[^\n]*` keeps the match on a single source line so a green
+    // branch elsewhere cannot satisfy it. This turns the weak presence check into
+    // a real never-fake-green assertion: a future edit that returns green for
+    // "red" or for the amber default would fail here.
+    expect(region).not.toMatch(/"red"[^\n]*pill green/);
+    expect(region).not.toMatch(/no evidence yet[^\n]*pill green/);
+    // The green pill line is the "present" line: assert green is co-located with
+    // the present state, never with another state token on its line.
+    expect(region).toMatch(/"present"[^\n]*pill green/);
+  });
+});
