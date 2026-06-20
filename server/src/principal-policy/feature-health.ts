@@ -23,16 +23,19 @@
  *  - "unknown is never green" + "broken-zero is undetectable for purely
  *    event-driven features." Self-reporting features (Castle Wall) can prove
  *    their own liveness via fresh enforcement evidence, so they earn `armed`;
- *    a fault op flips them to `fault`/red; stale or absent evidence is
- *    `unknown` (NOT green) — the "daemon silently died" case stays `unknown`
- *    because the periodic heartbeat *producer* is deliberately out of this
- *    slice (Slice 2). Event-driven features have NO liveness signal by
- *    construction: activity in the window renders `active`/green; quiet renders
- *    a distinct non-green `unconfirmed` chip ("armed — activity-only, not
- *    independently confirmed"), NEVER the same green as evidence-backed active.
- *    The config-vs-activity cross-check is *vacuous* for event-driven features
- *    (configured-ON + zero activity is indistinguishable from healthy-quiet),
- *    and we say so plainly rather than papering over it (HIGH-3).
+ *    a fault op flips them to `fault`/red. Slice 2 closes the "daemon silently
+ *    died" gap: a periodic, producer-signed liveness heartbeat lets the
+ *    absence-of-enforcement case split into an honest alive-but-idle (`unknown`,
+ *    `alive_no_recent_enforcement`) vs a silently-dead wall (`fault`/red,
+ *    `dead_no_heartbeat`) — the latter the alarm Slice 1 left as a silent
+ *    `unknown`. The heartbeat NEVER earns green: green stays gated on fresh
+ *    live-adjudication evidence only. Event-driven features have NO liveness
+ *    signal by construction: activity in the window renders `active`/green;
+ *    quiet renders a distinct non-green `unconfirmed` chip ("armed — activity-
+ *    only, not independently confirmed"), NEVER the same green as evidence-backed
+ *    active. The config-vs-activity cross-check is *vacuous* for event-driven
+ *    features (configured-ON + zero activity is indistinguishable from
+ *    healthy-quiet), and we say so plainly rather than papering over it (HIGH-3).
  *
  *  - Integrity-tainted read → forced `unknown`, never green, for EVERY feature
  *    (the "never fake green" invariant applied to the read path).
@@ -72,6 +75,7 @@ import {
 } from "../castle-wall/constants.js";
 import {
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
+  CASTLE_WALL_LIVENESS_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   DEFAULT_DIGEST_WINDOW_MS,
@@ -80,12 +84,50 @@ import {
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  livenessEntryCounts,
   producerSignedDedupKey,
+  signedCanonicalOperation,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
+import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../castle-wall/constants.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Map from the daemon's SIGNED WAL `operation` vocabulary to the read-side
+ * `entry.operation` this reader keys features on. Mirrors `WAL_OPERATION_TO_*`
+ * in the audit consumer and `SIGNED_WAL_OP_TO_ENTRY_OP` in `posture.ts`, plus
+ * the Slice-2 heartbeat (identity: the daemon signs and files the beat under the
+ * same `castle_wall_heartbeat` op). Used to bind a re-verified signed body's
+ * operation to the entry it is filed under, so a genuine signed tuple cannot be
+ * relabeled into a different feature slot — e.g. a signed liveness heartbeat
+ * stapled onto an `egress_blocked` entry to manufacture green (the sibling
+ * posture reader binds the same way; feature-health must not be the weaker
+ * surface).
+ */
+const SIGNED_WAL_OP_TO_FEATURE_OP: Readonly<Record<string, string>> =
+  Object.freeze({
+    egress_approved: "egress_allowed",
+    egress_blocked: "egress_blocked",
+    egress_pending: "operator_decision",
+    [CASTLE_WALL_HEARTBEAT_OPERATION]: CASTLE_WALL_HEARTBEAT_OPERATION,
+  });
+
+/**
+ * True iff a re-verified producer-signed entry's SIGNED canonical body attests
+ * to the same read-side operation the entry is filed under. Fail closed on any
+ * parse failure / unknown signed op / mismatch: a verified signature over one
+ * operation must NOT count toward a DIFFERENT operation's tally.
+ */
+function signedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const signedOp = signedCanonicalOperation(details);
+  if (signedOp === null) return false;
+  return SIGNED_WAL_OP_TO_FEATURE_OP[signedOp] === entryOperation;
 }
 
 /**
@@ -108,8 +150,9 @@ export const CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS: ReadonlySet<string> =
  *
  *  - `self_reporting`: emits evidence that could only come from the enforcing
  *    component acting on a real flow/policy, so fresh evidence earns `armed`
- *    and a fault op earns `fault`. Castle Wall is the only such feature in
- *    Slice 1.
+ *    and a fault op earns `fault`. Slice 2 adds a periodic, producer-signed
+ *    liveness heartbeat so a silently-dead daemon (no fresh heartbeat) reads
+ *    `fault`/red instead of `unknown`. Castle Wall is the only such feature.
  *  - `event_driven`: only ever writes to the audit log when something actually
  *    triggered it. A zero count is genuinely ambiguous (healthy-quiet vs
  *    silently-disabled are indistinguishable from counts alone), so quiet is
@@ -129,9 +172,12 @@ export type FeatureLivenessClass = "self_reporting" | "event_driven";
  *                 activity in the window: armed, but its working state cannot be
  *                 independently confirmed. NEVER the same chip as `active`.
  *  - `unknown`  → NON-GREEN. We cannot prove the state either way: a
- *                 self-reporting feature with stale/absent evidence (incl. the
- *                 "daemon silently died" case, pending the Slice-2 heartbeat),
- *                 or any feature whose backing audit read was integrity-tainted.
+ *                 self-reporting feature that is alive-but-idle (a fresh
+ *                 heartbeat, no fresh adjudication), or whose evidence is
+ *                 stale/absent with no prior liveness signal, or any feature
+ *                 whose backing audit read was integrity-tainted. Slice 2 moves
+ *                 the genuinely-dead case (alive once, now no heartbeat) OUT of
+ *                 `unknown` and into `fault`.
  */
 export type FeatureHealthStatus = "active" | "fault" | "unconfirmed" | "unknown";
 
@@ -145,6 +191,18 @@ export type FeatureHealthBasis =
   | "fault_evidence"
   | "stale_evidence"
   | "no_evidence_self_reporting"
+  // Observability Slice 2: NO fresh enforcement evidence AND a FRESH liveness
+  // heartbeat. The daemon is alive but has not adjudicated a flow in the window,
+  // so this is the honest "armed but idle" reading — `unknown` (never green),
+  // but distinguished from a silently-dead wall. Closes the alive-vs-dead
+  // ambiguity the old single `no_evidence_self_reporting` basis collapsed.
+  | "alive_no_recent_enforcement"
+  // Observability Slice 2: NO fresh enforcement evidence AND NO fresh heartbeat
+  // within the freshness window. The periodic heartbeat producer should be
+  // beating; its absence means the daemon silently died (process killed, sysext
+  // unbound). Rendered as `fault`/red — the silent-death alarm Slice 1 left as
+  // `unknown`.
+  | "dead_no_heartbeat"
   | "no_activity_event_driven"
   | "integrity_tainted"
   // The freshness-window scan could not be proven complete (it returned a full
@@ -181,6 +239,16 @@ export interface FeatureRegistryEntry {
    * event-driven ones (they have no fault-event vocabulary in Slice 1).
    */
   faultOps?: ReadonlySet<string>;
+  /**
+   * Operation strings that prove the feature's daemon is ALIVE but do NOT prove
+   * it adjudicated a real flow (the periodic liveness heartbeat, Slice 2). Only
+   * meaningful for self-reporting features. A fresh liveness op moves the
+   * absence-of-enforcement case from `unknown` toward an honest alive-but-idle
+   * vs silently-dead distinction; it NEVER earns green on its own and is kept
+   * DISJOINT from `invocationOps` (a heartbeat is liveness, not adjudication).
+   * Absent/empty for features with no heartbeat producer.
+   */
+  livenessOps?: ReadonlySet<string>;
   /**
    * When true, an invocation only counts if the entry carries the Castle Wall
    * `cw_source` provenance marker. Defends against a different L1 producer
@@ -240,6 +308,10 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       // Only live-adjudication ops prove enforcement; NOT policy_loaded.
       invocationOps: CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS,
       faultOps: CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
+      // Slice 2: the periodic liveness heartbeat. Disjoint from invocationOps
+      // (liveness, not adjudication), so it can distinguish alive-idle from
+      // silently-dead WITHOUT ever earning green.
+      livenessOps: CASTLE_WALL_LIVENESS_OPERATIONS,
       requireCastleWallProvenance: true,
       brokenZeroDetectable: true,
     },
@@ -437,6 +509,7 @@ export function evaluateFeatureHealth(args: {
   // read-side projection). This slice is no MORE permissive than posture.ts;
   // cryptographic per-entry provenance is out of scope for a read projection.
   // Returns the classification, or null to skip.
+  const livenessOps = feature.livenessOps;
   const classify = (
     entry: AuditEntry,
   ):
@@ -445,6 +518,8 @@ export function evaluateFeatureHealth(args: {
         tsValid: boolean;
         isInvocation: boolean;
         isFault: boolean;
+        /** A producer-gated liveness heartbeat (Slice 2). Never an invocation. */
+        isLiveness: boolean;
         /** Dedup key for a re-verified producer-signed invocation, else null. */
         signedDedupKey: string | null;
       }
@@ -453,33 +528,64 @@ export function evaluateFeatureHealth(args: {
     const op = entry.operation;
     const isInvocation = feature.invocationOps.has(op);
     const isFault = feature.faultOps !== undefined && feature.faultOps.has(op);
-    if (!isInvocation && !isFault) return null;
-    // Gate ONLY green-earning invocation evidence; never gate fault recognition.
-    // (For Castle Wall, invocationOps and faultOps are disjoint, so a fault entry
-    // is never dropped here.)
+    const isLiveness = livenessOps !== undefined && livenessOps.has(op);
+    if (!isInvocation && !isFault && !isLiveness) return null;
+    // Gate ONLY green-earning invocation evidence AND liveness heartbeats; never
+    // gate fault recognition. (For Castle Wall, invocationOps / faultOps /
+    // livenessOps are mutually disjoint, so a fault entry is never dropped here.)
+    //
+    // INVOCATIONS and LIVENESS heartbeats both pass the provenance marker + the
+    // producer-signature re-verify, but their COUNT rules differ because they are
+    // different kinds of evidence:
+    //
+    //  - An INVOCATION is green-earning enforcement evidence: on a key-bearing
+    //    host the audit consumer never persists a genuine one on the channel
+    //    basis, so only `producer_signed_verified` counts (`enforcementEntryCounts`).
+    //  - A LIVENESS heartbeat is NOT green-earning. The real producer
+    //    (`macos-daemon.ts:emitAuditHeartbeat`) writes it as a DIRECT
+    //    `auditLog.append`, never through the signing consumer, so a GENUINE beat
+    //    is channel-basis on EVERY host (Linux included). Gating it with
+    //    `enforcementEntryCounts` would drop every genuine beat on a key-bearing
+    //    host and render the silent-death alarm inert on the platform that
+    //    matters. It is gated with `livenessEntryCounts`: a genuine channel beat
+    //    counts, but a forged `producer_signed`-CLAIMING beat with a bad signature
+    //    (`producer_signed_rejected`) still does NOT — the one way an in-process
+    //    forger could fake "I am alive" to suppress the alarm.
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
-    if (feature.requireCastleWallProvenance && isInvocation) {
+    if (feature.requireCastleWallProvenance && (isInvocation || isLiveness)) {
       const hasProvenance =
         isRecord(entry.details) &&
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
           CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
       if (!hasProvenance) return null;
       // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
-      // authority for a green-earning invocation is the producer signature,
-      // RE-verified here against the pinned key. When a key IS configured, only a
-      // `producer_signed_verified` invocation counts — a channel/absent-basis or
-      // forged entry is dropped (the consumer never persists genuine enforcement
-      // evidence on the channel basis when a key is set; codex HIGH #1). When NO
-      // key is configured, the channel basis counts (honest macOS floor). Fault
-      // ops are NOT routed here (they fail toward RED), so this never drops a
-      // real fault.
+      // authority is the producer signature, RE-verified here against the pinned
+      // key. Fault ops are NOT routed here (they fail toward RED), so this never
+      // drops a real fault.
       const reResult = reverifyEntryProducerSignature(
         entry.details,
         pinnedProducerKey,
         args.verifyProducerSignature,
       );
-      if (!enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null)) {
+      const basisCounts = isLiveness
+        ? livenessEntryCounts(reResult.basis)
+        : enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null);
+      if (!basisCounts) {
+        return null;
+      }
+      // OPERATION BINDING (parity with `posture.ts`): for a verified producer
+      // signature the signed canonical body's operation is authoritative, NOT the
+      // forgeable top-level `entry.operation`. Require they match so a genuine
+      // signed tuple cannot be relabeled into a different feature slot — e.g. a
+      // signed liveness heartbeat re-appended as `egress_blocked` to manufacture
+      // green when it only proved liveness. Channel-basis entries have no signed
+      // op to bind, so they keep the honest no-key floor (the entry op).
+      if (
+        reResult.basis === "producer_signed_verified" &&
+        isRecord(entry.details) &&
+        !signedOperationMatchesEntry(entry.details, op)
+      ) {
         return null;
       }
       signedTs = reResult.signedCapturedAtMs;
@@ -494,9 +600,10 @@ export function evaluateFeatureHealth(args: {
     const ts = signedTs !== null ? signedTs : Date.parse(entry.timestamp);
     // Reject future-dated evidence beyond a small clock-skew tolerance: a future
     // timestamp must not keep a self-reporting feature green past the real
-    // freshness window.
+    // freshness window, nor let a future-dated heartbeat read as a fresh
+    // liveness signal.
     const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-    return { ts, tsValid, isInvocation, isFault, signedDedupKey };
+    return { ts, tsValid, isInvocation, isFault, isLiveness, signedDedupKey };
   };
 
   // Pass 1 — counts + staleness over the full digest window. A re-verified
@@ -507,9 +614,18 @@ export function evaluateFeatureHealth(args: {
   const countedSignedKeys = new Set<string>();
   let invocationCount = 0;
   let latestInvocationMs: number | null = null;
+  // Slice 2: did we observe ANY producer-gated heartbeat anywhere in the digest
+  // window (fresh or stale)? Used so the silent-death alarm fires ONLY when the
+  // daemon was once provably alive (a heartbeat or an invocation exists) and has
+  // since gone silent — NOT on a wall that was never installed/started (no
+  // evidence of any kind), which stays the honest `unknown`. A fault alarm is a
+  // claim; we never raise it without prior liveness evidence.
+  let everSawHeartbeat = false;
   for (const entry of entries) {
     const c = classify(entry);
-    if (c === null || !c.isInvocation) continue;
+    if (c === null) continue;
+    if (c.isLiveness && c.tsValid) everSawHeartbeat = true;
+    if (!c.isInvocation) continue;
     if (c.signedDedupKey !== null) {
       if (countedSignedKeys.has(c.signedDedupKey)) continue; // duplicate replay
       countedSignedKeys.add(c.signedDedupKey);
@@ -524,9 +640,14 @@ export function evaluateFeatureHealth(args: {
   }
 
   // Pass 2 — the fault/green decision over the (completeness-checked) freshness
-  // window. Fresh fault AND fresh invocation are both freshness-window facts.
+  // window. Fresh fault, fresh invocation, AND fresh heartbeat are all
+  // freshness-window facts.
   let latestFreshInvocationMs: number | null = null;
   let latestFreshFaultMs: number | null = null;
+  // Slice 2: the most recent FRESH, producer-gated liveness heartbeat. Only used
+  // to split the absence-of-enforcement case into alive-idle vs silently-dead; it
+  // NEVER promotes a feature to green.
+  let latestFreshHeartbeatMs: number | null = null;
   for (const entry of freshnessEntries) {
     const c = classify(entry);
     if (c === null || !c.tsValid || c.ts < freshnessFloor) continue;
@@ -542,6 +663,12 @@ export function evaluateFeatureHealth(args: {
     ) {
       latestFreshFaultMs = c.ts;
     }
+    if (
+      c.isLiveness &&
+      (latestFreshHeartbeatMs === null || c.ts > latestFreshHeartbeatMs)
+    ) {
+      latestFreshHeartbeatMs = c.ts;
+    }
   }
 
   let status: FeatureHealthStatus;
@@ -554,30 +681,76 @@ export function evaluateFeatureHealth(args: {
     basis = "integrity_tainted";
   } else if (feature.liveness === "self_reporting") {
     // Self-reporting: green ONLY on fresh live-adjudication evidence; a fresh
-    // fault is red and takes precedence over green ALWAYS; stale or absent
-    // evidence is unknown (NEVER green). The "daemon silently died" case lands
-    // here as `unknown` — the periodic heartbeat producer that would distinguish
-    // quiet-healthy from dead is Slice 2, by design.
+    // fault is red and takes precedence over green ALWAYS. Slice 2 closes the
+    // "daemon silently died" gap Slice 1 left: a periodic, producer-signed
+    // liveness heartbeat lets the ABSENCE-of-enforcement case split into an
+    // honest alive-but-idle (`unknown`) vs silently-dead (`fault`/red) reading.
+    // The heartbeat NEVER moves the PRESENCE case to green — green stays gated on
+    // fresh live-adjudication evidence only.
+    const hasFreshHeartbeat = latestFreshHeartbeatMs !== null;
+    // A feature with NO heartbeat producer wired (no livenessOps) cannot
+    // distinguish dead from idle, so it keeps the Slice-1 `unknown` floor rather
+    // than mislabeling a quiet feature as dead.
+    const hasHeartbeatProducer =
+      livenessOps !== undefined && livenessOps.size > 0;
+    // The silent-death alarm requires that the HEARTBEAT PRODUCER was once
+    // provably running: a heartbeat (fresh or stale) appears somewhere in the
+    // digest window, and now none is fresh. The beating stopped → the daemon
+    // silently died. We deliberately do NOT raise the alarm from stale
+    // enforcement evidence alone (no heartbeat ever seen): that could be a wall
+    // from an older build with no heartbeat producer, or a deliberately disarmed
+    // wall, so the honest reading there stays `stale_evidence`/`unknown`. With no
+    // heartbeat ever observed we cannot prove the producer was running, so we
+    // never fabricate a silent-death claim (never overclaim).
+    const heartbeatProducerWasRunning = everSawHeartbeat;
     if (latestFreshFaultMs !== null) {
       // Fault precedence: a fresh fault renders the feature `fault` even when
-      // fresh enforcement evidence co-occurs in the window (a wall that
-      // crashed/unbound after adjudicating is degraded, not healthy). Ordering
-      // this branch FIRST is the load-bearing "no green while faulted" guarantee
-      // — codex HIGH 2026-06-13.
+      // fresh enforcement evidence (or a fresh heartbeat) co-occurs in the window
+      // (a wall that crashed/unbound after adjudicating is degraded, not
+      // healthy). Ordering this branch FIRST is the load-bearing "no green/idle
+      // while faulted" guarantee — codex HIGH 2026-06-13. A fresh fault still
+      // beats a fresh heartbeat (Slice-2 invariant: fault precedence unchanged).
       status = "fault";
       basis = "fault_evidence";
     } else if (!freshnessComplete) {
       // The freshness scan was not provably complete, so an older fault in the
-      // window may be unseen. We cannot prove fault-absence → never green.
+      // window may be unseen. We cannot prove fault-absence → never green, and
+      // also never the dead-alarm (an unseen heartbeat could exist too). Fail
+      // closed to `unknown`.
       status = "unknown";
       basis = "freshness_scan_incomplete";
     } else if (latestFreshInvocationMs !== null) {
+      // PRESENCE case: fresh live-adjudication evidence. Green. A heartbeat never
+      // changes this branch (it cannot upgrade or downgrade real adjudication).
       status = "active";
       basis = "fresh_enforcement_evidence";
+    } else if (hasFreshHeartbeat) {
+      // ABSENCE-of-enforcement + FRESH heartbeat: the daemon is alive but has not
+      // adjudicated a flow in the window. Honest alive-but-idle — `unknown`
+      // (never green), distinguished from a silently-dead wall.
+      status = "unknown";
+      basis = "alive_no_recent_enforcement";
+    } else if (hasHeartbeatProducer && heartbeatProducerWasRunning) {
+      // ABSENCE-of-enforcement + NO fresh heartbeat, on a feature whose daemon
+      // SHOULD be beating AND whose heartbeat producer was provably running
+      // earlier in the window: the beating stopped → the wall silently died
+      // (process killed, sysext unbound). The Slice-2 silent-death alarm —
+      // `fault`/red, not the old `unknown`. (Reaching here means freshnessComplete
+      // is true, so the absence of a heartbeat in the freshness window is
+      // provable, not a truncated read.)
+      status = "fault";
+      basis = "dead_no_heartbeat";
     } else if (latestInvocationMs !== null) {
+      // Stale enforcement evidence but no heartbeat ever observed (an older build
+      // with no heartbeat producer, or a wall disarmed since): keep the Slice-1
+      // reading — `unknown`, never green. We do not fabricate a silent-death
+      // alarm without proof the heartbeat producer was running.
       status = "unknown";
       basis = "stale_evidence";
     } else {
+      // No enforcement evidence and no heartbeat ever: we cannot tell a
+      // never-started wall from one that died long ago. Honest `unknown`, never a
+      // fabricated silent-death alarm.
       status = "unknown";
       basis = "no_evidence_self_reporting";
     }
@@ -624,14 +797,20 @@ export interface FeatureHealthPanel {
   audit_integrity_ok: boolean;
   /**
    * Honest disclosure, surfaced to the UI: broken-zero (a silently-disabled
-   * feature) is UNDETECTABLE for purely event-driven features in Slice 1, and
-   * the periodic Castle Wall liveness heartbeat (which would catch the "daemon
-   * silently died" case) is Slice 2. The panel never claims more than it can
-   * prove.
+   * feature) is UNDETECTABLE for purely event-driven features in Slice 1.
+   *
+   * Slice 2 update: the Castle Wall "daemon silently died" case is now DETECTED.
+   * A periodic, producer-signed liveness heartbeat means a wall that silently
+   * dies (process killed, sysext unbound) in a quiet window reads `fault`/red
+   * (`dead_no_heartbeat`), NOT the old `unknown`. So
+   * `castle_wall_silent_death_is_unknown_not_green` is now `false`: silent death
+   * is no longer a silent `unknown`, it is a red alarm. The flag is retained
+   * (now `false`) for UI back-compat rather than removed. The panel still never
+   * claims more than it can prove — a heartbeat proves liveness only, never green.
    */
   disclosure: {
     broken_zero_undetectable_for_event_driven: true;
-    castle_wall_silent_death_is_unknown_not_green: true;
+    castle_wall_silent_death_is_unknown_not_green: false;
   };
 }
 
@@ -749,7 +928,9 @@ export async function buildFeatureHealthPanel(
     audit_integrity_ok: integrityOk,
     disclosure: {
       broken_zero_undetectable_for_event_driven: true,
-      castle_wall_silent_death_is_unknown_not_green: true,
+      // Slice 2: silent death is now DETECTED (a missing heartbeat reads
+      // `fault`/red, not `unknown`), so this honesty caveat no longer holds.
+      castle_wall_silent_death_is_unknown_not_green: false,
     },
   };
 }
