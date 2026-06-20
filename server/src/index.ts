@@ -926,8 +926,8 @@ export async function createSanctuaryServer(options?: {
     // which boots the server via `sanctuary --dashboard`) gets 401'd on its
     // tokenless loopback reads whenever an operator configures a dashboard auth
     // token, leaving the badge stuck and the embed rendering a raw 401 page.
-    // Gated identically to the standalone path — loopback host AND at least one
-    // identity decrypted — so the threat model is unchanged. State-changing
+    // Gated identically to the standalone path (loopback host AND at least one
+    // identity decrypted), so the threat model is unchanged. State-changing
     // approval-decision routes remain token-gated via `requireToken` regardless.
     const dashboardHostIsLoopback =
       config.dashboard.host === "127.0.0.1" ||

@@ -17,7 +17,7 @@ const { version: PKG_VERSION } = require("../package.json");
 /**
  * Strictly parse a whole-string integer from an env var.
  *
- * `parseInt("80abc", 10)` returns `80` — it stops at the first non-digit and
+ * `parseInt("80abc", 10)` returns `80`, stopping at the first non-digit and
  * silently TRUNCATES, binding the server to a port the operator never typed.
  * Returning `NaN` for any non-clean-integer string instead lets the downstream
  * range check in `validateConfig` REFUSE the value rather than bind a truncated
@@ -30,7 +30,7 @@ const { version: PKG_VERSION } = require("../package.json");
  * 3501, so that once it lands the server and the native reads stay on a single
  * source. Today the native bridge (`SanctuaryServerBridge`) hardcodes port 3501
  * and does not read `SANCTUARY_DASHBOARD_PORT`, so true single-source port
- * parity does NOT hold yet — a valid non-default port still diverges the two.
+ * parity does NOT hold yet, a valid non-default port still diverges the two.
  *
  * Accepts an optional sign and ASCII digits only (e.g. "3501", "+8443"). Returns
  * `NaN` for "", "80abc", "0x10", "3501 5", or any value with trailing/embedded
@@ -596,7 +596,7 @@ export function validateConfig(config: SanctuaryConfig): void {
   // always one the resolver accepts and the two stay on a single source. Today
   // the native bridge (`SanctuaryServerBridge`) hardcodes 3501 and never reads
   // SANCTUARY_DASHBOARD_PORT, so a VALID non-default port (e.g. 8443) binds the
-  // server while every native read still targets 3501 — single-source port
+  // server while every native read still targets 3501, single-source port
   // parity does NOT hold yet. This validation only closes the invalid-port hole.
   if (
     !Number.isInteger(config.dashboard.port) ||

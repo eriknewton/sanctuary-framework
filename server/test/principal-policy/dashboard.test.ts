@@ -630,7 +630,7 @@ describe("Principal Dashboard", () => {
 
     // dashboard-native-embed-loopback-read: the castle-wall-macos native app
     // embeds the posture board and reads `/api/posture/castle-wall` for the arm
-    // badge over a TOKENLESS loopback request (no bearer token, no session —
+    // badge over a TOKENLESS loopback request (no bearer token, no session,
     // see PostureWebView/SanctuaryServerBridge). That read MUST clear the auth
     // gate under loopback auto-auth, otherwise the badge sticks on "Checking
     // enforcement…" and the embed renders a raw 401 page. This locks the
@@ -640,7 +640,7 @@ describe("Principal Dashboard", () => {
     // opposite half: the approval-decision surface stays 401 even with auto-auth
     // on. Scope note: this `beforeEach` toggles the flag directly via
     // `setAutoAuthLocalhost(true)`, so what is locked here is the routing-layer
-    // (`checkAuth`) carve-out — posture reads pass, approve/deny stay 401 — NOT
+    // (`checkAuth`) carve-out (posture reads pass, approve/deny stay 401), NOT
     // the wiring that turns the flag on. The `sanctuary --dashboard` boot path
     // (`createSanctuaryServer` in index.ts) enables this fast path the same way
     // `sanctuary dashboard` does, but that boot wiring is a 1:1 copy of the

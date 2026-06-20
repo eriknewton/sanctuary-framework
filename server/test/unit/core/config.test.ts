@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { loadConfig, saveConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
-import { writeFile, mkdir, rm, readdir, readFile } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -15,9 +15,13 @@ describe("loadConfig", () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    // Create a unique temp directory for each test
-    tempDir = join(tmpdir(), `sanctuary-config-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(tempDir, { recursive: true });
+    // Create a unique temp directory for each test. mkdtemp creates the
+    // directory atomically with a randomized suffix the caller cannot predict,
+    // which avoids the insecure-temporary-file (TOCTOU) class that a manually
+    // joined tmpdir() path plus mkdir would expose. Every config file written
+    // by a test below lives INSIDE this per-test directory, never directly in
+    // os.tmpdir() under a predictable name.
+    tempDir = await mkdtemp(join(tmpdir(), "sanctuary-config-test-"));
   });
 
   afterEach(async () => {
@@ -309,7 +313,7 @@ describe("loadConfig", () => {
     });
   });
 
-  describe("Dashboard port validation — invalid-port fail-closed", () => {
+  describe("Dashboard port validation - invalid-port fail-closed", () => {
     // The server-side override used a lenient parseInt, so without validation
     // "80abc" -> 80 and "70000" -> a truncated/out-of-spec port would bind the
     // server to a port the operator never typed. These cases pin that an invalid
