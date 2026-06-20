@@ -353,6 +353,19 @@ describe("loadConfig", () => {
       );
     });
 
+    it("rejects a signed env port (reader-parity with paths.ts resolveDashboardPort)", async () => {
+      // A TCP port is unsigned, so a leading sign ("+8443") is never operator
+      // intent. The boot reader (strictParseIntEnv) screens with the SAME
+      // digit-only regex as the wrap reader (paths.ts parseStrictPortEnv), so an
+      // in-range-but-signed value is refused on BOTH paths rather than binding
+      // 8443 here while the wrap path falls back to 3501. Guards against the two
+      // readers diverging on signed input.
+      process.env.SANCTUARY_DASHBOARD_PORT = "+8443";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
     it("rejects an out-of-range port in a config FILE", async () => {
       const path = join(tempDir, "bad-port.json");
       await writeFile(

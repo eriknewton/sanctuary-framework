@@ -42,14 +42,16 @@ export function resolveStoragePath(
  *
  * `parseInt("80abc", 10)` returns `80`: it stops at the first non-digit and
  * silently TRUNCATES, which would bind the dashboard to a port the operator
- * never typed. This mirrors the strict env parse in `config.ts` (the
- * `loadConfig` reader): accept ASCII digits only, then enforce the valid TCP
- * range 1..65535. Any non-clean-integer or out-of-range value yields
- * `undefined` so the caller falls back to the documented default rather than
- * binding a truncated or out-of-spec port.
+ * never typed. This matches the strict env parse in `config.ts` (the
+ * `loadConfig` reader) byte-for-byte on the regex: both accept ASCII digits
+ * only (no leading sign), so the same env value never resolves to two different
+ * ports across the two readers. After the digit-only screen, enforce the valid
+ * TCP range 1..65535. Any non-clean-integer, signed, or out-of-range value
+ * yields `undefined` so the caller falls back to the documented default rather
+ * than binding a truncated or out-of-spec port.
  *
- * Returns `undefined` for "", "80abc", "0x10", "3501 5", "70000", "0", "-1",
- * or any value that is not a clean in-range integer.
+ * Returns `undefined` for "", "+8443", "-1", "80abc", "0x10", "3501 5",
+ * "70000", "0", or any value that is not a clean in-range unsigned integer.
  */
 function parseStrictPortEnv(raw: string): number | undefined {
   const trimmed = raw.trim();

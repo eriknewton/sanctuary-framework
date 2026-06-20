@@ -99,6 +99,19 @@ describe("resolveDashboardPort", () => {
     ).toBe(DEFAULT_DASHBOARD_PORT);
   });
 
+  it("rejects a signed port and falls back to the default (reader-parity with config.ts)", () => {
+    // A TCP port is unsigned, so a leading sign is never operator intent.
+    // Both TypeScript readers (this one and config.ts strictParseIntEnv) screen
+    // with a digit-only regex, so an in-range-but-signed value like "+8443"
+    // resolves identically on both paths: rejected, fall back to the default.
+    // Guards against the two readers diverging on signed input (one binding the
+    // signed value, the other falling back), which would make the SAME env
+    // value bind two different ports across the boot and wrap paths.
+    expect(
+      resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "+8443" })
+    ).toBe(DEFAULT_DASHBOARD_PORT);
+  });
+
   it("accepts a clean in-range port at the boundaries", () => {
     expect(
       resolveDashboardPort(undefined, { SANCTUARY_DASHBOARD_PORT: "1" })

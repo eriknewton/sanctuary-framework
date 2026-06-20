@@ -32,13 +32,17 @@ const { version: PKG_VERSION } = require("../package.json");
  * and does not read `SANCTUARY_DASHBOARD_PORT`, so true single-source port
  * parity does NOT hold yet, a valid non-default port still diverges the two.
  *
- * Accepts an optional sign and ASCII digits only (e.g. "3501", "+8443"). Returns
- * `NaN` for "", "80abc", "0x10", "3501 5", or any value with trailing/embedded
+ * Accepts ASCII digits only (e.g. "3501"). A TCP port is an unsigned quantity,
+ * so a leading sign ("+8443", "-1") is never operator intent; rejecting it keeps
+ * this reader byte-for-byte aligned with `parseStrictPortEnv` in `paths.ts` (the
+ * wrap/Protect boot path), so the same env value never resolves to two different
+ * ports across the two TypeScript readers. Returns `NaN` for "", "+8443", "-1",
+ * "80abc", "0x10", "3501 5", or any value with a sign or trailing/embedded
  * non-digits, so the caller's validation rejects it.
  */
 function strictParseIntEnv(raw: string): number {
   const trimmed = raw.trim();
-  if (!/^[+-]?\d+$/.test(trimmed)) {
+  if (!/^\d+$/.test(trimmed)) {
     return Number.NaN;
   }
   return Number.parseInt(trimmed, 10);
