@@ -1034,6 +1034,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `/api/*` route (including the approval channel and the posture JSON API) are
    * untouched and keep their existing handlers and auth gates.
    *
+   * Surface scope: this flip lives on THIS standalone `DashboardApprovalChannel`
+   * (the MCP-server boot path and `sanctuary dashboard`). The SEPARATE co-located
+   * `wrap` server (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP
+   * server) still serves the v1.1 SPA at `/` and is NOT flipped here — it has no
+   * `/api/posture/*` routes, so folding the posture board into it is a tracked
+   * Piece-C remainder (mount the posture JSON API there first).
+   *
    * Returns true when it served the posture board shell; false to fall through
    * to the existing v1.1 / legacy dispatch ladder.
    */
