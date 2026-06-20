@@ -10,6 +10,7 @@ import {
   buildAgentReach,
   buildPostureAgentRows,
   buildCustodyExitPanel,
+  buildRecognitionPanel,
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
@@ -866,5 +867,249 @@ describe("Slice 3 — Custody & Exit panel (evidence-based, honest)", () => {
     });
     expect(panel.rollback_freeze_suspected).toBe(false);
     expect(panel.custody_state).toBe("unconfirmed");
+  });
+});
+
+// ── P5 Recognition shaper: local-evidence-only + impartiality ────────────────
+describe("buildRecognitionPanel — local-evidence-only", () => {
+  async function appendBridge(
+    log: AuditLog,
+    op: "bridge_commit" | "bridge_verify" | "bridge_attest",
+    details: Record<string, unknown>,
+  ): Promise<void> {
+    if (op === "bridge_verify") {
+      await log.append("l3", op, FORTRESS, details);
+    } else {
+      await log.appendCritical({
+        layer: op === "bridge_attest" ? "l4" : "l3",
+        operation: op,
+        identity_id: FORTRESS,
+        result: "success",
+        details,
+      });
+    }
+  }
+
+  it("derives receipt counts from the audit log with NO Concordia process; verify split honored", async () => {
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    await appendBridge(log, "bridge_verify", { bridge_commitment_id: "bc-1", valid: true });
+    await appendBridge(log, "bridge_verify", { bridge_commitment_id: "bc-2", valid: false });
+    await appendBridge(log, "bridge_attest", { bridge_commitment_id: "bc-1" });
+
+    const panel = await buildRecognitionPanel({ auditLog: log, originMachine: FORTRESS });
+    // committed falls back to the bridge_commit event count when no storage list
+    // is injected — an honest lower bound, never fabricated.
+    expect(panel.receipts.committed).toBe(1);
+    expect(panel.receipts.verified_true).toBe(1);
+    expect(panel.receipts.verified_false).toBe(1);
+    expect(panel.receipts.attested).toBe(1);
+    expect(panel.receipts.verification_basis).toBe("local_bridge_crypto");
+    expect(panel.composition_enabled).toBe(true);
+  });
+
+  it("prefers the injected storage-list committed count over the audit-event lower bound", async () => {
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    const panel = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      committedReceiptCount: 5,
+    });
+    expect(panel.receipts.committed).toBe(5);
+  });
+
+  it("NEVER renders a score; reputation evidence is counts-only and amber from absence", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildRecognitionPanel({ auditLog: log, originMachine: FORTRESS });
+    expect(panel.reputation_evidence).toBeNull();
+    expect(panel.reputation_state).toBe("amber");
+    // No `score` field anywhere on the shape.
+    expect(JSON.stringify(panel)).not.toContain('"score"');
+    // The portable-identity export is an amber capability, named by tool.
+    expect(panel.export_state).toBe("export_available");
+    expect(panel.export_tool).toBe("sanctuary_export_identity_bundle");
+  });
+
+  it("present reputation evidence (>=1 attestation) earns green; zero stays amber", async () => {
+    const { log } = newAuditLog();
+    const present = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      reputationEvidence: {
+        attestation_count: 3,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: new Date().toISOString(),
+        dispute_count: 0,
+        verascore_linked: true,
+      },
+    });
+    expect(present.reputation_state).toBe("present");
+    // verascore_linked is a LOCAL boolean, not a number/score.
+    expect(present.reputation_evidence?.verascore_linked).toBe(true);
+
+    const empty = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      reputationEvidence: {
+        attestation_count: 0,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: null,
+        dispute_count: 0,
+        verascore_linked: false,
+      },
+    });
+    expect(empty.reputation_state).toBe("amber");
+  });
+
+  it("fails closed on a tainted audit read: zeroed counts, integrity flagged, never green", async () => {
+    const brokenLog = {
+      query: async () => {
+        throw new Error("tainted audit read");
+      },
+    } as unknown as AuditLog;
+    const panel = await buildRecognitionPanel({
+      auditLog: brokenLog,
+      originMachine: FORTRESS,
+    });
+    expect(panel.audit_integrity_ok).toBe(false);
+    expect(panel.receipts.committed).toBe(0);
+    expect(panel.receipts.verified_true).toBe(0);
+    expect(panel.reputation_state).toBe("amber");
+  });
+
+  it("fails closed on a readable-but-TAMPERED chain (query RESOLVES with integrity findings): receipts zeroed, never tallied from tampered entries", async () => {
+    // Mirrors posture.test.ts ~line 800 (custody) and the Castle-Wall tainted
+    // test: the read SUCCEEDS but returns integrity findings, so the entries are
+    // present-but-untrustworthy. Sibling shapers refuse to render off them
+    // (arm_state "unknown" / custody_basis "integrity_tainted"); this shaper must
+    // likewise zero the counts rather than tallying receipts from a tampered
+    // chain. Without the fix it would happily count the two bridge entries.
+    const taintedLog = {
+      query: async () => ({
+        entries: [
+          {
+            layer: "l3",
+            operation: "bridge_commit",
+            identity_id: FORTRESS,
+            details: { bridge_commitment_id: "bc-1" },
+          },
+          {
+            layer: "l3",
+            operation: "bridge_verify",
+            identity_id: FORTRESS,
+            details: { bridge_commitment_id: "bc-1", valid: true },
+          },
+        ],
+        total: 2,
+        integrity_findings: [{ kind: "entry_hash_mismatch" } as unknown],
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const panel = await buildRecognitionPanel({
+      auditLog: taintedLog,
+      originMachine: FORTRESS,
+      // Even a wired storage-list committed count must be discarded on a tainted
+      // read: a tampered chain makes the whole evidence picture untrustworthy.
+      committedReceiptCount: 7,
+      reputationEvidence: {
+        attestation_count: 3,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: new Date().toISOString(),
+        dispute_count: 0,
+        verascore_linked: true,
+      },
+    });
+    expect(panel.audit_integrity_ok).toBe(false);
+    expect(panel.receipts.committed).toBe(0);
+    expect(panel.receipts.verified_true).toBe(0);
+    expect(panel.receipts.verified_false).toBe(0);
+    expect(panel.receipts.attested).toBe(0);
+    // The reputation row fails closed to amber on a tainted read, never green.
+    expect(panel.reputation_evidence).toBeNull();
+    expect(panel.reputation_state).toBe("amber");
+  });
+
+  it("honestly flags a CAPPED audit read so receipt counts are disclosed as a lower bound, not silently undercounted", async () => {
+    // When a BRIDGE op's own population exceeds the cap, that op's read was
+    // truncated and its counts UNDERCOUNT. The shaper must surface this
+    // (receipts_capped=true) rather than presenting an undercount as a complete
+    // tally (#651 LOW). The shaper queries each bridge op separately, so the mock
+    // is argument-aware: `total` is the PER-OP bridge population, not all-ops.
+    const cappedLog = {
+      query: async ({ operation_type }: { operation_type?: string }) => ({
+        entries:
+          operation_type === "bridge_commit"
+            ? [
+                {
+                  layer: "l3",
+                  operation: "bridge_commit",
+                  identity_id: FORTRESS,
+                  details: { bridge_commitment_id: "bc-1" },
+                },
+              ]
+            : [],
+        // bridge_commit alone has 80k events in-window => truncated by the cap.
+        total: operation_type === "bridge_commit" ? 80_000 : 0,
+        integrity_findings: [],
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const capped = await buildRecognitionPanel({
+      auditLog: cappedLog,
+      originMachine: FORTRESS,
+    });
+    expect(capped.receipts.receipts_capped).toBe(true);
+    expect(capped.receipts.audit_query_cap).toBe(50_000);
+
+    // A within-cap read is NOT flagged capped.
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    const complete = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+    });
+    expect(complete.receipts.receipts_capped).toBe(false);
+  });
+
+  it("does NOT flag capped on a busy fortress whose huge audit total is NON-bridge traffic (#651 MEDIUM)", async () => {
+    // The regression the per-op query fixes: a mature fortress holds far more
+    // than the cap of NON-bridge audit entries (state reads/writes, castle-wall
+    // enforcement, ...), yet only a handful of bridge events, all inside the
+    // most-recent slice. The cap flag MUST stay false — the bridge tally is
+    // complete. The earlier all-ops read fired a false "incomplete tally"
+    // warning here because it compared the all-operations total against the
+    // returned bridge entries.
+    const busyLog = {
+      query: async ({ operation_type }: { operation_type?: string }) => {
+        // Every bridge op returns its full (tiny) population in the slice; no
+        // bridge op exceeds the cap, so nothing was truncated.
+        const bridgeEntries =
+          operation_type === "bridge_attest"
+            ? [
+                {
+                  layer: "l4",
+                  operation: "bridge_attest",
+                  identity_id: FORTRESS,
+                  details: { bridge_commitment_id: "bc-1" },
+                },
+              ]
+            : [];
+        return {
+          entries: bridgeEntries,
+          // total == returned bridge entries for that op => NOT truncated, even
+          // though the fortress as a whole has > 50k non-bridge entries.
+          total: bridgeEntries.length,
+          integrity_findings: [],
+        };
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const panel = await buildRecognitionPanel({
+      auditLog: busyLog,
+      originMachine: FORTRESS,
+    });
+    expect(panel.receipts.receipts_capped).toBe(false);
+    expect(panel.receipts.attested).toBe(1);
   });
 });
