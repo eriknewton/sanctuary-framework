@@ -309,13 +309,18 @@ describe("loadConfig", () => {
     });
   });
 
-  describe("Dashboard port validation — server/native single-source parity", () => {
-    // The native macOS embed/badge resolver parses SANCTUARY_DASHBOARD_PORT
-    // STRICTLY (Int + 1..65535) and falls back to 3501 on anything invalid.
+  describe("Dashboard port validation — invalid-port fail-closed", () => {
     // The server-side override used a lenient parseInt, so without validation
-    // "80abc" -> 80 and "70000" would bind the server to a port the resolver
-    // rejects, reintroducing the false "server not running" amber. These cases
-    // pin that an invalid port is now REFUSED rather than silently bound.
+    // "80abc" -> 80 and "70000" -> a truncated/out-of-spec port would bind the
+    // server to a port the operator never typed. These cases pin that an invalid
+    // port is now REFUSED rather than silently bound (fail-closed hardening).
+    //
+    // Forward note (not yet true in-tree): the deferred native macOS resolver is
+    // intended to parse SANCTUARY_DASHBOARD_PORT strictly (Int + 1..65535,
+    // fallback 3501) so server and native reads share one source. Today the
+    // native bridge hardcodes 3501 and never reads the env var, so full
+    // single-source port parity does NOT hold yet; this only closes the
+    // invalid-port hole.
     it("rejects a non-numeric-suffixed env port the server would otherwise truncate", async () => {
       process.env.SANCTUARY_DASHBOARD_PORT = "80abc";
       await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
