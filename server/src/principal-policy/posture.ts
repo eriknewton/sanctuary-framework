@@ -1176,6 +1176,19 @@ export interface RecognitionReceiptCounts {
    * Verascore". Frozen literal — asserted by an impartiality test.
    */
   verification_basis: "local_bridge_crypto";
+  /**
+   * HONESTY (#651 LOW): the bridge-receipt counts are derived from at most
+   * `audit_query_cap` of the MOST RECENT in-window audit entries. On a busy
+   * fortress with more bridge events than the cap, older events fall outside the
+   * read and the counts UNDERCOUNT. This flag is `true` exactly when the audit
+   * read was truncated (its post-filter `total` exceeded the entries returned),
+   * so the UI can disclose "counts capped" rather than silently presenting an
+   * undercount as a complete tally. `false` means the read covered every
+   * in-window entry, so the counts are complete for the window.
+   */
+  receipts_capped: boolean;
+  /** The audit-read cap applied to derive these counts (entries). */
+  audit_query_cap: number;
 }
 
 /** Tile colour state for the Recognition panel. Green is earned by evidence. */
@@ -1246,6 +1259,16 @@ const BRIDGE_RECEIPT_OPERATIONS: ReadonlySet<string> = Object.freeze(
 );
 
 /**
+ * Cap on the audit-read backing the bridge-receipt counts. The audit `query`
+ * returns the most-recent `limit` in-window entries plus a `total` of the
+ * post-filter population, so a fortress with more than this many in-window
+ * entries truncates and the counts undercount. We surface that truncation
+ * honestly via `receipts.receipts_capped` rather than silently undercounting
+ * (#651 LOW). Sized to match the sibling posture shapers.
+ */
+const RECOGNITION_RECEIPT_QUERY_CAP = 50_000;
+
+/**
  * Build the Recognition + portability panel (P5) — the LAST sovereignty
  * principle on the posture dashboard, and the single most impartiality-loaded
  * surface in it.
@@ -1283,13 +1306,19 @@ export async function buildRecognitionPanel(
 
   let entries;
   let integrityOk: boolean;
+  let receiptsCapped: boolean;
   try {
     const result = await input.auditLog.query({
       ...(since !== undefined ? { since } : {}),
-      limit: 50_000,
+      limit: RECOGNITION_RECEIPT_QUERY_CAP,
     });
     entries = result.entries;
     integrityOk = result.integrity_findings.length === 0;
+    // Honest cap disclosure (#651 LOW): `total` is the post-filter population;
+    // `entries` is at most the most-recent `cap` of it. When `total` exceeds the
+    // returned entries, older bridge events were dropped and the counts below
+    // UNDERCOUNT — surface that rather than presenting an undercount as complete.
+    receiptsCapped = result.total > entries.length;
   } catch {
     // A failed/tainted read must NOT read as "no receipts, therefore healthy".
     // Fail closed: zeroed counts + integrity flagged + reputation amber.
@@ -1302,6 +1331,36 @@ export async function buildRecognitionPanel(
         verified_false: 0,
         attested: 0,
         verification_basis: "local_bridge_crypto",
+        receipts_capped: false,
+        audit_query_cap: RECOGNITION_RECEIPT_QUERY_CAP,
+      },
+      reputation_evidence: null,
+      reputation_state: "amber",
+      audit_integrity_ok: false,
+      ...exportFields,
+    };
+  }
+
+  // Fail closed on a readable-but-TAMPERED chain (#651 LOW). A successful read
+  // that returned integrity findings means the entries we would tally come from
+  // a chain whose integrity is in question — so the counts cannot be trusted.
+  // Mirror the siblings (buildCastleWallPosture -> arm_state "unknown";
+  // buildCustodyExitPanel -> custody_basis "integrity_tainted"): zero the
+  // receipt counts, flag integrity, and hold the reputation row amber. The
+  // "never fake green" invariant applies to the readable-but-tainted path, not
+  // only the thrown-read path above.
+  if (!integrityOk) {
+    return {
+      origin_machine: input.originMachine,
+      composition_enabled: true,
+      receipts: {
+        committed: 0,
+        verified_true: 0,
+        verified_false: 0,
+        attested: 0,
+        verification_basis: "local_bridge_crypto",
+        receipts_capped: false,
+        audit_query_cap: RECOGNITION_RECEIPT_QUERY_CAP,
       },
       reputation_evidence: null,
       reputation_state: "amber",
@@ -1353,6 +1412,8 @@ export async function buildRecognitionPanel(
       verified_false: verifiedFalse,
       attested,
       verification_basis: "local_bridge_crypto",
+      receipts_capped: receiptsCapped,
+      audit_query_cap: RECOGNITION_RECEIPT_QUERY_CAP,
     },
     reputation_evidence: ev,
     reputation_state: reputationState,

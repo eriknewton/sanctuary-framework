@@ -529,6 +529,14 @@ export function renderPostureHomeHTML(): string {
     html +=
       '<div class="fh-note">These counts come from your local bridge audit and storage with no Concordia process running. ' +
       'A receipt proves the revealed terms match what was committed and is bound to the named parties; it is not a full counterparty track record.</div>';
+    // Honest cap disclosure (#651 LOW): the verify/attest counts read the most
+    // recent audit_query_cap entries, so on a very busy fortress they are a lower
+    // bound, not a complete tally. Disclose it rather than silently undercounting.
+    if (r.receipts_capped) {
+      html +=
+        '<div class="fh-note">Note: verify/attest counts cover the most recent ' +
+        '<code>' + esc(r.audit_query_cap) + '</code> audit entries, so on a very busy fortress they are a lower bound (not a complete all-time tally).</div>';
+    }
     // Local reputation EVIDENCE (counts only; NEVER a score).
     var ev = panel.reputation_evidence;
     html +=
@@ -565,25 +573,46 @@ export function renderPostureHomeHTML(): string {
     el.innerHTML = html;
   }
 
-  // Fetch the Recognition panel once, behind the composition render gate. A 200
-  // reveals the section; a 404 (composition OFF) leaves it hidden so the panel is
-  // ABSENT, never a greyed shell that implies a dependency. Any other failure
-  // also leaves it hidden (an honest absence, not a green claim). This runs once
-  // at boot rather than on every home frame because the gate flag is config and
-  // does not change within a session.
-  function loadRecognitionOnce() {
+  // Fetch the Recognition panel behind the composition render gate. A 200 reveals
+  // the section; a 404 (composition OFF) leaves it hidden so the panel is ABSENT,
+  // never a greyed shell that implies a dependency.
+  //
+  // RETRY ON LOCKED (#651 MEDIUM): the panel sits behind the audit-unlock 503
+  // guard, so the very first fetch can land while the fortress is still locked
+  // (a 503). A one-shot fetch would then keep the panel hidden FOREVER even after
+  // the operator unlocks. So we retry with capped backoff on ANY status that is
+  // not a definitive 404. A 404 means composition is off (a config fact that does
+  // not change within a session): that stays an honest, permanent absence and we
+  // stop. We never render a greyed shell while retrying: the section stays
+  // display:none until a 200 supplies real evidence, so a locked/booting fortress
+  // shows nothing (honest absence), not a composition-off implication.
+  var RECOGNITION_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+  function loadRecognition(attempt) {
     var section = document.getElementById("recognition-section");
     if (!section) return;
     api("/api/posture/recognition").then(function (panel) {
       // composition_enabled is always true on a served panel; reveal + render.
       section.style.display = "";
       renderRecognition(panel);
-    }).catch(function () {
-      // 404 (composition off) or any error: keep the panel absent. Do NOT show a
-      // greyed/empty card - absence is the honest non-dependency signal.
+    }).catch(function (err) {
+      // Keep the panel absent while we decide. Never a greyed/empty card.
       section.style.display = "none";
+      // api() throws Error("<path> -> <status>"); a 404 is a definitive
+      // composition-off absence, so stop. Anything else (503 locked, transient
+      // network) is retryable so the panel appears once the fortress unlocks.
+      var msg = err && err.message ? String(err.message) : "";
+      if (/-> 404$/.test(msg)) return;
+      var i = attempt || 0;
+      if (i >= RECOGNITION_RETRY_MS.length) {
+        // Settle at the slowest cadence so a long-locked fortress still recovers
+        // the panel after unlock without hammering the endpoint.
+        setTimeout(function () { loadRecognition(i); }, RECOGNITION_RETRY_MS[RECOGNITION_RETRY_MS.length - 1]);
+        return;
+      }
+      setTimeout(function () { loadRecognition(i + 1); }, RECOGNITION_RETRY_MS[i]);
     });
   }
+  function loadRecognitionOnce() { loadRecognition(0); }
 
   // "Never fake green" for the Query-privacy section. Mirrors the canonical pure
   // mapper exported from this module (queryPrivacyPill). GREEN is earned ONLY by

@@ -130,11 +130,14 @@ export interface PostureRouteDeps {
    * Recognition panel (P5): count of persisted Concordia-bridge commitments
    * (`storage.list("_bridge")`). Supplied by the dashboard, which holds the
    * storage backend; resolved lazily per request so post-unlock wiring is
-   * observed. Optional - when absent, the recognition shaper falls back to the
-   * count of `bridge_commit` audit events (an honest lower bound, never a
-   * fabricated count). Carries NO Concordia/Verascore data beyond a local count.
+   * observed. Optional - when absent, OR when it resolves to `undefined` (no
+   * storage backend wired, so the count is unknowable), the recognition shaper
+   * falls back to the count of `bridge_commit` audit events (an honest lower
+   * bound, never a fabricated count). A resolved `0` is a real "zero persisted
+   * commitments" fact and is used as-is. Carries NO Concordia/Verascore data
+   * beyond a local count.
    */
-  countBridgeCommitments?: () => Promise<number>;
+  countBridgeCommitments?: () => Promise<number | undefined>;
   /**
    * Recognition panel (P5): pre-gathered LOCAL reputation EVIDENCE (counts only)
    * for the primary identity - NOT a score and NOT a fetched Verascore value.

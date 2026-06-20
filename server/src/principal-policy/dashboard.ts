@@ -1027,13 +1027,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Recognition panel (P5): count persisted Concordia-bridge commitments by
    * listing the reserved `_bridge` namespace. This is the "committed receipts"
    * count — a LOCAL storage read with NO Concordia process running and NO
-   * external fetch. Returns 0 when no storage backend is wired (the shaper then
-   * falls back to the `bridge_commit` audit-event lower bound). A list failure
+   * external fetch. Returns `undefined` when no storage backend is wired so the
+   * shaper takes its documented audit-event lower-bound fallback (returning `0`
+   * would assert a fact — "zero bridge commitments" — that an un-wired store
+   * cannot establish, suppressing the fallback). A list failure likewise
    * propagates so the route layer's try/catch degrades to the audit-event count
    * rather than fabricating a number.
    */
-  private async countBridgeCommitments(): Promise<number> {
-    if (!this.storage) return 0;
+  private async countBridgeCommitments(): Promise<number | undefined> {
+    if (!this.storage) return undefined;
     const entries = await this.storage.list("_bridge");
     return entries.length;
   }

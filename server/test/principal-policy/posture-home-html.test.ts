@@ -361,16 +361,35 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
 
   it("reveals the section only on a 200 and hides it on any error (404 = composition off)", () => {
     const html = renderPostureHomeHTML();
-    const start = html.indexOf("function loadRecognitionOnce()");
-    const end = html.indexOf("function renderRecognition") > start
-      ? html.length
-      : html.length;
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
     const region = html.slice(start, end);
     expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
     // On success the section is revealed; on catch it is hidden (absent).
     expect(region).toContain('section.style.display = ""');
     expect(region).toContain('section.style.display = "none"');
     expect(region).toContain("/api/posture/recognition");
+  });
+
+  it("retries on a locked (503) first response so the panel appears after unlock, but a 404 (composition off) is a permanent absence (#651)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    // A 404 stops retrying (composition off is a config fact, not a transient
+    // lock): the catch returns early on a 404.
+    expect(region).toMatch(/404\$/);
+    expect(region).toContain("return;");
+    // Any non-404 error schedules a retry via setTimeout + backoff so a locked /
+    // booting fortress recovers the panel after unlock. The first one-shot fetch
+    // alone would have left the panel hidden forever.
+    expect(region).toContain("setTimeout(");
+    expect(region).toContain("loadRecognition(");
+    // The retry never renders a greyed shell while waiting: the section stays
+    // display:none until a 200, so there is exactly one reveal path.
+    expect(region).toContain('section.style.display = "none"');
   });
 
   it("never fetches a vendor reputation score: no score-fetch path in the page source", () => {
@@ -403,5 +422,17 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
     expect(region).toContain('pill amber');
     // The amber "no evidence yet" copy must be the default branch.
     expect(region).toContain("no evidence yet");
+    // NEGATIVE GUARD (#651 LOW): green must bind STRICTLY to the "present" state.
+    // Mirror featureHealthPill's guards: no branch keyed on a non-present state
+    // (the "red" branch, or the default "no evidence yet" branch) may emit a
+    // green pill. The `[^\n]*` keeps the match on a single source line so a green
+    // branch elsewhere cannot satisfy it. This turns the weak presence check into
+    // a real never-fake-green assertion: a future edit that returns green for
+    // "red" or for the amber default would fail here.
+    expect(region).not.toMatch(/"red"[^\n]*pill green/);
+    expect(region).not.toMatch(/no evidence yet[^\n]*pill green/);
+    // The green pill line is the "present" line: assert green is co-located with
+    // the present state, never with another state token on its line.
+    expect(region).toMatch(/"present"[^\n]*pill green/);
   });
 });

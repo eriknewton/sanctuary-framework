@@ -977,4 +977,92 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
     expect(panel.receipts.verified_true).toBe(0);
     expect(panel.reputation_state).toBe("amber");
   });
+
+  it("fails closed on a readable-but-TAMPERED chain (query RESOLVES with integrity findings): receipts zeroed, never tallied from tampered entries", async () => {
+    // Mirrors posture.test.ts ~line 800 (custody) and the Castle-Wall tainted
+    // test: the read SUCCEEDS but returns integrity findings, so the entries are
+    // present-but-untrustworthy. Sibling shapers refuse to render off them
+    // (arm_state "unknown" / custody_basis "integrity_tainted"); this shaper must
+    // likewise zero the counts rather than tallying receipts from a tampered
+    // chain. Without the fix it would happily count the two bridge entries.
+    const taintedLog = {
+      query: async () => ({
+        entries: [
+          {
+            layer: "l3",
+            operation: "bridge_commit",
+            identity_id: FORTRESS,
+            details: { bridge_commitment_id: "bc-1" },
+          },
+          {
+            layer: "l3",
+            operation: "bridge_verify",
+            identity_id: FORTRESS,
+            details: { bridge_commitment_id: "bc-1", valid: true },
+          },
+        ],
+        total: 2,
+        integrity_findings: [{ kind: "entry_hash_mismatch" } as unknown],
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const panel = await buildRecognitionPanel({
+      auditLog: taintedLog,
+      originMachine: FORTRESS,
+      // Even a wired storage-list committed count must be discarded on a tainted
+      // read: a tampered chain makes the whole evidence picture untrustworthy.
+      committedReceiptCount: 7,
+      reputationEvidence: {
+        attestation_count: 3,
+        tier_distribution: {} as never,
+        most_recent_attestation_at: new Date().toISOString(),
+        dispute_count: 0,
+        verascore_linked: true,
+      },
+    });
+    expect(panel.audit_integrity_ok).toBe(false);
+    expect(panel.receipts.committed).toBe(0);
+    expect(panel.receipts.verified_true).toBe(0);
+    expect(panel.receipts.verified_false).toBe(0);
+    expect(panel.receipts.attested).toBe(0);
+    // The reputation row fails closed to amber on a tainted read, never green.
+    expect(panel.reputation_evidence).toBeNull();
+    expect(panel.reputation_state).toBe("amber");
+  });
+
+  it("honestly flags a CAPPED audit read so receipt counts are disclosed as a lower bound, not silently undercounted", async () => {
+    // total exceeds the returned entries => the read was truncated by the cap, so
+    // the counts UNDERCOUNT. The shaper must surface this (receipts_capped=true)
+    // rather than presenting an undercount as a complete tally (#651 LOW).
+    const cappedLog = {
+      query: async () => ({
+        entries: [
+          {
+            layer: "l3",
+            operation: "bridge_commit",
+            identity_id: FORTRESS,
+            details: { bridge_commitment_id: "bc-1" },
+          },
+        ],
+        total: 80_000,
+        integrity_findings: [],
+      }),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    const capped = await buildRecognitionPanel({
+      auditLog: cappedLog,
+      originMachine: FORTRESS,
+    });
+    expect(capped.receipts.receipts_capped).toBe(true);
+    expect(capped.receipts.audit_query_cap).toBe(50_000);
+
+    // A within-cap read is NOT flagged capped.
+    const { log } = newAuditLog();
+    await appendBridge(log, "bridge_commit", { bridge_commitment_id: "bc-1" });
+    const complete = await buildRecognitionPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+    });
+    expect(complete.receipts.receipts_capped).toBe(false);
+  });
 });
