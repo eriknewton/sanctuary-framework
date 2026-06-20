@@ -88,6 +88,7 @@ import {
   livenessEntryCounts,
   producerSignedDedupKey,
   signedCanonicalOperation,
+  type EntryReverifyBasis,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../castle-wall/constants.js";
@@ -130,6 +131,62 @@ function signedOperationMatchesEntry(
   if (signedOp === null) return false;
   return SIGNED_WAL_OP_TO_FEATURE_OP[signedOp] === entryOperation;
 }
+
+/**
+ * A feature's per-feature producer-signature scheme: the bundle of read-side
+ * re-verification primitives the green-gate uses for a feature whose producer
+ * cryptographically signs its evidence. Factoring it out of a hardcoded Castle
+ * Wall branch lets a future signing daemon declare the same teeth WITHOUT this
+ * module growing a second `if (feature.id === ...)` ladder, while a feature with
+ * NO scheme (a channel-marker-only heartbeat) skips the path entirely. The
+ * Castle Wall scheme wires the EXISTING functions, so Castle Wall's behavior is
+ * byte-for-byte unchanged.
+ */
+export interface ProducerSignatureScheme {
+  /** Re-verify one entry's persisted producer signature against the pinned key. */
+  reverify: (
+    details: unknown,
+    pinnedProducerKeyB64url: string | null,
+    verify?: VerifyProducerSignatureFn,
+  ) => { basis: EntryReverifyBasis; signedCapturedAtMs: number | null };
+  /**
+   * Does this basis let a GREEN-earning invocation count? (Key-present hosts
+   * require a verified producer signature; no-key hosts accept channel basis.)
+   */
+  enforcementCounts: (basis: EntryReverifyBasis, keyPresent: boolean) => boolean;
+  /**
+   * Does this basis let a non-green LIVENESS / stand-down lifecycle signal
+   * count? (Channel basis counts on every host; only a rejected forgery does
+   * not, the heartbeat's inverse-asymmetry rule.)
+   */
+  livenessCounts: (basis: EntryReverifyBasis) => boolean;
+  /**
+   * For a verified producer signature, does the signed canonical body's
+   * operation bind to the entry's filed operation? Closes the relabel/staple
+   * attack. Channel-basis entries have no signed op to bind and skip this.
+   */
+  signedOperationMatches: (
+    details: Record<string, unknown>,
+    entryOperation: string,
+  ) => boolean;
+  /** Stable dedup key for a verified producer-signed entry (exact-replay guard). */
+  dedupKey: (details: Record<string, unknown>) => string | null;
+}
+
+/**
+ * The Castle Wall producer-signature scheme: the existing re-verify primitives
+ * wired into the per-feature shape. Declaring this on the Castle Wall registry
+ * row reproduces the prior hardcoded behavior EXACTLY (same re-verify, same
+ * enforcement/liveness basis rules, same signed-op binding, same dedup).
+ */
+export const CASTLE_WALL_PRODUCER_SIGNATURE_SCHEME: ProducerSignatureScheme =
+  Object.freeze({
+    reverify: reverifyEntryProducerSignature,
+    enforcementCounts: enforcementEntryCounts,
+    livenessCounts: livenessEntryCounts,
+    signedOperationMatches: signedOperationMatchesEntry,
+    dedupKey: producerSignedDedupKey,
+  });
 
 /**
  * Live-adjudication evidence for Castle Wall: the operations that prove the
@@ -276,11 +333,32 @@ export interface FeatureRegistryEntry {
    */
   standDownOps?: ReadonlySet<string>;
   /**
-   * When true, an invocation only counts if the entry carries the Castle Wall
-   * `cw_source` provenance marker. Defends against a different L1 producer
-   * reusing an operation name. Castle Wall only.
+   * Optional per-feature provenance marker. When present, an invocation /
+   * liveness / stand-down entry only counts if its `details[key] === value`,
+   * the cheap pre-filter that defends against a different producer on the same
+   * layer reusing an operation name. Castle Wall declares its existing
+   * `cw_source` marker here, so its provenance check is unchanged; a future
+   * always-on daemon feature (the broker liveness heartbeat next) declares its
+   * own `{ key, value }` pair to get the same gate WITHOUT inheriting Castle
+   * Wall's signature machinery. A feature with no marker counts on the operation
+   * string alone (the event-driven rows).
    */
-  requireCastleWallProvenance?: boolean;
+  provenanceMarker?: { readonly key: string; readonly value: string };
+  /**
+   * Optional per-feature producer-signature scheme. When present, the
+   * green-earning invocation evidence (and the liveness / stand-down lifecycle
+   * signals) are RE-verified against the reader's pinned producer key through
+   * this scheme, exactly as Castle Wall does today: a forged
+   * `producer_signed`-claiming entry is dropped, a verified signed body's
+   * operation is bound to the entry it is filed under, and exact replays are
+   * deduped. Castle Wall declares the Castle Wall scheme, so its signed-basis
+   * behavior is identical. A feature with a `provenanceMarker` but NO scheme
+   * (the broker's channel-marker heartbeat) is recognized on the channel/marker
+   * basis only (the signature re-verify path is never attempted for it), which
+   * is the SAME basis a genuine Castle Wall heartbeat already uses on a
+   * non-key-bearing host. Only meaningful alongside a `provenanceMarker`.
+   */
+  producerSignatureScheme?: ProducerSignatureScheme;
   /**
    * Whether broken-zero is even detectable for this feature. Surfaced verbatim
    * so the UI never implies "confirmed working" for a feature it cannot
@@ -343,7 +421,15 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       // A recent stand-down relabels `dead_no_heartbeat`/red to a non-fault
       // `intentionally_stopped`/`unknown`. Same trust basis as the heartbeat.
       standDownOps: CASTLE_WALL_STAND_DOWN_OPERATIONS,
-      requireCastleWallProvenance: true,
+      // Castle Wall declares its EXISTING `cw_source` provenance marker (the same
+      // pre-filter) plus the Castle Wall producer-signature scheme, so its
+      // provenance + signed-basis gate is byte-for-byte unchanged from the prior
+      // `requireCastleWallProvenance: true`.
+      provenanceMarker: {
+        key: CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+        value: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+      producerSignatureScheme: CASTLE_WALL_PRODUCER_SIGNATURE_SCHEME,
       brokenZeroDetectable: true,
     },
     {
@@ -542,6 +628,8 @@ export function evaluateFeatureHealth(args: {
   // Returns the classification, or null to skip.
   const livenessOps = feature.livenessOps;
   const standDownOps = feature.standDownOps;
+  const provenanceMarker = feature.provenanceMarker;
+  const signatureScheme = feature.producerSignatureScheme;
   const classify = (
     entry: AuditEntry,
   ):
@@ -603,47 +691,60 @@ export function evaluateFeatureHealth(args: {
     const gatedAsLiveness = isLiveness || isStandDown;
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
-    if (
-      feature.requireCastleWallProvenance &&
-      (isInvocation || isLiveness || isStandDown)
-    ) {
+    if (provenanceMarker !== undefined && (isInvocation || isLiveness || isStandDown)) {
+      // MARKER GATE (per-feature). The marker is a forgeable pre-filter that
+      // defends against a different producer on the same layer reusing an
+      // operation name. Universal to any feature that declares a `provenanceMarker`
+      // (Castle Wall today, the broker heartbeat next); fault ops are NOT routed
+      // here (they fail toward RED), so this never drops a real fault.
       const hasProvenance =
         isRecord(entry.details) &&
-        entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
-          CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
+        entry.details[provenanceMarker.key] === provenanceMarker.value;
       if (!hasProvenance) return null;
-      // SIGNATURE GATE (Slice R): the marker is a forgeable pre-filter. The
+      // SIGNATURE GATE (per-feature, scheme-conditional). When the feature
+      // declares a producer-signature SCHEME (Castle Wall), the marker's
       // authority is the producer signature, RE-verified here against the pinned
-      // key. Fault ops are NOT routed here (they fail toward RED), so this never
-      // drops a real fault.
-      const reResult = reverifyEntryProducerSignature(
-        entry.details,
-        pinnedProducerKey,
-        args.verifyProducerSignature,
-      );
-      const basisCounts = gatedAsLiveness
-        ? livenessEntryCounts(reResult.basis)
-        : enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null);
-      if (!basisCounts) {
-        return null;
-      }
-      // OPERATION BINDING (parity with `posture.ts`): for a verified producer
-      // signature the signed canonical body's operation is authoritative, NOT the
-      // forgeable top-level `entry.operation`. Require they match so a genuine
-      // signed tuple cannot be relabeled into a different feature slot — e.g. a
-      // signed liveness heartbeat re-appended as `egress_blocked` to manufacture
-      // green when it only proved liveness. Channel-basis entries have no signed
-      // op to bind, so they keep the honest no-key floor (the entry op).
-      if (
-        reResult.basis === "producer_signed_verified" &&
-        isRecord(entry.details) &&
-        !signedOperationMatchesEntry(entry.details, op)
-      ) {
-        return null;
-      }
-      signedTs = reResult.signedCapturedAtMs;
-      if (reResult.basis === "producer_signed_verified" && isRecord(entry.details)) {
-        signedDedupKey = producerSignedDedupKey(entry.details);
+      // key. A feature with a marker but NO scheme (the broker's channel-marker
+      // heartbeat) is recognized on the channel/marker basis only (the same
+      // basis a genuine Castle Wall heartbeat already uses on a non-key-bearing
+      // host), so the re-verify path is never attempted for it.
+      if (signatureScheme !== undefined) {
+        const reResult = signatureScheme.reverify(
+          entry.details,
+          pinnedProducerKey,
+          args.verifyProducerSignature,
+        );
+        const basisCounts = gatedAsLiveness
+          ? signatureScheme.livenessCounts(reResult.basis)
+          : signatureScheme.enforcementCounts(
+              reResult.basis,
+              pinnedProducerKey !== null,
+            );
+        if (!basisCounts) {
+          return null;
+        }
+        // OPERATION BINDING (parity with `posture.ts`): for a verified producer
+        // signature the signed canonical body's operation is authoritative, NOT
+        // the forgeable top-level `entry.operation`. Require they match so a
+        // genuine signed tuple cannot be relabeled into a different feature slot,
+        // e.g. a signed liveness heartbeat re-appended as `egress_blocked` to
+        // manufacture green when it only proved liveness. Channel-basis entries
+        // have no signed op to bind, so they keep the honest no-key floor (the
+        // entry op).
+        if (
+          reResult.basis === "producer_signed_verified" &&
+          isRecord(entry.details) &&
+          !signatureScheme.signedOperationMatches(entry.details, op)
+        ) {
+          return null;
+        }
+        signedTs = reResult.signedCapturedAtMs;
+        if (
+          reResult.basis === "producer_signed_verified" &&
+          isRecord(entry.details)
+        ) {
+          signedDedupKey = signatureScheme.dedupKey(entry.details);
+        }
       }
     }
     // Freshness uses the SIGNATURE-BOUND capture time for a verified producer
