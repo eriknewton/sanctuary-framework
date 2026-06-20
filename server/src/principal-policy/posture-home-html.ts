@@ -384,6 +384,12 @@ export function renderPostureHomeHTML(): string {
         return "Evidence is stale; recent state cannot be confirmed.";
       case "no_evidence_self_reporting":
         return "No recent evidence; working state cannot be confirmed.";
+      case "alive_no_recent_enforcement":
+        return "The wall is alive (recent heartbeat) but has not filtered a flow in the window.";
+      case "dead_no_heartbeat":
+        return "The wall was running but its heartbeat stopped; it appears to have silently died.";
+      case "intentionally_stopped":
+        return "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."

@@ -43,6 +43,7 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
 } from "../constants.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -357,12 +358,42 @@ export async function startMacOSCastleWallDaemon(
         return { ok: true };
       },
     },
-    onArmLeaseRevoke() {
+    async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
       // A revoked arm-lease means the wall is no longer enforcing for this
       // operator; stop claiming liveness too so the reader does not see a fresh
       // heartbeat from a daemon that has been told to stand down.
       stopAuditHeartbeat();
+      // Observability Slice 2 (false-RED fix): RECORD the intentional stand-down.
+      // Stopping the heartbeat without a recorded reason is indistinguishable
+      // from a daemon that was KILLED mid-flight, so the silent-death reader
+      // would raise a false `dead_no_heartbeat`/red alarm for the whole digest
+      // window on a deliberately-revoked wall. A clean `stop()` already files
+      // `filter_stopped`; a lease revoke must leave the same recognizable
+      // "stood down on purpose" signal. Stamped with the SAME `cw_source` marker
+      // the heartbeat carries (constructed fields only, marker LAST, no untrusted
+      // spread), so the reader recognizes it on the heartbeat's trust basis. A
+      // write failure must never crash the stand-down path; the reader fails
+      // toward the alarm (a missing stand-down reads as silent death), so a
+      // dropped marker is surfaced honestly rather than masked.
+      try {
+        await input.auditLog.append(
+          "l1",
+          CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+          input.fortressId,
+          {
+            socket_path: socketPath,
+            source: auditSource,
+            daemon_mode: daemonMode,
+            // Provenance marker LAST, from constructed fields only.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+          },
+          "success",
+        );
+        await input.auditLog.flush();
+      } catch {
+        // Intentional no-op: see comment above (fail toward the alarm).
+      }
     },
   };
   const listener = input.listenerFactory
@@ -554,7 +585,18 @@ export async function startMacOSCastleWallDaemon(
           "l1",
           "filter_stopped",
           input.fortressId,
-          { socket_path: socketPath, source: auditSource },
+          {
+            socket_path: socketPath,
+            source: auditSource,
+            // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
+            // marker the heartbeat carries so the silent-death reader recognizes
+            // this clean operator stop as an INTENTIONAL stand-down (off on
+            // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
+            // Constructed fields only, marker LAST (no untrusted spread). Gated
+            // read-side on the heartbeat's trust basis; it can only relabel red
+            // to a non-green `unknown`, never manufacture green.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+          },
           "success",
         );
         await input.auditLog.flush();
