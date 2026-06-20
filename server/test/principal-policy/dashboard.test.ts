@@ -837,4 +837,120 @@ describe("Principal Dashboard", () => {
       expect(results.every((s) => s === 200)).toBe(true);
     });
   });
+
+  // ── One-surface root-flip (Piece C) ─────────────────────────────────
+
+  describe("Root-flip: posture board served at /", () => {
+    it("GET / serves the posture board HTML (the one posture surface)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const body = await res.text();
+      // The posture-home shell fetches the posture API client-side; that string
+      // is the durable signature of the posture board (not the legacy/v1.1 SPA).
+      expect(body).toContain("/api/posture/home");
+    });
+
+    it("GET / and GET /posture serve byte-for-byte the same posture board", async () => {
+      const [rootRes, postureRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/`),
+        fetch(`http://127.0.0.1:${port}/posture`),
+      ]);
+      expect(rootRes.status).toBe(200);
+      expect(postureRes.status).toBe(200);
+      const [rootBody, postureBody] = await Promise.all([
+        rootRes.text(),
+        postureRes.text(),
+      ]);
+      // /posture remains a working alias of the same one surface.
+      expect(rootBody).toBe(postureBody);
+    });
+
+    it("root-flip does NOT regress the approval-channel routes", async () => {
+      // /api/pending still answers (the pending-approvals inbox source).
+      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      expect(pendingRes.status).toBe(200);
+      expect(await pendingRes.json()).toEqual([]);
+
+      // An Approve still round-trips through /api/approve/:id and resolves the
+      // blocked Tier-1 call (the same approval behavior, reached via the board).
+      const approvePromise = dashboard.requestApproval({
+        operation: "state_export",
+        tier: 1,
+        reason: "root-flip approval round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const approveList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(approveList).toHaveLength(1);
+      const approveRes = await fetch(
+        `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
+        { method: "POST" },
+      );
+      expect(approveRes.status).toBe(200);
+      expect((await approvePromise).decision).toBe("approve");
+
+      // A Deny still round-trips through /api/deny/:id.
+      const denyPromise = dashboard.requestApproval({
+        operation: "identity_rotate",
+        tier: 1,
+        reason: "root-flip deny round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const denyList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(denyList).toHaveLength(1);
+      const denyRes = await fetch(
+        `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
+        { method: "POST" },
+      );
+      expect(denyRes.status).toBe(200);
+      expect((await denyPromise).decision).toBe("deny");
+    });
+
+    it("root-flip leaves /v1.0 and unknown routes intact", async () => {
+      // The legacy four-panel dashboard is still reachable at its own URL.
+      const v10 = await fetch(`http://127.0.0.1:${port}/v1.0`);
+      expect(v10.status).toBe(200);
+      expect(await v10.text()).toContain("Principal Dashboard");
+      // The flip matches ONLY the bare root path; unknown routes still 404.
+      const unknown = await fetch(`http://127.0.0.1:${port}/nonexistent`);
+      expect(unknown.status).toBe(404);
+    });
+  });
+
+  // ── /api/health stays a cheap, non-sensitive liveness probe (A3 remediation) ──
+
+  describe("/api/health does NOT leak the Castle Wall posture", () => {
+    // SECURITY regression guard (Delta Review A3 remediation): a prior revision
+    // attached the full evidence-based Castle Wall posture (origin/operator id,
+    // verdict counts, enforcement timestamps) to this UNAUTHENTICATED probe and
+    // ran an unbounded audit scan + per-entry Ed25519 re-verify per call. That
+    // is reverted: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
+    // ONLY. The honest arm-state lives behind auth (`/api/posture/castle-wall`,
+    // `/v1/status`), never here.
+    it("returns ONLY { ok, mode } — no castle_wall, no posture telemetry", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.mode).toBe("principal-policy");
+      // The detailed posture (and the fields that would leak operator identity
+      // or enforcement telemetry) must NOT be on the unauthenticated probe.
+      expect(data.castle_wall).toBeUndefined();
+      expect(data.arm_state).toBeUndefined();
+      expect(data.origin_machine).toBeUndefined();
+      expect(data.verdict_counts).toBeUndefined();
+      expect(Object.keys(data).sort()).toEqual(["mode", "ok"]);
+    });
+
+    it("/api/health keeps its no-store cache header", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+  });
 });
