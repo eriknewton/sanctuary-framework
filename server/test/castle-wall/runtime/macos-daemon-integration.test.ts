@@ -22,6 +22,7 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
 } from "../../../src/castle-wall/constants.js";
 
 const silent = new Writable({
@@ -351,6 +352,85 @@ describe("Castle Wall macOS daemon integration", () => {
       await auditLog.query({ layer: "l1", limit: 5000 })
     ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION).length;
     expect(later).toBe(afterStop);
+  });
+
+  it("a clean stop records a provenance-marked filter_stopped stand-down (Slice 2 false-RED fix)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(40);
+    await handle.stop();
+
+    const stops = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "filter_stopped");
+    // Exactly the one clean-stop event, and it carries the cw_source marker so
+    // the silent-death reader recognizes it as an INTENTIONAL stand-down (off on
+    // purpose) rather than reading a false dead_no_heartbeat alarm.
+    expect(stops.length).toBe(1);
+    const details = stops[0].details as Record<string, unknown>;
+    expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(stops[0].result).toBe("success");
+  });
+
+  it("an arm-lease revoke records a provenance-marked arm_lease_revoked stand-down (Slice 2 false-RED fix)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let revokeHook:
+      | ((lease: ArmLeaseNotification) => void | Promise<void>)
+      | undefined;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory(options) {
+        revokeHook = options.onArmLeaseRevoke;
+        return fakeListenerFactory(options);
+      },
+    });
+    await wait(40);
+
+    const revoke: ArmLeaseNotification = {
+      type: "arm_lease",
+      armed: false,
+      revoked: true,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-06-10T00:00:00.000Z",
+    };
+    // The revoke path previously wrote NOTHING, so a lease-revoke stand-down was
+    // indistinguishable from a silent death. It must now leave a recognizable
+    // arm_lease_revoked marker on the heartbeat's trust basis.
+    await revokeHook?.(revoke);
+
+    const revokes = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter(
+      (e) => e.operation === CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+    );
+    expect(revokes.length).toBe(1);
+    const details = revokes[0].details as Record<string, unknown>;
+    expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(revokes[0].result).toBe("success");
+
+    await handle.stop();
   });
 
   it("rejects a second daemon for the same fortress with the Phase 3 message", async () => {

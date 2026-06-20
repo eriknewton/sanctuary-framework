@@ -77,6 +77,7 @@ import {
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   CASTLE_WALL_LIVENESS_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
+  CASTLE_WALL_STAND_DOWN_OPERATIONS,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   DEFAULT_DIGEST_WINDOW_MS,
   ENFORCEMENT_FUTURE_SKEW_MS,
@@ -203,6 +204,17 @@ export type FeatureHealthBasis =
   // unbound). Rendered as `fault`/red — the silent-death alarm Slice 1 left as
   // `unknown`.
   | "dead_no_heartbeat"
+  // Observability Slice 2 (false-RED fix): NO fresh enforcement AND NO fresh
+  // heartbeat, BUT the most-recent lifecycle signal is an INTENTIONAL stand-down
+  // (a clean operator `filter_stopped` or an `arm_lease_revoked`). The wall is
+  // off ON PURPOSE, not silently dead, so the honest reading is `unknown` (off,
+  // not enforcing) — NOT the `dead_no_heartbeat` red alarm and NEVER green. A
+  // genuine silent death (heartbeat stopped with NO subsequent stand-down)
+  // still reads `dead_no_heartbeat`; the suppression rests on the SAME trust
+  // basis as the heartbeat (see the stand-down trust note in `posture.ts`), so a
+  // forger cannot use it to mute a real alarm into green — only into this
+  // non-green `unknown`.
+  | "intentionally_stopped"
   | "no_activity_event_driven"
   | "integrity_tainted"
   // The freshness-window scan could not be proven complete (it returned a full
@@ -249,6 +261,20 @@ export interface FeatureRegistryEntry {
    * Absent/empty for features with no heartbeat producer.
    */
   livenessOps?: ReadonlySet<string>;
+  /**
+   * Operation strings that record an INTENTIONAL stand-down of this feature's
+   * daemon (observability Slice 2 false-RED fix): a clean operator stop or an
+   * arm-lease revoke. Only meaningful for self-reporting features with a
+   * heartbeat producer. A RECENT stand-down (more recent than the last
+   * heartbeat) means the daemon went quiet ON PURPOSE, so the reader relabels
+   * what would otherwise be `dead_no_heartbeat`/red to an honest non-fault
+   * `intentionally_stopped`/`unknown` (off, not dead). Gated on the SAME trust
+   * basis as the heartbeat (`livenessEntryCounts`), so it can never mute a real
+   * alarm into green — only into a non-green `unknown`. Kept DISJOINT from
+   * `invocationOps` / `livenessOps` / `faultOps`. Absent for features with no
+   * stand-down producer.
+   */
+  standDownOps?: ReadonlySet<string>;
   /**
    * When true, an invocation only counts if the entry carries the Castle Wall
    * `cw_source` provenance marker. Defends against a different L1 producer
@@ -312,6 +338,11 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       // (liveness, not adjudication), so it can distinguish alive-idle from
       // silently-dead WITHOUT ever earning green.
       livenessOps: CASTLE_WALL_LIVENESS_OPERATIONS,
+      // Slice 2 false-RED fix: an intentional stand-down (clean stop or arm-lease
+      // revoke) is the deliberate ABSENCE of enforcement, not a silent death.
+      // A recent stand-down relabels `dead_no_heartbeat`/red to a non-fault
+      // `intentionally_stopped`/`unknown`. Same trust basis as the heartbeat.
+      standDownOps: CASTLE_WALL_STAND_DOWN_OPERATIONS,
       requireCastleWallProvenance: true,
       brokenZeroDetectable: true,
     },
@@ -510,6 +541,7 @@ export function evaluateFeatureHealth(args: {
   // cryptographic per-entry provenance is out of scope for a read projection.
   // Returns the classification, or null to skip.
   const livenessOps = feature.livenessOps;
+  const standDownOps = feature.standDownOps;
   const classify = (
     entry: AuditEntry,
   ):
@@ -520,6 +552,11 @@ export function evaluateFeatureHealth(args: {
         isFault: boolean;
         /** A producer-gated liveness heartbeat (Slice 2). Never an invocation. */
         isLiveness: boolean;
+        /**
+         * An intentional stand-down marker (Slice 2 false-RED fix): a clean
+         * operator stop or arm-lease revoke. Never an invocation, never a fault.
+         */
+        isStandDown: boolean;
         /** Dedup key for a re-verified producer-signed invocation, else null. */
         signedDedupKey: string | null;
       }
@@ -529,7 +566,8 @@ export function evaluateFeatureHealth(args: {
     const isInvocation = feature.invocationOps.has(op);
     const isFault = feature.faultOps !== undefined && feature.faultOps.has(op);
     const isLiveness = livenessOps !== undefined && livenessOps.has(op);
-    if (!isInvocation && !isFault && !isLiveness) return null;
+    const isStandDown = standDownOps !== undefined && standDownOps.has(op);
+    if (!isInvocation && !isFault && !isLiveness && !isStandDown) return null;
     // Gate ONLY green-earning invocation evidence AND liveness heartbeats; never
     // gate fault recognition. (For Castle Wall, invocationOps / faultOps /
     // livenessOps are mutually disjoint, so a fault entry is never dropped here.)
@@ -551,9 +589,24 @@ export function evaluateFeatureHealth(args: {
     //    counts, but a forged `producer_signed`-CLAIMING beat with a bad signature
     //    (`producer_signed_rejected`) still does NOT — the one way an in-process
     //    forger could fake "I am alive" to suppress the alarm.
+    //  - A STAND-DOWN marker (Slice 2 false-RED fix) is ALSO not green-earning.
+    //    The producer (`macos-daemon.ts` stop()/onArmLeaseRevoke) writes it as a
+    //    DIRECT channel-basis `auditLog.append`, so it shares the heartbeat's
+    //    trust basis EXACTLY and is gated with `livenessEntryCounts` for the same
+    //    reason: a genuine channel stand-down counts (so a real clean stop
+    //    suppresses the false alarm on every host), but a forged
+    //    `producer_signed`-CLAIMING stand-down with a bad signature does NOT. A
+    //    forged CHANNEL-basis stand-down is accepted on the same forgeable basis
+    //    a forged channel heartbeat already is — and like that heartbeat it can
+    //    only relabel a RED alarm into a non-green `unknown`, NEVER manufacture
+    //    green, so no weaker trust boundary than the alarm it relabels is added.
+    const gatedAsLiveness = isLiveness || isStandDown;
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
-    if (feature.requireCastleWallProvenance && (isInvocation || isLiveness)) {
+    if (
+      feature.requireCastleWallProvenance &&
+      (isInvocation || isLiveness || isStandDown)
+    ) {
       const hasProvenance =
         isRecord(entry.details) &&
         entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
@@ -568,7 +621,7 @@ export function evaluateFeatureHealth(args: {
         pinnedProducerKey,
         args.verifyProducerSignature,
       );
-      const basisCounts = isLiveness
+      const basisCounts = gatedAsLiveness
         ? livenessEntryCounts(reResult.basis)
         : enforcementEntryCounts(reResult.basis, pinnedProducerKey !== null);
       if (!basisCounts) {
@@ -603,7 +656,15 @@ export function evaluateFeatureHealth(args: {
     // freshness window, nor let a future-dated heartbeat read as a fresh
     // liveness signal.
     const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-    return { ts, tsValid, isInvocation, isFault, isLiveness, signedDedupKey };
+    return {
+      ts,
+      tsValid,
+      isInvocation,
+      isFault,
+      isLiveness,
+      isStandDown,
+      signedDedupKey,
+    };
   };
 
   // Pass 1 — counts + staleness over the full digest window. A re-verified
@@ -621,10 +682,30 @@ export function evaluateFeatureHealth(args: {
   // evidence of any kind), which stays the honest `unknown`. A fault alarm is a
   // claim; we never raise it without prior liveness evidence.
   let everSawHeartbeat = false;
+  // Slice 2 false-RED fix: the most-recent heartbeat AND the most-recent
+  // INTENTIONAL stand-down (clean stop / arm-lease revoke) anywhere in the
+  // digest window. The silent-death branch suppresses the alarm iff the last
+  // lifecycle signal was a stand-down (stand-down at least as recent as the last
+  // heartbeat): the wall went quiet ON PURPOSE, not by dying. If a heartbeat is
+  // MORE recent than the last stand-down, the daemon came back and beat after
+  // the stand-down, then went silent with no further stand-down → a genuine
+  // silent death, and the alarm still fires.
+  let latestHeartbeatMs: number | null = null;
+  let latestStandDownMs: number | null = null;
   for (const entry of entries) {
     const c = classify(entry);
     if (c === null) continue;
-    if (c.isLiveness && c.tsValid) everSawHeartbeat = true;
+    if (c.isLiveness && c.tsValid) {
+      everSawHeartbeat = true;
+      if (latestHeartbeatMs === null || c.ts > latestHeartbeatMs) {
+        latestHeartbeatMs = c.ts;
+      }
+    }
+    if (c.isStandDown && c.tsValid) {
+      if (latestStandDownMs === null || c.ts > latestStandDownMs) {
+        latestStandDownMs = c.ts;
+      }
+    }
     if (!c.isInvocation) continue;
     if (c.signedDedupKey !== null) {
       if (countedSignedKeys.has(c.signedDedupKey)) continue; // duplicate replay
@@ -703,6 +784,18 @@ export function evaluateFeatureHealth(args: {
     // heartbeat ever observed we cannot prove the producer was running, so we
     // never fabricate a silent-death claim (never overclaim).
     const heartbeatProducerWasRunning = everSawHeartbeat;
+    // Slice 2 false-RED fix: was the wall INTENTIONALLY stood down (clean stop /
+    // arm-lease revoke), making this quiet window expected rather than a silent
+    // death? True iff a stand-down signal exists in the digest window AND it is
+    // at least as recent as the most-recent heartbeat. If a heartbeat came AFTER
+    // the last stand-down, the daemon came back and beat again, then went silent
+    // with no further stand-down — that IS a genuine silent death, so we do NOT
+    // suppress. The stand-down rests on the SAME trust basis as the heartbeat
+    // (channel-basis, `livenessEntryCounts`-gated), so a forger cannot use it to
+    // mute a real alarm into GREEN — only into a non-green `unknown`.
+    const intentionallyStoodDown =
+      latestStandDownMs !== null &&
+      (latestHeartbeatMs === null || latestStandDownMs >= latestHeartbeatMs);
     if (latestFreshFaultMs !== null) {
       // Fault precedence: a fresh fault renders the feature `fault` even when
       // fresh enforcement evidence (or a fresh heartbeat) co-occurs in the window
@@ -730,14 +823,29 @@ export function evaluateFeatureHealth(args: {
       // (never green), distinguished from a silently-dead wall.
       status = "unknown";
       basis = "alive_no_recent_enforcement";
+    } else if (
+      hasHeartbeatProducer &&
+      heartbeatProducerWasRunning &&
+      intentionallyStoodDown
+    ) {
+      // ABSENCE-of-enforcement + NO fresh heartbeat, BUT the most-recent
+      // lifecycle signal is an INTENTIONAL stand-down (clean operator stop or
+      // arm-lease revoke). The wall is off ON PURPOSE, not silently dead, so the
+      // honest reading is `unknown` (`intentionally_stopped`) — NOT the
+      // `dead_no_heartbeat` red alarm, and NEVER green. This is the false-RED fix:
+      // without it a deliberately-stopped wall read red for the whole digest
+      // window. Ordered BEFORE the silent-death branch so a recorded stand-down
+      // always relabels the quiet window honestly.
+      status = "unknown";
+      basis = "intentionally_stopped";
     } else if (hasHeartbeatProducer && heartbeatProducerWasRunning) {
       // ABSENCE-of-enforcement + NO fresh heartbeat, on a feature whose daemon
       // SHOULD be beating AND whose heartbeat producer was provably running
-      // earlier in the window: the beating stopped → the wall silently died
-      // (process killed, sysext unbound). The Slice-2 silent-death alarm —
-      // `fault`/red, not the old `unknown`. (Reaching here means freshnessComplete
-      // is true, so the absence of a heartbeat in the freshness window is
-      // provable, not a truncated read.)
+      // earlier in the window, with NO intentional stand-down recorded: the
+      // beating stopped on its own → the wall silently died (process killed,
+      // sysext unbound). The Slice-2 silent-death alarm — `fault`/red, not the old
+      // `unknown`. (Reaching here means freshnessComplete is true, so the absence
+      // of a heartbeat in the freshness window is provable, not a truncated read.)
       status = "fault";
       basis = "dead_no_heartbeat";
     } else if (latestInvocationMs !== null) {
@@ -800,17 +908,31 @@ export interface FeatureHealthPanel {
    * feature) is UNDETECTABLE for purely event-driven features in Slice 1.
    *
    * Slice 2 update: the Castle Wall "daemon silently died" case is now DETECTED.
-   * A periodic, producer-signed liveness heartbeat means a wall that silently
-   * dies (process killed, sysext unbound) in a quiet window reads `fault`/red
+   * A periodic liveness heartbeat means a wall that silently dies (process
+   * killed, sysext unbound) in a quiet window reads `fault`/red
    * (`dead_no_heartbeat`), NOT the old `unknown`. So
    * `castle_wall_silent_death_is_unknown_not_green` is now `false`: silent death
    * is no longer a silent `unknown`, it is a red alarm. The flag is retained
    * (now `false`) for UI back-compat rather than removed. The panel still never
    * claims more than it can prove — a heartbeat proves liveness only, never green.
+   *
+   * Slice 2 false-RED fix: the silent-death alarm is now DISTINGUISHED from an
+   * INTENTIONAL stand-down. A clean operator stop or an arm-lease revoke records
+   * a stand-down marker; the reader relabels what would otherwise be
+   * `dead_no_heartbeat`/red to an honest `intentionally_stopped`/`unknown` (off
+   * on purpose, not dead). Only a GENUINE silent death (the heartbeat stopped
+   * with NO subsequent stand-down) still reads red. `silent_death_distinguished_
+   * from_intentional_stop` records this honestly. CAVEAT (no overclaim): the
+   * stand-down marker is on the heartbeat's channel-basis trust boundary, so an
+   * in-process forger that can already forge a heartbeat could relabel a real red
+   * alarm to this `unknown` — but NEVER to green (the suppression can only move
+   * red -> non-green `unknown`). This is the same forgeable in-process-writer
+   * boundary the heartbeat itself discloses; it adds no weaker trust path.
    */
   disclosure: {
     broken_zero_undetectable_for_event_driven: true;
     castle_wall_silent_death_is_unknown_not_green: false;
+    silent_death_distinguished_from_intentional_stop: true;
   };
 }
 
@@ -931,6 +1053,11 @@ export async function buildFeatureHealthPanel(
       // Slice 2: silent death is now DETECTED (a missing heartbeat reads
       // `fault`/red, not `unknown`), so this honesty caveat no longer holds.
       castle_wall_silent_death_is_unknown_not_green: false,
+      // Slice 2 false-RED fix: a clean stop / arm-lease revoke is relabeled
+      // `intentionally_stopped`, so a deliberately-stopped wall no longer reads a
+      // false red `dead_no_heartbeat`. The alarm is distinguished from an
+      // intentional stand-down.
+      silent_death_distinguished_from_intentional_stop: true,
     },
   };
 }

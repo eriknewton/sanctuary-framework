@@ -46,6 +46,7 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
 } from "../castle-wall/constants.js";
 import {
@@ -125,6 +126,40 @@ export const CASTLE_WALL_ENFORCEMENT_OPERATIONS: ReadonlySet<string> =
  */
 export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
   Object.freeze(new Set<string>([CASTLE_WALL_HEARTBEAT_OPERATION]));
+
+/**
+ * Castle Wall audit operations that record an INTENTIONAL stand-down — the
+ * operator deliberately stopped the wall (`filter_stopped`) or revoked its arm
+ * lease (`arm_lease_revoked`). Both stop the liveness heartbeat on purpose, so
+ * the resulting heartbeat-then-silent pattern is NOT a silent death.
+ *
+ * This set exists to fix a false-RED defect (observability Slice 2): without it
+ * a deliberately-stopped wall reads `dead_no_heartbeat`/red for ~24h, because
+ * "no fresh heartbeat after the producer was once running" looks identical to a
+ * killed daemon. The silent-death reader (`feature-health.ts`) consults this set
+ * BEFORE firing the alarm: a recent stand-down signal relabels the reading to an
+ * honest non-fault `intentionally_stopped` (`unknown`, never green, never red).
+ *
+ * TRUST BASIS (load-bearing honesty note): a stand-down entry is a DIRECT
+ * channel-basis audit append carrying the `cw_source` marker, the SAME trust
+ * basis as the heartbeat — NOT producer-signature gated. The reader therefore
+ * gates it with `livenessEntryCounts` (the heartbeat's gate), so a forged
+ * `producer_signed`-CLAIMING stand-down with a bad signature is dropped, but a
+ * forged channel-basis stand-down is accepted on the same forgeable basis the
+ * heartbeat already lives with. This is sound because a forged stand-down can
+ * only relabel a RED alarm into a non-green `unknown` (off-on-purpose), exactly
+ * as a forged channel-basis heartbeat already can — it can NEVER manufacture
+ * green. No weaker trust basis than the alarm it suppresses is introduced.
+ *
+ * Kept DISJOINT from the enforcement, liveness, and not-enforcing sets: a
+ * stand-down is neither adjudication, nor a liveness claim, nor a fault (it is
+ * the deliberate ABSENCE of enforcement, not a malfunction). Asserted by a
+ * disjointness test.
+ */
+export const CASTLE_WALL_STAND_DOWN_OPERATIONS: ReadonlySet<string> =
+  Object.freeze(
+    new Set<string>(["filter_stopped", CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION]),
+  );
 
 /**
  * Castle Wall audit operations that prove the wall is present but NOT
