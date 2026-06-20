@@ -478,7 +478,13 @@ Commands:
             "Sanctuary Secret Broker: stand-down flush did not complete in " +
             `${String(BROKER_SHUTDOWN_WATCHDOG_MS)}ms; forcing exit.`,
           );
-          process.exit(0);
+          // Exit NON-ZERO on the watchdog path: a wedged stand-down flush is a
+          // DEGRADED shutdown (the stand-down marker may not have been durably
+          // written), not a clean one. Reporting it as exit 0 would tell a
+          // process supervisor "clean exit" for what is really a storage wedge -
+          // an overclaim on the very honesty surface this feature serves. The
+          // clean `.finally` path below keeps exit 0.
+          process.exit(1);
         }, BROKER_SHUTDOWN_WATCHDOG_MS);
         watchdog.unref();
         void liveness.standDown().finally(() => {
