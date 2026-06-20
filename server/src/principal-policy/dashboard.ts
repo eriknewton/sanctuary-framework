@@ -65,6 +65,7 @@ import {
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import {
   buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   mapPlatform,
   type CastleWallPosture,
 } from "./posture.js";
@@ -1105,7 +1106,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           platform: mapPlatform(process.platform),
           evidence_basis: "no_evidence",
           last_enforcement_evidence_at: null,
-          freshness_window_ms: 0,
+          // Report the real freshness window (not 0) so this fallback matches
+          // the canonical buildCastleWallPosture shaper, whose own
+          // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+          freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
           verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
           audit_integrity_ok: true,
           producer_authenticity: "not_applicable",
@@ -1129,7 +1133,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         platform: mapPlatform(process.platform),
         evidence_basis: "no_evidence",
         last_enforcement_evidence_at: null,
-        freshness_window_ms: 0,
+        // Report the real freshness window (not 0) so this fallback matches
+        // the canonical buildCastleWallPosture shaper, whose own
+        // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+        freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
         verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
         audit_integrity_ok: false,
         producer_authenticity: "not_applicable",
