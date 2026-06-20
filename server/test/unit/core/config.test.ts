@@ -309,6 +309,57 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("Dashboard port validation — server/native single-source parity", () => {
+    // The native macOS embed/badge resolver parses SANCTUARY_DASHBOARD_PORT
+    // STRICTLY (Int + 1..65535) and falls back to 3501 on anything invalid.
+    // The server-side override used a lenient parseInt, so without validation
+    // "80abc" -> 80 and "70000" would bind the server to a port the resolver
+    // rejects, reintroducing the false "server not running" amber. These cases
+    // pin that an invalid port is now REFUSED rather than silently bound.
+    it("rejects a non-numeric-suffixed env port the server would otherwise truncate", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "80abc";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an out-of-range env port (> 65535)", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "70000";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an env port of 0", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "0";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects a non-numeric env port", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "not-a-port";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an out-of-range port in a config FILE", async () => {
+      const path = join(tempDir, "bad-port.json");
+      await writeFile(
+        path,
+        JSON.stringify({ dashboard: { enabled: true, port: 70000, host: "127.0.0.1" } })
+      );
+      await expect(loadConfig(path)).rejects.toThrow(/dashboard\.port/);
+    });
+
+    it("accepts a valid in-range env port (boundary 65535)", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "65535";
+      const config = await loadConfig(join(tempDir, "nonexistent.json"));
+      expect(config.dashboard.port).toBe(65535);
+    });
+  });
+
   describe("Config structural shape validation (#4)", () => {
     it("rejects a config file that overrides an object-typed key with a string", async () => {
       const path = join(tempDir, "broken-shape.json");

@@ -918,6 +918,24 @@ export async function createSanctuaryServer(options?: {
         config,
       }),
     );
+    // Loopback auto-auth (parity with `sanctuary dashboard`,
+    // dashboard-standalone.ts): the master key that unlocked this fortress
+    // above is strictly stronger than the in-memory dashboard bearer token, so
+    // a loopback caller after a successful unlock should not be re-challenged.
+    // Without this, the embedded native posture surface (castle-wall-macos,
+    // which boots the server via `sanctuary --dashboard`) gets 401'd on its
+    // tokenless loopback reads whenever an operator configures a dashboard auth
+    // token, leaving the badge stuck and the embed rendering a raw 401 page.
+    // Gated identically to the standalone path — loopback host AND at least one
+    // identity decrypted — so the threat model is unchanged. State-changing
+    // approval-decision routes remain token-gated via `requireToken` regardless.
+    const dashboardHostIsLoopback =
+      config.dashboard.host === "127.0.0.1" ||
+      config.dashboard.host === "::1" ||
+      config.dashboard.host === "localhost";
+    if (dashboardHostIsLoopback && loadResult.loaded > 0) {
+      dashboard.setAutoAuthLocalhost(true);
+    }
     await dashboard.start();
     approvalChannel = dashboard;
   } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {

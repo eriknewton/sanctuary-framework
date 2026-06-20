@@ -14,6 +14,32 @@ import { ConfigLoadError } from "./errors/config-error.js";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/**
+ * Strictly parse a whole-string integer from an env var, mirroring the native
+ * macOS resolver's `Int(raw.trimmingCharacters(in:))` semantics
+ * (`SanctuaryServerBridge.dashboardBaseURL`).
+ *
+ * `parseInt("80abc", 10)` returns `80` — it stops at the first non-digit and
+ * silently TRUNCATES. The native dashboard-port resolver instead rejects
+ * "80abc" entirely and falls back to 3501. If the server kept parseInt's lenient
+ * truncation, the two would bind/read different ports for such a value, which is
+ * exactly the false "server not running" amber the native resolver exists to
+ * eliminate. Returning `NaN` for any non-clean-integer string lets the downstream
+ * range check in `validateConfig` REFUSE the value rather than bind a truncated
+ * port, keeping the server and the native reads on the same single source.
+ *
+ * Accepts an optional sign and ASCII digits only (e.g. "3501", "+8443"). Returns
+ * `NaN` for "", "80abc", "0x10", "3501 5", or any value with trailing/embedded
+ * non-digits, so the caller's validation rejects it.
+ */
+function strictParseIntEnv(raw: string): number {
+  const trimmed = raw.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) {
+    return Number.NaN;
+  }
+  return Number.parseInt(trimmed, 10);
+}
+
 /** Package version, exported for use by other modules (avoids duplicate require paths). */
 export const SANCTUARY_VERSION = PKG_VERSION;
 
@@ -258,7 +284,10 @@ export async function loadConfig(
     config.dashboard.enabled = false;
   }
   if (process.env.SANCTUARY_DASHBOARD_PORT) {
-    config.dashboard.port = parseInt(process.env.SANCTUARY_DASHBOARD_PORT, 10);
+    // Strict whole-string parse so a value the native macOS resolver would
+    // reject (e.g. "80abc") becomes NaN here and is refused by validateConfig,
+    // instead of parseInt silently truncating it to a bound-but-divergent port.
+    config.dashboard.port = strictParseIntEnv(process.env.SANCTUARY_DASHBOARD_PORT);
   }
   if (process.env.SANCTUARY_DASHBOARD_HOST) {
     config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
@@ -484,6 +513,31 @@ export function validateConfig(config: SanctuaryConfig): void {
     errors.push(
       `Invalid config value: privacy_filter.timeout_ms = "${config.privacy_filter.timeout_ms}". ` +
       `Use an integer timeout of at least 100 ms.`
+    );
+  }
+
+  // dashboard.port must be a valid TCP port (integer in 1..65535). The env
+  // override (SANCTUARY_DASHBOARD_PORT) is read with a strict whole-string
+  // parse that yields NaN for a value like "80abc" (instead of the old lenient
+  // parseInt that truncated it to 80), and a config-FILE value can be any
+  // number; either way an out-of-range or non-integer port would bind the
+  // server to a truncated/out-of-spec port. The native macOS embed/badge
+  // resolver (`dashboardBaseURL`) parses the SAME env var STRICTLY (Int + a
+  // 1...65535 guard) and falls back to 3501 on anything invalid, so such a
+  // value would silently drift the two apart: the server armed on (say) port
+  // 70000-truncated while every native read targets 3501, finds nothing, and
+  // renders a false "server not running" amber — the exact regression the
+  // resolver exists to eliminate. Refusing an invalid port here (rather than
+  // binding it) keeps the single-source-of-truth guarantee literally true: the
+  // value the server binds is always one the resolver accepts. Fails CLOSED.
+  if (
+    !Number.isInteger(config.dashboard.port) ||
+    config.dashboard.port < 1 ||
+    config.dashboard.port > 65535
+  ) {
+    errors.push(
+      `Invalid config value: dashboard.port = "${config.dashboard.port}". ` +
+      `Use an integer TCP port in the range 1-65535.`
     );
   }
 

@@ -628,6 +628,31 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
     });
 
+    // dashboard-native-embed-loopback-read: the castle-wall-macos native app
+    // embeds the posture board and reads `/api/posture/castle-wall` for the arm
+    // badge over a TOKENLESS loopback request (no bearer token, no session —
+    // see PostureWebView/SanctuaryServerBridge). That read MUST clear the auth
+    // gate under loopback auto-auth, otherwise the badge sticks on "Checking
+    // enforcement…" and the embed renders a raw 401 page. This locks the
+    // posture-read route as a read-only route the auto-auth fast path covers
+    // (NOT a `requireToken` approval-decision route). The `sanctuary
+    // --dashboard` boot path (index.ts) now enables this fast path the same way
+    // `sanctuary dashboard` does. Its companion above
+    // (`rejects a tokenless loopback POST /api/approve/:id (401)`) locks the
+    // opposite half: the approval-decision surface stays 401 even with auto-auth
+    // on. Together they bracket the `--dashboard` boot fix.
+    it("tokenless loopback GET /api/posture/castle-wall is NOT 401 under auto-auth (native embed read)", async () => {
+      const res = await fetch(
+        `http://127.0.0.1:${autoPort}/api/posture/castle-wall`,
+      );
+      // The contract the native embed needs is the AUTH boundary: a tokenless
+      // loopback read must clear `checkAuth` (never 401). This bare test channel
+      // has no posture dependencies wired, so the handler itself may 404/503;
+      // what matters here is that auto-auth let the request THROUGH the auth
+      // gate (in contrast to the approve/deny routes, which stay 401).
+      expect(res.status).not.toBe(401);
+    });
+
     // legacy-dashboard-approval-route: the approval DECISION routes are
     // dispatched POST-only. There is no live GET handler, so a GET can never
     // release a Tier-1 op — closing any residual "self-approve via GET"
