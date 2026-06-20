@@ -25,6 +25,16 @@ export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/**
+ * Fallback exit deadline for the broker daemon's clean shutdown. If the
+ * stand-down audit flush wedges on a storage backend that never settles, the
+ * SIGTERM/SIGINT handler would otherwise hang forever (the signal listener
+ * suppresses Node's default termination). The watchdog forces `process.exit(0)`
+ * after this window so the daemon dies promptly instead of waiting for an OS
+ * SIGKILL. Generous enough that a healthy flush always finishes first.
+ */
+const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
+
 async function main(): Promise<void> {
   // Parse CLI flags
   const invokedAs = basename(process.argv[1] ?? "");
@@ -450,11 +460,34 @@ Commands:
     const shutdownBroker = (exit: boolean): void => {
       if (shuttingDown) return;
       shuttingDown = true;
-      // Fire and forget: standDown() resolves even if the append/flush fails
-      // (fail toward the alarm), and process.exit owns the lifecycle from here.
-      void liveness.standDown().finally(() => {
-        if (exit) process.exit(0);
-      });
+      // Fire and forget: standDown() resolves even if the append/flush
+      // *rejects* (fail toward the alarm), and process.exit owns the lifecycle
+      // from here. But standDown() awaits auditLog.flush(), which awaits the
+      // pending storage writes; a wedged backend that never SETTLES (neither
+      // resolves nor rejects) would hang the flush, so the `.finally` never
+      // fires. Installing a SIGTERM/SIGINT listener suppresses Node's default
+      // termination, so without a fallback the daemon would hang on the signal
+      // until the OS SIGKILLs it after its grace period. Arm a watchdog that
+      // forces exit if the stand-down flush does not complete in time. It is
+      // `.unref()`ed so it never keeps the event loop alive: a fast clean
+      // stand-down still exits promptly via the `.finally` below.
+      if (exit) {
+        const watchdog = setTimeout(() => {
+          // SAFETY: stderr is the operator-facing CLI channel; no logger in scope.
+          console.error(
+            "Sanctuary Secret Broker: stand-down flush did not complete in " +
+            `${String(BROKER_SHUTDOWN_WATCHDOG_MS)}ms; forcing exit.`,
+          );
+          process.exit(0);
+        }, BROKER_SHUTDOWN_WATCHDOG_MS);
+        watchdog.unref();
+        void liveness.standDown().finally(() => {
+          clearTimeout(watchdog);
+          process.exit(0);
+        });
+        return;
+      }
+      void liveness.standDown();
     };
     server.onclose = () => shutdownBroker(true);
     process.on("SIGTERM", () => shutdownBroker(true));
