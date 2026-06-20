@@ -67,7 +67,6 @@ import {
   handleQueryAnonymityStatsRequest,
   QUERY_ANONYMITY_API_PREFIX,
 } from "../query-anonymity/query-anonymity-routes.js";
-import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
 import {
   handlePostureStream,
@@ -202,15 +201,14 @@ export async function handlePostureRoute(
 ): Promise<boolean> {
   const path = url.pathname;
 
-  // Posture home HTML.
-  if (method === "GET" && path === POSTURE_HOME_PATH) {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-cache",
-    });
-    res.end(renderPostureHomeHTML());
-    return true;
-  }
+  // NOTE (Delta Review A3 remediation): the posture-home HTML at `/posture` is
+  // NO LONGER served here. The dashboard now serves the `/posture` shell (and
+  // `/`) BEFORE its auth gate, byte-for-byte the same unauthenticated static
+  // shell, so `/` and `/posture` are genuinely one surface under the same auth
+  // contract (see `DashboardApprovalChannel.dispatchRootPosture`). This branch
+  // would be unreachable for `GET /posture`; the data routes below are
+  // unchanged and still run behind `checkAuth`. `POSTURE_HOME_PATH` is still
+  // exported for the dashboard's routing/view-route classification.
 
   // Per-agent drill-down HTML (Slice 4). The page is a static shell; it parses
   // the :id from the path and fetches `/api/posture/reach/:id` + `/api/posture/

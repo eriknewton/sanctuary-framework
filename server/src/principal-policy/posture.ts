@@ -489,6 +489,19 @@ export async function buildCastleWallPosture(
   };
 }
 
+/**
+ * Map a Node `process.platform` token to the Castle Wall posture's coarse
+ * `platform` field (`"macos" | "linux" | "other"`). The posture surfaces this so
+ * the operator can see which enforcement story applies (the macOS sysext path vs
+ * the Linux path vs an unsupported host) without leaking the exact OS build.
+ *
+ * Exported (consumed by the dashboard's `buildStatusCastleWall`, which derives
+ * the same posture shape for the auth-gated `/v1/status` document) so the two
+ * code paths classify the platform identically and can never diverge — the
+ * mapping lives in exactly one place. `darwin → macos`, `linux → linux`, and
+ * every other token collapses to `other` (the honest "no first-class
+ * enforcement story" bucket).
+ */
 export function mapPlatform(platform: NodeJS.Platform): "macos" | "linux" | "other" {
   if (platform === "darwin") return "macos";
   if (platform === "linux") return "linux";

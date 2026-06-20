@@ -157,8 +157,14 @@ these subsystems are largely independent. The fix is documentation, not deletion
   internal snapshot; `buildHealthEvidenceReport`, 1 file).
 - **shr/** = a SIGNED, versioned, portable capability ADVERTISEMENT an agent hands a counterparty to
   PROVE posture without being trusted (the external cryptographic claim).
-- **principal-policy/posture.ts + posture-routes.ts** = the operator-facing `/posture` HTTP
-  DASHBOARD (the live human UI surface).
+- **principal-policy/posture.ts + posture-routes.ts** = the operator-facing posture HTTP
+  DASHBOARD (the live human UI surface). Since the 2026-06-19 root-flip the SAME static HTML shell
+  is the default page at BOTH `/` and `/posture` (`dashboard.ts` serves it before the auth gate);
+  the shell carries no posture data and fetches the evidence from `/api/posture/*`, which stay
+  behind `checkAuth`. Do NOT confuse this dashboard posture with the unauthenticated `/api/health`
+  probe: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer ONLY (no arm-state, no audit
+  scan); the detailed evidence-gated Castle Wall arm-state is served exclusively behind auth, via
+  `/api/posture/castle-wall` and the SESSION_TOKEN-gated `/v1/status` document.
 - Crisp rule: **audit scores you, health snapshots you (internally), shr signs-and-advertises you
   (externally), posture shows you (in a dashboard).**
 

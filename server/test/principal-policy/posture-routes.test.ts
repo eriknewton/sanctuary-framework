@@ -94,15 +94,16 @@ function newLog(): AuditLog {
 }
 
 describe("posture route layer", () => {
-  it("serves the posture home HTML at /posture", async () => {
+  it("no longer owns the /posture home HTML (served pre-auth by the dashboard)", async () => {
+    // Delta Review A3 remediation: the `/posture` home shell is now served by
+    // the dashboard BEFORE its auth gate (byte-for-byte the same shell as `/`),
+    // so `/` and `/posture` are one surface under one auth contract. The route
+    // layer therefore no longer serves the `/posture` HTML — it falls through
+    // (this harness 404s an unhandled path). The shell content itself is pinned
+    // by `posture-home-html.test.ts` + the dashboard/v1.1 routing tests.
     const base = await serve(baseDeps(newLog(), []));
     const res = await fetch(`${base}${POSTURE_HOME_PATH}`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/html");
-    const body = await res.text();
-    expect(body).toContain("Sovereignty Posture");
-    // Never-fake-green discipline visible in the renderer.
-    expect(body).toContain("/api/posture/home");
+    expect(res.status).toBe(404);
   });
 
   it("composes the home payload (G1+G2+G4 + honest protection split)", async () => {

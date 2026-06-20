@@ -923,34 +923,32 @@ describe("Principal Dashboard", () => {
     });
   });
 
-  // ── Honest /api/health castle_wall source (Delta Review A3) ──────────
+  // ── /api/health stays a cheap, non-sensitive liveness probe (A3 remediation) ──
 
-  describe("/api/health reports the evidence-gated castle_wall arm-state", () => {
-    it("preserves the { ok, mode } shape AND adds an honest castle_wall", async () => {
+  describe("/api/health does NOT leak the Castle Wall posture", () => {
+    // SECURITY regression guard (Delta Review A3 remediation): a prior revision
+    // attached the full evidence-based Castle Wall posture (origin/operator id,
+    // verdict counts, enforcement timestamps) to this UNAUTHENTICATED probe and
+    // ran an unbounded audit scan + per-entry Ed25519 re-verify per call. That
+    // is reverted: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
+    // ONLY. The honest arm-state lives behind auth (`/api/posture/castle-wall`,
+    // `/v1/status`), never here.
+    it("returns ONLY { ok, mode } — no castle_wall, no posture telemetry", async () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       expect(res.status).toBe(200);
       const data = await res.json();
-      // Back-compat: the CLI health probe + external monitors key on these.
       expect(data.ok).toBe(true);
       expect(data.mode).toBe("principal-policy");
-      // A3 fix: castle_wall is now the full evidence-gated posture object, not
-      // the dead `{ status: "unknown" }` placeholder.
-      expect(data.castle_wall).toBeDefined();
-      expect(data.castle_wall.arm_state).toBeDefined();
+      // The detailed posture (and the fields that would leak operator identity
+      // or enforcement telemetry) must NOT be on the unauthenticated probe.
+      expect(data.castle_wall).toBeUndefined();
+      expect(data.arm_state).toBeUndefined();
+      expect(data.origin_machine).toBeUndefined();
+      expect(data.verdict_counts).toBeUndefined();
+      expect(Object.keys(data).sort()).toEqual(["mode", "ok"]);
     });
 
-    it("never fakes green: no audit evidence ⇒ arm_state unknown, not armed", async () => {
-      // This bare rig has no unlocked audit log, so there is no enforcement
-      // evidence to read. The honest answer is `unknown` (amber), never `armed`.
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
-      const data = await res.json();
-      expect(data.castle_wall.arm_state).toBe("unknown");
-      expect(data.castle_wall.arm_state).not.toBe("armed");
-      // The producer authenticity basis is honestly "not_applicable" off-green.
-      expect(data.castle_wall.producer_authenticity).toBe("not_applicable");
-    });
-
-    it("/api/health keeps its no-store cache header after the A3 change", async () => {
+    it("/api/health keeps its no-store cache header", async () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       expect(res.headers.get("cache-control")).toBe("no-store");
     });
