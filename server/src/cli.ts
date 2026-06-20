@@ -420,7 +420,7 @@ Commands:
     const agentId = process.env.SANCTUARY_AGENT_ID ?? "mcp-host";
     const fortressId =
       process.env.SANCTUARY_FORTRESS_ID ?? fortressIdFromStoragePath(config.storage_path);
-    const { broker } = await openBroker();
+    const { broker, auditLog } = await openBroker();
     const server = createBrokerMcpServer(broker, {
       skill: process.env.SANCTUARY_BROKER_SKILL ?? process.env.SANCTUARY_SKILL_NAME ?? agentId,
       agentId,
@@ -431,6 +431,35 @@ Commands:
     });
     const transport = new StdioServerTransport();
     await server.connect(transport);
+
+    // Observability (Option C): periodic process-liveness heartbeat for the
+    // long-running broker daemon. A reader (principal-policy/feature-health.ts)
+    // turns a MISSING heartbeat in a quiet window into an honest "broker daemon
+    // silently died" alarm instead of `unknown`. HONEST SCOPE: this proves only
+    // that this daemon PROCESS is alive, NOT that it would correctly mint/deny a
+    // token and NOT that the keychain backend is reachable.
+    const { startBrokerLivenessHeartbeat } = await import("./broker-mcp/liveness-heartbeat.js");
+    const liveness = startBrokerLivenessHeartbeat({ auditLog, fortressId });
+
+    // CRITICAL (the #657 false-RED lesson): a clean broker-server shutdown must
+    // record an INTENTIONAL stand-down. Without it, every deliberate stop reads
+    // as a silent death for the whole digest window. Wire it to SIGTERM / SIGINT
+    // AND the transport/server close hook, then exit. `standDown()` is
+    // idempotent, so overlapping triggers emit at most one stand-down.
+    let shuttingDown = false;
+    const shutdownBroker = (exit: boolean): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      // Fire and forget: standDown() resolves even if the append/flush fails
+      // (fail toward the alarm), and process.exit owns the lifecycle from here.
+      void liveness.standDown().finally(() => {
+        if (exit) process.exit(0);
+      });
+    };
+    server.onclose = () => shutdownBroker(true);
+    process.on("SIGTERM", () => shutdownBroker(true));
+    process.on("SIGINT", () => shutdownBroker(true));
+
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("Sanctuary Secret Broker MCP server running (stdio)");
     return;

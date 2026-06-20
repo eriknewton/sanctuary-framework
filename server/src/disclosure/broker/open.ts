@@ -37,6 +37,14 @@ export interface OpenBrokerOptions {
 
 export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
   broker: Broker;
+  /**
+   * The shared audit log the broker writes to (same storage the main server
+   * uses). Threaded out so the long-running `broker-server` daemon can append
+   * its liveness heartbeat / stand-down through the SAME chain the broker's
+   * token decisions land on, without re-opening storage. The per-invocation
+   * `sanctuary secrets` CLI ignores it.
+   */
+  auditLog: AuditLog;
   close: () => Promise<void>;
 }> {
   // 1. Resolve or load Sanctuary config for storage path
@@ -86,6 +94,7 @@ export async function openBroker(opts: OpenBrokerOptions = {}): Promise<{
 
   return {
     broker,
+    auditLog,
     close: async () => {
       // Drain pending audit writes before the caller exits — without this,
       // CLI invocations that call `process.exit()` immediately after a
