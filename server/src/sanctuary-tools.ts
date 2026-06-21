@@ -125,8 +125,8 @@ export function createSanctuaryTools(
       description:
         "One-shot bootstrap for a new sovereign agent identity. " +
         "Generates an Ed25519 keypair, stores the encrypted identity, " +
-        "constructs a Sovereignty Health Report (SHR), and publishes it to Verascore. " +
-        "Returns { did, profileUrl, tier } for the newly-minted agent.",
+        "constructs an SHR, and OPTIONALLY publishes to Verascore when publish=true " +
+        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -297,9 +297,9 @@ export function createSanctuaryTools(
     {
       name: "sanctuary_policy_status",
       description:
-        "Return a summary of the active Principal Policy: which operations " +
-        "require approval (Tier 1), which are subject to anomaly detection " +
-        "(Tier 2), and which auto-allow with audit (Tier 3).",
+        "Return active Principal Policy summary: explicit Tier 1 and Tier 3 operation " +
+        "lists plus Tier 2 anomaly-detection configuration. Tier 2 is not exposed as " +
+        "a named operation list.",
       inputSchema: {
         type: "object",
         properties: {},

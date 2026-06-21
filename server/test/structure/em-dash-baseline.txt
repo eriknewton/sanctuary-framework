@@ -108,11 +108,11 @@
 2	server/src/audit/detector.ts
 2	server/src/audit/reset-history.ts
 1	server/src/audit/siem-formatter.ts
-3	server/src/audit/siem-tools.ts
+2	server/src/audit/siem-tools.ts
 1	server/src/audit/tools.ts
 3	server/src/bridge/bridge.ts
 1	server/src/bridge/tools.ts
-2	server/src/broker-mcp/broker-server.ts
+1	server/src/broker-mcp/broker-server.ts
 8	server/src/castle-wall/allowlist/habeas-port.ts
 2	server/src/castle-wall/allowlist/schema.ts
 1	server/src/castle-wall/boot/boot-token.ts
@@ -141,7 +141,7 @@
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 4	server/src/compliance/eu_ai_act/cli.ts
 35	server/src/compliance/eu_ai_act/coverage_matrix.ts
-17	server/src/compliance/eu_ai_act/generator.ts
+16	server/src/compliance/eu_ai_act/generator.ts
 11	server/src/compliance/eu_ai_act/pdf.ts
 9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
 7	server/src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts
@@ -206,7 +206,7 @@
 7	server/src/operational/context-gate-tools.ts
 2	server/src/operational/context-gate.ts
 4	server/src/operational/governor-tools.ts
-4	server/src/operational/hardening-tools.ts
+1	server/src/operational/hardening-tools.ts
 5	server/src/policy-engine/auto-trigger-ladder.ts
 4	server/src/policy-engine/canonical-policy.ts
 1	server/src/policy-engine/commitment-boundary.ts
@@ -222,7 +222,6 @@
 2	server/src/proxy/client-manager.ts
 2	server/src/proxy/proxy-router.ts
 3	server/src/reputation/reputation-store.ts
-1	server/src/reputation/tools.ts
 5	server/src/router.ts
 6	server/src/sanctuary-tools.ts
 4	server/src/sdw/export.ts
@@ -236,9 +235,7 @@
 1	server/src/shr/decommission-verifier.ts
 12	server/src/shr/gateway-adapter.ts
 6	server/src/shr/generator.ts
-1	server/src/shr/tools.ts
 4	server/src/shr/verifier.ts
-2	server/src/sovereignty-profile-tools.ts
 3	server/src/storage/filesystem.ts
 2	server/src/substrate/governance.ts
 1	server/src/substrate/manifest.ts

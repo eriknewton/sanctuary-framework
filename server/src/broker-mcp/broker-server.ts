@@ -122,7 +122,8 @@ export function createBrokerMcpServer(
       {
         name: "broker/list_grants",
         description:
-          "List the currently-active grants visible to this broker. Names only — no secret values.",
+          "List active grant metadata visible to this broker: skill, secret name, scope, optional " +
+          "agent/tenant/fortress/audience, and TTL. Secret values are never returned.",
         inputSchema: {
           type: "object",
           properties: {},
