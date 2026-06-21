@@ -8,7 +8,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  PrincipalPolicy,
+} from "../../src/principal-policy/types.js";
 import {
   bindWithRetry,
   randomTestPort,
@@ -369,6 +373,46 @@ describe("Principal Dashboard", () => {
       expect(data.pending_count).toBe(0);
     });
 
+    it("includes approval_redirect mode in /api/status for folded approval routing", async () => {
+      const policy: PrincipalPolicy = {
+        version: 1,
+        tier1_always_approve: ["state_export"],
+        tier2_anomaly: {
+          new_namespace_access: "approve",
+          new_counterparty: "approve",
+          frequency_spike_multiplier: 3,
+          max_signs_per_minute: 10,
+          bulk_read_threshold: 20,
+          first_session_policy: "approve",
+        },
+        tier3_always_allow: [],
+        approval_channel: {
+          type: "callback",
+          timeout_seconds: 2,
+          auto_deny: true,
+        },
+        approval_redirect: {
+          enabled: true,
+          mode: "replace",
+        },
+      };
+      authDashboard.setDependencies({
+        policy,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: {} as never,
+      });
+
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.policy.approval_redirect).toEqual({
+        enabled: true,
+        mode: "replace",
+      });
+    });
+
     it("gates GET /api/posture/composition behind the SAME checkAuth gate", async () => {
       // Recognition precursor: the composition gate endpoint must sit behind the
       // same bearer gate as the rest of /api/posture/*, never a weaker path.
@@ -410,6 +454,17 @@ describe("Principal Dashboard", () => {
         headers: { Authorization: `Bearer ${wrongToken}` },
       });
       expect(res.status).toBe(401);
+    });
+
+    it("sets the dashboard login cookie SameSite=Strict", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const cookie = res.headers.get("set-cookie") ?? "";
+      expect(cookie).toContain("sanctuary_session=");
+      expect(cookie).toContain("SameSite=Strict");
     });
 
     it("rejects long-lived token in query parameter (SEC-012)", async () => {
