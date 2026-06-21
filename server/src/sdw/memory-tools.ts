@@ -61,8 +61,8 @@ export interface SdwMemoryToolsOptions {
   readonly auditLog: AuditLog;
 }
 
-/** Public, brain-agnostic view of a passage (the shipped shape, named honestly). */
-function publicPassage(passage: MemoryPassage): Record<string, unknown> {
+/** Full body view, reserved for explicit single-passage retrieval. */
+function publicFullPassage(passage: MemoryPassage): Record<string, unknown> {
   return {
     passage_id: passage.passage_id,
     owner_ref: passage.owner_ref,
@@ -75,9 +75,22 @@ function publicPassage(passage: MemoryPassage): Record<string, unknown> {
   };
 }
 
-function publicSearchResult(result: MemorySearchResult): Record<string, unknown> {
+function publicPassageMetadata(passage: MemoryPassage): Record<string, unknown> {
   return {
-    passage: publicPassage(result.passage),
+    passage_id: passage.passage_id,
+    owner_ref: passage.owner_ref,
+    content_hash: passage.content_hash,
+    created_at: passage.created_at,
+    chunk_count: passage.chunk_count,
+    tag_count: passage.tags.length,
+  };
+}
+
+function publicSearchResult(
+  result: MemorySearchResult,
+): Record<string, unknown> {
+  return {
+    passage: publicPassageMetadata(result.passage),
     match_count: result.match_count,
   };
 }
@@ -255,7 +268,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
         });
         return deny("memory_insert");
       }
-      return toolResult({ inserted: true, passage: publicPassage(passage) });
+      return toolResult({ inserted: true, passage: publicPassageMetadata(passage) });
     },
   };
 
@@ -286,7 +299,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           return toolResult({ found: false });
         }
         await auditSuccess("memory_get", { passage_id: passageId, result_count: 1 });
-        return toolResult({ found: true, passage: publicPassage(passage) });
+        return toolResult({ found: true, passage: publicFullPassage(passage) });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "get_failed";
         await auditFailure("memory_get_denied", { denial_class: category });
@@ -301,7 +314,8 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     description:
       "Deterministic substring search over your sovereign memory passages. This is " +
       "the always-available lexical search so you can query your own vault with no " +
-      "engine running; semantic / embedding search lives in a swappable engine, not here.",
+      "engine running; semantic / embedding search lives in a swappable engine, not here. " +
+      "Returns metadata only; use memory_get for an explicit full-body read.",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -339,7 +353,9 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           limited: limit ?? null,
           tag_filter: typeof tag === "string",
         });
-        return toolResult({ results: results.map(publicSearchResult) });
+        return toolResult({
+          results: results.map(publicSearchResult),
+        });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "search_failed";
         await auditFailure("memory_search_denied", { denial_class: category });
@@ -383,7 +399,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
           limited: limit ?? null,
           after_provided: typeof after === "string",
         });
-        return toolResult({ passages: passages.map(publicPassage) });
+        return toolResult({ passages: passages.map(publicPassageMetadata) });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "list_failed";
         await auditFailure("memory_list_denied", { denial_class: category });
