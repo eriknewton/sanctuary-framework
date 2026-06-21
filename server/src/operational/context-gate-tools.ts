@@ -586,31 +586,10 @@ export function createContextGateTools(
           });
         }
 
-        // Build the filtered context that is safe to send. Field-level policy
-        // runs first; local span filtering then catches PII/secrets inside
-        // otherwise-allowed strings.
-        const safeContext: Record<string, unknown> = {};
-        for (const decision of result.decisions) {
-          switch (decision.action) {
-            case "allow":
-              safeContext[decision.field] = context[decision.field];
-              break;
-            case "redact":
-              // Field excluded from safe context
-              break;
-            case "hash":
-              safeContext[decision.field] = decision.hash_value;
-              break;
-            case "summarize":
-              // Include but mark for summarization
-              safeContext[decision.field] = context[decision.field];
-              break;
-          }
-        }
         let privacyFiltered: Awaited<ReturnType<typeof applyConfiguredPrivacyFilter>>;
         try {
           privacyFiltered = await applyConfiguredPrivacyFilter(
-            safeContext,
+            result.filtered_output,
             privacyVault,
             policyId,
             privacyFilterConfig
@@ -804,15 +783,15 @@ export function createContextGateTools(
           log_only: {
             type: "boolean",
             description:
-              "Enable log_only mode: filter decisions are logged but original " +
-              "args are passed to handlers. Useful for monitoring before " +
-              "enabling actual filtering. Default: leave unchanged.",
+              "Enable log_only mode with a bound policy: filter decisions are " +
+              "logged but original args are passed to handlers. Useful for " +
+              "monitoring before enabling actual filtering. Default: leave unchanged.",
           },
           default_policy_id: {
             type: "string",
             description:
               "Set the default context-gating policy to use for filtering. " +
-              "If not set, the enforcer uses built-in sensitive field patterns. " +
+              "If not set while the enforcer is enabled, calls are blocked. " +
               "Default: leave unchanged.",
           },
           on_deny: {

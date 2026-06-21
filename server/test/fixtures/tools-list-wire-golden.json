@@ -1380,11 +1380,11 @@
           },
           "log_only": {
             "type": "boolean",
-            "description": "Enable log_only mode: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
+            "description": "Enable log_only mode with a bound policy: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
           },
           "default_policy_id": {
             "type": "string",
-            "description": "Set the default context-gating policy to use for filtering. If not set, the enforcer uses built-in sensitive field patterns. Default: leave unchanged."
+            "description": "Set the default context-gating policy to use for filtering. If not set while the enforcer is enabled, calls are blocked. Default: leave unchanged."
           },
           "on_deny": {
             "type": "string",

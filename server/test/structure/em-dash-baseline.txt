@@ -198,7 +198,7 @@
 7	server/src/mesh/trust-root.ts
 25	server/src/operational/audit-log.ts
 4	server/src/operational/call-governor.ts
-3	server/src/operational/context-gate-enforcer.ts
+1	server/src/operational/context-gate-enforcer.ts
 4	server/src/operational/context-gate-recommend.ts
 7	server/src/operational/context-gate-tools.ts
 2	server/src/operational/context-gate.ts
