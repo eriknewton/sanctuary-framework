@@ -243,7 +243,7 @@ export interface ApprovalGateEvent {
    * Human-facing target the request acts on, derived by the gate via
    * `deriveTargetResource` (e.g. `state_export:SECRET`). Surfaced in the
    * operator card's `action_summary` so two same-operation cards are
-   * visibly distinct — the operator must be able to tell the PUBLIC export
+   * visibly distinct - the operator must be able to tell the PUBLIC export
    * from the SECRET export they are approving. Display-only; the security
    * binding is carried by `args_binding`.
    */
@@ -258,7 +258,7 @@ export interface ApprovalGateEvent {
  * either silently re-open the amplification hole or wedge a legitimate
  * approval as unmatchable.
  *
- * `args_binding` is the gate's `normalizedArgsHash` — the SAME normalization
+ * `args_binding` is the gate's `normalizedArgsHash` - the SAME normalization
  * the direct approval-proof envelope binds via `normalized_args_hash`. When
  * present it makes two same-operation, same-millisecond requests with
  * DIFFERENT args produce DISTINCT keys (two inbox cards, two waiters);
@@ -394,6 +394,17 @@ export class ApprovalAggregator {
 
   /** Cached entries by `aggregator_id`. */
   private readonly entries = new Map<string, AggregatedApproval>();
+  /**
+   * Per-entry terminal-resolution lock. The old implementation mutated
+   * `entry.status` synchronously before awaiting I/O, which accidentally
+   * made double resolution idempotent but exposed terminal state too early.
+   * This lock preserves idempotency without publishing terminal status until
+   * the signed audit write and encrypted entry persist have both succeeded.
+   */
+  private readonly resolutionLocks = new Map<
+    string,
+    Promise<AggregatedApproval>
+  >();
   /** Dedup index: `${harness}|${agent}|${audit_id}` -> aggregator_id. */
   private readonly dedupIndex = new Map<string, string>();
   /** Correlation index: gate `correlation_id` -> aggregator_id. */
@@ -838,17 +849,14 @@ export class ApprovalAggregator {
     if (entry.status !== "pending") {
       return entry;
     }
-    entry.status = decision;
-    entry.resolved_at = this.now().toISOString();
-    entry.resolved_by = operatorId;
-    entry.last_modified_revision = this.nextRevision();
-    await this.persist(entry);
-    await this.auditLog.appendCritical({
-      layer: "l2",
-      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-      identity_id: this.identityId,
-      result: decision === "approved" ? "success" : "failure",
-      details: {
+    const resolvedAt = this.now().toISOString();
+    return this.resolvePendingEntry({
+      entry,
+      status: decision,
+      resolvedAt,
+      resolvedBy: operatorId,
+      auditResult: decision === "approved" ? "success" : "failure",
+      auditDetails: {
         aggregator_id: entry.aggregator_id,
         source_harness: entry.source_harness,
         source_agent_id: entry.source_agent_id,
@@ -856,11 +864,9 @@ export class ApprovalAggregator {
         policy_rule_id: entry.policy_rule_id,
         decision,
         decided_by: operatorId,
-        decided_at: entry.resolved_at,
+        decided_at: resolvedAt,
       },
     });
-    this.emit({ type: "resolved", entry: { ...entry } });
-    return entry;
   }
 
   // ── Internal: ingest paths ─────────────────────────────────────────────
@@ -974,30 +980,24 @@ export class ApprovalAggregator {
         ? "approved"
         : "denied";
 
-    entry.status = status;
-    entry.resolved_at = event.resolution.decided_at;
-    entry.resolved_by = event.resolution.decided_by;
-    entry.last_modified_revision = this.nextRevision();
-    await this.persist(entry);
-    await this.auditLog.appendCritical({
-      layer: "l2",
-      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-      identity_id: this.identityId,
-      result: status === "approved" ? "success" : "failure",
-      details: {
+    return this.resolvePendingEntry({
+      entry,
+      status,
+      resolvedAt: event.resolution.decided_at,
+      resolvedBy: event.resolution.decided_by,
+      auditResult: status === "approved" ? "success" : "failure",
+      auditDetails: {
         aggregator_id: id,
         source_harness: entry.source_harness,
         source_agent_id: entry.source_agent_id,
         audit_log_entry_id: entry.audit_log_entry_id,
         policy_rule_id: entry.policy_rule_id,
         decision: status,
-        decided_by: entry.resolved_by,
-        decided_at: entry.resolved_at,
+        decided_by: event.resolution.decided_by,
+        decided_at: event.resolution.decided_at,
         fail_closed: failClosed,
       },
     });
-    this.emit({ type: "resolved", entry: { ...entry } });
-    return entry;
   }
 
   // ── Internal: helpers ──────────────────────────────────────────────────
@@ -1061,17 +1061,14 @@ export class ApprovalAggregator {
     for (const entry of this.entries.values()) {
       if (entry.status !== "pending") continue;
       if (Date.parse(entry.expires_at) > nowMs) continue;
-      entry.status = "expired";
-      entry.resolved_at = this.now().toISOString();
-      entry.resolved_by = "system_ttl";
-      entry.last_modified_revision = this.nextRevision();
-      await this.persist(entry);
-      await this.auditLog.appendCritical({
-        layer: "l2",
-        operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
-        identity_id: this.identityId,
-        result: "failure",
-        details: {
+      const resolvedAt = this.now().toISOString();
+      await this.resolvePendingEntry({
+        entry,
+        status: "expired",
+        resolvedAt,
+        resolvedBy: "system_ttl",
+        auditResult: "failure",
+        auditDetails: {
           aggregator_id: entry.aggregator_id,
           source_harness: entry.source_harness,
           source_agent_id: entry.source_agent_id,
@@ -1079,11 +1076,105 @@ export class ApprovalAggregator {
           policy_rule_id: entry.policy_rule_id,
           decision: "expired",
           decided_by: "system_ttl",
-          decided_at: entry.resolved_at,
+          decided_at: resolvedAt,
         },
       });
-      this.emit({ type: "resolved", entry: { ...entry } });
     }
+  }
+
+  private async resolvePendingEntry(params: {
+    entry: AggregatedApproval;
+    status: AggregatedApprovalStatus;
+    resolvedAt: string;
+    resolvedBy: string;
+    auditResult: "success" | "failure";
+    auditDetails: Record<string, unknown>;
+  }): Promise<AggregatedApproval> {
+    const id = params.entry.aggregator_id;
+    const existing = this.resolutionLocks.get(id);
+    if (existing) {
+      return existing;
+    }
+
+    const task = this.commitPendingResolution(params);
+    this.resolutionLocks.set(id, task);
+    try {
+      return await task;
+    } finally {
+      if (this.resolutionLocks.get(id) === task) {
+        this.resolutionLocks.delete(id);
+      }
+    }
+  }
+
+  private async commitPendingResolution(params: {
+    entry: AggregatedApproval;
+    status: AggregatedApprovalStatus;
+    resolvedAt: string;
+    resolvedBy: string;
+    auditResult: "success" | "failure";
+    auditDetails: Record<string, unknown>;
+  }): Promise<AggregatedApproval> {
+    const current = this.entries.get(params.entry.aggregator_id);
+    if (!current) {
+      throw new Error("approval-aggregator: not_found");
+    }
+    if (current.status !== "pending") {
+      return current;
+    }
+
+    const updated: AggregatedApproval = {
+      ...current,
+      status: params.status,
+      resolved_at: params.resolvedAt,
+      resolved_by: params.resolvedBy,
+      last_modified_revision: this.nextRevision(),
+    };
+
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+      identity_id: this.identityId,
+      result: params.auditResult,
+      details: params.auditDetails,
+    });
+
+    try {
+      await this.persist(updated);
+    } catch (err) {
+      // The signed audit entry is already durable (appendCritical above). We
+      // attempt to roll the PERSISTED entry back to pending so a reported
+      // failure does not leave a terminal entry that would hydrate as applied
+      // on restart. The in-memory entry is still pending (updated has not been
+      // published below), so this process stays consistent.
+      //
+      // If the rollback ALSO fails, the on-disk entry may be inconsistent
+      // (terminal despite this failure, e.g. a write that installed via rename
+      // then threw on fsync) - surface that LOUDLY rather than swallowing it
+      // (AGENTS.md rule #5: never silently degrade). RESIDUAL (tracked): making
+      // the audit-log write and the entry-store write atomic is the larger
+      // restructure flagged in ASSURANCE_MATRIX ("two sync API sites"); this
+      // best-effort restore does not make the two writes transactional.
+      try {
+        await this.persist(current);
+      } catch (restoreErr) {
+        throw new Error(
+          "approval-aggregator: resolution persist failed AND the rollback to " +
+            `pending failed for ${updated.aggregator_id}; the persisted entry may ` +
+            "be inconsistent (terminal on disk despite this failure) and must be " +
+            "reconciled. original: " +
+            (err instanceof Error ? err.message : String(err)) +
+            "; rollback: " +
+            (restoreErr instanceof Error ? restoreErr.message : String(restoreErr)),
+          { cause: restoreErr },
+        );
+      }
+      throw err;
+    }
+
+    this.entries.set(updated.aggregator_id, updated);
+    this.emit({ type: "resolved", entry: { ...updated } });
+    return updated;
   }
 
   private async persist(entry: AggregatedApproval): Promise<void> {
