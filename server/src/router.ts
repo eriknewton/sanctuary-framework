@@ -1,11 +1,11 @@
 /**
- * Sanctuary MCP Server — Tool Router
+ * Sanctuary MCP Server - Tool Router
  *
  * Routes sanctuary/* tool calls to their layer-specific handlers.
  * Every tool call passes through schema validation and the ApprovalGate
  * (if configured) before execution. Neither can be bypassed.
  *
- * This module is the abstraction boundary for MCP SDK version migration —
+ * This module is the abstraction boundary for MCP SDK version migration -
  * if the SDK API changes, only this module needs updating.
  */
 
@@ -49,9 +49,11 @@ const AGENT_CATALOG_HIDDEN_TOOLS = new Set([
   "context_gate_apply_template",
 ]);
 
+const GENERIC_GATE_DENIAL_REMEDIATION = "unavailable" as const;
+
 /** Options for server creation */
 export interface ServerOptions {
-  /** Approval gate — if provided, every tool call is evaluated before execution */
+  /** Approval gate - if provided, every tool call is evaluated before execution */
   gate?: ApprovalGate;
   /** Pi-3 honeypot runtime for server-local fake tool catalog injection. */
   toolCallTrapRuntime?: ToolCallTrapRuntime;
@@ -115,7 +117,7 @@ export function createServer(
     };
   });
 
-  // Register tool execution — validation + gate sit between router and handler
+  // Register tool execution - validation + gate sit between router and handler
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const typedArgs = (args ?? {}) as Record<string, unknown>;
@@ -157,7 +159,7 @@ export function createServer(
       };
     }
 
-    // ── Schema Validation ────────────────────────────────────────────
+    // Schema Validation
     // Validate arguments against the tool's declared inputSchema.
     // This runs BEFORE the gate so that the gate sees normalized args.
     let approvalRef: string | undefined;
@@ -185,7 +187,7 @@ export function createServer(
       };
     }
 
-    // ── Approval Gate ──────────────────────────────────────────────
+    // Approval Gate
     // If a gate is configured, every tool call must pass through it.
     // Denied calls return the fixed coarse schema; details stay in audit.
     if (gate) {
@@ -193,7 +195,11 @@ export function createServer(
       try {
         gateArgs = tool.approvalTargetArgs?.(handlerArgs) ?? handlerArgs;
       } catch {
-        const errorPayload = fixedDenial(`audit:gate:${name}`, "try_lower_scope", null);
+        const errorPayload = fixedDenial(
+          `audit:gate:${name}`,
+          GENERIC_GATE_DENIAL_REMEDIATION,
+          null
+        );
         return {
           content: [
             {
@@ -210,21 +216,11 @@ export function createServer(
         approvalRef ? { approval_ref: approvalRef } : undefined
       );
       if (!result.allowed) {
-        // OPACITY NOTE (Invariant #7, policy-surface sweep 2026-06-13): this hint
-        // is a deliberate 2-valued agent-facing UX affordance, not a leak of policy
-        // internals. "request_review" tells the agent to seek human approval;
-        // "try_lower_scope" tells it to reduce scope / drop an injected arg and
-        // retry. That lets the agent self-correct instead of blindly retrying. It
-        // distinguishes exactly ONE bit — "needs approval" vs "scope/injection
-        // blocked" — i.e. which enforcement LAYER fired. It never reveals the
-        // matched rule, the tier, the anomaly threshold, the namespace, or any
-        // other policy detail (those stay in the audit record only). Collapsing
-        // this to a single fixed hint would trade that self-correction affordance
-        // for marginally tighter opacity; that is a product/opacity call flagged
-        // for Erik (collapse-vs-keep). Behavior is intentionally UNCHANGED here.
+        // Invariant #7: the agent-facing denial must not reveal which policy
+        // class fired. Specific remediation belongs in operator-only audit data.
         const errorPayload = fixedDenial(
           `audit:gate:${name}`,
-          result.approval_required ? "request_review" : "try_lower_scope",
+          GENERIC_GATE_DENIAL_REMEDIATION,
           null
         );
         return {
@@ -292,7 +288,7 @@ export function createServer(
       return result;
     } catch (err) {
       // FAIL-CLOSED ERROR HANDLING (CISO MED-2, Invariant #7 no-policy-inference):
-      // an uncaught handler error must NOT return its raw message to the agent —
+      // an uncaught handler error must NOT return its raw message to the agent -
       // `err.message` can carry a path, a policy detail, a stack-derived
       // internal, or a thrown invariant string (info disclosure / fail-open).
       // Instead, LOG the full error operator-side (audit log) under a synthetic
@@ -303,7 +299,7 @@ export function createServer(
       const message = err instanceof Error ? err.message : "Unknown error";
       const stack = err instanceof Error ? err.stack : undefined;
       // Operator-visible record (full fidelity). Defensive: a logging failure
-      // must never re-surface the raw error to the agent, so swallow it — the
+      // must never re-surface the raw error to the agent, so swallow it - the
       // generic response below is always returned.
       try {
         await options?.auditLog?.append(
