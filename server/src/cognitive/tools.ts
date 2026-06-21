@@ -831,7 +831,7 @@ export function createCognitiveTools(
   }
 
   const tools: ToolDefinition[] = [
-    // ── Identity Tools ──────────────────────────────────────────────────
+    // Identity Tools
 
     {
       name: "identity_create",
@@ -1148,7 +1148,7 @@ export function createCognitiveTools(
       },
     },
 
-    // ── State Tools ─────────────────────────────────────────────────────
+    // State Tools
 
     {
       name: "state_write",
@@ -1398,7 +1398,7 @@ export function createCognitiveTools(
     {
       name: "state_export",
       description:
-        "Export a namespace's state as an encrypted, portable bundle for migration to another Sanctuary instance. Tier 1: requires operator approval (data leaves the local store). Returns the encrypted bundle; import elsewhere with state_import.",
+        "Export state as an encrypted sanctuary-v1 bundle for migration to another instance of the same fortress, meaning the same master key, for example after restoring via the recovery key. Tier 1: requires operator approval because data leaves the local store. New exports include an authenticated completeness manifest with the namespace set, per-namespace item counts, and per-namespace content checksums. On state_import, the manifest verifies that the bundle body still matches the approved export scope and rejects dropped or added namespaces and entries within that scope. It does not prove that data outside the approved export scope should have been included, and it does not make the bundle importable by a different fortress master key.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1443,7 +1443,7 @@ export function createCognitiveTools(
 
     {
       name: "state_import",
-      description: "Import a previously exported encrypted state bundle into this instance. Tier 1: requires operator approval. Verifies bundle integrity before writing; pairs with state_export.",
+      description: "Import a previously exported encrypted sanctuary-v1 state bundle into another instance of the same fortress, meaning the same master key, for example after restoring via the recovery key. Tier 1: requires operator approval. By default, import requires authenticated bundle integrity and a completeness manifest, then recomputes the manifest before any write. Manifest, count, checksum, timestamp, MAC, or newer-schema mismatches are rejected. The verification proves the bundle body still matches the approved export scope; it does not prove data outside that scope should have been included. Manifestless legacy bundles are rejected unless allow_unverified_legacy is true, and that import result is flagged unverified-completeness-legacy-bundle.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1452,6 +1452,12 @@ export function createCognitiveTools(
             type: "string",
             enum: ["skip", "overwrite", "version"],
             default: "skip",
+          },
+          allow_unverified_legacy: {
+            type: "boolean",
+            default: false,
+            description:
+              "Explicitly import a manifestless legacy bundle without completeness guarantees. Default false rejects bundles that predate authenticated completeness verification.",
           },
         },
         required: ["bundle"],
@@ -1487,7 +1493,8 @@ export function createCognitiveTools(
           args.bundle as string,
           (args.conflict_resolution as "skip" | "overwrite" | "version") ??
             "skip",
-          publicKeyResolver
+          publicKeyResolver,
+          { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
         );
 
         return toolResult(result);
@@ -1498,7 +1505,7 @@ export function createCognitiveTools(
   return { tools, identityManager: identityMgr, internalSigning, namespaceRegistry };
 }
 
-// ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
+// Back-compat alias (L1-L4 rename PR-3)
 // The layer-numbered name stays exported so downstream imports keep working.
 // The functional name above is canonical.
 export const createL1Tools = createCognitiveTools;

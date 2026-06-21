@@ -70,6 +70,46 @@ const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
 // from a legacy bare record (legacy keys are versionKeys, never this).
 const STATE_META_MAC_MARKER = "__sanctuary_meta_mac_v1";
 const FACADE_HIDDEN_MARKER_NAMESPACE = "_facade/hidden";
+const STATE_EXPORT_FORMAT = "sanctuary-v1";
+const STATE_EXPORT_BUNDLE_SCHEMA_VERSION = 1;
+const STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION = 1;
+const STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION = 1;
+const STATE_EXPORT_BUNDLE_MAC_PURPOSE = "state-export-bundle-mac-v1";
+const STATE_EXPORT_BUNDLE_MAC_DOMAIN =
+  "sanctuary.state-export-bundle.v1\n";
+const STATE_EXPORT_BUNDLE_MAC_COVERAGE =
+  "sanctuary-v1-body-and-completeness-manifest";
+const STATE_EXPORT_LEGACY_REJECT_MESSAGE =
+  "export predates completeness verification; re-export, or re-run with allow_unverified_legacy to import without completeness guarantees";
+const ISO_8601_TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
+
+export interface StateExportNamespaceManifest {
+  item_count: number;
+  content_sha256: string;
+}
+
+export interface StateExportCompletenessManifest {
+  schema_version: number;
+  format: string;
+  exported_at: string;
+  namespaces: string[];
+  namespace_count: number;
+  total_keys: number;
+  namespace_items: Record<string, StateExportNamespaceManifest>;
+}
+
+export type StateExportCompletenessVerification =
+  | "verified"
+  | "unverified-completeness-legacy-bundle";
+
+interface ExportedStateItem {
+  key: string;
+  entry: StateEntry;
+}
+
+type StateExportData = Record<string, ExportedStateItem[]>;
+type StateExportBundle = Record<string, unknown>;
 
 export type StateVerificationClassification =
   | "signature_mismatch"
@@ -88,27 +128,84 @@ export class StateVerificationError extends Error {
   }
 }
 
-export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
+function parseExportBundleObject(bundleBase64: string): StateExportBundle {
   const bundleBytes = fromBase64url(bundleBase64);
   const bundleJson = bytesToString(bundleBytes);
-  const bundle = JSON.parse(bundleJson) as {
-    namespaces?: unknown;
-    data?: unknown;
-  };
-  const actualNamespaces =
-    bundle.data && typeof bundle.data === "object" && !Array.isArray(bundle.data)
-      ? Object.keys(bundle.data).sort()
-      : [];
+  const parsed = JSON.parse(bundleJson) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("export bundle is malformed");
+  }
+  return parsed as StateExportBundle;
+}
+
+function assertSupportedExportBundleSchema(bundle: StateExportBundle): void {
+  const schemaVersion = bundle.sanctuary_export_version;
+  if (
+    typeof schemaVersion === "number" &&
+    schemaVersion > STATE_EXPORT_BUNDLE_SCHEMA_VERSION
+  ) {
+    throw new StateVerificationError(
+      "schema_mismatch",
+      "State export bundle schema version is newer than this build supports"
+    );
+  }
+}
+
+function readExportData(bundle: StateExportBundle): StateExportData {
+  const data = bundle.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("export bundle data is malformed");
+  }
+
+  const result: StateExportData = {};
+  for (const [namespace, entries] of Object.entries(data)) {
+    if (!Array.isArray(entries)) {
+      throw new Error("export bundle namespace entries are malformed");
+    }
+    result[namespace] = entries.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new Error("export bundle entry is malformed");
+      }
+      const record = item as Record<string, unknown>;
+      if (
+        typeof record.key !== "string" ||
+        !record.entry ||
+        typeof record.entry !== "object" ||
+        Array.isArray(record.entry)
+      ) {
+        throw new Error("export bundle entry is malformed");
+      }
+      return {
+        key: record.key,
+        entry: record.entry as StateEntry,
+      };
+    });
+  }
+  return result;
+}
+
+function assertBundleNamespaceMetadataMatches(
+  bundle: StateExportBundle,
+  data: StateExportData
+): string[] {
+  const actualNamespaces = Object.keys(data).sort();
   if (Array.isArray(bundle.namespaces)) {
     if (!bundle.namespaces.every((namespace) => typeof namespace === "string")) {
       throw new Error("export bundle namespace metadata is invalid");
     }
     const declaredNamespaces = [...bundle.namespaces].sort();
-    if (declaredNamespaces.join("\0") !== actualNamespaces.join("\0")) {
+    if (JSON.stringify(declaredNamespaces) !== JSON.stringify(actualNamespaces)) {
       throw new Error("export bundle namespace metadata does not match data");
     }
   }
   return actualNamespaces;
+}
+
+export function decodeExportBundleNamespaces(bundleBase64: string): string[] {
+  const bundle = parseExportBundleObject(bundleBase64);
+  assertSupportedExportBundleSchema(bundle);
+  const data = readExportData(bundle);
+  return assertBundleNamespaceMetadataMatches(bundle, data);
 }
 
 function parseFacadeHiddenMarker(raw: Uint8Array): { namespace: string; key: string } | null {
@@ -296,6 +393,131 @@ function canonicalize(value: unknown): unknown {
 
 function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
+}
+
+function sortExportItems(entries: ExportedStateItem[]): ExportedStateItem[] {
+  return [...entries]
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    .map((item) => ({ key: item.key, entry: item.entry }));
+}
+
+function exportNamespaceChecksum(entries: ExportedStateItem[]): string {
+  return hashToString(stringToBytes(canonicalJson(sortExportItems(entries))));
+}
+
+function buildCompletenessManifest(
+  exportedAt: string,
+  data: StateExportData
+): StateExportCompletenessManifest {
+  const namespaces = Object.keys(data).sort();
+  const namespaceItems: Record<string, StateExportNamespaceManifest> = {};
+  let totalKeys = 0;
+
+  for (const namespace of namespaces) {
+    const entries = data[namespace] ?? [];
+    namespaceItems[namespace] = {
+      item_count: entries.length,
+      content_sha256: exportNamespaceChecksum(entries),
+    };
+    totalKeys += entries.length;
+  }
+
+  return {
+    schema_version: STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION,
+    format: STATE_EXPORT_FORMAT,
+    exported_at: exportedAt,
+    namespaces,
+    namespace_count: namespaces.length,
+    total_keys: totalKeys,
+    namespace_items: namespaceItems,
+  };
+}
+
+function isWellFormedIso8601Timestamp(value: string): boolean {
+  const match = ISO_8601_TIMESTAMP_RE.exec(value);
+  if (!match) return false;
+
+  const [
+    ,
+    yearText,
+    monthText,
+    dayText,
+    hourText,
+    minuteText,
+    secondText,
+    fractionText,
+    zoneText,
+    signText,
+    offsetHourText,
+    offsetMinuteText,
+  ] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const millisecond = Number((fractionText ?? "0").padEnd(3, "0"));
+  const offsetHour = offsetHourText ? Number(offsetHourText) : 0;
+  const offsetMinute = offsetMinuteText ? Number(offsetMinuteText) : 0;
+
+  if (
+    month < 1 ||
+    month > 12 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
+    return false;
+  }
+
+  const localMs = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond
+  );
+  if (!Number.isFinite(localMs)) return false;
+
+  const localDate = new Date(localMs);
+  if (
+    localDate.getUTCFullYear() !== year ||
+    localDate.getUTCMonth() !== month - 1 ||
+    localDate.getUTCDate() !== day ||
+    localDate.getUTCHours() !== hour ||
+    localDate.getUTCMinutes() !== minute ||
+    localDate.getUTCSeconds() !== second ||
+    localDate.getUTCMilliseconds() !== millisecond
+  ) {
+    return false;
+  }
+
+  const signedOffsetMinutes =
+    zoneText === "Z"
+      ? 0
+      : (signText === "+" ? 1 : -1) * (offsetHour * 60 + offsetMinute);
+  const expectedUtcMs = localMs - signedOffsetMinutes * 60 * 1000;
+  return Date.parse(value) === expectedUtcMs;
+}
+
+function exportBundleMacPayload(bundle: StateExportBundle): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    sanctuary_export_version: bundle.sanctuary_export_version,
+    format: bundle.format,
+    exported_at: bundle.exported_at,
+    namespaces: bundle.namespaces,
+    data: bundle.data,
+    completeness_manifest: bundle.completeness_manifest,
+  };
+  if (bundle.facade_hidden_markers !== undefined) {
+    payload.facade_hidden_markers = bundle.facade_hidden_markers;
+  }
+  return payload;
 }
 
 /** Constant-time byte comparison for MAC verification (avoids timing leaks). */
@@ -517,6 +739,145 @@ export class StateStore {
   constructor(storage: StorageBackend, masterKey: Uint8Array) {
     this.storage = storage;
     this.masterKey = masterKey;
+  }
+
+  private exportBundleMacBytes(bundle: StateExportBundle): Uint8Array {
+    const macKey = derivePurposeKey(
+      this.masterKey,
+      STATE_EXPORT_BUNDLE_MAC_PURPOSE
+    );
+    return hmacSha256(
+      macKey,
+      stringToBytes(
+        STATE_EXPORT_BUNDLE_MAC_DOMAIN +
+          canonicalJson(exportBundleMacPayload(bundle))
+      )
+    );
+  }
+
+  private createExportBundleIntegrity(
+    bundle: StateExportBundle
+  ): Record<string, unknown> {
+    return {
+      schema_version: STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION,
+      algo: "HMAC-SHA256",
+      coverage: STATE_EXPORT_BUNDLE_MAC_COVERAGE,
+      mac: toBase64url(this.exportBundleMacBytes(bundle)),
+    };
+  }
+
+  private verifyExportBundleCompleteness(
+    bundle: StateExportBundle,
+    data: StateExportData,
+    allowUnverifiedLegacy: boolean
+  ): StateExportCompletenessVerification {
+    const manifest = bundle.completeness_manifest;
+    const integrity = bundle.bundle_integrity;
+
+    if (manifest === undefined && integrity === undefined) {
+      if (!allowUnverifiedLegacy) {
+        throw new StateVerificationError(
+          "integrity_hash_mismatch",
+          STATE_EXPORT_LEGACY_REJECT_MESSAGE
+        );
+      }
+      return "unverified-completeness-legacy-bundle";
+    }
+
+    if (
+      !manifest ||
+      typeof manifest !== "object" ||
+      Array.isArray(manifest) ||
+      !integrity ||
+      typeof integrity !== "object" ||
+      Array.isArray(integrity)
+    ) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle completeness metadata is incomplete"
+      );
+    }
+
+    const manifestRecord = manifest as Record<string, unknown>;
+    const integrityRecord = integrity as Record<string, unknown>;
+    const manifestSchemaVersion = manifestRecord.schema_version;
+    const integritySchemaVersion = integrityRecord.schema_version;
+
+    if (
+      typeof manifestSchemaVersion !== "number" ||
+      typeof integritySchemaVersion !== "number"
+    ) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        "State export bundle completeness schema metadata is malformed"
+      );
+    }
+    if (
+      manifestSchemaVersion > STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION ||
+      integritySchemaVersion > STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION
+    ) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        "State export bundle completeness schema version is newer than this build supports"
+      );
+    }
+    if (
+      manifestSchemaVersion !== STATE_EXPORT_COMPLETENESS_MANIFEST_SCHEMA_VERSION ||
+      integritySchemaVersion !== STATE_EXPORT_BUNDLE_INTEGRITY_SCHEMA_VERSION
+    ) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        "State export bundle completeness schema version is unsupported"
+      );
+    }
+
+    if (
+      bundle.format !== STATE_EXPORT_FORMAT ||
+      typeof bundle.exported_at !== "string" ||
+      manifestRecord.format !== STATE_EXPORT_FORMAT ||
+      manifestRecord.exported_at !== bundle.exported_at ||
+      integrityRecord.algo !== "HMAC-SHA256" ||
+      integrityRecord.coverage !== STATE_EXPORT_BUNDLE_MAC_COVERAGE ||
+      typeof integrityRecord.mac !== "string"
+    ) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle completeness metadata is malformed"
+      );
+    }
+    if (!isWellFormedIso8601Timestamp(bundle.exported_at)) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle exported_at timestamp is malformed"
+      );
+    }
+
+    let providedMac: Uint8Array;
+    try {
+      providedMac = fromBase64url(integrityRecord.mac);
+    } catch {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle integrity MAC is malformed"
+      );
+    }
+
+    if (!constantTimeEqual(providedMac, this.exportBundleMacBytes(bundle))) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle failed integrity verification"
+      );
+    }
+
+    const expectedManifest = buildCompletenessManifest(bundle.exported_at, data);
+    if (canonicalJson(manifestRecord) !== canonicalJson(expectedManifest)) {
+      throw new StateVerificationError(
+        "integrity_hash_mismatch",
+        "State export bundle completeness manifest does not match contents"
+      );
+    }
+
+    return "verified";
   }
 
   /**
@@ -1529,6 +1890,7 @@ export class StateStore {
     total_keys: number;
     bundle_hash: string;
     exported_at: string;
+    completeness_manifest: StateExportCompletenessManifest;
   }> {
     return this.exportNamespaces(
       namespace === undefined ? undefined : [namespace]
@@ -1549,6 +1911,7 @@ export class StateStore {
     total_keys: number;
     bundle_hash: string;
     exported_at: string;
+    completeness_manifest: StateExportCompletenessManifest;
   }> {
     const namespacesToExport: string[] = [];
 
@@ -1605,16 +1968,27 @@ export class StateStore {
       });
     }
 
-    const bundleJson = JSON.stringify({
-      sanctuary_export_version: 1,
-      exported_at: new Date().toISOString(),
+    const exportedAt = new Date().toISOString();
+    const completenessManifest = buildCompletenessManifest(
+      exportedAt,
+      exportData
+    );
+    const bundleRecord: StateExportBundle = {
+      sanctuary_export_version: STATE_EXPORT_BUNDLE_SCHEMA_VERSION,
+      format: STATE_EXPORT_FORMAT,
+      exported_at: exportedAt,
       namespaces: namespacesToExport,
       data: exportData,
       ...(facadeHiddenMarkers.length > 0
         ? { facade_hidden_markers: facadeHiddenMarkers }
         : {}),
-    });
+      completeness_manifest: completenessManifest,
+    };
+    bundleRecord.bundle_integrity = this.createExportBundleIntegrity(
+      bundleRecord
+    );
 
+    const bundleJson = JSON.stringify(bundleRecord);
     const bundleBytes = stringToBytes(bundleJson);
     const bundleHash = hashToString(bundleBytes);
 
@@ -1623,7 +1997,8 @@ export class StateStore {
       namespaces: namespacesToExport,
       total_keys: totalKeys,
       bundle_hash: bundleHash,
-      exported_at: new Date().toISOString(),
+      exported_at: exportedAt,
+      completeness_manifest: completenessManifest,
     };
   }
 
@@ -1633,7 +2008,8 @@ export class StateStore {
   async import(
     bundleBase64: string,
     conflictResolution: "skip" | "overwrite" | "version" = "skip",
-    publicKeyResolver: (kid: string) => Uint8Array | null
+    publicKeyResolver: (kid: string) => Uint8Array | null,
+    options: { allowUnverifiedLegacy?: boolean } = {}
   ): Promise<{
     imported_keys: number;
     skipped_keys: number;
@@ -1642,11 +2018,17 @@ export class StateStore {
     conflicts: number;
     namespaces: string[];
     imported_at: string;
+    completeness_verification: StateExportCompletenessVerification;
   }> {
-    const bundleBytes = fromBase64url(bundleBase64);
-    const bundleJson = bytesToString(bundleBytes);
-    const bundle = JSON.parse(bundleJson);
-    decodeExportBundleNamespaces(bundleBase64);
+    const bundle = parseExportBundleObject(bundleBase64);
+    assertSupportedExportBundleSchema(bundle);
+    const data = readExportData(bundle);
+    assertBundleNamespaceMetadataMatches(bundle, data);
+    const completenessVerification = this.verifyExportBundleCompleteness(
+      bundle,
+      data,
+      options.allowUnverifiedLegacy === true
+    );
 
     let importedKeys = 0;
     let skippedKeys = 0;
@@ -1655,9 +2037,7 @@ export class StateStore {
     let conflicts = 0;
     const namespaces: string[] = [];
 
-    for (const [ns, entries] of Object.entries(
-      bundle.data as Record<string, Array<{ key: string; entry: StateEntry }>>
-    )) {
+    for (const [ns, entries] of Object.entries(data)) {
       // Namespace firewall: skip reserved namespaces during import.
       // F6: reject ALL underscore-prefixed (internal) namespaces, not just the
       // curated RESERVED_NAMESPACE_PREFIXES list. Export never emits a
@@ -1666,7 +2046,7 @@ export class StateStore {
       if (ns.startsWith("_") || RESERVED_NAMESPACE_PREFIXES.some(
         (prefix) => ns === prefix || ns.startsWith(prefix + "/")
       )) {
-        skippedKeys += (entries as Array<{ key: string; entry: StateEntry }>).length;
+        skippedKeys += entries.length;
         continue;
       }
       namespaces.push(ns);
@@ -1814,11 +2194,12 @@ export class StateStore {
       conflicts,
       namespaces,
       imported_at: new Date().toISOString(),
+      completeness_verification: completenessVerification,
     };
   }
 }
 
-// ── Master-rotation helpers (core/master-rotation.ts) ────────────────
+// Master-rotation helpers (core/master-rotation.ts)
 //
 // State entries cryptographically bind their CIPHERTEXT to the writer
 // identity (the v2 envelope signs nonce/tag/ciphertext; the legacy v1 `sig`
@@ -1856,7 +2237,7 @@ export type RotateStateEntryResult =
  * Verify (and, unless `verifyOnly`, re-encrypt + re-sign) one persisted
  * state entry for a master rotation.
  *
- *  - Decrypts under the NEW namespace key first → "already-new" (idempotent
+ *  - Decrypts under the NEW namespace key first -> "already-new" (idempotent
  *    resume; GCM authentication decides).
  *  - Otherwise decrypts under the OLD namespace key (failure throws - the
  *    rotation preflight aborts; nothing is mutated on an undecryptable
