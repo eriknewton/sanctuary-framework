@@ -40,7 +40,7 @@ jobs:
     # macOS-26-only build bug (A1 drill, 2026-06-04) cannot recur.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Show toolchain
         run: |
