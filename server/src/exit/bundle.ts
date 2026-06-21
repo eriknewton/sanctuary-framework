@@ -67,8 +67,8 @@ import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js"
 import {
   partitionByMemoryClass,
   type PartitionConsentRelease,
+  type PartitionCandidate,
   type PartitionResult,
-  type SealedProvenanceStamp,
 } from "./memory-class.js";
 
 const ARTIFACT_DIR = "artifacts";
@@ -122,7 +122,7 @@ const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
  * Custody-envelope re-key block (post-#496). Carries a wrap of the SOURCE
  * master under a fresh, random, export-scoped "bundle re-key key" minted at
  * export time and disclosed to the operator (never written into the
- * bundle). Import recovers the source master by unwrapping with that key —
+ * bundle). Import recovers the source master by unwrapping with that key -
  * no parallel derivation path, no fortress credential travels.
  *
  * Deliberately NOT the fortress's own envelope wraps (codex round-1 MED):
@@ -149,10 +149,15 @@ export interface ExitEncryptedStateBundle {
   exported_at: string;
   key_source: "passphrase" | "recovery-key" | "unknown";
   /**
+   * Additive Slice-2 signal: true when this artifact was filtered through the
+   * verified ownership partition, false/absent for legacy full-fortress exports.
+   */
+  ownership_partitioned?: boolean;
+  /**
    * Legacy re-key parameters (pre-envelope custody): Argon2id params under
    * which `master = Argon2id(passphrase, params)`. Still emitted when the
    * legacy `_meta/key-params` marker exists (migrated fortresses keep their
-   * markers — #496) so older importers keep working on those bundles. For
+   * markers - #496) so older importers keep working on those bundles. For
    * envelope-custody fortresses this mechanism is legacy-only; the
    * authoritative re-key path is `source_custody`.
    */
@@ -278,7 +283,7 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted — CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6).
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
@@ -291,30 +296,28 @@ export interface ExportExitBundleOptions {
    * included in the outbound (agent) bundle ONLY when the caller supplies a
    * sealed `agent_owned` stamp BOUND to its `namespace/key` (or an audited
    * consent receipt releases its `shared_entangled` lineage). Every other entry
-   * — unsealed, binding-mismatched, operator-owned, or shared-entangled without
-   * consent — is EXCLUDED and fails toward "stays with the operator," never
+   * - unsealed, binding-mismatched, operator-owned, or shared-entangled without
+   * consent - is EXCLUDED and fails toward "stays with the operator," never
    * `agent_owned`.
    *
-   * `stampsByEntryKey` keys are `"<namespace>/<key>"`; each stamp must have been
-   * minted with `entry_binding` equal to that same `"<namespace>/<key>"`. Only
-   * the live, in-process sealed stamp object is trusted; a deserialized stamp is
-   * not sealed and the entry is conservatively excluded.
+   * Slice 2: the export path no longer trusts caller-supplied stamp maps. It
+   * verifies each state envelope first and re-mints a live sealed stamp from the
+   * signed `provenance_stamp` field. Legacy or unstamped records are excluded.
    */
   memoryClassPartition?: {
-    readonly stampsByEntryKey: ReadonlyMap<string, SealedProvenanceStamp>;
     readonly consentReleases?: readonly PartitionConsentRelease[];
   };
   /**
    * Codex HIGH (06-13) reconciliation: backward compatibility requires the
    * pre-Slice-1 single-operator export (every non-`_` namespace, no ownership
-   * partition) to remain the behavior when no partition is supplied — the
+   * partition) to remain the behavior when no partition is supplied - the
    * shipped CLI, hub, dashboard, and drill paths all rely on it, and Slice 1 is
    * explicitly scoped as an OPT-IN ownership axis.
    *
    * To keep that compatibility WITHOUT silently masking the absence, an
    * unpartitioned export now requires the caller to acknowledge it explicitly
    * with `unpartitionedLegacyExport: true`. An export that supplies neither
-   * `memoryClassPartition` nor this flag throws — so an *agent-exit* caller
+   * `memoryClassPartition` nor this flag throws - so an *agent-exit* caller
    * (which must partition) cannot accidentally fall through to "export
    * everything." Operator-driven full-fortress exports pass this flag; agent
    * exit flows pass `memoryClassPartition`.
@@ -350,6 +353,7 @@ export interface ExportExitBundleResult {
   state_partition?: {
     included: number;
     excluded: number;
+    excluded_unstamped: number;
     excluded_unsealed: number;
   };
 }
@@ -515,7 +519,7 @@ const SOURCE_CUSTODY_MAX_WRAPS = 4;
 /**
  * Mint the bundle re-key key and the source_custody block that carries the
  * source master wrapped under it. The key is returned for operator
- * disclosure and is NEVER written into the bundle — it is the only
+ * disclosure and is NEVER written into the bundle - it is the only
  * credential that re-keys this bundle's state, held separately from it.
  *
  * Fortress envelope wraps are deliberately not copied (see
@@ -571,7 +575,7 @@ async function exportEncryptedState(
   );
   const collected: ExitEncryptedStateBundle["entries"] = [];
   for (const namespace of [...namespaceSet].sort()) {
-    // F6: never export internal `_`-prefixed namespaces — the rekey/import path
+    // F6: never export internal `_`-prefixed namespaces - the rekey/import path
     // rejects them, so exporting one (e.g. an explicit `--state-namespace _x`)
     // would silently fail to round-trip. Symmetric with the import guard.
     if (namespace.startsWith("_") || isReservedNamespace(namespace)) continue;
@@ -594,7 +598,7 @@ async function exportEncryptedState(
   // Exit machinery Slice 1: apply the conservative ownership partition. The
   // caller MUST make an explicit choice (codex HIGH): supply
   // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
-  // (loud, named full-export opt-out). Supplying neither — or both — throws, so
+  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
   // an agent-exit caller cannot silently fall through to "export everything."
   const hasPartition = opts.memoryClassPartition !== undefined;
   const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
@@ -614,19 +618,37 @@ async function exportEncryptedState(
   let partition: PartitionResult | undefined;
   let entries = collected;
   if (opts.memoryClassPartition !== undefined) {
-    const stamps = opts.memoryClassPartition.stampsByEntryKey;
-    partition = partitionByMemoryClass(
-      collected.map((entry) => {
-        const stamp = stamps.get(`${entry.namespace}/${entry.key}`);
-        return {
-          id: `${entry.namespace}/${entry.key}`,
-          ...(stamp !== undefined ? { sealedStamp: stamp } : {}),
-        };
-      }),
-      {
-        consentReleases: opts.memoryClassPartition.consentReleases,
-      },
-    );
+    const stateStore = new StateStore(opts.storage, opts.masterKey);
+    const candidates: PartitionCandidate[] = [];
+    for (const entry of collected) {
+      const id = `${entry.namespace}/${entry.key}`;
+      const reminted = await stateStore.remintVerifiedProvenanceStampForExport(
+        entry.entry,
+        entry.namespace,
+        entry.key,
+      );
+      if (reminted.status === "sealed") {
+        candidates.push({
+          id,
+          declaredStamp: reminted.declaredStamp,
+          sealedStamp: reminted.sealedStamp,
+        });
+      } else if (reminted.status === "unsealed") {
+        candidates.push({
+          id,
+          ...(reminted.declaredStamp !== undefined
+            ? { declaredStamp: reminted.declaredStamp }
+            : {}),
+        });
+      } else if (reminted.status === "verification_failed") {
+        candidates.push({ id, verificationFailed: true });
+      } else {
+        candidates.push({ id });
+      }
+    }
+    partition = partitionByMemoryClass(candidates, {
+      consentReleases: opts.memoryClassPartition.consentReleases,
+    });
     const includableIds = new Set(
       partition.includable.map((decision) => decision.id),
     );
@@ -648,6 +670,7 @@ async function exportEncryptedState(
       format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
       exported_at: new Date().toISOString(),
       key_source: opts.keySource ?? "unknown",
+      ownership_partitioned: opts.memoryClassPartition !== undefined,
       source_key_derivation: await readSourceKeyParams(opts.storage),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
       namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
@@ -966,7 +989,24 @@ export async function exportExitBundle(
       },
     );
   }
+  if (encryptedStateExport.partition !== undefined) {
+    const partitionSummary = summarizePartition(encryptedStateExport.partition);
+    void opts.auditLog.append(
+      "l1",
+      "exit_bundle_state_partition",
+      identity.identity_id,
+      {
+        approval_id: exportApprovalAuditId,
+        state_partition: partitionSummary,
+      },
+    );
+  }
   await opts.auditLog.flush();
+
+  const statePartitionSummary =
+    encryptedStateExport.partition !== undefined
+      ? summarizePartition(encryptedStateExport.partition)
+      : undefined;
 
   return {
     bundle_dir: bundleDir,
@@ -979,20 +1019,24 @@ export async function exportExitBundle(
     ...(encryptedStateExport.rekeyKey !== undefined
       ? { state_rekey_key: encryptedStateExport.rekeyKey }
       : {}),
-    ...(encryptedStateExport.partition !== undefined
-      ? {
-          state_partition: {
-            included: encryptedStateExport.partition.includable.length,
-            excluded: encryptedStateExport.partition.excluded.length,
-            excluded_unsealed: encryptedStateExport.partition.excluded.filter(
-              (decision) =>
-                decision.reason === "unsealed_stamp_defaulted_operator_owned" ||
-                decision.reason ===
-                  "stamp_binding_mismatch_defaulted_operator_owned",
-            ).length,
-          },
-        }
+    ...(statePartitionSummary !== undefined
+      ? { state_partition: statePartitionSummary }
       : {}),
+  };
+}
+
+function summarizePartition(partition: PartitionResult): ExportExitBundleResult["state_partition"] {
+  return {
+    included: partition.includable.length,
+    excluded: partition.excluded.length,
+    excluded_unstamped: partition.excluded.filter(
+      (decision) => decision.reason === "unstamped_defaulted_operator_owned",
+    ).length,
+    excluded_unsealed: partition.excluded.filter(
+      (decision) =>
+        decision.reason === "unsealed_stamp_defaulted_operator_owned" ||
+        decision.reason === "stamp_binding_mismatch_defaulted_operator_owned",
+    ).length,
   };
 }
 
@@ -1112,7 +1156,7 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
  * Shape-check a bundle's `source_custody` block before any wrap is tried.
  * A crafted or corrupted block fails closed with a structured error rather
  * than being silently ignored (which would demote the import to the legacy
- * derivation path — a downgrade, #5).
+ * derivation path - a downgrade, #5).
  */
 function validateSourceCustody(custody: ExitSourceCustody): void {
   const malformed =
@@ -1165,11 +1209,11 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *     check in `rekeyState` (SOURCE_KEY_MISMATCH).
  *  3. Passphrase WITHOUT legacy params: fails closed. Envelope-era bundles
  *     deliberately carry no passphrase-checkable material (no offline
- *     oracle), so a passphrase cannot re-key them — the error points the
+ *     oracle), so a passphrase cannot re-key them - the error points the
  *     operator at the bundle re-key key. No silent staging, no fallback.
  *  4. Recovery key + `source_custody`: the bundle re-key key minted at
  *     export, GCM-authenticated against the embedded wrap. A key that
- *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` —
+ *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` -
  *     never falls through to the legacy raw-key path (that would silently
  *     treat an arbitrary 32 bytes as the master and drop every entry).
  *  5. Recovery key on a legacy bundle: pre-envelope semantics (the
@@ -1178,7 +1222,7 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  * The recovered master is transient: it only decrypts bundle entries, which
  * are immediately re-encrypted and re-signed under the DESTINATION
  * fortress's custody (whose master is established exclusively by
- * `establishMaster` — import has no parallel establishment path).
+ * `establishMaster` - import has no parallel establishment path).
  */
 async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
@@ -1288,7 +1332,7 @@ async function rekeyState(
   // many entries reached AEAD decryption and how many failed it. When the
   // source master decrypts NOTHING, the key is wrong (e.g. a legacy bundle
   // from a dual-path-damaged fortress whose key-params derive a divergent
-  // master) — that must fail closed, not silently skip every entry.
+  // master) - that must fail closed, not silently skip every entry.
   let decryptAttempts = 0;
   let decryptFailures = 0;
 
@@ -1358,7 +1402,7 @@ async function rekeyState(
     } catch {
       // AEAD verification failed for this entry. When OTHER entries
       // decrypt fine this is a per-entry data issue (skip and continue);
-      // when EVERY entry fails, the source master itself is wrong — the
+      // when EVERY entry fails, the source master itself is wrong - the
       // post-loop check below fails the import closed.
       decryptFailures++;
       skippedInvalidSig++;
@@ -1393,7 +1437,7 @@ async function rekeyState(
   if (decryptAttempts > 0 && decryptFailures === decryptAttempts) {
     // Nothing decrypted under the recovered source master: wrong source
     // credential (legacy derivation path) or a bundle whose embedded key
-    // material does not match its entries. Fail closed — never report a
+    // material does not match its entries. Fail closed - never report a
     // "successful" re-key that silently imported zero entries (#5). No
     // state writes happened on this path; the caller's cleanup handler
     // removes the staged artifacts.
@@ -1843,7 +1887,7 @@ export async function importExitBundle(
   // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
   // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
   // "audit entries exist on disk but no head anchor file yet" as the custody
-  // SPLICE signature — a FALSE rollback freeze that fails a LEGITIMATE import
+  // SPLICE signature - a FALSE rollback freeze that fails a LEGITIMATE import
   // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
   // queue here makes the gate observe a settled, self-consistent audit state
   // (entry on disk ⟹ its head anchor on disk), so a genuine import is never
@@ -1877,7 +1921,7 @@ export async function importExitBundle(
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
   // source_custody) must roll back the artifacts staged above, exactly like
-  // a re-key failure — otherwise a refused import leaves staged state behind.
+  // a re-key failure - otherwise a refused import leaves staged state behind.
   let sourceMasterKey: Uint8Array | null = null;
   try {
     sourceMasterKey = await resolveSourceMasterKey(

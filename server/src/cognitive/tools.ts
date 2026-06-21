@@ -12,6 +12,7 @@ import {
   StateStore,
   StateVerificationError,
 } from "./state-store.js";
+import type { OriginActor } from "../exit/memory-class.js";
 import {
   createIdentity,
   rotateKeys,
@@ -135,7 +136,7 @@ function getReservedNamespaceViolation(namespace: string): string | null {
   // F6: ALL underscore-prefixed namespaces are reserved for internal subsystems;
   // external callers must not write/read/list/delete them. The curated list below
   // enumerates the known internal namespaces (used for a precise violation label),
-  // but the `_` prefix is the contract — a non-curated `_foo` is still reserved.
+  // but the `_` prefix is the contract - a non-curated `_foo` is still reserved.
   if (namespace.startsWith("_")) {
     for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
       if (namespace === prefix || namespace.startsWith(prefix + "/")) {
@@ -498,8 +499,8 @@ export class IdentityManager {
   /** Save an identity to storage */
   async save(identity: StoredIdentity): Promise<void> {
     // Two-factor custody floor (I4/F6) for NEW identities, enforced here
-    // (not only in saveNew) because several callers — sanctuary_bootstrap,
-    // wrap-auto identity creation — persist through save() directly
+    // (not only in saveNew) because several callers - sanctuary_bootstrap,
+    // wrap-auto identity creation - persist through save() directly
     // (codex round-2 HIGH). Updates/rotations of an already-loaded
     // identity are not creation and stay un-gated.
     if (!this.identities.has(identity.identity_id)) {
@@ -817,6 +818,15 @@ export function createCognitiveTools(
     const active = resolveActiveSessionIdentity(binding);
     if (identityId && identityId !== active.identity_id) {
       throw new Error(`${operation}: identity binding unavailable`);
+    }
+  }
+
+  function stateWriteOriginActor(identityId: string): OriginActor {
+    try {
+      const active = resolveActiveSessionIdentity(options?.currentSessionBinding?.());
+      return active.identity_id === identityId ? "agent" : "operator";
+    } catch {
+      return "operator";
     }
   }
 
@@ -1210,6 +1220,9 @@ export function createCognitiveTools(
             content_type: metadata?.content_type,
             ttl_seconds: metadata?.ttl_seconds,
             tags: metadata?.tags,
+            provenance: {
+              origin_actor: stateWriteOriginActor(identity.identity_id),
+            },
           }
         );
 
