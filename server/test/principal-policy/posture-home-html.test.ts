@@ -264,6 +264,7 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(end).toBeGreaterThan(start);
     const fn = html.slice(start, end);
     // The existing mint endpoint and method.
+    expect(fn).toContain('if (urlSession) return Promise.resolve("?session=" + encodeURIComponent(urlSession))');
     expect(fn).toContain('fetch("/auth/session", {');
     expect(fn).toContain('method: "POST"');
     // The long-lived bearer travels in the Authorization header of the POST,
@@ -307,6 +308,31 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(html).not.toMatch(/posture\/stream[^"]*token=/);
     // And no ?token= query is ever constructed for any stream URL.
     expect(html).not.toContain('"/api/posture/stream?token=');
+  });
+
+  it("threads the one-click ?session= credential into board reads and decision POSTs", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain("function readUrlSession()");
+    expect(html).toContain('new URLSearchParams(location.search || "").get("session")');
+    expect(html).toContain("function credentialedPath(path)");
+    expect(html).toContain('u.searchParams.set("session", urlSession)');
+
+    const apiStart = html.indexOf("function api(path)");
+    const apiEnd = html.indexOf("function rememberToken");
+    expect(apiStart).toBeGreaterThan(-1);
+    expect(apiEnd).toBeGreaterThan(apiStart);
+    const apiFn = html.slice(apiStart, apiEnd);
+    expect(apiFn).toContain("var url = credentialedPath(path)");
+    expect(apiFn).toContain("fetch(url, opts)");
+
+    const decisionStart = html.indexOf("function postDecision(path, retried)");
+    const decisionEnd = html.indexOf("// SEC-012 stream handshake");
+    expect(decisionStart).toBeGreaterThan(-1);
+    expect(decisionEnd).toBeGreaterThan(decisionStart);
+    const decisionFn = html.slice(decisionStart, decisionEnd);
+    expect(decisionFn).toContain("fetch(credentialedPath(path),");
+    expect(decisionFn).toContain('method: "POST"');
+    expect(decisionFn).not.toContain('"Authorization": "Bearer " + urlSession');
   });
 
   it("degrades to honest polling on mint failure / 401 / expiry - the mint never throws and reconnect re-mints", () => {

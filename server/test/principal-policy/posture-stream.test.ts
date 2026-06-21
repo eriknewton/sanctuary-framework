@@ -187,6 +187,7 @@ describe("posture SSE stream (server)", () => {
     expect(m).not.toBeNull();
     const payload = JSON.parse(m![1]!);
     expect(payload.origin_machine).toBe(FORTRESS);
+    expect(payload.stream_available).toBe(true);
     expect(payload.castle_wall.arm_state).toBe("armed");
     expect(payload.protection_requested_count).toBe(1);
     expect(payload.unwrapped.unwrapped[0].harness).toBe("cursor");
@@ -280,6 +281,8 @@ describe("posture SSE stream (server)", () => {
     // The existing /home endpoint still works (page keeps functioning).
     const home = await fetch(`${base}/api/posture/home`);
     expect(home.status).toBe(200);
+    const body = await home.json();
+    expect(body.stream_available).toBe(false);
   });
 
   it("(d) caps concurrent streams (503 at the cap, no unbounded sockets)", async () => {
@@ -458,11 +461,13 @@ describe("posture home page client (honesty + reconnect + static-load)", () => {
     expect(html).toContain('"EventSource" in window');
     expect(html).toContain("startPolling");
     expect(html).toContain("pollOnce");
+    expect(html).toContain("streamAvailable = home && home.stream_available === true");
+    expect(html).toContain("if (!streamAvailable) { startPolling(); return; }");
     // The poll path still hits the existing /home endpoint (unchanged contract).
     expect(html).toContain("/api/posture/home");
     // The page renders once on boot before any stream connects, so first paint
     // is correct even if SSE never connects.
-    expect(html).toContain("else startPolling()");
+    expect(html).toContain("if (!supportsSSE || !streamAvailable) startPolling()");
   });
 
   it("never weakens the existing never-fake-green tile model", () => {
