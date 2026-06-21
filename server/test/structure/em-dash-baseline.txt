@@ -136,8 +136,6 @@
 1	server/src/cli/sentinel.ts
 2	server/src/cli/transparency.ts
 3	server/src/cognitive/memory-attest.ts
-18	server/src/cognitive/state-store.ts
-2	server/src/cognitive/tools.ts
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 4	server/src/compliance/eu_ai_act/cli.ts
 35	server/src/compliance/eu_ai_act/coverage_matrix.ts
@@ -172,7 +170,6 @@
 3	server/src/distress/listener.ts
 1	server/src/distress/local-secret.ts
 5	server/src/distress/tools.ts
-7	server/src/exit/bundle.ts
 2	server/src/exit/cli.ts
 4	server/src/federation/registry.ts
 2	server/src/federation/tools.ts

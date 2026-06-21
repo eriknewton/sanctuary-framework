@@ -53,7 +53,7 @@ import {
   RotationResumeError,
   type RotateMasterOptions,
 } from "../../src/core/master-rotation.js";
-import { StateStore } from "../../src/cognitive/state-store.js";
+import { StateStore, type StateEntry } from "../../src/cognitive/state-store.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   deriveNamespaceKey,
@@ -251,9 +251,11 @@ async function verifyRotated(
   // Nothing decrypts under the OLD master anymore (user state).
   const oldNsKey = deriveNamespaceKey(fortress.master, "notes");
   const rawEntry = await storage.read("notes", "k1");
-  const entry = JSON.parse(bytesToString(rawEntry!)) as {
-    payload: EncryptedPayload;
-  };
+  const entry = JSON.parse(bytesToString(rawEntry!)) as StateEntry;
+  expect(entry.v).toBe(3);
+  expect(entry.metadata.schema_version).toBe(3);
+  expect(entry.provenance_stamp?.entry_binding).toBe("notes/k1");
+  expect(entry.envelope?.provenance_stamp).toEqual(entry.provenance_stamp);
   expect(() => decrypt(entry.payload, oldNsKey)).toThrow();
 
   // Audit: the FULL chain (pre- and post-rotation entries) loads cleanly in

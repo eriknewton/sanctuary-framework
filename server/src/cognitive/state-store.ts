@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — L1 Cognitive Sovereignty: StateStore
+ * Sanctuary MCP Server - L1 Cognitive Sovereignty: StateStore
  *
  * The encrypted state store is the foundation of Sanctuary.
  * Every read and write goes through here. All data is encrypted
@@ -40,9 +40,19 @@ import {
 import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { StoredIdentity } from "../core/identity.js";
+import {
+  mintProvenanceStamp,
+  serializeStamp,
+  type DerivedFromEdge,
+  type OriginActor,
+  type ProvenanceStamp,
+  type SealedProvenanceStamp,
+} from "../exit/memory-class.js";
 
-const STATE_ENVELOPE_SCHEMA_VERSION = 2;
-const STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
+const LEGACY_STATE_ENVELOPE_SCHEMA_VERSION = 2;
+const STATE_ENVELOPE_SCHEMA_VERSION = 3;
+const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
+const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
 const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
 const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
 // F1: domain-separated MAC over the version-anchor record (the rollback floor),
@@ -54,7 +64,7 @@ const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
 // registry (`state-envelope-public-keys-v1`) is a separate plaintext `_meta`
 // record; authenticating it (to close kid->key injection when an identity is
 // resolved from the registry rather than `_identities`) is a related but
-// distinct hardening, tracked separately — it is NOT covered here.
+// distinct hardening, tracked separately - it is NOT covered here.
 const STATE_META_MAC_DOMAIN = "sanctuary.meta-record-mac.v1\n";
 // Distinctive envelope marker so a MAC'd record is unambiguously distinguished
 // from a legacy bare record (legacy keys are versionKeys, never this).
@@ -138,6 +148,7 @@ export interface SignedStateEnvelope {
     ttl_seconds?: number;
     tags?: string[];
   };
+  provenance_stamp?: ProvenanceStamp;
   integrity_hash: string;
   payload: {
     schema_version: number;
@@ -150,7 +161,7 @@ export interface SignedStateEnvelope {
 }
 
 /**
- * Reserved namespace prefixes — used by internal subsystems.
+ * Reserved namespace prefixes - used by internal subsystems.
  * Imported bundles MUST NOT write to these namespaces.
  */
 const RESERVED_NAMESPACE_PREFIXES = [
@@ -184,9 +195,9 @@ export function isReservedNamespace(namespace: string): boolean {
 
 /** On-disk format for an encrypted state entry */
 export interface StateEntry {
-  /** Format version. v1 is legacy signed-ciphertext-only. v2 signs the full envelope. */
+  /** Format version. v1 is legacy signed-ciphertext-only; v2+ signs the full envelope. */
   v: number;
-  /** Canonical schema-2 state envelope signed by sig. */
+  /** Canonical state envelope signed by envelope_sig. */
   envelope?: SignedStateEnvelope;
   /** Encrypted payload */
   payload: EncryptedPayload;
@@ -194,8 +205,13 @@ export interface StateEntry {
   ver: number;
   /** Legacy-compatible signature over ciphertext by the writing identity (base64url) */
   sig: string;
-  /** Schema-2 signature over the canonical envelope by the writing identity (base64url) */
+  /** Signature over the canonical envelope by the writing identity (base64url) */
   envelope_sig?: string;
+  /**
+   * Schema-3 user-state provenance stamp. Present only on new writes after
+   * Exit Slice 2. Legacy schema-2 entries intentionally remain unstamped.
+   */
+  provenance_stamp?: ProvenanceStamp;
   /** Identity that wrote this entry */
   kid: string;
   /** SHA-256 of the plaintext value (base64url, for client-side verification) */
@@ -240,6 +256,16 @@ export interface WriteOptions {
   content_type?: string;
   ttl_seconds?: number;
   tags?: string[];
+  provenance?: {
+    /**
+     * Internal, derived actor signal. `agent` is passed only from the existing
+     * session-identity path; absent/unknown fails closed to operator.
+     */
+    origin_actor?: OriginActor;
+    origin_ref?: string;
+    lineage_id?: string;
+    derived_from?: readonly DerivedFromEdge[];
+  };
 }
 
 /** Cached namespace key with TTL */
@@ -282,8 +308,16 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
+function stateEnvelopeSigningDomain(envelope: SignedStateEnvelope): string {
+  const schemaVersion = envelope.metadata.schema_version;
+  if (schemaVersion <= LEGACY_STATE_ENVELOPE_SCHEMA_VERSION) {
+    return LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN;
+  }
+  return `${STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX}${schemaVersion}\n`;
+}
+
 function stateEnvelopeSigningBytes(envelope: SignedStateEnvelope): Uint8Array {
-  return stringToBytes(STATE_ENVELOPE_SIGNING_DOMAIN + canonicalJson(envelope));
+  return stringToBytes(stateEnvelopeSigningDomain(envelope) + canonicalJson(envelope));
 }
 
 function legacyWarning(): LegacyEnvelopeWarningInfo {
@@ -311,7 +345,9 @@ function buildSignedEnvelope(args: {
   key: string;
   version: number;
   kid: string;
+  schemaVersion: number;
   metadata: StateEntry["metadata"];
+  provenanceStamp?: ProvenanceStamp;
   integrityHash: string;
   payload: EncryptedPayload;
 }): SignedStateEnvelope {
@@ -322,11 +358,14 @@ function buildSignedEnvelope(args: {
     kid: args.kid,
     metadata: {
       timestamp: args.metadata.written_at,
-      schema_version: STATE_ENVELOPE_SCHEMA_VERSION,
+      schema_version: args.schemaVersion,
       content_type: args.metadata.content_type,
       ttl_seconds: args.metadata.ttl_seconds,
       tags: args.metadata.tags,
     },
+    ...(args.provenanceStamp !== undefined
+      ? { provenance_stamp: args.provenanceStamp }
+      : {}),
     integrity_hash: args.integrityHash,
     payload: {
       schema_version: args.payload.v,
@@ -336,6 +375,127 @@ function buildSignedEnvelope(args: {
       ciphertext: args.payload.ct,
       encrypted_at: args.payload.ts,
     },
+  };
+}
+
+function entryBinding(namespace: string, key: string): string {
+  return `${namespace}/${key}`;
+}
+
+function resolveWriteOriginActor(actor: OriginActor | undefined): OriginActor {
+  return actor === "agent" || actor === "system" ? actor : "operator";
+}
+
+function mintSerializedWriteStamp(args: {
+  namespace: string;
+  key: string;
+  identityId: string;
+  writtenAt: string;
+  version: number;
+  provenance?: WriteOptions["provenance"];
+}): ProvenanceStamp {
+  const stamp = mintProvenanceStamp({
+    origin_actor: resolveWriteOriginActor(args.provenance?.origin_actor),
+    origin_ref: args.provenance?.origin_ref ?? args.identityId,
+    lineage_id:
+      args.provenance?.lineage_id ??
+      `state:${entryBinding(args.namespace, args.key)}:v${args.version}`,
+    written_at: args.writtenAt,
+    entry_binding: entryBinding(args.namespace, args.key),
+    ...(args.provenance?.derived_from !== undefined
+      ? { derived_from: args.provenance.derived_from }
+      : {}),
+  });
+  return serializeStamp(stamp);
+}
+
+function isMemoryClass(value: unknown): value is ProvenanceStamp["memory_class"] {
+  return (
+    value === "operator_owned" ||
+    value === "agent_owned" ||
+    value === "shared_entangled"
+  );
+}
+
+function isOriginActor(value: unknown): value is OriginActor {
+  return value === "operator" || value === "agent" || value === "system";
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function normalizeDerivedEdgesForRemint(
+  stamp: ProvenanceStamp
+): readonly DerivedFromEdge[] | null {
+  if (stamp.derived_from_edges !== undefined) {
+    if (!Array.isArray(stamp.derived_from_edges)) return null;
+    const edges: DerivedFromEdge[] = [];
+    for (const edge of stamp.derived_from_edges) {
+      if (
+        edge === null ||
+        typeof edge !== "object" ||
+        typeof (edge as { lineage_id?: unknown }).lineage_id !== "string" ||
+        !isMemoryClass((edge as { memory_class?: unknown }).memory_class)
+      ) {
+        return null;
+      }
+      edges.push({
+        lineage_id: (edge as { lineage_id: string }).lineage_id,
+        memory_class: (edge as { memory_class: ProvenanceStamp["memory_class"] }).memory_class,
+      });
+    }
+    return edges;
+  }
+
+  // Old serialized stamps that carried only lineage ids cannot safely
+  // reconstruct a shared_entangled class. New schema-3 writes persist full
+  // edges, so this path is only for defensive compatibility.
+  return stamp.memory_class === "shared_entangled" ? null : [];
+}
+
+function normalizePersistedProvenanceStamp(value: unknown): ProvenanceStamp | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !isMemoryClass(record.memory_class) ||
+    !isOriginActor(record.origin_actor) ||
+    typeof record.origin_ref !== "string" ||
+    record.origin_ref.length === 0 ||
+    typeof record.lineage_id !== "string" ||
+    record.lineage_id.length === 0 ||
+    typeof record.written_at !== "string" ||
+    !isStringArray(record.derived_from)
+  ) {
+    return null;
+  }
+  if (
+    record.entry_binding !== undefined &&
+    (typeof record.entry_binding !== "string" || record.entry_binding.length === 0)
+  ) {
+    return null;
+  }
+  const stamp: ProvenanceStamp = {
+    memory_class: record.memory_class,
+    origin_actor: record.origin_actor,
+    origin_ref: record.origin_ref,
+    lineage_id: record.lineage_id,
+    written_at: record.written_at,
+    derived_from: [...record.derived_from],
+    ...(record.entry_binding !== undefined
+      ? { entry_binding: record.entry_binding }
+      : {}),
+  };
+  const edges = normalizeDerivedEdgesForRemint({
+    ...stamp,
+    ...(record.derived_from_edges !== undefined
+      ? { derived_from_edges: record.derived_from_edges as DerivedFromEdge[] }
+      : {}),
+  });
+  if (edges === null) return null;
+  return {
+    ...stamp,
+    ...(edges.length > 0 ? { derived_from_edges: edges } : {}),
   };
 }
 
@@ -473,7 +633,7 @@ export class StateStore {
 
   /**
    * Load the MAC-authenticated version-anchor record (the persistent rollback
-   * floor — F1). Stored as a `{ marker, data, mac }` envelope:
+   * floor - F1). Stored as a `{ marker, data, mac }` envelope:
    *   - MAC present + valid    -> return the authenticated floor.
    *   - MAC present + invalid  -> edited in place; reject (the attacker cannot
    *     silently LOWER a key's floor).
@@ -488,7 +648,7 @@ export class StateStore {
    * Residual (documented, not closed here): deleting the anchor AND replacing a
    * key's entry with an older validly-signed v2 entry resets that key's floor
    * (a replay). Closing it needs a floor that does not live in a single
-   * deletable file (boot-anchored / externally-attested) — out of scope for F1.
+   * deletable file (boot-anchored / externally-attested) - out of scope for F1.
    */
   private async loadVersionAnchors(): Promise<Record<string, unknown>> {
     const raw = await this.storage.read(
@@ -681,7 +841,7 @@ export class StateStore {
             stateEntry.ver
           );
         } catch {
-          // Corrupted entry — skip it
+          // Corrupted entry - skip it
         }
       }
     }
@@ -720,7 +880,7 @@ export class StateStore {
     const payload = encrypt(plaintext, namespaceKey);
 
     // F1: the version-anchor record is untrusted unless MAC-valid (a bare /
-    // marker-stripped anchor is ignored — see loadVersionAnchors), so it cannot
+    // marker-stripped anchor is ignored - see loadVersionAnchors), so it cannot
     // be the sole monotonic floor: otherwise the first post-upgrade write to an
     // existing key on a cold process (empty cache + ignored bare anchor) would
     // reset its version to 1, clobbering a higher on-disk version. Populate
@@ -743,12 +903,22 @@ export class StateStore {
       schema_version: STATE_ENVELOPE_SCHEMA_VERSION,
       written_at: now,
     };
+    const provenanceStamp = mintSerializedWriteStamp({
+      namespace,
+      key,
+      identityId,
+      writtenAt: now,
+      version: newVersion,
+      provenance: options.provenance,
+    });
     const envelope = buildSignedEnvelope({
       namespace,
       key,
       version: newVersion,
       kid: identityId,
+      schemaVersion: STATE_ENVELOPE_SCHEMA_VERSION,
       metadata,
+      provenanceStamp,
       integrityHash,
       payload,
     });
@@ -775,6 +945,7 @@ export class StateStore {
     const stateEntry: StateEntry = {
       v: STATE_ENVELOPE_SCHEMA_VERSION,
       envelope,
+      provenance_stamp: provenanceStamp,
       payload,
       ver: newVersion,
       sig: toBase64url(legacyCiphertextSignature),
@@ -858,7 +1029,7 @@ export class StateStore {
     });
   }
 
-  private validateSchema2Envelope(
+  private validateSignedEnvelope(
     entry: StateEntry,
     namespace: string,
     key: string
@@ -866,7 +1037,31 @@ export class StateStore {
     if (!entry.envelope) {
       throw new StateVerificationError(
         "schema_mismatch",
-        `State envelope schema 2 is missing for ${namespace}/${key}`
+        `State envelope is missing for ${namespace}/${key}`
+      );
+    }
+
+    if (
+      entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
+      entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
+    ) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `Unsupported state envelope schema: ${entry.v}`
+      );
+    }
+
+    if (entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION && entry.provenance_stamp !== undefined) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `Legacy state envelope schema ${LEGACY_STATE_ENVELOPE_SCHEMA_VERSION} cannot carry provenance for ${namespace}/${key}`
+      );
+    }
+
+    if (entry.v === STATE_ENVELOPE_SCHEMA_VERSION && entry.provenance_stamp === undefined) {
+      throw new StateVerificationError(
+        "schema_mismatch",
+        `State envelope schema ${STATE_ENVELOPE_SCHEMA_VERSION} is missing provenance for ${namespace}/${key}`
       );
     }
 
@@ -875,7 +1070,11 @@ export class StateStore {
       key,
       version: entry.ver,
       kid: entry.kid,
+      schemaVersion: entry.v,
       metadata: entry.metadata,
+      ...(entry.provenance_stamp !== undefined
+        ? { provenanceStamp: entry.provenance_stamp }
+        : {}),
       integrityHash: entry.integrity_hash,
       payload: entry.payload,
     });
@@ -918,7 +1117,10 @@ export class StateStore {
       return { verified: true, warnings };
     }
 
-    if (entry.v !== STATE_ENVELOPE_SCHEMA_VERSION) {
+    if (
+      entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
+      entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
+    ) {
       throw new StateVerificationError(
         "schema_mismatch",
         `Unsupported state envelope schema: ${entry.v}`
@@ -932,7 +1134,7 @@ export class StateStore {
       );
     }
 
-    const envelope = this.validateSchema2Envelope(entry, namespace, key);
+    const envelope = this.validateSignedEnvelope(entry, namespace, key);
     if (!entry.envelope_sig) {
       throw new StateVerificationError(
         "schema_mismatch",
@@ -966,6 +1168,85 @@ export class StateStore {
     return { verified: true };
   }
 
+  /**
+   * Verify a persisted state entry's signed envelope before re-minting its
+   * provenance stamp into a live in-process seal for the exit partition. The
+   * on-disk stamp is never trusted directly: schema/signature verification is
+   * the durable trust anchor, then this method recomputes the class through the
+   * sealed minter.
+   */
+  async remintVerifiedProvenanceStampForExport(
+    entry: StateEntry,
+    namespace: string,
+    key: string
+  ): Promise<
+    | {
+        status: "sealed";
+        declaredStamp: ProvenanceStamp;
+        sealedStamp: SealedProvenanceStamp;
+      }
+    | { status: "unstamped" }
+    | { status: "unsealed"; declaredStamp?: ProvenanceStamp }
+    | { status: "verification_failed"; error: StateVerificationError }
+  > {
+    // Legacy schema v1 signs only ciphertext, and schema v2 intentionally
+    // carries no signed provenance. Any top-level provenance on either schema
+    // is unsigned attacker-controlled metadata, so partitioned export must
+    // treat the entry as unstamped without inspecting that field.
+    if (entry.v <= LEGACY_STATE_ENVELOPE_SCHEMA_VERSION) {
+      return { status: "unstamped" };
+    }
+
+    try {
+      const verification = await this.verifyEntrySignature(entry, namespace, key);
+      if (!verification.verified) {
+        return {
+          status: "verification_failed",
+          error: new StateVerificationError(
+            "kid_unknown",
+            `Writer key not found for ${entry.kid}`
+          ),
+        };
+      }
+    } catch (err) {
+      if (err instanceof StateVerificationError) {
+        return { status: "verification_failed", error: err };
+      }
+      throw err;
+    }
+
+    if (entry.provenance_stamp === undefined) {
+      return { status: "unstamped" };
+    }
+
+    const declaredStamp = normalizePersistedProvenanceStamp(entry.provenance_stamp);
+    if (declaredStamp === null) {
+      return { status: "unsealed" };
+    }
+
+    const derivedEdges = normalizeDerivedEdgesForRemint(declaredStamp);
+    if (derivedEdges === null) {
+      return { status: "unsealed", declaredStamp };
+    }
+
+    const sealedStamp = mintProvenanceStamp({
+      origin_actor: declaredStamp.origin_actor,
+      origin_ref: declaredStamp.origin_ref,
+      lineage_id: declaredStamp.lineage_id,
+      written_at: declaredStamp.written_at,
+      ...(declaredStamp.entry_binding !== undefined
+        ? { entry_binding: declaredStamp.entry_binding }
+        : {}),
+      ...(derivedEdges.length > 0 ? { derived_from: derivedEdges } : {}),
+    });
+
+    if (sealedStamp.memory_class !== declaredStamp.memory_class) {
+      return { status: "unsealed", declaredStamp };
+    }
+
+    return { status: "sealed", declaredStamp, sealedStamp };
+  }
+
   private async migrateLegacyEntryToSchema2(
     entry: StateEntry,
     namespace: string,
@@ -978,13 +1259,14 @@ export class StateStore {
 
     const metadata: StateEntry["metadata"] = {
       ...entry.metadata,
-      schema_version: STATE_ENVELOPE_SCHEMA_VERSION,
+      schema_version: LEGACY_STATE_ENVELOPE_SCHEMA_VERSION,
     };
     const envelope = buildSignedEnvelope({
       namespace,
       key,
       version: entry.ver,
       kid: entry.kid,
+      schemaVersion: LEGACY_STATE_ENVELOPE_SCHEMA_VERSION,
       metadata,
       integrityHash: entry.integrity_hash,
       payload: entry.payload,
@@ -996,7 +1278,7 @@ export class StateStore {
     );
     const migrated: StateEntry = {
       ...entry,
-      v: STATE_ENVELOPE_SCHEMA_VERSION,
+      v: LEGACY_STATE_ENVELOPE_SCHEMA_VERSION,
       envelope,
       envelope_sig: toBase64url(envelopeSignature),
       metadata,
@@ -1045,8 +1327,8 @@ export class StateStore {
     }
 
     // F1: a legacy (v1) entry must never ADVANCE the version past an established
-    // anchor. The current write schema is v2, so every legitimate version bump is
-    // written as v2 — a v1 entry claiming a version above the persisted anchor can
+    // anchor. Legitimate version bumps are written as signed-envelope schemas
+    // (v2+), so a v1 entry claiming a version above the persisted anchor can
     // only be a downgrade/replay forgery. The v1 signature binds the ciphertext
     // ONLY (not version/namespace/key), so the signature check below cannot catch
     // this; the persisted anchor is the discriminator. The anchor record is now
@@ -1060,7 +1342,7 @@ export class StateStore {
     // record and then replay a forged high-version v1 entry. Closing the
     // deletion variant requires distrusting v1 on the enforced read path entirely
     // (verified:false unless re-migrated), which breaks reads of legitimate
-    // un-migrated pre-v2 fortresses — a backward-compat migration decision left
+    // un-migrated pre-v2 fortresses - a backward-compat migration decision left
     // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
     // on a bare-anchor fortress it reads normally because the gate is skipped.)
     if (options.enforceRollback && stateEntry.v === 1) {
@@ -1068,7 +1350,7 @@ export class StateStore {
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
         throw new StateVerificationError(
           "rollback_detected",
-          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${stateEntry.ver} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as schema v2)`
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${stateEntry.ver} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
         );
       }
     }
@@ -1141,7 +1423,7 @@ export class StateStore {
   }
 
   /**
-   * List keys in a namespace (metadata only — no decryption).
+   * List keys in a namespace (metadata only - no decryption).
    */
   async list(
     namespace: string,
@@ -1270,7 +1552,7 @@ export class StateStore {
   }> {
     const namespacesToExport: string[] = [];
 
-    // F6: never export internal `_`-prefixed namespaces — import() rejects them
+    // F6: never export internal `_`-prefixed namespaces - import() rejects them
     // (so they cannot round-trip) and they are internal-subsystem state external
     // export must not expose. Filter HERE (not mid-loop) so the serialized
     // `namespaces` metadata and `data` stay consistent: the bundle never lists a
@@ -1399,20 +1681,26 @@ export class StateStore {
           continue;
         }
 
-        // Verify the signature against the schema-2 envelope or legacy ciphertext.
+        // Verify the signature against the signed envelope or legacy ciphertext.
         try {
-          if (entry.v !== 1 && entry.v !== STATE_ENVELOPE_SCHEMA_VERSION) {
+          if (
+            entry.v !== 1 &&
+            entry.v !== LEGACY_STATE_ENVELOPE_SCHEMA_VERSION &&
+            entry.v !== STATE_ENVELOPE_SCHEMA_VERSION
+          ) {
             skippedInvalidSig++;
             skippedKeys++;
             continue;
           }
           const signaturePayload =
+            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
             entry.v === STATE_ENVELOPE_SCHEMA_VERSION
               ? stateEnvelopeSigningBytes(
-                  this.validateSchema2Envelope(entry, ns, key)
+                  this.validateSignedEnvelope(entry, ns, key)
                 )
               : fromBase64url(entry.payload.ct);
           const signature =
+            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
             entry.v === STATE_ENVELOPE_SCHEMA_VERSION
               ? entry.envelope_sig
               : entry.sig;
@@ -1431,7 +1719,10 @@ export class StateStore {
             skippedKeys++;
             continue;
           }
-          if (entry.v === STATE_ENVELOPE_SCHEMA_VERSION) {
+          if (
+            entry.v === LEGACY_STATE_ENVELOPE_SCHEMA_VERSION ||
+            entry.v === STATE_ENVELOPE_SCHEMA_VERSION
+          ) {
             const legacySigValid = verify(
               fromBase64url(entry.payload.ct),
               fromBase64url(entry.sig),
@@ -1444,7 +1735,7 @@ export class StateStore {
             }
           }
         } catch {
-          // Malformed signature or ciphertext — reject
+          // Malformed signature or ciphertext - reject
           skippedInvalidSig++;
           skippedKeys++;
           continue;
@@ -1471,7 +1762,7 @@ export class StateStore {
                   continue;
                 }
               } catch {
-                // Corrupted existing entry — overwrite
+                // Corrupted existing entry - overwrite
               }
             }
           }
@@ -1532,7 +1823,7 @@ export class StateStore {
 // State entries cryptographically bind their CIPHERTEXT to the writer
 // identity (the v2 envelope signs nonce/tag/ciphertext; the legacy v1 `sig`
 // signs the raw ciphertext), so a master rotation cannot simply re-encrypt a
-// state entry — it must re-sign with the original writer's resident private
+// state entry - it must re-sign with the original writer's resident private
 // key. These helpers keep the canonical envelope/signature construction in
 // this module (single source of truth) while the rotation engine drives the
 // walk. They never relax verification: the OLD entry's signatures are
@@ -1567,14 +1858,14 @@ export type RotateStateEntryResult =
  *
  *  - Decrypts under the NEW namespace key first → "already-new" (idempotent
  *    resume; GCM authentication decides).
- *  - Otherwise decrypts under the OLD namespace key (failure throws — the
+ *  - Otherwise decrypts under the OLD namespace key (failure throws - the
  *    rotation preflight aborts; nothing is mutated on an undecryptable
  *    fortress).
  *  - Verifies the OLD entry's signature(s) against the writer's public key
  *    before producing anything (no laundering).
  *  - Re-encrypts the plaintext under the new key and re-signs with the
  *    writer's resident private key. Version, integrity_hash (plaintext
- *    hash), metadata, and kid are all preserved — only the ciphertext block
+ *    hash), metadata, and kid are all preserved - only the ciphertext block
  *    and the signatures over it change.
  */
 export async function rotateStateEntryBytes(args: {
@@ -1607,7 +1898,7 @@ export async function rotateStateEntryBytes(args: {
     decrypt(entry.payload, args.newNamespaceKey).fill(0);
     return { status: "already-new" };
   } catch {
-    // Not yet converted — proceed with the old key.
+    // Not yet converted - proceed with the old key.
   }
 
   let plaintext: Uint8Array;
@@ -1651,7 +1942,11 @@ export async function rotateStateEntryBytes(args: {
         key,
         version: entry.ver,
         kid: entry.kid,
+        schemaVersion: entry.v,
         metadata: entry.metadata,
+        ...(entry.provenance_stamp !== undefined
+          ? { provenanceStamp: entry.provenance_stamp }
+          : {}),
         integrityHash: entry.integrity_hash,
         payload: entry.payload,
       });
@@ -1695,7 +1990,11 @@ export async function rotateStateEntryBytes(args: {
         key,
         version: entry.ver,
         kid: entry.kid,
+        schemaVersion: entry.v,
         metadata: entry.metadata,
+        ...(entry.provenance_stamp !== undefined
+          ? { provenanceStamp: entry.provenance_stamp }
+          : {}),
         integrityHash: entry.integrity_hash,
         payload: newPayload,
       });
@@ -1729,13 +2028,13 @@ export const STATE_META_VERSION_ANCHORS_KEY = STATE_ENVELOPE_VERSION_ANCHORS_KEY
  * Re-MAC the version-anchor `_meta` record for a master rotation.
  *
  * Returns:
- *  - null            — record is bare/legacy (no MAC marker): untrusted today
+ *  - null            - record is bare/legacy (no MAC marker): untrusted today
  *    and left untouched; the floor re-derives from authenticated entries.
- *  - "already-new"   — MAC already verifies under the new master (resume).
- *  - bytes           — restamped record, after the OLD MAC verified.
+ *  - "already-new"   - MAC already verifies under the new master (resume).
+ *  - bytes           - restamped record, after the OLD MAC verified.
  *
  * Throws when the record carries the marker but its MAC verifies under
- * NEITHER master — that is tampering, and a rotation must not launder it
+ * NEITHER master - that is tampering, and a rotation must not launder it
  * into a freshly-authenticated record.
  */
 export function rotateStateMetaRecordBytes(args: {
