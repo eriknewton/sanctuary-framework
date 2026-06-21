@@ -162,12 +162,12 @@ these subsystems are largely independent. The fix is documentation, not deletion
   is the default page at BOTH `/` and `/posture` on the **standalone `DashboardApprovalChannel`**
   front door (`principal-policy/dashboard.ts` serves it before the auth gate; that is the channel
   used by the MCP server boot path and `sanctuary dashboard`). The shell carries no posture data and
-  fetches the evidence from `/api/posture/*`, which stay behind `checkAuth`. **Scope caveat:** the
-  root-flip is NOT yet wired into the SEPARATE co-located `wrap` server (`dashboard/api.ts`, the
-  `sanctuary wrap` / "Protect" HTTP server), which still serves the v1.1 SPA at `/` and has no
-  `/api/posture/*` routes. Folding the posture board into that server is a tracked Piece-C
-  remainder (it needs the posture JSON API mounted there first, so flipping `/` alone would land an
-  operator on a shell whose data fetches 404). Do NOT confuse this dashboard posture with the
+  fetches the evidence from `/api/posture/*`, which stay behind `checkAuth`. The SEPARATE co-located
+  `wrap` server (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP server) also serves that
+  posture shell at `/` and `/posture`, mounts `/api/posture/*` behind read auth, and preserves the
+  v1.1 SPA compatibility aliases at `/dashboard` and `/v1.1`; its `/api/status` remains
+  `decision_capable:false` because that process cannot release live approval promises. Do NOT
+  confuse this dashboard posture with the
   unauthenticated `/api/health` probe: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
   ONLY (no arm-state, no audit scan); the detailed evidence-gated Castle Wall arm-state is served
   exclusively behind auth, via `/api/posture/castle-wall` and the SESSION_TOKEN-gated `/v1/status`

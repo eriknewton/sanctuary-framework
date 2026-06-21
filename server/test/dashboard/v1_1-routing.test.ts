@@ -4,8 +4,8 @@
  * v1.1.0 shipped the v1.1 dashboard module + hub API but no entry-point
  * server imported them. From an operator's perspective v1.1.0 delivered
  * no interactive new functionality. The hotfix mounts v1.1 routes
- * additively at /v1.1 (HTML) and /api/hub/* (API); legacy routes at /
- * continue to serve.
+ * additively at /v1.1 (HTML) and /api/hub/* (API); the legacy dashboard
+ * root behavior has since been superseded by the posture shell root.
  *
  * These tests boot a real DashboardApprovalChannel instance, call
  * setV11Bindings with stub-empty hub state, and assert end-to-end that
