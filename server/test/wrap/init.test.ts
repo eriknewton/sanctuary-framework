@@ -15,7 +15,7 @@
  *   - parseInitArgs round-trips every flag.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   mkdtemp,
   mkdir,
@@ -32,13 +32,124 @@ import {
   printInitHelp,
   resolveFortressPath,
   resolveNoPin,
-  runInit,
+  runInit as runInitRaw,
+  type InitOptions,
+  type RunInitDeps,
 } from "../../src/wrap/init.js";
 import {
   RECOVERY_KEY_FILENAME,
   RecoveryKeyOutputPathExistsError,
   RecoveryKeyOutputPathSymlinkError,
 } from "../../src/wrap/recovery-key-disclosure.js";
+import {
+  RecoveryKeyKeychainStoreError,
+  recoveryKeyServiceFor,
+} from "../../src/wrap/keychain-custody.js";
+import type { ExecResult } from "../../src/wrap/passphrase.js";
+
+type ExecCall = { cmd: string; args: string[]; input?: string };
+
+function unescapeSecurityToken(value: string): string {
+  return value.replace(/\\(.)/g, "$1");
+}
+
+function readSecurityToken(input: string | undefined, flag: string): string {
+  const escapedFlag = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = input?.match(
+    new RegExp(`${escapedFlag} "((?:[^"\\\\]|\\\\.)*)"`)
+  );
+  return match ? unescapeSecurityToken(match[1]!) : "";
+}
+
+function makeRecoveryKeychainMock(opts: {
+  writeFails?: boolean;
+  readBackOverride?: string;
+} = {}): {
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>;
+  calls: ExecCall[];
+  stored: Map<string, string>;
+} {
+  const calls: ExecCall[] = [];
+  const stored = new Map<string, string>();
+
+  function keyFor(account: string, service: string): string {
+    return `${account}:${service}`;
+  }
+
+  const exec = async (
+    cmd: string,
+    args: string[],
+    input?: string
+  ): Promise<ExecResult> => {
+    calls.push(input === undefined ? { cmd, args } : { cmd, args, input });
+    if (cmd !== "security") {
+      return { stdout: "", stderr: "unknown", code: 1 };
+    }
+    if (args[0] === "-i") {
+      if (opts.writeFails) {
+        return { stdout: "", stderr: "write failed", code: 1 };
+      }
+      const account = readSecurityToken(input, "-a");
+      const service = readSecurityToken(input, "-s");
+      const value = readSecurityToken(input, "-w");
+      stored.set(keyFor(account, service), value);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "find-generic-password") {
+      const account = args[args.indexOf("-a") + 1] ?? "";
+      const service = args[args.indexOf("-s") + 1] ?? "";
+      const value = opts.readBackOverride ?? stored.get(keyFor(account, service));
+      if (value) return { stdout: value + "\n", stderr: "", code: 0 };
+      return { stdout: "", stderr: "not found", code: 44 };
+    }
+    return { stdout: "", stderr: "unknown", code: 1 };
+  };
+
+  return { exec, calls, stored };
+}
+
+async function runInit(
+  options: InitOptions,
+  deps: RunInitDeps = {}
+): Promise<Awaited<ReturnType<typeof runInitRaw>>> {
+  const keychain = makeRecoveryKeychainMock();
+  return runInitRaw(options, {
+    ...deps,
+    recoveryKeychain: {
+      home: "/tmp/sanctuary-test-home",
+      platformOverride: "darwin",
+      exec: keychain.exec,
+    },
+  });
+}
+
+async function runInitWithRecoveryKeychain(
+  options: InitOptions,
+  keychain = makeRecoveryKeychainMock(),
+  deps: RunInitDeps = {}
+): Promise<{
+  result: Awaited<ReturnType<typeof runInitRaw>>;
+  keychain: ReturnType<typeof makeRecoveryKeychainMock>;
+}> {
+  const result = await runInitRaw(options, {
+    ...deps,
+    recoveryKeychain: {
+      home: "/tmp/sanctuary-test-home",
+      platformOverride: "darwin",
+      exec: keychain.exec,
+    },
+  });
+  return { result, keychain };
+}
+
+function extractRecoveryKey(fileContent: string): string {
+  const keyLine = fileContent
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => /^[A-Za-z0-9_-]{43}$/.test(l));
+  if (!keyLine) throw new Error("recovery key not found");
+  return keyLine;
+}
 
 describe("resolveFortressPath", () => {
   it("returns ~/.sanctuary when no flag or env var is set", () => {
@@ -131,6 +242,120 @@ describe("runInit", () => {
     // on a developer machine (it might already exist), but we CAN assert
     // the fortress isn't at the default location.
     expect(result.fortressPath).not.toBe(join(homedir(), ".sanctuary"));
+  });
+
+  it("stores the minted recovery key in a read-back-verified Keychain item", async () => {
+    const fortressPath = join(tmp, "keychain-recovery-fortress");
+    const { result, keychain } = await runInitWithRecoveryKeychain({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+
+    const recoveryFile = await readFile(
+      result.recoveryKeyDisclosurePath,
+      "utf-8",
+    );
+    const recoveryKey = extractRecoveryKey(recoveryFile);
+    const service = recoveryKeyServiceFor(
+      fortressPath,
+      "/tmp/sanctuary-test-home",
+    );
+
+    expect(keychain.stored.get(`sanctuary:${service}`)).toBe(recoveryKey);
+
+    const writeIndex = keychain.calls.findIndex(
+      (call) => call.cmd === "security" && call.args[0] === "-i",
+    );
+    const readIndex = keychain.calls.findIndex(
+      (call) =>
+        call.cmd === "security" &&
+        call.args[0] === "find-generic-password" &&
+        call.args.includes(service),
+    );
+    expect(writeIndex).toBeGreaterThanOrEqual(0);
+    expect(readIndex).toBeGreaterThan(writeIndex);
+    expect(
+      keychain.calls.some((call) => call.args.includes(recoveryKey)),
+    ).toBe(false);
+  });
+
+  it("fails closed before custody state when recovery-key Keychain write fails", async () => {
+    const fortressPath = join(tmp, "keychain-write-fails-fortress");
+    const keychain = makeRecoveryKeychainMock({ writeFails: true });
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    let thrown: unknown;
+    let consoleOutput = "";
+    try {
+      await runInitRaw(
+        {
+          fortress: fortressPath,
+          noConfirm: true,
+          noPin: true,
+        },
+        {
+          recoveryKeychain: {
+            home: "/tmp/sanctuary-test-home",
+            platformOverride: "darwin",
+            exec: keychain.exec,
+          },
+        },
+      );
+    } catch (err) {
+      thrown = err;
+    } finally {
+      consoleOutput = consoleSpy.mock.calls
+        .map((args) => args.join(" "))
+        .join("\n");
+      consoleSpy.mockRestore();
+    }
+
+    expect(thrown).toBeInstanceOf(RecoveryKeyKeychainStoreError);
+    const writeInput = keychain.calls.find(
+      (call) => call.cmd === "security" && call.args[0] === "-i",
+    )?.input;
+    const recoveryKey = readSecurityToken(writeInput, "-w");
+    expect(recoveryKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect((thrown as Error).message).not.toContain(recoveryKey);
+    expect(consoleOutput).not.toContain(recoveryKey);
+    await expect(
+      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+    ).rejects.toThrow();
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+  });
+
+  it("fails closed before custody state when recovery-key Keychain read-back mismatches", async () => {
+    const fortressPath = join(tmp, "keychain-readback-fails-fortress");
+    const keychain = makeRecoveryKeychainMock({
+      readBackOverride: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    });
+
+    await expect(
+      runInitRaw(
+        {
+          fortress: fortressPath,
+          noConfirm: true,
+          noPin: true,
+        },
+        {
+          recoveryKeychain: {
+            home: "/tmp/sanctuary-test-home",
+            platformOverride: "darwin",
+            exec: keychain.exec,
+          },
+        },
+      ),
+    ).rejects.toThrow(RecoveryKeyKeychainStoreError);
+
+    await expect(
+      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+    ).rejects.toThrow();
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
   });
 
   it("--recovery-out writes the recovery key to an external durable path", async () => {

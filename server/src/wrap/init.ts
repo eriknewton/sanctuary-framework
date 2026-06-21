@@ -37,7 +37,11 @@ import {
   type CustodyEnvelope,
   type CustodyWrap,
 } from "../core/master-custody.js";
-import { getOrCreateKeychainCustodyKey } from "./keychain-custody.js";
+import {
+  getOrCreateKeychainCustodyKey,
+  storeRecoveryKeyInKeychain,
+  type KeychainCustodyOptions,
+} from "./keychain-custody.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
@@ -173,6 +177,8 @@ async function isDirectoryEmpty(path: string): Promise<boolean> {
  */
 export interface RunInitDeps {
   provisionPin?: typeof runProvisionPin;
+  /** Test seam: inject a mock OS-keyring backend for recovery-key storage. */
+  recoveryKeychain?: KeychainCustodyOptions;
   /** Test seam: simulate a race after preflight but before O_EXCL capture. */
   beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
 }
@@ -248,6 +254,12 @@ export async function runInit(
     }),
   ];
   recoveryKeyBytes.fill(0);
+
+  await storeRecoveryKeyInKeychain(
+    fortressPath,
+    recoveryKey,
+    deps.recoveryKeychain
+  );
 
   // Second factor. Interactive installs MUST enroll one (the two-factor
   // floor refuses trust-bearing writes — including the Castle pin below —
