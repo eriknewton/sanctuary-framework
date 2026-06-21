@@ -15,11 +15,9 @@
  * `invocationOps` EMPTY so a beat can NEVER earn green - see
  * `principal-policy/feature-health.ts`.
  *
- * BASIS: a DIRECT channel-basis `auditLog.append` (provenance marker only, no
- * producer signature). The broker has no per-event producer-signing infra; this
- * is the SAME basis the Castle Wall heartbeat uses on a non-key-bearing host. A
- * forged in-process beat can only relabel a real silent-death `fault` to a
- * non-green `unknown`, never manufacture green.
+ * BASIS: a producer-signed heartbeat. The reader re-verifies the signature
+ * against the broker liveness producer public key and rejects unsigned,
+ * wrong-key, and replayed beats.
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
@@ -27,16 +25,20 @@ import {
   BROKER_DAEMON_AUDIT_LAYER,
   BROKER_DAEMON_HEARTBEAT_OPERATION,
   BROKER_DAEMON_STAND_DOWN_OPERATION,
-  BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
-  BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
   BROKER_DAEMON_HEARTBEAT_INTERVAL_SECONDS,
 } from "./liveness-constants.js";
+import {
+  brokerProducerMarkerDetails,
+  type BrokerProducerSigner,
+} from "./producer-signature.js";
 
 export interface BrokerLivenessHeartbeatOptions {
   /** Audit log the broker daemon shares with the rest of the fortress. */
   auditLog: AuditLog;
   /** Identity id stamped on the audit entries (the daemon's fortress id). */
   fortressId: string;
+  /** Dedicated broker daemon liveness producer signer. */
+  producerSigner: BrokerProducerSigner;
   /** Override the cadence (seconds) for tests. Defaults to ~45s. */
   intervalSeconds?: number;
 }
@@ -54,20 +56,6 @@ export interface BrokerLivenessHeartbeatHandle {
 }
 
 /**
- * Build the marker fields for a heartbeat / stand-down entry from FIXED fields
- * only (no untrusted spread), provenance marker stamped LAST - mirroring the
- * Castle Wall producer so a forger cannot pre-seed a field that out-ranks the
- * marker.
- */
-function brokerMarkerDetails(): Record<string, unknown> {
-  return {
-    source: "broker-server",
-    // Provenance marker LAST, constructed fields only (no untrusted spread).
-    [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
-  };
-}
-
-/**
  * Start the periodic liveness heartbeat. Emits one beat IMMEDIATELY, then on a
  * ~45s interval. The interval is `.unref()`ed so it never keeps the event loop
  * alive on its own. A write failure is swallowed (the reader fails toward the
@@ -78,34 +66,55 @@ function brokerMarkerDetails(): Record<string, unknown> {
 export function startBrokerLivenessHeartbeat(
   opts: BrokerLivenessHeartbeatOptions,
 ): BrokerLivenessHeartbeatHandle {
-  const { auditLog, fortressId } = opts;
+  const { auditLog, fortressId, producerSigner } = opts;
   const intervalMs =
     (opts.intervalSeconds ?? BROKER_DAEMON_HEARTBEAT_INTERVAL_SECONDS) * 1000;
 
-  const emitBeat = async (): Promise<void> => {
+  let writeQueue = Promise.resolve();
+
+  const emitOperation = async (
+    operation:
+      | typeof BROKER_DAEMON_HEARTBEAT_OPERATION
+      | typeof BROKER_DAEMON_STAND_DOWN_OPERATION,
+  ): Promise<void> => {
     try {
-      await auditLog.append(
-        BROKER_DAEMON_AUDIT_LAYER,
-        BROKER_DAEMON_HEARTBEAT_OPERATION,
-        fortressId,
-        brokerMarkerDetails(),
-        "success",
-      );
+      const capturedAtUnixMs = Date.now();
+      const signedDetails = await producerSigner.signDetails(operation, capturedAtUnixMs);
+      await auditLog.appendCritical({
+        layer: BROKER_DAEMON_AUDIT_LAYER,
+        operation,
+        identity_id: fortressId,
+        timestamp: new Date(capturedAtUnixMs).toISOString(),
+        details: brokerProducerMarkerDetails(signedDetails),
+        result: "success",
+      });
       await auditLog.flush();
     } catch {
-      // A heartbeat write failure must never crash the daemon. The reader's
-      // silent-death detection fails toward an alarm (a MISSING heartbeat reads
-      // as fault), so a dropped beat is surfaced honestly rather than masked.
+      // A lifecycle write failure must never crash the daemon. The reader's
+      // silent-death detection fails toward an alarm when signed lifecycle
+      // evidence is missing, so a dropped beat is surfaced honestly.
     }
+  };
+
+  const queueOperation = (
+    operation:
+      | typeof BROKER_DAEMON_HEARTBEAT_OPERATION
+      | typeof BROKER_DAEMON_STAND_DOWN_OPERATION,
+  ): Promise<void> => {
+    writeQueue = writeQueue.then(
+      () => emitOperation(operation),
+      () => emitOperation(operation),
+    );
+    return writeQueue;
   };
 
   // Emit one beat immediately so a daemon that dies seconds after boot still has
   // a prior-liveness signal on the chain (the reader only raises the silent-death
   // alarm once it has proof the producer was running).
-  void emitBeat();
+  void queueOperation(BROKER_DAEMON_HEARTBEAT_OPERATION);
 
   let interval: NodeJS.Timeout | undefined = setInterval(() => {
-    void emitBeat();
+    void queueOperation(BROKER_DAEMON_HEARTBEAT_OPERATION);
   }, intervalMs);
   interval.unref();
 
@@ -121,20 +130,7 @@ export function startBrokerLivenessHeartbeat(
     if (stoodDown) return;
     stoodDown = true;
     stop();
-    try {
-      await auditLog.append(
-        BROKER_DAEMON_AUDIT_LAYER,
-        BROKER_DAEMON_STAND_DOWN_OPERATION,
-        fortressId,
-        brokerMarkerDetails(),
-        "success",
-      );
-      await auditLog.flush();
-    } catch {
-      // A stand-down write failure must never crash the shutdown path. Without a
-      // recorded stand-down the reader reads this quiet window as a silent death
-      // (fails toward the alarm), which is the honest fallback.
-    }
+    await queueOperation(BROKER_DAEMON_STAND_DOWN_OPERATION);
   };
 
   return { standDown, stop };

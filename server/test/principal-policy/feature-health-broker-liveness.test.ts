@@ -5,9 +5,9 @@
  * This is a process-liveness surface for the long-running `sanctuary
  * broker-server` MCP daemon. It is ADDITIVE on the now-generalized per-feature
  * provenance gate (#658) and replicates the CORRECTED Castle Wall Slice-2
- * pattern (#656/#657): a periodic channel-marker heartbeat + a clean-stop
- * stand-down signal, so a deliberate stop is NOT a false-RED while a genuine
- * silent death still fires the alarm.
+ * pattern (#656/#657): a periodic signed heartbeat + a clean-stop stand-down
+ * signal, so a deliberate stop is NOT a false-RED while a genuine silent death
+ * still fires the alarm.
  *
  * HONEST SCOPE (every assertion below defends this): a heartbeat proves ONLY
  * that the daemon PROCESS is alive. It is NOT token-mint/deny correctness, NOT
@@ -15,18 +15,20 @@
  * secrets` path. The row carries an EMPTY `invocationOps` set, so green
  * (`active`) is STRUCTURALLY impossible.
  *
- * BASIS: channel/marker only (no producer signature) - exactly the basis a
- * genuine Castle Wall heartbeat uses on a non-key-bearing host. Entries are
- * written through a REAL AuditLog over MemoryStorage (exactly what an in-process
- * writer can do), and the reader's verdict is asserted.
+ * BASIS: producer-signed by a dedicated broker liveness key. Entries are
+ * written through a REAL AuditLog over MemoryStorage, and the reader must reject
+ * marker-only, wrong-key, and replayed beats.
  */
 
 import { describe, expect, it } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import { AuditLog, type AuditEntry } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { toBase64url } from "../../src/core/encoding.js";
 import {
+  BROKER_DAEMON_PRODUCER_SIGNATURE_SCHEME,
   buildFeatureHealthPanel,
   evaluateFeatureHealth,
   SLICE1_FEATURE_REGISTRY,
@@ -40,6 +42,10 @@ import {
   BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
   BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
 } from "../../src/broker-mcp/liveness-constants.js";
+import {
+  buildBrokerProducerSignedDetails,
+  brokerProducerMarkerDetails,
+} from "../../src/broker-mcp/producer-signature.js";
 
 const FORTRESS = "fortress:broker-test";
 const NOW = 1_750_000_000_000;
@@ -56,9 +62,33 @@ const BROKER_ROW_ID = "secret_broker_daemon";
 const FRESH_SELF_REPORTING_ROW_ID = "fresh_self_reporting_probe";
 const FRESH_SELF_REPORTING_INVOCATION_OPERATION =
   "fresh_self_reporting_probe_invoked";
+const BROKER_PRIV = ed25519.utils.randomPrivateKey();
+const BROKER_PUB_B64 = toBase64url(ed25519.getPublicKey(BROKER_PRIV));
+const WRONG_PRIV = ed25519.utils.randomPrivateKey();
+const WRONG_PUB_B64 = toBase64url(ed25519.getPublicKey(WRONG_PRIV));
 
 function newLog(): AuditLog {
   return new AuditLog(new MemoryStorage(), generateRandomKey());
+}
+
+let nextBrokerSeq = 1;
+
+function signedBrokerDetails(
+  operation:
+    | typeof BROKER_DAEMON_HEARTBEAT_OPERATION
+    | typeof BROKER_DAEMON_STAND_DOWN_OPERATION,
+  tsMs: number,
+  seq = nextBrokerSeq++,
+  privateKey = BROKER_PRIV,
+): Record<string, unknown> {
+  return brokerProducerMarkerDetails(
+    buildBrokerProducerSignedDetails({
+      operation,
+      capturedAtUnixMs: tsMs,
+      seq,
+      privateKey,
+    }),
+  );
 }
 
 function brokerRow(panel: { rows: FeatureHealthRow[] }): FeatureHealthRow {
@@ -101,11 +131,15 @@ function truncatedAuditLog(
   return fake as unknown as AuditLog;
 }
 
-async function buildPanel(log: AuditLog): Promise<FeatureHealthPanel> {
+async function buildPanel(
+  log: AuditLog,
+  brokerPinnedProducerKeyB64url: string | null = BROKER_PUB_B64,
+): Promise<FeatureHealthPanel> {
   return buildFeatureHealthPanel({
     auditLog: log,
     originMachine: FORTRESS,
     now: NOW,
+    brokerPinnedProducerKeyB64url,
   });
 }
 
@@ -129,11 +163,7 @@ function brokerHeartbeatEntry(tsMs: number): AuditEntry {
     identity_id: FORTRESS,
     result: "success",
     timestamp: new Date(tsMs).toISOString(),
-    details: {
-      source: "broker-server",
-      [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]:
-        BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
-    },
+    details: signedBrokerDetails(BROKER_DAEMON_HEARTBEAT_OPERATION, tsMs),
   };
 }
 
@@ -149,9 +179,8 @@ function freshSelfReportingInvocationEntry(tsMs: number): AuditEntry {
 }
 
 /**
- * A genuine broker daemon liveness heartbeat — the SHAPE THE REAL PRODUCER
- * EMITS (`broker-mcp/liveness-heartbeat.ts`): a direct channel-basis append on
- * l3 carrying the broker provenance marker and NO producer signature.
+ * A genuine broker daemon liveness heartbeat: a broker-producer-signed l3 entry
+ * carrying the broker provenance marker.
  */
 async function appendBrokerHeartbeat(log: AuditLog, tsMs: number): Promise<void> {
   await log.appendCritical({
@@ -160,10 +189,7 @@ async function appendBrokerHeartbeat(log: AuditLog, tsMs: number): Promise<void>
     identity_id: FORTRESS,
     result: "success",
     timestamp: new Date(tsMs).toISOString(),
-    details: {
-      source: "broker-server",
-      [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
-    },
+    details: signedBrokerDetails(BROKER_DAEMON_HEARTBEAT_OPERATION, tsMs),
   });
 }
 
@@ -175,10 +201,7 @@ async function appendBrokerStandDown(log: AuditLog, tsMs: number): Promise<void>
     identity_id: FORTRESS,
     result: "success",
     timestamp: new Date(tsMs).toISOString(),
-    details: {
-      source: "broker-server",
-      [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
-    },
+    details: signedBrokerDetails(BROKER_DAEMON_STAND_DOWN_OPERATION, tsMs),
   });
 }
 
@@ -194,6 +217,21 @@ async function appendUnmarkedHeartbeat(log: AuditLog, tsMs: number): Promise<voi
   });
 }
 
+async function appendBrokerHeartbeatDetails(
+  log: AuditLog,
+  tsMs: number,
+  details: Record<string, unknown>,
+): Promise<void> {
+  await log.appendCritical({
+    layer: "l3",
+    operation: BROKER_DAEMON_HEARTBEAT_OPERATION,
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details,
+  });
+}
+
 describe("broker daemon liveness — registry row is honest by construction", () => {
   it("the secret_broker_daemon row exists, is self_reporting, and has EMPTY invocationOps (green is structurally impossible)", () => {
     const row = SLICE1_FEATURE_REGISTRY.find((f) => f.id === BROKER_ROW_ID);
@@ -204,13 +242,15 @@ describe("broker daemon liveness — registry row is honest by construction", ()
     // EMPTY invocation set: the `active` branch requires a fresh invocation, so
     // an empty set makes green unreachable.
     expect(row.invocationOps.size).toBe(0);
-    // Channel/marker basis only: a provenance marker, NO producer-signature
-    // scheme (the broker has no per-event signing infra).
     expect(row.provenanceMarker).toEqual({
       key: BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
       value: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
     });
-    expect(row.producerSignatureScheme).toBeUndefined();
+    expect(row.producerSignatureScheme).toBe(
+      BROKER_DAEMON_PRODUCER_SIGNATURE_SCHEME,
+    );
+    expect(row.rejectNonMonotonicSignedLiveness).toBe(true);
+    expect(row.noHeartbeatFaultWhenProducerKeyPresent).toBe(true);
     expect(row.brokenZeroDetectable).toBe(true);
   });
 
@@ -325,6 +365,7 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
       registry: Object.freeze([brokerFeature, freshFeature]),
       originMachine: FORTRESS,
       now: NOW,
+      brokerPinnedProducerKeyB64url: BROKER_PUB_B64,
     });
     const freshRow = panel.rows.find(
       (r) => r.feature_id === FRESH_SELF_REPORTING_ROW_ID,
@@ -391,26 +432,75 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     expect(row.basis).toBe("dead_no_heartbeat");
   });
 
-  // (5) No heartbeat ever → unknown / no_evidence_self_reporting (no fabricated
-  // death alarm for a daemon that was never observed running).
-  it("no heartbeat ever → unknown / no_evidence_self_reporting (never a fabricated death alarm)", async () => {
+  // (5) No heartbeat ever with a broker producer key → fault /
+  // dead_no_heartbeat. The key proves this producer is provisioned to beat.
+  it("no heartbeat ever with a broker producer key → fault / dead_no_heartbeat", async () => {
     const log = newLog();
     const row = brokerRow(await buildPanel(log));
-    expect(row.status).toBe("unknown");
-    expect(row.basis).toBe("no_evidence_self_reporting");
-    expect(row.status).not.toBe("fault");
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+    expect(row.status).not.toBe("active");
   });
 
   // (6) A beat missing the broker marker is NOT counted (foreign L3 producer
   // reusing the op name cannot fake liveness).
-  it("a heartbeat missing the broker provenance marker is NOT counted → no_evidence_self_reporting", async () => {
+  it("a heartbeat missing the broker provenance marker is NOT counted → dead_no_heartbeat", async () => {
     const log = newLog();
     await appendUnmarkedHeartbeat(log, FRESH_TS);
     const row = brokerRow(await buildPanel(log));
-    // The unmarked beat is invisible to the reader, so it reads as if no beat
-    // ever happened — never alive, never a death alarm.
-    expect(row.status).toBe("unknown");
-    expect(row.basis).toBe("no_evidence_self_reporting");
+    // The unmarked beat is invisible to the reader; with the broker key present,
+    // no verified beat means the daemon is not alive.
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+  });
+
+  it("an unsigned marker-only heartbeat is NOT counted as alive", async () => {
+    const log = newLog();
+    await appendBrokerHeartbeatDetails(log, FRESH_TS, {
+      source: "broker-server",
+      [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]:
+        BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
+    });
+    const row = brokerRow(await buildPanel(log));
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+    expect(row.basis).not.toBe("alive_no_recent_enforcement");
+  });
+
+  it("a wrong-key signed heartbeat is NOT counted as alive", async () => {
+    const log = newLog();
+    await appendBrokerHeartbeatDetails(
+      log,
+      FRESH_TS,
+      signedBrokerDetails(
+        BROKER_DAEMON_HEARTBEAT_OPERATION,
+        FRESH_TS,
+        50,
+        WRONG_PRIV,
+      ),
+    );
+    const row = brokerRow(await buildPanel(log));
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+    expect(WRONG_PUB_B64).not.toBe(BROKER_PUB_B64);
+  });
+
+  it("a non-monotonic signed heartbeat is rejected as replayed evidence", async () => {
+    const log = newLog();
+    await appendBrokerHeartbeatDetails(
+      log,
+      STALE_TS,
+      signedBrokerDetails(BROKER_DAEMON_HEARTBEAT_OPERATION, STALE_TS, 80),
+    );
+    await appendBrokerHeartbeatDetails(
+      log,
+      FRESH_TS,
+      signedBrokerDetails(BROKER_DAEMON_HEARTBEAT_OPERATION, FRESH_TS, 79),
+    );
+    const row = brokerRow(await buildPanel(log));
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+    expect(row.basis).not.toBe("alive_no_recent_enforcement");
   });
 
   // (7) Tainted read → unknown (never green, never a trusted red).
@@ -436,13 +526,13 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
   });
 
   // (8) Future-skew rejection: a future-dated heartbeat does not register fresh,
-  // and (since no other liveness exists) reads as no-evidence, not alive.
-  it("a future-dated heartbeat beyond skew is rejected → no_evidence_self_reporting (not alive)", async () => {
+  // and (since no other liveness exists) reads dead, not alive.
+  it("a future-dated heartbeat beyond skew is rejected → dead_no_heartbeat (not alive)", async () => {
     const log = newLog();
     await appendBrokerHeartbeat(log, FUTURE_TS);
     const row = brokerRow(await buildPanel(log));
-    expect(row.status).toBe("unknown");
-    expect(row.basis).toBe("no_evidence_self_reporting");
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
     expect(row.status).not.toBe("active");
   });
 

@@ -1310,7 +1310,11 @@ export async function runWrap(
         const { loadFortressProducerKey } = await import(
           "../castle-wall/runtime/producer-signature.js"
         );
+        const { loadBrokerProducerKey } = await import(
+          "../broker-mcp/producer-signature.js"
+        );
         const producerKeyLoad = await loadFortressProducerKey(storagePath);
+        const brokerProducerKeyLoad = await loadBrokerProducerKey(storagePath);
         dashboard.updateSources?.({
           resolvePinnedProducerKey: () =>
             producerKeyLoad.status === "present"
@@ -1318,6 +1322,13 @@ export async function runWrap(
               : null,
           ...(producerKeyLoad.status === "unreadable"
             ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+          resolveBrokerPinnedProducerKey: () =>
+            brokerProducerKeyLoad.status === "present"
+              ? brokerProducerKeyLoad.keyB64url
+              : null,
+          ...(brokerProducerKeyLoad.status === "unreadable"
+            ? { brokerProducerKeyExpectedButUnavailable: true }
             : {}),
         });
       } catch {

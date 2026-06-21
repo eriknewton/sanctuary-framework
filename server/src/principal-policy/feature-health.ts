@@ -84,9 +84,13 @@ import {
 } from "./posture.js";
 import {
   reverifyEntryProducerSignature,
+  reverifyBrokerEntryProducerSignature,
   enforcementEntryCounts,
   livenessEntryCounts,
+  brokerLivenessEntryCounts,
   producerSignedDedupKey,
+  brokerProducerSignedDedupKey,
+  brokerSignedOperationMatchesEntry,
   signedCanonicalOperation,
   type EntryReverifyBasis,
   type VerifyProducerSignatureFn,
@@ -193,9 +197,8 @@ function signedOperationMatchesEntry(
  * cryptographically signs its evidence. Factoring it out of a hardcoded Castle
  * Wall branch lets a future signing daemon declare the same teeth WITHOUT this
  * module growing a second `if (feature.id === ...)` ladder, while a feature with
- * NO scheme (a channel-marker-only heartbeat) skips the path entirely. The
- * Castle Wall scheme wires the EXISTING functions, so Castle Wall's behavior is
- * byte-for-byte unchanged.
+ * NO scheme skips the path entirely. The Castle Wall scheme wires the EXISTING
+ * functions, so Castle Wall's behavior is byte-for-byte unchanged.
  */
 export interface ProducerSignatureScheme {
   /** Re-verify one entry's persisted producer signature against the pinned key. */
@@ -241,6 +244,15 @@ export const CASTLE_WALL_PRODUCER_SIGNATURE_SCHEME: ProducerSignatureScheme =
     livenessCounts: livenessEntryCounts,
     signedOperationMatches: signedOperationMatchesEntry,
     dedupKey: producerSignedDedupKey,
+  });
+
+export const BROKER_DAEMON_PRODUCER_SIGNATURE_SCHEME: ProducerSignatureScheme =
+  Object.freeze({
+    reverify: reverifyBrokerEntryProducerSignature,
+    enforcementCounts: () => false,
+    livenessCounts: brokerLivenessEntryCounts,
+    signedOperationMatches: brokerSignedOperationMatchesEntry,
+    dedupKey: brokerProducerSignedDedupKey,
   });
 
 /**
@@ -408,12 +420,24 @@ export interface FeatureRegistryEntry {
    * operation is bound to the entry it is filed under, and exact replays are
    * deduped. Castle Wall declares the Castle Wall scheme, so its signed-basis
    * behavior is identical. A feature with a `provenanceMarker` but NO scheme
-   * (the broker's channel-marker heartbeat) is recognized on the channel/marker
-   * basis only (the signature re-verify path is never attempted for it), which
-   * is the SAME basis a genuine Castle Wall heartbeat already uses on a
-   * non-key-bearing host. Only meaningful alongside a `provenanceMarker`.
+   * no signed producer is recognized on the channel/marker basis only (the
+   * signature re-verify path is never attempted for it). Only meaningful
+   * alongside a `provenanceMarker`.
    */
   producerSignatureScheme?: ProducerSignatureScheme;
+  /**
+   * A signed lifecycle producer whose sequence must strictly increase as the
+   * reader walks the audit entries. Used by the broker daemon to reject a
+   * previously signed heartbeat re-appended after a newer signed beat.
+   */
+  rejectNonMonotonicSignedLiveness?: boolean;
+  /**
+   * When true, a self-reporting feature with a pinned producer key but no valid
+   * heartbeat reads as `dead_no_heartbeat` instead of the legacy no-evidence
+   * floor. The broker daemon uses this because its Node producer key proves the
+   * daemon was provisioned to beat.
+   */
+  noHeartbeatFaultWhenProducerKeyPresent?: boolean;
   /**
    * Whether broken-zero is even detectable for this feature. Surfaced verbatim
    * so the UI never implies "confirmed working" for a feature it cannot
@@ -518,14 +542,10 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       // absence-of-evidence case from `unknown` toward an honest
       // daemon-alive-but-idle vs silently-dead split; it never earns green.
       //
-      // CHANNEL/MARKER basis only (NO `producerSignatureScheme`): the broker has
-      // no per-event producer-signing infra, so recognition rests on the broker
-      // provenance marker via the generalized per-feature gate from #658 - the
-      // SAME basis a genuine Castle Wall heartbeat uses on a non-key-bearing
-      // host. The in-process-writer boundary the Castle Wall channel heartbeat
-      // discloses applies here UNCHANGED: an L3 writer holding `AuditLog.append`
-      // could forge a fresh beat to suppress the alarm red -> non-green
-      // `unknown`, but NEVER manufacture green.
+      // PRODUCER-SIGNED basis: the broker daemon owns a dedicated Ed25519
+      // liveness producer key. The reader requires a verified signature and a
+      // strictly increasing signed seq, so marker-only, wrong-key, and replayed
+      // beats cannot suppress the dead-daemon alarm.
       id: "secret_broker_daemon",
       label: "Secret broker daemon (process liveness)",
       layer: "l3",
@@ -538,11 +558,14 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
       // A clean operator stop relabels the otherwise-silent quiet window as an
       // honest intentional stand-down (false-RED parity with Castle Wall #657).
       standDownOps: BROKER_DAEMON_STAND_DOWN_OPERATIONS,
-      // Channel/marker basis: provenance marker, NO signature scheme.
+      // Marker is a pre-filter; the producer signature is the authority.
       provenanceMarker: {
         key: BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
         value: BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
       },
+      producerSignatureScheme: BROKER_DAEMON_PRODUCER_SIGNATURE_SCHEME,
+      rejectNonMonotonicSignedLiveness: true,
+      noHeartbeatFaultWhenProducerKeyPresent: true,
       // Silent death of the broker DAEMON process is now detectable from a
       // missing heartbeat (true). NOTE: this is detectable for the long-running
       // DAEMON only; the event-driven `secret_broker` row's broken-zero (a
@@ -656,6 +679,10 @@ export interface BuildFeatureHealthInput {
    * Set only when `pinnedProducerKeyB64url` is null.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for the broker daemon liveness producer. */
+  brokerPinnedProducerKeyB64url?: string | null;
+  /** Broker producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
 }
@@ -700,12 +727,16 @@ export function evaluateFeatureHealth(args: {
    * is never gated by it (faults fail toward RED - see `classify`).
    */
   pinnedProducerKeyB64url?: string | null;
+  /** True when this feature's producer key is expected but unreadable. */
+  producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
   const pinnedProducerKey = args.pinnedProducerKeyB64url ?? null;
+  const producerKeyExpectedButUnavailable =
+    args.producerKeyExpectedButUnavailable === true;
   const freshnessEntries = args.freshnessEntries ?? entries;
   const freshnessComplete = args.freshnessComplete ?? true;
   const freshnessFloor = now - freshnessWindowMs;
@@ -755,6 +786,8 @@ export function evaluateFeatureHealth(args: {
         isStandDown: boolean;
         /** Dedup key for a re-verified producer-signed invocation, else null. */
         signedDedupKey: string | null;
+        /** Signed producer sequence for verified producer-signed evidence. */
+        signedSeq: number | null;
       }
     | null => {
     if (entry.layer !== feature.layer) return null;
@@ -799,6 +832,7 @@ export function evaluateFeatureHealth(args: {
     const gatedAsLiveness = isLiveness || isStandDown;
     let signedTs: number | null = null;
     let signedDedupKey: string | null = null;
+    let signedSeq: number | null = null;
     if (provenanceMarker !== undefined && (isInvocation || isLiveness || isStandDown)) {
       // MARKER GATE (per-feature). The marker is a forgeable pre-filter that
       // defends against a different producer on the same layer reusing an
@@ -810,12 +844,11 @@ export function evaluateFeatureHealth(args: {
         entry.details[provenanceMarker.key] === provenanceMarker.value;
       if (!hasProvenance) return null;
       // SIGNATURE GATE (per-feature, scheme-conditional). When the feature
-      // declares a producer-signature SCHEME (Castle Wall), the marker's
+      // declares a producer-signature SCHEME, the marker's
       // authority is the producer signature, RE-verified here against the pinned
-      // key. A feature with a marker but NO scheme (the broker's channel-marker
-      // heartbeat) is recognized on the channel/marker basis only (the same
-      // basis a genuine Castle Wall heartbeat already uses on a non-key-bearing
-      // host), so the re-verify path is never attempted for it.
+      // key. A feature with a marker but NO scheme is recognized on the
+      // channel/marker basis only, so the re-verify path is never attempted for
+      // it.
       if (signatureScheme !== undefined) {
         const reResult = signatureScheme.reverify(
           entry.details,
@@ -852,6 +885,8 @@ export function evaluateFeatureHealth(args: {
           isRecord(entry.details)
         ) {
           signedDedupKey = signatureScheme.dedupKey(entry.details);
+          const seq = entry.details.seq;
+          signedSeq = typeof seq === "number" ? seq : null;
         }
       }
     }
@@ -873,7 +908,18 @@ export function evaluateFeatureHealth(args: {
       isLiveness,
       isStandDown,
       signedDedupKey,
+      signedSeq,
     };
+  };
+
+  const signedLifecycleInstanceKey = (
+    entry: AuditEntry,
+    c: { signedDedupKey: string | null; signedSeq: number | null },
+  ): string | null => {
+    if (c.signedSeq === null) return null;
+    return `${entry.timestamp}|${entry.operation}|${
+      c.signedDedupKey ?? String(c.signedSeq)
+    }`;
   };
 
   // Pass 1 - counts + staleness over the full digest window. A re-verified
@@ -882,6 +928,8 @@ export function evaluateFeatureHealth(args: {
   // round-4 HIGH). Pass 2 is max-based, so duplicates there are harmless and
   // need no dedup.
   const countedSignedKeys = new Set<string>();
+  const acceptedSignedLifecycleInstances = new Set<string>();
+  let latestSignedLifecycleSeq: number | null = null;
   let invocationCount = 0;
   let latestInvocationMs: number | null = null;
   // Slice 2: did we observe ANY producer-gated heartbeat anywhere in the digest
@@ -904,6 +952,23 @@ export function evaluateFeatureHealth(args: {
   for (const entry of entries) {
     const c = classify(entry);
     if (c === null) continue;
+    if (
+      feature.rejectNonMonotonicSignedLiveness === true &&
+      (c.isLiveness || c.isStandDown) &&
+      c.signedSeq !== null
+    ) {
+      if (
+        latestSignedLifecycleSeq !== null &&
+        c.signedSeq <= latestSignedLifecycleSeq
+      ) {
+        continue;
+      }
+      latestSignedLifecycleSeq = c.signedSeq;
+      const instanceKey = signedLifecycleInstanceKey(entry, c);
+      if (instanceKey !== null) {
+        acceptedSignedLifecycleInstances.add(instanceKey);
+      }
+    }
     if (c.isLiveness && c.tsValid) {
       everSawHeartbeat = true;
       if (latestHeartbeatMs === null || c.ts > latestHeartbeatMs) {
@@ -942,6 +1007,19 @@ export function evaluateFeatureHealth(args: {
     const c = classify(entry);
     if (c === null || !c.tsValid || c.ts < freshnessFloor) continue;
     if (
+      feature.rejectNonMonotonicSignedLiveness === true &&
+      (c.isLiveness || c.isStandDown) &&
+      c.signedSeq !== null
+    ) {
+      const instanceKey = signedLifecycleInstanceKey(entry, c);
+      if (
+        instanceKey === null ||
+        !acceptedSignedLifecycleInstances.has(instanceKey)
+      ) {
+        continue;
+      }
+    }
+    if (
       c.isInvocation &&
       (latestFreshInvocationMs === null || c.ts > latestFreshInvocationMs)
     ) {
@@ -964,9 +1042,10 @@ export function evaluateFeatureHealth(args: {
   let status: FeatureHealthStatus;
   let basis: FeatureHealthBasis;
 
-  if (!integrityOk) {
+  if (!integrityOk || producerKeyExpectedButUnavailable) {
     // The "never fake green" invariant applied to the read path: a tainted
-    // read can never render green (or a trusted red). Fail closed to unknown.
+    // read, or an unavailable producer key for this feature, can never render
+    // green (or a trusted red). Fail closed to unknown.
     status = "unknown";
     basis = "integrity_tainted";
   } else if (feature.liveness === "self_reporting") {
@@ -1055,6 +1134,18 @@ export function evaluateFeatureHealth(args: {
       // sysext unbound). The Slice-2 silent-death alarm - `fault`/red, not the old
       // `unknown`. (Reaching here means freshnessComplete is true, so the absence
       // of a heartbeat in the freshness window is provable, not a truncated read.)
+      status = "fault";
+      basis = "dead_no_heartbeat";
+    } else if (
+      hasHeartbeatProducer &&
+      feature.noHeartbeatFaultWhenProducerKeyPresent === true &&
+      pinnedProducerKey !== null
+    ) {
+      // Broker-specific signed-heartbeat floor: once the broker liveness
+      // producer key exists, a complete read with no verified heartbeat means
+      // the daemon is not beating. This covers a genuinely dead broker that
+      // never produced an initial beat, while leaving Castle Wall's legacy
+      // no-evidence floor unchanged.
       status = "fault";
       basis = "dead_no_heartbeat";
     } else if (latestInvocationMs !== null) {
@@ -1149,9 +1240,9 @@ export interface FeatureHealthPanel {
    * events is still indistinguishable from one that is simply quiet
    * (`broken_zero_undetectable_for_event_driven` stays true). Both facts coexist:
    * DAEMON process-death is detectable; event-driven broken-zero is not. The
-   * daemon heartbeat is channel/marker basis (no producer signature), so it
-   * carries the SAME in-process-writer caveat as the Castle Wall channel
-   * heartbeat - it can only move red -> non-green `unknown`, never to green.
+   * daemon heartbeat is broker-producer-signed, so marker-only or replayed
+   * beats no longer suppress the dead-daemon alarm. It still never proves token
+   * mint/deny correctness and can never make the row green.
    */
   disclosure: {
     broken_zero_undetectable_for_event_driven: true;
@@ -1279,8 +1370,15 @@ export async function buildFeatureHealthPanel(
   const inWindow = upperBounded(entries);
   const inFreshness = upperBounded(freshnessEntries);
 
-  const rows = registry.map((feature) =>
-    evaluateFeatureHealth({
+  const rows = registry.map((feature) => {
+    const isBrokerDaemon = feature.id === "secret_broker_daemon";
+    const featurePinnedProducerKey = isBrokerDaemon
+      ? input.brokerPinnedProducerKeyB64url ?? null
+      : input.pinnedProducerKeyB64url ?? null;
+    const featureProducerKeyUnavailable = isBrokerDaemon
+      ? input.brokerProducerKeyExpectedButUnavailable === true
+      : false;
+    return evaluateFeatureHealth({
       feature,
       entries: inWindow,
       freshnessEntries: inFreshness,
@@ -1289,12 +1387,15 @@ export async function buildFeatureHealthPanel(
       now,
       freshnessWindowMs,
       integrityOk,
-      pinnedProducerKeyB64url: input.pinnedProducerKeyB64url ?? null,
+      pinnedProducerKeyB64url: featurePinnedProducerKey,
+      ...(featureProducerKeyUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
       ...(input.verifyProducerSignature
         ? { verifyProducerSignature: input.verifyProducerSignature }
       : {}),
-    }),
-  );
+    });
+  });
   const detectionEvidenceComplete = freshnessComplete && lifecycleHistoryComplete;
 
   return {

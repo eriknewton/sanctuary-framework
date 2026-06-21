@@ -21,16 +21,11 @@
  *    is STRUCTURALLY impossible for the heartbeat ever to earn the green
  *    `active` light. A heartbeat is liveness, not request-correctness.
  *
- * TRUST BASIS (same boundary the Castle Wall channel heartbeat discloses): the
- * heartbeat is a DIRECT channel-basis `auditLog.append` (provenance marker only,
- * NO producer signature) - the broker has no per-event producer-signing infra,
- * exactly like the Castle Wall heartbeat on a non-key-bearing host. The reader
- * recognizes it on the CHANNEL/marker basis (`livenessEntryCounts`). An
- * in-process L3 writer that already holds `AuditLog.append` could mint a fake
- * fresh `broker_daemon_heartbeat` to suppress the silent-death alarm, but - like
- * the Castle Wall channel heartbeat - that can only move the verdict from
- * `fault`/red to a non-green `unknown`, NEVER manufacture green. This adds no
- * weaker trust basis than the alarm it relabels.
+ * TRUST BASIS: the heartbeat is producer-signed by a dedicated broker daemon
+ * Ed25519 key. The reader treats the broker provenance marker as a pre-filter
+ * only; the signature, key id, signed canonical body, and monotonic seq are the
+ * authority. Marker-only, unsigned, wrong-key, and replayed beats do not count
+ * as broker liveness.
  *
  * These are NEW at-rest audit operation strings (documented per the
  * frozen-surface rule); none is a wire message type and none alters any existing
@@ -69,10 +64,10 @@ export const BROKER_DAEMON_HEARTBEAT_OPERATION = "broker_daemon_heartbeat" as co
  * stand-down at all. This stand-down emission is the load-bearing parity
  * requirement with the corrected Castle Wall Slice-2 pattern.
  *
- * TRUST BASIS: a DIRECT channel-basis audit append (marker only, no producer
- * signature), EXACTLY like the heartbeat. The reader only lets it relabel
- * `fault` -> a non-green `unknown`, NEVER green, so it introduces no weaker trust
- * basis than the alarm it relabels.
+ * TRUST BASIS: producer-signed with the same dedicated broker liveness key as
+ * the heartbeat. The reader only lets it relabel `fault` -> a non-green
+ * `unknown`, NEVER green, so it introduces no weaker trust basis than the alarm
+ * it relabels.
  */
 export const BROKER_DAEMON_STAND_DOWN_OPERATION = "broker_daemon_stopped" as const;
 
@@ -83,9 +78,7 @@ export const BROKER_DAEMON_STAND_DOWN_OPERATION = "broker_daemon_stopped" as con
  * `CASTLE_WALL_AUDIT_PROVENANCE_VALUE`. The reader REQUIRES it: a different L3
  * producer reusing the `broker_daemon_heartbeat` operation name (or a beat that
  * simply omits the marker) can never be mistaken for real broker daemon
- * liveness. There is NO signature scheme here - recognition rests on the
- * channel/marker basis, the same basis a genuine Castle Wall heartbeat uses on a
- * non-key-bearing host.
+ * liveness. The marker is not the authority; the producer signature is.
  */
 export const BROKER_DAEMON_AUDIT_PROVENANCE_KEY = "broker_source" as const;
 export const BROKER_DAEMON_AUDIT_PROVENANCE_VALUE = "broker_daemon" as const;

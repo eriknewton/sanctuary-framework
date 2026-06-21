@@ -100,6 +100,10 @@ export interface StartDashboardOptions {
    * `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for broker daemon liveness producer verification. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
 }
 
 /**
@@ -137,6 +141,12 @@ export async function startDashboard(
       : {}),
     ...(options.producerKeyExpectedButUnavailable
       ? { producerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(options.resolveBrokerPinnedProducerKey
+      ? { resolveBrokerPinnedProducerKey: options.resolveBrokerPinnedProducerKey }
+      : {}),
+    ...(options.brokerProducerKeyExpectedButUnavailable
+      ? { brokerProducerKeyExpectedButUnavailable: true }
       : {}),
     activity,
     pendingApprovals: pending,
