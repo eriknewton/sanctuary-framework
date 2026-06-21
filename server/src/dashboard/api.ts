@@ -226,6 +226,10 @@ export async function handleRequest(
         resolvePinnedProducerKey: deps.sources.resolvePinnedProducerKey,
         producerKeyExpectedButUnavailable:
           deps.sources.producerKeyExpectedButUnavailable === true,
+        resolveBrokerPinnedProducerKey:
+          deps.sources.resolveBrokerPinnedProducerKey,
+        brokerProducerKeyExpectedButUnavailable:
+          deps.sources.brokerProducerKeyExpectedButUnavailable === true,
       },
       req,
       res,

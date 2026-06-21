@@ -29,6 +29,10 @@ import {
   loadFortressProducerKey,
   type ProducerKeyLoad,
 } from "../castle-wall/runtime/producer-signature.js";
+import {
+  loadBrokerProducerKey,
+  type BrokerProducerKeyLoad,
+} from "../broker-mcp/producer-signature.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
@@ -283,6 +287,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * consumer wrote with (Slice P single-source contract).
    */
   private _producerKeyLoad: ProducerKeyLoad | undefined = undefined;
+  private _brokerProducerKeyLoad: BrokerProducerKeyLoad | undefined = undefined;
   private dashboardHTML: string;
   private fortressHTML: string | null = null;
   private loginHTML: string;
@@ -999,7 +1004,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `unreadable` → fail honestly (the readers force non-green via
     // `producerKeyExpectedButUnavailable`), never the channel basis.
     await this.ensureProducerKeyLoaded();
+    await this.ensureBrokerProducerKeyLoaded();
     const load = this._producerKeyLoad;
+    const brokerLoad = this._brokerProducerKeyLoad;
     // Recognition precursor: resolve the composition render-gate flag via the
     // canonical resolver (default-off). The fortress config carries no composition
     // input today, so this resolves to the honest `false` default; when an input
@@ -1022,6 +1029,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      resolveBrokerPinnedProducerKey: () =>
+        brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+      brokerProducerKeyExpectedButUnavailable:
+        brokerLoad?.status === "unreadable",
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -1260,6 +1271,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // on the next request, so a post-provision write (or a fixed permission) is
     // always picked up.
     this._producerKeyLoad = load.status === "absent" ? undefined : load;
+  }
+
+  private async ensureBrokerProducerKeyLoaded(): Promise<void> {
+    if (this._brokerProducerKeyLoad?.status === "present") return;
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) {
+      this._brokerProducerKeyLoad = undefined;
+      return;
+    }
+    let load: BrokerProducerKeyLoad;
+    try {
+      load = await loadBrokerProducerKey(storagePath);
+    } catch {
+      load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
+    }
+    this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
   }
 
   /**

@@ -43,6 +43,18 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
+import {
+  BROKER_EVIDENCE_BASIS_DETAIL_KEY,
+  BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  BROKER_PRODUCER_KID_DETAIL_KEY,
+  BROKER_PRODUCER_SIG_DETAIL_KEY,
+  BROKER_PRODUCER_SIGNATURE_SCHEME_DETAIL_KEY,
+  BROKER_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  brokerSignedCanonicalOperation,
+  verifyBrokerProducerSignature,
+  type BrokerProducerSignatureInput,
+} from "../broker-mcp/producer-signature.js";
 
 /**
  * The RAW `operation` string the persisted SIGNED canonical body attests to,
@@ -228,6 +240,63 @@ export function reverifyEntryProducerSignature(
 }
 
 /**
+ * Re-verify a broker daemon liveness / stand-down producer signature.
+ *
+ * Broker differs from Castle Wall's macOS floor: this producer is Node-side and
+ * is expected to have a dedicated key. Without the pinned broker producer
+ * public key, a broker heartbeat cannot count on the channel basis.
+ */
+export function reverifyBrokerEntryProducerSignature(
+  details: unknown,
+  pinnedProducerKeyB64url: string | null,
+): EntryReverifyResult {
+  if (!isRecord(details)) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  if (details[BROKER_EVIDENCE_BASIS_DETAIL_KEY] !== BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  if (pinnedProducerKeyB64url === null) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+
+  const signatureB64url = details[BROKER_PRODUCER_SIG_DETAIL_KEY];
+  const keyId = details[BROKER_PRODUCER_KID_DETAIL_KEY];
+  const signatureScheme = details[BROKER_PRODUCER_SIGNATURE_SCHEME_DETAIL_KEY];
+  const eventCanonicalJson = details[BROKER_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  const capturedAtUnixMs = details[BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+  const seq = details.seq;
+
+  if (
+    typeof signatureB64url !== "string" ||
+    typeof keyId !== "string" ||
+    typeof signatureScheme !== "string" ||
+    typeof eventCanonicalJson !== "string" ||
+    typeof capturedAtUnixMs !== "number" ||
+    typeof seq !== "number"
+  ) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+
+  const input: BrokerProducerSignatureInput = {
+    eventCanonicalJson,
+    capturedAtUnixMs,
+    seq,
+    signatureB64url,
+    keyId,
+    signatureScheme,
+  };
+  const verdict = verifyBrokerProducerSignature(input, pinnedProducerKeyB64url);
+  if (!verdict.ok) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  return {
+    basis: "producer_signed_verified",
+    signedCapturedAtMs: capturedAtUnixMs,
+  };
+}
+
+/**
  * Does this re-verification basis permit a Castle Wall ENFORCEMENT-EVIDENCE
  * entry to count toward a GREEN arm-state / kernel-block / active tally?
  *
@@ -288,6 +357,11 @@ export function livenessEntryCounts(basis: EntryReverifyBasis): boolean {
   return basis !== "producer_signed_rejected";
 }
 
+/** Broker liveness counts only on a verified producer signature. */
+export function brokerLivenessEntryCounts(basis: EntryReverifyBasis): boolean {
+  return basis === "producer_signed_verified";
+}
+
 /**
  * A stable dedup key for a re-verified producer-signed entry, used to count each
  * genuine signed enforcement event AT MOST ONCE.
@@ -310,5 +384,21 @@ export function producerSignedDedupKey(
   const seq = details.seq;
   const sig = details[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
   if (typeof seq !== "number" || typeof sig !== "string") return null;
-  return `${seq} ${sig}`;
+  return `${seq}|${sig}`;
+}
+
+export function brokerSignedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  return brokerSignedCanonicalOperation(details) === entryOperation;
+}
+
+export function brokerProducerSignedDedupKey(
+  details: Record<string, unknown>,
+): string | null {
+  const seq = details.seq;
+  const sig = details[BROKER_PRODUCER_SIG_DETAIL_KEY];
+  if (typeof seq !== "number" || typeof sig !== "string") return null;
+  return `${seq}|${sig}`;
 }

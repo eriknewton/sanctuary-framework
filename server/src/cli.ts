@@ -439,6 +439,12 @@ Commands:
       fortressId,
       audience: process.env.SANCTUARY_BROKER_AUDIENCE ?? "sanctuary-broker",
     });
+    const { loadOrCreateBrokerProducerSigner } = await import(
+      "./broker-mcp/producer-signature.js"
+    );
+    const producerSigner = await loadOrCreateBrokerProducerSigner(
+      config.storage_path,
+    );
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
@@ -449,7 +455,11 @@ Commands:
     // that this daemon PROCESS is alive, NOT that it would correctly mint/deny a
     // token and NOT that the keychain backend is reachable.
     const { startBrokerLivenessHeartbeat } = await import("./broker-mcp/liveness-heartbeat.js");
-    const liveness = startBrokerLivenessHeartbeat({ auditLog, fortressId });
+    const liveness = startBrokerLivenessHeartbeat({
+      auditLog,
+      fortressId,
+      producerSigner,
+    });
 
     // CRITICAL (the #657 false-RED lesson): a clean broker-server shutdown must
     // record an INTENTIONAL stand-down. Without it, every deliberate stop reads

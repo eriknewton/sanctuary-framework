@@ -214,6 +214,10 @@ export interface AggregatorSources {
    * with. Mutually exclusive with a non-null `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for the broker daemon liveness producer. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
 }
 
 /**

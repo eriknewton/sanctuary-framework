@@ -199,6 +199,10 @@ export interface PostureRouteDeps {
    * exclusive with a non-null `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for the broker daemon liveness producer. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
   /**
    * Shared active-stream registry for the SSE live-refresh endpoint
    * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
@@ -513,8 +517,14 @@ async function buildFeatureHealth(
     pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
       ? deps.resolvePinnedProducerKey()
       : null,
+    brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
+      ? deps.resolveBrokerPinnedProducerKey()
+      : null,
     ...(deps.producerKeyExpectedButUnavailable
       ? { producerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(deps.brokerProducerKeyExpectedButUnavailable
+      ? { brokerProducerKeyExpectedButUnavailable: true }
       : {}),
   });
 }
