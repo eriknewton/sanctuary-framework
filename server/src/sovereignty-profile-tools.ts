@@ -47,9 +47,10 @@ export function createSovereigntyProfileTools(
     {
       name: "sovereignty_profile_get",
       description:
-        "Get the current Sovereignty Profile — shows which Sanctuary features " +
-        "are active (audit logging, injection detection, context gating, " +
-        "approval gates, ZK proofs) and their configuration.",
+        "Get the current Sovereignty Profile configuration. context_gating is wired " +
+        "to the runtime enforcer; approval_gate is always enabled; other flags are " +
+        "configuration/signaling and may not by themselves enable/disable the " +
+        "underlying tools.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -76,11 +77,10 @@ export function createSovereigntyProfileTools(
     {
       name: "sovereignty_profile_update",
       description:
-        "Update the Sovereignty Profile feature toggles. This changes which " +
-        "Sanctuary protections are active. Requires human approval (Tier 1) " +
-        "because it modifies enforcement behavior. " +
-        "Pass only the features you want to change — unspecified features " +
-        "remain unchanged.",
+        "Update Sovereignty Profile configuration. Updating context_gating " +
+        "reconfigures the runtime context-gate enforcer; approval_gate remains " +
+        "always enabled; other flags update profile/signaling state unless " +
+        "separate runtime wiring is present.",
       inputSchema: {
         type: "object",
         properties: {

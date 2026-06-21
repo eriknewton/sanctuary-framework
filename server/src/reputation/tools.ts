@@ -639,10 +639,9 @@ export function createReputationTools(
     {
       name: "reputation_publish",
       description:
-        "Publish sovereignty data to Verascore (verascore.ai) — the agent reputation platform. " +
-        "Sends SHR data, handshake attestations, or sovereignty updates. " +
-        "The data is signed with the agent's Ed25519 key for verification. " +
-        "Requires a Verascore agent profile (claimed or stub) to exist.",
+        "Publish sovereignty data to Verascore using the supplied or DID-derived agent id; " +
+        "payload is Ed25519-signed; the Verascore API response determines profile " +
+        "existence/acceptance.",
       inputSchema: {
         type: "object",
         properties: {

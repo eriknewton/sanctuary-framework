@@ -1259,13 +1259,13 @@ export function createComplianceTools(deps: GeneratorDeps): {
       name: "compliance_generate_eu_ai_act_bundle",
       description:
         "Generate an EU AI Act compliance bundle for a given agent " +
-        "and reporting period. Produces 6 Markdown documents plus a " +
-        "signed JSON manifest, covering Annex IV technical " +
+        "and reporting period. Produces 7 core Markdown documents plus a signed JSON " +
+        "manifest, and may add 08_delta.md when delta_from_bundle_path is supplied. Covers Annex IV technical " +
         "documentation (Art. 11), Art. 12 automatic record-keeping, " +
         "Art. 13 transparency, Art. 14 human oversight, Art. 15 " +
         "cybersecurity, and Art. 26 deployer obligations. Every " +
         "file is individually SHA-256 hashed and signed with the " +
-        "provider's primary Ed25519 identity. NOT LEGAL ADVICE — " +
+        "provider's primary Ed25519 identity. NOT LEGAL ADVICE - " +
         "consult qualified counsel before filing. " +
         "Tier 1 (operator approval required): the bundle body embeds your " +
         "anomaly-detection thresholds, approval timeout, and audit-derived " +

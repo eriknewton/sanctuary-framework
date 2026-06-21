@@ -354,9 +354,10 @@ export function createBridgeTools(
       name: "bridge_attest",
       description:
         "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, " +
-        "linked to a bridge commitment. This completes the bridge: the commitment " +
-        "(L3) proves the terms were agreed, and the attestation (L4) feeds the " +
-        "sovereignty-weighted reputation score. The attestation is automatically " +
+        "linked to a bridge commitment. The commitment (L3) proves the revealed " +
+        "outcome matches the committer's signed commitment and terms hash; it does " +
+        "not independently prove Concordia agreement or counterparty assent. The " +
+        "attestation (L4) feeds the sovereignty-weighted reputation score. The attestation is automatically " +
         "tagged with the counterparty's sovereignty tier from any completed handshake.",
       inputSchema: {
         type: "object",
