@@ -25,6 +25,16 @@ export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/**
+ * Fallback exit deadline for the broker daemon's clean shutdown. If the
+ * stand-down audit flush wedges on a storage backend that never settles, the
+ * SIGTERM/SIGINT handler would otherwise hang forever (the signal listener
+ * suppresses Node's default termination). The watchdog forces `process.exit(0)`
+ * after this window so the daemon dies promptly instead of waiting for an OS
+ * SIGKILL. Generous enough that a healthy flush always finishes first.
+ */
+const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
+
 async function main(): Promise<void> {
   // Parse CLI flags
   const invokedAs = basename(process.argv[1] ?? "");
@@ -420,7 +430,7 @@ Commands:
     const agentId = process.env.SANCTUARY_AGENT_ID ?? "mcp-host";
     const fortressId =
       process.env.SANCTUARY_FORTRESS_ID ?? fortressIdFromStoragePath(config.storage_path);
-    const { broker } = await openBroker();
+    const { broker, auditLog } = await openBroker();
     const server = createBrokerMcpServer(broker, {
       skill: process.env.SANCTUARY_BROKER_SKILL ?? process.env.SANCTUARY_SKILL_NAME ?? agentId,
       agentId,
@@ -431,6 +441,64 @@ Commands:
     });
     const transport = new StdioServerTransport();
     await server.connect(transport);
+
+    // Observability (Option C): periodic process-liveness heartbeat for the
+    // long-running broker daemon. A reader (principal-policy/feature-health.ts)
+    // turns a MISSING heartbeat in a quiet window into an honest "broker daemon
+    // silently died" alarm instead of `unknown`. HONEST SCOPE: this proves only
+    // that this daemon PROCESS is alive, NOT that it would correctly mint/deny a
+    // token and NOT that the keychain backend is reachable.
+    const { startBrokerLivenessHeartbeat } = await import("./broker-mcp/liveness-heartbeat.js");
+    const liveness = startBrokerLivenessHeartbeat({ auditLog, fortressId });
+
+    // CRITICAL (the #657 false-RED lesson): a clean broker-server shutdown must
+    // record an INTENTIONAL stand-down. Without it, every deliberate stop reads
+    // as a silent death for the whole digest window. Wire it to SIGTERM / SIGINT
+    // AND the transport/server close hook, then exit. `standDown()` is
+    // idempotent, so overlapping triggers emit at most one stand-down.
+    let shuttingDown = false;
+    const shutdownBroker = (exit: boolean): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      // Fire and forget: standDown() resolves even if the append/flush
+      // *rejects* (fail toward the alarm), and process.exit owns the lifecycle
+      // from here. But standDown() awaits auditLog.flush(), which awaits the
+      // pending storage writes; a wedged backend that never SETTLES (neither
+      // resolves nor rejects) would hang the flush, so the `.finally` never
+      // fires. Installing a SIGTERM/SIGINT listener suppresses Node's default
+      // termination, so without a fallback the daemon would hang on the signal
+      // until the OS SIGKILLs it after its grace period. Arm a watchdog that
+      // forces exit if the stand-down flush does not complete in time. It is
+      // `.unref()`ed so it never keeps the event loop alive: a fast clean
+      // stand-down still exits promptly via the `.finally` below.
+      if (exit) {
+        const watchdog = setTimeout(() => {
+          // SAFETY: stderr is the operator-facing CLI channel; no logger in scope.
+          console.error(
+            "Sanctuary Secret Broker: stand-down flush did not complete in " +
+            `${String(BROKER_SHUTDOWN_WATCHDOG_MS)}ms; forcing exit.`,
+          );
+          // Exit NON-ZERO on the watchdog path: a wedged stand-down flush is a
+          // DEGRADED shutdown (the stand-down marker may not have been durably
+          // written), not a clean one. Reporting it as exit 0 would tell a
+          // process supervisor "clean exit" for what is really a storage wedge -
+          // an overclaim on the very honesty surface this feature serves. The
+          // clean `.finally` path below keeps exit 0.
+          process.exit(1);
+        }, BROKER_SHUTDOWN_WATCHDOG_MS);
+        watchdog.unref();
+        void liveness.standDown().finally(() => {
+          clearTimeout(watchdog);
+          process.exit(0);
+        });
+        return;
+      }
+      void liveness.standDown();
+    };
+    server.onclose = () => shutdownBroker(true);
+    process.on("SIGTERM", () => shutdownBroker(true));
+    process.on("SIGINT", () => shutdownBroker(true));
+
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("Sanctuary Secret Broker MCP server running (stdio)");
     return;

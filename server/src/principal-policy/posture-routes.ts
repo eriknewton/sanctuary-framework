@@ -27,6 +27,13 @@
  *                                  gate flag (config, NOT evidence-gated). Carries
  *                                  NO Concordia/Verascore data - only the flag and
  *                                  origin_machine. Behind the SAME checkAuth gate.
+ *   GET /api/posture/recognition - Recognition + portability panel (P5). GATED on
+ *                                  composition-enabled (404 when off, so the panel
+ *                                  is ABSENT not greyed). LOCAL-evidence only:
+ *                                  bridge receipt counts + local reputation
+ *                                  EVIDENCE (counts, never a score) + the portable-
+ *                                  identity export capability. No score-fetch path;
+ *                                  counterparty verification is local bridge crypto.
  *   GET /posture                 - the posture home HTML.
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
  */
@@ -36,7 +43,7 @@ import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
-import { CURATED_ALLOWLIST } from "../castle-wall/runtime/curated-allowlist.js";
+import { resolveCuratedRules } from "../castle-wall/runtime/curated-allowlist.js";
 import {
   buildCastleWallPosture,
   buildAuditDigest,
@@ -44,6 +51,7 @@ import {
   buildAgentReach,
   buildPostureAgentRows,
   buildCustodyExitPanel,
+  buildRecognitionPanel,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -52,6 +60,8 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
   type CustodyExitPanel,
+  type RecognitionPanel,
+  type RecognitionReputationEvidence,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -67,7 +77,6 @@ import {
   handleQueryAnonymityStatsRequest,
   QUERY_ANONYMITY_API_PREFIX,
 } from "../query-anonymity/query-anonymity-routes.js";
-import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
 import {
   handlePostureStream,
@@ -116,6 +125,29 @@ export interface PostureRouteDeps {
    * absent is treated as `false` (honest default-off).
    */
   compositionEnabled?: boolean;
+  /**
+   * Recognition panel (P5): count of persisted Concordia-bridge commitments
+   * (`storage.list("_bridge")`). Supplied by the dashboard, which holds the
+   * storage backend; resolved lazily per request so post-unlock wiring is
+   * observed. Optional - when absent, OR when it resolves to `undefined` (no
+   * storage backend wired, so the count is unknowable), the recognition shaper
+   * falls back to the count of `bridge_commit` audit events (an honest lower
+   * bound, never a fabricated count). A resolved `0` is a real "zero persisted
+   * commitments" fact and is used as-is. Carries NO Concordia/Verascore data
+   * beyond a local count.
+   */
+  countBridgeCommitments?: () => Promise<number | undefined>;
+  /**
+   * Recognition panel (P5): pre-gathered LOCAL reputation EVIDENCE (counts only)
+   * for the primary identity - NOT a score and NOT a fetched Verascore value.
+   * Supplied by the dashboard, which holds the identity + master key needed to
+   * read the local attestation store. Resolved lazily per request. Returns
+   * `null` when no reputation store is wired / readable, which renders the
+   * reputation row amber ("no evidence yet"), never green-from-absence. There is
+   * NO score-fetch path anywhere in this flow; this is the only reputation input
+   * the panel ever sees.
+   */
+  gatherRecognitionReputation?: () => Promise<RecognitionReputationEvidence | null>;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
   /**
@@ -125,6 +157,18 @@ export interface PostureRouteDeps {
    * this later without changing the shape. Optional override for tests.
    */
   listReachRules?: () => ReachRule[];
+  /**
+   * The curated rule ids the operator has ACTUALLY enabled on disk (#641). The
+   * default `curatedReachRules()` shaper sources reach lines from these ids via
+   * `resolveCuratedRules`, instead of mapping the entire curated catalog, so a
+   * never-configured fortress reports NO wall rules (an honest red gap) rather
+   * than a fabricated default-deny over the full curated set. When this returns
+   * `null` / an empty list, or when it is absent (no enabled manifest readable),
+   * the reach view shows the honest "No Castle Wall ruleset applies" gap.
+   * Resolved lazily per request so post-provision wiring is observed. Ignored
+   * when `listReachRules` is supplied (the explicit override wins, e.g. tests).
+   */
+  listEnabledCuratedRuleIds?: () => readonly string[] | null;
   /**
    * Scan for installed harnesses by config-file presence. Optional override so
    * tests inject a deterministic detection set instead of touching the real
@@ -190,15 +234,14 @@ export async function handlePostureRoute(
 ): Promise<boolean> {
   const path = url.pathname;
 
-  // Posture home HTML.
-  if (method === "GET" && path === POSTURE_HOME_PATH) {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-cache",
-    });
-    res.end(renderPostureHomeHTML());
-    return true;
-  }
+  // NOTE (Delta Review A3 remediation): the posture-home HTML at `/posture` is
+  // NO LONGER served here. The dashboard now serves the `/posture` shell (and
+  // `/`) BEFORE its auth gate, byte-for-byte the same unauthenticated static
+  // shell, so `/` and `/posture` are genuinely one surface under the same auth
+  // contract (see `DashboardApprovalChannel.dispatchRootPosture`). This branch
+  // would be unreachable for `GET /posture`; the data routes below are
+  // unchanged and still run behind `checkAuth`. `POSTURE_HOME_PATH` is still
+  // exported for the dashboard's routing/view-route classification.
 
   // Per-agent drill-down HTML (Slice 4). The page is a static shell; it parses
   // the :id from the path and fetches `/api/posture/reach/:id` + `/api/posture/
@@ -340,6 +383,32 @@ export async function handlePostureRoute(
 
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/custody-exit`) {
       const panel = await buildCustodyExit(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
+    // Recognition + portability panel (P5). GATED on composition-enabled: when
+    // composition is OFF the panel is ABSENT entirely (404 within the namespace,
+    // NOT a greyed/empty payload), so its mere existence never implies a
+    // Concordia/Verascore dependency. When ON it returns LOCAL-evidence-only
+    // receipt counts + local reputation evidence (counts, NOT a score) + the
+    // portable-identity export capability. It reaches here only after the
+    // audit-null 503 guard above, so it is never built against a locked log.
+    // IMPARTIALITY: there is no score-fetch path; counterparty verification is
+    // labeled local bridge crypto; rows are amber unless evidence is present.
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/recognition`) {
+      if (deps.compositionEnabled !== true) {
+        // Honest absence: composition off => the Recognition panel does not
+        // exist on this fortress. 404 (not an empty 200) so the page omits the
+        // panel rather than rendering a greyed/implied-dependency shell.
+        writeJSON(res, 404, {
+          error: "recognition_unavailable",
+          reason: "composition is disabled; the recognition panel is absent",
+          origin_machine: om,
+        });
+        return true;
+      }
+      const panel = await buildRecognition(deps);
       writeJSON(res, 200, panel);
       return true;
     }
@@ -504,6 +573,47 @@ async function buildCustodyExit(
   });
 }
 
+/**
+ * Recognition + portability panel (P5). The route already enforced the
+ * composition-enabled render gate and the audit-unlock 503 before we reach here,
+ * so this helper only shapes evidence. It resolves the two optional impure
+ * sources defensively: a failed bridge-commitment list or a failed reputation
+ * gather degrades to the honest fallback (audit-event lower bound / `null` amber
+ * row) rather than throwing, so a partial-evidence fortress still renders an
+ * honest panel instead of a 500. There is NO score fetch on any of these paths.
+ */
+async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPanel> {
+  let committedReceiptCount: number | undefined;
+  if (deps.countBridgeCommitments) {
+    try {
+      committedReceiptCount = await deps.countBridgeCommitments();
+    } catch {
+      // A failed `_bridge` list is not evidence of zero receipts: leave it
+      // undefined so the shaper falls back to the audit-event lower bound.
+      committedReceiptCount = undefined;
+    }
+  }
+
+  let reputationEvidence: RecognitionReputationEvidence | null = null;
+  if (deps.gatherRecognitionReputation) {
+    try {
+      reputationEvidence = await deps.gatherRecognitionReputation();
+    } catch {
+      // A failed reputation read is NOT evidence of health: null renders the
+      // reputation row amber ("no evidence yet"), never green.
+      reputationEvidence = null;
+    }
+  }
+
+  return buildRecognitionPanel({
+    auditLog: deps.auditLog as AuditLog,
+    originMachine: deps.originMachine,
+    ...(deps.now ? { now: deps.now() } : {}),
+    ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
+    reputationEvidence,
+  });
+}
+
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
   const detected = deps.detectInstalledHarnesses
     ? await deps.detectInstalledHarnesses()
@@ -523,12 +633,29 @@ function buildReach(
   if (!agent) return null;
   const rules = deps.listReachRules
     ? deps.listReachRules()
-    : curatedReachRules();
+    : curatedReachRules(
+        deps.listEnabledCuratedRuleIds
+          ? deps.listEnabledCuratedRuleIds()
+          : null,
+      );
+  // #641 honesty gate: derive enforcement_confirmed from the SAME per-agent
+  // signal the agent pill uses, via the canonical row shaper (single source of
+  // truth: never re-implement the policy-vs-enforcement split). Today this is
+  // always false (no per-agent live enforcement signal exists), so the reach
+  // view renders rules as configured, not as confirmed OS enforcement. Routing
+  // it through `buildPostureAgentRows` means any future per-agent enforcement
+  // probe lights up the pill AND the reach view together, with no second path.
+  const [row] = buildPostureAgentRows({
+    originMachine: deps.originMachine,
+    records: [agent],
+  });
+  const enforcementConfirmed = row?.enforcement_active === "active";
   return buildAgentReach({
     originMachine: deps.originMachine,
     agentId,
     harness: agent.harness,
     rules,
+    enforcementConfirmed,
   });
 }
 
@@ -566,6 +693,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
   return {
     origin_machine: deps.originMachine,
+    stream_available: deps.streamRegistry !== undefined,
     castle_wall: castleWall,
     digest,
     unwrapped,
@@ -625,25 +753,36 @@ async function scanInstalledHarnesses(
 }
 
 /**
- * Phase 1 reach rules from the curated allowlist. Every curated entry is a
- * Castle Wall (kernel-enforced) rule. When a daemon-sourced live manifest
- * becomes readable from the dashboard, this becomes the live ruleset with the
- * same shape.
+ * Reach rules from the curated allowlist, scoped to the rules the operator has
+ * ACTUALLY enabled (#641). Phase 1 read-only source for the dashboard (no daemon
+ * dependency). Curated entries are `default_enabled: false` and are NOT
+ * auto-applied at install; mapping the entire catalog would have shown
+ * never-enabled rules as an operator-enabled, kernel-enforced default-deny: the
+ * fabricated posture #641 fixes. Instead we source via `resolveCuratedRules`
+ * over the operator's enabled rule ids: an empty / null id set yields NO rules,
+ * so the reach view reports `has_wall_policy=false` and surfaces the honest red
+ * "No Castle Wall ruleset applies to this agent" gap rather than a fabricated
+ * default-deny. The `castle_wall` enforcing layer is a CONFIGURATION fact (these
+ * rules target the wall); whether the OS is actually enforcing them is gated
+ * separately by `enforcement_confirmed` on the payload.
  */
-function curatedReachRules(): ReachRule[] {
-  return CURATED_ALLOWLIST.map((entry) => {
+function curatedReachRules(
+  enabledRuleIds: readonly string[] | null,
+): ReachRule[] {
+  if (!enabledRuleIds || enabledRuleIds.length === 0) return [];
+  return resolveCuratedRules(enabledRuleIds).map((allowRule) => {
     const rule: ReachRule = {
-      rule_id: entry.rule.id,
-      disposition: entry.rule.disposition,
+      rule_id: allowRule.id,
+      disposition: allowRule.disposition,
       enforcing_layer: "castle_wall",
     };
-    const match = entry.rule.match;
+    const match = allowRule.match;
     if (match.host !== undefined) rule.host = match.host;
     if (match.host_pattern !== undefined) rule.host_pattern = match.host_pattern;
     if (match.ip !== undefined) rule.ip = match.ip;
     if (match.cidr !== undefined) rule.cidr = match.cidr;
-    if (entry.rule.scope?.agent_ids !== undefined) {
-      rule.agent_ids = entry.rule.scope.agent_ids;
+    if (allowRule.scope?.agent_ids !== undefined) {
+      rule.agent_ids = allowRule.scope.agent_ids;
     }
     return rule;
   });

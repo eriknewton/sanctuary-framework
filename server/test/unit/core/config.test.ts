@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { loadConfig, saveConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
-import { writeFile, mkdir, rm, readdir, readFile } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -15,9 +15,13 @@ describe("loadConfig", () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    // Create a unique temp directory for each test
-    tempDir = join(tmpdir(), `sanctuary-config-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(tempDir, { recursive: true });
+    // Create a unique temp directory for each test. mkdtemp creates the
+    // directory atomically with a randomized suffix the caller cannot predict,
+    // which avoids the insecure-temporary-file (TOCTOU) class that a manually
+    // joined tmpdir() path plus mkdir would expose. Every config file written
+    // by a test below lives INSIDE this per-test directory, never directly in
+    // os.tmpdir() under a predictable name.
+    tempDir = await mkdtemp(join(tmpdir(), "sanctuary-config-test-"));
   });
 
   afterEach(async () => {
@@ -306,6 +310,143 @@ describe("loadConfig", () => {
       await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
         /privacy_filter\.mode/
       );
+    });
+  });
+
+  describe("Dashboard port validation - invalid-port fail-closed", () => {
+    // The server-side override used a lenient parseInt, so without validation
+    // "80abc" -> 80 and "70000" -> a truncated/out-of-spec port would bind the
+    // server to a port the operator never typed. These cases pin that an invalid
+    // port is now REFUSED rather than silently bound (fail-closed hardening).
+    //
+    // Forward note (not yet true in-tree): the deferred native macOS resolver is
+    // intended to parse SANCTUARY_DASHBOARD_PORT strictly (Int + 1..65535,
+    // fallback 3501) so server and native reads share one source. Today the
+    // native bridge hardcodes 3501 and never reads the env var, so full
+    // single-source port parity does NOT hold yet; this only closes the
+    // invalid-port hole.
+    it("rejects a non-numeric-suffixed env port the server would otherwise truncate", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "80abc";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an out-of-range env port (> 65535)", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "70000";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an env port of 0", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "0";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects a non-numeric env port", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "not-a-port";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects a signed env port (reader-parity with paths.ts resolveDashboardPort)", async () => {
+      // A TCP port is unsigned, so a leading sign ("+8443") is never operator
+      // intent. The boot reader (strictParseIntEnv) screens with the SAME
+      // digit-only regex as the wrap reader (paths.ts parseStrictPortEnv), so an
+      // in-range-but-signed value is refused on BOTH paths rather than binding
+      // 8443 here while the wrap path falls back to 3501. Guards against the two
+      // readers diverging on signed input.
+      process.env.SANCTUARY_DASHBOARD_PORT = "+8443";
+      await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
+        /dashboard\.port/
+      );
+    });
+
+    it("rejects an out-of-range port in a config FILE", async () => {
+      const path = join(tempDir, "bad-port.json");
+      await writeFile(
+        path,
+        JSON.stringify({ dashboard: { enabled: true, port: 70000, host: "127.0.0.1" } })
+      );
+      await expect(loadConfig(path)).rejects.toThrow(/dashboard\.port/);
+    });
+
+    it("refuses an out-of-range FILE port WITHOUT quarantining (a port typo is not corruption)", async () => {
+      // Regression guard: an out-of-range dashboard.port in a structurally-valid
+      // config FILE must fail CLOSED (server refuses to start) but must NOT
+      // destructively rename the operator's file to .corrupted.<ts>. A value
+      // typo is recoverable in place; moving the file away from under the
+      // operator is the defect this guards against.
+      const path = join(tempDir, "typo-port.json");
+      const original = JSON.stringify(
+        { dashboard: { enabled: true, port: 70000, host: "127.0.0.1" } },
+        null,
+        2
+      );
+      await writeFile(path, original);
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "invalid-value",
+      });
+
+      // The original file is still present and byte-identical.
+      expect(await readFile(path, "utf-8")).toBe(original);
+      // No quarantine copy was created.
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.includes(".corrupted."))).toBe(false);
+    });
+
+    it("STILL quarantines a genuine schema mismatch in a config FILE (unimplemented feature)", async () => {
+      // The non-quarantine carve-out is scoped to scalar VALUE typos only. A
+      // config that references an unimplemented feature is a genuine schema
+      // mismatch and must still be quarantined (pre-existing behavior).
+      const path = join(tempDir, "bad-feature.json");
+      await writeFile(
+        path,
+        JSON.stringify({
+          disclosure: { proof_system: "groth16", default_policy: "minimum-necessary" },
+        })
+      );
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "schema-mismatch",
+      });
+
+      await expect(readFile(path, "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.startsWith("bad-feature.json.corrupted."))).toBe(true);
+    });
+
+    it("quarantines when a value typo coexists with a feature mismatch (feature wins)", async () => {
+      // If a file has BOTH a feature mismatch and a value typo, the file is
+      // going to be quarantined regardless, and both problems are reported.
+      const path = join(tempDir, "mixed-bad.json");
+      await writeFile(
+        path,
+        JSON.stringify({
+          disclosure: { proof_system: "groth16", default_policy: "minimum-necessary" },
+          dashboard: { enabled: true, port: 70000, host: "127.0.0.1" },
+        })
+      );
+
+      await expect(loadConfig(path)).rejects.toMatchObject({
+        name: "ConfigLoadError",
+        classification: "schema-mismatch",
+      });
+      const files = await readdir(tempDir);
+      expect(files.some((f) => f.startsWith("mixed-bad.json.corrupted."))).toBe(true);
+    });
+
+    it("accepts a valid in-range env port (boundary 65535)", async () => {
+      process.env.SANCTUARY_DASHBOARD_PORT = "65535";
+      const config = await loadConfig(join(tempDir, "nonexistent.json"));
+      expect(config.dashboard.port).toBe(65535);
     });
   });
 

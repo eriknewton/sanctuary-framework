@@ -469,6 +469,12 @@ export async function startStandaloneDashboard(
     shrOpts,
     sanctuaryConfig: config,
     profileStore,
+    // Recognition panel (P5): storage for the local bridge-commitment list +
+    // local attestation-store reputation evidence (counts, never a score).
+    // Mirrors the embedded path (index.ts) so the standalone dashboard does
+    // not silently degrade the committed-receipt count / reputation row to
+    // the audit-event lower bound when composition is enabled.
+    storage,
   });
   dashboard.setStandaloneMode(true);
 

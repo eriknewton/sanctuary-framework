@@ -39,6 +39,10 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import { gatherReputationEvidence } from "../shr/tools.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import type { StorageBackend } from "../storage/interface.js";
+import type { RecognitionReputationEvidence } from "./posture.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
@@ -62,6 +66,13 @@ import {
   POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import { renderPostureHomeHTML } from "./posture-home-html.js";
+import {
+  buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  mapPlatform,
+  type CastleWallPosture,
+} from "./posture.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
@@ -243,6 +254,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private identityManager: IdentityManager | null = null;
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
+  /**
+   * Storage backend, injected for the Recognition panel (P5) so the dashboard
+   * can list persisted Concordia-bridge commitments (`storage.list("_bridge")`)
+   * and read the local attestation store for reputation EVIDENCE (counts, not a
+   * score). Optional: when absent (standalone / un-wired), the Recognition panel
+   * falls back to audit-event counts and a `null` (amber) reputation row. Never
+   * used to fetch any external reputation score — there is no such path.
+   */
+  private storage: StorageBackend | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
@@ -491,6 +511,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
     clientManager?: ClientManager;
+    /** Storage backend for the Recognition panel (bridge list + reputation read). */
+    storage?: StorageBackend;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -498,6 +520,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+    if (deps.storage) this.storage = deps.storage;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
     if (deps.clientManager) this.clientManager = deps.clientManager;
@@ -988,6 +1011,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       auditLog: this.auditLog ?? null,
       originMachine,
       compositionEnabled,
+      // Recognition panel (P5) impure sources, resolved lazily per request so
+      // post-unlock wiring is observed. Both are LOCAL reads only: a count of
+      // persisted bridge commitments, and the local attestation-store evidence
+      // (COUNTS, never a score). They are only consulted when the route builds
+      // the panel (composition-enabled); the panel is absent otherwise.
+      countBridgeCommitments: () => this.countBridgeCommitments(),
+      gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
@@ -998,6 +1028,196 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
+  }
+
+  /**
+   * One-surface root-flip: the posture board is the default page served at BOTH
+   * `/` and `/posture`.
+   *
+   * Serves the posture-home HTML shell (`renderPostureHomeHTML`) byte-for-byte
+   * identically on the root path and the `/posture` alias. This is the one
+   * posture surface the embedded native web view and any browser both land on.
+   *
+   * Auth contract (Delta Review A3 remediation): the shell is a STATIC page that
+   * carries no posture data — it negotiates its own auth client-side (loopback
+   * auto-auth or a pasted bearer) and fetches `/api/posture/*` for every byte of
+   * evidence, and those JSON routes stay behind `checkAuth`. So the shell itself
+   * is served WITHOUT a server-side auth gate, identically on `/` and
+   * `/posture`. Previously `/` was served here (unauthenticated) while
+   * `/posture`'s HTML was served by the posture router AFTER `checkAuth`, so the
+   * two surfaces had divergent auth contracts and were only "equivalent" when
+   * the test rig disabled auth. Serving both here, before the auth gate, makes
+   * them genuinely one surface under the real production auth posture. The
+   * `/posture` HTML branch was removed from {@link handlePostureRoute}
+   * accordingly (it would now be unreachable); the data routes it owns are
+   * unchanged.
+   *
+   * Scope: this matches ONLY the bare root path (`/`) and the `/posture` alias.
+   * `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`, `/posture/agent/:id`, and every
+   * `/api/*` route (including the approval channel and the posture JSON API) are
+   * untouched and keep their existing handlers and auth gates.
+   *
+   * Surface scope: this flip lives on THIS standalone `DashboardApprovalChannel`
+   * (the MCP-server boot path and `sanctuary dashboard`). The SEPARATE co-located
+   * `wrap` server (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP
+   * server) still serves the v1.1 SPA at `/` and is NOT flipped here — it has no
+   * `/api/posture/*` routes, so folding the posture board into it is a tracked
+   * Piece-C remainder (mount the posture JSON API there first).
+   *
+   * Returns true when it served the posture board shell; false to fall through
+   * to the existing v1.1 / legacy dispatch ladder.
+   */
+  private dispatchRootPosture(
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): boolean {
+    if (
+      method !== "GET" ||
+      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+    ) {
+      return false;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureHomeHTML());
+    return true;
+  }
+
+  /**
+   * Build the evidence-gated Castle Wall arm-state the SAME way
+   * `/api/posture/castle-wall` derives it, so the AUTHENTICATED `/v1/status`
+   * document can report ONE honest arm-state instead of the dead
+   * `{ status: "unknown" }` placeholder it carried before.
+   *
+   * Auth scope (Delta Review A3 remediation): this is deliberately NOT exposed
+   * on the unauthenticated `/api/health` probe — that surface stays a cheap
+   * O(1) liveness answer with no posture and no audit scan. The detailed
+   * posture leaves the server only behind auth: this builder feeds the
+   * SESSION_TOKEN-gated `/v1/status` document (and `/api/posture/castle-wall`
+   * derives the same shape behind checkAuth). The native badge sources from
+   * `/api/posture/castle-wall`, never from `/api/health`.
+   *
+   * Resolves dependencies the same way {@link dispatchPosture} does (origin
+   * machine, the pinned producer key load, the unlocked audit log): green
+   * (`armed`) is derived by the ONE canonical {@link buildCastleWallPosture}
+   * shaper and nowhere else. The only divergence from the `/api/posture/...`
+   * route is the locked/absent-audit case: that route 503s (it need not answer
+   * when it cannot evidence posture), whereas a status document must answer 200,
+   * so this builder returns an honest `unknown` placeholder instead of routing
+   * through the shaper (whose `auditLog` input is typed non-null, so the null
+   * case genuinely cannot reach it). Honesty is preserved end-to-end: when the
+   * audit log is locked/absent, or the producer key is expected-but-unreadable,
+   * or evidence is stale, the result is `unknown` / `degraded` (never `armed`).
+   * Green (`armed`) is only ever returned for fresh, observed enforcement
+   * evidence, and only from the canonical shaper.
+   *
+   * Never throws into the request path: any unexpected failure resolves to an
+   * honest `unknown` posture so the status document always answers.
+   */
+  private async buildStatusCastleWall(): Promise<CastleWallPosture> {
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    try {
+      // Reuse the same producer-key load + audit log + origin attribution the
+      // posture dispatcher uses, so the two surfaces can never diverge on green.
+      await this.ensureProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      if (this.auditLog === null) {
+        // No unlocked audit log ⇒ no enforcement evidence to read. Honest
+        // `unknown` (amber), never green, never a fabricated placeholder.
+        return {
+          origin_machine: originMachine,
+          arm_state: "unknown",
+          platform: mapPlatform(process.platform),
+          evidence_basis: "no_evidence",
+          last_enforcement_evidence_at: null,
+          // Report the real freshness window (not 0) so this fallback matches
+          // the canonical buildCastleWallPosture shaper, whose own
+          // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+          freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+          verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+          audit_integrity_ok: true,
+          producer_authenticity: "not_applicable",
+        };
+      }
+      return await buildCastleWallPosture({
+        auditLog: this.auditLog,
+        originMachine,
+        pinnedProducerKeyB64url:
+          load?.status === "present" ? load.keyB64url : null,
+        ...(load?.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      });
+    } catch {
+      // Defensive: a health probe must never fail. Fall back to an honest
+      // `unknown` posture rather than throwing or claiming green.
+      return {
+        origin_machine: originMachine,
+        arm_state: "unknown",
+        platform: mapPlatform(process.platform),
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        // Report the real freshness window (not 0) so this fallback matches
+        // the canonical buildCastleWallPosture shaper, whose own
+        // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+        freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        producer_authenticity: "not_applicable",
+      };
+    }
+  }
+
+  /**
+   * Recognition panel (P5): count persisted Concordia-bridge commitments by
+   * listing the reserved `_bridge` namespace. This is the "committed receipts"
+   * count — a LOCAL storage read with NO Concordia process running and NO
+   * external fetch. Returns `undefined` when no storage backend is wired so the
+   * shaper takes its documented audit-event lower-bound fallback (returning `0`
+   * would assert a fact — "zero bridge commitments" — that an un-wired store
+   * cannot establish, suppressing the fallback). A list failure likewise
+   * propagates so the route layer's try/catch degrades to the audit-event count
+   * rather than fabricating a number.
+   */
+  private async countBridgeCommitments(): Promise<number | undefined> {
+    if (!this.storage) return undefined;
+    const entries = await this.storage.list("_bridge");
+    return entries.length;
+  }
+
+  /**
+   * Recognition panel (P5): gather LOCAL reputation EVIDENCE (attestation counts,
+   * tier distribution, dispute count, most-recent timestamp, and the local
+   * `verascore_linked` publish flag) for the primary identity. This reads the
+   * local attestation store ONLY — it never fetches a Verascore (or any vendor)
+   * score, and it returns COUNTS, not a number-on-a-scale. Returns `null` when
+   * the storage backend, master key, or a primary identity is unavailable, which
+   * the panel renders as an amber "no evidence yet" row (never green).
+   */
+  private async gatherRecognitionReputation(): Promise<RecognitionReputationEvidence | null> {
+    if (!this.storage || !this.shrOpts || !this.identityManager) return null;
+    const identity = this.identityManager.getDefault();
+    if (!identity) return null;
+    const reputationStore = new ReputationStore(this.storage, this.shrOpts.masterKey);
+    if (this.auditLog === null) return null;
+    const evidence = await gatherReputationEvidence(reputationStore, this.auditLog, {
+      identity_id: identity.identity_id,
+      did: identity.did,
+    });
+    // Project to the panel's evidence shape (counts only; never a score).
+    return {
+      attestation_count: evidence.attestation_count,
+      tier_distribution: evidence.tier_distribution,
+      most_recent_attestation_at: evidence.most_recent_attestation_at,
+      dispute_count: evidence.dispute_count,
+      verascore_linked: evidence.verascore_linked,
+    };
   }
 
   /**
@@ -1052,11 +1272,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * the stored identity — never a spread, so the encrypted private key
    * blob can never ride along into an HTTP response (CLAUDE.md
    * constraint 6). Federation is honestly `enabled: false` until the
-   * PR-A3 listener work; castle_wall reports `unknown` until status
-   * wiring lands later in the stack.
+   * PR-A3 listener work.
+   *
+   * Delta Review A3: `castle_wall` now carries the SAME evidence-gated arm-state
+   * `/api/posture/castle-wall` derives (via the canonical
+   * {@link buildStatusCastleWall} → {@link buildCastleWallPosture} path), not the
+   * old dead `{ status: "unknown" }` placeholder. This document is served ONLY
+   * to a SESSION_TOKEN holder with the status-read capability, so the detailed
+   * posture (and the audit scan that derives it) stays behind auth — it is NOT
+   * on the unauthenticated `/api/health` probe. Honesty is preserved: the shaper
+   * returns `unknown` / `degraded` (never `armed`) whenever there is no fresh,
+   * verified enforcement evidence.
    */
-  private buildV1FullStatus(): Record<string, unknown> {
+  private async buildV1FullStatus(): Promise<Record<string, unknown>> {
     const identity = this.identityManager?.getDefault();
+    const castleWall = await this.buildStatusCastleWall();
     return {
       ok: true,
       version: PKG_VERSION,
@@ -1083,7 +1313,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             created_at: identity.created_at,
           }
         : null,
-      castle_wall: { status: "unknown" },
+      castle_wall: castleWall,
     };
   }
 
@@ -1882,6 +2112,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _origin: string | undefined,
     _selfOrigin: string,
   ): void {
+    // One-surface root-flip: the posture board is the default page at `/` AND
+    // its `/posture` alias. Intercepted here, BEFORE the v1.1 SPA dispatch
+    // (which previously owned `/`), the auth gate, and the legacy route table,
+    // so both paths serve the one unauthenticated static shell under the same
+    // auth contract (the shell's data fetches stay behind checkAuth). Matches
+    // ONLY `/` and `/posture` — `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
+    // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
+    // the posture JSON API included) fall through untouched.
+    if (this.dispatchRootPosture(res, url, method)) return;
+
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
     // and never falls through to legacy routing — fail-closed 401 for
@@ -2093,6 +2333,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v1.3.0 (XXXXX): /api/health is exempt from auth AND rate limiting.
     // Health checks must always respond so the multi-aggregator health probe
     // pattern (multi-server.ts) and external monitoring work reliably.
+    //
+    // SECURITY (Delta Review A3 remediation): this probe is UNAUTHENTICATED and
+    // unthrottled, so it stays a cheap O(1) liveness answer and MUST NOT carry
+    // the evidence-based Castle Wall posture. A prior revision attached the full
+    // arm-state object (origin/operator id, verdict counts, enforcement
+    // timestamps) here and ran an unbounded audit-log scan + per-entry Ed25519
+    // re-verify on every call — that both leaked the detailed posture to any
+    // anonymous caller and gave an unauthenticated DoS amplifier. The honest
+    // arm-state lives ONLY behind auth: `/api/posture/castle-wall` (checkAuth;
+    // the native app reaches it via loopback auto-auth) and the `/v1/status`
+    // document (the v1 SESSION_TOKEN ceremony). The native badge sources its
+    // arm-state from `/api/posture/castle-wall`, never from this probe. The
+    // `{ ok, mode }` shape is the only contract the CLI health probe + external
+    // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -2149,13 +2403,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     )
       return;
 
-    // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
-    // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER
-    // checkAuth (same gate as `/api/audit-log`) and before the legacy route
-    // table. The dispatch is async; when it serves the request it returns
-    // true, otherwise we fall through to the legacy table below.
+    // Sovereignty Posture Dashboard: the authenticated posture surface, namely
+    // the per-agent drill-down HTML at `/posture/agent/:id` and the JSON gap
+    // endpoints at `/api/posture/*`. Dispatched AFTER checkAuth (same gate as
+    // `/api/audit-log`) and before the legacy route table. The dispatch is
+    // async; when it serves the request it returns true, otherwise we fall
+    // through to the legacy table below.
+    //
+    // NOTE (root-flip): the `/posture` HOME HTML is NOT served here. `GET /`
+    // and `GET /posture` are intercepted earlier by `dispatchRootPosture`
+    // (BEFORE checkAuth) and serve the one unauthenticated static shell, and
+    // `handlePostureRoute` no longer carries a `/posture` HTML branch. So
+    // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
-      url.pathname === POSTURE_HOME_PATH ||
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
@@ -2387,6 +2647,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
         },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
+        },
       };
     }
 
@@ -2489,6 +2753,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       pending_count: this.pending.size,
       connected_clients: this.sseClients.size,
       standalone_mode: this._standaloneMode,
+      decision_capable: !this._standaloneMode,
     };
 
     if (this.baseline) {
@@ -2504,6 +2769,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
+        },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
         },
       };
     }

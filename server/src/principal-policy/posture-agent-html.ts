@@ -29,6 +29,8 @@
  * `renderPostureHomeHTML`).
  */
 
+import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
+
 export function renderPostureAgentHTML(): string {
   // Inline everything (no external assets) so the page works on a locked-down
   // loopback dashboard with a strict CSP and no network egress.
@@ -155,14 +157,9 @@ export function renderPostureAgentHTML(): string {
   // enforcement; a policy-protected agent whose enforcement we cannot observe is
   // amber "protection requested", never green; a no-longer-protected agent is
   // red. This is the SAME color model the Home agent grid uses - the drill-down
-  // must not weaken it.
-  function agentPill(row) {
-    if (row.enforcement_active === "active")
-      return '<span class="pill green">enforcement active</span>';
-    if (row.policy_protected && row.enforcement_active !== "active")
-      return '<span class="pill amber">protection requested</span>';
-    return '<span class="pill red">not enforcing</span>';
-  }
+  // must not weaken it. The body is the SHARED source of truth
+  // (posture-html-shared.ts), byte-identical to Home's copy and test-pinned (#641).
+  ${AGENT_PILL_FN_SOURCE}
 
   // Plain-English honesty line for the enforcement column. "unknown" is the only
   // value the read path emits today (no per-agent live enforcement signal
@@ -177,19 +174,35 @@ export function renderPostureAgentHTML(): string {
       "is not inherited per agent by design.";
   }
 
-  // Disposition pill: allow is neutral (the agent may reach it), deny is the
-  // protective state (green - the wall stops it), prompt is amber (gated). This
-  // is not an enforcement claim about the agent; it describes the rule line.
-  function dispositionPill(d) {
-    if (d === "deny") return '<span class="pill green">deny</span>';
+  // Disposition pill (#641 honesty gate). A green "deny" claims the OS actively
+  // STOPS this destination - so it is reserved for CONFIRMED enforcement
+  // (enforcementConfirmed). When enforcement is not confirmed (today: always,
+  // since no per-agent live enforcement signal exists), a configured deny rule
+  // is shown amber "deny (configured)": the rule is on disk, but the OS is not
+  // confirmed to be enforcing it, so it must not read as an in-effect block.
+  // allow is neutral; prompt is amber regardless (it is a gate, never a green
+  // protective state). This describes a rule line, not a live agent claim.
+  function dispositionPill(d, enforcementConfirmed) {
+    if (d === "deny")
+      return enforcementConfirmed
+        ? '<span class="pill green">deny</span>'
+        : '<span class="pill amber">deny (configured)</span>';
     if (d === "prompt") return '<span class="pill amber">prompt</span>';
     return '<span class="pill neutral">allow</span>';
   }
 
-  function layerLabel(layer) {
-    return layer === "castle_wall"
-      ? '<span class="pill green">Castle Wall</span>'
-      : '<span class="pill neutral">policy</span>';
+  // Enforced-by pill (#641 honesty gate). A green "Castle Wall" pill claims the
+  // operating system is enforcing this line at the kernel. That claim is earned
+  // ONLY by confirmed enforcement; when enforcement is not confirmed the same
+  // line is shown amber "Castle Wall (configured)" - the rule is configured for
+  // the wall, but the OS is not confirmed to be enforcing it for this agent.
+  // policy lines are cooperative (neutral) either way.
+  function layerLabel(layer, enforcementConfirmed) {
+    if (layer === "castle_wall")
+      return enforcementConfirmed
+        ? '<span class="pill green">Castle Wall</span>'
+        : '<span class="pill amber">Castle Wall (configured)</span>';
+    return '<span class="pill neutral">policy</span>';
   }
 
   function renderStanding(row) {
@@ -276,6 +289,11 @@ export function renderPostureAgentHTML(): string {
 
   function renderReach(reach) {
     var el = document.getElementById("reach");
+    // #641 honesty gate: enforcement_confirmed is the SAME evidence the Standing
+    // pill keys on (a confirmed-active per-agent enforcement signal). Today it is
+    // always false (no per-agent live signal exists), so the reach table must NOT
+    // claim the OS is enforcing these rules - it shows them as configured.
+    var enforcementConfirmed = reach.enforcement_confirmed === true;
     var head =
       '<div class="meta">Allowed, prompt, and deny destinations for this agent, ' +
       "annotated by the layer that enforces each line.</div>";
@@ -286,6 +304,16 @@ export function renderPostureAgentHTML(): string {
         '<div class="evidence err">No Castle Wall ruleset applies to this agent. ' +
         "The operating system is not restricting its outbound reach - this is a " +
         'gap, shown in red by design.</div>';
+    } else if (!enforcementConfirmed) {
+      // A wall ruleset is configured, but enforcement is NOT confirmed for this
+      // agent - so we must NOT claim default-deny is in effect (that is an
+      // OS-enforcement claim). State plainly that the rules are configured and
+      // the OS is not confirmed to be enforcing them.
+      head +=
+        '<div class="evidence">These rules are configured for the Castle Wall, ' +
+        "but the wall is not confirmed armed and enforcing for this agent, so the " +
+        "operating system is not confirmed to be enforcing them. The rules below " +
+        "describe the configured policy, not a confirmed in-effect block.</div>";
     } else {
       head +=
         '<div class="evidence">' +
@@ -299,9 +327,9 @@ export function renderPostureAgentHTML(): string {
       return;
     }
     var rows = reach.destinations.map(function (d) {
-      return "<tr><td>" + dispositionPill(d.disposition) + "</td>" +
+      return "<tr><td>" + dispositionPill(d.disposition, enforcementConfirmed) + "</td>" +
         "<td><code>" + esc(d.destination) + "</code></td>" +
-        "<td>" + layerLabel(d.enforcing_layer) + "</td>" +
+        "<td>" + layerLabel(d.enforcing_layer, enforcementConfirmed) + "</td>" +
         '<td class="meta">' + esc(d.rule_id) + "</td></tr>";
     }).join("");
     el.innerHTML = head +

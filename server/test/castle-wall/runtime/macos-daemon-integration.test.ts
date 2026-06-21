@@ -18,6 +18,12 @@ import {
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+} from "../../../src/castle-wall/constants.js";
 
 const silent = new Writable({
   write(_chunk, _encoding, callback) {
@@ -282,6 +288,148 @@ describe("Castle Wall macOS daemon integration", () => {
     await wait(35);
 
     expect(broadcasts).toEqual([revoke]);
+    await handle.stop();
+  });
+
+  it("emits a provenance-marked castle_wall_heartbeat audit entry on its audit-cadence interval (Slice 2)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      // A tiny audit-heartbeat cadence so the test does not wait the 45s default.
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+
+    // Let the startup beat plus a couple of interval beats land.
+    await wait(40);
+    await handle.stop();
+
+    const q = await auditLog.query({ layer: "l1", limit: 1000 });
+    const beats = q.entries.filter(
+      (e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION,
+    );
+    // At least the startup beat (and almost certainly several interval beats).
+    expect(beats.length).toBeGreaterThanOrEqual(1);
+    // Every beat carries the SAME cw_source provenance marker enforcement
+    // evidence carries, so the reader treats it as genuine Castle Wall liveness.
+    for (const beat of beats) {
+      const details = beat.details as Record<string, unknown>;
+      expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      );
+      expect(beat.result).toBe("success");
+    }
+  });
+
+  it("stops emitting heartbeats after the daemon is stopped (same teardown as the lease heartbeat)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(40);
+    await handle.stop();
+
+    const afterStop = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION).length;
+    // Give any leaked interval a chance to fire post-stop.
+    await wait(40);
+    const later = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION).length;
+    expect(later).toBe(afterStop);
+  });
+
+  it("a clean stop records a provenance-marked filter_stopped stand-down (Slice 2 false-RED fix)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(40);
+    await handle.stop();
+
+    const stops = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "filter_stopped");
+    // Exactly the one clean-stop event, and it carries the cw_source marker so
+    // the silent-death reader recognizes it as an INTENTIONAL stand-down (off on
+    // purpose) rather than reading a false dead_no_heartbeat alarm.
+    expect(stops.length).toBe(1);
+    const details = stops[0].details as Record<string, unknown>;
+    expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(stops[0].result).toBe("success");
+  });
+
+  it("an arm-lease revoke records a provenance-marked arm_lease_revoked stand-down (Slice 2 false-RED fix)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let revokeHook:
+      | ((lease: ArmLeaseNotification) => void | Promise<void>)
+      | undefined;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      listenerFactory(options) {
+        revokeHook = options.onArmLeaseRevoke;
+        return fakeListenerFactory(options);
+      },
+    });
+    await wait(40);
+
+    const revoke: ArmLeaseNotification = {
+      type: "arm_lease",
+      armed: false,
+      revoked: true,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-06-10T00:00:00.000Z",
+    };
+    // The revoke path previously wrote NOTHING, so a lease-revoke stand-down was
+    // indistinguishable from a silent death. It must now leave a recognizable
+    // arm_lease_revoked marker on the heartbeat's trust basis.
+    await revokeHook?.(revoke);
+
+    const revokes = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter(
+      (e) => e.operation === CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+    );
+    expect(revokes.length).toBe(1);
+    const details = revokes[0].details as Record<string, unknown>;
+    expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(revokes[0].result).toBe("success");
+
     await handle.stop();
   });
 
