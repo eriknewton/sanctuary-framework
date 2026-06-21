@@ -34,7 +34,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { writeFile, access, lstat, mkdir, open, stat } from "node:fs/promises";
+import { access, lstat, mkdir, open } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
@@ -620,27 +620,48 @@ async function writeSecretFile(opts: {
     return { filePath, written: true };
   }
 
-  try {
-    const existing = await stat(filePath);
-    if (!existing.isFile()) {
-      throw new Error(
-        `Recovery key output path exists but is not a file: ${filePath}`
-      );
-    }
-    if (opts.failIfExists) {
-      throw new RecoveryKeyOutputPathExistsError(filePath);
-    }
-    return { filePath, written: false };
-  } catch (err) {
-    if (!isMissingPathError(err)) {
-      throw err;
-    }
-    // File does not exist, proceed to write.
-  }
-
+  // Single-issuance, race-free create. O_CREAT|O_EXCL fails atomically with
+  // EEXIST if anything already occupies the path (a prior issuance or a planted
+  // symlink), and O_NOFOLLOW refuses a final-component symlink, so there is no
+  // check-then-use window an attacker could exploit to redirect the write. An
+  // existing regular file is a prior issuance the fortress must never overwrite.
   await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
 
-  await writeFile(filePath, content, { mode: 0o600 });
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const flags =
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(filePath, flags, 0o600);
+    await handle.writeFile(content, { encoding: "utf-8" });
+  } catch (err) {
+    if (isErrnoCode(err, "EEXIST")) {
+      let existingIsFile: boolean;
+      try {
+        existingIsFile = (await lstat(filePath)).isFile();
+      } catch {
+        existingIsFile = false;
+      }
+      if (!existingIsFile) {
+        throw new Error(
+          `Recovery key output path exists but is not a file: ${filePath}`,
+          { cause: err }
+        );
+      }
+      return { filePath, written: false };
+    }
+    if (isErrnoCode(err, "ELOOP")) {
+      throw new Error(
+        `Recovery key output path exists but is not a file: ${filePath}`,
+        { cause: err }
+      );
+    }
+    throw err;
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
   return { filePath, written: true };
 }
 
