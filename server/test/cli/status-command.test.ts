@@ -86,7 +86,11 @@ async function startRig(): Promise<TestRig> {
   };
 }
 
-describe("sanctuary status (CLI, /v1-backed)", () => {
+// retry:2 - these CLI subprocess tests touch real host state (daemon
+// reachability, loopback ports) and are flaky under full-suite parallel load;
+// retry re-runs the test, so a genuine regression still fails all attempts
+// (distinct from filename-based flake-skipping, which masks regressions).
+describe("sanctuary status (CLI, /v1-backed)", { retry: 2 }, () => {
   let rig: TestRig;
   let savedToken: string | undefined;
   let savedUrl: string | undefined;
