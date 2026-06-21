@@ -14,6 +14,12 @@ import {
   type TestRig,
 } from "./rig.js";
 import { makeFederationMaterials, type FedMaterials } from "./fed-materials.js";
+import {
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
+  FEDERATION_SYNC_WIRE_VERSION,
+  federationOperatorAuthorityOrigin,
+  signFederationNodeEvictionPayload,
+} from "../../src/v1/federation-revocation.js";
 
 let rig: TestRig;
 let materials: FedMaterials;
@@ -49,11 +55,46 @@ function makeEvent(params: {
   };
 }
 
+function makeEvictionEvent(
+  nodeId: string,
+  sequence: number,
+  previousHash: string | null,
+): FederationEvent {
+  const origin = federationOperatorAuthorityOrigin(materials.fortressId);
+  const payload = signFederationNodeEvictionPayload({
+    fortressId: materials.fortressId,
+    nodeId,
+    reason: "operator test eviction",
+    effectiveAt: `2026-06-20T12:00:0${sequence}.000Z`,
+    evictionSerial: sequence,
+    operatorPrincipalId: materials.context.issuingPrincipalCert.principal_id,
+    operatorPrincipalPrivateKey:
+      materials.context.getIssuingPrincipalPrivateKey(),
+  });
+  const withoutHash = {
+    event_id: `${origin}:${sequence}`,
+    origin_node_id: origin,
+    sequence,
+    occurred_at: `2026-06-20T12:00:0${sequence}.000Z`,
+    kind: FEDERATION_NODE_EVICTION_EVENT_KIND,
+    payload: payload as unknown as Record<string, unknown>,
+    previous_hash: previousHash,
+  };
+  return {
+    ...withoutHash,
+    event_hash: federationEventHash(withoutHash),
+  };
+}
+
 function operatorSigned(action: string, payload: Record<string, unknown>) {
   return {
     ...payload,
     operator_signature: toBase64url(signOperatorPayload(action, payload, OPERATOR.privateKey)),
   };
+}
+
+function currentSyncPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  return { wire_version: FEDERATION_SYNC_WIRE_VERSION, ...payload };
 }
 
 async function enable(token: string) {
@@ -84,7 +125,10 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       cursor: { after_sequence: 0 },
       idempotency_key: "sync-1",
     };
-    const res = await sync(token, operatorSigned("/v1/federation/sync", payload));
+    const res = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", currentSyncPayload(payload)),
+    );
     expect(res.status).toBe(200);
 
     const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
@@ -100,13 +144,96 @@ describe("/v1/nodes + /v1/federation/sync", () => {
 
   it("requires OPERATOR_SIGNED for sync; a loopback session alone is not enough", async () => {
     const token = await openLoopbackSession(rig);
-    const res = await sync(token, {
-      node_id: "linux-1",
-      events: [],
-      idempotency_key: "unsigned",
-    });
+    const res = await sync(
+      token,
+      currentSyncPayload({
+        node_id: "linux-1",
+        events: [],
+        idempotency_key: "unsigned",
+      }),
+    );
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: "forbidden" });
+  });
+
+  it("rejects legacy unversioned sync requests before appending events", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+    const event = makeEvent({ nodeId: "linux-1", sequence: 1, previousHash: null });
+    const legacyPayload = {
+      node_id: "linux-1",
+      events: [event],
+      cursor: { after_sequence: 0 },
+      idempotency_key: "legacy-unversioned",
+    };
+
+    const res = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", legacyPayload),
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+    const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(((await nodesRes.json()) as { nodes: unknown[] }).nodes).toHaveLength(0);
+  });
+
+  it("rejects ordinary operator-signed sync events from an already-revoked node", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+
+    const eviction = makeEvictionEvent("linux-1", 1, null);
+    const evictionPayload = {
+      node_id: federationOperatorAuthorityOrigin(materials.fortressId),
+      events: [eviction],
+      cursor: {},
+      idempotency_key: "evict-linux-1",
+    };
+    const evictionRes = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", currentSyncPayload(evictionPayload)),
+    );
+    expect(evictionRes.status).toBe(200);
+    expect(((await evictionRes.json()) as { accepted: string[] }).accepted).toEqual([
+      eviction.event_id,
+    ]);
+
+    const linuxEvent = makeEvent({
+      nodeId: "linux-1",
+      sequence: 1,
+      previousHash: null,
+    });
+    const res = await sync(
+      token,
+      operatorSigned(
+        "/v1/federation/sync",
+        currentSyncPayload({
+          node_id: "linux-1",
+          events: [linuxEvent],
+          cursor: { node_id: "linux-1", after_sequence: 0 },
+          idempotency_key: "revoked-linux-ordinary",
+        }),
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      accepted: string[];
+      rejected: Array<{ event_id: string; reason: string }>;
+      events?: FederationEvent[];
+    };
+    expect(body.accepted).toEqual([]);
+    expect(body.rejected).toEqual([
+      { event_id: linuxEvent.event_id, reason: "node_revoked" },
+    ]);
+    expect(body.events).toBeUndefined();
+
+    const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(((await nodesRes.json()) as { nodes: unknown[] }).nodes).toHaveLength(0);
   });
 
   it("rejects a tampered operator signature before appending events", async () => {
@@ -118,7 +245,7 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       events: [event],
       idempotency_key: "tampered",
     };
-    const signed = operatorSigned("/v1/federation/sync", payload);
+    const signed = operatorSigned("/v1/federation/sync", currentSyncPayload(payload));
     const res = await sync(token, { ...signed, node_id: "cloud-1" });
     expect(res.status).toBe(403);
 
@@ -155,7 +282,10 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       cursor: { node_id: "linux-1", after_sequence: 0 },
       idempotency_key: "exchange",
     };
-    const res = await sync(token, operatorSigned("/v1/federation/sync", payload));
+    const res = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", currentSyncPayload(payload)),
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       accepted: string[];

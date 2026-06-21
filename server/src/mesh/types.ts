@@ -75,6 +75,12 @@ export interface PrincipalCertificate {
  * Spec: §2.2, §10.2, §10.4.
  */
 export interface NodeIdentityCertificate {
+  /**
+   * Explicit signed node-certificate shape marker. Present on expiring v1 node
+   * certs so mismatched peers fail on a versioned cert shape instead of an
+   * ambiguous signature mismatch. Legacy non-expiring certs omit it.
+   */
+  certificate_version?: string;
   /** 128-bit UUID for this node, stable for node lifetime. */
   node_id: string;
   /** Base64url-encoded Ed25519 public key (32 bytes). */
@@ -85,6 +91,11 @@ export interface NodeIdentityCertificate {
   fortress_id: string;
   /** ISO8601 timestamp of join. */
   joined_at: string;
+  /**
+   * ISO8601 timestamp of optional node-cert expiry. Legacy certificates that
+   * omit this field remain non-expiring for migration compatibility.
+   */
+  expires_at?: string;
   /**
    * Capability bitmap. Bit 0 is the v0.1 default (standard_fortress_node).
    * Bits 1-2 are v0.1 opt-in. Bits 3-31 are RESERVED for v1.x.

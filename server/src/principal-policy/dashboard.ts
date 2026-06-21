@@ -93,6 +93,7 @@ import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
   federationEventHash,
   validateFederationEventHash,
+  type FederationAppendOptions,
   type FederationAppendResult,
   type FederationContext,
   type FederationEvent,
@@ -100,6 +101,17 @@ import {
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import {
+  acceptFederationEventsFailClosed,
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
+  federationOperatorAuthorityOrigin,
+  foldAcceptedFederationNodeEvictionEvent,
+  foldFederationNodeEvictionEvent,
+  isFederationOperatorAuthorityEvent,
+  renewNodeIdentityCertificateIfDue,
+  startFederationNodeCertificateAutoRenewal,
+  type FederationNodeCertificateAutoRenewalHandle,
+} from "../v1/federation-revocation.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -386,6 +398,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private readonly _federationRoster = new Set<string>();
   private readonly _federationNodes = new Map<string, FederationNodeView>();
   private readonly _federationEventLog: FederationEvent[] = [];
+  private readonly _federationRevoked = new Set<string>();
+  private _federationEvictionMaxSerial = 0;
+  private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
   /**
    * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
    * highest envelope high-water accepted per sender node id (whole-envelope
@@ -1446,8 +1461,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * flag (a federation with no materials cannot be enabled).
    */
   setFederationContext(ctx: FederationContext | null): void {
+    this.stopFederationCertificateAutoRenewal();
     this._federationContext = ctx;
-    if (ctx === null) this._federationEnabled = false;
+    if (ctx === null) {
+      this._federationEnabled = false;
+      this._federationRevoked.clear();
+      this._federationEvictionMaxSerial = 0;
+      return;
+    }
+    this.reprojectFederationRevocations(ctx);
+    ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
+    this._federationRenewal = startFederationNodeCertificateAutoRenewal({
+      renewNow: () => this.renewLocalFederationNodeCertificate(),
+      config: ctx.nodeCertificateRenewal,
+    });
   }
 
   /**
@@ -1477,7 +1504,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       listNodes: () => [...this._federationNodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
-      appendFederationEvents: (events) => this.appendFederationEvents(events),
+      appendFederationEvents: (events, options) =>
+        this.appendFederationEvents(events, options),
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
       recordAcceptedHighWater: (senderNodeId, highWater) => {
@@ -1491,6 +1519,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         });
       },
       nextOutboundHighWater: () => ++this._federationOutboundHighWater,
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      renewLocalNodeCertificate: () => {
+        this.renewLocalFederationNodeCertificate();
+      },
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -1500,6 +1532,89 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         }
       },
     };
+  }
+
+  private stopFederationCertificateAutoRenewal(): void {
+    this._federationRenewal?.stop();
+    this._federationRenewal = null;
+  }
+
+  private renewLocalFederationNodeCertificate(): void {
+    const ctx = this._federationContext;
+    if (ctx === null) return;
+    const result = renewNodeIdentityCertificateIfDue({
+      certificate: ctx.localNodeCert ?? null,
+      localNodeId: ctx.nodeId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+      operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
+      masterPrivateKey: ctx.getMasterPrivateKey?.(),
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      config: ctx.nodeCertificateRenewal,
+    });
+    if (result.renewed) {
+      ctx.localNodeCert = result.certificate;
+      void this.auditLog?.append(
+        "l2",
+        "v1_federation_node_cert_auto_renewed",
+        result.certificate.node_id,
+        {
+          previous_expires_at: result.previousExpiresAt,
+          next_expires_at: result.nextExpiresAt,
+        },
+        "success",
+      ).catch(() => {
+        // Best-effort observability only; renewal already completed.
+      });
+    }
+  }
+
+  private isFederationNodeRevoked(nodeId: string): boolean {
+    return this._federationRevoked.has(nodeId);
+  }
+
+  private reprojectFederationRevocations(ctx: FederationContext): void {
+    this._federationRevoked.clear();
+    this._federationEvictionMaxSerial = 0;
+
+    const projection = {
+      revokedNodeIds: this._federationRevoked,
+      highestEvictionSerial: this._federationEvictionMaxSerial,
+    };
+    const events = this._federationEventLog
+      .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
+      .sort((a, b) => a.sequence - b.sequence);
+    for (const event of events) {
+      const folded = foldAcceptedFederationNodeEvictionEvent({
+        event,
+        projection,
+        fortressId: ctx.fortressId,
+      });
+      if (folded.ok) {
+        this._federationEvictionMaxSerial = projection.highestEvictionSerial;
+      }
+    }
+  }
+
+  private foldFederationEvictionEvent(event: FederationEvent):
+    | { ok: true }
+    | { ok: false; reason: string } {
+    const ctx = this._federationContext;
+    if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
+    const projection = {
+      revokedNodeIds: this._federationRevoked,
+      highestEvictionSerial: this._federationEvictionMaxSerial,
+    };
+    const folded = foldFederationNodeEvictionEvent({
+      event,
+      projection,
+      fortressId: ctx.fortressId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+    });
+    if (!folded.ok) return { ok: false, reason: folded.reason };
+    this._federationEvictionMaxSerial = projection.highestEvictionSerial;
+    return { ok: true };
   }
 
   private upsertFederationNode(
@@ -1572,7 +1687,34 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
-  private appendFederationEvents(events: FederationEvent[]): FederationAppendResult {
+  private appendFederationEvents(
+    events: FederationEvent[],
+    options?: FederationAppendOptions,
+  ): FederationAppendResult {
+    const ctx = this._federationContext;
+    if (ctx === null) {
+      return {
+        accepted: [],
+        rejected: events.map((event) => ({
+          event_id: event.event_id,
+          reason: "federation_not_provisioned",
+        })),
+      };
+    }
+    return acceptFederationEventsFailClosed({
+      events,
+      fortressId: ctx.fortressId,
+      senderNodeId: options?.senderNodeId,
+      wireVersion: options?.wireVersion,
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      appendEvents: (batch) =>
+        this.appendFederationEventsAfterRevocationGate(batch),
+    });
+  }
+
+  private appendFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
     const accepted: FederationEvent[] = [];
     const rejected: Array<{ event_id: string; reason: string }> = [];
     const byNode = new Map<string, FederationEvent[]>();
@@ -1604,16 +1746,39 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "previous_hash_mismatch" });
           continue;
         }
+        const ctx = this._federationContext;
+        const operatorAuthorityOrigin =
+          ctx === null ? null : federationOperatorAuthorityOrigin(ctx.fortressId);
+        const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+        const isAuthorityOrigin =
+          operatorAuthorityOrigin !== null &&
+          event.origin_node_id === operatorAuthorityOrigin;
+        if (isEvictionKind || isAuthorityOrigin) {
+          if (
+            ctx === null ||
+            !isFederationOperatorAuthorityEvent(event, ctx.fortressId)
+          ) {
+            rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
+            continue;
+          }
+          const folded = this.foldFederationEvictionEvent(event);
+          if (!folded.ok) {
+            rejected.push({ event_id: event.event_id, reason: folded.reason });
+            continue;
+          }
+        }
         this._federationEventLog.push(event);
         accepted.push(event);
         last = event;
-        this.upsertFederationNode(nodeId, {
-          attestation_status: "verified",
-          last_sync: {
-            received_at: new Date().toISOString(),
-            last_sequence: event.sequence,
-          },
-        });
+        if (!isAuthorityOrigin) {
+          this.upsertFederationNode(nodeId, {
+            attestation_status: "verified",
+            last_sync: {
+              received_at: new Date().toISOString(),
+              last_sequence: event.sequence,
+            },
+          });
+        }
       }
     }
     return { accepted, rejected };
@@ -1745,6 +1910,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       clearInterval(this.sessionCleanupTimer);
       this.sessionCleanupTimer = null;
     }
+    this.stopFederationCertificateAutoRenewal();
 
     // Clean up rate limit tracking
     this.rateLimits.clear();
