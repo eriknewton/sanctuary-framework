@@ -61,6 +61,7 @@ export function makeFederationMaterials(opts?: {
     getIssuingPrincipalPrivateKey: () => principalPriv,
     getFortressMasterSecret: () => masterSecret,
     getMasterPrivateKey: () => master.private_key,
+    isNodeRevoked: () => false,
     ...(opts?.approver ? { approver: opts.approver } : {}),
   };
 
@@ -141,6 +142,7 @@ export function makeMultiNodeFortress(nodeIds: string[]): MultiNodeFortress {
       getMasterPrivateKey: () => master.private_key,
       localNodeCert: nodeCert,
       getLocalNodePrivateKey: () => privateKey,
+      isNodeRevoked: () => false,
     };
 
     const peerIdentity: PeerSyncIdentity = {

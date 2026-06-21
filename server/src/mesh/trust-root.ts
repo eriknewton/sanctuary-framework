@@ -48,6 +48,9 @@ import type {
   PrincipalCertificate,
 } from "./types.js";
 
+export const NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING =
+  "sanctuary.v1.expiring-node-cert" as const;
+
 // ═══════════════════════════════════════════════════════════════════════
 // Bootstrap
 // ═══════════════════════════════════════════════════════════════════════
@@ -145,6 +148,7 @@ export function issueNodeIdentityCertificate(params: {
   capabilities: number;
   parent_chain: NodeIdentityCertificate["parent_chain"];
   principal_private_key: Uint8Array;
+  expires_at?: string;
   tee_attestation_hash?: string;
   /** Optional — set to attach master_signature (recommended; REQUIRED at v1.x). */
   master_private_key?: Uint8Array;
@@ -159,11 +163,15 @@ export function issueNodeIdentityCertificate(params: {
   }
 
   const body = {
+    certificate_version: params.expires_at
+      ? NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING
+      : undefined,
     node_id: params.node_id,
     node_pubkey: toBase64url(params.node_pubkey),
     node_mode: params.node_mode,
     fortress_id: params.fortress_id,
     joined_at: new Date().toISOString(),
+    expires_at: params.expires_at,
     capabilities: params.capabilities,
     parent_chain: params.parent_chain,
     tee_attestation_hash: params.tee_attestation_hash,
@@ -197,14 +205,15 @@ export function issueNodeIdentityCertificate(params: {
  */
 export function verifyPrincipalCertificate(
   cert: PrincipalCertificate,
-  pinnedMasterPubkey: FortressMasterPublicKey
+  pinnedMasterPubkey: FortressMasterPublicKey,
+  nowMs = Date.now()
 ): void {
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
     throw new MeshChainError(
       `principal cert fortress_id=${cert.fortress_id} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
     );
   }
-  if (cert.expires_at && Date.parse(cert.expires_at) < Date.now()) {
+  if (cert.expires_at && Date.parse(cert.expires_at) < nowMs) {
     throw new MeshChainError(
       `principal cert ${cert.principal_id} expired at ${cert.expires_at}`
     );
@@ -249,7 +258,8 @@ export function verifyPrincipalCertificate(
 export function verifyCertChain(
   cert: NodeIdentityCertificate,
   principalCert: PrincipalCertificate,
-  pinnedMasterPubkey: FortressMasterPublicKey
+  pinnedMasterPubkey: FortressMasterPublicKey,
+  nowMs = Date.now()
 ): void {
   // Fortress-id coherence across the whole chain.
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
@@ -281,15 +291,45 @@ export function verifyCertChain(
   }
 
   // Walk the upper hop: principal → master.
-  verifyPrincipalCertificate(principalCert, pinnedMasterPubkey);
+  verifyPrincipalCertificate(principalCert, pinnedMasterPubkey, nowMs);
+
+  // Migration-safe node expiry: legacy node certs with no expires_at remain
+  // non-expiring, but any present expiry is signed below and enforced here.
+  if (cert.certificate_version !== undefined) {
+    if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} has unsupported certificate_version ${cert.certificate_version}`
+      );
+    }
+    if (!cert.expires_at) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} has certificate_version without expires_at`
+      );
+    }
+  }
+  if (cert.expires_at) {
+    if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} missing certificate_version ${NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING}`
+      );
+    }
+    const expiresMs = Date.parse(cert.expires_at);
+    if (Number.isNaN(expiresMs) || expiresMs < nowMs) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} expired at ${cert.expires_at}`
+      );
+    }
+  }
 
   // Walk the lower hop: node → principal.
   const body = {
+    certificate_version: cert.certificate_version,
     node_id: cert.node_id,
     node_pubkey: cert.node_pubkey,
     node_mode: cert.node_mode,
     fortress_id: cert.fortress_id,
     joined_at: cert.joined_at,
+    expires_at: cert.expires_at,
     capabilities: cert.capabilities,
     parent_chain: cert.parent_chain,
     tee_attestation_hash: cert.tee_attestation_hash,

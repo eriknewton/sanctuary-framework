@@ -57,6 +57,12 @@ import {
 } from "../../src/v1/federation-sync-envelope.js";
 import { federationEventHash, type FederationEvent } from "../../src/v1/federation.js";
 import {
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
+  FEDERATION_NODE_EVICTION_EVENT_VERSION,
+  federationOperatorAuthorityOrigin,
+  signFederationNodeEvictionPayload,
+} from "../../src/v1/federation-revocation.js";
+import {
   makeMultiNodeFortress,
   type FortressNode,
   type MultiNodeFortress,
@@ -190,6 +196,7 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
       sessionToken: linuxSession,
       events: macEvents,
       syncHighWater: 1,
+      isNodeRevoked: () => false,
     });
 
     expect(result.ok).toBe(true);
@@ -230,6 +237,7 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
       sessionToken: linuxSession,
       events: macEvents,
       syncHighWater: 1,
+      isNodeRevoked: () => false,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -238,6 +246,101 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
     expect(result.reciprocalHighWater).toBeGreaterThan(0);
     const reciprocalAgents = recognizedPortableAgents(result.reciprocalEvents);
     expect(reciprocalAgents.has("agent-on-linux")).toBe(true);
+  });
+
+  it("denies a revoked peer's reciprocal envelope on the client path", async () => {
+    const linuxSession = await openSession(linux1);
+    const result = await pushSyncToPeer(peerIdentity(fortress.nodes["mac-1"]), {
+      peerUrl: linux1.baseUrl,
+      recipientNodeId: "linux-1",
+      sessionToken: linuxSession,
+      events: [],
+      syncHighWater: 1,
+      isNodeRevoked: (nodeId) => nodeId === "linux-1",
+    });
+
+    expect(result).toEqual({ ok: false, reason: "reciprocal_unverified" });
+  });
+
+  it("rejects a sender-origin reciprocal node_eviction on the fallback path", async () => {
+    const linux = fortress.nodes["linux-1"];
+    const senderOriginEviction = makeSenderOriginEvictionEvent("linux-1", "mac-1", 1);
+    const reciprocalEnvelope = signSyncEnvelope({
+      fortressId: fortress.fortressId,
+      senderNodeId: "linux-1",
+      recipientNodeId: "mac-1",
+      syncHighWater: 1,
+      events: [senderOriginEviction],
+      senderNodeCert: linux.nodeCert,
+      issuingPrincipalCert: fortress.principalCert,
+      nodePrivateKey: Uint8Array.from(linux.nodePrivateKey),
+    });
+
+    const result = await pushSyncToPeer(peerIdentity(fortress.nodes["mac-1"]), {
+      peerUrl: linux1.baseUrl,
+      recipientNodeId: "linux-1",
+      sessionToken: "test-session",
+      events: [],
+      syncHighWater: 1,
+      isNodeRevoked: () => false,
+      request: async () => ({
+        accepted: [],
+        rejected: [],
+        envelope: reciprocalEnvelope,
+      }),
+    });
+
+    expect(result).toEqual({ ok: false, reason: "reciprocal_unverified" });
+  });
+
+  it("processes reciprocal evictions before returning the revoked peer's own events", async () => {
+    const linux = fortress.nodes["linux-1"];
+    const reciprocalSelfEvent = makeEvent("linux-1", 1, null);
+    const eviction = makeEvictionEvent("linux-1", 1, null);
+    const reciprocalEnvelope = signSyncEnvelope({
+      fortressId: fortress.fortressId,
+      senderNodeId: "linux-1",
+      recipientNodeId: "mac-1",
+      syncHighWater: 1,
+      events: [eviction, reciprocalSelfEvent],
+      senderNodeCert: linux.nodeCert,
+      issuingPrincipalCert: fortress.principalCert,
+      nodePrivateKey: Uint8Array.from(linux.nodePrivateKey),
+    });
+
+    const result = await pushSyncToPeer(peerIdentity(fortress.nodes["mac-1"]), {
+      peerUrl: linux1.baseUrl,
+      recipientNodeId: "linux-1",
+      sessionToken: "test-session",
+      events: [],
+      syncHighWater: 1,
+      isNodeRevoked: (nodeId) => mac1.node.context.isNodeRevoked(nodeId),
+      acceptReciprocalEvents: (events, options) =>
+        (mac1.dashboard as unknown as {
+          appendFederationEvents(
+            events: FederationEvent[],
+            options?: { senderNodeId?: string },
+          ): { accepted: FederationEvent[]; rejected: Array<{ event_id: string; reason: string }> };
+        }).appendFederationEvents(events, options),
+      request: async () => ({
+        accepted: [],
+        rejected: [],
+        envelope: reciprocalEnvelope,
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.reciprocalEvents.map((event) => event.event_id)).toEqual([
+      eviction.event_id,
+    ]);
+    const macEvents = (mac1.dashboard as unknown as {
+      listFederationEvents(): FederationEvent[];
+    }).listFederationEvents();
+    expect(macEvents.map((event) => event.event_id)).toContain(eviction.event_id);
+    expect(macEvents.map((event) => event.event_id)).not.toContain(
+      reciprocalSelfEvent.event_id,
+    );
   });
 
   it("rejects a peer event stamped with a FOREIGN origin_node_id (no node impersonation)", async () => {
@@ -266,6 +369,114 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
     });
     const nodes = ((await nodesRes.json()) as { nodes: Array<Record<string, unknown>> }).nodes;
     expect(nodes.find((n) => n.node_id === "victim-node")).toBeUndefined();
+  });
+
+  it("processes same-envelope evictions before rejecting the revoked sender's own events", async () => {
+    const linuxSession = await openSession(linux1);
+    const mac = fortress.nodes["mac-1"];
+    const selfEvent = makeEvent("mac-1", 1, null);
+    const eviction = makeEvictionEvent("mac-1", 1, null);
+    const envelope = signSyncEnvelope({
+      fortressId: fortress.fortressId,
+      senderNodeId: "mac-1",
+      recipientNodeId: "linux-1",
+      syncHighWater: 1,
+      events: [selfEvent, eviction],
+      senderNodeCert: mac.nodeCert,
+      issuingPrincipalCert: fortress.principalCert,
+      nodePrivateKey: Uint8Array.from(mac.nodePrivateKey),
+    });
+
+    const res = await postPeer(linux1.baseUrl, linuxSession, envelope);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      accepted: string[];
+      rejected: Array<{ event_id: string; reason: string }>;
+      envelope?: unknown;
+      events?: unknown;
+    };
+    expect(body.accepted).toContain(eviction.event_id);
+    expect(body.rejected).toContainEqual({
+      event_id: selfEvent.event_id,
+      reason: "node_revoked",
+    });
+    expect(body.envelope).toBeUndefined();
+    expect(body.events).toBeUndefined();
+    const linuxEvents = (linux1.dashboard as unknown as {
+      listFederationEvents(): FederationEvent[];
+    }).listFederationEvents();
+    expect(linuxEvents.map((event) => event.event_id)).toContain(eviction.event_id);
+    expect(linuxEvents.map((event) => event.event_id)).not.toContain(selfEvent.event_id);
+  });
+
+  it("suppresses the no-local-cert bare-events fallback when the envelope evicts the sender", async () => {
+    linux1.dashboard.recordLocalAgentIdentity("agent-on-linux", undefined);
+    const {
+      localNodeCert: _localNodeCert,
+      getLocalNodePrivateKey: _getLocalNodePrivateKey,
+      ...noLocalCertContext
+    } = fortress.nodes["linux-1"].context;
+    linux1.dashboard.setFederationContext(noLocalCertContext);
+
+    const linuxSession = await openSession(linux1);
+    const mac = fortress.nodes["mac-1"];
+    const eviction = makeEvictionEvent("mac-1", 1, null);
+    const envelope = signSyncEnvelope({
+      fortressId: fortress.fortressId,
+      senderNodeId: "mac-1",
+      recipientNodeId: "linux-1",
+      syncHighWater: 1,
+      events: [eviction],
+      senderNodeCert: mac.nodeCert,
+      issuingPrincipalCert: fortress.principalCert,
+      nodePrivateKey: Uint8Array.from(mac.nodePrivateKey),
+    });
+
+    const res = await postPeer(linux1.baseUrl, linuxSession, envelope);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      accepted: string[];
+      envelope?: unknown;
+      events?: unknown;
+    };
+    expect(body.accepted).toContain(eviction.event_id);
+    expect(body.envelope).toBeUndefined();
+    expect(body.events).toBeUndefined();
+  });
+
+  it("does not emit bare reciprocal events when the local node cert is missing", async () => {
+    linux1.dashboard.recordLocalAgentIdentity("agent-on-linux", undefined);
+    const {
+      localNodeCert: _localNodeCert,
+      getLocalNodePrivateKey: _getLocalNodePrivateKey,
+      ...noLocalCertContext
+    } = fortress.nodes["linux-1"].context;
+    linux1.dashboard.setFederationContext(noLocalCertContext);
+
+    const linuxSession = await openSession(linux1);
+    const mac = fortress.nodes["mac-1"];
+    const envelope = signSyncEnvelope({
+      fortressId: fortress.fortressId,
+      senderNodeId: "mac-1",
+      recipientNodeId: "linux-1",
+      syncHighWater: 1,
+      events: [],
+      senderNodeCert: mac.nodeCert,
+      issuingPrincipalCert: fortress.principalCert,
+      nodePrivateKey: Uint8Array.from(mac.nodePrivateKey),
+    });
+
+    const res = await postPeer(linux1.baseUrl, linuxSession, envelope);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      envelope?: unknown;
+      events?: unknown;
+    };
+    expect(body.envelope).toBeUndefined();
+    expect(body.events).toBeUndefined();
   });
 
   it("does NOT advance the high-water when the appended slice is partially rejected", async () => {
@@ -328,6 +539,7 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
       sessionToken: linuxSession,
       events: [strangerEvent],
       syncHighWater: 1,
+      isNodeRevoked: () => false,
     });
     // The cert chains to the stranger's master, not linux-1's pinned master.
     expect(result.ok).toBe(false);
@@ -528,6 +740,64 @@ function makeEvent(
     kind: "agent.seen",
     payload: { agent_id: `agent-${sequence}` },
     previous_hash: previousHash,
+  };
+  return { ...withoutHash, event_hash: federationEventHash(withoutHash) };
+}
+
+function makeEvictionEvent(
+  nodeId: string,
+  sequence: number,
+  previousHash: string | null,
+): FederationEvent {
+  const origin = federationOperatorAuthorityOrigin(fortress.fortressId);
+  const payload = signFederationNodeEvictionPayload({
+    fortressId: fortress.fortressId,
+    nodeId,
+    reason: "operator test eviction",
+    effectiveAt: `2026-06-20T12:00:0${sequence}.000Z`,
+    evictionSerial: sequence,
+    operatorPrincipalId: fortress.principalCert.principal_id,
+    operatorPrincipalPrivateKey:
+      fortress.nodes["linux-1"].context.getIssuingPrincipalPrivateKey(),
+  });
+  const withoutHash = {
+    event_id: `${origin}:${sequence}`,
+    origin_node_id: origin,
+    sequence,
+    occurred_at: `2026-06-20T12:00:0${sequence}.000Z`,
+    kind: FEDERATION_NODE_EVICTION_EVENT_KIND,
+    payload: payload as unknown as Record<string, unknown>,
+    previous_hash: previousHash,
+  };
+  return { ...withoutHash, event_hash: federationEventHash(withoutHash) };
+}
+
+function makeSenderOriginEvictionEvent(
+  senderNodeId: string,
+  targetNodeId: string,
+  sequence: number,
+): FederationEvent {
+  const payload = signFederationNodeEvictionPayload({
+    fortressId: fortress.fortressId,
+    nodeId: targetNodeId,
+    reason: "sender-origin reserved event",
+    effectiveAt: `2026-06-20T12:00:0${sequence}.000Z`,
+    evictionSerial: sequence,
+    operatorPrincipalId: fortress.principalCert.principal_id,
+    operatorPrincipalPrivateKey:
+      fortress.nodes["linux-1"].context.getIssuingPrincipalPrivateKey(),
+  });
+  const withoutHash = {
+    event_id: `${senderNodeId}:eviction:${sequence}`,
+    origin_node_id: senderNodeId,
+    sequence,
+    occurred_at: `2026-06-20T12:00:0${sequence}.000Z`,
+    kind: FEDERATION_NODE_EVICTION_EVENT_KIND,
+    payload: {
+      ...payload,
+      event_version: FEDERATION_NODE_EVICTION_EVENT_VERSION,
+    } as unknown as Record<string, unknown>,
+    previous_hash: null,
   };
   return { ...withoutHash, event_hash: federationEventHash(withoutHash) };
 }
