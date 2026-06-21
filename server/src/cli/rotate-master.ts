@@ -33,6 +33,8 @@ import { getOrCreateKeychainCustodyKey } from "../wrap/keychain-custody.js";
 import { readCustodyEnvelope } from "../core/master-custody.js";
 import {
   discloseRecoveryKey,
+  preflightRecoveryKeyOutputFile,
+  resolveRecoveryKeyOutputPath,
   verifyRecoveryKeyReentry,
   type DisclosureIo,
 } from "../wrap/recovery-key-disclosure.js";
@@ -50,6 +52,7 @@ export interface RotateMasterCliArgs {
 
 interface ParsedArgs {
   storage?: string;
+  recoveryOut?: string;
   resume: boolean;
   help: boolean;
 }
@@ -62,11 +65,26 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--resume") out.resume = true;
     else if ((a === "--fortress" || a === "--storage") && argv[i + 1]) {
       out.storage = argv[++i];
+    } else if (a === "--recovery-out") {
+      out.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
+      i++;
     } else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
   }
   return out;
+}
+
+function readRequiredPathArg(
+  argv: string[],
+  index: number,
+  flag: string
+): string {
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`${flag} requires a path value`);
+  }
+  return value;
 }
 
 function printUsage(out: NodeJS.WritableStream): void {
@@ -86,6 +104,10 @@ old master or a credential for it may have been exposed.
 Options:
   --fortress <path>   Override the fortress storage path.
   --storage <path>    Alias for --fortress.
+  --recovery-out <path>
+                      Write the NEW plaintext recovery key to this exact
+                      path instead of <fortress>/recovery-key.txt. The path
+                      must be outside the fortress directory.
   --resume            Resume a rotation interrupted by a crash or power loss.
                       Idempotent; requires the fortress passphrase.
   --help, -h          Show this help.
@@ -102,6 +124,38 @@ markers, and any leaked copy of the old master no longer unlock anything.
 async function fileExists(path: string): Promise<boolean> {
   try {
     await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function captureRotatedRecoveryKey(opts: {
+  recoveryKey: string;
+  verify: (entered: string) => Promise<boolean>;
+  storagePath: string;
+  fortressId: string;
+  recoveryKeyFilePath?: string;
+  io: DisclosureIo;
+  err: NodeJS.WritableStream;
+}): Promise<boolean> {
+  const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
+    recoveryKey: opts.recoveryKey,
+    storagePath: opts.storagePath,
+    fortressId: opts.fortressId,
+    mode: "no-confirm", // re-entry verification below replaces the Y/N
+    io: opts.io,
+  };
+  if (opts.recoveryKeyFilePath) {
+    disclosureOptions.recoveryKeyFilePath = opts.recoveryKeyFilePath;
+  }
+  await discloseRecoveryKey(disclosureOptions);
+  opts.err.write(
+    "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
+      "  completes. Your previous recovery key stops working at that point.\n\n"
+  );
+  try {
+    await verifyRecoveryKeyReentry({ check: opts.verify, io: opts.io });
     return true;
   } catch {
     return false;
@@ -189,6 +243,20 @@ export async function runRotateMasterCommand(
 
   const storagePath =
     parsed.storage ?? args.storagePath ?? resolveStoragePath(process.env, home);
+  let recoveryKeyFilePath: string | undefined;
+  try {
+    recoveryKeyFilePath = resolveRecoveryKeyOutputPath({
+      recoveryOut: parsed.recoveryOut,
+      storagePath,
+      env: process.env,
+    });
+    if (recoveryKeyFilePath) {
+      await preflightRecoveryKeyOutputFile(recoveryKeyFilePath);
+    }
+  } catch (e) {
+    err.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    return 1;
+  }
   const statePath = join(storagePath, "state");
   const fortressId = fortressIdFromStoragePath(storagePath);
   const fortressName = basename(storagePath) || "sanctuary";
@@ -290,23 +358,18 @@ export async function runRotateMasterCommand(
         return true;
       },
       captureRecoveryKey: async (recoveryKey, verify) => {
-        await discloseRecoveryKey({
+        const captureOptions: Parameters<typeof captureRotatedRecoveryKey>[0] = {
           recoveryKey,
+          verify,
           storagePath,
           fortressId,
-          mode: "no-confirm", // re-entry verification below replaces the Y/N
           io,
-        });
-        err.write(
-          "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
-            "  completes. Your previous recovery key stops working at that point.\n\n"
-        );
-        try {
-          await verifyRecoveryKeyReentry({ check: verify, io });
-          return true;
-        } catch {
-          return false;
+          err,
+        };
+        if (recoveryKeyFilePath) {
+          captureOptions.recoveryKeyFilePath = recoveryKeyFilePath;
         }
+        return captureRotatedRecoveryKey(captureOptions);
       },
     });
 

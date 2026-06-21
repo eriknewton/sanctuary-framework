@@ -26,6 +26,8 @@ import type { ExecResult } from "./passphrase.js";
 const CUSTODY_ACCOUNT = "sanctuary";
 const CUSTODY_SERVICE_PREFIX = "sanctuary-custody";
 const CUSTODY_LABEL = "Sanctuary Custody Key";
+const RECOVERY_SERVICE_PREFIX = "sanctuary-recovery";
+const RECOVERY_LABEL = "Sanctuary Recovery Key";
 
 export interface KeychainCustodyOptions {
   /** Override home directory (for tests). */
@@ -34,6 +36,31 @@ export interface KeychainCustodyOptions {
   platformOverride?: NodeJS.Platform;
   /** Command executor (tests inject a mock). */
   exec?: (cmd: string, args: string[], input?: string) => Promise<ExecResult>;
+}
+
+export class RecoveryKeyKeychainStoreError extends Error {
+  readonly service: string;
+
+  constructor(service: string) {
+    super(
+      `Recovery key could not be stored in OS keyring service '${service}'; refusing to continue.`
+    );
+    this.name = "RecoveryKeyKeychainStoreError";
+    this.service = service;
+  }
+}
+
+function serviceForStoragePath(
+  prefix: string,
+  storagePath: string,
+  home: string
+): string {
+  const defaultPath = resolve(join(home, DEFAULT_STORAGE_DIR));
+  const canonicalStorage = resolve(storagePath);
+  if (canonicalStorage === defaultPath) return prefix;
+  const digest = sha256(Buffer.from(canonicalStorage, "utf-8"));
+  const suffix = Buffer.from(digest).toString("hex").slice(0, 16);
+  return `${prefix}-${suffix}`;
 }
 
 /**
@@ -46,12 +73,19 @@ export function custodyServiceFor(
   storagePath: string,
   home: string = homedir()
 ): string {
-  const defaultPath = resolve(join(home, DEFAULT_STORAGE_DIR));
-  const canonicalStorage = resolve(storagePath);
-  if (canonicalStorage === defaultPath) return CUSTODY_SERVICE_PREFIX;
-  const digest = sha256(Buffer.from(canonicalStorage, "utf-8"));
-  const suffix = Buffer.from(digest).toString("hex").slice(0, 16);
-  return `${CUSTODY_SERVICE_PREFIX}-${suffix}`;
+  return serviceForStoragePath(CUSTODY_SERVICE_PREFIX, storagePath, home);
+}
+
+/**
+ * Keyring service name for the fortress recovery key. Same canonical-path
+ * hashing as passphrase and custody services, but with a separate prefix so
+ * the recovery key is a distinct OS-keyring item.
+ */
+export function recoveryKeyServiceFor(
+  storagePath: string,
+  home: string = homedir()
+): string {
+  return serviceForStoragePath(RECOVERY_SERVICE_PREFIX, storagePath, home);
 }
 
 function escapeForSecurity(s: string): string {
@@ -99,8 +133,10 @@ async function writeKey(
   exec: NonNullable<KeychainCustodyOptions["exec"]>,
   plat: NodeJS.Platform,
   service: string,
-  value: string
+  value: string,
+  label: string
 ): Promise<boolean> {
+  if (/[\r\n]/.test(value)) return false;
   try {
     if (plat === "darwin") {
       // Secret via `security -i` batch script on stdin, never argv (F5).
@@ -116,7 +152,7 @@ async function writeKey(
         [
           "store",
           "--label",
-          CUSTODY_LABEL,
+          label,
           "service",
           service,
           "account",
@@ -152,7 +188,7 @@ export async function getOrCreateKeychainCustodyKey(
 
   const key = generateRandomKey();
   const encoded = toBase64url(key);
-  const wrote = await writeKey(exec, plat, service, encoded);
+  const wrote = await writeKey(exec, plat, service, encoded, CUSTODY_LABEL);
   if (!wrote) return null;
 
   const readBack = await readKey(exec, plat, service);
@@ -169,6 +205,52 @@ export async function readKeychainCustodyKey(
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
   return readKey(exec, plat, custodyServiceFor(storagePath, home));
+}
+
+/**
+ * Store the user fortress recovery key in the OS keyring and verify it by
+ * reading it back. This is the convenient, machine-local store for the same
+ * already-minted recovery key that is disclosed once to the operator. It is
+ * never a wrap derivation change, and failure is fail-closed.
+ */
+export async function storeRecoveryKeyInKeychain(
+  storagePath: string,
+  recoveryKey: string,
+  opts: KeychainCustodyOptions = {}
+): Promise<{ service: string }> {
+  const home = opts.home ?? homedir();
+  const plat = opts.platformOverride ?? platform();
+  const exec = opts.exec ?? defaultExec;
+  const service = recoveryKeyServiceFor(storagePath, home);
+  let recoveryKeyBytes: Uint8Array;
+
+  try {
+    recoveryKeyBytes = fromBase64url(recoveryKey);
+  } catch {
+    throw new RecoveryKeyKeychainStoreError(service);
+  }
+
+  try {
+    if (recoveryKeyBytes.length !== 32) {
+      throw new RecoveryKeyKeychainStoreError(service);
+    }
+    const wrote = await writeKey(
+      exec,
+      plat,
+      service,
+      recoveryKey,
+      RECOVERY_LABEL
+    );
+    if (!wrote) throw new RecoveryKeyKeychainStoreError(service);
+
+    const readBack = await readKey(exec, plat, service);
+    if (!readBack || !buffersEqual(readBack, recoveryKeyBytes)) {
+      throw new RecoveryKeyKeychainStoreError(service);
+    }
+    return { service };
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
 }
 
 function buffersEqual(a: Uint8Array, b: Uint8Array): boolean {

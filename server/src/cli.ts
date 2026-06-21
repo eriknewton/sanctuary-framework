@@ -817,6 +817,7 @@ Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
+  SANCTUARY_RECOVERY_OUT            Init recovery-key plaintext output path
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
