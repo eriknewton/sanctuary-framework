@@ -2102,6 +2102,11 @@
             "version"
           ],
           "default": "skip"
+        },
+        "allow_unverified_legacy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicitly import a manifestless legacy bundle without completeness guarantees. Default false rejects bundles that predate authenticated completeness verification."
         }
       },
       "required": [
