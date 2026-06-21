@@ -180,6 +180,23 @@ export function renderPostureHomeHTML(): string {
   .fh-row .name { flex: 1; }
   .fh-row .why { color: var(--muted); font-size: 12px; }
   .fh-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .approval-row {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid var(--border);
+  }
+  .approval-row:last-child { border-bottom: 0; }
+  .approval-main { min-width: 0; }
+  .approval-title { font-weight: 600; }
+  .approval-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .approval-actions { display: flex; gap: 8px; flex: none; }
+  .approval-actions button {
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
+    color: var(--text); background: var(--panel-2); cursor: pointer; font-size: 12px;
+  }
+  .approval-actions button.approve { border-color: rgba(46,160,67,.55); }
+  .approval-actions button.deny { border-color: rgba(248,81,73,.55); }
+  .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
+  .approval-error { color: var(--red); font-size: 12px; margin-top: 8px; }
   .footer {
     margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
     border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
@@ -286,6 +303,9 @@ export function renderPostureHomeHTML(): string {
   // login session cookie rides along; if a token is in the URL hash we use it.
   var tokenMatch = /[#&]token=([^&]+)/.exec(location.hash);
   var token = tokenMatch ? decodeURIComponent(tokenMatch[1]) : null;
+  if (!token && typeof sessionStorage !== "undefined") {
+    token = sessionStorage.getItem("authToken") || null;
+  }
 
   function api(path) {
     var opts = { credentials: "same-origin", headers: {} };
@@ -293,6 +313,45 @@ export function renderPostureHomeHTML(): string {
     return fetch(path, opts).then(function (r) {
       if (!r.ok) throw new Error(path + " -> " + r.status);
       return r.json();
+    });
+  }
+
+  function rememberToken(value) {
+    token = value;
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("authToken", value);
+    }
+  }
+
+  function promptForToken() {
+    if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
+    var entered = window.prompt("Sanctuary operator token required for approval decisions.");
+    if (!entered) return null;
+    entered = entered.trim();
+    if (!entered) return null;
+    rememberToken(entered);
+    return entered;
+  }
+
+  function decisionHeaders() {
+    var headers = {};
+    if (token) headers["Authorization"] = "Bearer " + token;
+    return headers;
+  }
+
+  function postDecision(path, retried) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: decisionHeaders(),
+      cache: "no-store",
+    }).then(function (r) {
+      if (r.status === 401 && !retried) {
+        if (!promptForToken()) return null;
+        return postDecision(path, true);
+      }
+      if (!r.ok) throw new Error(path + " -> " + r.status);
+      return r.json().catch(function () { return {}; });
     });
   }
 
@@ -695,9 +754,9 @@ export function renderPostureHomeHTML(): string {
     el.innerHTML = headline + rows + note;
   }
 
-  function renderBanner(home, pending, anomalies) {
+  function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
-    var pendingCount = (pending && pending.length) || 0;
+    var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
     document.getElementById("origin").textContent =
       "Machine: " + home.origin_machine + " · single-machine view (federation off)";
     document.getElementById("banner").innerHTML =
@@ -749,17 +808,129 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
-  function renderApprovals(pending) {
-    if (!pending || !pending.length) {
+  function normalizeLegacyApproval(p) {
+    var id = p && (p.id || p.request_id);
+    if (!id) return null;
+    return {
+      id: String(id),
+      source: "legacy",
+      title: p.operation || "pending operation",
+      detail: (p.reason || "") + (p.tier ? " · Tier " + p.tier : ""),
+      review_href: "/api/pending",
+      approve_path: "/api/approve/" + encodeURIComponent(id),
+      deny_path: "/api/deny/" + encodeURIComponent(id),
+    };
+  }
+
+  function normalizeInboxApproval(p) {
+    var id = p && p.aggregator_id;
+    if (!id) return null;
+    return {
+      id: String(id),
+      source: "approval-inbox",
+      title: p.action_summary || p.policy_rule_id || "pending operation",
+      detail: (p.source_harness || "approval inbox") +
+        (p.source_agent_id ? " · " + p.source_agent_id : ""),
+      review_href: "/api/approval-inbox/" + encodeURIComponent(id),
+      approve_path: "/api/approval-inbox/" + encodeURIComponent(id) + "/approve",
+      deny_path: "/api/approval-inbox/" + encodeURIComponent(id) + "/deny",
+    };
+  }
+
+  function mapRows(items, mapper) {
+    var rows = [];
+    (items || []).forEach(function (item) {
+      var row = mapper(item);
+      if (row) rows.push(row);
+    });
+    return rows;
+  }
+
+  function approvalRedirect(status) {
+    return status && status.policy && status.policy.approval_redirect
+      ? status.policy.approval_redirect
+      : { enabled: false, mode: "replace" };
+  }
+
+  function chooseApprovalRows(legacyRows, inboxRows, status) {
+    var redirect = approvalRedirect(status);
+    if (redirect.enabled === true && redirect.mode === "replace") {
+      return { rows: inboxRows, source: "approval-inbox" };
+    }
+    if (legacyRows.length) return { rows: legacyRows, source: "legacy" };
+    if (inboxRows.length) return { rows: inboxRows, source: "approval-inbox" };
+    return { rows: [], source: "none" };
+  }
+
+  function buildApprovalState(legacyBody, inboxBody, status) {
+    var legacyList = legacyBody && legacyBody.pending ? legacyBody.pending : legacyBody;
+    var inboxList = inboxBody && inboxBody.data && inboxBody.data.entries
+      ? inboxBody.data.entries
+      : [];
+    var selected = chooseApprovalRows(
+      mapRows(legacyList || [], normalizeLegacyApproval),
+      mapRows(inboxList || [], normalizeInboxApproval),
+      status || null
+    );
+    return {
+      rows: selected.rows,
+      source: selected.source,
+      can_decide: !!status && status.decision_capable === true,
+      mode: status
+        ? (status.standalone_mode === true ? "standalone" : "co-located")
+        : "unknown",
+    };
+  }
+
+  function renderApprovals(approvalState) {
+    var pending = (approvalState && approvalState.rows) || [];
+    if (!pending.length) {
       document.getElementById("approvals").innerHTML = '<span class="empty">Nothing needs you.</span>';
       return;
     }
     var html = "";
     pending.forEach(function (p) {
-      html += '<div class="story-line">' + esc(p.operation || p.id || "pending operation") +
-        ' — <a href="/api/pending">review &rarr;</a></div>';
+      html += '<div class="approval-row" data-approval-row="' + esc(p.id) + '">' +
+        '<div class="approval-main"><div class="approval-title">' + esc(p.title) + "</div>" +
+        (p.detail ? '<div class="approval-detail">' + esc(p.detail) + "</div>" : "") +
+        '<div class="approval-detail"><a href="' + esc(p.review_href) + '">review &rarr;</a></div>' +
+        '<div class="approval-error" data-approval-error="' + esc(p.id) + '"></div></div>';
+      if (approvalState && approvalState.can_decide) {
+        html += '<div class="approval-actions">' +
+          '<button class="approve" data-decision-path="' + esc(p.approve_path) + '" data-approval-id="' + esc(p.id) + '">Approve</button>' +
+          '<button class="deny" data-decision-path="' + esc(p.deny_path) + '" data-approval-id="' + esc(p.id) + '">Deny</button>' +
+          "</div>";
+      }
+      html += "</div>";
     });
-    document.getElementById("approvals").innerHTML = html;
+    var el = document.getElementById("approvals");
+    el.innerHTML = html;
+    if (approvalState && approvalState.can_decide) wireApprovalButtons(el);
+  }
+
+  function wireApprovalButtons(el) {
+    Array.prototype.forEach.call(el.querySelectorAll("button[data-decision-path]"), function (button) {
+      button.addEventListener("click", function () {
+        var path = button.getAttribute("data-decision-path");
+        var id = button.getAttribute("data-approval-id");
+        if (!path) return;
+        var row = id ? el.querySelector('[data-approval-row="' + id + '"]') : null;
+        var rowButtons = row ? row.querySelectorAll("button[data-decision-path]") : [button];
+        Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = true; });
+        var error = id ? el.querySelector('[data-approval-error="' + id + '"]') : null;
+        if (error) error.textContent = "";
+        postDecision(path, false).then(function (result) {
+          if (result === null) {
+            Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = false; });
+            return;
+          }
+          pollOnce();
+        }).catch(function (err) {
+          Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = false; });
+          if (error) error.textContent = "Decision failed: " + (err && err.message ? err.message : "unknown error");
+        });
+      });
+    });
   }
 
   function renderStory(d) {
@@ -826,12 +997,12 @@ export function renderPostureHomeHTML(): string {
   // pending-approvals + anomaly findings come from the existing endpoints (not
   // carried on the home payload), so the caller passes the most recent values it
   // has; both default to empty arrays when never fetched.
-  function renderHome(home, pending, findings) {
-    pending = pending || [];
+  function renderHome(home, approvals, findings) {
+    approvals = approvals || { rows: [], can_decide: false, mode: "unknown", source: "none" };
     findings = findings || [];
-    renderBanner(home, pending, findings);
+    renderBanner(home, approvals, findings);
     renderAgents(home);
-    renderApprovals(pending);
+    renderApprovals(approvals);
     renderStory(home.digest);
     renderAnomalies(findings);
     renderWall(home.castle_wall);
@@ -892,15 +1063,17 @@ export function renderPostureHomeHTML(): string {
   // Not carried on the home payload, so refreshed alongside each home frame.
   // Failures degrade to empty (never block the home render); these are honest
   // empties, not green claims.
-  var lastPending = [];
+  var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none" };
   var lastFindings = [];
   function refreshAuxiliary() {
     return Promise.all([
-      api("/api/pending").catch(function () { return { pending: [] }; }),
+      api("/api/pending").catch(function () { return []; }),
+      api("/api/approval-inbox?status=pending").catch(function () { return { data: { entries: [] } }; }),
+      api("/api/status").catch(function () { return null; }),
       api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
     ]).then(function (rest) {
-      lastPending = rest[0].pending || rest[0] || [];
-      lastFindings = rest[1].findings || rest[1] || [];
+      lastApprovals = buildApprovalState(rest[0], rest[1], rest[2]);
+      lastFindings = rest[3].findings || rest[3] || [];
     });
   }
 
@@ -909,7 +1082,7 @@ export function renderPostureHomeHTML(): string {
   // advanced, so the "Live" indicator is earned by a real, fully-rendered frame.
   function applyHome(home) {
     return refreshAuxiliary().then(function () {
-      renderHome(home, lastPending, lastFindings);
+      renderHome(home, lastApprovals, lastFindings);
       lastFrameAt = Date.now();
       setConn("live");
     });

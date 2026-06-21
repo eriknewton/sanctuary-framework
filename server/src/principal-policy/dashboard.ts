@@ -2647,6 +2647,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
         },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
+        },
       };
     }
 
@@ -2749,6 +2753,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       pending_count: this.pending.size,
       connected_clients: this.sseClients.size,
       standalone_mode: this._standaloneMode,
+      decision_capable: !this._standaloneMode,
     };
 
     if (this.baseline) {
@@ -2764,6 +2769,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
+        },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
         },
       };
     }

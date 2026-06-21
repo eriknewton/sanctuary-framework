@@ -24,6 +24,13 @@ import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
+import { renderPostureHomeHTML } from "../principal-policy/posture-home-html.js";
+import {
+  handlePostureRoute,
+  POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_API_PREFIX,
+  POSTURE_HOME_PATH,
+} from "../principal-policy/posture-routes.js";
 
 export { constantTimeEquals };
 
@@ -127,6 +134,15 @@ function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: U
   return token !== null && constantTimeEquals(token, deps.authToken);
 }
 
+function isLoopbackRequest(req: IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress;
+  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost";
+}
+
+function isAuthorizedForRead(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  return isAuthorized(deps, req, url) || (deps.loopbackAutoAuth === true && isLoopbackRequest(req));
+}
+
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -178,6 +194,46 @@ export async function handleRequest(
   const url = new URL(req.url ?? "/", `http://${host}`);
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
+
+  // ── Posture board shell (3-to-1 fold, minimal Stack A retirement) ───
+  // The wrap-auto monitor server cannot release live approval promises. Serve
+  // the same posture shell here, but keep its `/api/status` decision_capable
+  // flag false below so the approval area stays read-only on this old process.
+  if (method === "GET" && (path === "/" || path === POSTURE_HOME_PATH)) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    writeText(res, 200, renderPostureHomeHTML(), "text/html; charset=utf-8");
+    return true;
+  }
+
+  if (
+    path === POSTURE_API_PREFIX ||
+    path.startsWith(`${POSTURE_API_PREFIX}/`) ||
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
+  ) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    const handled = await handlePostureRoute(
+      {
+        auditLog: deps.sources.auditLog ?? null,
+        originMachine:
+          deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",
+        listAgents: () => deps.v11Bindings?.hubService.listAgents() ?? [],
+        resolvePinnedProducerKey: deps.sources.resolvePinnedProducerKey,
+        producerKeyExpectedButUnavailable:
+          deps.sources.producerKeyExpectedButUnavailable === true,
+      },
+      req,
+      res,
+      url,
+      method,
+    );
+    if (handled) return true;
+  }
 
   // ── Session exchange ───────────────────────────────────────────────
   // Header-only by design: this is the only route that mints URL-carryable
@@ -234,8 +290,51 @@ export async function handleRequest(
   }
 
   // ── Auth (all routes) ───────────────────────────────────────────────
-  if (!isAuthorized(deps, req, url)) {
+  const isFoldedReadAuxiliary =
+    method === "GET" && (path === "/api/status" || path === "/api/pending");
+  const authorized = isFoldedReadAuxiliary
+    ? isAuthorizedForRead(deps, req, url)
+    : isAuthorized(deps, req, url);
+  if (!authorized) {
     writeJSON(res, 401, { error: "unauthorized" });
+    return true;
+  }
+
+  // ── Folded posture-page auxiliaries ─────────────────────────────────
+  if (method === "GET" && path === "/api/status") {
+    writeJSON(res, 200, {
+      pending_count: deps.sources.pendingApprovals?.length ?? 0,
+      connected_clients: 0,
+      standalone_mode: false,
+      decision_capable: false,
+      policy: deps.sources.policy
+        ? {
+            version: deps.sources.policy.version,
+            tier1_always_approve: deps.sources.policy.tier1_always_approve,
+            tier2_anomaly: deps.sources.policy.tier2_anomaly,
+            tier3_always_allow: deps.sources.policy.tier3_always_allow,
+            approval_channel: {
+              type: deps.sources.policy.approval_channel.type,
+              timeout_seconds: deps.sources.policy.approval_channel.timeout_seconds,
+              auto_deny: true,
+            },
+            approval_redirect: {
+              enabled: deps.sources.policy.approval_redirect?.enabled === true,
+              mode:
+                deps.sources.policy.approval_redirect?.mode === "notify"
+                  ? "notify"
+                  : "replace",
+            },
+          }
+        : {
+            approval_redirect: { enabled: false, mode: "replace" },
+          },
+    });
+    return true;
+  }
+
+  if (method === "GET" && path === "/api/pending") {
+    writeJSON(res, 200, deps.sources.pendingApprovals ?? []);
     return true;
   }
 

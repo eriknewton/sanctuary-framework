@@ -340,6 +340,143 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
   });
 });
 
+describe("posture home - folded approval controls", () => {
+  type ApprovalState = {
+    rows: Array<{
+      source: string;
+      approve_path: string;
+      deny_path: string;
+      review_href: string;
+    }>;
+    can_decide: boolean;
+    mode: string;
+  };
+  type ApprovalHelpers = {
+    buildApprovalState: (
+      legacyBody: unknown,
+      inboxBody: unknown,
+      status: unknown,
+    ) => ApprovalState;
+  };
+
+  function approvalHelpers(): ApprovalHelpers {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function normalizeLegacyApproval");
+    const end = html.indexOf("function renderApprovals");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const source =
+      html.slice(start, end) +
+      "\nreturn { buildApprovalState: buildApprovalState };";
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    return new Function(source)() as ApprovalHelpers;
+  }
+
+  it("refreshes both approval read models plus status before rendering", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function refreshAuxiliary()");
+    expect(start).toBeGreaterThan(-1);
+    const region = html.slice(start, start + 700);
+    expect(region).toContain('api("/api/pending")');
+    expect(region).toContain('api("/api/approval-inbox?status=pending")');
+    expect(region).toContain('api("/api/status")');
+    expect(region).toContain("buildApprovalState(rest[0], rest[1], rest[2])");
+  });
+
+  it("default co-located mode renders decision routes against the legacy pending inbox", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-1", operation: "state_export", tier: 1 }],
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      {
+        standalone_mode: false,
+        decision_capable: true,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.can_decide).toBe(true);
+    expect(state.mode).toBe("co-located");
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]!.source).toBe("legacy");
+    expect(state.rows[0]!.approve_path).toBe("/api/approve/legacy-1");
+    expect(state.rows[0]!.deny_path).toBe("/api/deny/legacy-1");
+  });
+
+  it("replace mode renders decision routes against the approval inbox", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-should-not-win", operation: "state_export", tier: 1 }],
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      {
+        standalone_mode: false,
+        decision_capable: true,
+        policy: { approval_redirect: { enabled: true, mode: "replace" } },
+      },
+    );
+    expect(state.can_decide).toBe(true);
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]!.source).toBe("approval-inbox");
+    expect(state.rows[0]!.approve_path).toBe("/api/approval-inbox/agg-1/approve");
+    expect(state.rows[0]!.deny_path).toBe("/api/approval-inbox/agg-1/deny");
+  });
+
+  it("standalone mode keeps the approval section read-only", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-1", operation: "state_export", tier: 1 }],
+      { data: { entries: [] } },
+      {
+        standalone_mode: true,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.mode).toBe("standalone");
+    expect(state.can_decide).toBe(false);
+
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderApprovals(approvalState)");
+    const end = html.indexOf("function wireApprovalButtons");
+    const region = html.slice(start, end);
+    expect(region).toContain("approvalState && approvalState.can_decide");
+    expect(html).toContain("status.decision_capable === true");
+    expect(region).toContain("review &rarr;");
+  });
+
+  it("decision POSTs prefer the bearer header and retry once after a 401 prompt", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function decisionHeaders()");
+    const end = html.indexOf("// SEC-012 stream handshake");
+    const region = html.slice(start, end);
+    expect(region).toContain('method: "POST"');
+    expect(region).toContain('credentials: "same-origin"');
+    expect(region).toContain('headers["Authorization"] = "Bearer " + token');
+    expect(region).toContain("r.status === 401 && !retried");
+    expect(region).toContain("promptForToken()");
+    expect(region).toContain("return postDecision(path, true)");
+  });
+});
+
 /**
  * Recognition + portability panel (P5) renderer honesty. The panel is the most
  * impartiality-loaded surface: these assert the rendered HTML/source honors the
