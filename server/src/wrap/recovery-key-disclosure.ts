@@ -27,12 +27,20 @@
  *   - server/src/wrap/cli.ts (sanctuary wrap, generated passphrase only)
  */
 
-import { writeFile, access, constants, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  constants,
+  lstatSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { writeFile, access, lstat, mkdir, open, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 export const RECOVERY_KEY_FILENAME = "recovery-key.txt";
 export const PASSPHRASE_BACKUP_FILENAME = "passphrase-backup.txt";
+export const RECOVERY_OUT_ENV_VAR = "SANCTUARY_RECOVERY_OUT";
 
 /**
  * Confirmation policy:
@@ -155,11 +163,254 @@ export class RecoveryKeyReentryMismatchError extends Error {
   }
 }
 
+export class RecoveryKeyOutputPathInsideFortressError extends Error {
+  constructor(filePath: string, fortressPath: string) {
+    super(
+      "Recovery key output path must be outside the fortress directory.\n" +
+        `Requested path: ${filePath}\n` +
+        `Fortress path: ${fortressPath}`
+    );
+    this.name = "RecoveryKeyOutputPathInsideFortressError";
+  }
+}
+
+export class RecoveryKeyOutputPathExistsError extends Error {
+  constructor(filePath: string) {
+    super(
+      "refusing to reuse an existing --recovery-out file; " +
+        "the new recovery key was NOT written; " +
+        "choose a path that does not exist.\n" +
+        `Requested path: ${filePath}`
+    );
+    this.name = "RecoveryKeyOutputPathExistsError";
+  }
+}
+
+export class RecoveryKeyOutputPathSymlinkError extends Error {
+  constructor(filePath: string) {
+    super(
+      "refusing to write the recovery key through a symlink.\n" +
+        `Requested path: ${filePath}`
+    );
+    this.name = "RecoveryKeyOutputPathSymlinkError";
+  }
+}
+
+function isPathInsideOrEqual(parentPath: string, candidatePath: string): boolean {
+  const rel = relative(parentPath, candidatePath);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function caseFoldPathForContainment(path: string): string {
+  return path.normalize("NFC").toLowerCase();
+}
+
+function resolveExistingSymlinkComponents(absPath: string, depth = 0): string {
+  if (depth > 40) {
+    throw new Error(`Too many symbolic links while resolving path: ${absPath}`);
+  }
+
+  const parsed = parse(absPath);
+  const segments = absPath
+    .slice(parsed.root.length)
+    .split(/[\\/]+/)
+    .filter((segment) => segment.length > 0);
+
+  let current = parsed.root;
+  for (let i = 0; i < segments.length; i++) {
+    const next = resolve(current, segments[i]);
+    try {
+      const entry = lstatSync(next);
+      if (entry.isSymbolicLink()) {
+        const target = readlinkSync(next);
+        const resolvedTarget = isAbsolute(target)
+          ? target
+          : resolve(dirname(next), target);
+        return resolveExistingSymlinkComponents(
+          resolve(resolvedTarget, ...segments.slice(i + 1)),
+          depth + 1
+        );
+      }
+      current = next;
+    } catch (err) {
+      if (isMissingPathError(err)) {
+        return resolve(current, ...segments.slice(i));
+      }
+      throw err;
+    }
+  }
+
+  return current;
+}
+
+function realpathAnchoredPathForContainment(path: string): string {
+  const resolvedPath = resolveExistingSymlinkComponents(resolve(path));
+  let ancestor = resolvedPath;
+
+  while (true) {
+    try {
+      const entry = statSync(ancestor);
+      if (entry.isDirectory()) {
+        const rest = relative(ancestor, resolvedPath);
+        return resolve(realpathSync(ancestor), rest);
+      }
+      ancestor = dirname(ancestor);
+    } catch (err) {
+      if (!isMissingPathError(err)) {
+        throw err;
+      }
+      const parent = dirname(ancestor);
+      if (parent === ancestor) {
+        return resolvedPath;
+      }
+      ancestor = parent;
+    }
+  }
+}
+
+function assertPathOutsideFortress(filePath: string, fortressPath: string): void {
+  const resolvedFile = resolve(filePath);
+  const realTarget = realpathAnchoredPathForContainment(resolvedFile);
+  const realFortress = realpathAnchoredPathForContainment(fortressPath);
+  if (
+    isPathInsideOrEqual(realFortress, realTarget) ||
+    isPathInsideOrEqual(
+      caseFoldPathForContainment(realFortress),
+      caseFoldPathForContainment(realTarget)
+    )
+  ) {
+    throw new RecoveryKeyOutputPathInsideFortressError(
+      realTarget,
+      realFortress
+    );
+  }
+}
+
+/**
+ * Resolve an optional durable recovery-key output path. The env var is a
+ * path, not a boolean: only an explicit non-empty path opts in.
+ */
+export function resolveRecoveryKeyOutputPath(opts: {
+  recoveryOut?: string;
+  storagePath: string;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}): string | undefined {
+  const flag = opts.recoveryOut?.trim();
+  const envValue = opts.env?.[RECOVERY_OUT_ENV_VAR]?.trim();
+  const raw = flag && flag.length > 0 ? flag : envValue;
+  if (!raw || raw.length === 0) {
+    return undefined;
+  }
+
+  const resolved = resolve(opts.cwd ?? process.cwd(), raw);
+  assertPathOutsideFortress(resolved, opts.storagePath);
+  return resolved;
+}
+
+/**
+ * Best-effort early failure for operator-specified output locations. The
+ * real write remains authoritative, but init/rotation call this before
+ * mutating fortress state so unwritable destinations fail before custody
+ * material is minted.
+ */
+export async function preflightRecoveryKeyOutputFile(
+  filePath: string
+): Promise<void> {
+  try {
+    const existing = await lstat(filePath);
+    if (existing.isSymbolicLink()) {
+      throw new RecoveryKeyOutputPathSymlinkError(filePath);
+    }
+    if (existing.isFile()) {
+      throw new RecoveryKeyOutputPathExistsError(filePath);
+    }
+    throw new Error(
+      `Recovery key output path exists but is not a file: ${filePath}`
+    );
+  } catch (err) {
+    if (!isMissingPathError(err)) {
+      throw err;
+    }
+    // File does not exist, ensure the parent can be created and written.
+  }
+  const parent = dirname(filePath);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  await access(parent, constants.W_OK);
+}
+
+function isMissingPathError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}
+
+function isErrnoCode(err: unknown, code: string): boolean {
+  return (
+    err instanceof Error &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === code
+  );
+}
+
+async function throwAtomicCustomOutputError(
+  err: unknown,
+  filePath: string
+): Promise<never> {
+  if (isErrnoCode(err, "ELOOP")) {
+    throw new RecoveryKeyOutputPathSymlinkError(filePath);
+  }
+  if (isErrnoCode(err, "EEXIST")) {
+    try {
+      const existing = await lstat(filePath);
+      if (existing.isSymbolicLink()) {
+        throw new RecoveryKeyOutputPathSymlinkError(filePath);
+      }
+    } catch (lstatErr) {
+      if (lstatErr instanceof RecoveryKeyOutputPathSymlinkError) {
+        throw lstatErr;
+      }
+      if (!isMissingPathError(lstatErr)) {
+        throw lstatErr;
+      }
+    }
+    throw new RecoveryKeyOutputPathExistsError(filePath);
+  }
+  throw err;
+}
+
+async function writeCustomRecoveryOutputFile(
+  filePath: string,
+  content: string
+): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+
+  // Residual limitation: a parent directory can still be swapped for a symlink
+  // between parent creation and open. The final component and existence races
+  // are closed here with exclusive-create plus no-follow semantics.
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const flags =
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(filePath, flags, 0o600);
+    await handle.writeFile(content, { encoding: "utf-8" });
+  } catch (err) {
+    await throwAtomicCustomOutputError(err, filePath);
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
+}
+
 const RECOVERY_KEY_REENTRY_ATTEMPTS = 3;
 
 /**
  * Force capture verification: prompt the operator to re-enter the recovery
- * key. The caller supplies the check — typically "does the entered key
+ * key. The caller supplies the check, typically "does the entered key
  * actually unwrap the master?" (an end-to-end proof, not a string compare).
  * Throws {@link RecoveryKeyReentryMismatchError} after the attempts run out
  * and {@link RecoveryKeyConfirmationNonInteractiveError} on a non-TTY stdin.
@@ -187,7 +438,7 @@ export async function verifyRecoveryKeyReentry(opts: {
           await rl.question("Re-enter the recovery key to verify you saved it: ")
         ).trim();
       } catch {
-        // Input closed mid-verification (EOF) — treat as a failed capture,
+        // Input closed mid-verification (EOF): treat as a failed capture,
         // never as success.
         break;
       }
@@ -247,21 +498,41 @@ function printSecretBanner(
   secret: string,
   filePath: string,
   copy: SecretDisclosureCopy,
-  output: NodeJS.WritableStream = process.stderr
+  output: NodeJS.WritableStream = process.stderr,
+  destination: "storage" | "custom" = "storage",
+  fileWritten = true
 ): void {
-  const lines = [
-    copy.bannerHeader,
-    "",
-    `${copy.bannerSecretLabel}: ${secret}`,
-    "",
-    copy.bannerSaveLine,
-    copy.bannerLossLine,
-    "",
-    "Plaintext copy written to:",
-    `  ${filePath}`,
-    "Move it off-host (password manager, encrypted backup),",
-    "then delete the file from the fortress directory.",
-  ];
+  const deleteLine =
+    destination === "custom"
+      ? "and keep it outside the fortress directory."
+      : "then delete the file from the fortress directory.";
+  const lines = fileWritten
+    ? [
+        copy.bannerHeader,
+        "",
+        `${copy.bannerSecretLabel}: ${secret}`,
+        "",
+        copy.bannerSaveLine,
+        copy.bannerLossLine,
+        "",
+        "Plaintext copy written to:",
+        `  ${filePath}`,
+        "Move it off-host (password manager, encrypted backup),",
+        deleteLine,
+      ]
+    : [
+        copy.bannerHeader,
+        "",
+        `${copy.bannerSecretLabel}: ${secret}`,
+        "",
+        copy.bannerSaveLine,
+        copy.bannerLossLine,
+        "",
+        "Plaintext copy was NOT written this run:",
+        `  ${filePath}`,
+        "That file already exists and may hold a prior key.",
+        "The authoritative new key is the value shown above.",
+      ];
   const inner = Math.max(...lines.map((l) => l.length));
   const horizontal = "═".repeat(inner + 2);
   const top = `╔${horizontal}╗`;
@@ -277,9 +548,17 @@ function printSecretBanner(
 export function printRecoveryKeyBanner(
   recoveryKey: string,
   filePath: string,
-  output: NodeJS.WritableStream = process.stderr
+  output: NodeJS.WritableStream = process.stderr,
+  fileWritten = true
 ): void {
-  printSecretBanner(recoveryKey, filePath, RECOVERY_KEY_COPY, output);
+  printSecretBanner(
+    recoveryKey,
+    filePath,
+    RECOVERY_KEY_COPY,
+    output,
+    "storage",
+    fileWritten
+  );
 }
 
 /**
@@ -288,9 +567,17 @@ export function printRecoveryKeyBanner(
 export function printPassphraseBanner(
   passphrase: string,
   filePath: string,
-  output: NodeJS.WritableStream = process.stderr
+  output: NodeJS.WritableStream = process.stderr,
+  fileWritten = true
 ): void {
-  printSecretBanner(passphrase, filePath, PASSPHRASE_BACKUP_COPY, output);
+  printSecretBanner(
+    passphrase,
+    filePath,
+    PASSPHRASE_BACKUP_COPY,
+    output,
+    "storage",
+    fileWritten
+  );
 }
 
 /**
@@ -301,21 +588,17 @@ export function printPassphraseBanner(
  */
 async function writeSecretFile(opts: {
   storagePath: string;
+  filePath?: string;
   secret: string;
   copy: SecretDisclosureCopy;
   fortressId?: string;
   now?: () => Date;
+  failIfExists?: boolean;
 }): Promise<{ filePath: string; written: boolean }> {
-  const filePath = join(opts.storagePath, opts.copy.fileName);
-
-  try {
-    await access(filePath, constants.F_OK);
-    return { filePath, written: false };
-  } catch {
-    // File does not exist, proceed to write.
-  }
-
-  await mkdir(opts.storagePath, { recursive: true, mode: 0o700 });
+  const filePath =
+    opts.filePath !== undefined
+      ? resolve(opts.filePath)
+      : join(opts.storagePath, opts.copy.fileName);
 
   const now = (opts.now ?? (() => new Date()))().toISOString();
   const fortressLine = opts.fortressId
@@ -332,6 +615,31 @@ async function writeSecretFile(opts: {
     "\n" +
     opts.copy.fileBody;
 
+  if (opts.failIfExists) {
+    await writeCustomRecoveryOutputFile(filePath, content);
+    return { filePath, written: true };
+  }
+
+  try {
+    const existing = await stat(filePath);
+    if (!existing.isFile()) {
+      throw new Error(
+        `Recovery key output path exists but is not a file: ${filePath}`
+      );
+    }
+    if (opts.failIfExists) {
+      throw new RecoveryKeyOutputPathExistsError(filePath);
+    }
+    return { filePath, written: false };
+  } catch (err) {
+    if (!isMissingPathError(err)) {
+      throw err;
+    }
+    // File does not exist, proceed to write.
+  }
+
+  await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+
   await writeFile(filePath, content, { mode: 0o600 });
   return { filePath, written: true };
 }
@@ -341,15 +649,23 @@ async function writeSecretFile(opts: {
  */
 export async function writeRecoveryKeyFile(opts: {
   storagePath: string;
+  recoveryKeyFilePath?: string;
   recoveryKey: string;
   fortressId?: string;
   now?: () => Date;
 }): Promise<{ filePath: string; written: boolean }> {
+  if (opts.recoveryKeyFilePath !== undefined) {
+    assertPathOutsideFortress(opts.recoveryKeyFilePath, opts.storagePath);
+  }
   const writeOpts: Parameters<typeof writeSecretFile>[0] = {
     storagePath: opts.storagePath,
     secret: opts.recoveryKey,
     copy: RECOVERY_KEY_COPY,
   };
+  if (opts.recoveryKeyFilePath !== undefined) {
+    writeOpts.filePath = opts.recoveryKeyFilePath;
+    writeOpts.failIfExists = true;
+  }
   if (opts.fortressId !== undefined) writeOpts.fortressId = opts.fortressId;
   if (opts.now !== undefined) writeOpts.now = opts.now;
   return writeSecretFile(writeOpts);
@@ -444,6 +760,10 @@ interface DiscloseSecretInternalOptions {
   secret: string;
   /** Resolved fortress storage path; backup file lands here. */
   storagePath: string;
+  /** Optional exact plaintext backup path, used for durable off-fortress capture. */
+  filePath?: string;
+  /** File write completed by the caller before disclosure. */
+  prewrittenFile?: { filePath: string; written: boolean };
   /** Optional fortress identifier; embedded in the file content. */
   fortressId?: string;
   /** Confirmation policy. */
@@ -478,16 +798,41 @@ async function discloseSecret(
 ): Promise<DiscloseSecretInternalResult> {
   const mode = opts.mode ?? "interactive";
 
-  const writeOpts: Parameters<typeof writeSecretFile>[0] = {
-    storagePath: opts.storagePath,
-    secret: opts.secret,
-    copy,
-  };
-  if (opts.fortressId !== undefined) writeOpts.fortressId = opts.fortressId;
-  if (opts.now !== undefined) writeOpts.now = opts.now;
-  const fileResult = await writeSecretFile(writeOpts);
+  const expectedFilePath =
+    opts.filePath !== undefined
+      ? resolve(opts.filePath)
+      : join(opts.storagePath, copy.fileName);
+  let fileResult: { filePath: string; written: boolean };
+  if (opts.prewrittenFile !== undefined) {
+    if (resolve(opts.prewrittenFile.filePath) !== expectedFilePath) {
+      throw new Error(
+        `prewritten disclosure file path mismatch: ${opts.prewrittenFile.filePath}`
+      );
+    }
+    fileResult = opts.prewrittenFile;
+  } else {
+    const writeOpts: Parameters<typeof writeSecretFile>[0] = {
+      storagePath: opts.storagePath,
+      secret: opts.secret,
+      copy,
+    };
+    if (opts.filePath !== undefined) {
+      writeOpts.filePath = opts.filePath;
+      writeOpts.failIfExists = true;
+    }
+    if (opts.fortressId !== undefined) writeOpts.fortressId = opts.fortressId;
+    if (opts.now !== undefined) writeOpts.now = opts.now;
+    fileResult = await writeSecretFile(writeOpts);
+  }
 
-  printSecretBanner(opts.secret, fileResult.filePath, copy, opts.io?.output);
+  printSecretBanner(
+    opts.secret,
+    fileResult.filePath,
+    copy,
+    opts.io?.output,
+    opts.filePath ? "custom" : "storage",
+    fileResult.written
+  );
 
   if (mode === "no-confirm" || mode === "stdio-server") {
     return {
@@ -510,6 +855,10 @@ export interface DiscloseRecoveryKeyOptions {
   recoveryKey: string;
   /** Resolved fortress storage path; recovery-key.txt lands here. */
   storagePath: string;
+  /** Optional exact plaintext recovery-key path; must be outside storagePath. */
+  recoveryKeyFilePath?: string;
+  /** File write completed by the caller before disclosure. */
+  prewrittenFile?: { filePath: string; written: boolean };
   /** Optional fortress identifier; embedded in the file content. */
   fortressId?: string;
   /** Confirmation policy. */
@@ -559,10 +908,19 @@ export interface DisclosePassphraseResult {
 export async function discloseRecoveryKey(
   opts: DiscloseRecoveryKeyOptions
 ): Promise<DiscloseRecoveryKeyResult> {
+  if (opts.recoveryKeyFilePath !== undefined) {
+    assertPathOutsideFortress(opts.recoveryKeyFilePath, opts.storagePath);
+  }
   const internalOpts: DiscloseSecretInternalOptions = {
     secret: opts.recoveryKey,
     storagePath: opts.storagePath,
   };
+  if (opts.recoveryKeyFilePath !== undefined) {
+    internalOpts.filePath = opts.recoveryKeyFilePath;
+  }
+  if (opts.prewrittenFile !== undefined) {
+    internalOpts.prewrittenFile = opts.prewrittenFile;
+  }
   if (opts.fortressId !== undefined) internalOpts.fortressId = opts.fortressId;
   if (opts.mode !== undefined) internalOpts.mode = opts.mode;
   if (opts.now !== undefined) internalOpts.now = opts.now;

@@ -16,7 +16,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, writeFile, stat } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  writeFile,
+  stat,
+  symlink,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import {
@@ -26,7 +34,11 @@ import {
   resolveNoPin,
   runInit,
 } from "../../src/wrap/init.js";
-import { RECOVERY_KEY_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
+import {
+  RECOVERY_KEY_FILENAME,
+  RecoveryKeyOutputPathExistsError,
+  RecoveryKeyOutputPathSymlinkError,
+} from "../../src/wrap/recovery-key-disclosure.js";
 
 describe("resolveFortressPath", () => {
   it("returns ~/.sanctuary when no flag or env var is set", () => {
@@ -86,6 +98,7 @@ describe("runInit", () => {
   });
 
   afterEach(async () => {
+    delete process.env.SANCTUARY_RECOVERY_OUT;
     try {
       await rm(tmp, { recursive: true, force: true });
     } catch {
@@ -118,6 +131,137 @@ describe("runInit", () => {
     // on a developer machine (it might already exist), but we CAN assert
     // the fortress isn't at the default location.
     expect(result.fortressPath).not.toBe(join(homedir(), ".sanctuary"));
+  });
+
+  it("--recovery-out writes the recovery key to an external durable path", async () => {
+    const fortressPath = join(tmp, "external-recovery-fortress");
+    const recoveryOut = join(tmp, "durable", "recovery-key.txt");
+    const result = await runInit({
+      fortress: fortressPath,
+      recoveryOut,
+      noConfirm: true,
+      noPin: true,
+    });
+
+    expect(result.fortressPath).toBe(fortressPath);
+    expect(result.recoveryKeyDisclosurePath).toBe(recoveryOut);
+    const recoveryFile = await readFile(recoveryOut, "utf-8");
+    expect(recoveryFile).toContain("Recovery key:");
+    expect(recoveryFile).toContain(
+      "DO NOT COMMIT, DO NOT EMAIL, MOVE OFF-HOST IMMEDIATELY",
+    );
+    const st = await stat(recoveryOut);
+    expect(st.mode & 0o777).toBe(0o600);
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+  });
+
+  it("SANCTUARY_RECOVERY_OUT writes to an external durable path when the flag is absent", async () => {
+    const fortressPath = join(tmp, "env-recovery-fortress");
+    const recoveryOut = join(tmp, "env-durable", "recovery-key.txt");
+    process.env.SANCTUARY_RECOVERY_OUT = recoveryOut;
+
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+
+    expect(result.recoveryKeyDisclosurePath).toBe(recoveryOut);
+    const recoveryFile = await readFile(recoveryOut, "utf-8");
+    expect(recoveryFile).toContain("Recovery key:");
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+  });
+
+  it("refuses --recovery-out paths inside the fortress before init writes state", async () => {
+    const fortressPath = join(tmp, "inside-recovery-fortress");
+    const recoveryOut = join(fortressPath, "backup", "recovery-key.txt");
+
+    await expect(
+      runInit({
+        fortress: fortressPath,
+        recoveryOut,
+        noConfirm: true,
+        noPin: true,
+      }),
+    ).rejects.toThrow(/outside the fortress/);
+
+    await expect(stat(fortressPath)).rejects.toThrow();
+    await expect(stat(recoveryOut)).rejects.toThrow();
+  });
+
+  it("refuses an existing --recovery-out file before init writes state", async () => {
+    const fortressPath = join(tmp, "existing-recovery-out-fortress");
+    const durableDir = join(tmp, "existing-durable");
+    const recoveryOut = join(durableDir, "recovery-key.txt");
+    await mkdir(durableDir, { recursive: true });
+    await writeFile(recoveryOut, "old key", { mode: 0o600 });
+
+    await expect(
+      runInit({
+        fortress: fortressPath,
+        recoveryOut,
+        noConfirm: true,
+        noPin: true,
+      }),
+    ).rejects.toThrow(RecoveryKeyOutputPathExistsError);
+
+    await expect(stat(fortressPath)).rejects.toThrow();
+    await expect(readFile(recoveryOut, "utf-8")).resolves.toBe("old key");
+  });
+
+  it("aborts without custody state when --recovery-out appears after preflight", async () => {
+    const fortressPath = join(tmp, "raced-recovery-out-fortress");
+    const durableDir = join(tmp, "raced-durable");
+    const recoveryOut = join(durableDir, "recovery-key.txt");
+    await mkdir(durableDir, { recursive: true });
+
+    await expect(
+      runInit(
+        {
+          fortress: fortressPath,
+          recoveryOut,
+          noConfirm: true,
+          noPin: true,
+        },
+        {
+          beforeRecoveryKeyOutputWrite: async (filePath) => {
+            expect(filePath).toBe(recoveryOut);
+            await writeFile(filePath, "raced key", { mode: 0o600 });
+          },
+        },
+      ),
+    ).rejects.toThrow(RecoveryKeyOutputPathExistsError);
+
+    await expect(readFile(recoveryOut, "utf-8")).resolves.toBe("raced key");
+    await expect(stat(join(fortressPath, "state"))).rejects.toThrow();
+    await expect(
+      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+    ).rejects.toThrow();
+  });
+
+  it("refuses a dangling --recovery-out symlink before init writes state", async () => {
+    const fortressPath = join(tmp, "dangling-recovery-out-fortress");
+    const durableDir = join(tmp, "dangling-durable");
+    const recoveryOut = join(durableDir, "recovery-key.txt");
+    const symlinkTarget = join(tmp, "outside-target.txt");
+    await mkdir(durableDir, { recursive: true });
+    await symlink(symlinkTarget, recoveryOut);
+
+    await expect(
+      runInit({
+        fortress: fortressPath,
+        recoveryOut,
+        noConfirm: true,
+        noPin: true,
+      }),
+    ).rejects.toThrow(RecoveryKeyOutputPathSymlinkError);
+
+    await expect(stat(fortressPath)).rejects.toThrow();
+    await expect(stat(symlinkTarget)).rejects.toThrow();
   });
 
   it("persists a custody envelope whose recovery wrap unlocks the master on subsequent boots", async () => {
@@ -243,6 +387,7 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
 
   afterEach(async () => {
     delete process.env.SANCTUARY_INIT_NO_PIN;
+    delete process.env.SANCTUARY_RECOVERY_OUT;
     try {
       await rm(tmp, { recursive: true, force: true });
     } catch {
@@ -408,24 +553,36 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
 });
 
 describe("parseInitArgs", () => {
-  it("recognizes --fortress, --force, --no-confirm, --no-pin, --help", () => {
+  it("recognizes --fortress, --force, --no-confirm, --no-pin, --recovery-out, --help", () => {
     const opts = parseInitArgs([
       "--fortress",
       "/tmp/x",
       "--force",
       "--no-confirm",
       "--no-pin",
+      "--recovery-out",
+      "/tmp/recovery-key.txt",
     ]);
     expect(opts.fortress).toBe("/tmp/x");
     expect(opts.force).toBe(true);
     expect(opts.noConfirm).toBe(true);
     expect(opts.noPin).toBe(true);
+    expect(opts.recoveryOut).toBe("/tmp/recovery-key.txt");
 
     const helpOpts = parseInitArgs(["--help"]);
     expect(helpOpts.helpRequested).toBe(true);
 
     const shortHelp = parseInitArgs(["-h"]);
     expect(shortHelp.helpRequested).toBe(true);
+  });
+
+  it("rejects --recovery-out without a path value", () => {
+    expect(() => parseInitArgs(["--recovery-out"])).toThrow(
+      "--recovery-out requires a path value",
+    );
+    expect(() => parseInitArgs(["--recovery-out", "--no-pin"])).toThrow(
+      "--recovery-out requires a path value",
+    );
   });
 
   it("printInitHelp does not throw", () => {

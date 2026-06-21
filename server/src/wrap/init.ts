@@ -42,10 +42,15 @@ import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   discloseRecoveryKey,
+  preflightRecoveryKeyOutputFile,
+  resolveRecoveryKeyOutputPath,
   verifyRecoveryKeyReentry,
+  writeRecoveryKeyFile,
   RecoveryKeyConfirmationDeclinedError,
   RecoveryKeyConfirmationNonInteractiveError,
+  RecoveryKeyOutputPathInsideFortressError,
   RecoveryKeyReentryMismatchError,
+  type DiscloseRecoveryKeyResult,
 } from "./recovery-key-disclosure.js";
 import { DEFAULT_STORAGE_DIR } from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
@@ -66,6 +71,11 @@ export interface InitOptions {
   noConfirm?: boolean;
   /** Allow init against a non-empty directory. Refuses without this flag. */
   force?: boolean;
+  /**
+   * Exact plaintext recovery-key destination. When set, the key is written
+   * here instead of <fortress>/recovery-key.txt. Must be outside fortress.
+   */
+  recoveryOut?: string;
   /**
    * Skip the Castle Wall global-pin provisioning step. Default init writes
    * the machine-wide enforcement anchor at
@@ -163,6 +173,8 @@ async function isDirectoryEmpty(path: string): Promise<boolean> {
  */
 export interface RunInitDeps {
   provisionPin?: typeof runProvisionPin;
+  /** Test seam: simulate a race after preflight but before O_EXCL capture. */
+  beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
 }
 
 export async function runInit(
@@ -171,6 +183,26 @@ export async function runInit(
 ): Promise<InitResult> {
   const provisionPin = deps.provisionPin ?? runProvisionPin;
   const fortressPath = resolveFortressPath(options);
+  let recoveryKeyOutputPath: string | undefined;
+  try {
+    recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
+      recoveryOut: options.recoveryOut,
+      storagePath: fortressPath,
+      env: process.env,
+    });
+    if (recoveryKeyOutputPath) {
+      await preflightRecoveryKeyOutputFile(recoveryKeyOutputPath);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const prefix =
+      err instanceof RecoveryKeyOutputPathInsideFortressError
+        ? "recovery key output refused"
+        : "recovery key output unavailable";
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
+    throw err;
+  }
 
   if (!options.force) {
     const empty = await isDirectoryEmpty(fortressPath);
@@ -206,6 +238,7 @@ export async function runInit(
   const masterKey = generateRandomKey();
   const recoveryKeyBytes = generateRandomKey();
   const recoveryKey = toBase64url(recoveryKeyBytes);
+  const fortressId = fortressIdFromStoragePath(fortressPath);
 
   const wraps: CustodyWrap[] = [
     wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
@@ -242,6 +275,26 @@ export async function runInit(
     }
   }
 
+  let prewrittenRecoveryKeyFile:
+    | Awaited<ReturnType<typeof writeRecoveryKeyFile>>
+    | undefined;
+  if (recoveryKeyOutputPath) {
+    try {
+      await deps.beforeRecoveryKeyOutputWrite?.(recoveryKeyOutputPath);
+      prewrittenRecoveryKeyFile = await writeRecoveryKeyFile({
+        storagePath: fortressPath,
+        recoveryKeyFilePath: recoveryKeyOutputPath,
+        recoveryKey,
+        fortressId,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary init: recovery key output unavailable: ${message}\n`);
+      throw err;
+    }
+  }
+
   let envelope: CustodyEnvelope = await writeCustodyEnvelope(
     storage,
     {
@@ -260,14 +313,41 @@ export async function runInit(
   // Disclose first (banner + recovery-key.txt), then force re-entry
   // verification on the interactive path. Verification is end-to-end: the
   // re-entered key must actually unwrap the master.
-  let disclosure: { filePath: string };
+  let disclosure: DiscloseRecoveryKeyResult;
   try {
-    disclosure = await discloseRecoveryKey({
+    const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
       recoveryKey,
       storagePath: fortressPath,
-      fortressId: fortressIdFromStoragePath(fortressPath),
+      fortressId,
       mode: "no-confirm", // capture/verification below replaces the Y/N prompt
-    });
+    };
+    if (recoveryKeyOutputPath) {
+      if (!prewrittenRecoveryKeyFile) {
+        throw new Error("custom recovery-key output was not captured");
+      }
+      disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
+      disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
+    }
+    disclosure = await discloseRecoveryKey(disclosureOptions);
+    if (interactive && !recoveryKeyOutputPath && disclosure.fileWritten) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        "\n  WARNING: the only plaintext recovery-key copy currently lives inside\n" +
+          "  the fortress directory. It will be lost if that directory is cleared;\n" +
+          "  a later master rotation also mints a new recovery key.\n" +
+          "  Re-run with --recovery-out <path outside the fortress>, or move this\n" +
+          "  file now.\n",
+      );
+    }
+    if (interactive && !recoveryKeyOutputPath && !disclosure.fileWritten) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        "\n  WARNING: the default recovery-key.txt already existed and was not\n" +
+          "  overwritten. It may contain a prior recovery key. The authoritative\n" +
+          "  new recovery key is the one shown above and re-entered now; save\n" +
+          "  that key outside the fortress.\n",
+      );
+    }
     if (interactive) {
       await verifyRecoveryKeyReentry({
         check: async (entered) => {
@@ -304,7 +384,7 @@ export async function runInit(
   await auditLog.appendCritical({
     layer: "l2",
     operation: "custody_envelope_created",
-    identity_id: fortressIdFromStoragePath(fortressPath),
+    identity_id: fortressId,
     result: "success",
     details: {
       install_mode: envelope.install_mode,
@@ -317,7 +397,7 @@ export async function runInit(
     await auditLog.appendCritical({
       layer: "l2",
       operation: "custody_headless_install",
-      identity_id: fortressIdFromStoragePath(fortressPath),
+      identity_id: fortressId,
       result: "success",
       details: {
         source: "sanctuary-init",
@@ -334,7 +414,7 @@ export async function runInit(
     await auditLog.appendCritical({
       layer: "l2",
       operation: "castle_pin_provision_skipped",
-      identity_id: fortressIdFromStoragePath(fortressPath),
+      identity_id: fortressId,
       result: "success",
       details: {
         source: "sanctuary-init",
@@ -394,6 +474,10 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-pin":
         opts.noPin = true;
         break;
+      case "--recovery-out":
+        opts.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
+        i++;
+        break;
       case "--help":
       case "-h":
         opts.helpRequested = true;
@@ -401,6 +485,18 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
     }
   }
   return opts;
+}
+
+function readRequiredPathArg(
+  argv: string[],
+  index: number,
+  flag: string,
+): string {
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`${flag} requires a path value`);
+  }
+  return value;
 }
 
 export function printInitHelp(): void {
@@ -418,6 +514,11 @@ Options:
   --force              Allow init against a non-empty directory.
   --no-confirm         Skip the recovery-key Y/N confirmation. Required
                        for non-TTY callers (CI, launchd, systemd).
+  --recovery-out <path>
+                       Write the plaintext recovery key to this exact path
+                       instead of <fortress>/recovery-key.txt. The path must
+                       be outside the fortress directory. Also honors
+                       SANCTUARY_RECOVERY_OUT when this flag is absent.
   --no-pin             Do NOT provision the machine-wide Castle Wall pin.
                        Default init writes the host-wide enforcement anchor
                        at /Library/Application Support/Sanctuary/; use this
@@ -437,10 +538,11 @@ What init does:
   3. Enrolls a second custody factor on interactive installs: an OS-keyring
      custody key when available, else a passphrase from SANCTUARY_PASSPHRASE.
   4. Prints the full recovery key in a bordered banner AND writes it to
-     <fortress>/recovery-key.txt mode 0600 with explicit move-off-host
-     instructions, then (interactive) requires you to re-enter it — the
-     re-entered key must actually unwrap the master. Single-issuance:
-     existing recovery-key.txt is never overwritten.
+     <fortress>/recovery-key.txt mode 0600, or to --recovery-out when set,
+     with explicit move-off-host instructions, then (interactive) requires
+     you to re-enter it — the re-entered key must actually unwrap the
+     master. Single-issuance: existing recovery-key files are never
+     overwritten.
   5. With --no-confirm: records an explicit, audited headless install
      (custody_headless_install in the audit log) instead of the
      re-entry verification.
