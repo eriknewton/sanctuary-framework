@@ -23,13 +23,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, type AuditEntry } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   buildFeatureHealthPanel,
   evaluateFeatureHealth,
   SLICE1_FEATURE_REGISTRY,
+  type FeatureRegistryEntry,
   type FeatureHealthRow,
   type FeatureHealthPanel,
 } from "../../src/principal-policy/feature-health.js";
@@ -52,6 +53,9 @@ const OLDER_TS = NOW - 60 * 60_000;
 const FUTURE_TS = NOW + 10 * 60_000;
 
 const BROKER_ROW_ID = "secret_broker_daemon";
+const FRESH_SELF_REPORTING_ROW_ID = "fresh_self_reporting_probe";
+const FRESH_SELF_REPORTING_INVOCATION_OPERATION =
+  "fresh_self_reporting_probe_invoked";
 
 function newLog(): AuditLog {
   return new AuditLog(new MemoryStorage(), generateRandomKey());
@@ -63,12 +67,85 @@ function brokerRow(panel: { rows: FeatureHealthRow[] }): FeatureHealthRow {
   return r;
 }
 
+function truncatedAuditLog(
+  allEntries: AuditEntry[],
+  effectivePageLimit: number,
+): AuditLog {
+  const fake = {
+    query: async (
+      options: Parameters<AuditLog["query"]>[0],
+    ): ReturnType<AuditLog["query"]> => {
+      let filtered = allEntries;
+      if (options.since) {
+        const since = new Date(options.since);
+        filtered = filtered.filter((e) => new Date(e.timestamp) >= since);
+      }
+      if (options.layer) {
+        filtered = filtered.filter((e) => e.layer === options.layer);
+      }
+      if (options.operation_type) {
+        filtered = filtered.filter((e) => e.operation === options.operation_type);
+      }
+      if (options.identity_id !== undefined) {
+        filtered = filtered.filter((e) => e.identity_id === options.identity_id);
+      }
+      const requestedLimit = options.limit ?? 50;
+      const limit = Math.min(requestedLimit, effectivePageLimit);
+      return {
+        entries: filtered.slice(-limit),
+        total: filtered.length,
+        integrity_findings: [],
+      };
+    },
+  };
+  return fake as unknown as AuditLog;
+}
+
 async function buildPanel(log: AuditLog): Promise<FeatureHealthPanel> {
   return buildFeatureHealthPanel({
     auditLog: log,
     originMachine: FORTRESS,
     now: NOW,
   });
+}
+
+function freshSelfReportingFeature(): FeatureRegistryEntry {
+  return {
+    id: FRESH_SELF_REPORTING_ROW_ID,
+    label: "Fresh self-reporting probe",
+    layer: "l3",
+    liveness: "self_reporting",
+    invocationOps: Object.freeze(
+      new Set<string>([FRESH_SELF_REPORTING_INVOCATION_OPERATION]),
+    ),
+    brokenZeroDetectable: true,
+  };
+}
+
+function brokerHeartbeatEntry(tsMs: number): AuditEntry {
+  return {
+    layer: "l3",
+    operation: BROKER_DAEMON_HEARTBEAT_OPERATION,
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details: {
+      source: "broker-server",
+      [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]:
+        BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
+    },
+  };
+}
+
+function freshSelfReportingInvocationEntry(tsMs: number): AuditEntry {
+  return {
+    layer: "l3",
+    operation: FRESH_SELF_REPORTING_INVOCATION_OPERATION,
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details: {},
+  };
 }
 
 /**
@@ -193,6 +270,101 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     const row = brokerRow(await buildPanel(log));
     expect(row.status).toBe("fault");
     expect(row.basis).toBe("dead_no_heartbeat");
+  });
+
+  it("stale heartbeat is still found when unrelated audit volume truncates the global digest page", async () => {
+    const pageLimit = 2;
+    const heartbeat: AuditEntry = {
+      layer: "l3",
+      operation: BROKER_DAEMON_HEARTBEAT_OPERATION,
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(STALE_TS).toISOString(),
+      details: {
+        source: "broker-server",
+        [BROKER_DAEMON_AUDIT_PROVENANCE_KEY]:
+          BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
+      },
+    };
+    const unrelated: AuditEntry[] = [0, 1, 2].map((i) => ({
+      layer: "l3",
+      operation: "unrelated_l3_noise",
+      identity_id: FORTRESS,
+      result: "success",
+      timestamp: new Date(FRESH_TS + i * 1000).toISOString(),
+      details: { source: "noise" },
+    }));
+
+    const panel = await buildPanel(
+      truncatedAuditLog([heartbeat, ...unrelated], pageLimit),
+    );
+    const row = brokerRow(panel);
+
+    expect(row.status).toBe("fault");
+    expect(row.basis).toBe("dead_no_heartbeat");
+    expect(panel.disclosure.broker_daemon_silent_death_detectable).toBe(true);
+  });
+
+  it("targeted lifecycle self-truncation degrades detectability without corrupting fresh self-reporting rows", async () => {
+    const pageLimit = 2;
+    const brokerFeature = SLICE1_FEATURE_REGISTRY.find(
+      (f) => f.id === BROKER_ROW_ID,
+    );
+    expect(brokerFeature).toBeDefined();
+    if (!brokerFeature) return;
+    const freshFeature = freshSelfReportingFeature();
+    const heartbeats: AuditEntry[] = [0, 1, 2].map((i) =>
+      brokerHeartbeatEntry(STALE_TS + i * 1000),
+    );
+
+    const panel = await buildFeatureHealthPanel({
+      auditLog: truncatedAuditLog(
+        [...heartbeats, freshSelfReportingInvocationEntry(FRESH_TS)],
+        pageLimit,
+      ),
+      registry: Object.freeze([brokerFeature, freshFeature]),
+      originMachine: FORTRESS,
+      now: NOW,
+    });
+    const freshRow = panel.rows.find(
+      (r) => r.feature_id === FRESH_SELF_REPORTING_ROW_ID,
+    );
+
+    expect(panel.audit_integrity_ok).toBe(true);
+    expect(panel.disclosure.broker_daemon_silent_death_detectable).toBe(false);
+    expect(panel.disclosure.silent_death_distinguished_from_intentional_stop).toBe(
+      false,
+    );
+    expect(panel.disclosure.castle_wall_silent_death_is_unknown_not_green).toBe(
+      true,
+    );
+    expect(freshRow).toBeDefined();
+    expect(freshRow?.status).toBe("active");
+    expect(freshRow?.basis).toBe("fresh_enforcement_evidence");
+    expect(freshRow?.basis).not.toBe("freshness_scan_incomplete");
+  });
+
+  it("freshness-window truncation still degrades self-reporting rows to freshness_scan_incomplete", async () => {
+    const pageLimit = 10_000;
+    const freshEntries: AuditEntry[] = Array.from(
+      { length: pageLimit + 1 },
+      (_, i) => freshSelfReportingInvocationEntry(FRESH_TS + i),
+    );
+
+    const panel = await buildFeatureHealthPanel({
+      auditLog: truncatedAuditLog(freshEntries, pageLimit),
+      registry: Object.freeze([freshSelfReportingFeature()]),
+      originMachine: FORTRESS,
+      now: NOW,
+    });
+    const row = panel.rows.find(
+      (r) => r.feature_id === FRESH_SELF_REPORTING_ROW_ID,
+    );
+
+    expect(panel.audit_integrity_ok).toBe(true);
+    expect(row).toBeDefined();
+    expect(row?.status).toBe("unknown");
+    expect(row?.basis).toBe("freshness_scan_incomplete");
   });
 
   // (3) Most-recent signal is a stand-down → unknown / intentionally_stopped.
