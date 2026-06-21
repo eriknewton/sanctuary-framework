@@ -47,6 +47,10 @@ import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
 import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
 
 const ALLOWED_VIEW_KEYS = [...AGENT_AUDIT_VIEW_FIELDS].sort();
+const ALLOWED_EVENT_KEYS = [
+  "cursor_event_id",
+  ...AGENT_AUDIT_VIEW_FIELDS,
+].sort();
 
 // Threshold-bearing free-text reasons, exactly as the gate writes them into the
 // audit `details.reason` field (principal-policy/gate.ts). Each leaks a policy
@@ -612,7 +616,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
     }
 
     // sanctuary_events_read: open a cursor and read; the redacted event carries
-    // only a has_details summary, never raw details.
+    // only top-level has_details, never raw details.
     const cursor = parse(
       await facadeTools
         .find((t) => t.name === "sanctuary_events_open_cursor")!
@@ -623,6 +627,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (regression guard)", () => {
         .find((t) => t.name === "sanctuary_events_read")!
         .handler({ cursor })
     );
+    for (const event of page.events as Array<Record<string, unknown>>) {
+      expect(Object.keys(event).sort()).toEqual(ALLOWED_EVENT_KEYS);
+      expect(typeof event.has_details).toBe("boolean");
+      expect(event).not.toHaveProperty("summary");
+      expect(event).not.toHaveProperty("layer");
+      expect(event).not.toHaveProperty("identity_match");
+    }
     assertNoLeak(JSON.stringify(page.events));
   });
 

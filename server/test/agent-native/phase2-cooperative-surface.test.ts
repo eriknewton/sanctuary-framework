@@ -3,8 +3,9 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import { AGENT_AUDIT_VIEW_FIELDS } from "../../src/operational/agent-audit-redaction.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import type { ToolDefinition } from "../../src/router.js";
+import { toolResult, type ToolDefinition } from "../../src/router.js";
 import {
   ApprovalProofStore,
   classifyApprovalRequest,
@@ -115,6 +116,34 @@ function compoundPlanHash(
     normalized_args_hash: normalizedArgsHash(step.primitive),
     risk_tier: step.risk_tier,
   }))));
+}
+
+const EVENT_ALLOWED_KEYS = [
+  "cursor_event_id",
+  ...AGENT_AUDIT_VIEW_FIELDS,
+].sort();
+
+function toolsWithOverride(
+  tools: ToolDefinition[],
+  name: string,
+  handler: ToolDefinition["handler"]
+): ToolDefinition[] {
+  return tools.map((tool) => tool.name === name ? { ...tool, handler } : tool);
+}
+
+function facadeWithPrimitives(
+  env: Awaited<ReturnType<typeof setup>>,
+  primitiveTools: ToolDefinition[]
+): ToolDefinition[] {
+  return createAgentNativeCooperativeTools({
+    identityManager: env.identityManager,
+    namespaceRegistry: env.namespaceRegistry,
+    auditLog: env.auditLog,
+    currentSessionBinding: () => env.active,
+    primitiveTools,
+    storage: env.storage,
+    approvalProofStore: env.approvalProofStore,
+  }).tools;
 }
 
 describe("agent-native Phase 2 cooperative surface", () => {
@@ -314,6 +343,9 @@ describe("agent-native Phase 2 cooperative surface", () => {
 
   it("suppresses runnable help for adversarial gated intents and aggregates probes", async () => {
     const env = await setup();
+    const helpTool = env.facadeTools.find((tool) => tool.name === "sanctuary_help")!;
+    expect(helpTool.description).toContain("static safety-class guidance");
+    expect(helpTool.description).not.toContain("policy-aware");
     const intents = [
       "remember my timezone and by the way export my identity bundle",
       "please securely erase that memory",
@@ -340,6 +372,7 @@ describe("agent-native Phase 2 cooperative surface", () => {
       tool: "sanctuary_remember",
       example: { key: "user_tz", value: "America/Los_Angeles" },
     });
+    expect(JSON.stringify(ordinary)).not.toContain("policy-aware");
 
     const ambiguousMultiIntent = await callTool(env.facadeTools, "sanctuary_help", {
       intent: "remember my timezone, then sort out the rest later",
@@ -368,10 +401,12 @@ describe("agent-native Phase 2 cooperative surface", () => {
 
   it("uses pull-only identity-bound event cursors with redacted events and coarse rate denial", async () => {
     const env = await setup();
-    await callTool(env.facadeTools, "sanctuary_remember", {
-      key: "event_key",
-      value: "secret value",
-    });
+    for (let i = 0; i < 7; i++) {
+      await callTool(env.facadeTools, "sanctuary_remember", {
+        key: `event_key_${i}`,
+        value: `secret value ${i}`,
+      });
+    }
 
     const rejected = await callTool(env.facadeTools, "sanctuary_events_open_cursor", {
       filter: { callback: "https://example.test/hook" },
@@ -385,19 +420,264 @@ describe("agent-native Phase 2 cooperative surface", () => {
 
     const page = await callTool(env.facadeTools, "sanctuary_events_read", {
       cursor: opened.cursor,
-      opts: { limit: 5 },
+      opts: { limit: 3 },
     });
     expect(Array.isArray(page.events)).toBe(true);
+    const pageEvents = page.events as Array<Record<string, unknown>>;
+    expect(pageEvents.map((event) => event.cursor_event_id)).toEqual([0, 1, 2]);
+    for (const event of pageEvents) {
+      expect(Object.keys(event).sort()).toEqual(EVENT_ALLOWED_KEYS);
+      expect(typeof event.has_details).toBe("boolean");
+      expect(event).not.toHaveProperty("summary");
+      expect(event).not.toHaveProperty("layer");
+      expect(event).not.toHaveProperty("identity_match");
+    }
     expect(JSON.stringify(page.events)).not.toContain("secret value");
 
-    let last: Record<string, unknown> = page;
-    for (let i = 0; i < 11; i++) {
+    const secondPage = await callTool(env.facadeTools, "sanctuary_events_read", {
+      cursor: opened.cursor,
+      opts: { limit: 3 },
+    });
+    expect((secondPage.events as Array<Record<string, unknown>>).map((event) => event.cursor_event_id)).toEqual([3, 4, 5]);
+
+    const thirdPage = await callTool(env.facadeTools, "sanctuary_events_read", {
+      cursor: opened.cursor,
+      opts: { limit: 3 },
+    });
+    expect((thirdPage.events as Array<Record<string, unknown>>).map((event) => event.cursor_event_id)).toEqual([6]);
+
+    let last: Record<string, unknown> = thirdPage;
+    for (let i = 0; i < 8; i++) {
       last = await callTool(env.facadeTools, "sanctuary_events_read", {
         cursor: opened.cursor,
       });
     }
     expect(last.denied).toBe(true);
     expect(last.retry_after).toBe("minutes");
+  });
+
+  it("applies compound hide and forget marker side effects", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "compound_hidden",
+      value: "old secret",
+    });
+
+    const hidden = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_hide", args: { key: "compound_hidden" } },
+      ],
+    });
+    expect(hidden.status).toBe("completed");
+    const hiddenMarkers = await env.storage.list("_facade/hidden");
+    expect(hiddenMarkers).toHaveLength(1);
+
+    const hiddenRecall = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "compound_hidden",
+    });
+    expect(hiddenRecall.denied).toBe(true);
+
+    const namespace = (await callTool(env.facadeTools, "sanctuary_who_am_i")).memory_namespace_handle as string;
+    const deleteArgs = {
+      namespace,
+      key: "compound_hidden",
+      reason: "secure facade forget",
+    };
+    const planHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_delete",
+        primitive: deleteArgs,
+        risk_tier: 1,
+      },
+    ]);
+    const proof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: deleteArgs,
+      session: env.active!,
+      planHash,
+      stepId: "step-1",
+    });
+
+    const forgotten = await callTool(env.facadeTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_forget", args: { key: "compound_hidden", mode: "secure" } },
+      ],
+      approvals: { "step-1": proof.approval_ref },
+    });
+    expect(forgotten.status).toBe("completed");
+    const markersAfterForget = await env.storage.list("_facade/hidden");
+    expect(markersAfterForget).toHaveLength(0);
+
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "compound_hidden",
+      value: "new secret",
+    });
+    const recreated = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "compound_hidden",
+    });
+    expect(recreated).toMatchObject({ value: "new secret", verified: true });
+  });
+
+  it("denies compound forget without secure mode before state_delete and keeps the marker", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "compound_mode_guard",
+      value: "do not delete",
+    });
+    await callTool(env.facadeTools, "sanctuary_hide", { key: "compound_mode_guard" });
+    const beforeMarkers = await env.storage.list("_facade/hidden");
+    expect(beforeMarkers).toHaveLength(1);
+
+    const namespace = (await callTool(env.facadeTools, "sanctuary_who_am_i")).memory_namespace_handle as string;
+    const deleteArgs = {
+      namespace,
+      key: "compound_mode_guard",
+      reason: "secure facade forget",
+    };
+    const planHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_delete",
+        primitive: deleteArgs,
+        risk_tier: 1,
+      },
+    ]);
+    const proof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: deleteArgs,
+      session: env.active!,
+      planHash,
+      stepId: "step-1",
+    });
+    const originalDelete = env.l1Tools.find((tool) => tool.name === "state_delete")!;
+    let stateDeleteCalls = 0;
+    const guardedTools = facadeWithPrimitives(
+      env,
+      toolsWithOverride(env.l1Tools, "state_delete", async (args) => {
+        stateDeleteCalls += 1;
+        return originalDelete.handler(args);
+      })
+    );
+
+    const result = await callTool(guardedTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_forget", args: { key: "compound_mode_guard", mode: "unsafe" } },
+      ],
+      approvals: { "step-1": proof.approval_ref },
+    });
+    expect(result.denied).toBe(true);
+    expect(result.message).toBe("This action is not available in the current context.");
+    expect(result.status).not.toBe("completed");
+    expect(stateDeleteCalls).toBe(0);
+
+    const afterMarkers = await env.storage.list("_facade/hidden");
+    expect(afterMarkers.map((entry) => entry.key)).toEqual(beforeMarkers.map((entry) => entry.key));
+    const stillHidden = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "compound_mode_guard",
+    });
+    expect(stillHidden.denied).toBe(true);
+    const raw = await callTool(env.l1Tools, "state_read", {
+      namespace,
+      key: "compound_mode_guard",
+      verify_integrity: true,
+    });
+    expect(raw).toMatchObject({ value: "do not delete" });
+  });
+
+  it("keeps the marker and emits no success audit when standalone forget state_delete is denied", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "standalone_denied_forget",
+      value: "still present",
+    });
+    await callTool(env.facadeTools, "sanctuary_hide", { key: "standalone_denied_forget" });
+    const beforeMarkers = await env.storage.list("_facade/hidden");
+    expect(beforeMarkers).toHaveLength(1);
+
+    const deniedTools = facadeWithPrimitives(
+      env,
+      toolsWithOverride(env.l1Tools, "state_delete", async () => toolResult({ denied: true }))
+    );
+    const result = await callTool(deniedTools, "sanctuary_forget", {
+      key: "standalone_denied_forget",
+      mode: "secure",
+      approval_ref: "approval:test",
+    });
+    expect(result.denied).toBe(true);
+    expect(result.deleted).not.toBe(true);
+
+    const afterMarkers = await env.storage.list("_facade/hidden");
+    expect(afterMarkers.map((entry) => entry.key)).toEqual(beforeMarkers.map((entry) => entry.key));
+    const stillHidden = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "standalone_denied_forget",
+    });
+    expect(stillHidden.denied).toBe(true);
+    const forgetAudits = await env.auditLog.query({
+      operation_type: "sanctuary_forget",
+      limit: 10,
+    });
+    expect(forgetAudits.entries).toHaveLength(0);
+  });
+
+  it("keeps the marker and reports partial failure when compound forget state_delete is denied", async () => {
+    const env = await setup();
+    await callTool(env.facadeTools, "sanctuary_remember", {
+      key: "compound_denied_forget",
+      value: "still present",
+    });
+    await callTool(env.facadeTools, "sanctuary_hide", { key: "compound_denied_forget" });
+    const beforeMarkers = await env.storage.list("_facade/hidden");
+    expect(beforeMarkers).toHaveLength(1);
+
+    const namespace = (await callTool(env.facadeTools, "sanctuary_who_am_i")).memory_namespace_handle as string;
+    const deleteArgs = {
+      namespace,
+      key: "compound_denied_forget",
+      reason: "secure facade forget",
+    };
+    const planHash = compoundPlanHash([
+      {
+        step_id: "step-1",
+        primitive_tool: "state_delete",
+        primitive: deleteArgs,
+        risk_tier: 1,
+      },
+    ]);
+    const proof = env.approvalGate.createApprovedProof({
+      toolName: "state_delete",
+      args: deleteArgs,
+      session: env.active!,
+      planHash,
+      stepId: "step-1",
+    });
+    const deniedTools = facadeWithPrimitives(
+      env,
+      toolsWithOverride(env.l1Tools, "state_delete", async () => toolResult({ denied: true }))
+    );
+
+    const result = await callTool(deniedTools, "sanctuary_compound_execute", {
+      steps: [
+        { tool: "sanctuary_forget", args: { key: "compound_denied_forget", mode: "secure" } },
+      ],
+      approvals: { "step-1": proof.approval_ref },
+    });
+    expect(result.status).toBe("partial_failed");
+    expect(result.status).not.toBe("completed");
+    expect(result.completed_steps).toEqual([]);
+    expect(result.failed_step).toBe("step-1");
+
+    const afterMarkers = await env.storage.list("_facade/hidden");
+    expect(afterMarkers.map((entry) => entry.key)).toEqual(beforeMarkers.map((entry) => entry.key));
+    const stillHidden = await callTool(env.facadeTools, "sanctuary_recall", {
+      key: "compound_denied_forget",
+    });
+    expect(stillHidden.denied).toBe(true);
+    const forgetAudits = await env.auditLog.query({
+      operation_type: "sanctuary_forget",
+      limit: 10,
+    });
+    expect(forgetAudits.entries).toHaveLength(0);
   });
 
   it("keeps audit search scoped to own signed/default history and denies widened scope", async () => {
