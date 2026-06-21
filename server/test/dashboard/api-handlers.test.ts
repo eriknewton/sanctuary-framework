@@ -201,14 +201,16 @@ describe("Dashboard API", () => {
       expect(create).not.toHaveBeenCalled();
     });
 
-    it("serves /api/health", async () => {
+    it("serves /api/health without auth and only ok/mode", async () => {
       const res = mockRes();
       const deps = makeDeps();
-      const req = mockReq({ url: "/api/health", headers: { authorization: "Bearer tok" } });
+      const req = mockReq({ url: "/api/health" });
       const matched = await handleRequest(deps, req, res);
       expect(matched).toBe(true);
       expect(res._status).toBe(200);
-      expect(res._body).toContain("ok");
+      const body = JSON.parse(res._body);
+      expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
+      expect(body).toEqual({ ok: true, mode: "co-located" });
     });
 
     it("wrap-auto posture home reports no live stream when no stream registry is wired", async () => {

@@ -335,8 +335,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _autoAuthLocalhost = false;
   /**
    * v1.1 routes (dashboard HTML at /v1.1, hub API at /api/hub/*) are
-   * mounted additively when set. Legacy routes at / continue to serve
-   * regardless. Default route flip is deferred to v1.2.
+   * mounted additively when set. `/` is the posture shell; `/dashboard`
+   * and `/v1.1` remain v1.1 SPA compatibility aliases.
    */
   private v11Bindings: V11Bindings | null = null;
 
@@ -1057,12 +1057,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `/api/*` route (including the approval channel and the posture JSON API) are
    * untouched and keep their existing handlers and auth gates.
    *
-   * Surface scope: this flip lives on THIS standalone `DashboardApprovalChannel`
-   * (the MCP-server boot path and `sanctuary dashboard`). The SEPARATE co-located
-   * `wrap` server (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP
-   * server) still serves the v1.1 SPA at `/` and is NOT flipped here — it has no
-   * `/api/posture/*` routes, so folding the posture board into it is a tracked
-   * Piece-C remainder (mount the posture JSON API there first).
+   * Surface scope: this standalone `DashboardApprovalChannel` owns live approval
+   * decisions. The SEPARATE co-located `wrap` server (`dashboard/api.ts`, the
+   * `sanctuary wrap` / "Protect" HTTP server) performs its own fold: `/` and
+   * `/posture` serve the posture shell, `/api/posture/*` stays behind read auth,
+   * and `/dashboard` + `/v1.1` remain v1.1 compatibility aliases.
    *
    * Returns true when it served the posture board shell; false to fall through
    * to the existing v1.1 / legacy dispatch ladder.
@@ -2303,9 +2302,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // v1.1.1 hotfix: try v1.1 dispatch first. dispatchV11 returns true when
     // the request matched a v1.1 route (dashboard HTML at /v1.1, hub API
-    // at /api/hub/*). When false, fall through to the legacy route table
-    // below so v1.0 surfaces stay live (additive mount, default route flip
-    // deferred to v1.2).
+    // at /api/hub/*). When false, fall through to the legacy route table below
+    // so v1.0 surfaces stay live; `/` was already handled by the posture shell.
     if (this.v11Bindings) {
       this.dispatchV11(req, res, url, method)
         .then((handled) => {
@@ -2369,10 +2367,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // For GET /v1.0: serve login page if not authenticated (instead of JSON 401).
-    // v1.1.7: root path now serves the v1.1 SPA (handled by dispatchV11
-    // above). The legacy four-panel dashboard moved to /v1.0; the login
-    // page mirrors that move so unauthenticated requests at /v1.0 still
-    // hit the legacy login flow.
+    // Root now serves the posture shell; /dashboard and /v1.1 remain v1.1 SPA
+    // aliases. The legacy four-panel dashboard moved to /v1.0; the login page
+    // mirrors that move so unauthenticated requests at /v1.0 still hit the
+    // legacy login flow.
     if (method === "GET" && url.pathname === "/v1.0" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
         // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
@@ -2458,8 +2456,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
-        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root and
-        // /dashboard now route to the v1.1 SPA via dispatchV11 above.
+        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
+        // posture shell; /dashboard and /v1.1 remain v1.1 SPA aliases.
         if (this.fortressHTML) {
           this.serveFortressView(res);
         } else {

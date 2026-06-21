@@ -196,9 +196,9 @@ export async function handleRequest(
   const path = url.pathname;
 
   // ── Posture board shell (3-to-1 fold, minimal Stack A retirement) ───
-  // The wrap-auto monitor server cannot release live approval promises. Serve
-  // the same posture shell here, but keep its `/api/status` decision_capable
-  // flag false below so the approval area stays read-only on this old process.
+  // The co-located wrap server serves the same posture shell at `/` and
+  // `/posture`, while keeping `/api/status` decision_capable false below so
+  // the approval area stays read-only on this process.
   if (method === "GET" && (path === "/" || path === POSTURE_HOME_PATH)) {
     if (!isAuthorizedForRead(deps, req, url)) {
       writeJSON(res, 401, { error: "unauthorized" });
@@ -266,9 +266,9 @@ export async function handleRequest(
   }
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
-  // Try v1.1 routes first when bindings are set. Mounted additively at
-  // /v1.1 (HTML) and /api/hub/* (API); legacy routes at / continue to
-  // serve. Default route flip deferred to v1.2.
+  // Try v1.1 compatibility routes first when bindings are set. Mounted at
+  // /dashboard + /v1.1 (HTML) and /api/hub/* (API); `/` is the posture
+  // shell handled above.
   //
   // Auth gating is intentionally inside the shared helper so the v1.1
   // HTML at /v1.1 can serve unauthenticated (the inline client handles
@@ -287,6 +287,14 @@ export async function handleRequest(
       method,
     );
     if (handled) return true;
+  }
+
+  // ── Health (unauthenticated liveness only) ───────────────────────────
+  // Mirrors the principal-policy dashboard contract exactly: `{ ok, mode }`
+  // only, with no state, config, posture, agent, token, or count data.
+  if (method === "GET" && path === "/api/health") {
+    writeJSON(res, 200, { ok: true, mode: deps.sources.mode });
+    return true;
   }
 
   // ── Auth (all routes) ───────────────────────────────────────────────
@@ -338,17 +346,11 @@ export async function handleRequest(
     return true;
   }
 
-  // ── Health (unauthenticated-safe, but we still require auth above) ──
-  if (method === "GET" && path === "/api/health") {
-    writeJSON(res, 200, { ok: true, mode: deps.sources.mode });
-    return true;
-  }
-
   // ── Legacy v1.0 HTML (preserved at /v1.0) ───────────────────────────
-  // v1.1.7: root and /dashboard now serve the v1.1 SPA via dispatchV11
-  // above. The legacy four-panel dashboard moved to /v1.0 so operators
-  // who explicitly want the prior surface can reach it; /index.html
-  // alias preserved on the legacy path for parity.
+  // v1.1.7: root serves the posture shell above; /dashboard and /v1.1
+  // remain compatibility aliases via dispatchV11. The legacy four-panel
+  // dashboard moved to /v1.0 so operators who explicitly want the prior
+  // surface can reach it; /index.html alias preserved on the legacy path.
   if (
     method === "GET" &&
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")

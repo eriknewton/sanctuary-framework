@@ -58,9 +58,9 @@ describe("Dashboard HTTP API", () => {
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
     // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
-    // Root and /dashboard now route to the v1.1 SPA via dispatchV11 in
-    // production wiring (this rig boots without v11Bindings, so the
-    // dispatch is dormant and legacy serves at the new /v1.0 URL).
+    // Root serves the posture shell; /dashboard and /v1.1 are v1.1 SPA
+    // compatibility aliases when production wiring provides v11Bindings. This
+    // rig boots without v11Bindings, so legacy serves at the new /v1.0 URL.
     handle = await startForTest();
     const res = await fetch(`${handle.url}/v1.0`);
     expect(res.status).toBe(200);
@@ -74,6 +74,21 @@ describe("Dashboard HTTP API", () => {
   });
 
   it("returns 401 when auth token is required and missing", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/snapshot`);
+    expect(res.status).toBe(401);
+  });
+
+  it("serves /api/health without auth when auth token is configured and exposes only liveness fields", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
+    expect(body).toEqual({ ok: true, mode: "co-located" });
+  });
+
+  it("keeps /api/snapshot auth-gated without auth when auth token is configured", async () => {
     handle = await startForTest({ authToken: "secret-xyz" });
     const res = await fetch(`${handle.url}/api/snapshot`);
     expect(res.status).toBe(401);
@@ -266,6 +281,7 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/api/health`);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
     expect(body.ok).toBe(true);
     expect(body.mode).toBe("co-located");
   });
