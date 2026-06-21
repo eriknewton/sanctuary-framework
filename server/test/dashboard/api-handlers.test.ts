@@ -15,6 +15,9 @@ import {
   type APIDeps,
 } from "../../src/dashboard/api.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 function mockReq(opts: { url?: string; method?: string; headers?: Record<string, string> }): IncomingMessage {
   return {
@@ -206,6 +209,21 @@ describe("Dashboard API", () => {
       expect(matched).toBe(true);
       expect(res._status).toBe(200);
       expect(res._body).toContain("ok");
+    });
+
+    it("wrap-auto posture home reports no live stream when no stream registry is wired", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      deps.sources.auditLog = new AuditLog(new MemoryStorage(), generateRandomKey()) as any;
+      const req = mockReq({
+        url: "/api/posture/home",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body) as { stream_available?: boolean };
+      expect(body.stream_available).toBe(false);
     });
 
     it("returns 503 for approvals when no handlers", async () => {

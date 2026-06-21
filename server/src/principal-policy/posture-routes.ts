@@ -693,6 +693,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
   return {
     origin_machine: deps.originMachine,
+    stream_available: deps.streamRegistry !== undefined,
     castle_wall: castleWall,
     digest,
     unwrapped,

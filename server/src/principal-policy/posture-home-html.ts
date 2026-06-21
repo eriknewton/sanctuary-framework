@@ -307,10 +307,35 @@ export function renderPostureHomeHTML(): string {
     token = sessionStorage.getItem("authToken") || null;
   }
 
+  function readUrlSession() {
+    try {
+      var value = new URLSearchParams(location.search || "").get("session");
+      // Dashboard sessions are server-minted opaque URL-safe ids. Reject odd
+      // characters rather than reflecting them into any follow-up request URL.
+      if (value && /^[A-Za-z0-9_-]{1,256}$/.test(value)) return value;
+    } catch (e) {}
+    return null;
+  }
+
+  var urlSession = readUrlSession();
+
+  function credentialedPath(path) {
+    if (!urlSession) return path;
+    try {
+      var u = new URL(path, location.origin);
+      if (u.origin !== location.origin) return path;
+      u.searchParams.set("session", urlSession);
+      return u.pathname + u.search + u.hash;
+    } catch (e) {
+      return path;
+    }
+  }
+
   function api(path) {
     var opts = { credentials: "same-origin", headers: {} };
     if (token) opts.headers["Authorization"] = "Bearer " + token;
-    return fetch(path, opts).then(function (r) {
+    var url = credentialedPath(path);
+    return fetch(url, opts).then(function (r) {
       if (!r.ok) throw new Error(path + " -> " + r.status);
       return r.json();
     });
@@ -340,7 +365,7 @@ export function renderPostureHomeHTML(): string {
   }
 
   function postDecision(path, retried) {
-    return fetch(path, {
+    return fetch(credentialedPath(path), {
       method: "POST",
       credentials: "same-origin",
       headers: decisionHeaders(),
@@ -378,6 +403,7 @@ export function renderPostureHomeHTML(): string {
   // polling honestly. Reuses the dashboard's existing session TTL (we do not
   // lengthen it) and never puts the long-lived token in a URL.
   function mintStreamSession() {
+    if (urlSession) return Promise.resolve("?session=" + encodeURIComponent(urlSession));
     if (!token || hasSessionCookie()) return Promise.resolve("");
     return fetch("/auth/session", {
       method: "POST",
@@ -1022,6 +1048,7 @@ export function renderPostureHomeHTML(): string {
   // honest value the last real frame produced - but the connection banner makes
   // the freshness of that frame unmistakable.
   var lastFrameAt = null; // ms epoch of the last successful render, or null.
+  var streamAvailable = false;
   // If no fresh frame arrives within this window, the view is treated as stale
   // even if a socket is nominally open. Comfortably larger than the server push
   // cadence (5s) + heartbeat (15s) so a single missed tick is not flapped.
@@ -1082,6 +1109,7 @@ export function renderPostureHomeHTML(): string {
   // advanced, so the "Live" indicator is earned by a real, fully-rendered frame.
   function applyHome(home) {
     return refreshAuxiliary().then(function () {
+      streamAvailable = home && home.stream_available === true;
       renderHome(home, lastApprovals, lastFindings);
       lastFrameAt = Date.now();
       setConn("live");
@@ -1095,7 +1123,11 @@ export function renderPostureHomeHTML(): string {
   // surfaces an honest error in the banner and leaves the indicator amber.
   function pollOnce() {
     return api("/api/posture/home")
-      .then(function (home) { return applyHome(home); })
+      .then(function (home) {
+        return applyHome(home).then(function () {
+          if (supportsSSE && streamAvailable && !es && reconnectTimer === null) connectStream();
+        });
+      })
       .catch(function (e) {
         setConn("reconnecting");
         document.getElementById("banner").innerHTML =
@@ -1139,6 +1171,7 @@ export function renderPostureHomeHTML(): string {
   }
 
   function connectStream() {
+    if (!streamAvailable) { startPolling(); return; }
     if (!supportsSSE) { startPolling(); return; }
     if (es) { try { es.close(); } catch (e) {} es = null; }
     // EventSource cannot set an Authorization header. On loopback / cookie auth
@@ -1199,8 +1232,7 @@ export function renderPostureHomeHTML(): string {
   // If SSE is unavailable, this degrades to the prior poll-only behavior.
   setConn("reconnecting");
   pollOnce().then(function () {
-    if (supportsSSE) connectStream();
-    else startPolling();
+    if (!supportsSSE || !streamAvailable) startPolling();
   });
   // Recognition + portability (P5) is a separate, composition-gated fetch (it is
   // NOT on the home payload, so an off-fortress never receives any of its data).

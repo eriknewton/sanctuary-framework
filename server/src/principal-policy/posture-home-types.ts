@@ -39,6 +39,12 @@ import type { QueryPrivacySection } from "./posture-query-privacy.js";
  */
 export interface PostureHome {
   origin_machine: string;
+  /**
+   * Whether this dashboard mount has the posture SSE live-refresh registry
+   * wired. False on folded wrap-auto mounts that intentionally omit the stream;
+   * the client must keep polling there instead of opening a doomed EventSource.
+   */
+  stream_available: boolean;
   castle_wall: CastleWallPosture;
   digest: AuditDigest;
   unwrapped: UnwrappedRoster;

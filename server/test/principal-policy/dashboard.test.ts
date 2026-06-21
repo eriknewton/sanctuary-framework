@@ -17,6 +17,9 @@ import {
   bindWithRetry,
   randomTestPort,
 } from "../util/port-collision-retry.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 async function requestNoKeepAlive(
   url: string,
@@ -488,6 +491,83 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
+    });
+
+    it("one-click session authenticates posture reads and approval decisions, while invalid sessions stay 401", async () => {
+      const policy: PrincipalPolicy = {
+        version: 1,
+        tier1_always_approve: ["state_export"],
+        tier2_anomaly: {
+          new_namespace_access: "approve",
+          new_counterparty: "approve",
+          frequency_spike_multiplier: 3,
+          max_signs_per_minute: 10,
+          bulk_read_threshold: 20,
+          first_session_policy: "approve",
+        },
+        tier3_always_allow: [],
+        approval_channel: {
+          type: "dashboard",
+          timeout_seconds: 2,
+          auto_deny: true,
+        },
+      };
+      authDashboard.setDependencies({
+        policy,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: new AuditLog(new MemoryStorage(), generateRandomKey()),
+      });
+
+      const exchangeRes = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchangeRes.status).toBe(200);
+      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Strict");
+      const { session_id } = await exchangeRes.json();
+      const session = encodeURIComponent(session_id);
+
+      const postureRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/home?session=${session}`,
+      );
+      expect(postureRes.status).toBe(200);
+      const posture = await postureRes.json();
+      expect(posture.stream_available).toBe(true);
+
+      const request: ApprovalRequest = {
+        operation: "state_export",
+        tier: 1,
+        reason: "One-click session decision",
+        context: {},
+        timestamp: new Date().toISOString(),
+      };
+      const approvalPromise = authDashboard.requestApproval(request);
+      const pendingRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/pending?session=${session}`,
+      );
+      expect(pendingRes.status).toBe(200);
+      const pending = await pendingRes.json();
+      expect(pending).toHaveLength(1);
+
+      const badRead = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/home?session=not-a-valid-session`,
+      );
+      expect(badRead.status).toBe(401);
+      const badDecision = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}?session=not-a-valid-session`,
+        { method: "POST" },
+      );
+      expect(badDecision.status).toBe(401);
+      expect(authDashboard.pendingCount).toBe(1);
+
+      const decisionRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}?session=${session}`,
+        { method: "POST" },
+      );
+      expect(decisionRes.status).toBe(200);
+      const decision = await approvalPromise;
+      expect(decision.decision).toBe("approve");
+      expect(decision.decided_by).toBe("human");
     });
 
     it("serves legacy dashboard HTML at /v1.0 with bearer header (SEC-012)", async () => {
