@@ -21,7 +21,10 @@ import type { ClientManager } from "./client-manager.js";
 import { UpstreamUnavailableError } from "./client-manager.js";
 import type { InjectionDetector } from "../security/injection-detector.js";
 import type { AuditLog } from "../operational/audit-log.js";
-import { ContextGateBlockedError } from "../operational/context-gate-enforcer.js";
+import {
+  ContextGateBlockedError,
+  ContextGateNoPolicyError,
+} from "../operational/context-gate-enforcer.js";
 import type { CallGovernor } from "../operational/call-governor.js";
 import type { LocalPrivacyEngine, PrivacyPolicy } from "../operational/privacy-core.js";
 import type { PrivacyDestinationCategory } from "../contracts/v1.1/index.js";
@@ -221,25 +224,28 @@ export class ProxyRouter {
           try {
             filteredArgs = await this.options.contextGateFilter(proxyName, args);
           } catch (gateErr) {
-            // Distinguish an EXPECTED policy block from a genuine filter error.
-            // A ContextGateBlockedError means the operator's `on_deny:"block"`
-            // policy fired (a designed denial, not infra failure), so we
-            // record the honest `context_gating_blocked` reason. Any other throw
-            // is an infra/runtime fault and keeps `context_gate_filter_error`.
-            // BOTH branches fail CLOSED identically: never forward to upstream,
-            // write a denial audit entry, return the generic agent-facing
-            // denial, and early-return (no success entry). The raw error stays
-            // operator-side in the audit log only (invariant #7 style).
+            // Distinguish designed context-gate denials from genuine filter
+            // errors. Explicit policy blocks and no-policy misconfiguration both
+            // fail closed without forwarding. Any other throw is an infra/runtime
+            // fault and keeps `context_gate_filter_error`. All branches return
+            // the same generic agent-facing denial; details stay operator-side.
             const isPolicyBlock = gateErr instanceof ContextGateBlockedError;
+            const isNoPolicyBlock = gateErr instanceof ContextGateNoPolicyError;
             const reason = isPolicyBlock
               ? "context_gating_blocked"
-              : "context_gate_filter_error";
+              : isNoPolicyBlock
+                ? "context_gating_no_policy_bound"
+                : "context_gate_filter_error";
             const operation = isPolicyBlock
               ? `proxy_context_gating_blocked:${proxyName}`
-              : `proxy_context_gate_error:${proxyName}`;
+              : isNoPolicyBlock
+                ? `proxy_context_gating_no_policy_block:${proxyName}`
+                : `proxy_context_gate_error:${proxyName}`;
             const eventType = isPolicyBlock
               ? "proxy.context_gating_blocked"
-              : "proxy.context_gate_error";
+              : isNoPolicyBlock
+                ? "proxy.context_gating_no_policy_block"
+                : "proxy.context_gate_error";
             const gateErrorMessage =
               gateErr instanceof Error ? gateErr.message : "context gate filter error";
             await this.auditLog.appendCritical({

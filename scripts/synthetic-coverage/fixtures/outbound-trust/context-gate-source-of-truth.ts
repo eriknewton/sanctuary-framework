@@ -65,6 +65,26 @@ async function queryAuditOperations(auditLog: AuditLog, operation: string): Prom
   return result.entries.length;
 }
 
+async function bindProxyRedactionPolicy(
+  policyStore: ReturnType<typeof createContextGateTools>["policyStore"],
+  profile: ReturnType<typeof createDefaultProfile>
+): Promise<void> {
+  const policy = await policyStore.create(
+    "synthetic-proxy-redaction",
+    [
+      {
+        provider: "tool-api",
+        allow: ["payload"],
+        redact: ["api_key"],
+        hash: [],
+        summarize: [],
+      },
+    ],
+    "redact"
+  );
+  profile.features.context_gating.policy_id = policy.policy_id;
+}
+
 registerFixture(
   CLAIM_ID,
   CLAIM_LABEL,
@@ -76,7 +96,8 @@ registerFixture(
     const auditLog = new AuditLog(storage, masterKey);
     const profile = createDefaultProfile();
     profile.features.context_gating.enabled = true;
-    const { enforcer } = createContextGateTools(storage, masterKey, auditLog);
+    const { enforcer, policyStore } = createContextGateTools(storage, masterKey, auditLog);
+    await bindProxyRedactionPolicy(policyStore, profile);
     initializeContextGateEnforcerFromProfile(enforcer, profile);
     const filtered = await enforcer.filterArgs(
       "proxy/test-server/send",
@@ -138,7 +159,8 @@ registerFixture(
     const auditLog = new AuditLog(storage, masterKey);
     const profile = createDefaultProfile();
     profile.features.context_gating.enabled = true;
-    const { enforcer } = createContextGateTools(storage, masterKey, auditLog);
+    const { enforcer, policyStore } = createContextGateTools(storage, masterKey, auditLog);
+    await bindProxyRedactionPolicy(policyStore, profile);
     initializeContextGateEnforcerFromProfile(enforcer, profile);
     const clientManager = createMockClientManager();
     let delegated = false;
@@ -179,8 +201,23 @@ registerFixture(
       const firstStorage = new FilesystemStorage(tempDir);
       const firstProfileStore = new SovereigntyProfileStore(firstStorage, masterKey);
       await firstProfileStore.load();
+      const firstAuditLog = new AuditLog(firstStorage, masterKey);
+      const { policyStore } = createContextGateTools(firstStorage, masterKey, firstAuditLog);
+      const policy = await policyStore.create(
+        "persisted-policy",
+        [
+          {
+            provider: "tool-api",
+            allow: ["payload"],
+            redact: ["api_key"],
+            hash: [],
+            summarize: [],
+          },
+        ],
+        "redact"
+      );
       await firstProfileStore.update({
-        context_gating: { enabled: true, policy_id: "persisted-policy" },
+        context_gating: { enabled: true, policy_id: policy.policy_id },
       });
 
       const restartedStorage = new FilesystemStorage(tempDir);
@@ -193,10 +230,10 @@ registerFixture(
       const passed =
         restartedProfile.features.context_gating.enabled === true &&
         enforcer.getStatus().enabled === true &&
-        enforcer.getStatus().default_policy_id === "persisted-policy" &&
+        enforcer.getStatus().default_policy_id === policy.policy_id &&
         combined.profile_enabled === true &&
         combined.enforcer_enabled === true &&
-        combined.policy_id === "persisted-policy";
+        combined.policy_id === policy.policy_id;
       return outcome(started, passed, "expected restarted health surface to reflect persisted profile state");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
