@@ -163,7 +163,7 @@ Usage: sanctuary exit <command> [options]
 
 Commands:
   export --out <dir>          Create a SANCTUARY_EXIT_BUNDLE_V1 directory
-  verify <dir>                Verify manifest, audit receipts, and reputation bundle
+  verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
 
@@ -320,6 +320,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(
             out,
             `reputation: ${result.reputation.verified_attestations}/${result.reputation.attestation_count} attestations verified\n`
+          );
+          write(
+            out,
+            `reputation completeness: ${result.reputation.completeness}\n`
           );
         }
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);

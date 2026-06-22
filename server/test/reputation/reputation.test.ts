@@ -17,6 +17,7 @@ import {
   ReputationStore,
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
+  verifyReputationBundleCompleteness,
   type ReputationBundle,
 } from "../../src/reputation/reputation-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -316,12 +317,16 @@ describe("L4 Reputation Store", () => {
       const publicKeys = publicKeysFor(identity);
 
       const verified = store2.verifyBundle(bundle, publicKeys);
+      const standaloneCompleteness = verifyReputationBundleCompleteness(bundle);
       expect(verified).toEqual({
         invalid: 0,
         unverifiable: 0,
         contexts: ["commerce"],
         completeness_verification: "verified",
       });
+      expect(standaloneCompleteness).toBe(
+        verified.completeness_verification
+      );
       await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
 
       const imported = await store2.importBundle(bundle, true, publicKeys);
@@ -336,6 +341,9 @@ describe("L4 Reputation Store", () => {
       tampered.completeness_manifest!.total_attestation_count = 2;
       const storage3 = new MemoryStorage();
       const store3 = new ReputationStore(storage3, masterKey);
+      expect(() => verifyReputationBundleCompleteness(tampered)).toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
       expect(() => store3.verifyBundle(tampered, publicKeys)).toThrow(
         "Reputation bundle completeness manifest does not match contents"
       );
@@ -527,6 +535,11 @@ describe("L4 Reputation Store", () => {
         publicKeysFor(identity),
         { allowUnverifiedLegacy: true }
       );
+      expect(
+        verifyReputationBundleCompleteness(legacyBundle, {
+          allowUnverifiedLegacy: true,
+        })
+      ).toBe(result.completeness_verification);
       expect(result.imported).toBe(1);
       expect(result.invalid).toBe(0);
       expect(result.unverifiable).toBe(0);

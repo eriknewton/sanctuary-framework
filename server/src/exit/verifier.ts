@@ -2,8 +2,9 @@
  * Sanctuary v1.1 exit-bundle verifier.
  *
  * Verifies the signed SANCTUARY_EXIT_BUNDLE_V1 manifest, every artifact hash,
- * and the exported identity / reputation signatures that are independently
- * verifiable from public material in the bundle.
+ * and the exported identity / reputation signatures and exported-set
+ * completeness manifests that are independently verifiable from public
+ * material in the bundle.
  */
 
 /**
@@ -39,7 +40,9 @@ import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import {
   reputationBundleSigningBytes,
+  verifyReputationBundleCompleteness,
   type ReputationBundle,
+  type ReputationBundleCompletenessVerification,
 } from "../reputation/reputation-store.js";
 import {
   readFileCustody,
@@ -63,6 +66,10 @@ export interface ExitBundleDetailedVerifierResult
   };
   reputation?: {
     bundle_signature_valid: boolean | "unverifiable";
+    completeness:
+      | ReputationBundleCompletenessVerification
+      | "mismatch";
+    completeness_error?: string;
     attestation_count: number;
     verified_attestations: number;
     invalid_attestations: number;
@@ -310,6 +317,21 @@ function verifyReputationArtifact(
     }
   }
 
+  let completeness:
+    | ReputationBundleCompletenessVerification
+    | "mismatch" = "mismatch";
+  let completenessError: string | undefined;
+  try {
+    completeness = verifyReputationBundleCompleteness(bundle, {
+      allowUnverifiedLegacy: true,
+    });
+  } catch (error) {
+    completenessError =
+      error instanceof Error
+        ? error.message
+        : "Reputation bundle completeness verification failed";
+  }
+
   let verified = 0;
   let invalid = 0;
   let unverifiable = 0;
@@ -330,6 +352,10 @@ function verifyReputationArtifact(
 
   return {
     bundle_signature_valid: bundleSignatureValid,
+    completeness,
+    ...(completenessError !== undefined
+      ? { completeness_error: completenessError }
+      : {}),
     attestation_count: attestations.length,
     verified_attestations: verified,
     invalid_attestations: invalid,
@@ -553,11 +579,28 @@ export async function verifyExitBundle(
         `${reputation.invalid_attestations} reputation attestation(s) failed signature verification`
       );
     }
+    if (reputation.completeness === "mismatch") {
+      warnings.push(
+        reputation.completeness_error !== undefined
+          ? `reputation bundle completeness mismatch: ${reputation.completeness_error}`
+          : "reputation bundle completeness mismatch"
+      );
+    } else if (
+      reputation.completeness === "unverified-completeness-legacy-bundle"
+    ) {
+      warnings.push(
+        "reputation bundle has no completeness manifest; exported-set completeness is unverified"
+      );
+    }
   }
 
   const reputationBundleFailed = reputation?.bundle_signature_valid === false;
   const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
-  const reputationFailed = reputationBundleFailed || reputationAttestationFailed;
+  const reputationCompletenessFailed = reputation?.completeness === "mismatch";
+  const reputationFailed =
+    reputationBundleFailed ||
+    reputationAttestationFailed ||
+    reputationCompletenessFailed;
   const identityFailed = identity ? !identity.signature_valid : false;
   const unverifiableCount = reputation?.unverifiable_attestations ?? 0;
   const unverifiableFailed =
@@ -572,9 +615,10 @@ export async function verifyExitBundle(
   // Full-sweep #77: route the specific failure cause so importers and
   // operators see what went wrong without having to parse the warnings
   // array. Priority ordering: identity (cryptographic-binding broken)
-  // beats reputation-bundle (provenance broken) beats individual
-  // attestation invalidity beats unverifiable signers (which is
-  // policy-relaxable via the explicit opt-in flag).
+  // beats reputation-bundle (provenance broken) beats completeness
+  // mismatch (signed manifest does not describe the body) beats
+  // individual attestation invalidity beats unverifiable signers
+  // (which is policy-relaxable via the explicit opt-in flag).
   let detailedFailureClass:
     | NonNullable<ExitBundleVerifierResult["failure_class"]>
     | undefined;
@@ -582,6 +626,8 @@ export async function verifyExitBundle(
     detailedFailureClass = "identity_signature_invalid";
   } else if (reputationBundleFailed) {
     detailedFailureClass = "reputation_bundle_signature_invalid";
+  } else if (reputationCompletenessFailed) {
+    detailedFailureClass = "reputation_completeness_mismatch";
   } else if (reputationAttestationFailed) {
     detailedFailureClass = "reputation_attestation_signature_invalid";
   } else if (unverifiableFailed) {
