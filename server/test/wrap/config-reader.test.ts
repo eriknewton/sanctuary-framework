@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { writeFile, mkdir, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   detectAgentConfig,
@@ -17,6 +17,7 @@ import {
   saveWrapMeta,
   findLatestBackup,
   rewriteConfigForWrap,
+  getPlatformPaths,
 } from "../../src/wrap/config-reader.js";
 import { detectHarnessSchema } from "../../src/wrap/harness-schema.js";
 
@@ -76,6 +77,103 @@ describe("Config Reader", () => {
       const result = await detectAgentConfig(undefined, configPath);
       expect(result).not.toBeNull();
       expect(result!.platform).toBe("claude-code");
+    });
+
+    const mastraConfigPathCases = [
+      {
+        label: "~/.mastra/mcp.json",
+        pathFor: (home: string) => join(home, ".mastra", "mcp.json"),
+      },
+      {
+        label: "~/mastra/mcp.json",
+        pathFor: (home: string) => join(home, "mastra", "mcp.json"),
+      },
+      {
+        label: "~/.config/mastra/mcp.json",
+        pathFor: (home: string) => join(home, ".config", "mastra", "mcp.json"),
+      },
+    ] as const;
+
+    async function writeJsonConfig(
+      configPath: string,
+      config: Record<string, unknown>
+    ): Promise<void> {
+      await mkdir(dirname(configPath), { recursive: true });
+      await writeFile(configPath, JSON.stringify(config));
+    }
+
+    async function withTempHome<T>(
+      fn: (home: string) => Promise<T>
+    ): Promise<T> {
+      const originalHome = process.env.HOME;
+      const originalAppdata = process.env.APPDATA;
+      const home = join(tmpDir, "home");
+      await mkdir(home, { recursive: true });
+      process.env.HOME = home;
+      process.env.APPDATA = join(home, "AppData", "Roaming");
+      try {
+        return await fn(home);
+      } finally {
+        if (originalHome !== undefined) process.env.HOME = originalHome;
+        else delete process.env.HOME;
+        if (originalAppdata !== undefined) process.env.APPDATA = originalAppdata;
+        else delete process.env.APPDATA;
+      }
+    }
+
+    for (const { label, pathFor } of mastraConfigPathCases) {
+      it(`auto-detects Mastra schema from ${label}`, async () => {
+        await withTempHome(async (home) => {
+          const configPath = pathFor(home);
+          const config = {
+            mcpServers: {
+              filesystem: { command: "node", args: ["fs-server.js"] },
+            },
+          };
+          await writeJsonConfig(configPath, config);
+
+          expect(getPlatformPaths()["mastra"]).toContain(configPath);
+          expect(detectHarnessSchema(configPath, config).kind).toBe("mastra");
+
+          const result = await detectAgentConfig(undefined, configPath);
+          expect(result).not.toBeNull();
+          expect(result!.platform).toBe("mastra");
+        });
+      });
+    }
+
+    it("auto-detects Mastra without a platform hint from temp HOME", async () => {
+      await withTempHome(async (home) => {
+        const configPath = join(home, ".mastra", "mcp.json");
+        const config = {
+          mcpServers: {
+            filesystem: { command: "node", args: ["fs-server.js"] },
+          },
+        };
+        await writeJsonConfig(configPath, config);
+
+        const result = await detectAgentConfigWithDiagnostics(undefined);
+        expect(result.config).not.toBeNull();
+        expect(result.config!.platform).toBe("mastra");
+        expect(result.config!.configPath).toBe(configPath);
+      });
+    });
+
+    it("does not detect non-Mastra flat mcpServers as Mastra", async () => {
+      await withTempHome(async (home) => {
+        const configPath = join(home, "generic", "mcp.json");
+        const config = { mcpServers: {} };
+        await writeJsonConfig(configPath, config);
+
+        const schema = detectHarnessSchema(configPath, config);
+        expect(schema.kind).toBe("claude-code");
+        expect(schema.kind).not.toBe("mastra");
+
+        const result = await detectAgentConfig(undefined, configPath);
+        expect(result).not.toBeNull();
+        expect(result!.platform).toBe("claude-code");
+        expect(result!.platform).not.toBe("mastra");
+      });
     });
 
     it("reads OpenClaw-style mcpServers config", async () => {
