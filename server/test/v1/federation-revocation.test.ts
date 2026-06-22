@@ -245,6 +245,220 @@ describe("/v1 federation revocation projection", () => {
     expect(appended).toEqual([]);
   });
 
+  it("does not leave partial durable state when a combined append fails", () => {
+    const materials = makeFederationMaterials();
+    const eviction = makeEvictionEvent(materials, signEviction(materials, "mac-1", 1));
+    const ordinary = makePeerEvent("linux-1");
+    const durable: FederationEvent[] = [];
+    let appendCalls = 0;
+
+    const result = acceptFederationEventsFailClosed({
+      events: [eviction, ordinary],
+      fortressId: materials.fortressId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+      senderNodeId: "linux-1",
+      isNodeRevoked: () => false,
+      validateEvents: (batch) => ({ accepted: batch, rejected: [] }),
+      appendEvents: (batch) => {
+        appendCalls += 1;
+        const staged = [...durable];
+        for (const event of batch) {
+          if (event.event_id === ordinary.event_id) {
+            throw new Error("simulated durable append failure");
+          }
+          staged.push(event);
+        }
+        durable.splice(0, durable.length, ...staged);
+        return { accepted: batch, rejected: [] };
+      },
+    });
+
+    expect(appendCalls).toBe(1);
+    expect(result).toEqual({
+      accepted: [],
+      rejected: [
+        { event_id: eviction.event_id, reason: "append_failed" },
+        { event_id: ordinary.event_id, reason: "append_failed" },
+      ],
+      senderRevoked: false,
+      revocationStateAvailable: true,
+      batchRejected: true,
+    });
+    expect(durable).toEqual([]);
+  });
+
+  it("rejects the whole dashboard batch and preserves state when the state swap fails", async () => {
+    const materials = makeFederationMaterials();
+    const eviction = makeEvictionEvent(materials, signEviction(materials, "mac-1", 1));
+    const ordinary = makePeerEvent("linux-1");
+    const dashboard = new DashboardApprovalChannel({
+      port: 0,
+      host: "127.0.0.1",
+      timeout_seconds: 30,
+      auto_open: false,
+    });
+    const dashboardAccess = dashboard as unknown as {
+      _federationState: {
+        eventLog: FederationEvent[];
+        revoked: Set<string>;
+        nodes: Map<string, unknown>;
+      };
+      appendFederationEvents(
+        events: FederationEvent[],
+        options?: { wireVersion?: unknown; senderNodeId?: string },
+      ): {
+        accepted: FederationEvent[];
+        rejected: Array<{ event_id: string; reason: string }>;
+        batchRejected?: boolean;
+      };
+      listFederationEvents(): FederationEvent[];
+    };
+    let stateDescriptor: PropertyDescriptor | undefined;
+
+    try {
+      dashboard.setFederationContext(materials.context);
+      stateDescriptor = Object.getOwnPropertyDescriptor(
+        dashboard,
+        "_federationState",
+      );
+      if (stateDescriptor === undefined) {
+        throw new Error("missing federation state descriptor");
+      }
+      const initialState = dashboardAccess._federationState;
+      Object.defineProperty(dashboard, "_federationState", {
+        configurable: true,
+        get: () => initialState,
+        set: () => {
+          throw new Error("simulated federation state swap failure");
+        },
+      });
+
+      const result = dashboardAccess.appendFederationEvents([eviction, ordinary], {
+        wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+        senderNodeId: "linux-1",
+      });
+
+      expect(result.accepted).toEqual([]);
+      expect(result.batchRejected).toBe(true);
+      expect(result.rejected).toEqual([
+        { event_id: eviction.event_id, reason: "append_failed" },
+        { event_id: ordinary.event_id, reason: "append_failed" },
+      ]);
+      expect(dashboardAccess.listFederationEvents()).toEqual([]);
+      expect(materials.context.isNodeRevoked("mac-1")).toBe(false);
+      expect(dashboardAccess._federationState.eventLog).toEqual([]);
+      expect(dashboardAccess._federationState.revoked.has("mac-1")).toBe(false);
+      expect(dashboardAccess._federationState.nodes.has("linux-1")).toBe(false);
+    } finally {
+      if (stateDescriptor !== undefined) {
+        Object.defineProperty(dashboard, "_federationState", stateDescriptor);
+      }
+      dashboard.setFederationContext(null);
+      await dashboard.stop();
+    }
+  });
+
+  it("rejects same-batch events from a projected pending eviction before commit", () => {
+    const materials = makeFederationMaterials();
+    const eviction = makeEvictionEvent(materials, signEviction(materials, "mac-1", 1));
+    const ordinary = makePeerEvent("mac-1");
+    const durable: FederationEvent[] = [];
+    const appendBatches: FederationEvent[][] = [];
+
+    const result = acceptFederationEventsFailClosed({
+      events: [eviction, ordinary],
+      fortressId: materials.fortressId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+      senderNodeId: "linux-1",
+      isNodeRevoked: () => false,
+      validateEvents: (batch) => ({ accepted: batch, rejected: [] }),
+      appendEvents: (batch) => {
+        appendBatches.push(batch);
+        durable.push(...batch);
+        return { accepted: batch, rejected: [] };
+      },
+    });
+
+    expect(result).toEqual({
+      accepted: [eviction],
+      rejected: [{ event_id: ordinary.event_id, reason: "node_revoked" }],
+      senderRevoked: false,
+      revocationStateAvailable: true,
+      batchRejected: false,
+    });
+    expect(appendBatches).toEqual([[eviction]]);
+    expect(durable).toEqual([eviction]);
+  });
+
+  it("does not project evictions when dry validation verifier is unavailable", () => {
+    const materials = makeFederationMaterials();
+    const eviction = makeEvictionEvent(materials, signEviction(materials, "mac-1", 1));
+    const ordinary = makePeerEvent("mac-1");
+    const durable: FederationEvent[] = [];
+
+    const result = acceptFederationEventsFailClosed({
+      events: [eviction, ordinary],
+      fortressId: materials.fortressId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+      senderNodeId: "linux-1",
+      isNodeRevoked: () => false,
+      appendEvents: (batch) => {
+        durable.push(...batch);
+        return { accepted: batch, rejected: [] };
+      },
+    });
+
+    expect(result).toEqual({
+      accepted: [ordinary],
+      rejected: [
+        {
+          event_id: eviction.event_id,
+          reason: "revocation_validation_unavailable",
+        },
+      ],
+      senderRevoked: false,
+      revocationStateAvailable: true,
+      batchRejected: false,
+    });
+    expect(result.rejected).not.toContainEqual({
+      event_id: ordinary.event_id,
+      reason: "node_revoked",
+    });
+    expect(durable).toEqual([ordinary]);
+  });
+
+  it("does not project evictions rejected by dry append validation", () => {
+    const materials = makeFederationMaterials();
+    const eviction = makeEvictionEvent(materials, signEviction(materials, "mac-1", 1));
+    const ordinary = makePeerEvent("mac-1");
+    const durable: FederationEvent[] = [];
+
+    const result = acceptFederationEventsFailClosed({
+      events: [eviction, ordinary],
+      fortressId: materials.fortressId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+      senderNodeId: "linux-1",
+      isNodeRevoked: () => false,
+      validateEvents: () => ({
+        accepted: [],
+        rejected: [{ event_id: eviction.event_id, reason: "operator_signature_invalid" }],
+      }),
+      appendEvents: (batch) => {
+        durable.push(...batch);
+        return { accepted: batch, rejected: [] };
+      },
+    });
+
+    expect(result).toEqual({
+      accepted: [ordinary],
+      rejected: [{ event_id: eviction.event_id, reason: "operator_signature_invalid" }],
+      senderRevoked: false,
+      revocationStateAvailable: true,
+      batchRejected: false,
+    });
+    expect(durable).toEqual([ordinary]);
+  });
+
   it("accepts current lockstep sync wire version and its peer event", () => {
     const materials = makeFederationMaterials();
     const sender = issueNode(materials, "sender-node");
