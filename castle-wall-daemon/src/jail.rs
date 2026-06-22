@@ -968,6 +968,11 @@ fn append_unconditional_deny(branch: &mut Vec<BpfInstruction>, syscall_nr: u32) 
 }
 
 fn checked_jump_offset(len: usize) -> u8 {
+    // Safety: classic BPF jump offsets are u8 (max 255 instructions). Every
+    // seccomp branch we build is well under that bound (the largest, plugin-v1
+    // x86_64, is ~160 instructions). If a future deny-table change grew a branch
+    // past 255, this panics at filter-build time, which fail-closes (the
+    // confined process does not launch) rather than emitting a malformed filter.
     len.try_into()
         .expect("seccomp branch exceeds classic BPF jump range")
 }
