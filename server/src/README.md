@@ -171,7 +171,10 @@ these subsystems are largely independent. The fix is documentation, not deletion
   unauthenticated `/api/health` probe: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
   ONLY (no arm-state, no audit scan); the detailed evidence-gated Castle Wall arm-state is served
   exclusively behind auth, via `/api/posture/castle-wall` and the SESSION_TOKEN-gated `/v1/status`
-  document.
+  document. The Phase 2 Evidence View (`posture-evidence-html.ts`, `GET /posture/evidence` HTML +
+  `GET /api/posture/evidence` JSON) is the third IA level: a filterable, operator-gated audit-entry
+  table with integrity_findings surfaced on-view; it reuses `AuditLog.query()` verbatim and adds no
+  new backend query logic.
 - Crisp rule: **audit scores you, health snapshots you (internally), shr signs-and-advertises you
   (externally), posture shows you (in a dashboard).**
 
