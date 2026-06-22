@@ -5,6 +5,7 @@ export type HarnessSchema =
   | { kind: "claude-code"; nativeKey: "mcpServers" }
   | { kind: "cursor"; nativeKey: "mcpServers" }
   | { kind: "hermes"; nativeKey: "mcp_servers" }
+  | { kind: "mastra"; nativeKey: "mcpServers" }
   | { kind: "cline"; nativeKey: "mcpServers" }
   | { kind: "generic"; nativeKey: "mcpServers" };
 
@@ -44,6 +45,13 @@ export function detectHarnessSchema(
 
   if (file === "mcp.json" && parent === ".cursor") {
     return { kind: "cursor", nativeKey: "mcpServers" };
+  }
+
+  if (
+    (file === "mcp.json" && (parent === "mastra" || parent === ".mastra")) ||
+    normalizedPath.includes("/.config/mastra/")
+  ) {
+    return { kind: "mastra", nativeKey: "mcpServers" };
   }
 
   if (

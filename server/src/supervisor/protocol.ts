@@ -41,6 +41,7 @@
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { LOCAL_HARNESS_KINDS } from "../contracts/v1.1/local-agent-records.js";
 
 /** Wire-protocol version. A mismatch is rejected (no silent downgrade). */
 export const SUPERVISOR_PROTOCOL_VERSION = 1 as const;
@@ -245,16 +246,9 @@ export class FrameDecoder {
 // ── Shape validation (post-MAC) ─────────────────────────────────────────────
 
 /** Known harness kinds a supervised spec may name. Unknown ⇒ bad_request. */
-export const SUPERVISOR_KNOWN_HARNESSES: ReadonlySet<string> = new Set([
-  "openclaw",
-  "hermes",
-  "claude_code",
-  "cursor",
-  "cline",
-  "mastra",
-  "generic_mcp",
-  "other",
-]);
+export const SUPERVISOR_KNOWN_HARNESSES: ReadonlySet<string> = new Set(
+  LOCAL_HARNESS_KINDS,
+);
 
 /**
  * Validate a decoded-and-MAC-verified object into a typed request. Returns

@@ -98,7 +98,7 @@ const harnesses: HarnessFixture[] = [
   {
     label: "Mastra",
     localKind: "mastra",
-    options: {},
+    options: { mastra: true },
     configPath: (home) => join(home, "mastra", "mcp.json"),
     fixture: "flat-mcp.json",
     serversKey: "mcpServers",
@@ -329,7 +329,10 @@ describe("harness README parity", () => {
     const readme = await readFile(readmePath, "utf-8");
     const records = await readFile(localAgentRecordsPath, "utf-8");
     const kinds = new Set(
-      Array.from(records.matchAll(/\|\s+"([^"]+)"/g), (match) => match[1])
+      Array.from(
+        records.matchAll(/^\s*(?:\|\s*)?"([^"]+)"/gm),
+        (match) => match[1],
+      )
     );
 
     for (const kind of [
@@ -387,7 +390,7 @@ function resolveOptions(
   extra: WrapOptions
 ): WrapOptions {
   const base =
-    harness.localKind === "mastra" || harness.localKind === "generic_mcp"
+    harness.localKind === "generic_mcp"
       ? { wrap: configPath }
       : harness.options;
   return { ...base, ...extra };

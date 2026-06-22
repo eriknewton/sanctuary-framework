@@ -1112,6 +1112,7 @@ function printWrapHelpEarly(): void {
     sanctuary protect --claude-code    Protect Claude Code
     sanctuary protect --cursor         Protect Cursor
     sanctuary protect --cline          Protect Cline (VS Code extension)
+    sanctuary protect --mastra         Protect Mastra
     sanctuary protect --wrap <path>    Protect a specific MCP config file
     sanctuary protect --unwrap         Restore original config
 
@@ -1123,6 +1124,7 @@ function printWrapHelpEarly(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)

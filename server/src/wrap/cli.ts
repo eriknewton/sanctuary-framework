@@ -12,6 +12,7 @@
  *   npx @sanctuary-framework/mcp-server wrap --claude-code
  *   npx @sanctuary-framework/mcp-server wrap --cursor
  *   npx @sanctuary-framework/mcp-server wrap --cline
+ *   npx @sanctuary-framework/mcp-server wrap --mastra
  *   npx @sanctuary-framework/mcp-server wrap --wrap /path/to/config.json
  *   npx @sanctuary-framework/mcp-server wrap --unwrap
  *
@@ -113,6 +114,8 @@ export interface WrapOptions {
   cursor?: boolean;
   /** Auto-detect Cline config. */
   cline?: boolean;
+  /** Auto-detect Mastra MCP config. */
+  mastra?: boolean;
   /** Unwrap — restore the original config. */
   unwrap?: boolean;
   /** Explicit passphrase override. If unset, one is generated and stored. */
@@ -465,6 +468,7 @@ export async function runWrap(
   else if (options.claudeCode) platformHint = "claude-code";
   else if (options.cursor) platformHint = "cursor";
   else if (options.cline) platformHint = "cline";
+  else if (options.mastra) platformHint = "mastra";
 
   let detection = await detectAgentConfigWithDiagnostics(
     platformHint,
@@ -539,7 +543,7 @@ export async function runWrap(
     } else {
       console.error("  Could not auto-detect any agent configuration.");
       console.error(
-        "  Use --openclaw, --hermes, --claude-code, --cursor, --cline, or --wrap /path/to/config.json"
+        "  Use --openclaw, --hermes, --claude-code, --cursor, --cline, --mastra, or --wrap /path/to/config.json"
       );
     }
     if (detection.pathsChecked.length > 0) {
@@ -2058,6 +2062,7 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
     case "claude-code": return "Claude Code";
     case "cursor": return "Cursor";
     case "cline": return "Cline";
+    case "mastra": return "Mastra";
     default: return "your agent";
   }
 }
@@ -2070,13 +2075,14 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
  * mapping here means the hub layer doesn't import the wrap layer's enum
  * and vice versa.
  */
-function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
+export function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
   switch (platform) {
     case "openclaw": return "openclaw";
     case "hermes": return "hermes";
     case "claude-code": return "claude_code";
     case "cursor": return "cursor";
     case "cline": return "cline";
+    case "mastra": return "mastra";
     case "generic": return "generic_mcp";
     default: {
       // Defensive: unknown future platforms map to "other" rather than
@@ -2197,6 +2203,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--claude-code",
   "--cursor",
   "--cline",
+  "--mastra",
   "--unwrap",
   "--dry-run",
   "--no-open",
@@ -2207,7 +2214,14 @@ const WRAP_BOOLEAN_FLAGS = new Set([
 ]);
 
 /** Known harness flags (for "did you mean" suggestions). */
-const WRAP_HARNESS_FLAGS = ["--openclaw", "--hermes", "--claude-code", "--cursor", "--cline"];
+const WRAP_HARNESS_FLAGS = [
+  "--openclaw",
+  "--hermes",
+  "--claude-code",
+  "--cursor",
+  "--cline",
+  "--mastra",
+];
 
 function parseDashboardPortFlag(flag: string, value: string | undefined): number {
   if (value === undefined || value.startsWith("-")) {
@@ -2267,6 +2281,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--cline":
         options.cline = true;
         break;
+      case "--mastra":
+        options.mastra = true;
+        break;
       case "--unwrap":
         options.unwrap = true;
         break;
@@ -2319,6 +2336,7 @@ function printWrapHelp(): void {
     sanctuary wrap --claude-code       Wrap Claude Code
     sanctuary wrap --cursor            Wrap Cursor
     sanctuary wrap --cline             Wrap Cline (VS Code extension)
+    sanctuary wrap --mastra            Wrap Mastra
     sanctuary wrap --wrap <path>       Wrap a specific MCP config file
     sanctuary wrap --unwrap            Restore original config
 
@@ -2328,6 +2346,7 @@ function printWrapHelp(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)
