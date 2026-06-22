@@ -553,6 +553,10 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
 
     const outerVerification = await verifyExitBundle(bundleDir);
     expect(outerVerification.passed).toBe(true);
+    expect(outerVerification.reputation?.completeness).toBe(
+      "unverified-completeness-legacy-bundle"
+    );
+    expect(outerVerification.reputation?.completeness).not.toBe("verified");
 
     const destination = await makeHarness();
     await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
@@ -601,10 +605,67 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     );
 
     const outerVerification = await verifyExitBundle(bundleDir);
-    expect(outerVerification.passed).toBe(true);
+    expect(outerVerification.passed).toBe(false);
+    expect(outerVerification.failure_class).toBe(
+      "reputation_completeness_mismatch"
+    );
+    expect(outerVerification.reputation?.bundle_signature_valid).toBe(true);
+    expect(outerVerification.reputation?.completeness).toBe("mismatch");
 
     const destination = await makeHarness();
     await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
+  });
+
+  it("verify-exit-bundle fails when a signed reputation body is truncated against its completeness manifest", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "truncated-rep-manifest",
+    });
+    const identityId = created.identity_id as string;
+    for (const interactionId of ["truncated-001", "truncated-002"]) {
+      await callTool(source.tools, "reputation_record", {
+        interaction_id: interactionId,
+        counterparty_did: "did:key:counterparty",
+        outcome: {
+          type: "transaction",
+          result: "completed",
+          metrics: { score: 94 },
+        },
+        context: "exit-truncation",
+        identity_id: identityId,
+      });
+    }
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-truncated-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => {
+        const bundle = parsed as unknown as ReputationBundle;
+        const truncated = {
+          ...bundle,
+          attestations: bundle.attestations.slice(0, 1),
+        };
+        return {
+          ...truncated,
+          bundle_signature: signReputationBody(source, truncated),
+        } as unknown as Record<string, unknown>;
+      },
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("reputation_completeness_mismatch");
+    expect(result.reputation?.bundle_signature_valid).toBe(true);
+    expect(result.reputation?.attestation_count).toBe(1);
+    expect(result.reputation?.completeness).toBe("mismatch");
+    expect(result.warnings.join("\n")).toContain(
+      "Reputation bundle completeness manifest does not match contents"
+    );
   });
 
   it("exit activation leaves no artifacts for unverifiable reputation without opt-in", async () => {
@@ -666,6 +727,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
 
     const verified = await verifyExitBundle(bundleDir);
     expect(verified.passed).toBe(true);
+    expect(verified.reputation?.completeness).toBe("verified");
     expect(verified.reputation?.unverifiable_attestations).toBe(0);
     expect(verified.reputation?.verified_attestations).toBe(1);
   });

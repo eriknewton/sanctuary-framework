@@ -323,6 +323,89 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function assertSupportedReputationBundleShape(
+  bundle: unknown
+): asserts bundle is ReputationBundle {
+  if (!isRecord(bundle)) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle must be a JSON object"
+    );
+  }
+  if (
+    bundle.version !== "SANCTUARY_REP_V1" ||
+    !Array.isArray(bundle.attestations) ||
+    typeof bundle.exported_at !== "string" ||
+    typeof bundle.exporter_did !== "string" ||
+    typeof bundle.bundle_signature !== "string"
+  ) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle schema is unsupported"
+    );
+  }
+}
+
+/**
+ * Recompute and verify the public completeness manifest for a reputation
+ * bundle. This does not verify bundle or attestation signatures; callers that
+ * need provenance verification must run signature checks separately.
+ */
+export function verifyReputationBundleCompleteness(
+  bundle: unknown,
+  options: { allowUnverifiedLegacy?: boolean } = {}
+): ReputationBundleCompletenessVerification {
+  assertSupportedReputationBundleShape(bundle);
+
+  const manifest = bundle.completeness_manifest;
+  if (manifest === undefined) {
+    if (options.allowUnverifiedLegacy !== true) {
+      throw new ReputationBundleVerificationError(
+        REPUTATION_LEGACY_REJECT_MESSAGE
+      );
+    }
+    return "unverified-completeness-legacy-bundle";
+  }
+
+  if (!isRecord(manifest)) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness manifest is malformed"
+    );
+  }
+
+  const schemaVersion = manifest.schema_version;
+  if (typeof schemaVersion !== "number") {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema metadata is malformed"
+    );
+  }
+  if (schemaVersion > REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema version is newer than this build supports"
+    );
+  }
+  if (schemaVersion !== REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema version is unsupported"
+    );
+  }
+
+  const expectedManifest = buildReputationCompletenessManifest(
+    bundle.exported_at,
+    bundle.attestations
+  );
+  if (
+    manifest.format !== "SANCTUARY_REP_V1" ||
+    manifest.exported_at !== bundle.exported_at ||
+    manifest.total_attestation_count !== bundle.attestations.length ||
+    canonicalJson(manifest) !== canonicalJson(expectedManifest)
+  ) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness manifest does not match contents"
+    );
+  }
+
+  return "verified";
+}
+
 // ─── Reputation Store ─────────────────────────────────────────────────────
 
 export class ReputationStore {
@@ -630,75 +713,21 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     allowUnverifiedLegacy: boolean
   ): ReputationBundleCompletenessVerification {
-    if (!isRecord(bundle)) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle must be a JSON object"
-      );
-    }
-    if (
-      bundle.version !== "SANCTUARY_REP_V1" ||
-      !Array.isArray(bundle.attestations) ||
-      typeof bundle.exported_at !== "string" ||
-      typeof bundle.exporter_did !== "string" ||
-      typeof bundle.bundle_signature !== "string"
-    ) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle schema is unsupported"
-      );
-    }
+    assertSupportedReputationBundleShape(bundle);
 
-    const manifest = bundle.completeness_manifest;
-    if (manifest === undefined) {
+    if (bundle.completeness_manifest === undefined) {
       this.verifyBundleSignature(bundle, publicKeys);
-      if (!allowUnverifiedLegacy) {
-        throw new ReputationBundleVerificationError(
-          REPUTATION_LEGACY_REJECT_MESSAGE
-        );
-      }
-      return "unverified-completeness-legacy-bundle";
+      return verifyReputationBundleCompleteness(bundle, {
+        allowUnverifiedLegacy,
+      });
     }
 
-    if (!isRecord(manifest)) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle completeness manifest is malformed"
-      );
-    }
-
-    const schemaVersion = manifest.schema_version;
-    if (typeof schemaVersion !== "number") {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle completeness schema metadata is malformed"
-      );
-    }
-    if (schemaVersion > REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle completeness schema version is newer than this build supports"
-      );
-    }
-    if (schemaVersion !== REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle completeness schema version is unsupported"
-      );
-    }
-
-    const expectedManifest = buildReputationCompletenessManifest(
-      bundle.exported_at,
-      bundle.attestations
-    );
-    if (
-      manifest.format !== "SANCTUARY_REP_V1" ||
-      manifest.exported_at !== bundle.exported_at ||
-      manifest.total_attestation_count !== bundle.attestations.length ||
-      canonicalJson(manifest) !== canonicalJson(expectedManifest)
-    ) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle completeness manifest does not match contents"
-      );
-    }
-
+    const completenessVerification = verifyReputationBundleCompleteness(bundle, {
+      allowUnverifiedLegacy,
+    });
     this.verifyBundleSignature(bundle, publicKeys);
 
-    return "verified";
+    return completenessVerification;
   }
 
   private verifyBundleSignature(

@@ -251,7 +251,7 @@ export interface ExitBundleManifest {
  */
 export interface ExitBundleVerifierResult {
   version: "1.1";
-  /** True iff manifest signature, every artifact hash, and the aggregate hash all verify. */
+  /** True iff manifest, artifacts, and offline artifact-level checks all verify. */
   passed: boolean;
   /** ISO8601 timestamp of verification. */
   verified_at: string;
@@ -295,6 +295,7 @@ export interface ExitBundleVerifierResult {
     // the warnings array.
     | "identity_signature_invalid"
     | "reputation_bundle_signature_invalid"
+    | "reputation_completeness_mismatch"
     | "reputation_attestation_signature_invalid"
     | "reputation_unverifiable_attestations"
     | "other";
