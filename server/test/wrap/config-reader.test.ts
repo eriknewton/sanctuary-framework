@@ -158,20 +158,37 @@ describe("Config Reader", () => {
       });
     });
 
-    it("does not detect non-Mastra flat mcpServers as Mastra", async () => {
+    it("detects non-Mastra flat mcpServers as generic MCP, not Mastra", async () => {
       await withTempHome(async (home) => {
         const configPath = join(home, "generic", "mcp.json");
         const config = { mcpServers: {} };
         await writeJsonConfig(configPath, config);
 
         const schema = detectHarnessSchema(configPath, config);
-        expect(schema.kind).toBe("claude-code");
+        expect(schema.kind).toBe("generic");
         expect(schema.kind).not.toBe("mastra");
 
         const result = await detectAgentConfig(undefined, configPath);
         expect(result).not.toBeNull();
-        expect(result!.platform).toBe("claude-code");
+        expect(result!.platform).toBe("generic");
         expect(result!.platform).not.toBe("mastra");
+      });
+    });
+
+    it("detects bare claude.json with flat mcpServers as generic MCP, not Claude Code", async () => {
+      await withTempHome(async (home) => {
+        const configPath = join(home, "generic", "claude.json");
+        const config = { mcpServers: {} };
+        await writeJsonConfig(configPath, config);
+
+        const schema = detectHarnessSchema(configPath, config);
+        expect(schema.kind).toBe("generic");
+        expect(schema.kind).not.toBe("claude-code");
+
+        const result = await detectAgentConfig(undefined, configPath);
+        expect(result).not.toBeNull();
+        expect(result!.platform).toBe("generic");
+        expect(result!.platform).not.toBe("claude-code");
       });
     });
 
