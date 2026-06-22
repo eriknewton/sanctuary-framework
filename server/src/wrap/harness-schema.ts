@@ -59,8 +59,7 @@ export function detectHarnessSchema(
     file === ".claude.json" ||
     file === "claude_desktop_config.json" ||
     normalizedPath.includes("/.claude/") ||
-    normalizedPath.includes("/claude-code/") ||
-    hasPlainObject(obj.mcpServers)
+    normalizedPath.includes("/claude-code/")
   ) {
     return { kind: "claude-code", nativeKey: "mcpServers" };
   }
