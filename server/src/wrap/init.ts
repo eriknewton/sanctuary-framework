@@ -56,7 +56,11 @@ import {
   RecoveryKeyReentryMismatchError,
   type DiscloseRecoveryKeyResult,
 } from "./recovery-key-disclosure.js";
-import { DEFAULT_STORAGE_DIR } from "../paths.js";
+import {
+  DEFAULT_STORAGE_DIR,
+  formatFortressPathWritableError,
+  preflightFortressPathWritable,
+} from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
 /**
@@ -208,6 +212,18 @@ export async function runInit(
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
     throw err;
+  }
+
+  const fortressWritable = await preflightFortressPathWritable(fortressPath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: ${formatFortressPathWritableError(
+        fortressPath,
+        fortressWritable,
+      )}\n`,
+    );
+    throw new Error("fortress path is not writable");
   }
 
   if (!options.force) {
