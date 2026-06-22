@@ -538,25 +538,11 @@ export class ReputationStore {
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
     await enforceCustodyFloor(this.storage, "reputation_import", this.masterKey);
 
-    const completenessVerification = this.verifyBundleCompleteness(
+    const verification = this.verifyBundle(
       bundle,
       publicKeys,
-      options.allowUnverifiedLegacy === true
+      options
     );
-
-    const attestationVerification = this.inspectAttestationSignatures(
-      bundle,
-      publicKeys,
-      options.allowUnverifiableAttestations === true
-    );
-    const { invalid, unverifiable } = attestationVerification;
-    if (invalid > 0) {
-      throw new ReputationBundleVerificationError(
-        "Reputation bundle contains attestations with invalid or unverifiable signatures",
-        invalid,
-        unverifiable
-      );
-    }
 
     let imported = 0;
     const contexts = new Set<string>();
@@ -584,9 +570,57 @@ export class ReputationStore {
 
     return {
       imported,
+      invalid: verification.invalid,
+      unverifiable: verification.unverifiable,
+      contexts: Array.from(contexts),
+      completeness_verification: verification.completeness_verification,
+    };
+  }
+
+  /**
+   * Verify a reputation bundle without writing imported attestations.
+   * This is the exact semantic verification that importBundle uses after
+   * its custody gate and before the first _reputation write.
+   */
+  verifyBundle(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>,
+    options: {
+      allowUnverifiedLegacy?: boolean;
+      allowUnverifiableAttestations?: boolean;
+    } = {}
+  ): {
+    invalid: number;
+    unverifiable: number;
+    contexts: string[];
+    completeness_verification: ReputationBundleCompletenessVerification;
+  } {
+    const completenessVerification = this.verifyBundleCompleteness(
+      bundle,
+      publicKeys,
+      options.allowUnverifiedLegacy === true
+    );
+
+    const attestationVerification = this.inspectAttestationSignatures(
+      bundle,
+      publicKeys,
+      options.allowUnverifiableAttestations === true
+    );
+    const { invalid, unverifiable } = attestationVerification;
+    if (invalid > 0) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle contains attestations with invalid or unverifiable signatures",
+        invalid,
+        unverifiable
+      );
+    }
+
+    return {
       invalid,
       unverifiable,
-      contexts: Array.from(contexts),
+      contexts: Array.from(
+        new Set(bundle.attestations.map((attestation) => attestation.data.context))
+      ),
       completeness_verification: completenessVerification,
     };
   }
