@@ -39,6 +39,8 @@ mod linux {
     const CHILD_PLUGIN_FILE_READ_EPERM: i32 = 27;
     const CHILD_PLUGIN_SOCKETPAIR_INET_NOT_DENIED: i32 = 28;
     const CHILD_PLUGIN_CLONE3_NOT_DENIED: i32 = 29;
+    const CHILD_PLUGIN_SECCOMP_NOT_DENIED: i32 = 30;
+    const CHILD_PLUGIN_PRCTL_NOT_DENIED: i32 = 31;
 
     #[test]
     fn in_process_confinement_denies_only_af_vsock_three_times() {
@@ -174,6 +176,12 @@ else:
         if clone3_result() != Err(libc::EPERM) {
             return CHILD_PLUGIN_CLONE3_NOT_DENIED;
         }
+        if seccomp_result() != Err(libc::EPERM) {
+            return CHILD_PLUGIN_SECCOMP_NOT_DENIED;
+        }
+        if prctl_set_dumpable_result() != Err(libc::EPERM) {
+            return CHILD_PLUGIN_PRCTL_NOT_DENIED;
+        }
         if std::fs::read("/etc/hosts")
             .err()
             .and_then(|err| err.raw_os_error())
@@ -277,6 +285,24 @@ else:
         let rc =
             unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0usize) };
         if rc >= 0 {
+            Ok(())
+        } else {
+            Err(last_errno())
+        }
+    }
+
+    fn seccomp_result() -> Result<(), i32> {
+        let rc = unsafe { libc::syscall(libc::SYS_seccomp, u32::MAX, 0usize, 0usize) };
+        if rc >= 0 {
+            Ok(())
+        } else {
+            Err(last_errno())
+        }
+    }
+
+    fn prctl_set_dumpable_result() -> Result<(), i32> {
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+        if rc == 0 {
             Ok(())
         } else {
             Err(last_errno())

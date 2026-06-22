@@ -28,6 +28,7 @@ pub const NR_SOCKET_X86_64: u32 = 41;
 pub const NR_SOCKET_AARCH64: u32 = 198;
 pub const NR_SOCKETPAIR_X86_64: u32 = 53;
 pub const NR_SOCKETPAIR_AARCH64: u32 = 199;
+pub const X86_64_X32_SYSCALL_BIT: u32 = 0x4000_0000;
 pub const AF_VSOCK_LINUX: u32 = 40;
 pub const AF_UNIX_LINUX: u32 = 1;
 pub const AF_INET_LINUX: u32 = 2;
@@ -275,6 +276,90 @@ pub const PLUGIN_V1_DENIED_X86_64: &[NamedSyscall] = &[
         name: "fanotify_init",
         nr: 300,
     },
+    NamedSyscall {
+        name: "seccomp",
+        nr: 317,
+    },
+    NamedSyscall {
+        name: "prctl",
+        nr: 157,
+    },
+    NamedSyscall {
+        name: "setuid",
+        nr: 105,
+    },
+    NamedSyscall {
+        name: "setgid",
+        nr: 106,
+    },
+    NamedSyscall {
+        name: "setresuid",
+        nr: 117,
+    },
+    NamedSyscall {
+        name: "setresgid",
+        nr: 119,
+    },
+    NamedSyscall {
+        name: "setreuid",
+        nr: 113,
+    },
+    NamedSyscall {
+        name: "setregid",
+        nr: 114,
+    },
+    NamedSyscall {
+        name: "setfsuid",
+        nr: 122,
+    },
+    NamedSyscall {
+        name: "setfsgid",
+        nr: 123,
+    },
+    NamedSyscall {
+        name: "capset",
+        nr: 126,
+    },
+    NamedSyscall {
+        name: "personality",
+        nr: 135,
+    },
+    NamedSyscall {
+        name: "modify_ldt",
+        nr: 154,
+    },
+    NamedSyscall {
+        name: "iopl",
+        nr: 172,
+    },
+    NamedSyscall {
+        name: "ioperm",
+        nr: 173,
+    },
+    NamedSyscall {
+        name: "mknod",
+        nr: 133,
+    },
+    NamedSyscall {
+        name: "mknodat",
+        nr: 259,
+    },
+    NamedSyscall {
+        name: "memfd_create",
+        nr: 319,
+    },
+    NamedSyscall {
+        name: "landlock_create_ruleset",
+        nr: 444,
+    },
+    NamedSyscall {
+        name: "landlock_add_rule",
+        nr: 445,
+    },
+    NamedSyscall {
+        name: "landlock_restrict_self",
+        nr: 446,
+    },
 ];
 
 pub const PLUGIN_V1_DENIED_AARCH64: &[NamedSyscall] = &[
@@ -465,6 +550,74 @@ pub const PLUGIN_V1_DENIED_AARCH64: &[NamedSyscall] = &[
     NamedSyscall {
         name: "fanotify_init",
         nr: 262,
+    },
+    NamedSyscall {
+        name: "seccomp",
+        nr: 277,
+    },
+    NamedSyscall {
+        name: "prctl",
+        nr: 167,
+    },
+    NamedSyscall {
+        name: "setuid",
+        nr: 146,
+    },
+    NamedSyscall {
+        name: "setgid",
+        nr: 144,
+    },
+    NamedSyscall {
+        name: "setresuid",
+        nr: 147,
+    },
+    NamedSyscall {
+        name: "setresgid",
+        nr: 149,
+    },
+    NamedSyscall {
+        name: "setreuid",
+        nr: 145,
+    },
+    NamedSyscall {
+        name: "setregid",
+        nr: 143,
+    },
+    NamedSyscall {
+        name: "setfsuid",
+        nr: 151,
+    },
+    NamedSyscall {
+        name: "setfsgid",
+        nr: 152,
+    },
+    NamedSyscall {
+        name: "capset",
+        nr: 91,
+    },
+    NamedSyscall {
+        name: "personality",
+        nr: 92,
+    },
+    NamedSyscall {
+        name: "mknodat",
+        nr: 33,
+    },
+    NamedSyscall {
+        name: "memfd_create",
+        nr: 279,
+    },
+    NamedSyscall {
+        name: "landlock_create_ruleset",
+        nr: 444,
+    },
+    NamedSyscall {
+        name: "landlock_add_rule",
+        nr: 445,
+    },
+    NamedSyscall {
+        name: "landlock_restrict_self",
+        nr: 446,
     },
 ];
 
@@ -766,6 +919,9 @@ const fn ret(k: u32) -> BpfInstruction {
 fn build_plugin_v1_arch_branch(table: PluginV1SyscallTable) -> Vec<BpfInstruction> {
     let mut branch = Vec::new();
     branch.push(load_abs(SECCOMP_DATA_NR_OFFSET));
+    if table.arch == AUDIT_ARCH_X86_64 {
+        append_x32_syscall_deny(&mut branch);
+    }
     append_socket_family_gate(&mut branch, table.socket);
     append_socket_family_gate(&mut branch, table.socketpair);
     append_clone_namespace_gate(&mut branch, table.clone);
@@ -775,6 +931,11 @@ fn build_plugin_v1_arch_branch(table: PluginV1SyscallTable) -> Vec<BpfInstructio
     }
     branch.push(ret(SECCOMP_RET_ALLOW));
     branch
+}
+
+fn append_x32_syscall_deny(branch: &mut Vec<BpfInstruction>) {
+    branch.push(jump_set(X86_64_X32_SYSCALL_BIT, 0, 1));
+    branch.push(ret(SECCOMP_RET_ERRNO_EPERM));
 }
 
 fn append_socket_family_gate(branch: &mut Vec<BpfInstruction>, syscall_nr: u32) {
@@ -829,6 +990,27 @@ const _: () = {
     assert!(PLUGIN_V1_DENIED_X86_64[9].nr as libc::c_long == libc::SYS_perf_event_open);
     assert!(PLUGIN_V1_DENIED_X86_64[10].nr as libc::c_long == libc::SYS_bpf);
     assert!(PLUGIN_V1_DENIED_X86_64[11].nr as libc::c_long == libc::SYS_clone3);
+    assert!(PLUGIN_V1_DENIED_X86_64[47].nr as libc::c_long == libc::SYS_seccomp);
+    assert!(PLUGIN_V1_DENIED_X86_64[48].nr as libc::c_long == libc::SYS_prctl);
+    assert!(PLUGIN_V1_DENIED_X86_64[49].nr as libc::c_long == libc::SYS_setuid);
+    assert!(PLUGIN_V1_DENIED_X86_64[50].nr as libc::c_long == libc::SYS_setgid);
+    assert!(PLUGIN_V1_DENIED_X86_64[51].nr as libc::c_long == libc::SYS_setresuid);
+    assert!(PLUGIN_V1_DENIED_X86_64[52].nr as libc::c_long == libc::SYS_setresgid);
+    assert!(PLUGIN_V1_DENIED_X86_64[53].nr as libc::c_long == libc::SYS_setreuid);
+    assert!(PLUGIN_V1_DENIED_X86_64[54].nr as libc::c_long == libc::SYS_setregid);
+    assert!(PLUGIN_V1_DENIED_X86_64[55].nr as libc::c_long == libc::SYS_setfsuid);
+    assert!(PLUGIN_V1_DENIED_X86_64[56].nr as libc::c_long == libc::SYS_setfsgid);
+    assert!(PLUGIN_V1_DENIED_X86_64[57].nr as libc::c_long == libc::SYS_capset);
+    assert!(PLUGIN_V1_DENIED_X86_64[58].nr as libc::c_long == libc::SYS_personality);
+    assert!(PLUGIN_V1_DENIED_X86_64[59].nr as libc::c_long == libc::SYS_modify_ldt);
+    assert!(PLUGIN_V1_DENIED_X86_64[60].nr as libc::c_long == libc::SYS_iopl);
+    assert!(PLUGIN_V1_DENIED_X86_64[61].nr as libc::c_long == libc::SYS_ioperm);
+    assert!(PLUGIN_V1_DENIED_X86_64[62].nr as libc::c_long == libc::SYS_mknod);
+    assert!(PLUGIN_V1_DENIED_X86_64[63].nr as libc::c_long == libc::SYS_mknodat);
+    assert!(PLUGIN_V1_DENIED_X86_64[64].nr as libc::c_long == libc::SYS_memfd_create);
+    assert!(PLUGIN_V1_DENIED_X86_64[65].nr as libc::c_long == libc::SYS_landlock_create_ruleset);
+    assert!(PLUGIN_V1_DENIED_X86_64[66].nr as libc::c_long == libc::SYS_landlock_add_rule);
+    assert!(PLUGIN_V1_DENIED_X86_64[67].nr as libc::c_long == libc::SYS_landlock_restrict_self);
 };
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -849,6 +1031,23 @@ const _: () = {
     assert!(PLUGIN_V1_DENIED_AARCH64[9].nr as libc::c_long == libc::SYS_perf_event_open);
     assert!(PLUGIN_V1_DENIED_AARCH64[10].nr as libc::c_long == libc::SYS_bpf);
     assert!(PLUGIN_V1_DENIED_AARCH64[11].nr as libc::c_long == libc::SYS_clone3);
+    assert!(PLUGIN_V1_DENIED_AARCH64[47].nr as libc::c_long == libc::SYS_seccomp);
+    assert!(PLUGIN_V1_DENIED_AARCH64[48].nr as libc::c_long == libc::SYS_prctl);
+    assert!(PLUGIN_V1_DENIED_AARCH64[49].nr as libc::c_long == libc::SYS_setuid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[50].nr as libc::c_long == libc::SYS_setgid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[51].nr as libc::c_long == libc::SYS_setresuid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[52].nr as libc::c_long == libc::SYS_setresgid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[53].nr as libc::c_long == libc::SYS_setreuid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[54].nr as libc::c_long == libc::SYS_setregid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[55].nr as libc::c_long == libc::SYS_setfsuid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[56].nr as libc::c_long == libc::SYS_setfsgid);
+    assert!(PLUGIN_V1_DENIED_AARCH64[57].nr as libc::c_long == libc::SYS_capset);
+    assert!(PLUGIN_V1_DENIED_AARCH64[58].nr as libc::c_long == libc::SYS_personality);
+    assert!(PLUGIN_V1_DENIED_AARCH64[59].nr as libc::c_long == libc::SYS_mknodat);
+    assert!(PLUGIN_V1_DENIED_AARCH64[60].nr as libc::c_long == libc::SYS_memfd_create);
+    assert!(PLUGIN_V1_DENIED_AARCH64[61].nr as libc::c_long == libc::SYS_landlock_create_ruleset);
+    assert!(PLUGIN_V1_DENIED_AARCH64[62].nr as libc::c_long == libc::SYS_landlock_add_rule);
+    assert!(PLUGIN_V1_DENIED_AARCH64[63].nr as libc::c_long == libc::SYS_landlock_restrict_self);
 };
 
 #[cfg(test)]
@@ -924,6 +1123,34 @@ mod tests {
     }
 
     #[test]
+    fn plugin_v1_x86_64_denies_x32_syscall_numbers_before_native_gates() {
+        let branch = build_plugin_v1_arch_branch(PLUGIN_V1_X86_64_SYSCALLS);
+        assert_eq!(branch[0], load_abs(SECCOMP_DATA_NR_OFFSET));
+        assert_eq!(branch[1], jump_set(X86_64_X32_SYSCALL_BIT, 0, 1));
+        assert_eq!(branch[2], ret(SECCOMP_RET_ERRNO_EPERM));
+
+        let program = build_plugin_v1_filter();
+        for native_nr in [
+            NR_SOCKET_X86_64,
+            syscall_nr_by_name(PLUGIN_V1_DENIED_X86_64, "ptrace"),
+            syscall_nr_by_name(PLUGIN_V1_DENIED_X86_64, "bpf"),
+            syscall_nr_by_name(PLUGIN_V1_DENIED_X86_64, "clone3"),
+            syscall_nr_by_name(PLUGIN_V1_DENIED_X86_64, "seccomp"),
+        ] {
+            assert_eq!(
+                simulate(
+                    &program,
+                    AUDIT_ARCH_X86_64,
+                    X86_64_X32_SYSCALL_BIT | native_nr,
+                    AF_UNIX_LINUX
+                ),
+                SECCOMP_RET_ERRNO_EPERM,
+                "x32-numbered syscall {native_nr} should deny"
+            );
+        }
+    }
+
+    #[test]
     fn plugin_v1_allows_only_af_unix_socket_families() {
         let program = build_plugin_v1_filter();
         for table in plugin_v1_tables() {
@@ -990,6 +1217,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn plugin_v1_denies_seccomp_and_prctl_for_both_arches() {
+        let program = build_plugin_v1_filter();
+        for table in plugin_v1_tables() {
+            assert_denies_named_syscalls(&program, table, &["seccomp", "prctl"]);
+        }
+    }
+
+    #[test]
+    fn plugin_v1_denies_credential_capability_personality_device_and_landlock_syscalls() {
+        let program = build_plugin_v1_filter();
+        assert_denies_named_syscalls(
+            &program,
+            PLUGIN_V1_X86_64_SYSCALLS,
+            &[
+                "setuid",
+                "setgid",
+                "setresuid",
+                "setresgid",
+                "setreuid",
+                "setregid",
+                "setfsuid",
+                "setfsgid",
+                "capset",
+                "personality",
+                "modify_ldt",
+                "iopl",
+                "ioperm",
+                "mknod",
+                "mknodat",
+                "memfd_create",
+                "landlock_create_ruleset",
+                "landlock_add_rule",
+                "landlock_restrict_self",
+            ],
+        );
+        assert_denies_named_syscalls(
+            &program,
+            PLUGIN_V1_AARCH64_SYSCALLS,
+            &[
+                "setuid",
+                "setgid",
+                "setresuid",
+                "setresgid",
+                "setreuid",
+                "setregid",
+                "setfsuid",
+                "setfsgid",
+                "capset",
+                "personality",
+                "mknodat",
+                "memfd_create",
+                "landlock_create_ruleset",
+                "landlock_add_rule",
+                "landlock_restrict_self",
+            ],
+        );
     }
 
     #[test]
@@ -1073,6 +1359,31 @@ mod tests {
 
     fn plugin_v1_tables() -> [PluginV1SyscallTable; 2] {
         [PLUGIN_V1_X86_64_SYSCALLS, PLUGIN_V1_AARCH64_SYSCALLS]
+    }
+
+    fn assert_denies_named_syscalls(
+        program: &[BpfInstruction],
+        table: PluginV1SyscallTable,
+        names: &[&str],
+    ) {
+        for name in names {
+            let nr = syscall_nr_by_name(table.denied, name);
+            assert_eq!(
+                simulate(program, table.arch, nr, 0),
+                SECCOMP_RET_ERRNO_EPERM,
+                "{} should deny {}",
+                table.arch_name,
+                name
+            );
+        }
+    }
+
+    fn syscall_nr_by_name(syscalls: &[NamedSyscall], name: &str) -> u32 {
+        syscalls
+            .iter()
+            .find(|syscall| syscall.name == name)
+            .unwrap_or_else(|| panic!("missing syscall {name}"))
+            .nr
     }
 
     fn simulate(program: &[BpfInstruction], arch: u32, nr: u32, arg0: u32) -> u32 {
