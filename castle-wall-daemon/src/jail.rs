@@ -1362,6 +1362,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plugin_v1_filter_stays_within_bpf_maxinsns() {
+        // BPF_MAXINSNS is the kernel's hard ceiling on a classic-BPF seccomp
+        // program: prctl(PR_SET_SECCOMP) returns EINVAL for any filter with
+        // more than 4096 instructions, which would fail OPEN (the confined
+        // process never gets a filter installed). `checked_jump_offset` only
+        // guards each branch's per-instruction u8 jump range (<= 255); it does
+        // NOT bound the total program length. This test is the missing
+        // total-length guard: it fails the build if future deny-table growth
+        // pushes the assembled plugin-v1 program past the kernel limit, before
+        // that growth can silently fail open at install time on Linux.
+        const BPF_MAXINSNS: usize = 4096;
+        let program = build_plugin_v1_filter();
+        assert!(
+            program.len() < BPF_MAXINSNS,
+            "plugin-v1 BPF program has {} instructions; must stay under BPF_MAXINSNS ({}) \
+             or prctl(PR_SET_SECCOMP) fails open on Linux",
+            program.len(),
+            BPF_MAXINSNS
+        );
+    }
+
     fn plugin_v1_tables() -> [PluginV1SyscallTable; 2] {
         [PLUGIN_V1_X86_64_SYSCALLS, PLUGIN_V1_AARCH64_SYSCALLS]
     }
