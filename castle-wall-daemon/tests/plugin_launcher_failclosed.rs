@@ -288,12 +288,20 @@ mod linux {
         assert_fail_closed(&run, "step2 (assemble_rootfs) with missing bundle");
     }
 
-    /// Step 3 (cgroup join): force failure by pointing at a cgroup path with no
-    /// writable `cgroup.procs`. We give a valid bundle + scratch so steps 1-2
-    /// can proceed (under root), then the cgroup write fails -> abort, report
-    /// absent, entry never runs.
+    /// Forces a cgroup-join failure by pointing at a cgroup path with no writable
+    /// `cgroup.procs`. The intent is to exercise step 3 (cgroup join), but on
+    /// hosted CI runners the tmpfs used for the bundle dir hits EOVERFLOW (os
+    /// error 75) at step 2 (`assemble_rootfs` -> `create_dir_all(bundle_dst)`),
+    /// so step 3 is never reached there. What this test actually asserts in CI is
+    /// the *generic* fail-closed triple from a forced pre-exec failure: non-zero
+    /// exit, realized-confinement report absent, entry sentinel never created.
+    ///
+    /// Per-step behavioral verification (each step reached and forced
+    /// individually) is deferred to the Phase B hostile-probe drill on a real
+    /// Linux host (N >= 3), which is the gate the spec requires for the
+    /// "contained" claim.
     #[test]
-    fn step3_cgroup_join_failure_is_fail_closed() {
+    fn forced_cgroup_failure_is_fail_closed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let bundle = tmp.path().join("bundle");
         std::fs::create_dir_all(bundle.join("bin")).expect("bundle/bin");
@@ -312,20 +320,28 @@ mod linux {
             "bin/entry",
         );
         let run = run_forced(&args, 3, 4, &sentinel);
-        assert_fail_closed(&run, "step3 (cgroup join) with un-writable cgroup.procs");
+        assert_fail_closed(&run, "forced cgroup failure (or earlier pre-exec abort) is fail-closed");
     }
 
-    /// Steps 1, 4, 5, 6, 7: these either succeed under root (unshare, netns,
-    /// scrub, confine) or are the exec itself. The report-absence invariant for
-    /// an EARLY abort is proven by step2/step3 above. Here we additionally prove
-    /// that an exec failure (step 7) -- the last step, after the report is
-    /// written -- still exits non-zero and never falls through to running an
-    /// unconfined program. We force exec failure with a missing entry binary
-    /// inside an otherwise-buildable sandbox. Because the seccomp filter is
-    /// already installed (step 6) before exec, this also confirms the abort is
-    /// reached from inside confinement.
+    /// Forces an exec failure by supplying a missing entry binary. The intent is
+    /// to exercise step 7 (execve), but on hosted CI runners the tmpfs used for
+    /// the bundle dir hits EOVERFLOW (os error 75) at step 2 (`assemble_rootfs`
+    /// -> `create_dir_all(bundle_dst)`), so step 7 is never reached there.
+    /// Additionally, `real_writable_cgroup_or_fake` falls back to a fake cgroup
+    /// on runners without writable cgroupfs, which aborts at step 3 even if
+    /// step 2 were to succeed.
+    ///
+    /// What this test actually asserts in CI is the *generic* fail-closed triple
+    /// from a forced pre-exec failure: non-zero exit, realized-confinement report
+    /// absent, entry sentinel never created. The assertion is correct regardless
+    /// of which step aborts first.
+    ///
+    /// Per-step behavioral verification (reaching step 7 inside the seccomp
+    /// filter and forcing exec failure there specifically) is deferred to the
+    /// Phase B hostile-probe drill on a real Linux host (N >= 3), which is the
+    /// gate the spec requires for the "contained" and "inside confinement" claim.
     #[test]
-    fn step7_exec_failure_exits_nonzero() {
+    fn forced_exec_failure_is_fail_closed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let bundle = tmp.path().join("bundle");
         std::fs::create_dir_all(bundle.join("bin")).expect("bundle/bin");
@@ -347,7 +363,7 @@ mod linux {
         assert_eq!(
             run.exit_code,
             Some(1),
-            "exec failure (or earlier abort) must exit non-zero"
+            "forced exec failure (or earlier pre-exec abort) must exit non-zero"
         );
         assert!(
             !run.sentinel_exists,
