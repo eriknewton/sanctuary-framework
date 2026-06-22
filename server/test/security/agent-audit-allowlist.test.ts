@@ -922,6 +922,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "coordination/handoff-log.ts",
     // query-anonymity routes — operator analytics
     "query-anonymity/query-anonymity-routes.ts",
+    // posture routes — operator/principal Evidence View (Phase 2 section 2.5):
+    // the filterable audit-entry table at /api/posture/evidence.  Full-fidelity
+    // read behind the SAME checkAuth gate as /api/audit-log; never agent-facing.
+    "principal-policy/posture-routes.ts",
     // principal Exit bundle — full-fidelity receipts, Tier-1 approval-gated
     "exit/bundle.ts",
   ] as const;

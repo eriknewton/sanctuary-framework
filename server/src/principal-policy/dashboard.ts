@@ -67,6 +67,7 @@ import {
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
   POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
@@ -247,7 +248,11 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     // operator page load), so it is exempt from the general rate limit the
     // same way `/posture` and `/fortress` are. Its data fetches still hit the
     // throttled JSON endpoints.
-    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+    // The Evidence View HTML shell is a dashboard view route: an operator page
+    // load that loads the filterable audit table. Its data fetch (`GET
+    // /api/posture/evidence`) still hits the throttled JSON endpoints.
+    path === POSTURE_EVIDENCE_PATH
   );
 }
 
@@ -2674,6 +2679,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+      // Phase 2: the Evidence View HTML shell is served by the posture router
+      // AFTER checkAuth (same gate), so it gets the same auth model as the
+      // per-agent drill-down and the JSON endpoints.
+      url.pathname === POSTURE_EVIDENCE_PATH ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
       // Phase 2: the query-privacy stats endpoint is dispatched through the
