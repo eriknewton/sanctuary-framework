@@ -84,7 +84,12 @@ import {
 import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
-import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
+import {
+  formatFortressPathWritableError,
+  preflightFortressPathWritable,
+  resolveStoragePath,
+  resolveDashboardPort,
+} from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
 import {
   registerHostTenant,
@@ -622,6 +627,17 @@ export async function runWrap(
   // profile, backup dir, and every other on-disk artifact land in the same
   // per-tenant location when SANCTUARY_STORAGE_PATH is set.
   const storagePath = resolveStoragePath();
+  const fortressWritable = await preflightFortressPathWritable(storagePath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary wrap: ${formatFortressPathWritableError(
+        storagePath,
+        fortressWritable,
+      )}\n`,
+    );
+    process.exit(2);
+  }
 
   // Resolve or generate passphrase.
   //

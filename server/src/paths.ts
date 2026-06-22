@@ -9,14 +9,80 @@
  * helpers so two instances on the same host can pick distinct locations.
  */
 
+import { access, constants, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** Default top-level storage directory when no env override is set. */
 export const DEFAULT_STORAGE_DIR = ".sanctuary";
 
 /** Default dashboard port — matched by config.ts default. */
 export const DEFAULT_DASHBOARD_PORT = 3501;
+
+export type FortressPathWritableResult =
+  | { ok: true }
+  | { ok: false; path: string; reason: string };
+
+const ACCESS_FAILURE_CODES = new Set(["EACCES", "EROFS", "ENOENT"]);
+
+/**
+ * Check only the filesystem location that `mkdir -p <fortressPath>` needs.
+ *
+ * If the fortress path exists, check that exact path. If it does not exist,
+ * check the nearest existing ancestor. Unknown filesystem states are allowed
+ * to continue so this preflight never becomes stricter than the later write.
+ */
+export async function preflightFortressPathWritable(
+  fortressPath: string,
+): Promise<FortressPathWritableResult> {
+  const targetPath = resolve(fortressPath);
+  let currentPath = targetPath;
+
+  while (true) {
+    try {
+      await stat(currentPath);
+      return checkWritable(currentPath);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code !== "ENOENT") {
+        const accessResult = await checkWritable(currentPath);
+        return accessResult.ok ? { ok: true } : accessResult;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        return { ok: false, path: currentPath, reason: "ENOENT" };
+      }
+      currentPath = parentPath;
+    }
+  }
+}
+
+export function formatFortressPathWritableError(
+  fortressPath: string,
+  result: Exclude<FortressPathWritableResult, { ok: true }>,
+): string {
+  return `Sanctuary cannot create its secure storage at ${fortressPath}: ${result.reason}. Make sure you can write to ${result.path}, or pass --fortress <writable-path> to choose a different location.`;
+}
+
+async function checkWritable(path: string): Promise<FortressPathWritableResult> {
+  try {
+    await access(path, constants.W_OK);
+    return { ok: true };
+  } catch (error) {
+    const reason = errorCode(error);
+    if (reason && ACCESS_FAILURE_CODES.has(reason)) {
+      return { ok: false, path, reason };
+    }
+    return { ok: true };
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
 
 /**
  * Resolve the storage path for a Sanctuary instance.
