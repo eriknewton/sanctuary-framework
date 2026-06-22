@@ -1907,7 +1907,11 @@ export async function importExitBundle(
     const imported = await reputationStore.importBundle(
       reputationArtifact.json,
       true,
-      publicKeys.byDid
+      publicKeys.byDid,
+      {
+        allowUnverifiableAttestations:
+          opts.acceptUnverifiableAttestations === true,
+      }
     );
     reputationResult = {
       imported_attestations: imported.imported,
