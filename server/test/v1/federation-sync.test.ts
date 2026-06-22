@@ -114,6 +114,17 @@ async function sync(token: string, payload: Record<string, unknown>) {
   });
 }
 
+async function latestSyncAudit(identityId: string) {
+  const { entries } = await rig.auditLog.query({
+    layer: "l2",
+    operation_type: "v1_federation_sync",
+    identity_id: identityId,
+    limit: 20,
+  });
+  expect(entries.length).toBeGreaterThan(0);
+  return entries[entries.length - 1]!;
+}
+
 describe("/v1/nodes + /v1/federation/sync", () => {
   it("lists joined nodes with attestation and sync metadata", async () => {
     const token = await openDurableSession(rig);
@@ -130,6 +141,15 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       operatorSigned("/v1/federation/sync", currentSyncPayload(payload)),
     );
     expect(res.status).toBe(200);
+    const audit = await latestSyncAudit("linux-1");
+    expect(audit.result).toBe("success");
+    expect(audit.details).toEqual(
+      expect.objectContaining({
+        accepted: 1,
+        rejected: 0,
+        sender_revoked: false,
+      }),
+    );
 
     const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -229,11 +249,24 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       { event_id: linuxEvent.event_id, reason: "node_revoked" },
     ]);
     expect(body.events).toBeUndefined();
+    const audit = await latestSyncAudit("linux-1");
+    expect(audit.result).toBe("failure");
+    expect(audit.details).toEqual(
+      expect.objectContaining({
+        accepted: 0,
+        rejected: 1,
+        sender_revoked: true,
+      }),
+    );
 
     const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(((await nodesRes.json()) as { nodes: unknown[] }).nodes).toHaveLength(0);
+    const events = (rig.dashboard as unknown as {
+      listFederationEvents(): FederationEvent[];
+    }).listFederationEvents();
+    expect(events.map((event) => event.event_id)).not.toContain(linuxEvent.event_id);
   });
 
   it("rejects a tampered operator signature before appending events", async () => {

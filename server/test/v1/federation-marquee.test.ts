@@ -72,6 +72,7 @@ interface NodeDaemon {
   dashboard: DashboardApprovalChannel;
   baseUrl: string;
   node: FortressNode;
+  auditLog: AuditLog;
   stop: () => Promise<void>;
 }
 
@@ -116,6 +117,7 @@ async function startNodeDaemon(node: FortressNode): Promise<NodeDaemon> {
     dashboard,
     baseUrl: `http://127.0.0.1:${port}`,
     node,
+    auditLog,
     stop: () => dashboard.stop(),
   };
 }
@@ -203,6 +205,16 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
     if (!result.ok) return;
     // linux-1 accepted mac-1's agent.identity event after cert-chain verifying it.
     expect(result.acceptedByPeer).toContain("mac-1:1");
+    const audit = await latestPeerSyncAudit(linux1, "mac-1");
+    expect(audit.result).toBe("success");
+    expect(audit.details).toEqual(
+      expect.objectContaining({
+        accepted: 1,
+        rejected: 0,
+        sender_revoked: false,
+        reply_suppressed: false,
+      }),
+    );
 
     // Cross-machine unified view: linux-1's /v1/nodes now lists mac-1 as a
     // VERIFIED node, and linux-1's log recognizes the portable agent without
@@ -403,6 +415,17 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
     });
     expect(body.envelope).toBeUndefined();
     expect(body.events).toBeUndefined();
+    const audit = await latestPeerSyncAudit(linux1, "mac-1");
+    expect(audit.result).toBe("failure");
+    expect(audit.details).toEqual(
+      expect.objectContaining({
+        accepted: 1,
+        rejected: 1,
+        high_water: 1,
+        sender_revoked: true,
+        reply_suppressed: true,
+      }),
+    );
     const linuxEvents = (linux1.dashboard as unknown as {
       listFederationEvents(): FederationEvent[];
     }).listFederationEvents();
@@ -725,6 +748,17 @@ async function postPeer(
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(envelope),
   });
+}
+
+async function latestPeerSyncAudit(daemon: NodeDaemon, identityId: string) {
+  const { entries } = await daemon.auditLog.query({
+    layer: "l2",
+    operation_type: "v1_federation_sync_peer",
+    identity_id: identityId,
+    limit: 20,
+  });
+  expect(entries.length).toBeGreaterThan(0);
+  return entries[entries.length - 1]!;
 }
 
 function makeEvent(
