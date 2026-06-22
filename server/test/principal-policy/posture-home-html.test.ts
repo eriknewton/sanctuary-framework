@@ -8,6 +8,75 @@ import {
 import type { FeatureHealthStatus } from "../../src/principal-policy/feature-health.js";
 import type { CustodyState } from "../../src/principal-policy/posture.js";
 
+type StoryDigestFixture = {
+  total_operations: number;
+  kernel_blocks: number;
+  kernel_allows: number;
+  approvals_denied: number;
+  approvals_granted: number;
+  chain_verified: boolean;
+  integrity_finding_count: number;
+};
+
+type StoryHarness = {
+  renderStory: (digest: StoryDigestFixture) => void;
+  wireStoryToggle: () => void;
+  storyEl: { innerHTML: string };
+  toggle: {
+    checked: boolean;
+    listeners: Record<string, () => void>;
+    addEventListener: (event: string, listener: () => void) => void;
+  };
+  store: Record<string, string>;
+};
+
+function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
+  const html = renderPostureHomeHTML();
+  const escStart = html.indexOf("function esc(s)");
+  const escEnd = html.indexOf('  // "Never fake green": ARMED');
+  const storyStart = html.indexOf("var STORY_PLAIN_SUMMARY_KEY");
+  const storyEnd = html.indexOf("function renderAnomalies(findings)");
+  expect(escStart).toBeGreaterThan(-1);
+  expect(escEnd).toBeGreaterThan(escStart);
+  expect(storyStart).toBeGreaterThan(-1);
+  expect(storyEnd).toBeGreaterThan(storyStart);
+
+  const storyEl = { innerHTML: "" };
+  const toggle = {
+    checked: false,
+    listeners: {} as Record<string, () => void>,
+    addEventListener(event: string, listener: () => void): void {
+      this.listeners[event] = listener;
+    },
+  };
+  const document = {
+    getElementById(id: string) {
+      if (id === "story") return storyEl;
+      if (id === "story-plain-summary") return toggle;
+      return null;
+    },
+  };
+  const store = { ...initialStore };
+  const sessionStorage = {
+    getItem(key: string): string | null {
+      return Object.prototype.hasOwnProperty.call(store, key) ? store[key]! : null;
+    },
+    setItem(key: string, value: string): void {
+      store[key] = value;
+    },
+  };
+  const source =
+    html.slice(escStart, escEnd) +
+    "\n" +
+    html.slice(storyStart, storyEnd) +
+    "\nreturn { renderStory: renderStory, wireStoryToggle: wireStoryToggle };";
+  const helpers = new Function("document", "sessionStorage", source)(
+    document,
+    sessionStorage,
+  ) as Pick<StoryHarness, "renderStory" | "wireStoryToggle">;
+  return { ...helpers, storyEl, toggle, store };
+}
+
 /**
  * Slice 2 of the unified posture dashboard: the feature-health panel is now
  * rendered on Home. These tests pin the #617/#634 honesty contract on the new
@@ -73,6 +142,94 @@ describe("posture home — feature-health panel honesty", () => {
   });
 });
 
+describe("posture home - Today's story plain summary toggle", () => {
+  const digest: StoryDigestFixture = {
+    total_operations: 212,
+    kernel_blocks: 4,
+    kernel_allows: 208,
+    approvals_denied: 1,
+    approvals_granted: 3,
+    chain_verified: true,
+    integrity_finding_count: 0,
+  };
+
+  it("renders factual counts by default and leaves the Plain summary toggle off", () => {
+    const h = storyHarness();
+    h.wireStoryToggle();
+    h.renderStory(digest);
+
+    expect(h.toggle.checked).toBe(false);
+    expect(h.storyEl.innerHTML).toContain(
+      '<div class="story-line"><strong>212</strong> operations in the last 24h.</div>',
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "<strong>4</strong> outbound connections blocked at the kernel; 208 allowed.",
+    );
+    expect(h.storyEl.innerHTML).not.toContain("story-summary");
+  });
+
+  it("toggled ON renders prose from the same counts and stores only the session preference", () => {
+    const h = storyHarness();
+    h.wireStoryToggle();
+    h.renderStory(digest);
+
+    h.toggle.checked = true;
+    h.toggle.listeners.change!();
+
+    expect(h.store.postureStoryPlainSummary).toBe("1");
+    expect(h.storyEl.innerHTML).toContain('<p class="story-summary">');
+    expect(h.storyEl.innerHTML).toContain(
+      "Today your agents ran <strong>212</strong> operations",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "Sanctuary blocked <strong>4</strong> outbound connections and allowed <strong>208</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "You denied <strong>1</strong> approvals and granted <strong>3</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "The audit log verified clean: no tampering.",
+    );
+    expect(h.storyEl.innerHTML).not.toContain("—");
+    expect(h.storyEl.innerHTML.toLowerCase()).not.toContain("sovereignty");
+  });
+
+  it("restores the session preference, says zero counts plainly, and toggles back to factual rows", () => {
+    const h = storyHarness({ postureStoryPlainSummary: "1" });
+    h.wireStoryToggle();
+    h.renderStory({
+      total_operations: 0,
+      kernel_blocks: 0,
+      kernel_allows: 0,
+      approvals_denied: 0,
+      approvals_granted: 0,
+      chain_verified: false,
+      integrity_finding_count: 2,
+    });
+
+    expect(h.toggle.checked).toBe(true);
+    expect(h.storyEl.innerHTML).toContain("ran <strong>0</strong> operations");
+    expect(h.storyEl.innerHTML).toContain(
+      "blocked <strong>0</strong> outbound connections and allowed <strong>0</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "denied <strong>0</strong> approvals and granted <strong>0</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "The audit log is unverified: 2 integrity finding(s).",
+    );
+
+    h.toggle.checked = false;
+    h.toggle.listeners.change!();
+
+    expect(h.store.postureStoryPlainSummary).toBe("0");
+    expect(h.storyEl.innerHTML).toContain(
+      '<div class="story-line"><strong>0</strong> operations in the last 24h.</div>',
+    );
+    expect(h.storyEl.innerHTML).not.toContain("story-summary");
+  });
+});
+
 /**
  * Slice 3 of the unified posture dashboard: the Custody and Exit panel. These
  * tests pin the #617 honesty contract on the new tile — custody is GREEN NEVER
@@ -112,19 +269,26 @@ describe("posture home — Custody and Exit panel honesty", () => {
     expect(fnSource).not.toContain("pill green");
   });
 
-  it("surfaces the exit export as a capability WITHOUT claiming a clean-exit guarantee", () => {
+  it("surfaces the exit evidence bundle as a capability WITHOUT claiming a clean-exit guarantee", () => {
     const html = renderPostureHomeHTML();
-    // The honest exit affordance: export available, Tier-1 gated. The command
-    // string is sourced from the panel at render time; the renderer falls back
-    // to the literal `sanctuary exit` verb, which is therefore present statically.
-    expect(html).toContain("export available");
-    expect(html).toContain("sanctuary exit");
+    const start = html.indexOf("function renderCustodyExit(panel)");
+    const end = html.indexOf("// ── Recognition + portability");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // The honest exit affordance is display-named as an evidence bundle and
+    // remains Tier-1 gated. The command string is sourced from the panel at
+    // render time; the renderer falls back to the literal `sanctuary exit` verb,
+    // which is therefore present statically.
+    expect(region).toContain("evidence bundle");
+    expect(region).toContain("sanctuary exit");
     // It is a Tier-1 (approval-gated) operation, surfaced honestly.
-    expect(html).toContain("a Tier-1 operation");
+    expect(region).toContain("a Tier-1 operation");
     // And the explicit honesty disclaimer that the full clean-exit guarantee is
     // NOT yet earned (delta review). No "clean exit guaranteed" claim on Home.
-    expect(html).toContain("does not yet mean a guaranteed clean exit");
-    expect(html.toLowerCase()).not.toContain("clean exit guaranteed");
+    expect(region).toContain("does not yet mean a guaranteed clean exit");
+    expect(region).not.toContain("export available");
+    expect(region.toLowerCase()).not.toContain("clean exit guaranteed");
   });
 
   it("uses no em-dashes in the rendered Custody and Exit user-facing copy", () => {
