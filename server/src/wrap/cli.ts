@@ -1563,9 +1563,9 @@ export async function startDashboardWithFallback(
   }
   const lastPort = preferredPort + PORT_FALLBACK_ATTEMPTS - 1;
   throw new Error(
-    `No free dashboard port in the ${PORT_FALLBACK_ATTEMPTS} ports starting at ${preferredPort} (tried ${preferredPort}-${lastPort}): ${
+    `No free dashboard port in the range ${preferredPort}-${lastPort} (all ${PORT_FALLBACK_ATTEMPTS} tried): ${
       (lastErr as Error)?.message ?? "unknown"
-    }`
+    }. Stop the other Sanctuary instance, or choose a port with: sanctuary wrap <your-flags> --port <port>.`
   );
 }
 
