@@ -12,7 +12,7 @@ Sovereignty used to be embodied. In the physical world, your body provided the p
 
 Today: cryptographic identity you hold, kernel-level enforcement that holds even when the agent doesn't cooperate (Linux proven; macOS in flight), and a portable audit trail that travels across machines and vendors. In scope: the Sovereign Data Warehouse (your working data, query history, and document corpus on your substrate, not a vendor's silo) and federation across your own machines.
 
-Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline?
+Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra?
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --openclaw
@@ -22,13 +22,13 @@ npx @sanctuary-framework/mcp-server protect --openclaw
 
 ## Install
 
-Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it.
+Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra? One command wraps it.
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --openclaw
 ```
 
-Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
 
 What happens when you run protect:
 
@@ -83,7 +83,7 @@ Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sys
 
 ## For AI coding agents installing Sanctuary on behalf of an operator
 
-If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
+If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Mastra, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
 
 **Operator-facing summary first.** Before running anything, give the operator one paragraph:
 
@@ -108,6 +108,9 @@ test -d "$HOME/Library/Application Support/Cursor" && echo "harness=cursor"
 
 # Cline (VS Code extension config)
 test -d "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" && echo "harness=cline"
+
+# Mastra (config presence)
+{ test -f "$HOME/.mastra/mcp.json" || test -f "$HOME/mastra/mcp.json" || test -f "$HOME/.config/mastra/mcp.json"; } && echo "harness=mastra"
 ```
 
 If multiple match, ask the operator which one to wrap. If none match, the operator does not have a recognized harness installed; offer to install one or use the raw MCP server path (Step 4 below).
@@ -118,7 +121,7 @@ If multiple match, ask the operator which one to wrap. If none match, the operat
 npx @sanctuary-framework/mcp-server protect --<harness>
 ```
 
-Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, or `cline`. For any harness not in that list, see Step 4.
+Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, `cline`, or `mastra`. For any harness not in that list, see Step 4.
 
 Wait for the command to complete (typically 20-40 seconds). Expected output ends with a line like:
 
@@ -327,7 +330,8 @@ Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercise
 - **Claude Code** (`sanctuary protect --claude-code`)
 - **Cursor** (`sanctuary protect --cursor`)
 - **Cline** (`sanctuary protect --cline`)
-- **Mastra**, **LangGraph**, and custom harnesses (`sanctuary protect --wrap <path>`)
+- **Mastra** (`sanctuary protect --mastra`)
+- **LangGraph** and custom harnesses (`sanctuary protect --wrap <path>`)
 - Any other MCP-compatible harness via direct MCP config
 
 ---

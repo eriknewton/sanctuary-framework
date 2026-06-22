@@ -1541,6 +1541,7 @@ const PLATFORM_TO_HARNESS: Record<AgentPlatform, string> = {
   "claude-code": "claude_code",
   cursor: "cursor",
   hermes: "hermes",
+  mastra: "mastra",
   cline: "cline",
   generic: "generic_mcp",
 };
