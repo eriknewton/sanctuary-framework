@@ -16,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { format } from "node:util";
 
 import {
   runWrap,
@@ -46,6 +47,7 @@ describe("generic MCP wrap conformance", () => {
   let originalDashboardEnabled: string | undefined;
   let originalAgentPrivateKey: string | undefined;
   let originalTransientKey: string | undefined;
+  let stdoutSpy: ReturnType<typeof vi.spyOn>;
   let stderrSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
@@ -71,11 +73,13 @@ describe("generic MCP wrap conformance", () => {
     process.env.SANCTUARY_TEST_AGENT_PRIVATE_KEY = AGENT_PRIVATE_KEY_SECRET;
     process.env.SANCTUARY_TEST_TRANSIENT_KEY = TRANSIENT_KEY_SECRET;
 
+    stdoutSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     await seedCustody(process.env.SANCTUARY_STORAGE_PATH);
   });
 
   afterEach(async () => {
+    stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
     restoreEnv("HOME", originalHome);
     restoreEnv("SANCTUARY_STORAGE_PATH", originalStoragePath);
@@ -166,6 +170,7 @@ describe("generic MCP wrap conformance", () => {
     await runWrap({ unwrap: true }, deps);
     const restored = await readFile(configPath, "utf-8");
     expect(restored).toBe(originalJson);
+    await expectNoSentinelLeaks(tmpHome, capturedConsoleCalls());
   });
 
   it("routes a minimal arbitrary flat mcpServers config through generic_mcp", async () => {
@@ -272,7 +277,10 @@ async function writeJsonFile(path: string, value: unknown): Promise<void> {
   await writeFile(path, JSON.stringify(value, null, 2), "utf-8");
 }
 
-async function expectNoSentinelLeaks(root: string): Promise<void> {
+async function expectNoSentinelLeaks(
+  root: string,
+  consoleCalls: unknown[][] = capturedConsoleCalls(),
+): Promise<void> {
   const files = await collectFiles(root);
   const needles = [
     ...encodedNeedles("passphrase", Buffer.from(PASSPHRASE_SECRET, "utf8")),
@@ -287,13 +295,39 @@ async function expectNoSentinelLeaks(root: string): Promise<void> {
   const leaks: string[] = [];
   for (const file of files) {
     const data = await readFile(file);
-    for (const needle of needles) {
-      if (data.indexOf(needle.value) !== -1) {
-        leaks.push(`${needle.label} in ${file}`);
-      }
+    scanNeedles(data, file, needles, leaks);
+  }
+  scanNeedles(
+    Buffer.from(serializeConsoleCalls(consoleCalls), "utf8"),
+    "console output",
+    needles,
+    leaks,
+  );
+  expect(leaks).toEqual([]);
+}
+
+function capturedConsoleCalls(): unknown[][] {
+  return [
+    ...((console.log as unknown as { mock: { calls: unknown[][] } }).mock?.calls ?? []),
+    ...((console.error as unknown as { mock: { calls: unknown[][] } }).mock?.calls ?? []),
+  ];
+}
+
+function serializeConsoleCalls(calls: unknown[][]): string {
+  return calls.map((call) => format(...call)).join("\n");
+}
+
+function scanNeedles(
+  data: Buffer,
+  location: string,
+  needles: Array<{ label: string; value: Buffer }>,
+  leaks: string[],
+): void {
+  for (const needle of needles) {
+    if (data.indexOf(needle.value) !== -1) {
+      leaks.push(`${needle.label} in ${location}`);
     }
   }
-  expect(leaks).toEqual([]);
 }
 
 function encodedNeedles(label: string, bytes: Buffer): Array<{

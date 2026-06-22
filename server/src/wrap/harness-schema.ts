@@ -55,7 +55,6 @@ export function detectHarnessSchema(
   }
 
   if (
-    file === "claude.json" ||
     file === ".claude.json" ||
     file === "claude_desktop_config.json" ||
     normalizedPath.includes("/.claude/") ||
