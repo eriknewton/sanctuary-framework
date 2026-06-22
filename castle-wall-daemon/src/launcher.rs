@@ -386,7 +386,9 @@ mod linux {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
 
+    use nix::libc::rlim_t;
     use nix::sched::{unshare, CloneFlags};
+    use nix::sys::resource::{setrlimit, Resource};
 
     /// Step 1: unshare user (rootless) + mount + net namespaces.
     pub fn unshare_namespaces(mode: PrivilegeMode) -> Result<(), LauncherError> {
@@ -509,26 +511,19 @@ mod linux {
         std::fs::write(&procs, pid.to_string())
             .map_err(|e| to_step(format!("join cgroup {procs}: {e}")))?;
 
-        set_rlimit(libc::RLIMIT_CPU, spec.rlimit_cpu_seconds).map_err(to_step)?;
-        set_rlimit(libc::RLIMIT_AS, spec.rlimit_as_bytes).map_err(to_step)?;
-        set_rlimit(libc::RLIMIT_NOFILE, spec.rlimit_nofile).map_err(to_step)?;
+        set_rlimit(Resource::RLIMIT_CPU, spec.rlimit_cpu_seconds).map_err(to_step)?;
+        set_rlimit(Resource::RLIMIT_AS, spec.rlimit_as_bytes).map_err(to_step)?;
+        set_rlimit(Resource::RLIMIT_NOFILE, spec.rlimit_nofile).map_err(to_step)?;
         Ok(())
     }
 
-    fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> Result<(), String> {
-        let limit = libc::rlimit {
-            rlim_cur: value as libc::rlim_t,
-            rlim_max: value as libc::rlim_t,
-        };
-        let rc = unsafe { libc::setrlimit(resource, &limit) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "setrlimit({resource}) = {}",
-                std::io::Error::last_os_error()
-            ))
-        }
+    // Use nix's portable `setrlimit`: it resolves the resource-arg type
+    // difference between glibc (`__rlimit_resource_t`) and musl (`c_int`)
+    // internally, so the launcher compiles for both the gnu and musl Linux
+    // targets the static-jail build exercises.
+    fn set_rlimit(resource: Resource, value: u64) -> Result<(), String> {
+        setrlimit(resource, value as rlim_t, value as rlim_t)
+            .map_err(|e| format!("setrlimit({resource:?}) = {e}"))
     }
 
     /// Step 4: confirm the netns has no interfaces beyond loopback-down. We do
