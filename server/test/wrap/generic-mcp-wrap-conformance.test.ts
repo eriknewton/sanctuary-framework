@@ -9,6 +9,7 @@ import {
 import { Buffer } from "node:buffer";
 import {
   mkdir,
+  mkdtemp,
   readFile,
   readdir,
   rm,
@@ -16,7 +17,6 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { format } from "node:util";
 
 import {
   runWrap,
@@ -38,6 +38,11 @@ const TRANSIENT_KEY_SECRET =
 const MASTER_KEY_BYTES = Buffer.from("codex-master-secret-sentinel-32!");
 const RECOVERY_KEY_BYTES = Buffer.from("codex-recovery-secret-sentinel!!");
 
+type TerminalWrite = {
+  stream: "stdout" | "stderr";
+  data: Buffer;
+};
+
 describe("generic MCP wrap conformance", () => {
   let tmpHome: string;
   let originalHome: string | undefined;
@@ -47,15 +52,12 @@ describe("generic MCP wrap conformance", () => {
   let originalDashboardEnabled: string | undefined;
   let originalAgentPrivateKey: string | undefined;
   let originalTransientKey: string | undefined;
-  let stdoutSpy: ReturnType<typeof vi.spyOn>;
-  let stderrSpy: ReturnType<typeof vi.spyOn>;
+  let stdoutWriteSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let stderrWriteSpy: ReturnType<typeof vi.spyOn> | undefined;
+  let terminalWrites: TerminalWrite[];
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-generic-mcp-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    );
-    await mkdir(tmpHome, { recursive: true });
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-generic-mcp-"));
 
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
@@ -73,14 +75,17 @@ describe("generic MCP wrap conformance", () => {
     process.env.SANCTUARY_TEST_AGENT_PRIVATE_KEY = AGENT_PRIVATE_KEY_SECRET;
     process.env.SANCTUARY_TEST_TRANSIENT_KEY = TRANSIENT_KEY_SECRET;
 
-    stdoutSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    terminalWrites = [];
+    stdoutWriteSpy = spyOnTerminalStream(process.stdout, "stdout", terminalWrites);
+    stderrWriteSpy = spyOnTerminalStream(process.stderr, "stderr", terminalWrites);
     await seedCustody(process.env.SANCTUARY_STORAGE_PATH);
   });
 
   afterEach(async () => {
-    stdoutSpy.mockRestore();
-    stderrSpy.mockRestore();
+    stdoutWriteSpy?.mockRestore();
+    stderrWriteSpy?.mockRestore();
+    stdoutWriteSpy = undefined;
+    stderrWriteSpy = undefined;
     restoreEnv("HOME", originalHome);
     restoreEnv("SANCTUARY_STORAGE_PATH", originalStoragePath);
     restoreEnv("SANCTUARY_PASSPHRASE", originalPassphrase);
@@ -92,7 +97,7 @@ describe("generic MCP wrap conformance", () => {
     await rm(tmpHome, { recursive: true, force: true });
   });
 
-  it("wraps and unwraps an arbitrary multi-server mcpServers config without leaking sentinel secrets", async () => {
+  it("wraps and unwraps an arbitrary multi-server mcpServers config without leaking sentinel secrets to disk or terminal output", async () => {
     const configPath = join(tmpHome, "synthetic-harness", "mcp.json");
     const original = {
       displayName: "Synthetic MCP Harness",
@@ -165,12 +170,14 @@ describe("generic MCP wrap conformance", () => {
     expect(agents).toHaveLength(1);
     expect(agents[0]?.harness).toBe("generic_mcp");
 
-    await expectNoSentinelLeaks(tmpHome);
+    const terminalOutputAfterWrap = capturedTerminalOutput(terminalWrites);
+    expect(terminalOutputAfterWrap.byteLength).toBeGreaterThan(0);
+    await expectNoSentinelLeaks(tmpHome, terminalOutputAfterWrap);
 
     await runWrap({ unwrap: true }, deps);
     const restored = await readFile(configPath, "utf-8");
     expect(restored).toBe(originalJson);
-    await expectNoSentinelLeaks(tmpHome, capturedConsoleCalls());
+    await expectNoSentinelLeaks(tmpHome, capturedTerminalOutput(terminalWrites));
   });
 
   it("routes a minimal arbitrary flat mcpServers config through generic_mcp", async () => {
@@ -279,7 +286,7 @@ async function writeJsonFile(path: string, value: unknown): Promise<void> {
 
 async function expectNoSentinelLeaks(
   root: string,
-  consoleCalls: unknown[][] = capturedConsoleCalls(),
+  terminalOutput: Buffer,
 ): Promise<void> {
   const files = await collectFiles(root);
   const needles = [
@@ -297,24 +304,14 @@ async function expectNoSentinelLeaks(
     const data = await readFile(file);
     scanNeedles(data, file, needles, leaks);
   }
+  expect(terminalOutput.byteLength).toBeGreaterThan(0);
   scanNeedles(
-    Buffer.from(serializeConsoleCalls(consoleCalls), "utf8"),
-    "console output",
+    terminalOutput,
+    "terminal stdout/stderr",
     needles,
     leaks,
   );
   expect(leaks).toEqual([]);
-}
-
-function capturedConsoleCalls(): unknown[][] {
-  return [
-    ...((console.log as unknown as { mock: { calls: unknown[][] } }).mock?.calls ?? []),
-    ...((console.error as unknown as { mock: { calls: unknown[][] } }).mock?.calls ?? []),
-  ];
-}
-
-function serializeConsoleCalls(calls: unknown[][]): string {
-  return calls.map((call) => format(...call)).join("\n");
 }
 
 function scanNeedles(
@@ -366,4 +363,42 @@ async function collectFiles(root: string): Promise<string[]> {
 function restoreEnv(key: string, value: string | undefined): void {
   if (value === undefined) delete process.env[key];
   else process.env[key] = value;
+}
+
+function spyOnTerminalStream(
+  stream: NodeJS.WriteStream,
+  streamName: "stdout" | "stderr",
+  writes: TerminalWrite[],
+): ReturnType<typeof vi.spyOn> {
+  return vi
+    .spyOn(stream, "write")
+    .mockImplementation(((
+      chunk: string | Uint8Array,
+      encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+      callback?: (error?: Error | null) => void,
+    ) => {
+      writes.push({
+        stream: streamName,
+        data: terminalChunkToBuffer(chunk, encodingOrCallback),
+      });
+      const done =
+        typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+      done?.();
+      return true;
+    }) as typeof stream.write);
+}
+
+function terminalChunkToBuffer(
+  chunk: string | Uint8Array,
+  encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+): Buffer {
+  if (typeof chunk !== "string") return Buffer.from(chunk);
+  const encoding = typeof encodingOrCallback === "string"
+    ? encodingOrCallback
+    : "utf8";
+  return Buffer.from(chunk, encoding);
+}
+
+function capturedTerminalOutput(writes: TerminalWrite[]): Buffer {
+  return Buffer.concat(writes.map((write) => write.data));
 }
