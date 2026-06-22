@@ -29,6 +29,12 @@ vi.mock("../../src/cli/castle-wall.js", () => ({
 
 vi.mock("../../src/castle-wall/runtime/index.js", () => ({
   startMacOSCastleWallDaemon: castleWallMocks.startMacOSCastleWallDaemon,
+  // Opt-in producer-signed Linux activation is OFF by default (mirrors the real
+  // `isLinuxProducerSignedActivationRequested`, which reads false without the
+  // explicit env flag). On Linux CI this keeps the wrap flow on the macOS-daemon
+  // channel basis the assertions below expect, instead of routing into the
+  // Linux activation gate.
+  isLinuxProducerSignedActivationRequested: () => false,
 }));
 
 import {
