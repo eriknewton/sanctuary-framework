@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, readFile } from "node:fs/promises";
+import { writeFile, mkdir, mkdtemp, rm, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -25,8 +25,7 @@ describe("Config Reader", () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = join(tmpdir(), `sanctuary-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(tmpDir, { recursive: true });
+    tmpDir = await mkdtemp(join(tmpdir(), "sanctuary-test-"));
   });
 
   afterEach(async () => {
