@@ -298,6 +298,55 @@ describe("L4 Reputation Store", () => {
       expect(summary.total_interactions).toBe(2);
     });
 
+    it("verifyBundle matches importBundle verification without writing", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "verify-only-1", "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      const verified = store2.verifyBundle(bundle, publicKeys);
+      expect(verified).toEqual({
+        invalid: 0,
+        unverifiable: 0,
+        contexts: ["commerce"],
+        completeness_verification: "verified",
+      });
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+
+      const imported = await store2.importBundle(bundle, true, publicKeys);
+      expect(imported.invalid).toBe(verified.invalid);
+      expect(imported.unverifiable).toBe(verified.unverifiable);
+      expect(imported.contexts).toEqual(verified.contexts);
+      expect(imported.completeness_verification).toBe(
+        verified.completeness_verification
+      );
+
+      const tampered = cloneBundle(bundle);
+      tampered.completeness_manifest!.total_attestation_count = 2;
+      const storage3 = new MemoryStorage();
+      const store3 = new ReputationStore(storage3, masterKey);
+      expect(() => store3.verifyBundle(tampered, publicKeys)).toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(
+        store3.importBundle(tampered, true, publicKeys)
+      ).rejects.toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(storage3.list("_reputation")).resolves.toHaveLength(0);
+    });
+
     it("rejects a dropped attestation before any import write", async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
