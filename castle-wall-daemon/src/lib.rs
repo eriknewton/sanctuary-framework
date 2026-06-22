@@ -27,6 +27,7 @@ pub mod habeas;
 pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;
+pub mod launcher;
 pub mod manifest;
 pub mod nfqueue;
 pub mod nftables;
