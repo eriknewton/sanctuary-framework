@@ -116,7 +116,6 @@
 8	server/src/castle-wall/allowlist/habeas-port.ts
 2	server/src/castle-wall/allowlist/schema.ts
 1	server/src/castle-wall/boot/boot-token.ts
-10	server/src/castle-wall/runtime/audit-consumer.ts
 1	server/src/castle-wall/runtime/helper-signer.ts
 1	server/src/castle-wall/runtime/lifecycle.ts
 17	server/src/castle-wall/runtime/macos-daemon.ts
@@ -125,7 +124,6 @@
 2	server/src/castle-wall/runtime/producer-signature.ts
 1	server/src/cli/agents/cli.ts
 12	server/src/cli/castle-wall-boot.ts
-39	server/src/cli/castle-wall.ts
 1	server/src/cli/did-web.ts
 2	server/src/cli/distress.ts
 2	server/src/cli/federation.ts
@@ -252,7 +250,6 @@
 10	server/src/workload-lifecycle/host-attestation.ts
 8	server/src/workload-lifecycle/payload.ts
 3	server/src/workload-lifecycle/undeclared-finding.ts
-18	server/src/wrap/cli.ts
 24	server/src/wrap/config-reader.ts
 2	server/src/wrap/custody-flow.ts
 1	server/src/wrap/fortress-view.ts
