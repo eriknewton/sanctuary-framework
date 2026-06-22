@@ -21,7 +21,7 @@ import {
   readBootToken,
   safeModeAuditStoragePath,
 } from "../../src/castle-wall/boot/boot-token.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 class CaptureStream extends Writable {

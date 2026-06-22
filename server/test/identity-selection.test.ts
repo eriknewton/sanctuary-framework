@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryStorage } from "../src/storage/memory.js";
 import { generateRandomKey } from "../src/core/random.js";
-import { IdentityManager } from "../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../src/cognitive/tools.js";
 import { generateSHR } from "../src/shr/generator.js";
 import { defaultConfig } from "../src/config.js";
 import { createIdentity } from "../src/core/identity.js";

@@ -8,7 +8,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { createAuditTools } from "../../src/audit/tools.js";
 import type { SanctuaryConfig } from "../../src/config.js";
-import { AuditIntegrityError } from "../../src/l2-operational/audit-log.js";
+import { AuditIntegrityError } from "../../src/operational/audit-log.js";
 
 // Mock the detector and analyzer modules
 vi.mock("../../src/audit/detector.js", () => ({
@@ -121,7 +121,10 @@ describe("Sovereignty Audit Tool", () => {
           mcp_tools_bricked_by_integrity_gate: true,
         },
       }),
-      expect.anything()
+      expect.anything(),
+      // Honesty (audit seam #5): the handler now also passes live runtime
+      // signals (undefined here — no runtimeDeps wired in this test).
+      undefined
     );
   });
 

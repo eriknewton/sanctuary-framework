@@ -23,8 +23,13 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import {
+  publicCodeForStatus,
+  sendCaughtError,
+} from "../http/error-envelope.js";
 
 import type { LocalHarnessKind } from "../contracts/v1.1/local-agent-records.js";
+import { effectiveLivenessStatus } from "../contracts/v1.1/liveness.js";
 import {
   HUB_AGENT_CONTROL_ACTIONS,
   HUB_API_PREFIX,
@@ -53,7 +58,7 @@ import type { HubService } from "./hub-service.js";
 import {
   TASK_STATUSES,
   type TaskStatus,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 
 export interface HubRouterDeps {
   authConfig: AuthConfig;
@@ -117,17 +122,30 @@ function rejectCrossFortressParams(url: URL): void {
   }
 }
 
-function handleError(res: ServerResponse, err: unknown): void {
+function handleError(
+  res: ServerResponse,
+  err: unknown,
+  opts: { operation: string; suppressPublicDetail?: boolean },
+): void {
   if (err instanceof HubError) {
+    if (opts.suppressPublicDetail === true) {
+      sendCaughtError(res, err.statusCode, publicCodeForStatus(err.statusCode), err, {
+        route: "hub",
+        operation: opts.operation,
+      });
+      return;
+    }
     writeJSON(res, err.statusCode, {
       ok: false,
       error: err.name,
-      detail: err.message,
+      detail: err.publicDetail,
     });
     return;
   }
-  const msg = err instanceof Error ? err.message : String(err);
-  writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+  sendCaughtError(res, 500, "internal_error", err, {
+    route: "hub",
+    operation: opts.operation,
+  });
 }
 
 /**
@@ -526,7 +544,18 @@ export async function handleHubRoute(
           : {}),
       };
       const records = deps.service.listAgents(filter);
-      writeJSON(res, 200, { ok: true, data: { agents: records } });
+      // Liveness aging: a stored `active` status is the last value written and
+      // is never aged by the registry, so a crashed/dead agent would keep
+      // reading "Running / online / protected / verified" on the fleet view.
+      // Age a stale `active` (last_activity_at older than the window) down to
+      // `unknown` before serving the read-projection, so the dashboard renders
+      // unknown/away and drops the verified badge instead of a false-live state.
+      const now = Date.now();
+      const aged = records.map((r) => {
+        const effective = effectiveLivenessStatus(r.status, r.last_activity_at, now);
+        return effective === r.status ? r : { ...r, status: effective };
+      });
+      writeJSON(res, 200, { ok: true, data: { agents: aged } });
       return true;
     }
 
@@ -740,7 +769,10 @@ export async function handleHubRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    handleError(res, err);
+    handleError(res, err, {
+      operation: `${method} ${path}`,
+      suppressPublicDetail: isApprovalDecision,
+    });
     return true;
   }
 }

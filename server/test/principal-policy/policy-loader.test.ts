@@ -56,6 +56,9 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
+        "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -125,6 +128,61 @@ approval_channel:
       }
     });
 
+    it("migrates audit_export_siem out of Tier 3 on upgrade (CISO MED-1)", () => {
+      // A pre-upgrade on-disk policy that still auto-allows audit_export_siem.
+      // validatePolicy must force it to Tier 1 and prune it from Tier 3, so a
+      // cooperative agent on an upgraded install cannot bulk-export audit (and
+      // infer per-operation tier + decision) without operator approval.
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+tier3_always_allow:
+  - state_read
+  - audit_export_siem
+approval_channel:
+  type: stderr
+`;
+      const policy = parsePolicy(yaml);
+      expect(policy.tier1_always_approve).toContain("audit_export_siem");
+      expect(policy.tier3_always_allow).not.toContain("audit_export_siem");
+    });
+
+    it("migrates compliance_generate_eu_ai_act_bundle out of Tier 3 on upgrade (CISO NEW-1)", () => {
+      // A pre-upgrade on-disk policy that still auto-allows the bundle generator
+      // (its original Tier-3 home). validatePolicy must force it to Tier 1 and
+      // prune it from Tier 3, so a cooperative agent on an upgraded install
+      // cannot self-generate a compliance bundle — whose body leaks the verbatim
+      // Tier-2 thresholds + approval timeout + audit-derived aggregates — without
+      // operator approval. The sibling classifier (no policy thresholds in its
+      // output) stays at Tier 3 and is NOT migrated.
+      const yaml = `
+version: 1
+tier1_always_approve:
+  - state_export
+tier3_always_allow:
+  - state_read
+  - compliance_generate_eu_ai_act_bundle
+  - compliance_eu_ai_act_annex_iii_classify
+approval_channel:
+  type: stderr
+`;
+      const policy = parsePolicy(yaml);
+      expect(policy.tier1_always_approve).toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+      expect(policy.tier3_always_allow).not.toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+      // The classifier is unaffected — it remains agent-callable at Tier 3.
+      expect(policy.tier3_always_allow).toContain(
+        "compliance_eu_ai_act_annex_iii_classify"
+      );
+      expect(policy.tier1_always_approve).not.toContain(
+        "compliance_eu_ai_act_annex_iii_classify"
+      );
+    });
+
     it("handles comments in YAML", () => {
       const yaml = `
 version: 1 # policy version
@@ -145,6 +203,9 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
+        "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
     });
 
@@ -167,6 +228,9 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
+        "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -202,6 +266,9 @@ approval_channel:
         "sanctuary_policy_status",
         "context_gate_set_policy",
         "context_gate_apply_template",
+        "audit_export_siem",
+        "compliance_generate_eu_ai_act_bundle",
+        "memory_delete",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
@@ -276,6 +343,9 @@ approval_channel:
           "sanctuary_policy_status",
           "context_gate_set_policy",
           "context_gate_apply_template",
+          "audit_export_siem",
+          "compliance_generate_eu_ai_act_bundle",
+          "memory_delete",
         ];
 
         for (const tool of forcedTier1Tools) {

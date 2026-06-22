@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   establishMaster,

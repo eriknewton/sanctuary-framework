@@ -26,7 +26,7 @@
  *   terminated workload.
  */
 
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import {
   WORKLOAD_LIFECYCLE_OPS,
   isWorkloadLifecycleOp,

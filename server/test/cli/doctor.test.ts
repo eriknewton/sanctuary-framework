@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runDoctorChecks, runDoctorCommand } from "../../src/cli/doctor.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { stringToBytes } from "../../src/core/encoding.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createIdentity } from "../../src/core/identity.js";
 
 class Capture extends Writable {

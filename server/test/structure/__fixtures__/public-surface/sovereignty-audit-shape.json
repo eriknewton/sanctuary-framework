@@ -1,0 +1,36 @@
+{
+  "layer_keys": [
+    "l1_cognitive",
+    "l2_operational",
+    "l3_selective_disclosure",
+    "l4_reputation"
+  ],
+  "gap_ids": [
+    "GAP-L1-001",
+    "GAP-L1-002",
+    "GAP-L1-003",
+    "GAP-L2-001",
+    "GAP-L2-003",
+    "GAP-L2-004",
+    "GAP-L3-001",
+    "GAP-L4-001"
+  ],
+  "gap_layer_values": [
+    "L1",
+    "L2",
+    "L3",
+    "L4"
+  ],
+  "gateway_layer_score_keys": [
+    "l1_cognitive",
+    "l2_operational",
+    "l3_disclosure",
+    "l4_reputation"
+  ],
+  "gateway_layer_status_keys": [
+    "l1_cognitive",
+    "l2_operational",
+    "l3_disclosure",
+    "l4_reputation"
+  ]
+}

@@ -59,6 +59,32 @@ class MemoryStorage implements StorageBackend {
   }
 }
 
+class RollbackFailureStorage extends MemoryStorage {
+  readonly deleteCalls: string[] = [];
+
+  constructor(
+    private readonly writeFailureKey: string,
+    private readonly deleteFailureKey: string,
+  ) {
+    super();
+  }
+
+  override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    if (key === this.writeFailureKey) {
+      throw new Error("simulated document write failure");
+    }
+    await super.write(namespace, key, data);
+  }
+
+  override async delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean> {
+    this.deleteCalls.push(key);
+    if (key === this.deleteFailureKey) {
+      throw new Error("simulated rollback delete failure");
+    }
+    return super.delete(namespace, key, secureOverwrite);
+  }
+}
+
 function makeAdapter(
   storage: MemoryStorage,
   overrides: { ownerRef?: string; maxChunkChars?: number } = {},
@@ -127,6 +153,17 @@ describe("SDW memory-backend adapter: insert + get", () => {
     expect(fetched!.text).toBe(text);
   });
 
+  it("roundtrips an astral character split across the default chunk boundary", async () => {
+    const adapter = makeAdapter(new MemoryStorage());
+    const text = `${"a".repeat(8191)}😀tail`;
+    const inserted = await adapter.insertPassage(
+      { passage_id: "emoji-boundary", text },
+      "user_content",
+    );
+    expect(inserted.chunk_count).toBe(2);
+    await expect(adapter.getPassage("emoji-boundary")).resolves.toMatchObject({ text });
+  });
+
   it("stores empty text as a single empty chunk", async () => {
     const adapter = makeAdapter(new MemoryStorage());
     const inserted = await adapter.insertPassage({ passage_id: "empty-1", text: "" }, "user_content");
@@ -175,6 +212,34 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
       ),
     ).rejects.toMatchObject({ category: "classifier_reject" });
     expect(storage.data.size).toBe(0);
+  });
+
+  it("rejects unpaired surrogates before writing", async () => {
+    const storage = new MemoryStorage();
+    const adapter = makeAdapter(storage);
+    await expect(
+      adapter.insertPassage({ passage_id: "bad-surrogate", text: "bad \uD800 text" }, "user_content"),
+    ).rejects.toMatchObject({ category: "invalid_text" });
+    expect(storage.data.size).toBe(0);
+  });
+
+  it("rolls back all written keys without masking the original write failure", async () => {
+    const documentId = "mem.letta-archive-1.rollback-1";
+    const docKey = documentKey(documentId);
+    const chunk0 = documentChunkKey(documentId, "000000", "c000000");
+    const chunk1 = documentChunkKey(documentId, "000001", "c000001");
+    const chunk2 = documentChunkKey(documentId, "000002", "c000002");
+    const storage = new RollbackFailureStorage(docKey, chunk1);
+    const adapter = makeAdapter(storage, { maxChunkChars: 2 });
+
+    await expect(
+      adapter.insertPassage({ passage_id: "rollback-1", text: "abcdef" }, "user_content"),
+    ).rejects.toThrow("simulated document write failure");
+
+    expect(storage.deleteCalls).toEqual([chunk2, chunk1, chunk0, docKey]);
+    expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(false);
+    expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk1}`)).toBe(true);
+    expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk2}`)).toBe(false);
   });
 });
 

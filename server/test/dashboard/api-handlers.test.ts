@@ -15,6 +15,9 @@ import {
   type APIDeps,
 } from "../../src/dashboard/api.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 function mockReq(opts: { url?: string; method?: string; headers?: Record<string, string> }): IncomingMessage {
   return {
@@ -72,10 +75,10 @@ describe("Dashboard API", () => {
       expect(extractToken(req, url)).toBe("tok123");
     });
 
-    it("extracts from ?token= query parameter", () => {
+    it("ignores ?token= query parameter", () => {
       const req = mockReq({ url: "/?token=qp-tok" });
       const url = new URL("http://localhost/?token=qp-tok");
-      expect(extractToken(req, url)).toBe("qp-tok");
+      expect(extractToken(req, url)).toBeNull();
     });
 
     it("returns null when no token present", () => {
@@ -84,7 +87,7 @@ describe("Dashboard API", () => {
       expect(extractToken(req, url)).toBeNull();
     });
 
-    it("prefers header over query param", () => {
+    it("uses the header when a query token is also present", () => {
       const req = mockReq({
         url: "/?token=query",
         headers: { authorization: "Bearer header" },
@@ -109,6 +112,24 @@ describe("Dashboard API", () => {
       const deps: APIDeps = { sources: {} as any, authToken: "secret" };
       const req = mockReq({ headers: { authorization: "Bearer secret" } });
       expect(isAuthorized(deps, req, new URL("http://localhost/"))).toBe(true);
+    });
+
+    it("returns true when a valid short-lived session is provided", () => {
+      const deps: APIDeps = {
+        sources: {} as any,
+        authToken: "secret",
+        sessions: { create: vi.fn(), validate: vi.fn((id: string) => id === "sess-ok") },
+      };
+      expect(
+        isAuthorized(deps, mockReq({}), new URL("http://localhost/?session=sess-ok"))
+      ).toBe(true);
+    });
+
+    it("rejects long-lived ?token= query auth", () => {
+      const deps: APIDeps = { sources: {} as any, authToken: "secret" };
+      expect(
+        isAuthorized(deps, mockReq({ url: "/?token=secret" }), new URL("http://localhost/?token=secret"))
+      ).toBe(false);
     });
 
     it("returns false when token mismatches", () => {
@@ -143,14 +164,68 @@ describe("Dashboard API", () => {
       expect(res._status).toBe(401);
     });
 
-    it("serves /api/health", async () => {
+    it("mints a short-lived session from the Authorization header only", async () => {
       const res = mockRes();
-      const deps = makeDeps();
-      const req = mockReq({ url: "/api/health", headers: { authorization: "Bearer tok" } });
+      const create = vi.fn(() => ({ id: "sess-created", expiresInSeconds: 300 }));
+      const deps = makeDeps({
+        sessions: { create, validate: vi.fn() },
+      });
+      const req = mockReq({
+        url: "/auth/session",
+        method: "POST",
+        headers: { authorization: "Bearer tok" },
+      });
       const matched = await handleRequest(deps, req, res);
       expect(matched).toBe(true);
       expect(res._status).toBe(200);
-      expect(res._body).toContain("ok");
+      expect(create).toHaveBeenCalledOnce();
+      expect(JSON.parse(res._body)).toEqual({
+        session_id: "sess-created",
+        expires_in_seconds: 300,
+      });
+    });
+
+    it("rejects session exchange without a bearer header", async () => {
+      const res = mockRes();
+      const create = vi.fn(() => ({ id: "sess-created", expiresInSeconds: 300 }));
+      const deps = makeDeps({
+        sessions: { create, validate: vi.fn() },
+      });
+      const req = mockReq({
+        url: "/auth/session?token=tok",
+        method: "POST",
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+      expect(create).not.toHaveBeenCalled();
+    });
+
+    it("serves /api/health without auth and only ok/mode", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({ url: "/api/health" });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
+      expect(body).toEqual({ ok: true, mode: "co-located" });
+    });
+
+    it("wrap-auto posture home reports no live stream when no stream registry is wired", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      deps.sources.auditLog = new AuditLog(new MemoryStorage(), generateRandomKey()) as any;
+      const req = mockReq({
+        url: "/api/posture/home",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body) as { stream_available?: boolean };
+      expect(body.stream_available).toBe(false);
     });
 
     it("returns 503 for approvals when no handlers", async () => {

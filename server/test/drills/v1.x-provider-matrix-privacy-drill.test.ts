@@ -20,24 +20,21 @@
 import { describe, expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
 import {
   LocalPrivacyEngine,
   type PrivacyPolicy,
-} from "../../src/l2-operational/privacy-core.js";
-import {
-  BUILTIN_SENSITIVE_PATTERNS,
-} from "../../src/l2-operational/context-gate-enforcer.js";
+} from "../../src/operational/privacy-core.js";
 import {
   filterContext,
   type ContextGatePolicy,
-} from "../../src/l2-operational/context-gate.js";
+} from "../../src/operational/context-gate.js";
 import {
   TEMPLATES,
   listTemplateIds,
   type ContextGateTemplate,
-} from "../../src/l2-operational/context-gate-templates.js";
+} from "../../src/operational/context-gate-templates.js";
 import type {
   PrivacyDestinationCategory,
   PrivacyFilteredPayload,
@@ -591,6 +588,10 @@ describe("v1.x provider-matrix privacy drill", () => {
 
         expect(decision.status).toBe("denied");
         expect(decision.payload).toBeUndefined();
+        expect(decision.audit_payload.denial_reason_class).toBe(
+          "fail_closed_no_policy",
+        );
+        expect(JSON.stringify(decision.payload ?? {})).toBe("{}");
       });
     }
   });
@@ -623,38 +624,33 @@ describe("v1.x provider-matrix privacy drill", () => {
     }
   });
 
-  // ── DRILL: Builtin Pattern Fallback ────────────────────────────────────
-  // When no explicit policy exists, the enforcer's builtin patterns
-  // must still catch sensitive field names.
+  // DRILL: No-Policy Fail-Closed Regression
+  // With context gating enabled, a missing bound policy blocks the call
+  // instead of falling back to builtin field-name patterns.
 
-  describe("enforcer builtin pattern fallback catches magic-string fields", () => {
-    it("builtin patterns match all PII/secret field names used in the corpus", () => {
-      const sensitiveFieldNames = [
-        "api_key",
-        "secret_token",
-        "password",
-        "private_key",
-        "credit_card",
-        "ssn",
-        "auth_token",
-        "access_token",
-        "refresh_token",
-      ];
+  describe("no-policy fail-closed regression blocks context egress", () => {
+    it("blocks structural context when no policy is bound", async () => {
+      const ctx = setupDrill();
+      const payload = buildStructuralContextObject();
 
-      for (const field of sensitiveFieldNames) {
-        const matches = BUILTIN_SENSITIVE_PATTERNS.some((pattern) => {
-          if (pattern === field) return true;
-          if (pattern.startsWith("*") && field.endsWith(pattern.slice(1)))
-            return true;
-          if (pattern.endsWith("*") && field.startsWith(pattern.slice(0, -1)))
-            return true;
-          return false;
-        });
-        expect(
-          matches,
-          `Field "${field}" should match a builtin sensitive pattern`
-        ).toBe(true);
-      }
+      const decision = await ctx.engine.filterOutbound({
+        payload,
+        policy: null,
+        identity_id: IDENTITY_ID,
+        agent_id: AGENT_ID,
+        destination_category: "tool-api",
+        audit_log: ctx.auditLog,
+      });
+
+      expect(decision.status).toBe("denied");
+      expect(decision.payload).toBeUndefined();
+      expect(decision.audit_payload.denial_reason_class).toBe(
+        "fail_closed_no_policy",
+      );
+      assertNoStructuralLeak(
+        JSON.stringify(decision.payload ?? {}),
+        "no-policy-fail-closed-wire",
+      );
     });
   });
 });

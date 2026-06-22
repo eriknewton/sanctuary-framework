@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { UnifiedInboxBridge } from "../principal-policy/unified-inbox-bridge.js";
 import {
   signErc8004Registration,

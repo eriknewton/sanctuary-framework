@@ -54,7 +54,7 @@ import type {
   AnomalyContext,
   FeatureVector,
 } from "../types.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 
 export const TIME_OF_DAY_ACTIVITY_EXTRACTOR_ID =
   "time-of-day-activity" as const;

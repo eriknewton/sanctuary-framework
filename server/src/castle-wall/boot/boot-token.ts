@@ -41,13 +41,17 @@
  * the operator account any new privilege over it.
  */
 
-import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
 
 import { randomBytes } from "../../core/random.js";
+import {
+  isCustodyFsError,
+  readFileCustody,
+  writeFileCustody,
+} from "../../storage/custody-fs.js";
 
 /** Root-owned custody directory (shared with the global pinned public key). */
 export const CASTLE_BOOT_CUSTODY_DIR = "/Library/Application Support/Sanctuary";
@@ -101,20 +105,21 @@ export async function persistBootToken(
     );
   }
   const path = opts.path ?? CASTLE_BOOT_TOKEN_PATH;
-  await mkdir(dirname(path), { recursive: true, mode: 0o755 });
-  const tempPath = `${path}.${process.pid}.tmp`;
-  await writeFile(tempPath, Buffer.from(token), { mode: 0o600 });
-  await chmod(tempPath, 0o600);
-  if (opts.chownFn) {
-    const result = opts.chownFn("chown", ["root:wheel", tempPath]);
-    if (result.code !== 0) {
-      throw new Error(
-        `Could not chown the boot token to root:wheel: ${result.stderr.trim()}. ` +
-          `Refusing to install a boot token the operator account could rewrite.`,
-      );
-    }
-  }
-  await rename(tempPath, path);
+  await writeFileCustody(path, Buffer.from(token), {
+    mode: 0o600,
+    parentMode: 0o755,
+    prepareTemp: opts.chownFn
+      ? (tempPath) => {
+          const result = opts.chownFn!("chown", ["root:wheel", tempPath]);
+          if (result.code !== 0) {
+            throw new Error(
+              `Could not chown the boot token to root:wheel: ${result.stderr.trim()}. ` +
+                `Refusing to install a boot token the operator account could rewrite.`,
+            );
+          }
+        }
+      : undefined,
+  });
   return path;
 }
 
@@ -135,23 +140,24 @@ export async function readBootToken(
   opts: BootTokenOptions = {},
 ): Promise<BootTokenReadResult> {
   const path = opts.path ?? CASTLE_BOOT_TOKEN_PATH;
-  let info;
+  let raw: Buffer;
   try {
-    info = await stat(path);
+    raw = await readFileCustody(path, {
+      mode: { rejectGroupOrOther: true },
+      verifyPathIdentity: true,
+    });
   } catch (err) {
     const code =
       err instanceof Error && "code" in err
         ? (err as NodeJS.ErrnoException).code
         : undefined;
     if (code === "ENOENT") return { status: "not-found" };
+    if (isCustodyFsError(err) && err.code === "mode_rejected") {
+      const mode = typeof err.details.mode === "number" ? err.details.mode : 0;
+      return { status: "bad-mode", mode };
+    }
     throw err;
   }
-  const mode = info.mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    // Group/other can read or write the token — refuse it (fail-closed).
-    return { status: "bad-mode", mode };
-  }
-  const raw = await readFile(path);
   if (raw.length !== BOOT_TOKEN_LENGTH) {
     return { status: "bad-length", length: raw.length };
   }

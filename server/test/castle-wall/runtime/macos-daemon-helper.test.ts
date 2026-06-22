@@ -17,7 +17,7 @@ import { join } from "node:path";
 
 import { ed25519 } from "@noble/curves/ed25519";
 import { parseFrame } from "../../../src/castle-wall/ipc/framing.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { fromBase64url, toBase64url } from "../../../src/core/encoding.js";

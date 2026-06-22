@@ -24,6 +24,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import type { SentinelDispatcher } from "./sentinel-dispatcher.js";
 import type { SentinelSeverity } from "./types.js";
 
@@ -72,6 +73,13 @@ function matchSubscribeRoute(path: string): { sentinelId: string } | null {
   const sentinelId = rest.slice(0, rest.length - "/subscribe".length);
   if (sentinelId.length === 0) return null;
   return { sentinelId: decodeURIComponent(sentinelId) };
+}
+
+function isUnknownSentinelError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    err.message.startsWith("sentinel-registry: unknown sentinel")
+  );
 }
 
 /**
@@ -154,11 +162,16 @@ export async function handleSentinelRoute(
             data: { sentinel_id: subscribeMatch.sentinelId, subscribed: true },
           });
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.startsWith("sentinel-registry: unknown sentinel")) {
-            writeJSON(res, 404, { ok: false, error: "not_found" });
+          if (isUnknownSentinelError(err)) {
+            sendCaughtError(res, 404, "not_found", err, {
+              route: "sentinel",
+              operation: "subscribe",
+            });
           } else {
-            writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+            sendCaughtError(res, 500, "internal_error", err, {
+              route: "sentinel",
+              operation: "subscribe",
+            });
           }
         }
         return true;
@@ -178,8 +191,10 @@ export async function handleSentinelRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "sentinel",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

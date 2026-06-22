@@ -9,7 +9,7 @@
  * the launcher PATCH the unit via a drop-in that splices
  * `producerKeyDaemonLaunchArgs(fortressStoragePath)` so the daemon publishes its
  * `audit-producer.pub` to EXACTLY `resolveProducerPubKeyPath(fortressStoragePath)`
- * — the same path the in-process TS server reads. Deriving both halves from one
+ * - the same path the in-process TS server reads. Deriving both halves from one
  * storage root closes the daemon↔TS path divergence by construction.
  *
  * # Security posture
@@ -91,7 +91,7 @@ export function renderProducerKeyDropIn(input: {
   fortressStoragePath: string;
   daemonBinary?: string;
 }): string {
-  // FIX 5 (codex MEDIUM — systemd unit injection). Validate the operator-derived
+  // FIX 5 (codex MEDIUM - systemd unit injection). Validate the operator-derived
   // inputs BEFORE splicing them into the unit. A newline or control char in the
   // storage path or fortress id could otherwise smuggle a second directive (e.g.
   // an extra `ExecStart=` or a `User=root`) into the rendered drop-in. We reject
@@ -118,7 +118,7 @@ export function renderProducerKeyDropIn(input: {
     ...keyArgs.map(shellQuote),
   ].join(" ");
   return [
-    "# Managed by Sanctuary — producer-signed audit activation (C4).",
+    "# Managed by Sanctuary - producer-signed audit activation (C4).",
     "# Splices the audit-producer key flags so the daemon publishes its",
     "# public key where the in-process Sanctuary server reads it. Regenerated",
     "# on each activation; do not edit by hand.",
@@ -202,7 +202,7 @@ export interface LaunchLinuxDaemonResult {
 /**
  * P-1: render + install the producer-key drop-in, reload systemd, (re)start the
  * unit, and VERIFY it is active. FAIL-CLOSED: any systemctl failure or a unit
- * that is not active after start throws `RuntimeLinuxActivationError` — the
+ * that is not active after start throws `RuntimeLinuxActivationError` - the
  * launcher never reports success it cannot prove.
  */
 export async function launchLinuxCastleWallDaemon(
@@ -210,7 +210,7 @@ export async function launchLinuxCastleWallDaemon(
 ): Promise<LaunchLinuxDaemonResult> {
   const fs = input.fs ?? realFs;
   const unit = input.unit ?? CASTLE_WALL_SYSTEMD_UNIT;
-  // FIX 5: validate even the test-only overrides — a control char in the unit
+  // FIX 5: validate even the test-only overrides - a control char in the unit
   // name or filename is an injection vector into the systemctl argv / drop-in
   // path. The filename must additionally be a bare basename (no separator).
   assertNoControlChars(unit, "systemd unit name");
@@ -233,7 +233,7 @@ export async function launchLinuxCastleWallDaemon(
     daemonBinary: input.daemonBinary,
   });
 
-  // Install the drop-in (root-owned, 0644 — the daemon's ExecStart override is
+  // Install the drop-in (root-owned, 0644 - the daemon's ExecStart override is
   // not a secret; the secret is the private key, which the daemon writes 0600).
   try {
     await fs.mkdir(dropInDir);
@@ -254,7 +254,7 @@ export async function launchLinuxCastleWallDaemon(
     "daemon_start_failed"
   );
 
-  // VERIFY active — the load-bearing honesty check. `is-active` exits 0 + prints
+  // VERIFY active - the load-bearing honesty check. `is-active` exits 0 + prints
   // "active" only when the unit actually came up. Anything else = not armed.
   const active = await input.systemctl.run(["is-active", unit]);
   const isActive = active.code === 0 && active.stdout.trim() === "active";
@@ -373,7 +373,7 @@ function adaptSocketToTransport(socket: import("node:net").Socket): IpcTransport
  * Resolve the producer pub-key path for a fortress + assert the published key is
  * READABLE by this (unprivileged) process. The daemon writes it world-readable;
  * if it is missing or unreadable AFTER a successful daemon start, that is a
- * fail-closed condition (a key is EXPECTED — `startCastleWall` will throw
+ * fail-closed condition (a key is EXPECTED - `startCastleWall` will throw
  * `unreadable`, which the caller surfaces as not-armed). This helper exists so a
  * launcher can give a precise diagnostic before the lifecycle's generic throw.
  */
@@ -423,7 +423,7 @@ function shellQuote(value: string): string {
 
 /**
  * Reject any value containing an ASCII control character (incl. newline, CR,
- * tab, NUL). FIX 5: a newline is the injection primitive for a systemd drop-in —
+ * tab, NUL). FIX 5: a newline is the injection primitive for a systemd drop-in -
  * it ends the current directive and starts a new one, which quoting does NOT
  * prevent. We refuse rather than try to escape, so a hostile path/id can never
  * smuggle an extra `[Service]` directive.
@@ -481,7 +481,7 @@ function assertSafeAbsolutePath(value: string, label: string): string {
     );
   }
   // Check the RAW value for `..` traversal segments BEFORE normalize() collapses
-  // them away — the concern is a traversal in the operator-supplied input, not in
+  // them away - the concern is a traversal in the operator-supplied input, not in
   // the resolved result.
   if (value.split("/").includes("..")) {
     throw new RuntimeLinuxActivationError(

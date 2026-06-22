@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -85,10 +88,13 @@ jobs:
   lint:
     # ESLint was wired and the floating-promise backlog driven to zero, but no
     # workflow ran it, so an error-level regression could land silently. This
-    # lightweight job (no sidecar/build needed) locks in "zero eslint errors"
-    # on every PR. It fails on ERRORS only; warnings are reported, not blocking
-    # (3 deliberately-deferred warnings remain, incl. one in security-critical
-    # anti-rollback code). Tighten to --max-warnings 0 only after those clear.
+    # lightweight job (no sidecar/build needed) locks in "zero eslint warnings"
+    # on every PR: `npm run lint` runs `eslint src/ --max-warnings 0`, so a NEW
+    # warning (not just an error) fails the required `lint` check. The 3 prior
+    # deferred warnings were cleared (real fixes for the no-explicit-any and
+    # no-useless-assignment items; a scoped, security-justified inline-disable
+    # for the FIXED_DENIAL_MESSAGE preserve-caught-error item that must not
+    # thread the caught error through `cause`).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

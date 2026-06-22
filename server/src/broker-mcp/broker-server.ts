@@ -22,14 +22,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { Broker } from "../l3-disclosure/broker/broker.js";
+import type { Broker } from "../disclosure/broker/broker.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import {
   BrokerDeniedError,
   BrokerTokenExpiredError,
   BrokerTokenUnknownError,
   type VerifiedBrokerCallerClaims,
-} from "../l3-disclosure/broker/token-issuer.js";
+} from "../disclosure/broker/token-issuer.js";
 
 // Re-export the shared package version. v0.10.0-rc.2 had an inlined local
 // require of package.json at this file's source depth — correct from src/
@@ -122,7 +122,8 @@ export function createBrokerMcpServer(
       {
         name: "broker/list_grants",
         description:
-          "List the currently-active grants visible to this broker. Names only — no secret values.",
+          "List active grant metadata visible to this broker: skill, secret name, scope, optional " +
+          "agent/tenant/fortress/audience, and TTL. Secret values are never returned.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -131,7 +132,7 @@ export function createBrokerMcpServer(
       {
         name: "broker/audit_query",
         description:
-          "Query the broker-scoped audit trail (all L3 broker operations). Never returns secret values.",
+          "Query your own broker-scoped audit trail (token request/issue/deny/read for your identity). Each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — never the secret name, the granted/requested scope, the ttl, the denial reason, or any tenant/audience claim; those are operator-only.",
         inputSchema: {
           type: "object",
           properties: {
@@ -199,7 +200,15 @@ export function createBrokerMcpServer(
         case "broker/audit_query": {
           const since = optionalString(args, "since");
           const limit = optionalNumber(args, "limit");
-          const summary = await broker.queryAudit({ since, limit });
+          // Scope to the verified caller's OWN broker entries and return the
+          // allowlist-redacted view only (no secret name / scope / ttl / reason
+          // / tenant). The identity is the harness-verified principal, never
+          // read from MCP args.
+          const summary = await broker.queryAudit({
+            since,
+            limit,
+            identity_id: opts.identityId,
+          });
           return ok(summary);
         }
 

@@ -17,7 +17,7 @@
  * and anomaly-trigger sentinels against this same shape.
  */
 
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { SubstrateSelector } from "../intelligence/selector.js";
 import type { SentinelFindingStore } from "./sentinel-finding-store.js";
 

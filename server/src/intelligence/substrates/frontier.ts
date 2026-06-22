@@ -268,7 +268,7 @@ export class FrontierClient {
 /**
  * Pre-egress redaction hook. The substrate adapter calls this on every
  * outbound text; returns the redacted text + placeholder map. The Privacy
- * Filter Tier 2 implementation lives in `l2-operational/privacy-filter.ts`
+ * Filter Tier 2 implementation lives in `operational/privacy-filter.ts`
  * (extended in this PR to wire the substrate-aware Tier 2 path).
  *
  * For v1.2, the redactor passed in is responsible for emitting the audit

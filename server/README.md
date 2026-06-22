@@ -277,7 +277,7 @@ npm test
 
 ## Architecture (source tree)
 
-The directory layout below reflects v1.2 shipped reality plus annotated v1.x and v1.3 placeholders for the Castle Wall and Sentinels work packages. Capability-surface directory names are the legacy `l1-l4-` prefixes; a follow-on cleanup pass renames them to plain capability names (`cognitive/`, `operational/`, `disclosure/`, `reputation/`) so the prefixes do not collide with Castle Layer numbering. The cleanup is non-gating; references in tooling and tests carry over either way.
+The directory layout below reflects v1.2 shipped reality plus annotated v1.x and v1.3 placeholders for the Castle Wall and Sentinels work packages. Capability-surface directory names are the plain capability names (`cognitive/`, `operational/`, `disclosure/`, `reputation/`), renamed from the legacy `l1`-`l4` prefixes so the prefixes do not collide with Castle Layer numbering. Crypto domain-separation labels that embed a legacy token (e.g. the HKDF info string `l4-reputation`) are deliberately frozen and were NOT renamed.
 
 ```
 src/
@@ -294,17 +294,17 @@ src/
 │   ├── interface.ts       # Abstract StorageBackend
 │   ├── filesystem.ts      # Encrypted filesystem (default)
 │   └── memory.ts          # In-memory (testing)
-├── l1-cognitive/          # Capability surface 1 (Castle Layer 3): encrypted state plus identity
+├── cognitive/          # Capability surface 1 (Castle Layer 3): encrypted state plus identity
 │   ├── state-store.ts     # StateStore with Merkle verification
 │   └── tools.ts           # MCP tool definitions
-├── l2-operational/        # Capability surface 2 (Castle Layer 3): attestation plus monitoring
+├── operational/        # Capability surface 2 (Castle Layer 3): attestation plus monitoring
 │   └── audit-log.ts       # Encrypted append-only audit log
-├── l3-disclosure/         # Capability surface 3 (Castle Layer 3): commitments plus ZK proofs plus policies
+├── disclosure/         # Capability surface 3 (Castle Layer 3): commitments plus ZK proofs plus policies
 │   ├── commitments.ts     # SHA-256 commitment schemes
 │   ├── zk-proofs.ts       # Pedersen/Ristretto255, Schnorr proofs, range proofs
 │   ├── policies.ts        # Disclosure policy engine
 │   └── tools.ts           # MCP tool definitions
-├── l4-reputation/         # Capability surface 4 (Castle Layer 3): reputation plus bootstrap plus tiers
+├── reputation/         # Capability surface 4 (Castle Layer 3): reputation plus bootstrap plus tiers
 │   ├── reputation-store.ts # Signed attestations, escrow, guarantees
 │   ├── tiers.ts           # Sovereignty-gated reputation tiers
 │   └── tools.ts           # MCP tool definitions

@@ -6,7 +6,7 @@
  */
 
 import type { SanctuaryConfig } from "../config.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type {
   SHRBody,
   SignedSHR,
@@ -20,7 +20,7 @@ import { sign } from "../core/identity.js";
 import { toBase64url, stringToBytes, fromBase64url, bytesToString } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 
 /** Default SHR validity window: 1 hour */
 const DEFAULT_VALIDITY_MS = 60 * 60 * 1000;
@@ -44,7 +44,7 @@ export const DEFAULT_LOW_TIER_DOMINANCE_THRESHOLD = 0.6;
  * degradations from them. Keeping evidence as plain data keeps the
  * generator synchronous and easy to test.
  */
-export interface L4Evidence {
+export interface ReputationEvidence {
   /** Total attestations attributed to the signing identity */
   attestation_count: number;
   /** Count of attestations at each sovereignty tier */
@@ -83,7 +83,7 @@ export interface SHRGeneratorOptions {
    * and downgrades `layers.l4.status` to `degraded` when any fire.
    * When omitted, L4 is left at "active" (backward-compatible).
    */
-  l4Evidence?: L4Evidence;
+  l4Evidence?: ReputationEvidence;
   /**
    * Clock override for deterministic testing of staleness behavior.
    * Defaults to the current wall clock.
@@ -102,8 +102,8 @@ export interface SHRGeneratorOptions {
  *     rich internal reputation but no external publish is still worth
  *     flagging.
  */
-export function deriveL4Degradations(
-  evidence: L4Evidence,
+export function deriveReputationDegradations(
+  evidence: ReputationEvidence,
   now: Date = new Date()
 ): SHRDegradation[] {
   const out: SHRDegradation[] = [];
@@ -191,6 +191,12 @@ export function deriveL4Degradations(
   return out;
 }
 
+// ── Back-compat aliases (L1-L4 rename PR-3) ─────────────────────────────
+// The layer-numbered names stay exported as aliases so downstream imports
+// keep working. The functional names above are canonical.
+export type L4Evidence = ReputationEvidence;
+export const deriveL4Degradations = deriveReputationDegradations;
+
 /**
  * Generate and sign a Sovereignty Health Report.
  *
@@ -244,7 +250,7 @@ export function generateSHR(
   // Without evidence the generator leaves L4 at "active" (backward-compatible
   // with older call sites; fresh code paths always provide evidence).
   const l4Degradations = l4Evidence
-    ? deriveL4Degradations(l4Evidence, now)
+    ? deriveReputationDegradations(l4Evidence, now)
     : [];
   degradations.push(...l4Degradations);
 

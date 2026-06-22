@@ -87,7 +87,7 @@ export function enforceAuth(
     throw new AuthGateError("missing configured authentication token");
   }
 
-  // Extract token from Authorization header or ?token= query param
+  // Extract token from Authorization header only; long-lived URL tokens are rejected.
   const token = extractToken(req, url);
   if (!token) {
     throw new AuthGateError("missing authentication token");

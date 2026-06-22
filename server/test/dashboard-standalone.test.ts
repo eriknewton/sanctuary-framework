@@ -7,7 +7,7 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
 import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
@@ -15,6 +15,15 @@ import {
   bindWithRetry,
   randomTestPort,
 } from "./util/port-collision-retry.js";
+
+type StandaloneDashboardStartOptions = Omit<
+  Parameters<typeof startStandaloneDashboard>[0],
+  "port"
+>;
+
+let isolatedDiscoveryOptions:
+  | StandaloneDashboardStartOptions["discoveryOptions"]
+  | undefined;
 
 /**
  * Boot startStandaloneDashboard with a freshly chosen port, retrying on
@@ -26,7 +35,11 @@ async function startDashboardOnFreePort(
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
   return bindWithRetry(async () => {
     const port = randomTestPort();
-    const dashboard = await startStandaloneDashboard({ ...options, port });
+    const dashboard = await startStandaloneDashboard({
+      ...options,
+      discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
+      port,
+    });
     return { dashboard, port };
   });
 }
@@ -37,6 +50,15 @@ describe("Standalone Dashboard", () => {
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "sanctuary-test-dashboard-"));
+    const discoveryRoot = join(tempDir, "discovery-root");
+    const discoveryHome = join(tempDir, "discovery-home");
+    await mkdir(discoveryRoot, { recursive: true, mode: 0o700 });
+    await mkdir(discoveryHome, { recursive: true, mode: 0o700 });
+    isolatedDiscoveryOptions = {
+      root: discoveryRoot,
+      home: discoveryHome,
+      env: {},
+    };
     // Ensure test environment flags are set (auto-open is skipped in test)
     process.env.VITEST = "true";
   });
@@ -53,6 +75,7 @@ describe("Standalone Dashboard", () => {
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
+    isolatedDiscoveryOptions = undefined;
   });
 
   it("starts a standalone dashboard HTTP server", async () => {
@@ -152,7 +175,10 @@ describe("Standalone Dashboard", () => {
 
   it("rejects unauthenticated /api/snapshot requests in standalone mode", async () => {
     // The fix must not weaken the auth posture: /api/snapshot sits behind
-    // the same bearer-token gate as every other legacy /api/* route.
+    // the same bearer-token gate as every other legacy /api/* route. The
+    // helper also pins tenant discovery to an empty test root, so this fresh
+    // fortress cannot auto-discover a parallel tenant and engage loopback
+    // auto-auth.
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-snapshot-auth";
 
@@ -206,6 +232,7 @@ describe("Standalone Dashboard", () => {
       dashboard2 = await startStandaloneDashboard({
         port: randomTestPort(),
         host: "127.0.0.1",
+        discoveryOptions: isolatedDiscoveryOptions,
       });
       // If we get here, clean up and fail
       await dashboard2.stop();
@@ -282,7 +309,7 @@ describe("Standalone Dashboard", () => {
       host: "127.0.0.1",
     });
 
-    const { IdentityManager } = await import("../src/l1-cognitive/tools.js");
+    const { IdentityManager } = await import("../src/cognitive/tools.js");
     const { FilesystemStorage } = await import("../src/storage/filesystem.js");
     const { derivePurposeKey } = await import("../src/core/key-derivation.js");
     const { createIdentity } = await import("../src/core/identity.js");

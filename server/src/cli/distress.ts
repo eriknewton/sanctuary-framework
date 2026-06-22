@@ -26,8 +26,8 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   IdentityManager,
   createInternalIdentitySigningHelpers,
-} from "../l1-cognitive/tools.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+} from "../cognitive/tools.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { readDistressConfig } from "../distress/config.js";

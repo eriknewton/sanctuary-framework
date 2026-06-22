@@ -1,4 +1,4 @@
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { bytesToString, stringToBytes } from "../core/encoding.js";
 import {
   decrypt,

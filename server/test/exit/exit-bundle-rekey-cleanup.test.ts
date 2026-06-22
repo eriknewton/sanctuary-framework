@@ -16,15 +16,21 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
+import { Buffer } from "node:buffer";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import {
+  StateStore,
+  STATE_META_PUBLIC_KEYS_KEY,
+  STATE_META_VERSION_ANCHORS_KEY,
+} from "../../src/cognitive/state-store.js";
+import { stringToBytes } from "../../src/core/encoding.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import {
@@ -122,6 +128,19 @@ function failOnNthUserWrite(
   };
 }
 
+async function storageNamespaceBytes(
+  storage: StorageBackend,
+  namespace: string
+): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  for (const entry of await storage.list(namespace)) {
+    const raw = await storage.read(namespace, entry.key);
+    if (!raw) continue;
+    snapshot[entry.key] = Buffer.from(raw).toString("base64");
+  }
+  return snapshot;
+}
+
 async function exportFromSourceWithState(
   source: Awaited<ReturnType<typeof makeHarness>>,
   bundleDir: string,
@@ -207,6 +226,11 @@ describe("Exit-bundle re-key staged-artifact cleanup (finding #78)", () => {
       destIdentityManager,
       destAuditLog
     );
+    const metaBefore = await storageNamespaceBytes(destInnerStorage, "_meta");
+    const userDataBefore = await storageNamespaceBytes(
+      destInnerStorage,
+      "user-data"
+    );
 
     let caught: ExitBundleImportError | null = null;
     try {
@@ -233,6 +257,12 @@ describe("Exit-bundle re-key staged-artifact cleanup (finding #78)", () => {
 
     // The first user-data entry was imported by the destination, then
     // rolled back. Confirm it is gone.
+    expect(await storageNamespaceBytes(destInnerStorage, "_meta")).toEqual(
+      metaBefore
+    );
+    expect(await storageNamespaceBytes(destInnerStorage, "user-data")).toEqual(
+      userDataBefore
+    );
     expect(await destInnerStorage.exists("user-data", "k1")).toBe(false);
     expect(await destInnerStorage.exists("user-data", "k2")).toBe(false);
 
@@ -262,6 +292,113 @@ describe("Exit-bundle re-key staged-artifact cleanup (finding #78)", () => {
     const details = entry.details as Record<string, unknown>;
     expect(details.import_id).toBeTruthy();
     expect(typeof details.removed_total).toBe("number");
+  });
+
+  it("rekey rollback restores pre-existing state and _meta bytes after overwrite", async () => {
+    const source = await makeHarness();
+    const sourceIdentity = await callTool(source.tools, "identity_create", {
+      label: "source-agent",
+    });
+    const sourceIdentityId = sourceIdentity.identity_id as string;
+    await callTool(source.tools, "state_write", {
+      namespace: "user-data",
+      key: "k1",
+      value: "source-v1",
+      identity_id: sourceIdentityId,
+    });
+    await callTool(source.tools, "state_write", {
+      namespace: "user-data",
+      key: "k2",
+      value: "source-v2",
+      identity_id: sourceIdentityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-rekey-cleanup-meta-"));
+    tempDirs.push(bundleDir);
+    await exportFromSourceWithState(source, bundleDir, sourceIdentityId, ["user-data"]);
+
+    const destInnerStorage = new MemoryStorage();
+    const destMasterKey = source.masterKey;
+    const destAuditLog = new AuditLog(destInnerStorage, destMasterKey);
+    const setupStateStore = new StateStore(destInnerStorage, destMasterKey);
+    const { tools: setupTools, identityManager: destIdentityManager } = createL1Tools(
+      setupStateStore,
+      destInnerStorage,
+      destMasterKey,
+      "recovery-key",
+      destAuditLog
+    );
+    await destIdentityManager.load();
+    const destIdentity = await callTool(setupTools as ToolDef[], "identity_create", {
+      label: "dest-default",
+    });
+    const destIdentityId = destIdentity.identity_id as string;
+    await callTool(setupTools as ToolDef[], "state_write", {
+      namespace: "user-data",
+      key: "k1",
+      value: "destination-original",
+      identity_id: destIdentityId,
+    });
+    await callTool(setupTools as ToolDef[], "state_write", {
+      namespace: "local-only",
+      key: "keep",
+      value: "destination-keep",
+      identity_id: destIdentityId,
+    });
+    await destInnerStorage.write(
+      "_meta",
+      STATE_META_PUBLIC_KEYS_KEY,
+      stringToBytes(JSON.stringify({ sentinel: "original-registry" }))
+    );
+
+    const metaBefore = await storageNamespaceBytes(destInnerStorage, "_meta");
+    const userDataBefore = await storageNamespaceBytes(
+      destInnerStorage,
+      "user-data"
+    );
+    const localOnlyBefore = await storageNamespaceBytes(
+      destInnerStorage,
+      "local-only"
+    );
+
+    const destStorage = failOnNthUserWrite(destInnerStorage, 2);
+    const { reputationStore: destReputationStore } = createL4Tools(
+      destStorage,
+      destMasterKey,
+      destIdentityManager,
+      destAuditLog
+    );
+
+    let caught: ExitBundleImportError | null = null;
+    try {
+      await importExitBundle({
+        bundleDir,
+        storage: destStorage,
+        masterKey: destMasterKey,
+        identityManager: destIdentityManager,
+        auditLog: destAuditLog,
+        reputationStore: destReputationStore,
+        activate: true,
+        sourceMasterKey: source.masterKey,
+        forceRebind: true,
+        conflictResolution: "overwrite",
+      });
+    } catch (err) {
+      caught = err as ExitBundleImportError;
+    }
+
+    expect(caught).toBeInstanceOf(ExitBundleImportError);
+    expect(caught?.code).toBe("REKEY_FAILED_AND_CLEANED");
+    expect(await storageNamespaceBytes(destInnerStorage, "_meta")).toEqual(
+      metaBefore
+    );
+    expect(await storageNamespaceBytes(destInnerStorage, "user-data")).toEqual(
+      userDataBefore
+    );
+    expect(await storageNamespaceBytes(destInnerStorage, "local-only")).toEqual(
+      localOnlyBefore
+    );
+    expect(await destInnerStorage.exists("user-data", "k2")).toBe(false);
   });
 
   it("rekey failure mid-write: cleans up every staged artifact even when zero state entries were imported", async () => {
@@ -341,5 +478,87 @@ describe("Exit-bundle re-key staged-artifact cleanup (finding #78)", () => {
       const entries = await destInnerStorage.list(ns);
       expect(entries.length).toBe(0);
     }
+  });
+
+  it("happy path still activates state entries and StateStore _meta records", async () => {
+    const source = await makeHarness();
+    const sourceIdentity = await callTool(source.tools, "identity_create", {
+      label: "source-agent",
+    });
+    const sourceIdentityId = sourceIdentity.identity_id as string;
+    await callTool(source.tools, "state_write", {
+      namespace: "user-data",
+      key: "k1",
+      value: "v1",
+      identity_id: sourceIdentityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-rekey-cleanup-happy-"));
+    tempDirs.push(bundleDir);
+    await exportFromSourceWithState(source, bundleDir, sourceIdentityId, ["user-data"]);
+
+    const destStorage = new MemoryStorage();
+    const destMasterKey = source.masterKey;
+    const destAuditLog = new AuditLog(destStorage, destMasterKey);
+    const setupStateStore = new StateStore(destStorage, destMasterKey);
+    const { tools: setupTools, identityManager: destIdentityManager } = createL1Tools(
+      setupStateStore,
+      destStorage,
+      destMasterKey,
+      "recovery-key",
+      destAuditLog
+    );
+    await destIdentityManager.load();
+    await callTool(setupTools as ToolDef[], "identity_create", {
+      label: "dest-default",
+    });
+    const { reputationStore: destReputationStore } = createL4Tools(
+      destStorage,
+      destMasterKey,
+      destIdentityManager,
+      destAuditLog
+    );
+
+    const imported = await importExitBundle({
+      bundleDir,
+      storage: destStorage,
+      masterKey: destMasterKey,
+      identityManager: destIdentityManager,
+      auditLog: destAuditLog,
+      reputationStore: destReputationStore,
+      activate: true,
+      sourceMasterKey: source.masterKey,
+      forceRebind: true,
+    });
+
+    expect(imported).toMatchObject({
+      verified: true,
+      activated: true,
+      state: {
+        status: "rekeyed",
+        imported_keys: 1,
+        skipped_keys: 0,
+        skipped_invalid_sig: 0,
+        skipped_unknown_kid: 0,
+      },
+    });
+    expect(await destStorage.exists("user-data", "k1")).toBe(true);
+
+    const publicKeys = await destStorage.read("_meta", STATE_META_PUBLIC_KEYS_KEY);
+    const anchors = await destStorage.read("_meta", STATE_META_VERSION_ANCHORS_KEY);
+    expect(publicKeys).not.toBeNull();
+    expect(anchors).not.toBeNull();
+    const publicKeyRegistry = JSON.parse(
+      Buffer.from(publicKeys!).toString("utf8")
+    ) as Record<string, string>;
+    const anchorRecord = JSON.parse(Buffer.from(anchors!).toString("utf8")) as {
+      __sanctuary_meta_mac_v1: true;
+      data: Record<string, number>;
+      mac: string;
+    };
+    expect(Object.keys(publicKeyRegistry).length).toBeGreaterThan(0);
+    expect(anchorRecord.__sanctuary_meta_mac_v1).toBe(true);
+    expect(anchorRecord.data["user-data/k1"]).toBe(1);
+    expect(typeof anchorRecord.mac).toBe("string");
   });
 });

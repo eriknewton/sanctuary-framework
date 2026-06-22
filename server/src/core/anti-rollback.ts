@@ -441,7 +441,7 @@ export async function isRollbackFrozenWithRecompute(
   // master-custody (which dynamically imports this module).
   const { readEnvelopeEpoch } = await import("./master-custody.js");
   const { readCustodyEpochCount, probeAuditHeadAnchor, deriveAuditEpochKeys } =
-    await import("../l2-operational/audit-log.js");
+    await import("../operational/audit-log.js");
 
   const epochKeys = deriveAuditEpochKeys(master);
   let rotationEpochCount = 0;
@@ -1350,7 +1350,7 @@ function defaultRekorFloorDeps(args: {
       const { readAnchorConfig, anchorReceiptsPresentOnDisk } = await import(
         "../transparency/anchoring.js"
       );
-      let configEnabled = false;
+      let configEnabled: boolean;
       try {
         const state = await readAnchorConfig({
           storage: args.storage,

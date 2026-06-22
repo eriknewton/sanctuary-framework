@@ -21,15 +21,16 @@
  *     bucket — never invented as some rule.
  *
  * SECURITY (property #11, no-policy-inference): the `ruleId` this module exposes
- * is operator-only. The redaction of `rule_id` / `rule_id_matched` happens at the
- * agent-facing read boundaries (AUDIT_AGENT_REDACT_DETAIL_KEYS in
- * server/src/index.ts and the cooperative-surface tools). This module is a pure
+ * is operator-only. The agent-facing read boundaries use an ALLOWLIST
+ * (agent-audit-redaction.ts): they emit only the fixed safe view and never pass
+ * audit `details` through, so `rule_id` / `rule_id_matched` (and any other
+ * operator-attribution detail) never reach an agent. This module is a pure
  * aggregator with no read-boundary of its own; callers MUST only hand it
  * operator-context entries. The operator CLI is such a caller; an agent-facing
  * tool is not and must not call it on raw (unredacted) entries.
  */
 
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 import type { DecisionValue } from "../ipc/messages.js";
 
 /**

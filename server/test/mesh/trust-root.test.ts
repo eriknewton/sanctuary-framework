@@ -25,6 +25,7 @@ import {
   generateFortressMaster,
   issueNodeIdentityCertificate,
   issuePrincipalCertificate,
+  NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING,
   v01VisibleCapabilities,
   verifyCertChain,
   verifyPrincipalCertificate,
@@ -125,7 +126,7 @@ describe("mesh/trust-root — per-node cert chain + hard-gate capability reserva
     nodeKeypair = generateKeypair();
   });
 
-  function issueNode(caps: number, withMasterSig = false) {
+  function issueNode(caps: number, withMasterSig = false, expires_at?: string) {
     return issueNodeIdentityCertificate({
       node_id: "node-" + toBase64url(randomBytes(4)),
       node_pubkey: nodeKeypair.publicKey,
@@ -139,12 +140,62 @@ describe("mesh/trust-root — per-node cert chain + hard-gate capability reserva
       },
       principal_private_key: principalKeypair.privateKey,
       master_private_key: withMasterSig ? master.private_key : undefined,
+      expires_at,
     });
   }
 
   it("issues and verifies a standard v0.1 node cert", () => {
     const cert = issueNode(CAP_STANDARD_FORTRESS_NODE);
     expect(() => verifyCertChain(cert, principalCert, master.public)).not.toThrow();
+  });
+
+  it("accepts a legacy node cert with no expires_at (migration compatibility)", () => {
+    const cert = issueNode(CAP_STANDARD_FORTRESS_NODE);
+    expect(cert.expires_at).toBeUndefined();
+    expect(() => verifyCertChain(cert, principalCert, master.public)).not.toThrow();
+  });
+
+  it("signs and enforces node cert expires_at when present", () => {
+    const now = Date.parse("2026-06-20T12:00:00.000Z");
+    const expiresAt = new Date(now + 60_000).toISOString();
+    const cert = issueNode(CAP_STANDARD_FORTRESS_NODE, true, expiresAt);
+    expect(cert.certificate_version).toBe(NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING);
+    expect(cert.expires_at).toBe(expiresAt);
+    expect(() =>
+      verifyCertChain(cert, principalCert, master.public, now),
+    ).not.toThrow();
+    expect(() =>
+      verifyCertChain(cert, principalCert, master.public, now + 60_001),
+    ).toThrow(MeshChainError);
+  });
+
+  it("rejects an expiring node cert without the signed certificate_version marker", () => {
+    const now = Date.parse("2026-06-20T12:00:00.000Z");
+    const cert = issueNode(
+      CAP_STANDARD_FORTRESS_NODE,
+      true,
+      new Date(now + 60_000).toISOString(),
+    );
+    const unversioned = { ...cert, certificate_version: undefined };
+    expect(() =>
+      verifyCertChain(unversioned, principalCert, master.public, now),
+    ).toThrow(MeshChainError);
+  });
+
+  it("rejects a node cert whose signed expires_at was tampered", () => {
+    const now = Date.parse("2026-06-20T12:00:00.000Z");
+    const cert = issueNode(
+      CAP_STANDARD_FORTRESS_NODE,
+      true,
+      new Date(now + 60_000).toISOString(),
+    );
+    const tampered = {
+      ...cert,
+      expires_at: new Date(now + 3_600_000).toISOString(),
+    };
+    expect(() =>
+      verifyCertChain(tampered, principalCert, master.public, now),
+    ).toThrow(MeshChainError);
   });
 
   it("cert issuance rejects reserved capability bits (hard gate §10.2)", () => {

@@ -38,8 +38,8 @@
  */
 
 import { canonicalJson, sha256Hex } from "../audit/chain.js";
-import type { AuditEntryInput } from "../l2-operational/audit-log.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntryInput } from "../operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   WORKLOAD_LIFECYCLE_OPS,
   WORKLOAD_LIFECYCLE_SCHEMA,

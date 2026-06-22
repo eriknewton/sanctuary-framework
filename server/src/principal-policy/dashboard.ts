@@ -29,16 +29,24 @@ import {
   loadFortressProducerKey,
   type ProducerKeyLoad,
 } from "../castle-wall/runtime/producer-signature.js";
+import {
+  loadBrokerProducerKey,
+  type BrokerProducerKeyLoad,
+} from "../broker-mcp/producer-signature.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import { gatherReputationEvidence } from "../shr/tools.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import type { StorageBackend } from "../storage/interface.js";
+import type { RecognitionReputationEvidence } from "./posture.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
@@ -50,14 +58,31 @@ import {
   getProtectionSnapshot,
   type AggregatorSources,
 } from "../dashboard/aggregator.js";
+import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
+  POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import { renderPostureHomeHTML } from "./posture-home-html.js";
+import {
+  buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  mapPlatform,
+  type CastleWallPosture,
+} from "./posture.js";
+import {
+  createPostureStreamRegistry,
+  type PostureStreamRegistry,
+} from "./posture-stream.js";
+import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
+import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
   V1IdempotencyStore,
   type V1AgentsDeps,
@@ -68,6 +93,7 @@ import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
   federationEventHash,
   validateFederationEventHash,
+  type FederationAppendOptions,
   type FederationAppendResult,
   type FederationContext,
   type FederationEvent,
@@ -75,6 +101,17 @@ import {
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import {
+  acceptFederationEventsFailClosed,
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
+  federationOperatorAuthorityOrigin,
+  foldAcceptedFederationNodeEvictionEvent,
+  foldFederationNodeEvictionEvent,
+  isFederationOperatorAuthorityEvent,
+  renewNodeIdentityCertificateIfDue,
+  startFederationNodeCertificateAutoRenewal,
+  type FederationNodeCertificateAutoRenewalHandle,
+} from "../v1/federation-revocation.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -199,12 +236,38 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/v1.0" ||
     path === "/fortress" ||
     path === "/events" ||
-    path === POSTURE_HOME_PATH
+    path === POSTURE_HOME_PATH ||
+    // The posture SSE live-refresh stream is a single long-lived connection per
+    // operator tab, exactly like the v1.0 `/events` stream. It must be exempt
+    // from the per-IP general rate limit so a normal reconnect (after a laptop
+    // sleep, say) does not 429 the operator out of their own live board. The
+    // stream handler enforces its OWN bound: a concurrency cap on open streams.
+    path === POSTURE_STREAM_PATH ||
+    // The per-agent drill-down HTML page is a dashboard view route too (an
+    // operator page load), so it is exempt from the general rate limit the
+    // same way `/posture` and `/fortress` are. Its data fetches still hit the
+    // throttled JSON endpoints.
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   );
+}
+
+interface FederationDashboardState {
+  eventLog: FederationEvent[];
+  revoked: Set<string>;
+  evictionMaxSerial: number;
+  nodes: Map<string, FederationNodeView>;
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
+  /**
+   * Shared active-stream registry for the posture SSE live-refresh endpoint
+   * (`/api/posture/stream`). One per server instance so the concurrency cap is
+   * enforced across every open stream. Created eagerly (cheap) so the live
+   * stream is available as soon as the dashboard serves the posture surface.
+   */
+  private postureStreamRegistry: PostureStreamRegistry =
+    createPostureStreamRegistry();
   private pending: Map<string, PendingRequest> = new Map();
   private sseClients: Set<SSEClient> = new Set();
   private httpServer: ReturnType<typeof createHttpServer> | null = null;
@@ -214,6 +277,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private identityManager: IdentityManager | null = null;
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
+  /**
+   * Storage backend, injected for the Recognition panel (P5) so the dashboard
+   * can list persisted Concordia-bridge commitments (`storage.list("_bridge")`)
+   * and read the local attestation store for reputation EVIDENCE (counts, not a
+   * score). Optional: when absent (standalone / un-wired), the Recognition panel
+   * falls back to audit-event counts and a `null` (amber) reputation row. Never
+   * used to fetch any external reputation score — there is no such path.
+   */
+  private storage: StorageBackend | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
@@ -234,6 +306,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * consumer wrote with (Slice P single-source contract).
    */
   private _producerKeyLoad: ProducerKeyLoad | undefined = undefined;
+  private _brokerProducerKeyLoad: BrokerProducerKeyLoad | undefined = undefined;
   private dashboardHTML: string;
   private fortressHTML: string | null = null;
   private loginHTML: string;
@@ -286,8 +359,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _autoAuthLocalhost = false;
   /**
    * v1.1 routes (dashboard HTML at /v1.1, hub API at /api/hub/*) are
-   * mounted additively when set. Legacy routes at / continue to serve
-   * regardless. Default route flip is deferred to v1.2.
+   * mounted additively when set. `/` is the posture shell; `/dashboard`
+   * and `/v1.1` remain v1.1 SPA compatibility aliases.
    */
   private v11Bindings: V11Bindings | null = null;
 
@@ -330,8 +403,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
   private readonly _federationRoster = new Set<string>();
-  private readonly _federationNodes = new Map<string, FederationNodeView>();
-  private readonly _federationEventLog: FederationEvent[] = [];
+  private _federationState: FederationDashboardState = {
+    eventLog: [],
+    revoked: new Set<string>(),
+    evictionMaxSerial: 0,
+    nodes: new Map<string, FederationNodeView>(),
+  };
+  private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
   /**
    * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
    * highest envelope high-water accepted per sender node id (whole-envelope
@@ -377,7 +455,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private handoffContextTransfer: ContextTransferExtractorDeps | null = null;
   private workflowStateTracker: WorkflowStateTracker | null = null;
   private handoffAuditLog:
-    | import("../l2-operational/audit-log.js").AuditLog
+    | import("../operational/audit-log.js").AuditLog
     | null = null;
   private handoffOperatorId: string | null = null;
   // v1.3 WP-V1.3-5 Pi-1 Honeypot Authoring: per-fortress trap registry
@@ -387,7 +465,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private honeypotRegistry: TrapRegistry | null = null;
   private honeypotFindingStore: SentinelFindingStore | null = null;
   private honeypotAuditLog:
-    | import("../l2-operational/audit-log.js").AuditLog
+    | import("../operational/audit-log.js").AuditLog
     | null = null;
   private honeypotOperatorId: string | null = null;
   private honeypotFortressId: string | null = null;
@@ -462,6 +540,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
     clientManager?: ClientManager;
+    /** Storage backend for the Recognition panel (bridge list + reputation read). */
+    storage?: StorageBackend;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -469,6 +549,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+    if (deps.storage) this.storage = deps.storage;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
     if (deps.clientManager) this.clientManager = deps.clientManager;
@@ -531,7 +612,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   setHandoffLog(opts: {
     handoffLog: HandoffLog | null;
     eventBridge?: HandoffEventBridge | null;
-    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    auditLog?: import("../operational/audit-log.js").AuditLog | null;
     operatorId?: string | null;
     /**
      * v1.3 WP-V1.3-3 Omega-2: context-transfer extractor deps. When
@@ -573,7 +654,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   setHoneypotRegistry(opts: {
     registry: TrapRegistry | null;
     findingStore?: SentinelFindingStore | null;
-    auditLog?: import("../l2-operational/audit-log.js").AuditLog | null;
+    auditLog?: import("../operational/audit-log.js").AuditLog | null;
     operatorId?: string | null;
     fortressId?: string | null;
     selector?: import("../intelligence/selector.js").SubstrateSelector | null;
@@ -947,16 +1028,230 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `unreadable` → fail honestly (the readers force non-green via
     // `producerKeyExpectedButUnavailable`), never the channel basis.
     await this.ensureProducerKeyLoaded();
+    await this.ensureBrokerProducerKeyLoaded();
     const load = this._producerKeyLoad;
+    const brokerLoad = this._brokerProducerKeyLoad;
+    // Recognition precursor: resolve the composition render-gate flag via the
+    // canonical resolver (default-off). The fortress config carries no composition
+    // input today, so this resolves to the honest `false` default; when an input
+    // is added later the same resolver picks it up without a shape change. This is
+    // CONFIG, not evidence - the composition endpoint exposes only this boolean.
+    const compositionEnabled =
+      resolveCompositionConfig().composition_enabled;
     const deps: PostureRouteDeps = {
       auditLog: this.auditLog ?? null,
       originMachine,
+      compositionEnabled,
+      // Recognition panel (P5) impure sources, resolved lazily per request so
+      // post-unlock wiring is observed. Both are LOCAL reads only: a count of
+      // persisted bridge commitments, and the local attestation-store evidence
+      // (COUNTS, never a score). They are only consulted when the route builds
+      // the panel (composition-enabled); the panel is absent otherwise.
+      countBridgeCommitments: () => this.countBridgeCommitments(),
+      gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      resolveBrokerPinnedProducerKey: () =>
+        brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+      brokerProducerKeyExpectedButUnavailable:
+        brokerLoad?.status === "unreadable",
+      // Wire the shared registry so the SSE live-refresh stream is available and
+      // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
+      // (no new data, no new green paths) on a cadence plus a heartbeat.
+      streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
+  }
+
+  /**
+   * One-surface root-flip: the posture board is the default page served at BOTH
+   * `/` and `/posture`.
+   *
+   * Serves the posture-home HTML shell (`renderPostureHomeHTML`) byte-for-byte
+   * identically on the root path and the `/posture` alias. This is the one
+   * posture surface the embedded native web view and any browser both land on.
+   *
+   * Auth contract (Delta Review A3 remediation): the shell is a STATIC page that
+   * carries no posture data — it negotiates its own auth client-side (loopback
+   * auto-auth or a pasted bearer) and fetches `/api/posture/*` for every byte of
+   * evidence, and those JSON routes stay behind `checkAuth`. So the shell itself
+   * is served WITHOUT a server-side auth gate, identically on `/` and
+   * `/posture`. Previously `/` was served here (unauthenticated) while
+   * `/posture`'s HTML was served by the posture router AFTER `checkAuth`, so the
+   * two surfaces had divergent auth contracts and were only "equivalent" when
+   * the test rig disabled auth. Serving both here, before the auth gate, makes
+   * them genuinely one surface under the real production auth posture. The
+   * `/posture` HTML branch was removed from {@link handlePostureRoute}
+   * accordingly (it would now be unreachable); the data routes it owns are
+   * unchanged.
+   *
+   * Scope: this matches ONLY the bare root path (`/`) and the `/posture` alias.
+   * `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`, `/posture/agent/:id`, and every
+   * `/api/*` route (including the approval channel and the posture JSON API) are
+   * untouched and keep their existing handlers and auth gates.
+   *
+   * Surface scope: this standalone `DashboardApprovalChannel` owns live approval
+   * decisions. The SEPARATE co-located `wrap` server (`dashboard/api.ts`, the
+   * `sanctuary wrap` / "Protect" HTTP server) performs its own fold: `/` and
+   * `/posture` serve the posture shell, `/api/posture/*` stays behind read auth,
+   * and `/dashboard` + `/v1.1` remain v1.1 compatibility aliases.
+   *
+   * Returns true when it served the posture board shell; false to fall through
+   * to the existing v1.1 / legacy dispatch ladder.
+   */
+  private dispatchRootPosture(
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): boolean {
+    if (
+      method !== "GET" ||
+      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+    ) {
+      return false;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureHomeHTML());
+    return true;
+  }
+
+  /**
+   * Build the evidence-gated Castle Wall arm-state the SAME way
+   * `/api/posture/castle-wall` derives it, so the AUTHENTICATED `/v1/status`
+   * document can report ONE honest arm-state instead of the dead
+   * `{ status: "unknown" }` placeholder it carried before.
+   *
+   * Auth scope (Delta Review A3 remediation): this is deliberately NOT exposed
+   * on the unauthenticated `/api/health` probe — that surface stays a cheap
+   * O(1) liveness answer with no posture and no audit scan. The detailed
+   * posture leaves the server only behind auth: this builder feeds the
+   * SESSION_TOKEN-gated `/v1/status` document (and `/api/posture/castle-wall`
+   * derives the same shape behind checkAuth). The native badge sources from
+   * `/api/posture/castle-wall`, never from `/api/health`.
+   *
+   * Resolves dependencies the same way {@link dispatchPosture} does (origin
+   * machine, the pinned producer key load, the unlocked audit log): green
+   * (`armed`) is derived by the ONE canonical {@link buildCastleWallPosture}
+   * shaper and nowhere else. The only divergence from the `/api/posture/...`
+   * route is the locked/absent-audit case: that route 503s (it need not answer
+   * when it cannot evidence posture), whereas a status document must answer 200,
+   * so this builder returns an honest `unknown` placeholder instead of routing
+   * through the shaper (whose `auditLog` input is typed non-null, so the null
+   * case genuinely cannot reach it). Honesty is preserved end-to-end: when the
+   * audit log is locked/absent, or the producer key is expected-but-unreadable,
+   * or evidence is stale, the result is `unknown` / `degraded` (never `armed`).
+   * Green (`armed`) is only ever returned for fresh, observed enforcement
+   * evidence, and only from the canonical shaper.
+   *
+   * Never throws into the request path: any unexpected failure resolves to an
+   * honest `unknown` posture so the status document always answers.
+   */
+  private async buildStatusCastleWall(): Promise<CastleWallPosture> {
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    try {
+      // Reuse the same producer-key load + audit log + origin attribution the
+      // posture dispatcher uses, so the two surfaces can never diverge on green.
+      await this.ensureProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      if (this.auditLog === null) {
+        // No unlocked audit log ⇒ no enforcement evidence to read. Honest
+        // `unknown` (amber), never green, never a fabricated placeholder.
+        return {
+          origin_machine: originMachine,
+          arm_state: "unknown",
+          platform: mapPlatform(process.platform),
+          evidence_basis: "no_evidence",
+          last_enforcement_evidence_at: null,
+          // Report the real freshness window (not 0) so this fallback matches
+          // the canonical buildCastleWallPosture shaper, whose own
+          // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+          freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+          verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+          audit_integrity_ok: true,
+          producer_authenticity: "not_applicable",
+        };
+      }
+      return await buildCastleWallPosture({
+        auditLog: this.auditLog,
+        originMachine,
+        pinnedProducerKeyB64url:
+          load?.status === "present" ? load.keyB64url : null,
+        ...(load?.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      });
+    } catch {
+      // Defensive: a health probe must never fail. Fall back to an honest
+      // `unknown` posture rather than throwing or claiming green.
+      return {
+        origin_machine: originMachine,
+        arm_state: "unknown",
+        platform: mapPlatform(process.platform),
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        // Report the real freshness window (not 0) so this fallback matches
+        // the canonical buildCastleWallPosture shaper, whose own
+        // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+        freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        producer_authenticity: "not_applicable",
+      };
+    }
+  }
+
+  /**
+   * Recognition panel (P5): count persisted Concordia-bridge commitments by
+   * listing the reserved `_bridge` namespace. This is the "committed receipts"
+   * count — a LOCAL storage read with NO Concordia process running and NO
+   * external fetch. Returns `undefined` when no storage backend is wired so the
+   * shaper takes its documented audit-event lower-bound fallback (returning `0`
+   * would assert a fact — "zero bridge commitments" — that an un-wired store
+   * cannot establish, suppressing the fallback). A list failure likewise
+   * propagates so the route layer's try/catch degrades to the audit-event count
+   * rather than fabricating a number.
+   */
+  private async countBridgeCommitments(): Promise<number | undefined> {
+    if (!this.storage) return undefined;
+    const entries = await this.storage.list("_bridge");
+    return entries.length;
+  }
+
+  /**
+   * Recognition panel (P5): gather LOCAL reputation EVIDENCE (attestation counts,
+   * tier distribution, dispute count, most-recent timestamp, and the local
+   * `verascore_linked` publish flag) for the primary identity. This reads the
+   * local attestation store ONLY — it never fetches a Verascore (or any vendor)
+   * score, and it returns COUNTS, not a number-on-a-scale. Returns `null` when
+   * the storage backend, master key, or a primary identity is unavailable, which
+   * the panel renders as an amber "no evidence yet" row (never green).
+   */
+  private async gatherRecognitionReputation(): Promise<RecognitionReputationEvidence | null> {
+    if (!this.storage || !this.shrOpts || !this.identityManager) return null;
+    const identity = this.identityManager.getDefault();
+    if (!identity) return null;
+    const reputationStore = new ReputationStore(this.storage, this.shrOpts.masterKey);
+    if (this.auditLog === null) return null;
+    const evidence = await gatherReputationEvidence(reputationStore, this.auditLog, {
+      identity_id: identity.identity_id,
+      did: identity.did,
+    });
+    // Project to the panel's evidence shape (counts only; never a score).
+    return {
+      attestation_count: evidence.attestation_count,
+      tier_distribution: evidence.tier_distribution,
+      most_recent_attestation_at: evidence.most_recent_attestation_at,
+      dispute_count: evidence.dispute_count,
+      verascore_linked: evidence.verascore_linked,
+    };
   }
 
   /**
@@ -1002,6 +1297,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this._producerKeyLoad = load.status === "absent" ? undefined : load;
   }
 
+  private async ensureBrokerProducerKeyLoaded(): Promise<void> {
+    if (this._brokerProducerKeyLoad?.status === "present") return;
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) {
+      this._brokerProducerKeyLoad = undefined;
+      return;
+    }
+    let load: BrokerProducerKeyLoad;
+    try {
+      load = await loadBrokerProducerKey(storagePath);
+    } catch {
+      load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
+    }
+    this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
+  }
+
   /**
    * Federation PR-A1: full `/v1/status` document, served only to a valid
    * SESSION_TOKEN holder with the status-read capability. Catalog shape:
@@ -1011,11 +1322,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * the stored identity — never a spread, so the encrypted private key
    * blob can never ride along into an HTTP response (CLAUDE.md
    * constraint 6). Federation is honestly `enabled: false` until the
-   * PR-A3 listener work; castle_wall reports `unknown` until status
-   * wiring lands later in the stack.
+   * PR-A3 listener work.
+   *
+   * Delta Review A3: `castle_wall` now carries the SAME evidence-gated arm-state
+   * `/api/posture/castle-wall` derives (via the canonical
+   * {@link buildStatusCastleWall} → {@link buildCastleWallPosture} path), not the
+   * old dead `{ status: "unknown" }` placeholder. This document is served ONLY
+   * to a SESSION_TOKEN holder with the status-read capability, so the detailed
+   * posture (and the audit scan that derives it) stays behind auth — it is NOT
+   * on the unauthenticated `/api/health` probe. Honesty is preserved: the shaper
+   * returns `unknown` / `degraded` (never `armed`) whenever there is no fresh,
+   * verified enforcement evidence.
    */
-  private buildV1FullStatus(): Record<string, unknown> {
+  private async buildV1FullStatus(): Promise<Record<string, unknown>> {
     const identity = this.identityManager?.getDefault();
+    const castleWall = await this.buildStatusCastleWall();
     return {
       ok: true,
       version: PKG_VERSION,
@@ -1042,7 +1363,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             created_at: identity.created_at,
           }
         : null,
-      castle_wall: { status: "unknown" },
+      castle_wall: castleWall,
     };
   }
 
@@ -1149,8 +1470,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * flag (a federation with no materials cannot be enabled).
    */
   setFederationContext(ctx: FederationContext | null): void {
+    this.stopFederationCertificateAutoRenewal();
     this._federationContext = ctx;
-    if (ctx === null) this._federationEnabled = false;
+    if (ctx === null) {
+      this._federationEnabled = false;
+      this._federationState = {
+        ...this._federationState,
+        revoked: new Set<string>(),
+        evictionMaxSerial: 0,
+      };
+      return;
+    }
+    this.reprojectFederationRevocations(ctx);
+    ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
+    this._federationRenewal = startFederationNodeCertificateAutoRenewal({
+      renewNow: () => this.renewLocalFederationNodeCertificate(),
+      config: ctx.nodeCertificateRenewal,
+    });
   }
 
   /**
@@ -1178,9 +1514,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           node_id: nodeId,
         });
       },
-      listNodes: () => [...this._federationNodes.values()],
+      listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
-      appendFederationEvents: (events) => this.appendFederationEvents(events),
+      appendFederationEvents: (events, options) =>
+        this.appendFederationEvents(events, options),
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
       recordAcceptedHighWater: (senderNodeId, highWater) => {
@@ -1194,6 +1531,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         });
       },
       nextOutboundHighWater: () => ++this._federationOutboundHighWater,
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      renewLocalNodeCertificate: () => {
+        this.renewLocalFederationNodeCertificate();
+      },
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -1205,15 +1546,114 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     };
   }
 
+  private stopFederationCertificateAutoRenewal(): void {
+    this._federationRenewal?.stop();
+    this._federationRenewal = null;
+  }
+
+  private renewLocalFederationNodeCertificate(): void {
+    const ctx = this._federationContext;
+    if (ctx === null) return;
+    const result = renewNodeIdentityCertificateIfDue({
+      certificate: ctx.localNodeCert ?? null,
+      localNodeId: ctx.nodeId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+      operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
+      masterPrivateKey: ctx.getMasterPrivateKey?.(),
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      config: ctx.nodeCertificateRenewal,
+    });
+    if (result.renewed) {
+      ctx.localNodeCert = result.certificate;
+      void this.auditLog?.append(
+        "l2",
+        "v1_federation_node_cert_auto_renewed",
+        result.certificate.node_id,
+        {
+          previous_expires_at: result.previousExpiresAt,
+          next_expires_at: result.nextExpiresAt,
+        },
+        "success",
+      ).catch(() => {
+        // Best-effort observability only; renewal already completed.
+      });
+    }
+  }
+
+  private isFederationNodeRevoked(nodeId: string): boolean {
+    return this._federationState.revoked.has(nodeId);
+  }
+
+  private reprojectFederationRevocations(ctx: FederationContext): void {
+    const projection = {
+      revokedNodeIds: new Set<string>(),
+      highestEvictionSerial: 0,
+    };
+    const events = this._federationState.eventLog
+      .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
+      .sort((a, b) => a.sequence - b.sequence);
+    for (const event of events) {
+      const folded = foldAcceptedFederationNodeEvictionEvent({
+        event,
+        projection,
+        fortressId: ctx.fortressId,
+      });
+      if (!folded.ok) continue;
+    }
+    this._federationState = {
+      ...this._federationState,
+      revoked: projection.revokedNodeIds,
+      evictionMaxSerial: projection.highestEvictionSerial,
+    };
+  }
+
+  private foldFederationEvictionEvent(
+    event: FederationEvent,
+    projection: {
+      revokedNodeIds: Set<string>;
+      highestEvictionSerial: number;
+    },
+  ): { ok: true } | { ok: false; reason: string } {
+    const ctx = this._federationContext;
+    if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
+    const folded = foldFederationNodeEvictionEvent({
+      event,
+      projection,
+      fortressId: ctx.fortressId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+    });
+    if (!folded.ok) return { ok: false, reason: folded.reason };
+    return { ok: true };
+  }
+
   private upsertFederationNode(
     nodeId: string,
     update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
     },
   ): FederationNodeView {
+    const nextNodes = new Map(this._federationState.nodes);
+    const node = this.buildFederationNodeUpsert(nextNodes, nodeId, update);
+    nextNodes.set(nodeId, node);
+    this._federationState = {
+      ...this._federationState,
+      nodes: nextNodes,
+    };
+    return node;
+  }
+
+  private buildFederationNodeUpsert(
+    nodes: Map<string, FederationNodeView>,
+    nodeId: string,
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+      last_sync?: Partial<FederationNodeView["last_sync"]>;
+    },
+  ): FederationNodeView {
     const now = new Date().toISOString();
-    const existing = this._federationNodes.get(nodeId);
-    const node: FederationNodeView = {
+    const existing = nodes.get(nodeId);
+    return {
       node_id: nodeId,
       label: update?.label ?? existing?.label ?? null,
       attestation_status: update?.attestation_status ?? existing?.attestation_status ?? "unknown",
@@ -1225,8 +1665,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
       },
     };
-    this._federationNodes.set(nodeId, node);
-    return node;
   }
 
   /**
@@ -1246,7 +1684,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private appendLocalFederationEvent(kind: string, payload: Record<string, unknown>): FederationEvent {
     const originNodeId = this._federationContext?.nodeId ?? "local";
-    const previous = [...this._federationEventLog]
+    const previous = [...this._federationState.eventLog]
       .reverse()
       .find((event) => event.origin_node_id === originNodeId);
     const eventWithoutHash = {
@@ -1262,22 +1700,79 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...eventWithoutHash,
       event_hash: federationEventHash(eventWithoutHash),
     };
-    this._federationEventLog.push(event);
+    this._federationState = {
+      ...this._federationState,
+      eventLog: [...this._federationState.eventLog, event],
+    };
     return event;
   }
 
   private listFederationEvents(since?: FederationSyncCursor): FederationEvent[] {
     const nodeId = since?.node_id;
     const after = since?.after_sequence ?? 0;
-    return this._federationEventLog.filter((event) => {
+    return this._federationState.eventLog.filter((event) => {
       if (nodeId && event.origin_node_id !== nodeId) return false;
       return event.sequence > after;
     });
   }
 
-  private appendFederationEvents(events: FederationEvent[]): FederationAppendResult {
+  private appendFederationEvents(
+    events: FederationEvent[],
+    options?: FederationAppendOptions,
+  ): FederationAppendResult {
+    const ctx = this._federationContext;
+    if (ctx === null) {
+      return {
+        accepted: [],
+        rejected: events.map((event) => ({
+          event_id: event.event_id,
+          reason: "federation_not_provisioned",
+        })),
+      };
+    }
+    return acceptFederationEventsFailClosed({
+      events,
+      fortressId: ctx.fortressId,
+      senderNodeId: options?.senderNodeId,
+      wireVersion: options?.wireVersion,
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      validateEvents: (batch) =>
+        this.validateFederationEventsAfterRevocationGate(batch),
+      appendEvents: (batch) =>
+        this.appendFederationEventsAfterRevocationGate(batch),
+    });
+  }
+
+  private validateFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
+  private appendFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    this._federationState = staged.nextState;
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
+  private stageFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult & {
+    nextState: FederationDashboardState;
+  } {
     const accepted: FederationEvent[] = [];
     const rejected: Array<{ event_id: string; reason: string }> = [];
+    const currentState = this._federationState;
+    const nextEventLog = [...currentState.eventLog];
+    const knownEventIds = new Set(currentState.eventLog.map((event) => event.event_id));
+    const nextNodes = new Map(currentState.nodes);
+    const evictionProjection = {
+      revokedNodeIds: new Set(currentState.revoked),
+      highestEvictionSerial: currentState.evictionMaxSerial,
+    };
     const byNode = new Map<string, FederationEvent[]>();
     for (const event of events) {
       const list = byNode.get(event.origin_node_id) ?? [];
@@ -1287,7 +1782,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     for (const [nodeId, nodeEvents] of byNode) {
       nodeEvents.sort((a, b) => a.sequence - b.sequence);
-      let last = [...this._federationEventLog]
+      let last = [...nextEventLog]
         .reverse()
         .find((event) => event.origin_node_id === nodeId);
       for (const event of nodeEvents) {
@@ -1295,7 +1790,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "hash_mismatch" });
           continue;
         }
-        if (this._federationEventLog.some((existing) => existing.event_id === event.event_id)) {
+        if (knownEventIds.has(event.event_id)) {
           rejected.push({ event_id: event.event_id, reason: "replay" });
           continue;
         }
@@ -1307,19 +1802,52 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "previous_hash_mismatch" });
           continue;
         }
-        this._federationEventLog.push(event);
+        const ctx = this._federationContext;
+        const operatorAuthorityOrigin =
+          ctx === null ? null : federationOperatorAuthorityOrigin(ctx.fortressId);
+        const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+        const isAuthorityOrigin =
+          operatorAuthorityOrigin !== null &&
+          event.origin_node_id === operatorAuthorityOrigin;
+        if (isEvictionKind || isAuthorityOrigin) {
+          if (
+            ctx === null ||
+            !isFederationOperatorAuthorityEvent(event, ctx.fortressId)
+          ) {
+            rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
+            continue;
+          }
+          const folded = this.foldFederationEvictionEvent(event, evictionProjection);
+          if (!folded.ok) {
+            rejected.push({ event_id: event.event_id, reason: folded.reason });
+            continue;
+          }
+        }
+        nextEventLog.push(event);
+        knownEventIds.add(event.event_id);
         accepted.push(event);
         last = event;
-        this.upsertFederationNode(nodeId, {
-          attestation_status: "verified",
-          last_sync: {
-            received_at: new Date().toISOString(),
-            last_sequence: event.sequence,
-          },
-        });
+        if (!isAuthorityOrigin) {
+          nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
+            attestation_status: "verified",
+            last_sync: {
+              received_at: new Date().toISOString(),
+              last_sequence: event.sequence,
+            },
+          }));
+        }
       }
     }
-    return { accepted, rejected };
+    return {
+      accepted,
+      rejected,
+      nextState: {
+        eventLog: nextEventLog,
+        revoked: evictionProjection.revokedNodeIds,
+        evictionMaxSerial: evictionProjection.highestEvictionSerial,
+        nodes: nextNodes,
+      },
+    };
   }
 
   /**
@@ -1448,6 +1976,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       clearInterval(this.sessionCleanupTimer);
       this.sessionCleanupTimer = null;
     }
+    this.stopFederationCertificateAutoRenewal();
 
     // Clean up rate limit tracking
     this.rateLimits.clear();
@@ -1553,7 +2082,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -1597,7 +2130,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const parts = authHeader.split(" ");
-      if (parts.length === 2 && parts[0] === "Bearer" && parts[1] === this.authToken) {
+      if (
+        parts.length === 2 &&
+        parts[0] === "Bearer" &&
+        constantTimeEquals(parts[1]!, this.authToken)
+      ) {
         return true;
       }
     }
@@ -1833,6 +2370,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _origin: string | undefined,
     _selfOrigin: string,
   ): void {
+    // One-surface root-flip: the posture board is the default page at `/` AND
+    // its `/posture` alias. Intercepted here, BEFORE the v1.1 SPA dispatch
+    // (which previously owned `/`), the auth gate, and the legacy route table,
+    // so both paths serve the one unauthenticated static shell under the same
+    // auth contract (the shell's data fetches stay behind checkAuth). Matches
+    // ONLY `/` and `/posture` — `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
+    // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
+    // the posture JSON API included) fall through untouched.
+    if (this.dispatchRootPosture(res, url, method)) return;
+
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
     // and never falls through to legacy routing — fail-closed 401 for
@@ -2014,9 +2561,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // v1.1.1 hotfix: try v1.1 dispatch first. dispatchV11 returns true when
     // the request matched a v1.1 route (dashboard HTML at /v1.1, hub API
-    // at /api/hub/*). When false, fall through to the legacy route table
-    // below so v1.0 surfaces stay live (additive mount, default route flip
-    // deferred to v1.2).
+    // at /api/hub/*). When false, fall through to the legacy route table below
+    // so v1.0 surfaces stay live; `/` was already handled by the posture shell.
     if (this.v11Bindings) {
       this.dispatchV11(req, res, url, method)
         .then((handled) => {
@@ -2044,6 +2590,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v1.3.0 (XXXXX): /api/health is exempt from auth AND rate limiting.
     // Health checks must always respond so the multi-aggregator health probe
     // pattern (multi-server.ts) and external monitoring work reliably.
+    //
+    // SECURITY (Delta Review A3 remediation): this probe is UNAUTHENTICATED and
+    // unthrottled, so it stays a cheap O(1) liveness answer and MUST NOT carry
+    // the evidence-based Castle Wall posture. A prior revision attached the full
+    // arm-state object (origin/operator id, verdict counts, enforcement
+    // timestamps) here and ran an unbounded audit-log scan + per-entry Ed25519
+    // re-verify on every call — that both leaked the detailed posture to any
+    // anonymous caller and gave an unauthenticated DoS amplifier. The honest
+    // arm-state lives ONLY behind auth: `/api/posture/castle-wall` (checkAuth;
+    // the native app reaches it via loopback auto-auth) and the `/v1/status`
+    // document (the v1 SESSION_TOKEN ceremony). The native badge sources its
+    // arm-state from `/api/posture/castle-wall`, never from this probe. The
+    // `{ ok, mode }` shape is the only contract the CLI health probe + external
+    // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -2066,10 +2626,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // For GET /v1.0: serve login page if not authenticated (instead of JSON 401).
-    // v1.1.7: root path now serves the v1.1 SPA (handled by dispatchV11
-    // above). The legacy four-panel dashboard moved to /v1.0; the login
-    // page mirrors that move so unauthenticated requests at /v1.0 still
-    // hit the legacy login flow.
+    // Root now serves the posture shell; /dashboard and /v1.1 remain v1.1 SPA
+    // aliases. The legacy four-panel dashboard moved to /v1.0; the login page
+    // mirrors that move so unauthenticated requests at /v1.0 still hit the
+    // legacy login flow.
     if (method === "GET" && url.pathname === "/v1.0" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
         // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
@@ -2100,15 +2660,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     )
       return;
 
-    // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
-    // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER
-    // checkAuth (same gate as `/api/audit-log`) and before the legacy route
-    // table. The dispatch is async; when it serves the request it returns
-    // true, otherwise we fall through to the legacy table below.
+    // Sovereignty Posture Dashboard: the authenticated posture surface, namely
+    // the per-agent drill-down HTML at `/posture/agent/:id` and the JSON gap
+    // endpoints at `/api/posture/*`. Dispatched AFTER checkAuth (same gate as
+    // `/api/audit-log`) and before the legacy route table. The dispatch is
+    // async; when it serves the request it returns true, otherwise we fall
+    // through to the legacy table below.
+    //
+    // NOTE (root-flip): the `/posture` HOME HTML is NOT served here. `GET /`
+    // and `GET /posture` are intercepted earlier by `dispatchRootPosture`
+    // (BEFORE checkAuth) and serve the one unauthenticated static shell, and
+    // `handlePostureRoute` no longer carries a `/posture` HTML branch. So
+    // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
-      url.pathname === POSTURE_HOME_PATH ||
+      url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
       url.pathname === POSTURE_API_PREFIX ||
-      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`)
+      url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
+      // Phase 2: the query-privacy stats endpoint is dispatched through the
+      // posture router so it shares the SAME checkAuth gate as `/api/posture/*`.
+      url.pathname.startsWith(`${QUERY_ANONYMITY_API_PREFIX}/`)
     ) {
       // JSON posture routes get the general rate limit; the HTML view is
       // exempt (it is a dashboard view route, like `/` and `/fortress`).
@@ -2145,8 +2715,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
-        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root and
-        // /dashboard now route to the v1.1 SPA via dispatchV11 above.
+        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
+        // posture shell; /dashboard and /v1.1 remain v1.1 SPA aliases.
         if (this.fortressHTML) {
           this.serveFortressView(res);
         } else {
@@ -2233,7 +2803,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     const parts = authHeader.split(" ");
-    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== this.authToken) {
+    if (
+      parts.length !== 2 ||
+      parts[0] !== "Bearer" ||
+      !constantTimeEquals(parts[1]!, this.authToken)
+    ) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid bearer token" }));
       return;
@@ -2330,6 +2904,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
         },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
+        },
       };
     }
 
@@ -2361,7 +2939,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * co-located server (dashboard/server.ts) receives at construction, so
    * /api/snapshot returns the same document shape in both modes.
    */
-  private buildAggregatorSources(): AggregatorSources {
+  private async buildAggregatorSources(): Promise<AggregatorSources> {
+    // Slice R + P: resolve the pinned producer key the SAME way dispatchPosture
+    // does, so the dashboard hero shield arms the wall on the identical
+    // cryptographic basis as /v1 G4. `present` → re-verify producer signatures
+    // (a forged marker-only entry cannot arm green); `absent` → channel basis
+    // (honest macOS / pre-provision); `unreadable` → fail honestly via
+    // `producerKeyExpectedButUnavailable` (the shield goes amber, never green on
+    // a weaker basis than the consumer wrote with).
+    await this.ensureProducerKeyLoaded();
+    const load = this._producerKeyLoad;
     return {
       mode: this._standaloneMode ? "standalone" : "co-located",
       server_version: PKG_VERSION,
@@ -2370,6 +2957,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...(this.baseline ? { baseline: this.baseline } : {}),
       ...(this.policy ? { policy: this.policy } : {}),
       ...(this.clientManager ? { clientManager: this.clientManager } : {}),
+      resolvePinnedProducerKey: () =>
+        load?.status === "present" ? load.keyB64url : null,
+      ...(load?.status === "unreadable"
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,
@@ -2387,7 +2979,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * legacy /api/* route.
    */
   private handleSnapshot(res: ServerResponse): void {
-    getProtectionSnapshot(this.buildAggregatorSources())
+    this.buildAggregatorSources()
+      .then((sources) => getProtectionSnapshot(sources))
       .then((snapshot) => {
         res.writeHead(200, {
           "Content-Type": "application/json",
@@ -2396,12 +2989,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify(snapshot));
       })
       .catch((err) => {
+        logCaughtError(
+          err,
+          { route: "/api/snapshot", operation: "get_snapshot" },
+          { status: 500 },
+        );
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               error: "snapshot_failed",
-              message: (err as Error).message,
             })
           );
         }
@@ -2413,6 +3010,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       pending_count: this.pending.size,
       connected_clients: this.sseClients.size,
       standalone_mode: this._standaloneMode,
+      decision_capable: !this._standaloneMode,
     };
 
     if (this.baseline) {
@@ -2428,6 +3026,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
+        },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
         },
       };
     }
@@ -2811,9 +3413,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ upstream_servers: updated.upstream_servers ?? [] }));
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Invalid request";
+        // The surrounding try covers JSON.parse(body), profileStore.update(),
+        // and broadcastSSE, so `err` can be a raw library/internal error
+        // (SyntaxError carrying request fragments, a profile-store failure
+        // carrying filesystem detail). Return a fixed safe message and keep
+        // the real, redacted detail server-side for operators.
+        logCaughtError(
+          err,
+          { route: "/api/proxy/servers", operation: "update_proxy_servers" },
+          { status: 400 },
+        );
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: message }));
+        res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
   }

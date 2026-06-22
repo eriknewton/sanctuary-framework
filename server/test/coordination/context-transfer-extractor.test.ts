@@ -30,7 +30,7 @@ import type { AddressInfo } from "node:net";
 import {
   AuditLog,
   type AuditEntry,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import {
   HandoffLog,
   HANDOFF_LOG_OBSERVED_OPS,

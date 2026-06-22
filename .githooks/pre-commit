@@ -50,8 +50,22 @@
 # the test suite is ~20s, total well under the budget.
 #
 # Emergency override: set SKIP_TEST_BASELINE=1 to bypass the hook.
-# Use only for emergency commits; the override is logged with
-# timestamp and HEAD SHA to .test-baseline-overrides.log for audit.
+# Use only for emergency commits. The override is REFUSED unless a
+# human-readable justification is also supplied in SKIP_REASON, e.g.:
+#   SKIP_TEST_BASELINE=1 SKIP_REASON="hotfix: CI runner outage, see #NNN" git commit ...
+# The override is logged to .test-baseline-overrides.log with timestamp,
+# HEAD SHA, branch, author (whoami), and the reason for audit.
+#
+# Enforcement status (be precise — do NOT call this hook "not
+# bypassable"): this LOCAL hook is the fast first line, but it is
+# CI-enforced with an audited emergency override — it can be skipped
+# with `SKIP_TEST_BASELINE=1` (documented + logged above) or with
+# `git commit --no-verify`, and it is absent in environments where the
+# hook was never installed. The HARD merge gate is the CI mirror at
+# .github/workflows/test-baseline-guard.yml (made a required status
+# check via the branch-protection runbook in
+# docs/audit/branch-protection-setup.md). Treat this hook as the local
+# convenience copy of that authority, not a guarantee on its own.
 #
 # Installation:
 #   cd server && npm run install-hooks
@@ -81,15 +95,79 @@ warn() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$YELLOW" "$1" "$N
 fail() { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$RED" "$1" "$NC" >&2; }
 ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC" >&2; }
 
+# ── Counter validation (fail CLOSED) ────────────────────────────────
+# The vitest-derived counters (`actual_total`, `passing`) are extracted from
+# vitest's text output with `grep -oE "[0-9]+"`. The capture is *shaped* like a
+# non-negative integer, but two pathological inputs are still possible and both
+# would corrupt the arithmetic guards downstream:
+#
+#   - a leading-zero string (e.g. "007") — historically a source of octal-parse
+#     surprises in `(( ... ))`; we reject it for the same reason we reject a
+#     leading-zero .test-baseline above; and
+#   - an absurdly large value (e.g. a 19-digit string) that overflows bash's
+#     signed-64-bit `(( ... ))` arithmetic and silently wraps (the macOS system
+#     bash is 3.2), so a numeric `(( _val > MAX ))` guard CANNOT catch it — the
+#     comparison itself overflows. Left unchecked, a wrapped-negative count would
+#     turn a "passing < baseline" regression check into a false PASS.
+#
+# So before ANY arithmetic touches a counter, validate it here and fail CLOSED.
+# The upper bound is enforced by DIGIT COUNT first (a value with more digits than
+# COUNTER_MAX is unambiguously larger and must never reach (( ))); only a value
+# already known to fit is compared numerically. A real suite never approaches
+# 100,000,000 tests/files, so a legitimate run never trips this; only a
+# parse-corrupted or adversarial value does. Args: <human-name> <value>.
+#
+# This MUST be invoked as a plain statement (`validate_counter NAME "$v"`), NOT
+# inside a command substitution: bash 3.2 does not propagate an `exit` out of a
+# `$(...)` subshell to abort the parent under `set -e`, which would fail OPEN.
+COUNTER_MAX=100000000   # 9 digits; see digit-count guard below.
+validate_counter() {
+  local _name="$1" _val="$2"
+  if ! [[ "$_val" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "$_name from vitest output is not a canonical integer, got: '$_val' — commit blocked"
+    exit 1
+  fi
+  # Reject by digit count first (overflow-safe), then numerically for same-length
+  # values. A value with MORE digits than COUNTER_MAX is definitely larger; a
+  # value with the SAME digit count is compared with (( )), which is safe because
+  # it is known to fit in 64-bit.
+  if (( ${#_val} > ${#COUNTER_MAX} )) \
+     || { (( ${#_val} == ${#COUNTER_MAX} )) && (( _val > COUNTER_MAX )); }; then
+    fail "$_name from vitest output ($_val) exceeds the sane upper bound ($COUNTER_MAX) — commit blocked"
+    printf '[baseline-guard]   This is almost certainly a parse-corrupted or adversarial value; refusing\n' >&2
+    printf '[baseline-guard]   to run arithmetic on it (overflow could mask a regression).\n' >&2
+    exit 1
+  fi
+  return 0
+}
+
 # ── Emergency override ───────────────────────────────────────────────
 if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
+  # An accountable override REQUIRES a reason. Refuse a bare bypass: an
+  # unexplained skip is exactly the unaudited shortcut this audit log exists to
+  # prevent. `SKIP_REASON` must be a non-empty, non-whitespace string.
+  skip_reason="${SKIP_REASON:-}"
+  if [[ -z "${skip_reason//[[:space:]]/}" ]]; then
+    fail "SKIP_TEST_BASELINE=1 was set WITHOUT a justification — override refused."
+    printf '[baseline-guard]   An emergency override must be accountable. Re-run with a reason:\n' >&2
+    printf '[baseline-guard]     SKIP_TEST_BASELINE=1 SKIP_REASON="why you are bypassing" git commit ...\n' >&2
+    exit 1
+  fi
+  # Collapse newlines/tabs so a multi-line reason cannot corrupt the single-line
+  # log record (each override is exactly one tab-delimited line).
+  skip_reason=$(printf '%s' "$skip_reason" | tr '\n\t' '  ')
   warn "SKIP_TEST_BASELINE=1 — emergency override active"
   warn "This commit is being made without running the baseline guard."
   warn "Override is logged to .test-baseline-overrides.log for audit."
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   head_sha=$(git rev-parse HEAD 2>/dev/null || echo "pre-commit")
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")
+  author=$(whoami 2>/dev/null || echo "unknown-user")
   repo_root_for_log=$(git rev-parse --show-toplevel)
-  printf '%s  %s  skipped-by-env\n' "$timestamp" "$head_sha" \
+  # Tab-delimited: timestamp <tab> sha <tab> branch <tab> author <tab> reason.
+  # Append-only; union-merged on rebase via .gitattributes (DoE 3a/N-3).
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp" "$head_sha" "$branch" "$author" "$skip_reason" \
     >> "$repo_root_for_log/.test-baseline-overrides.log"
   exit 0
 fi
@@ -113,16 +191,60 @@ ok "Gate 1/2: typecheck clean."
 # ── Gate 2: transform-error detection + test baseline ───────────────
 log "Gate 2/2: npm test + transform-error detection + baseline check"
 
-# Read the baseline integer from .test-baseline.
-if [[ ! -f .test-baseline ]]; then
-  fail ".test-baseline file missing at repo root"
-  printf '[baseline-guard]   Create it with a single integer: the current passing count.\n' >&2
+# Resolve the enforcement floor from the SOURCE THAT WILL BE COMMITTED — never the
+# unstaged working tree (the bypass this guard closes).
+#
+# Why not the working tree: if we read .test-baseline off disk here, an author
+# could raise it on disk (so passing == the on-disk number) WITHOUT staging it.
+# Then the fail-above ratchet check below (passing > baseline) sees passing ==
+# baseline and skips entirely, so the actually-committed floor stays stale and a
+# later regression can hide under it. The on-disk edit isn't even part of the
+# commit. So the floor must come from git's object store, not the working tree.
+#
+# The floor IN EFFECT for this commit is HEAD's committed blob
+# (`HEAD:.test-baseline`). A STAGED raise is a *proposed* new floor and is
+# validated separately, in the fail-above block, by comparing the staged blob
+# (`:.test-baseline`) against HEAD and requiring a strict increase. Keeping the
+# regression/trigger floor at HEAD avoids a false "regression" when a Linux-floor
+# bump is staged that is (legitimately) below the higher local macOS passing count.
+baseline_is_staged=""
+if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
+  baseline_is_staged="yes"
+fi
+
+# `|| true`: under `set -o pipefail` a failing `git show` (e.g. no HEAD on the
+# first-ever commit) would otherwise propagate non-zero through the command
+# substitution and abort the hook under `set -e`. We want the empty-value handling
+# below to run instead.
+baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+# First-ever commit of the file (no HEAD blob): treat the floor as 0 so the
+# fail-above block requires the introducing value to be staged and validated.
+if [[ -z "$baseline" ]]; then
+  baseline=0
+fi
+if ! [[ "$baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  fail "committed .test-baseline (HEAD:.test-baseline) is not a single integer, got: '$baseline'"
   exit 1
 fi
-baseline=$(tr -d '[:space:]' < .test-baseline)
-if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
-  fail ".test-baseline must contain a single integer, got: '$baseline'"
+
+# A .test-baseline must exist on disk for the repo to be in a sane state, but its
+# CONTENT is intentionally NOT used for enforcement (see above). Missing-file is
+# still worth flagging unless it is being introduced (staged) in this commit.
+if [[ ! -f .test-baseline && -z "$baseline_is_staged" ]]; then
+  fail ".test-baseline file missing at repo root"
+  printf '[baseline-guard]   Create it with a single integer (the current passing count) and stage it.\n' >&2
   exit 1
+fi
+
+# Defense-in-depth diagnostic: if the working-tree file disagrees with the
+# enforced (committed) floor, surface it. An UNSTAGED raise is exactly the bypass
+# shape, so make it loud — it is being IGNORED for enforcement, by design.
+if [[ -f .test-baseline ]]; then
+  worktree_baseline=$(tr -d '[:space:]' < .test-baseline)
+  if [[ "$worktree_baseline" =~ ^(0|[1-9][0-9]*)$ && "$worktree_baseline" != "$baseline" && -z "$baseline_is_staged" ]]; then
+    warn "working-tree .test-baseline ($worktree_baseline) differs from the committed floor ($baseline) and is UNSTAGED."
+    warn "The unstaged edit will NOT be committed and is IGNORED for enforcement. Stage it (git add .test-baseline) to make it count."
+  fi
 fi
 
 # Count test files on disk (expected).
@@ -218,6 +340,8 @@ if [[ -z "$actual_total" ]]; then
   echo "$test_output" | tail -30 >&2
   exit 1
 fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+validate_counter "Test Files count" "$actual_total"
 
 if (( actual_total < expected_files )); then
   fail "SILENT TEST FILE DROP DETECTED — commit blocked"
@@ -239,11 +363,13 @@ if [[ -z "$passing" ]]; then
   echo "$test_output" | tail -30 >&2
   exit 1
 fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+validate_counter "passing-test count" "$passing"
 
 if (( passing < baseline )); then
   fail "TEST BASELINE REGRESSION — commit blocked"
-  printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
-  printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
+  printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
+  printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
   printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
   printf '\n' >&2
   fail "Fix the regression, or update .test-baseline in a separate"
@@ -261,21 +387,68 @@ fi
 # LINUX CI passing count; a macOS dev box legitimately runs MORE tests
 # than that floor (platform-specific suites), so requiring passing ==
 # baseline locally would be impossible. The reconciliation: if the author
-# bumped .test-baseline in THIS commit (it is staged), the drift is
-# accounted for and the commit passes even though local passing > the new
-# (Linux) floor. If .test-baseline is NOT staged and passing > baseline,
-# that is an unaccounted drift and the commit is blocked. The CI guard
-# (which runs on Linux, where local == CI) enforces the exact floor.
-if (( passing > baseline )); then
-  baseline_staged=""
-  if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
-    baseline_staged="yes"
+# RAISED .test-baseline in THIS commit (an UPWARD bump of the staged value
+# over the previous committed value), the drift is accounted for and the
+# commit passes even though local passing > the new (Linux) floor. If
+# .test-baseline is NOT staged and passing > baseline, that is an
+# unaccounted drift and the commit is blocked. The CI guard (which runs on
+# Linux, where local == CI) enforces the exact floor.
+#
+# IMPORTANT (mirrors the CI guard's intent): merely STAGING .test-baseline is
+# not enough — the staged value must be GREATER than the previously committed
+# value. A flat re-stage (same number) or a LOWERED edit is NOT an accounting
+# of the drift: it would let an author satisfy this gate while keeping the
+# floor stale (or pushing it down so a real regression slips under it). So we
+# compare the staged blob against HEAD's blob and require a strict increase.
+#
+# STRICT-UPWARD STAGED CHECK RUNS UNCONDITIONALLY (codex #571 round-2 fix): if
+# .test-baseline is staged at all, validate it HERE, before the passing>baseline
+# branch. Otherwise, when passing == the committed floor, a staged LOWERED value
+# or a staged DELETION would skip the in-branch check below and quietly commit a
+# weaker/missing floor that a future regression could hide under. Fresh locals
+# (_sb/_pb) so the in-branch "drift accounted" message keeps its own vars.
+if [[ -n "$baseline_is_staged" ]]; then
+  _sb=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "$_sb" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
+    printf '[baseline-guard]   Staged value: %s\n' "'$_sb'" >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
   fi
-  if [[ -z "$baseline_staged" ]]; then
+  _pb=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  [[ "$_pb" =~ ^(0|[1-9][0-9]*)$ ]] || _pb=0
+  if (( _sb <= _pb )); then
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    printf '[baseline-guard]   Previously committed: %s\n' "$_pb" >&2
+    printf '[baseline-guard]   Staged value:         %s\n' "$_sb" >&2
+    printf '\n' >&2
+    fail "A flat re-stage, a lowered edit, or a deletion is not an accounting of"
+    fail "drift — it keeps the floor stale (or pushes it down so a regression"
+    fail "slips under it). Raise it to the new Linux CI passing count and re-stage."
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+  # An OVER-RAISED staged floor (above the current passing count) is also invalid:
+  # it poisons the NEXT commit (passing < floor -> fail-below blocks a clean commit)
+  # and can mask a real regression up to the inflated number. The correct staged
+  # value is the new LINUX CI passing count, which is <= local passing (a macOS box
+  # legitimately runs MORE tests than the Linux floor), so a legitimate value never
+  # trips this — only an inflated one does. (codex #571 r3 finding.)
+  if (( _sb > passing )); then
+    fail "STAGED .test-baseline ($_sb) EXCEEDS the current passing count ($passing) — commit blocked"
+    printf '[baseline-guard]   An over-raised floor poisons the next commit and can mask a\n' >&2
+    printf '[baseline-guard]   regression up to the inflated number. Set .test-baseline to the\n' >&2
+    printf '[baseline-guard]   new LINUX CI passing count (<= your local passing), not higher.\n' >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+fi
+if (( passing > baseline )); then
+  if [[ -z "$baseline_is_staged" ]]; then
     fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
-    printf '[baseline-guard]   Baseline (.test-baseline): %s\n' "$baseline" >&2
-    printf '[baseline-guard]   Current passing count:     %s\n' "$passing" >&2
-    printf '[baseline-guard]   Unaccounted above floor:   %s\n' "$((passing - baseline))" >&2
+    printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
+    printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
+    printf '[baseline-guard]   Unaccounted above floor:               %s\n' "$((passing - baseline))" >&2
     printf '\n' >&2
     fail "Account for the drift IN THIS COMMIT: raise .test-baseline (by the"
     fail "number of NEW tests that run on Linux CI, per the baseline-floor"
@@ -285,7 +458,38 @@ if (( passing > baseline )); then
     printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
-  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline is bumped in this commit — drift accounted for (local may exceed the Linux floor)."
+
+  # .test-baseline IS staged — verify the staged value is a strict UPWARD
+  # bump over the previously committed value. The staged content is the
+  # `:.test-baseline` blob (the index); the previous committed content is
+  # `HEAD:.test-baseline`. On the very first commit of the file there is no
+  # HEAD blob, so the prior value is treated as 0 and any positive staged
+  # value qualifies as an upward bump.
+  staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "$staged_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
+    printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
+    exit 1
+  fi
+  prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "$prev_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    prev_baseline=0
+  fi
+  if (( staged_baseline <= prev_baseline )); then
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    printf '[baseline-guard]   Previously committed: %s\n' "$prev_baseline" >&2
+    printf '[baseline-guard]   Staged value:         %s\n' "$staged_baseline" >&2
+    printf '[baseline-guard]   Current passing:      %s\n' "$passing" >&2
+    printf '\n' >&2
+    fail "Staging .test-baseline only accounts for the drift if it RAISES the"
+    fail "floor. A flat re-stage or a lowered edit is not an accounting — it"
+    fail "keeps the floor stale (or pushes it down so a regression slips"
+    fail "under it). Raise it to the new Linux CI passing count and re-stage"
+    fail "(git add .test-baseline)."
+    printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+    exit 1
+  fi
+  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline raised $prev_baseline -> $staged_baseline in this commit — drift accounted for (local may exceed the Linux floor)."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."

@@ -14,14 +14,26 @@ import {
   AuditIntegrityError,
   type AuditIntegrityFinding,
   type AuditLog,
-} from "../l2-operational/audit-log.js";
+} from "../operational/audit-log.js";
 import { detectEnvironment } from "./detector.js";
-import { analyzeSovereignty, formatAuditReport } from "./analyzer.js";
+import { analyzeSovereignty, formatAuditReport, type SovereigntyRuntimeSignals } from "./analyzer.js";
 import type { AuditSubsystemHealth } from "./types.js";
+
+/**
+ * Honesty (audit seam #5): the audit must read the LIVE sovereignty profile so
+ * it credits context-gating and zero-knowledge proofs only when they are
+ * actually enabled (both default OFF). `getRuntimeSignals` returns the current
+ * toggle state; if it throws or is absent the audit falls back to the
+ * conservative default-off reading rather than auto-crediting.
+ */
+export interface AuditToolsRuntimeDeps {
+  getRuntimeSignals?: () => SovereigntyRuntimeSignals;
+}
 
 export function createAuditTools(
   config: SanctuaryConfig,
-  auditLog?: Pick<AuditLog, "query">
+  auditLog?: Pick<AuditLog, "query">,
+  runtimeDeps?: AuditToolsRuntimeDeps
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
     {
@@ -49,8 +61,21 @@ export function createAuditTools(
         const env = await detectEnvironment(config, deepScan);
         env.audit_subsystem_health = await detectAuditSubsystemHealth(auditLog);
 
+        // Honesty (audit seam #5): read live profile toggles so default-off
+        // features are not auto-credited. A failure to read the profile must
+        // not silently fall back to crediting them, so we leave the signals
+        // undefined (conservative default-off) on any error.
+        let runtimeSignals: SovereigntyRuntimeSignals | undefined;
+        if (runtimeDeps?.getRuntimeSignals) {
+          try {
+            runtimeSignals = runtimeDeps.getRuntimeSignals();
+          } catch {
+            runtimeSignals = undefined;
+          }
+        }
+
         // Analyze sovereignty posture
-        const result = analyzeSovereignty(env, config);
+        const result = analyzeSovereignty(env, config, runtimeSignals);
 
         // Format human-readable report
         const report = formatAuditReport(result);

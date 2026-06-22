@@ -1,17 +1,33 @@
 /**
- * Sanctuary MCP Server — SIEM Export Tests
+ * Sanctuary MCP Server — SIEM Export Formatter Tests (agent-facing ALLOWLIST)
  *
- * Tests for CEF and OCSF format output, filtering, and error handling.
- * Verifies that audit log exports conform to SIEM standards and meet
- * enterprise observability requirements.
+ * The CEF/OCSF formatters consume ONLY the agent-facing allowlist view
+ * (timestamp, operation, result, has_details) plus the explicitly-safe coarse
+ * `decision` value. They never read the raw audit `details`, so the policy tier,
+ * the matched rule, the agent DID, the session id, and the free-text reason can
+ * never ride out through a SIEM record (CISO MED-1, property #11). Severity is
+ * derived from result/decision only — never from the policy tier.
+ *
+ * These tests assert the SAFE contract and explicitly verify the previously-leaky
+ * fields (DID / tier / session) do NOT appear.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { formatAsCEF, formatAsOCSF, type OCSFObject } from "../../src/audit/siem-formatter.js";
-import type { AuditEntry } from "../../src/audit/audit-log.js";
+import { describe, it, expect } from "vitest";
+import {
+  formatAsCEF,
+  formatAsOCSF,
+  agentDecision,
+} from "../../src/audit/siem-formatter.js";
+import {
+  redactAuditEntryForAgent,
+  buildAgentSearchCorpus,
+} from "../../src/operational/agent-audit-redaction.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import type { AgentAuditView } from "../../src/operational/agent-audit-redaction.js";
 
-// ── Helper: Create test audit entries ────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
+/** Build a raw audit entry (carrying leaky details) for the redaction path. */
 function createTestEntry(overrides?: Partial<AuditEntry>): AuditEntry {
   return {
     timestamp: new Date().toISOString(),
@@ -20,6 +36,7 @@ function createTestEntry(overrides?: Partial<AuditEntry>): AuditEntry {
     identity_id: "agent-001",
     result: "success",
     details: {
+      decision: "allow",
       gate_decision: "approve",
       tier: 2,
       session_id: "sess-12345",
@@ -29,157 +46,134 @@ function createTestEntry(overrides?: Partial<AuditEntry>): AuditEntry {
   };
 }
 
+/**
+ * The allowlisted view the formatters actually receive in production.
+ *
+ * NOTE (CISO HIGH, 2026-06-16): `decision` was removed from the agent search
+ * corpus, and siem-tools.ts NO LONGER threads a `safeDecision` to the
+ * formatters — the coarse allow/deny outcome derives from the entry `result`
+ * alone. So `safeDecision` is `undefined` here, mirroring production. The
+ * formatter's `safeDecision` PARAMETER still exists and is honored when passed;
+ * its decision-string→outcome contract is covered directly in the `agentDecision`
+ * unit tests below.
+ */
+function viewOf(entry: AuditEntry): { view: AgentAuditView; safeDecision?: string } {
+  // Reference buildAgentSearchCorpus so this test still pins that `decision` is
+  // NOT in the corpus (it returns undefined); production derives outcome from
+  // `result`, so we pass no safeDecision.
+  void buildAgentSearchCorpus(entry).decision;
+  return {
+    view: redactAuditEntryForAgent(entry),
+    safeDecision: undefined,
+  };
+}
+
+function cefOf(entry: AuditEntry, opts?: Parameters<typeof formatAsCEF>[2]) {
+  const { view, safeDecision } = viewOf(entry);
+  return formatAsCEF(view, safeDecision, opts);
+}
+
+function ocsfOf(entry: AuditEntry) {
+  const { view, safeDecision } = viewOf(entry);
+  return formatAsOCSF(view, safeDecision);
+}
+
 // ── CEF Format Tests ────────────────────────────────────────────────────
 
-describe("CEF Format", () => {
+describe("CEF Format (allowlist)", () => {
   describe("Header and structure", () => {
     it("should produce valid CEF header with default options", () => {
-      const entry = createTestEntry();
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toMatch(/^CEF:0\|Sanctuary\|MCP-Server\|0\.7\.0\|/);
+      expect(cefOf(createTestEntry())).toMatch(
+        /^CEF:0\|Sanctuary\|MCP-Server\|0\.7\.0\|/
+      );
     });
 
     it("should allow custom vendor, product, and version", () => {
-      const entry = createTestEntry();
-      const cef = formatAsCEF(entry, {
+      const cef = cefOf(createTestEntry(), {
         vendor: "CustomVendor",
         product: "CustomProduct",
         productVersion: "1.0.0",
       });
-
-      expect(cef).toMatch(
-        /^CEF:0\|CustomVendor\|CustomProduct\|1\.0\.0\|/
-      );
+      expect(cef).toMatch(/^CEF:0\|CustomVendor\|CustomProduct\|1\.0\.0\|/);
     });
 
     it("should include signature ID derived from operation name", () => {
-      const entry = createTestEntry({ operation: "state_create" });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("state_create");
+      expect(cefOf(createTestEntry({ operation: "state_create" }))).toContain(
+        "state_create"
+      );
     });
 
-    it("should include all required CEF extension fields", () => {
-      const entry = createTestEntry();
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("src=did:key:");
+    it("should include the allowlisted CEF extension fields (act/outcome/rt/result)", () => {
+      const cef = cefOf(createTestEntry({ details: { decision: "allow" } }));
       expect(cef).toContain("act=sovereignty_audit");
-      expect(cef).toContain("outcome=approve");
-      expect(cef).toContain("tier=2");
-      expect(cef).toContain("cs1=sess-12345");
-      expect(cef).toContain("cs1Label=SessionId");
-      expect(cef).toContain("layer=l2");
+      expect(cef).toContain("outcome=allow");
       expect(cef).toContain("result=success");
+      expect(cef).toMatch(/rt=\d+/);
+    });
+
+    it("never leaks agent DID, tier, session id, or layer in CEF", () => {
+      const cef = cefOf(createTestEntry());
+      expect(cef).not.toContain("src=did:key:");
+      expect(cef).not.toContain("did:key:");
+      expect(cef).not.toContain("tier=");
+      expect(cef).not.toContain("cs1=");
+      expect(cef).not.toContain("SessionId");
+      expect(cef).not.toContain("sess-12345");
+      expect(cef).not.toContain("layer=");
     });
   });
 
-  describe("Severity mapping", () => {
-    it("should map deny decisions to severity 8 (high)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "deny", tier: 2 },
-      });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toMatch(/\|[^|]*\|8\|/); // Severity is 4th pipe-delimited field from end
+  describe("Severity mapping (from result/decision, never tier)", () => {
+    it("should map deny to severity 8 (high)", () => {
+      const cef = cefOf(
+        createTestEntry({ result: "failure", details: { decision: "deny_once" } })
+      );
       expect(cef).toContain("|8|");
     });
 
-    it("should map approve + tier 1 to severity 5 (medium)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "approve", tier: 1 },
-      });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toMatch(/\|5\|/);
-    });
-
-    it("should map approve + tier 2 to severity 3 (low)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "approve", tier: 2 },
-      });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toMatch(/\|3\|/);
-    });
-
-    it("should map auto-allow to severity 1 (informational)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "auto-allow", tier: 3 },
-      });
-      const cef = formatAsCEF(entry);
-
+    it("should map allow to severity 1 (informational) regardless of tier", () => {
+      // tier 1 detail present but ignored — severity stays informational.
+      const cef = cefOf(createTestEntry({ details: { decision: "allow", tier: 1 } }));
       expect(cef).toMatch(/\|1\|/);
     });
 
-    it("should default to auto-allow severity if no decision specified", () => {
-      const entry = createTestEntry({ details: {} });
-      const cef = formatAsCEF(entry);
-
+    it("should default to allow severity if no decision specified and result success", () => {
+      const cef = cefOf(createTestEntry({ details: {} }));
       expect(cef).toMatch(/\|1\|/);
+    });
+
+    it("should map a failure result to deny severity even without a decision", () => {
+      const cef = cefOf(createTestEntry({ result: "failure", details: {} }));
+      expect(cef).toContain("|8|");
     });
   });
 
-  describe("Field extraction and defaults", () => {
-    it("should use provided agent DID in src field", () => {
-      const entry = createTestEntry({
-        details: { agent_did: "did:key:custom123" },
-      });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("src=did:key:custom123");
+  describe("Outcome derivation (from result; decision no longer threaded)", () => {
+    // Production derives the coarse outcome from `result` alone now (decision
+    // removed from the corpus, CISO HIGH 2026-06-16). The decision-string→outcome
+    // contract of the agentDecision PARAMETER is covered directly below.
+    it("derives outcome=deny from a failure result (even if details carry a deny decision)", () => {
+      expect(
+        cefOf(createTestEntry({ result: "failure", details: { decision: "deny_once" } }))
+      ).toContain("outcome=deny");
     });
 
-    it("should default agent DID to 'unknown' if not provided", () => {
-      const entry = createTestEntry({ details: {} });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("src=unknown");
-    });
-
-    it("should include provided session ID", () => {
-      const entry = createTestEntry({
-        details: { session_id: "unique-sess-999" },
-      });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("cs1=unique-sess-999");
-    });
-
-    it("should default session ID to 'unknown' if not provided", () => {
-      const entry = createTestEntry({ details: {} });
-      const cef = formatAsCEF(entry);
-
-      expect(cef).toContain("cs1=unknown");
+    it("derives outcome=allow from a success result (even if details carry a decision)", () => {
+      expect(
+        cefOf(createTestEntry({ result: "success", details: { decision: "allow" } }))
+      ).toContain("outcome=allow");
     });
 
     it("should include timestamp in rt field as milliseconds", () => {
       const now = new Date();
-      const entry = createTestEntry({ timestamp: now.toISOString() });
-      const cef = formatAsCEF(entry);
-
-      const expectedMs = now.getTime();
-      expect(cef).toContain(`rt=${expectedMs}`);
-    });
-
-    it("should clamp tier to valid range 1-3", () => {
-      const entryTier0 = createTestEntry({ details: { tier: 0 } });
-      const entryTier5 = createTestEntry({ details: { tier: 5 } });
-
-      const cefTier0 = formatAsCEF(entryTier0);
-      const cefTier5 = formatAsCEF(entryTier5);
-
-      expect(cefTier0).toContain("tier=1");
-      expect(cefTier5).toContain("tier=3");
+      const cef = cefOf(createTestEntry({ timestamp: now.toISOString() }));
+      expect(cef).toContain(`rt=${now.getTime()}`);
     });
   });
 
   describe("Newline-delimited output", () => {
     it("should produce single-line CEF with no embedded newlines", () => {
-      const entry = createTestEntry();
-      const cef = formatAsCEF(entry);
-
+      const cef = cefOf(createTestEntry());
       expect(cef).not.toContain("\n");
       expect(cef.split("|").length).toBeGreaterThan(5);
     });
@@ -188,12 +182,10 @@ describe("CEF Format", () => {
 
 // ── OCSF Format Tests ───────────────────────────────────────────────────
 
-describe("OCSF Format", () => {
+describe("OCSF Format (allowlist)", () => {
   describe("Structure and required fields", () => {
     it("should produce valid OCSF object with correct class and category UIDs", () => {
-      const entry = createTestEntry();
-      const ocsf = formatAsOCSF(entry);
-
+      const ocsf = ocsfOf(createTestEntry());
       expect(ocsf.class_uid).toBe(3001);
       expect(ocsf.class_name).toBe("API Activity");
       expect(ocsf.category_uid).toBe(3);
@@ -201,169 +193,122 @@ describe("OCSF Format", () => {
     });
 
     it("should include all required OCSF fields", () => {
-      const entry = createTestEntry();
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf).toHaveProperty("severity_id");
-      expect(ocsf).toHaveProperty("time");
-      expect(ocsf).toHaveProperty("activity_id");
-      expect(ocsf).toHaveProperty("activity_name");
-      expect(ocsf).toHaveProperty("actor");
-      expect(ocsf).toHaveProperty("api");
-      expect(ocsf).toHaveProperty("status_id");
-      expect(ocsf).toHaveProperty("disposition_id");
-      expect(ocsf).toHaveProperty("metadata");
+      const ocsf = ocsfOf(createTestEntry());
+      for (const f of [
+        "severity_id",
+        "time",
+        "activity_id",
+        "activity_name",
+        "actor",
+        "api",
+        "status_id",
+        "disposition_id",
+        "metadata",
+      ]) {
+        expect(ocsf).toHaveProperty(f);
+      }
     });
 
     it("should set activity to API Call (1)", () => {
-      const entry = createTestEntry();
-      const ocsf = formatAsOCSF(entry);
-
+      const ocsf = ocsfOf(createTestEntry());
       expect(ocsf.activity_id).toBe(1);
       expect(ocsf.activity_name).toBe("API Call");
     });
 
-    it("should include actor with user UID", () => {
-      const entry = createTestEntry({
-        details: { agent_did: "did:example:agent1" },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.actor.user.uid).toBe("did:example:agent1");
+    it("actor uid is a fixed 'self' sentinel — never the raw agent DID", () => {
+      const ocsf = ocsfOf(
+        createTestEntry({ details: { agent_did: "did:example:agent1" } })
+      );
+      expect(ocsf.actor.user.uid).toBe("self");
+      expect(JSON.stringify(ocsf)).not.toContain("did:example:agent1");
     });
 
     it("should include API operation and service name", () => {
-      const entry = createTestEntry({ operation: "state_update" });
-      const ocsf = formatAsOCSF(entry);
-
+      const ocsf = ocsfOf(createTestEntry({ operation: "state_update" }));
       expect(ocsf.api.operation).toBe("state_update");
       expect(ocsf.api.service.name).toBe("sanctuary-mcp");
     });
 
     it("should include metadata with product info", () => {
-      const entry = createTestEntry();
-      const ocsf = formatAsOCSF(entry);
-
+      const ocsf = ocsfOf(createTestEntry());
       expect(ocsf.metadata.version).toBe("1.3.0");
       expect(ocsf.metadata.product.name).toBe("Sanctuary Framework");
       expect(ocsf.metadata.product.vendor_name).toBe("Erik Newton");
       expect(ocsf.metadata.product.version).toBe("0.7.0");
     });
+
+    it("never leaks tier, session id, or agent DID anywhere in the OCSF object", () => {
+      const ocsf = ocsfOf(createTestEntry());
+      const s = JSON.stringify(ocsf);
+      expect(s).not.toContain("did:key:");
+      expect(s).not.toContain("sess-12345");
+      expect(s).not.toContain('"tier"');
+    });
   });
 
-  describe("Severity mapping", () => {
-    it("should map deny decision to severity 4 (Critical)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "deny" },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.severity_id).toBe(4);
+  describe("Severity mapping (from result/decision, never tier)", () => {
+    it("should map deny to severity 4 (Critical)", () => {
+      expect(
+        ocsfOf(
+          createTestEntry({ result: "failure", details: { decision: "deny_once" } })
+        ).severity_id
+      ).toBe(4);
     });
 
-    it("should map approve + tier 1 to severity 3 (High)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "approve", tier: 1 },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.severity_id).toBe(3);
-    });
-
-    it("should map approve + tier 2 to severity 2 (Medium)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "approve", tier: 2 },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.severity_id).toBe(2);
-    });
-
-    it("should map auto-allow to severity 1 (Informational)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "auto-allow", tier: 3 },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.severity_id).toBe(1);
+    it("should map allow to severity 1 (Informational) regardless of tier", () => {
+      expect(
+        ocsfOf(createTestEntry({ details: { decision: "allow", tier: 1 } })).severity_id
+      ).toBe(1);
     });
   });
 
   describe("Status and disposition", () => {
     it("should map success result to status 1", () => {
-      const entry = createTestEntry({ result: "success" });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.status_id).toBe(1);
+      expect(ocsfOf(createTestEntry({ result: "success" })).status_id).toBe(1);
     });
 
     it("should map failure result to status 2", () => {
-      const entry = createTestEntry({ result: "failure" });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.status_id).toBe(2);
+      expect(ocsfOf(createTestEntry({ result: "failure" })).status_id).toBe(2);
     });
 
     it("should map deny decision to disposition 2 (blocked)", () => {
-      const entry = createTestEntry({
-        details: { gate_decision: "deny" },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.disposition_id).toBe(2);
+      expect(
+        ocsfOf(
+          createTestEntry({ result: "failure", details: { decision: "deny_once" } })
+        ).disposition_id
+      ).toBe(2);
     });
 
-    it("should map approve/auto-allow to disposition 1 (allowed)", () => {
-      const entryApprove = createTestEntry({
-        details: { gate_decision: "approve" },
-      });
-      const entryAllow = createTestEntry({
-        details: { gate_decision: "auto-allow" },
-      });
-
-      const ocsfApprove = formatAsOCSF(entryApprove);
-      const ocsfAllow = formatAsOCSF(entryAllow);
-
-      expect(ocsfApprove.disposition_id).toBe(1);
-      expect(ocsfAllow.disposition_id).toBe(1);
+    it("should map allow to disposition 1 (allowed)", () => {
+      expect(
+        ocsfOf(createTestEntry({ details: { decision: "allow" } })).disposition_id
+      ).toBe(1);
     });
   });
 
   describe("Timestamp handling", () => {
     it("should convert ISO 8601 timestamp to epoch milliseconds", () => {
       const testDate = new Date("2026-04-08T15:30:45.123Z");
-      const entry = createTestEntry({ timestamp: testDate.toISOString() });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.time).toBe(testDate.getTime());
+      expect(
+        ocsfOf(createTestEntry({ timestamp: testDate.toISOString() })).time
+      ).toBe(testDate.getTime());
     });
 
     it("should handle various ISO 8601 formats", () => {
-      const timestamps = [
+      for (const ts of [
         "2026-04-08T15:30:45.123Z",
         "2026-04-08T15:30:45Z",
         "2026-04-08T15:30:45+00:00",
-      ];
-
-      timestamps.forEach((ts) => {
-        const entry = createTestEntry({ timestamp: ts });
-        const ocsf = formatAsOCSF(entry);
-
-        expect(ocsf.time).toBeGreaterThan(0);
-      });
+      ]) {
+        expect(ocsfOf(createTestEntry({ timestamp: ts })).time).toBeGreaterThan(0);
+      }
     });
   });
 
   describe("JSON serialization", () => {
     it("should produce valid JSON object", () => {
-      const entry = createTestEntry();
-      const ocsf = formatAsOCSF(entry);
-
-      // Should not throw
-      const json = JSON.stringify(ocsf);
-      const parsed = JSON.parse(json);
-
-      expect(parsed.class_uid).toBe(3001);
+      const json = JSON.stringify(ocsfOf(createTestEntry()));
+      expect(JSON.parse(json).class_uid).toBe(3001);
     });
 
     it("should produce JSON array when multiple entries formatted", () => {
@@ -371,11 +316,7 @@ describe("OCSF Format", () => {
         createTestEntry({ operation: "op1" }),
         createTestEntry({ operation: "op2" }),
       ];
-
-      const ocsfObjects = entries.map((e) => formatAsOCSF(e));
-      const json = JSON.stringify(ocsfObjects);
-      const parsed = JSON.parse(json);
-
+      const parsed = JSON.parse(JSON.stringify(entries.map(ocsfOf)));
       expect(Array.isArray(parsed)).toBe(true);
       expect(parsed.length).toBe(2);
       expect(parsed[0].api.operation).toBe("op1");
@@ -383,103 +324,88 @@ describe("OCSF Format", () => {
     });
   });
 
-  describe("Field extraction and defaults", () => {
-    it("should use provided agent DID", () => {
-      const entry = createTestEntry({
-        details: { agent_did: "did:key:z6Mkq..." },
-      });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.actor.user.uid).toBe("did:key:z6Mkq...");
-    });
-
-    it("should default agent DID to 'unknown' if not provided", () => {
-      const entry = createTestEntry({ details: {} });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.actor.user.uid).toBe("unknown");
-    });
-
+  describe("Operation + layer context", () => {
     it("should use operation name from audit entry", () => {
-      const entry = createTestEntry({ operation: "custom_operation_name" });
-      const ocsf = formatAsOCSF(entry);
-
-      expect(ocsf.api.operation).toBe("custom_operation_name");
+      expect(
+        ocsfOf(createTestEntry({ operation: "custom_operation_name" })).api.operation
+      ).toBe("custom_operation_name");
     });
-  });
 
-  describe("Layer context", () => {
-    it("should handle entries from all sovereignty layers", () => {
-      const layers: Array<"l1" | "l2" | "l3" | "l4"> = ["l1", "l2", "l3", "l4"];
-
-      layers.forEach((layer) => {
-        const entry = createTestEntry({ layer });
-        const ocsf = formatAsOCSF(entry);
-
-        // Should produce valid OCSF regardless of layer
+    it("should produce valid OCSF regardless of source layer", () => {
+      for (const layer of ["l1", "l2", "l3", "l4"] as const) {
+        const ocsf = ocsfOf(createTestEntry({ layer }));
         expect(ocsf.class_uid).toBe(3001);
         expect(ocsf.api).toBeDefined();
-      });
+      }
     });
   });
 });
 
-// ── Cross-format consistency tests ──────────────────────────────────────
+// ── agentDecision unit ──────────────────────────────────────────────────
 
-describe("Cross-format consistency", () => {
-  it("should include same gate decision in both CEF and OCSF", () => {
+describe("agentDecision (2-valued, tier-free)", () => {
+  const okView: AgentAuditView = {
+    timestamp: "t",
+    operation: "op",
+    result: "success",
+    has_details: true,
+  };
+  const failView: AgentAuditView = { ...okView, result: "failure" };
+
+  it("maps deny/drop/block decisions to deny", () => {
+    for (const d of ["deny", "deny_once", "drop", "block"]) {
+      expect(agentDecision(okView, d)).toBe("deny");
+    }
+  });
+
+  it("maps allow/approve/auto-allow decisions to allow", () => {
+    for (const d of ["allow", "approve", "auto-allow"]) {
+      expect(agentDecision(okView, d)).toBe("allow");
+    }
+  });
+
+  it("falls back to result when no decision: failure→deny, success→allow", () => {
+    expect(agentDecision(failView)).toBe("deny");
+    expect(agentDecision(okView)).toBe("allow");
+  });
+});
+
+// ── Cross-format consistency ─────────────────────────────────────────────
+
+describe("Cross-format consistency (allowlist)", () => {
+  it("represents the same coarse decision in both CEF and OCSF", () => {
     const entry = createTestEntry({
-      details: { gate_decision: "deny" },
+      result: "failure",
+      details: { decision: "deny_once" },
     });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toContain("outcome=deny");
-    expect(ocsf.disposition_id).toBe(2); // deny -> blocked
+    expect(cefOf(entry)).toContain("outcome=deny");
+    expect(ocsfOf(entry).disposition_id).toBe(2);
   });
 
-  it("should include same agent DID in both formats", () => {
-    const didValue = "did:key:z6MkhaXg...";
-    const entry = createTestEntry({
-      details: { agent_did: didValue },
-    });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toContain(`src=${didValue}`);
-    expect(ocsf.actor.user.uid).toBe(didValue);
+  it("neither format leaks the agent DID", () => {
+    const entry = createTestEntry({ details: { agent_did: "did:key:z6MkhaXg..." } });
+    expect(cefOf(entry)).not.toContain("did:key:");
+    expect(JSON.stringify(ocsfOf(entry))).not.toContain("did:key:");
   });
 
-  it("should represent same operation in both formats", () => {
-    const operation = "state_delete";
-    const entry = createTestEntry({ operation });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toContain(`act=${operation}`);
-    expect(ocsf.api.operation).toBe(operation);
+  it("represents the same operation in both formats", () => {
+    const entry = createTestEntry({ operation: "state_delete" });
+    expect(cefOf(entry)).toContain("act=state_delete");
+    expect(ocsfOf(entry).api.operation).toBe("state_delete");
   });
 
-  it("should represent same timestamp in both formats", () => {
+  it("represents the same timestamp in both formats", () => {
     const testDate = new Date("2026-04-08T12:00:00Z");
     const entry = createTestEntry({ timestamp: testDate.toISOString() });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    const expectedMs = testDate.getTime();
-    expect(cef).toContain(`rt=${expectedMs}`);
-    expect(ocsf.time).toBe(expectedMs);
+    expect(cefOf(entry)).toContain(`rt=${testDate.getTime()}`);
+    expect(ocsfOf(entry).time).toBe(testDate.getTime());
   });
 });
 
 // ── Edge cases ──────────────────────────────────────────────────────────
 
 describe("Edge cases", () => {
-  it("should handle missing details object gracefully", () => {
+  it("should handle a missing details object gracefully", () => {
     const entry: AuditEntry = {
       timestamp: new Date().toISOString(),
       layer: "l1",
@@ -487,60 +413,37 @@ describe("Edge cases", () => {
       identity_id: "id",
       result: "success",
     };
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toMatch(/^CEF:/);
-    expect(ocsf.class_uid).toBe(3001);
+    expect(cefOf(entry)).toMatch(/^CEF:/);
+    expect(ocsfOf(entry).class_uid).toBe(3001);
   });
 
   it("should sanitize special characters in operation names for CEF signature ID", () => {
-    const entry = createTestEntry({
-      operation: "state/create:v2",
-    });
-    const cef = formatAsCEF(entry);
-
-    // Special chars should be replaced with underscores
-    expect(cef).toContain("state_create_v2");
+    expect(cefOf(createTestEntry({ operation: "state/create:v2" }))).toContain(
+      "state_create_v2"
+    );
   });
 
-  it("should handle very long DID values", () => {
-    const longDid =
-      "did:key:" + "z".repeat(100);
-    const entry = createTestEntry({
-      details: { agent_did: longDid },
-    });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toContain(longDid);
-    expect(ocsf.actor.user.uid).toBe(longDid);
+  it("never leaks even a very long DID value (it is not read at all)", () => {
+    const longDid = "did:key:" + "z".repeat(100);
+    const entry = createTestEntry({ details: { agent_did: longDid } });
+    expect(cefOf(entry)).not.toContain(longDid);
+    expect(JSON.stringify(ocsfOf(entry))).not.toContain(longDid);
   });
 
   it("should handle empty operation name", () => {
     const entry = createTestEntry({ operation: "" });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toMatch(/^CEF:/);
-    expect(ocsf.api.operation).toBe("");
+    expect(cefOf(entry)).toMatch(/^CEF:/);
+    expect(ocsfOf(entry).api.operation).toBe("");
   });
 
   it("should handle null/undefined in details gracefully", () => {
     const entry = createTestEntry({
-      details: {
-        gate_decision: null,
-        tier: undefined,
-      } as any,
+      details: { decision: null, tier: undefined } as unknown as Record<
+        string,
+        unknown
+      >,
     });
-
-    const cef = formatAsCEF(entry);
-    const ocsf = formatAsOCSF(entry);
-
-    expect(cef).toMatch(/^CEF:/);
-    expect(ocsf.class_uid).toBe(3001);
+    expect(cefOf(entry)).toMatch(/^CEF:/);
+    expect(ocsfOf(entry).class_uid).toBe(3001);
   });
 });

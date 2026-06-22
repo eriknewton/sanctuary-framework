@@ -22,6 +22,17 @@ import type { TemplateName } from "../templates/registry.js";
 import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import { constantTimeEquals } from "../http/auth.js";
+import { logCaughtError } from "../http/error-envelope.js";
+import { renderPostureHomeHTML } from "../principal-policy/posture-home-html.js";
+import {
+  handlePostureRoute,
+  POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_API_PREFIX,
+  POSTURE_HOME_PATH,
+} from "../principal-policy/posture-routes.js";
+
+export { constantTimeEquals };
 
 export interface ApprovalHandlers {
   allow: (id: string) => Promise<boolean>;
@@ -31,6 +42,7 @@ export interface ApprovalHandlers {
 export interface APIDeps {
   sources: AggregatorSources;
   authToken?: string;
+  sessions?: DashboardSessionStore;
   approvals?: ApprovalHandlers;
   /** Register a listener; returns an unsubscribe fn. */
   onEvent?: (listener: (event: StreamEvent) => void) => () => void;
@@ -66,6 +78,16 @@ export interface APIDeps {
   loopbackAutoAuth?: boolean;
 }
 
+export interface DashboardSession {
+  id: string;
+  expiresInSeconds: number;
+}
+
+export interface DashboardSessionStore {
+  create: () => DashboardSession;
+  validate: (id: string) => boolean;
+}
+
 /**
  * SSE event taxonomy.
  *
@@ -83,34 +105,42 @@ export interface StreamEvent {
 }
 
 /**
- * Constant-time token comparison to avoid trivial timing attacks.
- */
-export function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-/**
- * Pull the bearer token from Authorization header or ?token= query.
+ * Pull the bearer token from Authorization header only. Long-lived URL
+ * query tokens are deliberately ignored; SSE uses short-lived sessions.
  */
 export function extractToken(req: IncomingMessage, url: URL): string | null {
   const header = req.headers.authorization;
   if (header && header.startsWith("Bearer ")) {
     return header.slice(7).trim();
   }
-  const q = url.searchParams.get("token");
-  return q ?? null;
+  void url;
+  return null;
 }
 
 export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
   if (!deps.authToken) return true;
   const token = extractToken(req, url);
-  if (!token) return false;
-  return constantTimeEquals(token, deps.authToken);
+  if (token && constantTimeEquals(token, deps.authToken)) return true;
+
+  const sessionId = url.searchParams.get("session");
+  if (sessionId && deps.sessions?.validate(sessionId)) return true;
+
+  return false;
+}
+
+function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  if (!deps.authToken) return true;
+  const token = extractToken(req, url);
+  return token !== null && constantTimeEquals(token, deps.authToken);
+}
+
+function isLoopbackRequest(req: IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress;
+  return addr === "127.0.0.1" || addr === "::1" || addr === "localhost";
+}
+
+function isAuthorizedForRead(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
+  return isAuthorized(deps, req, url) || (deps.loopbackAutoAuth === true && isLoopbackRequest(req));
 }
 
 function writeJSON(res: ServerResponse, status: number, payload: unknown): void {
@@ -165,10 +195,84 @@ export async function handleRequest(
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
 
+  // ── Posture board shell (3-to-1 fold, minimal Stack A retirement) ───
+  // The co-located wrap server serves the same posture shell at `/` and
+  // `/posture`, while keeping `/api/status` decision_capable false below so
+  // the approval area stays read-only on this process.
+  if (method === "GET" && (path === "/" || path === POSTURE_HOME_PATH)) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    writeText(res, 200, renderPostureHomeHTML(), "text/html; charset=utf-8");
+    return true;
+  }
+
+  if (
+    path === POSTURE_API_PREFIX ||
+    path.startsWith(`${POSTURE_API_PREFIX}/`) ||
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
+  ) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    const handled = await handlePostureRoute(
+      {
+        auditLog: deps.sources.auditLog ?? null,
+        originMachine:
+          deps.sources.identityManager?.getPrimaryIdentityId() ?? "local",
+        listAgents: () => deps.v11Bindings?.hubService.listAgents() ?? [],
+        resolvePinnedProducerKey: deps.sources.resolvePinnedProducerKey,
+        producerKeyExpectedButUnavailable:
+          deps.sources.producerKeyExpectedButUnavailable === true,
+        resolveBrokerPinnedProducerKey:
+          deps.sources.resolveBrokerPinnedProducerKey,
+        brokerProducerKeyExpectedButUnavailable:
+          deps.sources.brokerProducerKeyExpectedButUnavailable === true,
+      },
+      req,
+      res,
+      url,
+      method,
+    );
+    if (handled) return true;
+  }
+
+  // ── Session exchange ───────────────────────────────────────────────
+  // Header-only by design: this is the only route that mints URL-carryable
+  // short-lived sessions for EventSource and one-click operator URLs.
+  if (method === "POST" && path === "/auth/session") {
+    if (!deps.authToken) {
+      writeJSON(res, 200, { session_id: "no-auth", expires_in_seconds: 0 });
+      return true;
+    }
+    const token = extractToken(req, url);
+    if (!token || !constantTimeEquals(token, deps.authToken)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    if (!deps.sessions) {
+      writeJSON(res, 503, { error: "sessions_unavailable" });
+      return true;
+    }
+    const session = deps.sessions.create();
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      "Set-Cookie": `sanctuary_session=${session.id}; Path=/; SameSite=Strict; Max-Age=${session.expiresInSeconds}`,
+    });
+    res.end(JSON.stringify({
+      session_id: session.id,
+      expires_in_seconds: session.expiresInSeconds,
+    }));
+    return true;
+  }
+
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
-  // Try v1.1 routes first when bindings are set. Mounted additively at
-  // /v1.1 (HTML) and /api/hub/* (API); legacy routes at / continue to
-  // serve. Default route flip deferred to v1.2.
+  // Try v1.1 compatibility routes first when bindings are set. Mounted at
+  // /dashboard + /v1.1 (HTML) and /api/hub/* (API); `/` is the posture
+  // shell handled above.
   //
   // Auth gating is intentionally inside the shared helper so the v1.1
   // HTML at /v1.1 can serve unauthenticated (the inline client handles
@@ -189,23 +293,68 @@ export async function handleRequest(
     if (handled) return true;
   }
 
-  // ── Auth (all routes) ───────────────────────────────────────────────
-  if (!isAuthorized(deps, req, url)) {
-    writeJSON(res, 401, { error: "unauthorized" });
-    return true;
-  }
-
-  // ── Health (unauthenticated-safe, but we still require auth above) ──
+  // ── Health (unauthenticated liveness only) ───────────────────────────
+  // Mirrors the principal-policy dashboard contract exactly: `{ ok, mode }`
+  // only, with no state, config, posture, agent, token, or count data.
   if (method === "GET" && path === "/api/health") {
     writeJSON(res, 200, { ok: true, mode: deps.sources.mode });
     return true;
   }
 
+  // ── Auth (all routes) ───────────────────────────────────────────────
+  const isFoldedReadAuxiliary =
+    method === "GET" && (path === "/api/status" || path === "/api/pending");
+  const authorized = isFoldedReadAuxiliary
+    ? isAuthorizedForRead(deps, req, url)
+    : isAuthorized(deps, req, url);
+  if (!authorized) {
+    writeJSON(res, 401, { error: "unauthorized" });
+    return true;
+  }
+
+  // ── Folded posture-page auxiliaries ─────────────────────────────────
+  if (method === "GET" && path === "/api/status") {
+    writeJSON(res, 200, {
+      pending_count: deps.sources.pendingApprovals?.length ?? 0,
+      connected_clients: 0,
+      standalone_mode: false,
+      decision_capable: false,
+      policy: deps.sources.policy
+        ? {
+            version: deps.sources.policy.version,
+            tier1_always_approve: deps.sources.policy.tier1_always_approve,
+            tier2_anomaly: deps.sources.policy.tier2_anomaly,
+            tier3_always_allow: deps.sources.policy.tier3_always_allow,
+            approval_channel: {
+              type: deps.sources.policy.approval_channel.type,
+              timeout_seconds: deps.sources.policy.approval_channel.timeout_seconds,
+              auto_deny: true,
+            },
+            approval_redirect: {
+              enabled: deps.sources.policy.approval_redirect?.enabled === true,
+              mode:
+                deps.sources.policy.approval_redirect?.mode === "notify"
+                  ? "notify"
+                  : "replace",
+            },
+          }
+        : {
+            approval_redirect: { enabled: false, mode: "replace" },
+          },
+    });
+    return true;
+  }
+
+  if (method === "GET" && path === "/api/pending") {
+    writeJSON(res, 200, deps.sources.pendingApprovals ?? []);
+    return true;
+  }
+
   // ── Legacy v1.0 HTML (preserved at /v1.0) ───────────────────────────
-  // v1.1.7: root and /dashboard now serve the v1.1 SPA via dispatchV11
-  // above. The legacy four-panel dashboard moved to /v1.0 so operators
-  // who explicitly want the prior surface can reach it; /index.html
-  // alias preserved on the legacy path for parity.
+  // v1.1.7: root serves the posture shell above; /dashboard and /v1.1
+  // remain compatibility aliases via dispatchV11. The legacy four-panel
+  // dashboard moved to /v1.0 so operators who explicitly want the prior
+  // surface can reach it; /index.html alias preserved on the legacy path.
   if (
     method === "GET" &&
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")
@@ -226,6 +375,10 @@ export async function handleRequest(
   // ── Approval decisions ──────────────────────────────────────────────
   const approvalMatch = /^\/api\/approvals\/([^/]+)\/(allow|deny)$/.exec(path);
   if (method === "POST" && approvalMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const id = decodeURIComponent(approvalMatch[1]!);
     const action = approvalMatch[2] as "allow" | "deny";
     if (!deps.approvals) {
@@ -237,7 +390,12 @@ export async function handleRequest(
       const ok = await handler(id);
       writeJSON(res, ok ? 200 : 404, { id, action, ok });
     } catch (err) {
-      writeJSON(res, 500, { error: "approval_failed", message: (err as Error).message });
+      logCaughtError(
+        err,
+        { route: "/api/approvals/:id/:action", operation: action },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "approval_failed" });
     }
     return true;
   }
@@ -254,10 +412,12 @@ export async function handleRequest(
       const templates = listTemplates();
       writeJSON(res, 200, { templates });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates", operation: "list_templates" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -273,10 +433,12 @@ export async function handleRequest(
       }
       writeJSON(res, 200, entry);
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_load_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name", operation: "get_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_load_failed" });
     }
     return true;
   }
@@ -361,10 +523,12 @@ export async function handleRequest(
         attestation_panel_url: `/console#agent_roster`,
       });
     } catch (err) {
-      writeJSON(res, 500, {
-        error: "template_init_failed",
-        message: (err as Error).message,
-      });
+      logCaughtError(
+        err,
+        { route: "/api/templates/:name/init", operation: "init_template" },
+        { status: 500 },
+      );
+      writeJSON(res, 500, { error: "template_init_failed" });
     }
     return true;
   }

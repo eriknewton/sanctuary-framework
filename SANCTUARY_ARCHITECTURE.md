@@ -201,14 +201,14 @@ Post-review work completed 2026-03-29: Sovereignty Audit Tool (`server/src/audit
 Context gating is a new Operational Isolation (Sentinels) subsystem that controls what agent context flows to remote providers (LLM inference APIs, tool APIs, logging services, analytics). It enforces "minimum-necessary context" at the execution boundary — before any outbound call, the agent filters its context through a policy that classifies each top-level field as allow, redact, hash, summarize, or deny.
 
 **New source files:**
-- `server/src/l2-operational/context-gate.ts` — Core types, `evaluateField()`, `filterContext()`, pattern matching, encrypted policy store (`ContextGatePolicyStore`)
-- `server/src/l2-operational/context-gate-tools.ts` — 5 MCP tool definitions
-- `server/src/l2-operational/context-gate-templates.ts` — 4 starter templates + template registry
-- `server/src/l2-operational/context-gate-recommend.ts` — Heuristic recommendation engine with word-boundary matching
+- `server/src/operational/context-gate.ts` — Core types, `evaluateField()`, `filterContext()`, pattern matching, encrypted policy store (`ContextGatePolicyStore`)
+- `server/src/operational/context-gate-tools.ts` — 5 MCP tool definitions
+- `server/src/operational/context-gate-templates.ts` — 4 starter templates + template registry
+- `server/src/operational/context-gate-recommend.ts` — Heuristic recommendation engine with word-boundary matching
 
 **New test files:**
-- `server/test/l2/context-gate.test.ts` — 26 tests for core module
-- `server/test/l2/context-gate-templates.test.ts` — 47 tests for templates and recommendation engine
+- `server/test/operational/context-gate.test.ts` — 26 tests for core module
+- `server/test/operational/context-gate/context-gate-templates.test.ts` — 47 tests for templates and recommendation engine
 
 **Modified files:**
 - `server/src/index.ts` — imports + registration of context gate tools

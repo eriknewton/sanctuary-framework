@@ -18,8 +18,8 @@ import { describe, it, expect, vi } from "vitest";
 import { buildPrivacyTier2Redactor } from "../../src/intelligence/privacy-tier2-redactor.js";
 import { SubstrateSelector, IDENTITY_REDACTOR } from "../../src/intelligence/selector.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 

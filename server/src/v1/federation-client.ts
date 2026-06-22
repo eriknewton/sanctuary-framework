@@ -33,12 +33,20 @@ import type {
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "../mesh/types.js";
-import type { FederationEvent } from "./federation.js";
+import type {
+  FederationAppendOptions,
+  FederationAppendResult,
+  FederationEvent,
+} from "./federation.js";
 import {
   signSyncEnvelope,
   verifySyncEnvelope,
   type FederationSyncEnvelope,
 } from "./federation-sync-envelope.js";
+import {
+  acceptFederationEventsFailClosed,
+  isFederationOperatorAuthorityEvent,
+} from "./federation-revocation.js";
 import {
   dashboardRequest,
   DashboardRequestError,
@@ -81,6 +89,23 @@ export interface PushSyncParams {
    * with `result.reciprocalHighWater` on success.
    */
   acceptedReciprocalHighWater?: number | null;
+  /**
+   * Local grow-only revocation projection for the reciprocal sender. Required:
+   * if the caller cannot evaluate revocation, reciprocal verification fails
+   * closed instead of trusting a valid-but-revoked peer certificate.
+   */
+  isNodeRevoked(peerNodeId: string): boolean;
+  /**
+   * Local event-acceptance surface for the reciprocal envelope. When supplied,
+   * this must be the same fail-closed append gate used by the local federation
+   * log; it lets reciprocal operator-authority evictions update the revoked set
+   * before ordinary reciprocal events are accepted. If a reciprocal envelope
+   * carries an eviction and this callback is absent, the client fails closed.
+   */
+  acceptReciprocalEvents?(
+    events: FederationEvent[],
+    options?: FederationAppendOptions,
+  ): FederationAppendResult;
   /** Injection seam for tests; defaults to the real HTTP client. */
   request?: typeof dashboardRequest;
 }
@@ -172,18 +197,67 @@ export async function pushSyncToPeer(
     pinnedMaster: identity.pinnedMaster,
     recipientNodeId: identity.nodeId,
     acceptedHighWaterFor: () => priorReciprocal,
+    isNodeRevoked: (senderNodeId) => params.isNodeRevoked(senderNodeId),
   });
   if (!verification.ok) {
     return { ok: false, reason: "reciprocal_unverified" };
   }
+
+  const reciprocalAcceptance = acceptReciprocalEventsFailClosed(
+    identity,
+    params,
+    verification.senderNodeId,
+    verification.wireVersion,
+    verification.events,
+  );
+  if (reciprocalAcceptance === null) {
+    return { ok: false, reason: "reciprocal_unverified" };
+  }
+
   return {
     ok: true,
     acceptedByPeer,
     rejectedByPeer,
-    reciprocalEvents: verification.events,
+    reciprocalEvents: reciprocalAcceptance.accepted,
     peerNodeId: verification.senderNodeId,
     reciprocalHighWater: verification.syncHighWater,
   };
+}
+
+function acceptReciprocalEventsFailClosed(
+  identity: PeerSyncIdentity,
+  params: PushSyncParams,
+  senderNodeId: string,
+  wireVersion: string,
+  events: FederationEvent[],
+): FederationAppendResult | null {
+  if (params.acceptReciprocalEvents) {
+    const accepted = params.acceptReciprocalEvents(events, {
+      senderNodeId,
+      wireVersion,
+    });
+    return isBatchRejected(accepted) ? null : accepted;
+  }
+  if (
+    events.some((event) =>
+      isFederationOperatorAuthorityEvent(event, identity.fortressId),
+    )
+  ) {
+    return null;
+  }
+  const accepted = acceptFederationEventsFailClosed({
+    events,
+    fortressId: identity.fortressId,
+    senderNodeId,
+    wireVersion,
+    isNodeRevoked: params.isNodeRevoked,
+    appendEvents: (batch) => ({ accepted: batch, rejected: [] }),
+  });
+  return accepted.revocationStateAvailable && !accepted.batchRejected ? accepted : null;
+}
+
+function isBatchRejected(result: FederationAppendResult): boolean {
+  return (result as FederationAppendResult & { batchRejected?: boolean }).batchRejected === true;
 }
 
 interface PeerSyncResponse {

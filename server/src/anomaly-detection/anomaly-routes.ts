@@ -64,8 +64,9 @@ import {
 } from "./anomaly-catalog.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "./types.js";
 import { ClassifierStateStore } from "./classifier-state-store.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 
 export const ANOMALY_API_PREFIX = "/api/anomaly";
 
@@ -387,8 +388,10 @@ export async function handleAnomalyRoute(
             },
           });
         } catch (err) {
-          const detail = err instanceof Error ? err.message : String(err);
-          writeJSON(res, 500, { ok: false, error: "internal", detail });
+          sendCaughtError(res, 500, "internal_error", err, {
+            route: "anomaly",
+            operation: "subscribe",
+          });
         }
         return true;
       }
@@ -431,8 +434,10 @@ export async function handleAnomalyRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "anomaly",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

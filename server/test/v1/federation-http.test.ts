@@ -211,6 +211,45 @@ describe("/v1/federation join ceremony end-to-end over HTTP", () => {
     });
   });
 
+  it("denies a revoked node at authorize/complete through the HTTP ceremony path", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    const initRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/authorize/init", {
+          intended_node_id: "revoked-edge-node",
+          intended_node_mode: "local",
+        }),
+      ),
+    });
+    expect(initRes.status).toBe(200);
+    const { bootstrap_token } = (await initRes.json()) as { bootstrap_token: BootstrapToken };
+    materials.context.isNodeRevoked = (nodeId) => nodeId === "revoked-edge-node";
+
+    const assembled = assembleJoinRequest({
+      bootstrapToken: bootstrap_token,
+      fortressMasterSecret: materials.masterSecret,
+    });
+    const res = await fetch(`${rig.baseUrl}/v1/federation/authorize/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(assembled.joinRequest),
+    });
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+    const statusRes = await fetch(`${rig.baseUrl}/v1/federation/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(((await statusRes.json()) as { roster: { size: number } }).roster.size).toBe(0);
+    expect(await auditOps()).toContainEqual({
+      operation: "v1_federation_authorize_complete",
+      result: "failure",
+    });
+  });
+
   it("authorize/complete denies when federation is disabled (uniform 401, no oracle)", async () => {
     // Federation provisioned but NOT enabled: a probing joiner gets the same
     // 401 as a bad token — no signal that federation exists here.

@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { buildV11Bindings, fortressIdFromStoragePath } from "../../../src/dashboard/v1_1/wiring.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
-import { StateStore } from "../../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../../src/l1-cognitive/tools.js";
+import { StateStore } from "../../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../../src/cognitive/tools.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
 import { verifyExitBundle } from "../../../src/exit/verifier.js";
 

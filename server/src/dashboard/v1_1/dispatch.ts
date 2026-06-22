@@ -31,8 +31,8 @@ import {
 import type { V11Bindings } from "./wiring.js";
 import { enforceAuth, type AuthConfig } from "../../console/auth-middleware.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
-import { IdentityManager } from "../../l1-cognitive/tools.js";
-import { AuditLog } from "../../l2-operational/audit-log.js";
+import { IdentityManager } from "../../cognitive/tools.js";
+import { AuditLog } from "../../operational/audit-log.js";
 import { fromBase64url } from "../../core/encoding.js";
 import {
   applyDidWebRotationToRecord,
@@ -197,12 +197,12 @@ export async function dispatchV11Request(
 ): Promise<boolean> {
   const { bindings, authToken, loopbackAutoAuth } = inputs;
 
-  // v1.1 dashboard HTML at /, /dashboard, /v1.1 (and trailing slash).
-  // v1.1.7: root and /dashboard route to the v1.1 SPA so wrap-printed URLs
-  // land operators on the current surface. Legacy v1.0 dashboard is preserved
-  // at /v1.0 by the legacy route tables in principal-policy/dashboard.ts and
-  // dashboard/api.ts; /v1.1 continues to serve for back-compat with operator
-  // bookmarks.
+  // v1.1 dashboard HTML at /dashboard and /v1.1 (and trailing slash). The
+  // bare root match remains for direct/back-compat helper callers, but both
+  // production dashboard routers now serve the posture shell at `/` before
+  // dispatch reaches this helper. Legacy v1.0 dashboard is preserved at
+  // /v1.0 by the legacy route tables in principal-policy/dashboard.ts and
+  // dashboard/api.ts; /v1.1 continues to serve operator bookmarks.
   if (
     method === "GET" &&
     (url.pathname === "/" ||

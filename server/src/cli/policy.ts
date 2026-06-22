@@ -34,7 +34,7 @@
 
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { MemoryStorage } from "../storage/memory.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { generateRandomKey } from "../core/random.js";

@@ -62,7 +62,7 @@ jobs:
       # otherwise-green jobs when this was the unguarded last step).
       - name: Post PR summary (best-effort)
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             const fs = require("fs");
@@ -91,13 +91,13 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
@@ -119,7 +119,7 @@ jobs:
       # Informational only — best-effort by design (see Post PR summary note).
       - name: Post PR parity summary (best-effort)
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             const fs = require("fs");
@@ -148,19 +148,19 @@ jobs:
         run: npm ci
 
       - name: Download Linux synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-ubuntu-latest
           path: artifacts/ubuntu
 
       - name: Download macOS synthetic coverage report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-macos-latest
           path: artifacts/macos
 
       - name: Download synthetic coverage parity report
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: synthetic-coverage-parity
           path: artifacts/parity
@@ -197,7 +197,7 @@ jobs:
       # comment I/O failures must never flip this job red (or mask a red).
       - name: Post PR gate (a) verdict comment (best-effort)
         if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             const fs = require("fs");

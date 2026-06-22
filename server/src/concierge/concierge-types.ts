@@ -1,7 +1,7 @@
-import type { AuditEntry } from "../l2-operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
 import type { PublicIdentity } from "../core/identity.js";
 import type { HubInboxItem } from "../contracts/v1.1/hub-events.js";
-import type { Task, TaskStatus } from "../l2-operational/task-coordination/index.js";
+import type { Task, TaskStatus } from "../operational/task-coordination/index.js";
 
 export const CONCIERGE_PROMPT_DOMAIN = "sanctuary.concierge.v1\n";
 

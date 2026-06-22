@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Sanctuary wrap — CLI Entry Point
+ * Sanctuary wrap - CLI Entry Point
  *
  * One command to wrap any MCP-compatible agent in Sanctuary's enforcement
  * chain, auto-generate a passphrase, start the Sovereignty Dashboard
@@ -12,6 +12,7 @@
  *   npx @sanctuary-framework/mcp-server wrap --claude-code
  *   npx @sanctuary-framework/mcp-server wrap --cursor
  *   npx @sanctuary-framework/mcp-server wrap --cline
+ *   npx @sanctuary-framework/mcp-server wrap --mastra
  *   npx @sanctuary-framework/mcp-server wrap --wrap /path/to/config.json
  *   npx @sanctuary-framework/mcp-server wrap --unwrap
  *
@@ -80,10 +81,15 @@ import {
   establishWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
+import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
-import { resolveStoragePath, resolveDashboardPort } from "../paths.js";
+import {
+  formatFortressPathWritableError,
+  preflightFortressPathWritable,
+  resolveStoragePath,
+  resolveDashboardPort,
+} from "../paths.js";
 import { writeTenantRuntime, clearTenantRuntime } from "../cli/agents/runtime.js";
 import {
   registerHostTenant,
@@ -112,7 +118,9 @@ export interface WrapOptions {
   cursor?: boolean;
   /** Auto-detect Cline config. */
   cline?: boolean;
-  /** Unwrap — restore the original config. */
+  /** Auto-detect Mastra MCP config. */
+  mastra?: boolean;
+  /** Unwrap - restore the original config. */
   unwrap?: boolean;
   /** Explicit passphrase override. If unset, one is generated and stored. */
   passphrase?: string;
@@ -240,7 +248,7 @@ export function formatMcpServerCount(
  * path so harness restarts (Claude Code re-spawning the MCP server)
  * keep the same fortress directory. Pre-fix, --fortress was honored at
  * wrap time (via promoteFortressToStoragePath) but never written
- * into ~/.claude.json — every harness restart fell back to the default
+ * into ~/.claude.json - every harness restart fell back to the default
  * fortress location, silently drifting fortress isolation across reboots.
  *
  * The args list stays constant: persistence travels through env vars
@@ -325,7 +333,7 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   try {
     existingYaml = await readFile(yamlPath, "utf-8");
   } catch {
-    // File absent — the plan would create it.
+    // File absent - the plan would create it.
   }
   const sanctuaryEnv = buildSanctuaryEnv(options);
   const { command, args } = resolveSanctuaryCommand(options);
@@ -363,7 +371,7 @@ async function refuseSymlinkTarget(path: string, surface: string): Promise<void>
   try {
     isLink = (await lstat(path)).isSymbolicLink();
   } catch {
-    return; // Absent — nothing to refuse.
+    return; // Absent - nothing to refuse.
   }
   if (isLink) {
     throw new Error(
@@ -384,7 +392,7 @@ export const WRAP_GOVERNOR_DEFAULTS = {
 
 /**
  * How many consecutive ports the dashboard fallback tries, starting at
- * `preferredPort`. v0.10.0 hardcoded an absolute `MAX_PORT = 3510` cap —
+ * `preferredPort`. v0.10.0 hardcoded an absolute `MAX_PORT = 3510` cap -
  * starting above it (the documented tenant ports 3511/3512) produced an
  * empty range and the error "No free dashboard port in range 3511-3510".
  * Making the window relative to `preferredPort` fixes both the multi-tenant
@@ -396,7 +404,7 @@ export const PORT_FALLBACK_ATTEMPTS = 20;
 
 // ── Dashboard integration ───────────────────────────────────────────
 
-/** Minimal starter signature — matches `startDashboard` from ../dashboard. */
+/** Minimal starter signature - matches `startDashboard` from ../dashboard. */
 export type DashboardStarter = (opts: {
   port: number;
   host?: string;
@@ -443,7 +451,7 @@ export async function runWrap(
   options: WrapOptions,
   deps: RunWrapDeps = {}
 ): Promise<void> {
-  // D4 P2-2: --unwrap honors --dry-run too — pre-fix, the unwrap dispatch
+  // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
   // for real. The gate travels into unwrap() so it can report what WOULD
   // be restored/removed while writing nothing.
@@ -464,6 +472,7 @@ export async function runWrap(
   else if (options.claudeCode) platformHint = "claude-code";
   else if (options.cursor) platformHint = "cursor";
   else if (options.cline) platformHint = "cline";
+  else if (options.mastra) platformHint = "mastra";
 
   let detection = await detectAgentConfigWithDiagnostics(
     platformHint,
@@ -538,7 +547,7 @@ export async function runWrap(
     } else {
       console.error("  Could not auto-detect any agent configuration.");
       console.error(
-        "  Use --openclaw, --hermes, --claude-code, --cursor, --cline, or --wrap /path/to/config.json"
+        "  Use --openclaw, --hermes, --claude-code, --cursor, --cline, --mastra, or --wrap /path/to/config.json"
       );
     }
     if (detection.pathsChecked.length > 0) {
@@ -617,12 +626,23 @@ export async function runWrap(
   // profile, backup dir, and every other on-disk artifact land in the same
   // per-tenant location when SANCTUARY_STORAGE_PATH is set.
   const storagePath = resolveStoragePath();
+  const fortressWritable = await preflightFortressPathWritable(storagePath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary wrap: ${formatFortressPathWritableError(
+        storagePath,
+        fortressWritable,
+      )}\n`,
+    );
+    process.exit(2);
+  }
 
   // Resolve or generate passphrase.
   //
   // Invariant: the resolved passphrase never reaches argv or the rewritten
   // agent config. User-supplied `--passphrase` is treated as a one-time
-  // setter — we persist it into Keychain/fallback and the launcher
+  // setter - we persist it into Keychain/fallback and the launcher
   // re-resolves it at runtime via the same path everyone else uses.
   // See SEC-061 in Archive/DELTA_REVIEW_V0.9.0_RC1.md.
   let passphraseLocation: string;
@@ -720,7 +740,7 @@ export async function runWrap(
   // Establish the fortress's unified custody (core/master-custody.ts) BEFORE
   // anything trust-bearing is written: one master, wrapped under the
   // resolved passphrase AND a minted recovery key (a wrap of that same
-  // master — never a parallel one). Legacy fortresses migrate in place on
+  // master - never a parallel one). Legacy fortresses migrate in place on
   // this unlock. Interactive runs force recovery-key capture + re-entry
   // verification; non-interactive runs are recorded as an audited headless
   // install. Fail closed on a credential that does not unlock (#5).
@@ -793,10 +813,10 @@ export async function runWrap(
     const fortressId = fortressIdFromStoragePath(storagePath);
     const runtime = await import("../castle-wall/runtime/index.js");
 
-    // FIX 3 (codex HIGH — wire the opt-in producer-signed close into production).
+    // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
     // On Linux WITH the explicit opt-in flag, route through the producer-signed
-    // activation gate (fail-closed, drill-pending, off by default). macOS — and
-    // Linux WITHOUT the flag — keep the existing macOS daemon / channel basis.
+    // activation gate (fail-closed, drill-pending, off by default). macOS - and
+    // Linux WITHOUT the flag - keep the existing macOS daemon / channel basis.
     // The gate itself re-checks platform + opt-in, so this is belt-and-suspenders.
     if (
       process.platform === "linux" &&
@@ -813,7 +833,7 @@ export async function runWrap(
         key,
         auditSink: auditLog,
       });
-      // The gate returns activated:false only when NOT opted in / not Linux —
+      // The gate returns activated:false only when NOT opted in / not Linux -
       // neither is possible here (we just checked both), so an inactive outcome
       // means a logic drift; treat it as a no-op rather than a fake-arm.
       if (outcome.activated) {
@@ -879,7 +899,7 @@ export async function runWrap(
     mode: 0o600,
   });
 
-  // The args list is a constant — never inject `--passphrase`. The launcher
+  // The args list is a constant - never inject `--passphrase`. The launcher
   // re-resolves the stored passphrase at runtime from Keychain / fallback
   // file / SANCTUARY_PASSPHRASE env var. See SEC-061. Env-block and
   // command/args construction live in buildSanctuaryEnv /
@@ -919,7 +939,7 @@ export async function runWrap(
     try {
       existingYaml = await readFile(yamlPath, "utf-8");
     } catch {
-      // File absent — the plan creates it.
+      // File absent - the plan creates it.
     }
     try {
       const plan = planHermesYamlInjection(existingYaml, {
@@ -985,7 +1005,7 @@ export async function runWrap(
 
   // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
   // the JSON surface verified. D4 P1-1: the ENTIRE write+verify is inside
-  // one rollback scope — a thrown writeFile (unwritable file, bad symlink)
+  // one rollback scope - a thrown writeFile (unwritable file, bad symlink)
   // previously escaped the verify-only rollback and left the wrap partially
   // applied (JSON wrapped, YAML not: the exact silent-bypass state this fix
   // exists to prevent). Any failure now rolls BOTH surfaces back and exits
@@ -1112,7 +1132,7 @@ export async function runWrap(
     // The host tenant registry must live under the *resolved* storage root,
     // not the hardcoded ~/.sanctuary default. When SANCTUARY_STORAGE_PATH is
     // set (an isolated/drill fortress), `storagePath` is that override and the
-    // registry row lands in `<override>/tenants.json` — it must never pollute
+    // registry row lands in `<override>/tenants.json` - it must never pollute
     // the real operator fortress's `~/.sanctuary/tenants.json`. When the env
     // var is unset, `storagePath` already equals `~/.sanctuary`, so default
     // behavior (and the existing host-level cross-fortress index) is unchanged.
@@ -1204,7 +1224,7 @@ export async function runWrap(
         const ndStorage = new FilesystemStorage(`${storagePath}/state`);
         // Unified custody: the master was established (or migrated) above;
         // re-deriving from key-params here could produce a DIFFERENT master
-        // than the envelope holds — exactly the divergence this build ends.
+        // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
         // Best-effort: daemon failure does not block identity bootstrap.
@@ -1220,7 +1240,7 @@ export async function runWrap(
         // before the success exit below.
         await enableAnchorTransparencyForWrap(ndStorage, ndDerived.key, ndAuditLog);
 
-        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { IdentityManager } = await import("../cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
         const { derivePurposeKey } = await import("../core/key-derivation.js");
         const identityMgr = new IdentityManager(ndStorage, ndDerived.key);
@@ -1257,6 +1277,10 @@ export async function runWrap(
       serverCount: upstreamServers.length,
       passphraseLocation,
       passphraseSource,
+      // Honest arm outcome: castleWallDaemon is only defined when
+      // startCastleWallForWrap succeeded; on a start failure the catch above
+      // ran warnCastleWallDaemonNotStarted and left it undefined.
+      castleWallArmed: castleWallDaemon !== undefined,
     });
     return;
   }
@@ -1319,10 +1343,54 @@ export async function runWrap(
     try {
       const v11Storage = new FilesystemStorage(`${storagePath}/state`);
       // Unified custody: reuse the master established above (envelope-backed)
-      // instead of re-deriving from key-params — the spawned MCP server
+      // instead of re-deriving from key-params - the spawned MCP server
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+
+      // HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): resolve the
+      // pinned producer key over the SAME canonical storage path the wrap-auto
+      // Castle Wall daemon publishes it to (`<storagePath>/policy/egress/
+      // audit-producer.pub`, via loadFortressProducerKey) and feed it into the
+      // snapshot server's sources. Without this the wrap-auto dashboard read the
+      // wall posture on the bare channel basis, so on a key-bearing host a forged
+      // marker-only audit entry would arm the hero shield green. With the key
+      // present the reader re-verifies the producer signature and a forgery fails
+      // closed to amber, identical to the DashboardApprovalChannel path. `absent`
+      // (macOS / pre-provision) → honest channel basis; `unreadable` (a key is
+      // expected but malformed/locked) → fail honestly to amber via
+      // producerKeyExpectedButUnavailable, never the weaker channel basis.
+      try {
+        const { loadFortressProducerKey } = await import(
+          "../castle-wall/runtime/producer-signature.js"
+        );
+        const { loadBrokerProducerKey } = await import(
+          "../broker-mcp/producer-signature.js"
+        );
+        const producerKeyLoad = await loadFortressProducerKey(storagePath);
+        const brokerProducerKeyLoad = await loadBrokerProducerKey(storagePath);
+        dashboard.updateSources?.({
+          resolvePinnedProducerKey: () =>
+            producerKeyLoad.status === "present"
+              ? producerKeyLoad.keyB64url
+              : null,
+          ...(producerKeyLoad.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+          resolveBrokerPinnedProducerKey: () =>
+            brokerProducerKeyLoad.status === "present"
+              ? brokerProducerKeyLoad.keyB64url
+              : null,
+          ...(brokerProducerKeyLoad.status === "unreadable"
+            ? { brokerProducerKeyExpectedButUnavailable: true }
+            : {}),
+        });
+      } catch {
+        // Never let the producer-key probe fail wrap. On any unexpected throw the
+        // snapshot server keeps its honest default (no producer key → channel
+        // basis); it never silently arms green on a forged entry because the
+        // aggregator's wall reader treats absent-key as the channel floor.
+      }
       // Best-effort: a Castle Wall daemon startup failure (e.g. EACCES on
       // Linux when the fortress-scoped socket dir requires root, or any
       // platform where the pinned key is unavailable) does not fail wrap.
@@ -1343,7 +1411,7 @@ export async function runWrap(
 
       // v1.2.1 (Finding NNN): auto-create default identity at wrap time.
       try {
-        const { IdentityManager } = await import("../l1-cognitive/tools.js");
+        const { IdentityManager } = await import("../cognitive/tools.js");
         const { createIdentity } = await import("../core/identity.js");
         const { derivePurposeKey } = await import("../core/key-derivation.js");
         const identityMgr = new IdentityManager(v11Storage, derived.key);
@@ -1418,9 +1486,9 @@ export async function runWrap(
           masterKey: derived.key,
         }),
       );
-      // The wrap-auto dashboard always binds 127.0.0.1; the operator
-      // already has the bearer token in the auto-opened URL. Loopback
-      // auto-auth keeps the v1.1 client one-click from the URL.
+      // The wrap-auto dashboard always binds 127.0.0.1. The printed URL
+      // carries only a short-lived session; loopback auto-auth keeps the
+      // v1.1 client one-click without putting the bearer token in a URL.
       dashboard.setV11LoopbackAutoAuth(true);
     } catch (err) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1434,7 +1502,7 @@ export async function runWrap(
 
   failIfAnchorOptInDropped();
 
-  const dashboardUrl = `${dashboard.url}?token=${authToken}`;
+  const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
   // Publish runtime state so `sanctuary agents` + the multi-agent
   // dashboard aggregator can find this tenant's actual port. Best-effort:
@@ -1473,7 +1541,7 @@ export async function runWrap(
       const opener = deps.openBrowser ?? defaultOpenBrowser;
       await opener(dashboardUrl);
     } catch {
-      /* best-effort — user can still copy the URL */
+      /* best-effort - user can still copy the URL */
     }
   }
 
@@ -1492,6 +1560,8 @@ export async function runWrap(
     passphraseSource,
     intelligenceHealthy,
     intelligenceError,
+    // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
+    castleWallArmed: castleWallDaemon !== undefined,
   });
 }
 
@@ -1527,9 +1597,9 @@ export async function startDashboardWithFallback(
   }
   const lastPort = preferredPort + PORT_FALLBACK_ATTEMPTS - 1;
   throw new Error(
-    `No free dashboard port in the ${PORT_FALLBACK_ATTEMPTS} ports starting at ${preferredPort} (tried ${preferredPort}-${lastPort}): ${
+    `No free dashboard port in the range ${preferredPort}-${lastPort} (all ${PORT_FALLBACK_ATTEMPTS} tried): ${
       (lastErr as Error)?.message ?? "unknown"
-    }`
+    }. Stop the other Sanctuary instance, or choose a port with: sanctuary wrap <your-flags> --port <port>.`
   );
 }
 
@@ -1578,6 +1648,15 @@ interface WrapSuccessInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /**
+   * Whether the Castle Wall enforcement daemon actually armed during this
+   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
+   * fired and traffic is not being filtered; `undefined` => no arm signal was
+   * threaded into the banner (treated conservatively as not-confirmed, never
+   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
+   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   */
+  castleWallArmed?: boolean;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1611,8 +1690,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
+  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
+  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
+  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
+  // that is the exact overclaim the audit flagged (a green hero printed
+  // seconds after the loud "traffic NOT filtered" warning).
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
@@ -1623,6 +1712,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   }
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Render the Castle Wall segment of the wrap success banner from the real arm
+ * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
+ * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
+ * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ */
+function renderCastleWallBannerLabel(armed: boolean | undefined): string {
+  if (armed === true) return "Castle Wall Full";
+  if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
+  return "Castle Wall status unknown (not confirmed armed)";
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1639,6 +1740,8 @@ interface WrapSuccessNoDashboardInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
+  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
+  castleWallArmed?: boolean;
 }
 
 /**
@@ -1673,8 +1776,14 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
+  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
+  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
+  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
+  const heroPrefix = info.castleWallArmed === true
+    ? b("Your agent is protected.")
+    : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${b("Your agent is protected.")} Castle Wall Full / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
@@ -1803,7 +1912,7 @@ async function unwrap(dryRun: boolean): Promise<void> {
   // D4 P1-2 (validate before use) + P2-3 (no symlinked restore targets):
   // re-validate every auxiliary entry and refuse symlinked targets BEFORE
   // any restore runs, so a forged or symlinked entry aborts the whole
-  // unwrap with nothing modified — including the primary config. Round-2
+  // unwrap with nothing modified - including the primary config. Round-2
   // P1-A: the lstat loop below is a courtesy early refusal; the atomic
   // enforcement is the O_NOFOLLOW open inside restoreConfig itself.
   let auxiliary: ValidatedWrapMetaAuxiliaryFile[] = [];
@@ -1870,7 +1979,7 @@ async function unwrap(dryRun: boolean): Promise<void> {
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
       } else if (aux.alreadyAbsent) {
-        // Round-2 P2: created-by-wrap file whose parent directory is gone —
+        // Round-2 P2: created-by-wrap file whose parent directory is gone -
         // the "absent" end-state already holds; informational no-op.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
@@ -1910,8 +2019,8 @@ async function unwrap(dryRun: boolean): Promise<void> {
  * start during `wrap`. Wrap is best-effort with respect to the daemon (a start
  * failure never blocks wrapping the agent), but a silent "Note:" let an
  * upgrade quietly leave a previously-armed host UNARMED. This makes the
- * not-armed state loud, and — on macOS, when the failure is the A2/B2
- * helper-signing default having no reachable signer — prints the exact
+ * not-armed state loud, and - on macOS, when the failure is the A2/B2
+ * helper-signing default having no reachable signer - prints the exact
  * migration path (install the helper + point at the shim, or opt back into the
  * legacy local-signing key). See the A2/B2 re-drill verdict's migration caveat.
  */
@@ -1988,7 +2097,7 @@ function createWrapProfile(upstream: UpstreamServer[]): SovereigntyProfile {
 }
 
 function generateAuthToken(): string {
-  // 24 bytes → 32-char base64url — plenty of entropy for a single-use URL.
+  // 24 bytes → 32-char base64url - plenty of entropy for a single-use URL.
   return randomBytes(24)
     .toString("base64")
     .replace(/\+/g, "-")
@@ -2003,6 +2112,7 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
     case "claude-code": return "Claude Code";
     case "cursor": return "Cursor";
     case "cline": return "Cline";
+    case "mastra": return "Mastra";
     default: return "your agent";
   }
 }
@@ -2015,13 +2125,14 @@ function toolNameFor(platform: AgentPlatform, _servers: MCPServerEntry[]): strin
  * mapping here means the hub layer doesn't import the wrap layer's enum
  * and vice versa.
  */
-function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
+export function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKind {
   switch (platform) {
     case "openclaw": return "openclaw";
     case "hermes": return "hermes";
     case "claude-code": return "claude_code";
     case "cursor": return "cursor";
     case "cline": return "cline";
+    case "mastra": return "mastra";
     case "generic": return "generic_mcp";
     default: {
       // Defensive: unknown future platforms map to "other" rather than
@@ -2082,7 +2193,7 @@ function buildLocalAgentRecord(input: {
 }
 
 function countUpstreamTools(servers: UpstreamServer[]): number {
-  // Conservative estimate — real count requires live tool discovery.
+  // Conservative estimate - real count requires live tool discovery.
   // At wrap time we do not have an MCP client connection yet, so we show
   // a "0+ tools" placeholder until the dashboard fills in live data.
   return servers.length === 0 ? 0 : servers.length;
@@ -2142,6 +2253,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--claude-code",
   "--cursor",
   "--cline",
+  "--mastra",
   "--unwrap",
   "--dry-run",
   "--no-open",
@@ -2152,7 +2264,14 @@ const WRAP_BOOLEAN_FLAGS = new Set([
 ]);
 
 /** Known harness flags (for "did you mean" suggestions). */
-const WRAP_HARNESS_FLAGS = ["--openclaw", "--hermes", "--claude-code", "--cursor", "--cline"];
+const WRAP_HARNESS_FLAGS = [
+  "--openclaw",
+  "--hermes",
+  "--claude-code",
+  "--cursor",
+  "--cline",
+  "--mastra",
+];
 
 function parseDashboardPortFlag(flag: string, value: string | undefined): number {
   if (value === undefined || value.startsWith("-")) {
@@ -2212,6 +2331,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--cline":
         options.cline = true;
         break;
+      case "--mastra":
+        options.mastra = true;
+        break;
       case "--unwrap":
         options.unwrap = true;
         break;
@@ -2264,6 +2386,7 @@ function printWrapHelp(): void {
     sanctuary wrap --claude-code       Wrap Claude Code
     sanctuary wrap --cursor            Wrap Cursor
     sanctuary wrap --cline             Wrap Cline (VS Code extension)
+    sanctuary wrap --mastra            Wrap Mastra
     sanctuary wrap --wrap <path>       Wrap a specific MCP config file
     sanctuary wrap --unwrap            Restore original config
 
@@ -2273,6 +2396,7 @@ function printWrapHelp(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)

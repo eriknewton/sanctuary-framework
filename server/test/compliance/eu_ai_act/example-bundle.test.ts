@@ -38,8 +38,8 @@ import {
 } from "../../../src/core/identity.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import type { EncryptedPayload } from "../../../src/core/encryption.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
-import { IdentityManager } from "../../../src/l1-cognitive/tools.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
+import { IdentityManager } from "../../../src/cognitive/tools.js";
 import { DEFAULT_POLICY } from "../../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../../src/config.js";
 import {

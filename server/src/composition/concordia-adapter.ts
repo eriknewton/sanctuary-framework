@@ -12,11 +12,12 @@ import { SIDECAR_RPC_METHODS, SIDECAR_SIGNATURE_SCHEME, CONCORDIA_RECEIPT_SCHEMA
 import type { SidecarRpcClient } from "./sidecar-rpc.js";
 import type {
   CommitmentEvent,
+  ConcordiaAttestationMetadata,
   ConcordiaReceipt,
   ConcordiaReference,
   MandateVerificationResult,
 } from "./types.js";
-import { MandateVerificationError } from "./errors.js";
+import { MandateVerificationError, SidecarResponseShapeError } from "./errors.js";
 import { COMPOSITION_DEFAULTS, CONCORDIA_MANDATE_SCHEMA_URN } from "./constants.js";
 import {
   assertBoolean,
@@ -38,11 +39,146 @@ const MANDATE_CHECK_FLAGS = [
 const MANDATE_VALID_STATUSES = ["active", "expired", "revoked", "suspended"] as const;
 type MandateStatus = (typeof MANDATE_VALID_STATUSES)[number];
 
+type AttestationMetadataField =
+  | "commitment_class"
+  | "references_count"
+  | "counterparty_count"
+  | "offers_made"
+  | "concession_magnitude"
+  | "reasoning_provided";
+
+const ATTESTATION_METADATA_FIELDS: readonly AttestationMetadataField[] = [
+  "commitment_class",
+  "references_count",
+  "counterparty_count",
+  "offers_made",
+  "concession_magnitude",
+  "reasoning_provided",
+] as const;
+
+const ATTESTATION_METADATA_FIELD_SET = new Set<string>(
+  ATTESTATION_METADATA_FIELDS
+);
+
+const DISALLOWED_ATTESTATION_METADATA_FIELD_MESSAGE =
+  "Concordia sidecar attestation_metadata contains a disallowed field";
+
+const RAW_TERM_VALUE_PATTERNS = [
+  /\$/,
+  /\b(?:price|amount|quantity|qty|total|terms?|currency|cost|fee|budget|deliverable|deadline|invoice)\b/i,
+  /\b\d+(?:\.\d{1,2})?\s*(?:usd|dollars?|units?|items?|hours?)\b/i,
+] as const;
+
 function isMandateStatus(v: unknown): v is MandateStatus {
   return (
     typeof v === "string" &&
     (MANDATE_VALID_STATUSES as readonly string[]).includes(v)
   );
+}
+
+function stringLooksLikeRawTerms(value: string): boolean {
+  return RAW_TERM_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function assertSafeMetadataLabel(
+  method: string,
+  field: AttestationMetadataField,
+  value: unknown
+): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
+    throw new SidecarResponseShapeError(
+      method,
+      `field "attestation_metadata.${field}" must be a non-empty string up to 128 characters`
+    );
+  }
+  if (stringLooksLikeRawTerms(value)) {
+    throw new SidecarResponseShapeError(
+      method,
+      `field "attestation_metadata.${field}" contains raw-term-like text`
+    );
+  }
+  return value;
+}
+
+function assertNonNegativeIntegerMetadata(
+  method: string,
+  field: AttestationMetadataField,
+  value: unknown
+): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new SidecarResponseShapeError(
+      method,
+      `field "attestation_metadata.${field}" must be a non-negative integer`
+    );
+  }
+  return value;
+}
+
+function assertConcessionMagnitude(
+  method: string,
+  value: unknown
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new SidecarResponseShapeError(
+      method,
+      `field "attestation_metadata.concession_magnitude" must be a number from 0 to 1`
+    );
+  }
+  return value;
+}
+
+function assertBooleanMetadata(
+  method: string,
+  field: AttestationMetadataField,
+  value: unknown
+): boolean {
+  if (typeof value !== "boolean") {
+    throw new SidecarResponseShapeError(
+      method,
+      `field "attestation_metadata.${field}" must be a boolean`
+    );
+  }
+  return value;
+}
+
+function assertConcordiaAttestationMetadata(
+  method: string,
+  metadata: Record<string, unknown> | undefined
+): ConcordiaAttestationMetadata | undefined {
+  if (metadata === undefined) return undefined;
+
+  const out: ConcordiaAttestationMetadata = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!ATTESTATION_METADATA_FIELD_SET.has(key)) {
+      throw new SidecarResponseShapeError(
+        method,
+        DISALLOWED_ATTESTATION_METADATA_FIELD_MESSAGE
+      );
+    }
+
+    const field = key as AttestationMetadataField;
+    switch (field) {
+      case "commitment_class":
+        out.commitment_class = assertSafeMetadataLabel(method, field, value);
+        break;
+      case "references_count":
+        out.references_count = assertNonNegativeIntegerMetadata(method, field, value);
+        break;
+      case "counterparty_count":
+        out.counterparty_count = assertNonNegativeIntegerMetadata(method, field, value);
+        break;
+      case "offers_made":
+        out.offers_made = assertNonNegativeIntegerMetadata(method, field, value);
+        break;
+      case "concession_magnitude":
+        out.concession_magnitude = assertConcessionMagnitude(method, value);
+        break;
+      case "reasoning_provided":
+        out.reasoning_provided = assertBooleanMetadata(method, field, value);
+        break;
+    }
+  }
+  return out;
 }
 
 /**
@@ -112,10 +248,13 @@ export async function packConcordiaReceipt(
   const packedAt =
     assertOptionalString(SIDECAR_RPC_METHODS.PACK_RECEIPT, result, "packed_at") ??
     new Date().toISOString();
-  const attestationMetadata = assertOptionalPlainObject(
+  const attestationMetadata = assertConcordiaAttestationMetadata(
     SIDECAR_RPC_METHODS.PACK_RECEIPT,
-    result,
-    "attestation_metadata"
+    assertOptionalPlainObject(
+      SIDECAR_RPC_METHODS.PACK_RECEIPT,
+      result,
+      "attestation_metadata"
+    )
   );
 
   return {

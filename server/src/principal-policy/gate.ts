@@ -20,7 +20,7 @@ import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } f
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
 import { extractOperationName, FORCED_TIER3_OPERATIONS } from "./loader.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
 import {
@@ -44,6 +44,8 @@ export type InjectionAlertCallback = (alert: {
 
 /** Resolver for proxy tool tiers — provided by the ProxyRouter */
 export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
+
+const FORCED_TIER1_OPERATIONS = ["memory_delete"] as const;
 
 /**
  * Approval-lifecycle callback. Wired in v1.3 Upsilon-1 by the Cross-
@@ -426,6 +428,13 @@ export class ApprovalGate {
     unclassified?: boolean;
   } {
     const operation = extractOperationName(toolName);
+
+    if ((FORCED_TIER1_OPERATIONS as readonly string[]).includes(operation)) {
+      return {
+        tier: 1,
+        reason: `"${operation}" is a forced Tier 1 operation (always requires approval)`,
+      };
+    }
 
     if (this.policy.tier1_always_approve.includes(operation)) {
       return {

@@ -1,0 +1,302 @@
+{
+  "_comment": [
+    "Synthetic-coverage PR ratchet baseline (DoE H-3).",
+    "Frozen per-row coverage snapshot: a change that REDUCES coverage for any row",
+    "(dropped row, fewer passing fixtures, regressed coverage_state, or a newly",
+    "failing fixture) reds coverage-ratchet.test.ts inside `npm test`. Improvements",
+    "pass without a regen (the ratchet is a directional floor). DO NOT hand-edit to",
+    "lower a value; regenerate ONLY via `npm run synthetic-coverage:baseline` after",
+    "a legitimate, reviewed coverage change, in the same PR. Platform-agnostic: the",
+    "synthetic fixtures are deterministic in-process models, identical on Linux and",
+    "macOS."
+  ],
+  "rows": [
+    {
+      "assurance_row_id": "1",
+      "label": "Agent wrapping (MCP interception)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "2",
+      "label": "Approval gating (Tier 1 / Tier 2 / Tier 3 policy)",
+      "assurance_status": "proven",
+      "fixtures_passed": 3,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "custody-key-gate: gate-closed denies",
+        "custody-key-gate: gate-open allows",
+        "custody-key-gate: gate-toggle race produces deterministic outcome"
+      ]
+    },
+    {
+      "assurance_row_id": "3",
+      "label": "Critical audit durability (appendCritical)",
+      "assurance_status": "proven",
+      "fixtures_passed": 5,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "critical-audit-durability: happy path",
+        "critical-audit-durability: storage ENOSPC equivalent fails closed",
+        "critical-audit-durability: storage partial-write fails closed",
+        "critical-audit-durability: storage write rejected fails closed",
+        "critical-audit-durability: synchronous-API site coverage"
+      ]
+    },
+    {
+      "assurance_row_id": "4",
+      "label": "Tamper-evident audit chain",
+      "assurance_status": "proven",
+      "fixtures_passed": 8,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "appendCritical produces a verifiable signed checkpoint",
+        "audit-chain-verifier: checkpoint signature invalid",
+        "audit-chain-verifier: happy path",
+        "audit-chain-verifier: prev-hash skew",
+        "audit-chain-verifier: sequence gap",
+        "audit-chain-verifier: tamper mid-chain",
+        "empty-chain checkpoint signs the genesis state",
+        "standalone verifier rejects mid-chain entry mutation"
+      ]
+    },
+    {
+      "assurance_row_id": "5",
+      "label": "State encryption",
+      "assurance_status": "proven",
+      "fixtures_passed": 3,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "custody key access requires active roster gate",
+        "custody key bypass without gate is denied by default",
+        "gate revocation invalidates in-flight custody access"
+      ]
+    },
+    {
+      "assurance_row_id": "6",
+      "label": "State envelope integrity / default verify-on-read",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "state-envelope-migration: future-version rejected",
+        "state-envelope-migration: malformed envelope",
+        "state-envelope-migration: partial rollback",
+        "state-envelope-migration: v1-to-v2"
+      ]
+    },
+    {
+      "assurance_row_id": "7",
+      "label": "Config/profile fail-closed",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "config-profile-fail-closed: corrupted config quarantined plus fail-closed",
+        "config-profile-fail-closed: corrupted sovereignty profile preserved plus fail-closed",
+        "config-profile-fail-closed: happy path",
+        "config-profile-fail-closed: registry guard catches new config-like store"
+      ]
+    },
+    {
+      "assurance_row_id": "8",
+      "label": "Health and attestation evidence-based",
+      "assurance_status": "proven",
+      "fixtures_passed": 7,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "attestation payload mutation invalidates verification",
+        "large attestation envelope within current verifier bounds verifies",
+        "malformed attestation envelope returns explicit verification error",
+        "sentinel-registration: register baseline sentinel",
+        "sentinel-registration: register observation sentinel auditd",
+        "sentinel-registration: register observation sentinel eBPF",
+        "well-formed attestation envelope verifies"
+      ]
+    },
+    {
+      "assurance_row_id": "9",
+      "label": "Egress enforcement: Linux (Castle Wall Phase 1)",
+      "assurance_status": "proven",
+      "fixtures_passed": 5,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "boundary-admission: deny on expired token",
+        "boundary-admission: deny on missing token",
+        "boundary-admission: deny on revoked principal",
+        "boundary-admission: happy admit",
+        "boundary-admission: replay rejection"
+      ]
+    },
+    {
+      "assurance_row_id": "10",
+      "label": "Egress enforcement: macOS (Castle Wall Phase 1)",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "deny-by-default: malformed request denies",
+        "deny-by-default: request without identity context denies",
+        "deny-by-default: unconfigured route denies",
+        "deny-by-default: unknown verb denies"
+      ]
+    },
+    {
+      "assurance_row_id": "11",
+      "label": "Dashboard approval flow",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "12",
+      "label": "Export / exit bundle",
+      "assurance_status": "proven",
+      "fixtures_passed": 5,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "exit-bundle: conflict-refusal on import into populated dir",
+        "exit-bundle: export then offline-verify happy path",
+        "exit-bundle: import to fresh fortress dir",
+        "exit-bundle: re-key after import",
+        "exit-bundle: source-key cleanup after re-key"
+      ]
+    },
+    {
+      "assurance_row_id": "13",
+      "label": "Query anonymity (selective disclosure)",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "query-anonymity: adapter-matrix coverage gate",
+        "query-anonymity: header-strip",
+        "query-anonymity: pii-rewrite",
+        "query-anonymity: smart-mode classification"
+      ]
+    },
+    {
+      "assurance_row_id": "14",
+      "label": "Context-gate single source of truth",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "context-gate: health surface reflects enforcer state across restart",
+        "context-gate: profile feature toggle off bypasses enforcer with audit",
+        "context-gate: profile feature toggle on routes through enforcer",
+        "context-gate: proxy contextGateFilter delegates to live enforcer"
+      ]
+    },
+    {
+      "assurance_row_id": "15",
+      "label": "Proxy isolation: env (PR #267)",
+      "assurance_status": "proven",
+      "fixtures_passed": 3,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "proxy-env-isolation: default safe env only",
+        "proxy-env-isolation: explicit safe env pass-through",
+        "proxy-env-isolation: secret env denylist"
+      ]
+    },
+    {
+      "assurance_row_id": "16",
+      "label": "Proxy SSE SSRF protection",
+      "assurance_status": "proven",
+      "fixtures_passed": 5,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "proxy-sse-ssrf: cloud metadata rejected",
+        "proxy-sse-ssrf: link-local and ipv6 loopback rejected",
+        "proxy-sse-ssrf: loopback rejected",
+        "proxy-sse-ssrf: private-network escape hatch audited",
+        "proxy-sse-ssrf: rfc1918 rejected"
+      ]
+    },
+    {
+      "assurance_row_id": "17",
+      "label": "Dynamic proxy tool discovery",
+      "assurance_status": "proven",
+      "fixtures_passed": 4,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "proxy-tool-discovery: list-changed refresh",
+        "proxy-tool-discovery: reconnect rediscovery replaces catalog",
+        "proxy-tool-discovery: removed tool emits audit evidence",
+        "proxy-tool-discovery: tier1 context gate wraps added tool"
+      ]
+    },
+    {
+      "assurance_row_id": "18",
+      "label": "did:key encoding (PR #268, base58btc compliant)",
+      "assurance_status": "proven",
+      "fixtures_passed": 3,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "known node certificate resolves to expected signing key",
+        "malformed certificate key field is rejected",
+        "unknown certificate lookup has no silent default key"
+      ]
+    },
+    {
+      "assurance_row_id": "19",
+      "label": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
+      "assurance_status": "proven",
+      "fixtures_passed": 7,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "identity tool signing verifies through registry-mediated surface",
+        "identity-signing-tool-registry-guard: AP2 mandate sign via Key 17 permitted",
+        "identity-signing-tool-registry-guard: ERC-8004 identity sign via Key 17 permitted",
+        "identity-signing-tool-registry-guard: raw sign rejected",
+        "identity-signing-tool-registry-guard: tool-registry sign permitted",
+        "raw identity_sign is denied without approval",
+        "rotated identity key signs under the new public key only"
+      ]
+    },
+    {
+      "assurance_row_id": "20",
+      "label": "Composition root review surface",
+      "assurance_status": "planned",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "21",
+      "label": "Hostile-guest containment: macOS box launcher jails uncooperative plugins (B2 inner-confinement, seccomp-deny-AF_VSOCK)",
+      "assurance_status": "proven",
+      "fixtures_passed": 8,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "guest-jail: AF_UNIX and AF_INET sockets stay allowed (egress relay intact)",
+        "guest-jail: SanctuaryGuestJail.swift still encodes the launcher-applied deny + fail-closed invariants",
+        "guest-jail: jail.rs still encodes the seccomp-deny-AF_VSOCK confinement",
+        "guest-jail: launcher prepends the jail so an uncooperative plugin is born confined",
+        "guest-jail: non-socket syscalls pass through the filter unaffected",
+        "guest-jail: socket(AF_VSOCK) denied with EPERM on both supported arches",
+        "guest-jail: static-binary delivery fails closed without a valid SHA-256 pin",
+        "guest-jail: unknown-arch path fails closed (denies known socket syscalls)"
+      ]
+    },
+    {
+      "assurance_row_id": "22",
+      "label": "Verifiable transparency checkpoints (signed enforcement evidence)",
+      "assurance_status": "proven",
+      "fixtures_passed": 6,
+      "coverage_state": "covered",
+      "passing_fixture_names": [
+        "transparency: audit-head rollback detected",
+        "transparency: counter gap detected",
+        "transparency: duplicate counter (fork) detected",
+        "transparency: forged signature rejected",
+        "transparency: happy-path chain",
+        "transparency: replaced checkpoint breaks hash linkage"
+      ]
+    }
+  ]
+}

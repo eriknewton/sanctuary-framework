@@ -16,7 +16,7 @@
  * exercise the binding contract `runWrap` now establishes after Commit
  * 2: `setV11Bindings` + `setV11LoopbackAutoAuth(true)` against the
  * returned handle. Asserts /v1.1, /api/hub/*, and /api/identities all
- * serve content; legacy / continues to serve.
+ * serve content; root serves the folded posture board shell.
  *
  * Critical: this exercises the dashboard server `runWrap` actually
  * starts (server/src/dashboard/{server,api}.ts), NOT the standalone
@@ -36,7 +36,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 
 const IDENTITY_ID = "wrap-smoke-operator";
@@ -79,6 +79,7 @@ async function startWrapAutoRigWithRetry(): Promise<WrapAutoTestRig> {
       const storage = new MemoryStorage();
       const masterKey = randomBytes(32);
       const auditLog = new AuditLog(storage, masterKey);
+      handle.updateSources({ auditLog });
       handle.setV11Bindings(
         buildV11Bindings({
           identityId: IDENTITY_ID,
@@ -164,12 +165,57 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(await aliasRes.json()).toEqual(await directRes.json());
   });
 
-  it("GET / (legacy v1.0 dashboard) still serves 200 (additive mount preserved)", async () => {
-    const res = await fetch(
-      `${rig.baseUrl}/?token=${encodeURIComponent(rig.authToken)}`,
-    );
+  it("GET / with a short-lived session URL serves the folded posture board", async () => {
+    const sessionUrl = rig.handle.createSessionUrl?.() ?? rig.baseUrl;
+    expect(sessionUrl).not.toContain("?token=");
+    const res = await fetch(sessionUrl);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    expect(html).toContain("/api/posture/home");
+    expect(html).toContain("Approvals waiting");
+  });
+
+  it("GET / and GET /posture serve the same posture board", async () => {
+    const [rootRes, postureRes] = await Promise.all([
+      fetch(`${rig.baseUrl}/`),
+      fetch(`${rig.baseUrl}/posture`),
+    ]);
+    expect(rootRes.status).toBe(200);
+    expect(postureRes.status).toBe(200);
+    const [rootBody, postureBody] = await Promise.all([
+      rootRes.text(),
+      postureRes.text(),
+    ]);
+    expect(rootBody).toBe(postureBody);
+    expect(rootBody).toContain("/api/posture/home");
+  });
+
+  it("wrap-auto posture auxiliaries are read-only and not decision-capable", async () => {
+    const statusRes = await fetch(`${rig.baseUrl}/api/status`);
+    expect(statusRes.status).toBe(200);
+    const status = (await statusRes.json()) as {
+      standalone_mode: boolean;
+      decision_capable: boolean;
+      policy: { approval_redirect: { enabled: boolean; mode: string } };
+    };
+    expect(status.standalone_mode).toBe(false);
+    expect(status.decision_capable).toBe(false);
+    expect(status.policy.approval_redirect).toEqual({
+      enabled: false,
+      mode: "replace",
+    });
+
+    const pendingRes = await fetch(`${rig.baseUrl}/api/pending`);
+    expect(pendingRes.status).toBe(200);
+    expect(await pendingRes.json()).toEqual([]);
+  });
+
+  it("wrap-auto posture data route is mounted behind loopback read auth", async () => {
+    const res = await fetch(`${rig.baseUrl}/api/posture/home`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { origin_machine: string };
+    expect(typeof body.origin_machine).toBe("string");
   });
 
   it("setV11Bindings(null) detaches the v1.1 routes; /v1.1 falls through legacy gate", async () => {

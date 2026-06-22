@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { runTaskCommand } from "../../src/cli/task.js";
-import type { Task } from "../../src/l2-operational/task-coordination/index.js";
+import type { Task } from "../../src/operational/task-coordination/index.js";
 import { writeLockdownStatus } from "../../src/lockdown/status.js";
 
 class StringWritable extends Writable {

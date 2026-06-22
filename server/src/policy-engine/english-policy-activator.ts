@@ -44,7 +44,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
   encrypt,

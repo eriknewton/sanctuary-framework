@@ -1,12 +1,37 @@
 # Castle Wall macOS boot service (F1, Option C — split credential)
 
-Status: implemented 2026-06-10 (Option C re-spec). **Reboot survival is NOT
-yet proven.** The unit-level logic (boot-token custody, safe-mode bring-up
-wiring, plist generation, preflight gating, install start-verification,
-uninstall confirmation) is tested; the claim "the box reboots while armed and
-comes back in safe mode without bricking" can only be proven by an
-Erik-present reboot drill on real hardware. Until that drill passes N>=5,
-treat F1 as "smoke-level: the unit loads and the process starts," not "done."
+Status: implemented 2026-06-10 (Option C re-spec); **reboot survival drill-PROVEN
+2026-06-15** (5/5 reboot reps PASS, Erik present at the Mini1 console). The
+claim "the box reboots while armed and comes back in safe mode without bricking"
+is now backed by on-hardware evidence, not just the unit-level logic
+(boot-token custody, safe-mode bring-up wiring, plist generation, preflight
+gating, install start-verification, uninstall confirmation). The in-repo
+evidence is
+[`docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md`](../../docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md):
+the safe-mode boot daemon came up before login on the boot token alone, the box
+stayed reachable while armed, and the persisted manifest kept enforcing, across
+five reboots on macOS Tahoe 26.5.1 (signed build v774, git_sha `8c8efe68`).
+
+Two honest bounds on that proof:
+
+- **Rebase versus fresh binary.** The reboot evidence was captured on the v774
+  binary built from the drilled source `8c8efe68`. That source was rebased onto
+  main and merged as #450 (`7732f4d5`); the rebase was verified
+  behavior-preserving (codex-clean, frozen-surface guard, and the core boot
+  files byte-identical between `8c8efe68` and `7732f4d5`). A fresh signed build
+  from main's exact tree was not independently reboot-drilled, so main's exact
+  binary is treated as behavior-equivalent by inference, not by a second drill.
+- **Non-blocking residual.** A socket-chown by-name TOCTOU residual and a
+  real-plist-parse follow-on are tracked in issue #567. They were ruled
+  non-blocking: the severe symlink-redirect vector is closed, the agent runs
+  under a separate uid that cannot write the operator's `0700` fortress dir, and
+  the GUI VPN and Filters toggle remains the ultimate dead-man lever.
+
+A mid-drill daemon-start bug (a stale active-config plus PID reuse refused a
+clean start) was caught on an earlier candidate and fixed in `8c8efe68`: an
+active-config collision now requires a live listener, not a bare PID. The box
+was left in a safe state after the drill (filter disarmed, real `~/.sanctuary`
+untouched, boot service left installed and harmless with the filter off).
 
 ## The brick condition this closes
 
@@ -70,9 +95,14 @@ verifies the persisted last-valid signed manifest against the pinned **public**
 key (no secret), and absent a manifest classifies every flow `.agent` and
 denies. Full operation (approvals that touch fortress state, the master-key
 audit log) resumes at **first login**, when the operator session unlocks the
-master key and the full daemon supersedes the safe-mode one. SSH / operator
-reachability holds throughout, so an unattended reboot can no longer brick the
-box.
+master key and starts the full daemon. There is **no automatic supersede** of
+the root safe-mode boot daemon by the operator full daemon (honestly de-scoped:
+an unprivileged operator daemon cannot stand down a root launchd KeepAlive
+unit). The operator stands the boot daemon down explicitly (`sudo launchctl
+bootout system/ai.sanctuaryprotocol.castle-wall.daemon`) when they want the full
+daemon to take over the socket; the box stays protected in safe mode meanwhile.
+SSH / operator reachability holds throughout, so an unattended reboot can no
+longer brick the box.
 
 ### Privilege model (changed from #450, and why it is sound)
 
@@ -172,6 +202,15 @@ restarts the daemon if it crashes.
   with the boot-token key; full-operation audit events (post-login) stay in the
   master-key log as before.
 
+Drill-observation caveat (honest): this describes the designed and unit-covered
+audit path. In the 2026-06-15 drill the safe-mode boot-audit segment was
+observed **empty** on hardware, and per-flow allow/deny decisions are NOT
+recorded to any rule-attributed audit log (the C4 gap). So treat the boot-audit
+segment writes above as designed behavior, not as an on-hardware-proven audit
+capability; see the
+[drill evidence doc](../../docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md)
+for what the drill did and did not establish.
+
 ## What this PR does and does not deliver
 
 - **Delivers:** the boot path no longer holds the master key. The boot token
@@ -186,29 +225,42 @@ restarts the daemon if it crashes.
   operational secret in the login Keychain and documents the trajectory rather
   than claiming SE custody it does not yet have.
 
-## What only a real reboot drill can prove (pre-declared drill criteria)
+## Pre-declared drill criteria and what the 2026-06-15 drill proved
 
 Unit tests cover boot-token custody, safe-mode bring-up wiring, plist
 generation, preflight fail-closed gating, install start-verification, and
-uninstall confirmation. They cannot prove the on-hardware behavior. The
+uninstall confirmation; they cannot prove the on-hardware behavior. The
 Erik-present drill (per the drill-acceptance rule, N>=5 boot-reliability reps)
-must prove, on the signing/boot host:
+ran on 2026-06-15. The per-criterion verdicts are below, exactly as marked: the
+core boot-survival criteria (1, 2, 3) passed N=5; some criteria are IMPLICIT or
+PENDING a targeted sub-test, and the per-flow audit half of criterion 7 was NOT
+met (the C4 gap). Full evidence:
+[`docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md`](../../docs/audit/castle-wall-macos-boot-survival-drill-2026-06-14.md).
 
-1. The safe-mode daemon actually starts at cold/network boot, before login,
-   with only the boot token (launchd environment, root context, filesystem
-   timing). At least one **network-cold** boot.
-2. The box stays reachable: SSH session survives / can be re-established;
-   the machine is not deny-all-bricked.
+1. The safe-mode daemon actually starts at boot, before login, with only the
+   boot token (launchd environment, root context). **PROVEN x5.**
+2. The box stays reachable; the machine is not deny-all-bricked. **PROVEN x5.**
 3. The persisted manifest enforces in the pre-daemon window; the safe-mode
-   daemon connects within the backoff window and re-delivers the manifest.
+   daemon connects and re-delivers the manifest. **PROVEN** (armed and reachable
+   each reboot).
 4. **Helper signing from the root safe-mode daemon peer-authenticates
-   correctly.** (Open verification item: the signer helper's peer-auth was
-   designed against the operator-UID daemon; confirm a root peer is accepted,
-   or that safe mode degrades cleanly to persisted-manifest enforcement if not.
-   Either way the box must not brick.)
-5. Full operation engages at first login (master key unlocks; full daemon
-   supersedes safe mode; master-key audit log resumes).
-6. KeepAlive recovery after a daemon kill while armed.
-7. `boot_token_provisioned` + `filter_started` (source `launchd-boot-safe-mode`)
-   visible in the boot-audit segment; allow/deny differential still correct
-   after the reboot.
+   correctly.** **IMPLICIT** (the daemon came up in helper-signing mode and the
+   manifest was delivered each reboot); a targeted root-peer-auth sub-test is
+   still pending. Either way the box did not brick.
+5. Full operation engages at first login (master key unlocks). **DEMONSTRATED**
+   (a FileVault-passthrough login left the safe-mode daemon persisting without
+   bricking). Note: there is no automatic supersede of the root boot daemon by
+   the operator full daemon (honestly de-scoped, as documented in the safe-mode
+   section above);
+   the box stays protected in safe mode meanwhile.
+6. KeepAlive recovery after a daemon kill while armed. **PENDING targeted
+   sub-test** (unit-covered; not exercised on hardware in this run).
+7. Allow/deny differential correct in the armed window, and the boot-audit
+   segment carries the safe-mode lifecycle. The **per-uid allow/deny
+   differential PASSED (N=3)**. The **audit half was NOT met**: in this drill
+   the safe-mode boot-audit segment was empty, and there is no rule-attributed
+   per-flow audit trail in this configuration (the **C4 gap**). So this work is
+   "enforces a signed policy with a clean per-uid allow/deny demo," **not**
+   "audited per-rule per-flow." The producer-signed per-flow audit trail that
+   would close C4 is an unbuilt future build. See the drill evidence doc for
+   detail.

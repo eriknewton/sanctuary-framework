@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
+import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
@@ -25,7 +26,19 @@ export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/**
+ * Fallback exit deadline for the broker daemon's clean shutdown. If the
+ * stand-down audit flush wedges on a storage backend that never settles, the
+ * SIGTERM/SIGINT handler would otherwise hang forever (the signal listener
+ * suppresses Node's default termination). The watchdog forces `process.exit(0)`
+ * after this window so the daemon dies promptly instead of waiting for an OS
+ * SIGKILL. Generous enough that a healthy flush always finishes first.
+ */
+const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
+
 async function main(): Promise<void> {
+  assertSupportedNodeVersion();
+
   // Parse CLI flags
   const invokedAs = basename(process.argv[1] ?? "");
   let args = process.argv.slice(2);
@@ -90,7 +103,7 @@ async function main(): Promise<void> {
     // split-process supervisor, the transient master key arrives on an
     // inherited one-shot fd (never env/argv). Consume + close it at the
     // earliest point so it cannot linger for a same-uid `/proc/<pid>/fd` race,
-    // and FAIL CLOSED in supervisor mode — never silently fall through to the
+    // and FAIL CLOSED in supervisor mode: never silently fall through to the
     // passphrase/keychain path. Threading the raw master into wrap custody
     // (`establishWrapCustody`) is the drill-gated last mile (S1 acceptance is
     // Erik-present on the signing host); until that lands, supervisor mode
@@ -412,7 +425,7 @@ Commands:
   }
 
   if (args[0] === "broker-server") {
-    const { openBroker } = await import("./l3-disclosure/broker/open.js");
+    const { openBroker } = await import("./disclosure/broker/open.js");
     const { createBrokerMcpServer } = await import("./broker-mcp/broker-server.js");
     const { loadConfig } = await import("./config.js");
     const { fortressIdFromStoragePath } = await import("./dashboard/v1_1/wiring.js");
@@ -420,7 +433,7 @@ Commands:
     const agentId = process.env.SANCTUARY_AGENT_ID ?? "mcp-host";
     const fortressId =
       process.env.SANCTUARY_FORTRESS_ID ?? fortressIdFromStoragePath(config.storage_path);
-    const { broker } = await openBroker();
+    const { broker, auditLog } = await openBroker();
     const server = createBrokerMcpServer(broker, {
       skill: process.env.SANCTUARY_BROKER_SKILL ?? process.env.SANCTUARY_SKILL_NAME ?? agentId,
       agentId,
@@ -429,8 +442,76 @@ Commands:
       fortressId,
       audience: process.env.SANCTUARY_BROKER_AUDIENCE ?? "sanctuary-broker",
     });
+    const { loadOrCreateBrokerProducerSigner } = await import(
+      "./broker-mcp/producer-signature.js"
+    );
+    const producerSigner = await loadOrCreateBrokerProducerSigner(
+      config.storage_path,
+    );
     const transport = new StdioServerTransport();
     await server.connect(transport);
+
+    // Observability (Option C): periodic process-liveness heartbeat for the
+    // long-running broker daemon. A reader (principal-policy/feature-health.ts)
+    // turns a MISSING heartbeat in a quiet window into an honest "broker daemon
+    // silently died" alarm instead of `unknown`. HONEST SCOPE: this proves only
+    // that this daemon PROCESS is alive, NOT that it would correctly mint/deny a
+    // token and NOT that the keychain backend is reachable.
+    const { startBrokerLivenessHeartbeat } = await import("./broker-mcp/liveness-heartbeat.js");
+    const liveness = startBrokerLivenessHeartbeat({
+      auditLog,
+      fortressId,
+      producerSigner,
+    });
+
+    // CRITICAL (the #657 false-RED lesson): a clean broker-server shutdown must
+    // record an INTENTIONAL stand-down. Without it, every deliberate stop reads
+    // as a silent death for the whole digest window. Wire it to SIGTERM / SIGINT
+    // AND the transport/server close hook, then exit. `standDown()` is
+    // idempotent, so overlapping triggers emit at most one stand-down.
+    let shuttingDown = false;
+    const shutdownBroker = (exit: boolean): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      // Fire and forget: standDown() resolves even if the append/flush
+      // *rejects* (fail toward the alarm), and process.exit owns the lifecycle
+      // from here. But standDown() awaits auditLog.flush(), which awaits the
+      // pending storage writes; a wedged backend that never SETTLES (neither
+      // resolves nor rejects) would hang the flush, so the `.finally` never
+      // fires. Installing a SIGTERM/SIGINT listener suppresses Node's default
+      // termination, so without a fallback the daemon would hang on the signal
+      // until the OS SIGKILLs it after its grace period. Arm a watchdog that
+      // forces exit if the stand-down flush does not complete in time. It is
+      // `.unref()`ed so it never keeps the event loop alive: a fast clean
+      // stand-down still exits promptly via the `.finally` below.
+      if (exit) {
+        const watchdog = setTimeout(() => {
+          // SAFETY: stderr is the operator-facing CLI channel; no logger in scope.
+          console.error(
+            "Sanctuary Secret Broker: stand-down flush did not complete in " +
+            `${String(BROKER_SHUTDOWN_WATCHDOG_MS)}ms; forcing exit.`,
+          );
+          // Exit NON-ZERO on the watchdog path: a wedged stand-down flush is a
+          // DEGRADED shutdown (the stand-down marker may not have been durably
+          // written), not a clean one. Reporting it as exit 0 would tell a
+          // process supervisor "clean exit" for what is really a storage wedge -
+          // an overclaim on the very honesty surface this feature serves. The
+          // clean `.finally` path below keeps exit 0.
+          process.exit(1);
+        }, BROKER_SHUTDOWN_WATCHDOG_MS);
+        watchdog.unref();
+        void liveness.standDown().finally(() => {
+          clearTimeout(watchdog);
+          process.exit(0);
+        });
+        return;
+      }
+      void liveness.standDown();
+    };
+    server.onclose = () => shutdownBroker(true);
+    process.on("SIGTERM", () => shutdownBroker(true));
+    process.on("SIGINT", () => shutdownBroker(true));
+
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("Sanctuary Secret Broker MCP server running (stdio)");
     return;
@@ -739,6 +820,7 @@ Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
+  SANCTUARY_RECOVERY_OUT            Init recovery-key plaintext output path
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
@@ -1033,6 +1115,7 @@ function printWrapHelpEarly(): void {
     sanctuary protect --claude-code    Protect Claude Code
     sanctuary protect --cursor         Protect Cursor
     sanctuary protect --cline          Protect Cline (VS Code extension)
+    sanctuary protect --mastra         Protect Mastra
     sanctuary protect --wrap <path>    Protect a specific MCP config file
     sanctuary protect --unwrap         Restore original config
 
@@ -1044,6 +1127,7 @@ function printWrapHelpEarly(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)

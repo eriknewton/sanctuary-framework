@@ -4,13 +4,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
-import { ReputationStore } from "../../src/l4-reputation/reputation-store.js";
-import { CommitmentStore, createCommitment } from "../../src/l3-disclosure/commitments.js";
-import { PrivacyPlaceholderVault } from "../../src/l2-operational/privacy-filter.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import { CommitmentStore, createCommitment } from "../../src/disclosure/commitments.js";
+import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { defaultConfig } from "../../src/config.js";
 import { fromBase64url } from "../../src/core/encoding.js";
@@ -154,6 +154,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     const verified = await verifyExitBundle(bundleDir);
     expect(verified.passed).toBe(true);
     expect(verified.reputation?.bundle_signature_valid).toBe(true);
+    expect(verified.reputation?.completeness).toBe("verified");
     expect(verified.reputation?.verified_attestations).toBe(1);
     expect(verified.audit?.individual_signatures_verified).toBe(false);
     expect(verified.unsupported_artifacts.join("\n")).toContain(

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { AuditLog, type AuditEntry } from "../../src/l2-operational/audit-log.js";
+import { AuditLog, type AuditEntry } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { runInboxCommand } from "../../src/cli/inbox.js";

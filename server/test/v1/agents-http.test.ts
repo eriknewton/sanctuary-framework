@@ -20,9 +20,9 @@ import { randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import type { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import type { IdentityManager } from "../../src/cognitive/tools.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { signOperatorPayload } from "../../src/v1/operator-signed.js";
 import { toBase64url, fromBase64url } from "../../src/core/encoding.js";

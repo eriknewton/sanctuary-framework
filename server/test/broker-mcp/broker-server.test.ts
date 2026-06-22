@@ -15,10 +15,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { Backend } from "../../src/l3-disclosure/broker/backend-interface.js";
-import { SecretNotFoundError } from "../../src/l3-disclosure/broker/backend-interface.js";
-import { Broker } from "../../src/l3-disclosure/broker/broker.js";
-import { AuditLog, BROKER_OPS } from "../../src/l2-operational/audit-log.js";
+import type { Backend } from "../../src/disclosure/broker/backend-interface.js";
+import { SecretNotFoundError } from "../../src/disclosure/broker/backend-interface.js";
+import { Broker } from "../../src/disclosure/broker/broker.js";
+import { AuditLog, BROKER_OPS } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createBrokerMcpServer } from "../../src/broker-mcp/broker-server.js";
@@ -232,23 +232,49 @@ describe("Broker MCP Server", () => {
   });
 
   describe("broker/audit_query", () => {
-    it("returns broker audit entries and never leaks secret values", async () => {
+    it("returns the allowlist-redacted view and leaks neither secret value, secret NAME, scope, ttl, reason, nor tenant", async () => {
       const { server } = await makeServer();
-      // Generate some audit activity first.
+      // Generate audit activity: a successful issue+read, and a DENIED request
+      // whose details (granted_scope, reason "scope_exceeds_grant") must not leak.
       const issue = await callTool(server, "broker/request_token", {
         skill: "gmail-triage",
         secret: "gmail_oauth",
       });
       const { token } = parseContent(issue);
       await callTool(server, "broker/read_secret", { token });
+      // Over-scope request → TOKEN_DENIED with reason "scope_exceeds_grant" +
+      // granted_scope "read" in its operator details.
+      await callTool(server, "broker/request_token", {
+        skill: "gmail-triage",
+        secret: "gmail_oauth",
+        scope: "rotate",
+      });
 
       const result = await callTool(server, "broker/audit_query", {});
       const body = parseContent(result);
       const ops = body.entries.map((e: { operation: string }) => e.operation);
       expect(ops).toContain(BROKER_OPS.TOKEN_ISSUED);
       expect(ops).toContain(BROKER_OPS.SECRET_READ);
+
+      // Every entry is the fixed allowlist view — no `details`, no identity.
+      for (const e of body.entries) {
+        expect(Object.keys(e).sort()).toEqual([
+          "has_details",
+          "operation",
+          "result",
+          "timestamp",
+        ]);
+      }
+
       const serialized = JSON.stringify(body);
+      // No secret value, no secret NAME, no scope/ttl/reason/tenant/audience.
       expect(serialized).not.toContain("SECRET-VALUE-XYZ");
+      expect(serialized).not.toContain("gmail_oauth"); // the secret NAME
+      expect(serialized).not.toContain("granted_scope");
+      expect(serialized).not.toContain("scope_exceeds_grant");
+      expect(serialized).not.toContain("ttl_seconds");
+      expect(serialized).not.toContain("tenant-alpha");
+      expect(serialized).not.toContain("sanctuary-broker"); // audience
     });
   });
 

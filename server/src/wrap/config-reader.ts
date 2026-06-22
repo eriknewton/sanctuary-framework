@@ -2,17 +2,18 @@
  * Sanctuary Wrap — Agent Config Reader
  *
  * Detects and reads MCP server configurations from various agent platforms.
- * Supports: OpenClaw, Claude Code, Cursor, Cline, and generic MCP config files.
+ * Supports: OpenClaw, Claude Code, Cursor, Cline, Mastra, and generic MCP config files.
  *
  * Security invariant: Never modifies configs without explicit request.
  * All original configs are backed up before any modification.
  */
 
-import { readFile, writeFile, mkdir, copyFile, access, realpath, open, lstat, unlink } from "node:fs/promises";
+import { mkdir, realpath, open, lstat, unlink } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import { detectHarnessSchema } from "./harness-schema.js";
 import { hermesConfigYamlPath } from "./hermes-yaml.js";
 
@@ -23,6 +24,7 @@ export type AgentPlatform =
   | "claude-code"
   | "cursor"
   | "hermes"
+  | "mastra"
   | "cline"
   | "generic";
 
@@ -144,6 +146,11 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
             "cline_mcp_settings.json"
           ),
     ],
+    "mastra": [
+      join(home, ".mastra", "mcp.json"),
+      join(home, "mastra", "mcp.json"),
+      join(home, ".config", "mastra", "mcp.json"),
+    ],
     "generic": [],
   };
 }
@@ -176,7 +183,8 @@ export async function backupConfig(configPath: string): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const extension = extname(configPath) || ".json";
   const backupPath = join(dir, `config-backup-${timestamp}${extension}`);
-  await copyFile(configPath, backupPath);
+  const data = await readFileCustody(configPath, { verifyPathIdentity: true });
+  await writeFileCustody(backupPath, data, { mode: 0o600, createParent: false });
   return backupPath;
 }
 
@@ -499,7 +507,7 @@ export async function mkdirSafeUnderRoot(
  * segment-by-segment instead of `mkdir(recursive)` following a link.
  */
 export async function restoreConfig(backupPath: string, targetPath: string): Promise<void> {
-  const data = await readFile(backupPath);
+  const data = await readFileCustody(backupPath, { verifyPathIdentity: true });
   await writeFileSafeUnderRoot(targetPath, data);
 }
 
@@ -804,7 +812,12 @@ export async function findLatestBackup(): Promise<{
     const metaPath = join(backupDir(), filename);
     let meta: Record<string, unknown>;
     try {
-      meta = JSON.parse(await readFile(metaPath, "utf-8"));
+      meta = JSON.parse(
+        await readFileCustody(metaPath, {
+          encoding: "utf-8",
+          verifyPathIdentity: true,
+        }),
+      );
     } catch {
       // Missing or unreadable — try the next candidate.
       continue;
@@ -832,7 +845,10 @@ export async function saveWrapMeta(meta: {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const metaPath = join(dir, WRAP_META_FILENAME);
-  await writeFile(metaPath, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  await writeFileCustody(metaPath, JSON.stringify(meta, null, 2), {
+    mode: 0o600,
+    createParent: false,
+  });
 }
 
 // ── Config Detection ────────────────────────────────────────────────
@@ -907,16 +923,20 @@ async function readConfigFileWithError(
   path: string,
   platform?: AgentPlatform
 ): Promise<{ config: AgentConfig | null; error?: string }> {
-  try {
-    await access(path);
-  } catch {
-    return { config: null }; // File doesn't exist — not an error, just not found
-  }
-
   let raw: string;
   try {
-    raw = await readFile(path, "utf-8");
+    raw = await readFileCustody(path, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
+    const code =
+      err instanceof Error && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      return { config: null }; // File doesn't exist — not an error, just not found
+    }
     return { config: null, error: `Cannot read file: ${(err as Error).message}` };
   }
 
@@ -1000,6 +1020,17 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
   // fields that `parseServerEntry` already understands.
   if (platform === "hermes") {
     const mcpServers = obj.mcp_servers as Record<string, unknown> | undefined;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (isCanonicalSanctuaryName(name)) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+
+  if (platform === "mastra") {
+    const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
         if (isCanonicalSanctuaryName(name)) continue;

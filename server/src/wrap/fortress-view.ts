@@ -418,11 +418,21 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
   <!-- Fortress View -->
   <div class="fortress-content" id="fortress-tab">
     <!-- Status Banner -->
+    <!--
+      Honest default (never-overclaim): the banner starts AMBER, not green. Green
+      ("Agent Protected") is reserved for the case where the Castle Wall
+      enforcement layer is PROVEN armed via the G4 posture signal
+      (/api/posture/castle-wall, arm_state === "armed"). Until that evidence
+      arrives (or if it reports unknown/degraded/unavailable), we render
+      "Wrapped, enforcement not confirmed" so the page can never claim the
+      enforcing layer is on while it is unproven. updateStatus() flips to green
+      only on confirmed-armed posture.
+    -->
     <div class="status-banner" id="status-banner">
-      <div class="status-indicator green" id="status-indicator">&#x2713;</div>
+      <div class="status-indicator amber" id="status-indicator">&#x26A0;</div>
       <div class="status-info">
-        <h2 id="status-title">Agent Protected</h2>
-        <p id="status-subtitle">${options.upstreamServerCount} server${options.upstreamServerCount !== 1 ? "s" : ""} monitored. All systems nominal.</p>
+        <h2 id="status-title">Wrapped, enforcement not confirmed</h2>
+        <p id="status-subtitle">${options.upstreamServerCount} server${options.upstreamServerCount !== 1 ? "s" : ""} monitored. Confirming Castle Wall enforcement&hellip;</p>
       </div>
       <div class="status-stats">
         <div class="stat">
@@ -490,6 +500,13 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     let blockedCalls = 0;
     let pendingApprovals = [];
     let upstreamServers = [];
+    // Castle Wall enforcement posture (G4 / /api/posture/castle-wall arm_state).
+    // Honest default is 'unknown': the page must not show green "protected"
+    // until this resolves to 'armed' from real enforcement evidence. Values:
+    // 'armed' (proven, green) | 'degraded' (present but not enforcing, red) |
+    // 'unknown' (unproven, amber) | 'not_installed' (amber) | 'unavailable'
+    // (posture endpoint unreachable/erroring, treated as unknown, amber).
+    let wallArmState = 'unknown';
 
     // ── SSE Connection ──────────────────────────────────────────────
     function connectSSE() {
@@ -689,6 +706,33 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       document.getElementById('stat-pending').textContent = pendingApprovals.length.toString();
     }
 
+    // ── Castle Wall enforcement posture (G4) ──────────────────────────
+    // Fetch the enforcement-evidenced arm state from the same posture signal
+    // the dashboard hero shield and /posture home consume. Green
+    // ("Agent Protected") is earned ONLY by arm_state === 'armed'; anything
+    // else (unknown / degraded / not_installed / unreachable) keeps the banner
+    // off-green so the page never claims protection the enforcing layer cannot
+    // prove (never-overclaim).
+    async function refreshWallPosture() {
+      try {
+        const resp = await fetch(API_BASE + '/api/posture/castle-wall', {
+          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          wallArmState = (data && typeof data.arm_state === 'string') ? data.arm_state : 'unknown';
+        } else {
+          // Posture endpoint reachable but not serving an armed verdict
+          // (e.g. 503 audit-locked, 404 on an older daemon): treat as
+          // unproven, not protected.
+          wallArmState = 'unavailable';
+        }
+      } catch {
+        wallArmState = 'unavailable';
+      }
+      updateStatus();
+    }
+
     function updateStatus() {
       const indicator = document.getElementById('status-indicator');
       const title = document.getElementById('status-title');
@@ -696,24 +740,45 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
 
       const hasErrors = upstreamServers.some(s => s.state === 'error');
       const hasPending = pendingApprovals.length > 0;
-      const hasBlocked = blockedCalls > 0;
+      const wallArmed = wallArmState === 'armed';
+      const wallDegraded = wallArmState === 'degraded';
 
       if (hasErrors) {
         indicator.className = 'status-indicator red';
         indicator.innerHTML = '&#x26A0;';
         title.textContent = 'Connection Issues';
         subtitle.textContent = 'One or more upstream servers have errors.';
+      } else if (wallDegraded) {
+        // The enforcement layer reported it is present but NOT enforcing
+        // (crashed / unbound / clobbered). This is a red state: traffic is not
+        // being filtered even though the agent is wrapped.
+        indicator.className = 'status-indicator red';
+        indicator.innerHTML = '&#x26A0;';
+        title.textContent = 'Enforcement not active';
+        subtitle.textContent = 'Castle Wall is not filtering traffic. Your agent is wrapped but not protected.';
       } else if (hasPending) {
         indicator.className = 'status-indicator amber';
         indicator.innerHTML = '&#x23F3;';
         title.textContent = 'Action Required';
         subtitle.textContent = pendingApprovals.length + ' operation' + (pendingApprovals.length > 1 ? 's' : '') + ' awaiting your approval.';
-      } else {
+      } else if (wallArmed) {
+        // Green is earned: Castle Wall posture proved 'armed' from fresh
+        // enforcement evidence. This preserves the legitimate green path the
+        // CW-POSTURE drill exercises.
         indicator.className = 'status-indicator green';
         indicator.innerHTML = '&#x2713;';
         title.textContent = 'Agent Protected';
         const serverCount = upstreamServers.filter(s => s.state === 'connected').length || ${options.upstreamServerCount};
-        subtitle.textContent = serverCount + ' server' + (serverCount !== 1 ? 's' : '') + ' monitored. All systems nominal.';
+        subtitle.textContent = serverCount + ' server' + (serverCount !== 1 ? 's' : '') + ' monitored. Castle Wall enforcing.';
+      } else {
+        // Enforcement is unproven (unknown / not_installed / posture
+        // unavailable). The agent is wrapped, but we cannot confirm the
+        // enforcing layer is on; render amber, never green.
+        indicator.className = 'status-indicator amber';
+        indicator.innerHTML = '&#x26A0;';
+        title.textContent = 'Wrapped, enforcement not confirmed';
+        const serverCount = upstreamServers.filter(s => s.state === 'connected').length || ${options.upstreamServerCount};
+        subtitle.textContent = serverCount + ' server' + (serverCount !== 1 ? 's' : '') + ' monitored. Castle Wall enforcement not confirmed.';
       }
     }
 
@@ -765,6 +830,12 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
           updateStats();
         }
       } catch {}
+
+      // Pull the Castle Wall enforcement posture before the first paint of the
+      // banner, so the page does not flash green/amber incorrectly. Then poll
+      // it on an interval so a wall that arms (or later degrades) is reflected.
+      await refreshWallPosture();
+      setInterval(refreshWallPosture, 15000);
 
       updateStatus();
       connectSSE();

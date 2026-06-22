@@ -18,7 +18,7 @@ import {
   CallbackApprovalChannel,
 } from "../../src/principal-policy/approval-channel.js";
 import type { PrincipalPolicy, ApprovalRequest } from "../../src/principal-policy/types.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
@@ -168,6 +168,77 @@ describe("Approval Gate", () => {
         expect(result.allowed).toBe(false);
         expect(result.approval_required).toBe(true);
       }
+    });
+
+    it("gates audit_export_siem at Tier 1 — a cooperative agent cannot bulk-export audit without operator approval (CISO MED-1)", async () => {
+      // The SIEM export decrypts audit events across ALL principals, each
+      // carrying its policy tier + approve/deny decision — a policy-inference
+      // oracle. It must require operator approval, not auto-allow to the agent.
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain("audit_export_siem");
+      expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("audit_export_siem");
+
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("audit_export_siem", { format: "cef" });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+    });
+
+    it("gates compliance_generate_eu_ai_act_bundle at Tier 1 — a cooperative agent cannot self-generate a compliance bundle without operator approval (CISO NEW-1)", async () => {
+      // The generated bundle body embeds the verbatim Tier-2 anomaly policy
+      // (e.g. frequency_spike_multiplier), the approval-channel timeout, and
+      // audit-derived aggregate gate-decision counts — the same policy-inference
+      // leak class as audit_export_siem, a different door. It is also a
+      // governance conflict of interest: an agent must not self-generate its own
+      // compliance attestation. So it must require operator approval, never
+      // auto-allow to the agent.
+      expect(DEFAULT_POLICY.tier1_always_approve).toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+      expect(DEFAULT_POLICY.tier3_always_allow).not.toContain(
+        "compliance_generate_eu_ai_act_bundle"
+      );
+
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(DEFAULT_POLICY, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("compliance_generate_eu_ai_act_bundle", {
+        agent_did: "did:key:zExampleAgent",
+      });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
+    });
+
+    it("forces memory_delete to Tier 1 even if a hand-built policy lists it as Tier 3", async () => {
+      const policy = createTestPolicy({
+        tier1_always_approve: [],
+        tier3_always_allow: ["memory_delete"],
+      });
+      const channel = new CallbackApprovalChannel(async () => ({
+        decision: "deny",
+        decided_at: new Date().toISOString(),
+        decided_by: "human",
+      }));
+      const gate = new ApprovalGate(policy, baseline, channel, auditLog);
+
+      const result = await gate.evaluate("memory_delete", { passage_id: "p1" });
+
+      expect(result.tier).toBe(1);
+      expect(result.allowed).toBe(false);
+      expect(result.approval_required).toBe(true);
     });
   });
 

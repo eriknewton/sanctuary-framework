@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.4.0] - 2026-06-15
+
+Minor release. The published `latest` (1.3.3, 2026-05-26) is roughly three weeks behind `main`, which has accumulated a large body of feature, hardening, and fix work since the v1.3.2 git tag. This release brings `latest` back in line with `main` and reconciles the version story: there is no separate v1.3.3 git tag, and the feature weight here is a semver minor bump.
+
+The headline since 1.3.3 is the macOS Castle Wall enforcement proof, a wave of Sentinel and audit-surface hardening that closes agent-facing policy-inference and self-attestation leaks, the agent-native cooperative surface, the Sovereign Data Workspace storage spine, federation v1 plumbing, signed transparency checkpoints with opt-in external-anchoring scaffolding, and the operator custody and distress-channel mechanisms. This section groups the work; per-PR detail is in the git history from the v1.3.2 tag through `main`.
+
+### Added
+
+- **Castle Wall macOS: per-uid allow/deny egress-enforcement demonstration.** The signed system extension and content-filter provider now have a clean allow/deny demo captured on a real host (Mini1, macOS Tahoe 26.5.1, system extension v716; drill 2026-06-11). Agent egress to a non-allowlisted address is blocked, agent egress to an allowlisted hostname is allowed, and operator egress is unaffected, across armed cycles with graceful disarm and dead-man fail-open. This promotes the macOS egress row in `ASSURANCE_MATRIX.md` from `partial` to `proven`. Supporting work: IP/CIDR rule matcher with auto-derived scoped DNS allow (#464), headless arm/disarm verbs `sanctuary castle-wall enable|disable` routed through LaunchServices for Tahoe (#448, #462), provider-side dead-man lease for wedge-proof headless disarm (#471), live content-filter state in `sanctuary castle-wall status` (#456), operator-differential baseline-allow with a signed descriptor (#374), and an operator override plus `audit-findings` verb for a broken audit chain (#461).
+- **Castle Wall macOS hostile-guest containment (Apple Containerization box).** The trusted launcher applies seccomp-deny-AF_VSOCK inner-confinement to uncooperative plugins; the vminitd escape reproduced without the jail is shut with it (drill N=3/3, 2026-06-09). A static-binary jail-delivery path for python-less guest images is built and unit/CI-verified but has not yet run its own box drill (#443, #441, #439, #376). This is one inner-confinement layer, not full plugin isolation.
+- **Agent-native cooperative surface.** A safety base (gate verify-mode, preflight, opaque-handle ownership) plus a cooperative surface of verbs, help, introspection, compound operations, events, and audit search for agents operating their own fortress (#417, #419).
+- **Sovereign Data Workspace (SDW).** Storage spine with an enforced write gate that cannot persist secrets, Phase 2 stores (working-state, query-history, document-corpus), approval-bound export/import with a signed ciphertext-inventory manifest, blind plaintext query-history timestamping, provenance-derived taint propagation, and a memory-backend adapter contract (#420, #421, #449, #440, #438, #484).
+- **Federation v1 foundation.** A `/v1` node skeleton with session ceremony, enable/disable/status verbs, durable operator attestations, agent protect/unprotect endpoints, node sync plumbing, and a cross-machine sync plus identity-portability demo (#445, #457, #465, #466, #507).
+- **Verifiable transparency checkpoints.** Signed enforcement-evidence checkpoints with a standalone offline verifier (#451). The `proven` row in `ASSURANCE_MATRIX.md` covers the format and verifier properties only; that row records no hosted transparency log and no external anchoring as part of the proven claim, and publishing remains a manual operator action. An opt-in external-anchoring path to Sigstore Rekor (salted-hash-only, fail-loud) and auditor-side anchor verification are present in code (#487, #489) but are not part of the proven trust claim.
+- **Operator custody and recovery.** One-master-per-fortress establishment with a two-factor floor and no silent lockout-key generators, journaled two-phase master rotation that re-keys the whole fortress under an epoch-scoped audit chain, and anti-rollback epoch anchoring with a Rekor counter-floor cross-check (#496, #501, #506, #512).
+- **Habeas distress channel.** A reserved guaranteed-egress distress port with a local listener and a CLI verb, with Linux conflict-gate parity. The operator-trust limit is documented honestly: the writ is filed with the jailer (#497, #500, #503).
+- **Anomaly detectors (Sentinels).** Credential-use-sequence and cross-agent-distribution detectors, a time-of-day-conditioned baseline detector, and root-cause hints derived from feature contributions (#483, #490, #495).
+- **Operator and workload mechanisms.** Wave 1.5 operator CLI verbs (`doctor`, `completion`, audit search, generate-systemd), a split-process Tier-A supervised protect mode, undeclared-workload detection (live versus declared), host attestation with a registry projection, a plugin vendor-contract surface, a sovereignty-posture dashboard home, and an exit-machinery slice for memory-class minting under explicit consent (#433, #509, #513, #514, #508, #505, #515).
+
+### Security
+
+- **Agent-facing audit redaction inverted from denylist to allowlist.** Agent-facing audit, read, and search surfaces now expose only an explicit allowlist of fields, closing several policy-inference and self-attestation leaks that a denylist had let through (#573, #570).
+- **Sentinel re-tiering closes self-attestation and policy-inference leaks.** `compliance_generate_eu_ai_act_bundle` and `audit_export_siem` move from Tier-3 to Tier-1 (operator approval required), and policy-read tools require approval, closing agent self-approval and policy-leak paths (#577, #575, #413, #414, #416, #418).
+- **Approval-path hardening.** Approval decisions require an operator token even on loopback auto-auth, legacy dashboard approval buttons POST through the token gate, and redirect-inbox approval is bound to the request args to close an amplification path (#525, #526, #521).
+- **At-rest and crypto hardening.** The state version-anchor is authenticated against in-place tampering, audit-log rotation is authenticated with a MAC'd checkpoint, keychain writes deliver the secret via stdin rather than argv, underscore-prefixed namespaces are treated as internal-only, derived namespace keys are zeroed on eviction, and secure-delete passes are fsynced (#394, #396, #392, #393, #522).
+- **Audit producer authenticity.** Audit readers re-verify the producer signature rather than trusting a marker, with Linux daemon enforcement-event signing and producer-key provisioning (#517, #518, #520, #437).
+- **Boundary and transport hardening.** Bridge verify/attest authentication with canonicalization byte-parity, did:web SSRF defense-in-depth, mesh counter monotonicity that fails closed on rollback, recursive nested-field context-gate filtering, and dependency CVE patches (#412, #434, #409, #388, #524, #519).
+
+### Fixed
+
+- **Castle Wall macOS operability.** A re-encoded-rule-bytes digest mismatch that could cut the operator on Tahoe is fixed by digesting the delivered rule bytes (#479); the system-extension update path now version-stamps and re-activates on launch (#480); the build fails loud if the sysext bundle is unnotarized (#481); IPC reconnect, fortress-coherent pinned-key paths, provider dispatch, and connection preservation are repaired (#367, #368, #369, #459); and the headless arm/disarm dead-man lever survives a flaky post-change verify (#467, #469).
+- **Exit and migration.** Exit-bundle re-key happens under envelope custody with no credentials travelling and fail-closed import (#499), `--import-state` is rejected without source credentials (#382), and `sanctuary wrap` does read-both/write-new migration for legacy on-disk filenames (#446).
+- **Wrap install-path hardening.** The Claude Code allowlist install sink is re-hardened against symlink redirection, and a Hermes `config.yaml` MCP-injection path plus a non-write-free `--dry-run` are fixed (#492, #493).
+- **Reputation and policy.** Reputation tiers resolve by DID rather than instance ID and fail closed on non-finite metrics and unknown tiers (#383, #390); anomaly baselines commit only on approval to prevent poisoning (#411); and secrets are redacted from the approval context (#384).
+
+### Changed
+
+- **Vocabulary and layer-naming cleanup.** The deprecated `cocoon` internals and CLI alias are retired with a repo-wide vocabulary gate, and the L1-L4 layer numbering is dropped in favor of the named layers (#444, #458, #510).
+- **Concordia sidecar bumped to 0.6.0** with the composition version pin updated (#566).
+
+### Docs
+
+- **Professionalization and onboarding.** A `server/src` module map, a frozen-surface reorg manifest, documentation conventions with a forward rule, sharpened MCP tool descriptions for the AI-agent audience, and pre-outreach repo hygiene (`SECURITY.md`, badges, SBOM, coverage tooling) (#529, #535, #538, #539, #579).
+- **Honest-state doc reconciliation.** The macOS egress assurance row moved to `proven` with the 2026-06-11 drill evidence in-repo (#486), stale ROADMAP and architecture numbers were refreshed, and the habeas operator-trust limit is stated plainly.
+
+Full release notes: [docs/releases/v1.4.0.md](docs/releases/v1.4.0.md).
+
 ## [1.3.3] - 2026-05-26
 
 Castle Wall macOS Phase 2.5 retail UX + Track 4A IPC integration + Track 4A.2 sysext socket-path discovery. The macOS host app gains agent detection (Track 1 AgentDetector covers OpenClaw, Claude Desktop, Claude Code, Codex CLI, Hermes, Cursor, Cline), a tabbed protect/unprotect UI (Track 2), first-run welcome screen with batch protect (Track 3), plain-English activity log (Track 4B), and vocabulary normalization to `protected` across CLI + dashboard surfaces (Track 4C). Track 4A wires the Castle Wall server-side IPC daemon into `sanctuary wrap` startup so the daemon binds its UDS socket fortress-scoped, with three new CLI verbs (`sanctuary castle-wall reload`, `audit-dump`, `approve`) and auto-bootstrap of `provision-pin` at `sanctuary init`. Track 4A.2 closes the path-agreement gap between daemon and sysext via a shared discovery file at `/tmp/sanctuary-castle-active.json` with atomic-write semantics and PID-liveness checks on both sides.

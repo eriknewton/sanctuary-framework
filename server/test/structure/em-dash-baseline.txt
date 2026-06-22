@@ -1,0 +1,260 @@
+# Em-dash ratchet baseline (DoE review C-1, the no-em-dash rule).
+#
+# The no-em-dash rule (CLAUDE.md, 2026-04-21): ZERO em-dashes (—, U+2014) in
+# public-facing artifacts. This file pins the CURRENT per-file em-dash count
+# across the guard's scope so the guard is a FAIL-ON-NEW ratchet:
+#
+#   - Adding an em-dash to ANY in-scope file (count exceeds its baseline, or a
+#     file not listed here gains one) -> the em-dash guard reds.
+#   - REMOVING em-dashes is always allowed; when a file drops to 0 the guard
+#     tells you to delete its row here so the ratchet tightens permanently.
+#
+# SCOPE (mirrors public-surface.ts, used by em-dash.test.ts): public root docs
+# (README*, CHANGELOG*, ROADMAP.md, SANCTUARY_ARCHITECTURE.md,
+# sanctuary_framework.md), the public text subtrees (docs/, announcements/,
+# examples/, quickstart/, rfcs/), package metadata + the plugin manifest, and
+# every tracked server/src TS file scanned CODE-ONLY (comments/JSDoc stripped —
+# the rule exempts code comments).
+#
+# TODO (no-em-dash debt): drive these counts to 0 in dedicated prose-cleanup
+# PRs (NOT mixed with code changes), then delete this file and flip the guard to
+# a hard "zero em-dashes anywhere in scope" assertion. Each row removed is debt
+# retired.
+#
+# DO NOT hand-edit to raise a count. Regenerate ONLY via
+#   npx tsx test/structure/gen-em-dash-baseline.ts
+# (from server/) after a legitimate scope change or a prose-cleanup reduction.
+#
+# Format: one row per file with at least one em-dash, "<count>\t<repo-relative-path>",
+# sorted by path. Lines starting with '#' and blank lines are ignored.
+#
+4	.github/ISSUE_TEMPLATE/implementation-experience.yml
+6	.github/ISSUE_TEMPLATE/specification-feedback.yml
+1	CHANGELOG.md
+3	CODE_OF_CONDUCT.md
+1	GOVERNANCE.md
+51	SANCTUARY_ARCHITECTURE.md
+31	announcements/blog-post.md
+3	announcements/hackernews-submission.md
+9	announcements/linkedin-post.md
+8	announcements/x-twitter-thread.md
+4	castle-wall-vmm/README.md
+2	docs/DID_ENCODING.md
+4	docs/MIGRATION_v0.3_to_v0.4.md
+45	docs/OWASP_AGENTIC_AI.md
+23	docs/SHR_SPEC.md
+7	docs/assets/css/site.css
+46	docs/audit/BUG_REPORT.md
+14	docs/audit/DELTA_REVIEW_REPORT.md
+4	docs/audit/KNOWN_ISSUES.md
+23	docs/audit/MERGE_GATE_REPORT.md
+70	docs/audit/REMEDIATION_PLAN.md
+80	docs/audit/SECURITY_AUDIT.md
+8	docs/audit/SPRINT_CONTRACT.md
+226	docs/audit/SPRINT_EVAL.md
+3	docs/audit/SPRINT_RESULT.md
+26	docs/audit/branch-protection-setup.md
+10	docs/audit/commit-4ac95830-postmortem.md
+16	docs/audit/test-baseline-hardening-plan.md
+29	docs/compliance/eu_ai_act_bundle.md
+108	docs/compliance/eu_ai_act_coverage_matrix_v1.md
+22	docs/habeas-port.md
+7	docs/releases/v1.3.2.md
+42	docs/research/RESEARCH_ZK_UPGRADE_L3.md
+67	examples/eu_ai_act_bundle_example/01_annex_iv_technical_documentation.md
+29	examples/eu_ai_act_bundle_example/02_article_26_deployer_log.md
+15	examples/eu_ai_act_bundle_example/03_article_12_automatic_logs.md
+32	examples/eu_ai_act_bundle_example/04_risk_management_summary.md
+15	examples/eu_ai_act_bundle_example/05_human_oversight_statement.md
+6	examples/eu_ai_act_bundle_example/06_cryptographic_attestations.md
+6	examples/eu_ai_act_bundle_example/07_annex_iii_classification.md
+10	examples/eu_ai_act_bundle_example/README.md
+4	integrations/crewai/README.md
+7	integrations/langchain/README.md
+14	integrations/ping-identity/README.md
+1	plugin/.claude-plugin/plugin.json
+23	plugin/skills/sanctuary/SKILL.md
+4	quickstart/README.md
+40	rfcs/RFC-0001-sanctuary-mcp-server.md
+8	rfcs/RFC-0002-principal-policy-operational-approval.md
+163	sanctuary_framework.md
+1	scripts/synthetic-coverage/fixtures/castle-wall/guest-jail-confinement.ts
+2	server/docs/auditor-runbook.md
+4	server/docs/castle-wall-headless-arm-design.md
+4	server/docs/castle-wall-macos-boot-service.md
+3	server/docs/federation-protocol-v0.1-spec.md
+9	server/docs/federation-v0.1-hard-gate-walkthrough.md
+13	server/docs/keychain-schema.md
+15	server/docs/multi-tenancy.md
+14	server/docs/query-anonymity-tiers.md
+8	server/docs/test-concurrency-discipline.md
+8	server/docs/test-port-discipline.md
+3	server/docs/transparency-checkpoints.md
+2	server/electron/README.md
+2	server/examples/dashboard-example.mjs
+2	server/scripts/test-port-discipline.ts
+2	server/scripts/three-mode-drill/node.ts
+1	server/src/agent-contract/adapters/claude-code.ts
+2	server/src/agent-contract/adapters/cline.ts
+1	server/src/agent-contract/adapters/mastra.ts
+10	server/src/agent-contract/adapters/tier-b-sdk.ts
+2	server/src/agent-contract/capability-enforcer.ts
+6	server/src/agent-contract/errors.ts
+3	server/src/agent-contract/identity-bind.ts
+1	server/src/agent-contract/lifecycle.ts
+4	server/src/agent-contract/schema.ts
+6	server/src/agent-native/cooperative-surface.ts
+12	server/src/audit/analyzer.ts
+2	server/src/audit/detector.ts
+2	server/src/audit/reset-history.ts
+1	server/src/audit/siem-formatter.ts
+2	server/src/audit/siem-tools.ts
+1	server/src/audit/tools.ts
+3	server/src/bridge/bridge.ts
+1	server/src/bridge/tools.ts
+1	server/src/broker-mcp/broker-server.ts
+8	server/src/castle-wall/allowlist/habeas-port.ts
+2	server/src/castle-wall/allowlist/schema.ts
+1	server/src/castle-wall/boot/boot-token.ts
+1	server/src/castle-wall/runtime/helper-signer.ts
+1	server/src/castle-wall/runtime/lifecycle.ts
+17	server/src/castle-wall/runtime/macos-daemon.ts
+1	server/src/castle-wall/runtime/macos-flow-events.ts
+6	server/src/castle-wall/runtime/macos-ipc-listener.ts
+2	server/src/castle-wall/runtime/producer-signature.ts
+1	server/src/cli/agents/cli.ts
+12	server/src/cli/castle-wall-boot.ts
+1	server/src/cli/did-web.ts
+2	server/src/cli/distress.ts
+2	server/src/cli/federation.ts
+1	server/src/cli/nodes.ts
+2	server/src/cli/restore-attest.ts
+2	server/src/cli/rotate-master.ts
+4	server/src/cli/secrets.ts
+1	server/src/cli/sentinel.ts
+2	server/src/cli/transparency.ts
+3	server/src/cognitive/memory-attest.ts
+13	server/src/compliance/eu_ai_act/annex_iii.ts
+4	server/src/compliance/eu_ai_act/cli.ts
+35	server/src/compliance/eu_ai_act/coverage_matrix.ts
+16	server/src/compliance/eu_ai_act/generator.ts
+11	server/src/compliance/eu_ai_act/pdf.ts
+9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
+7	server/src/compliance/eu_ai_act/templates/02_article_26_deployer_log.ts
+1	server/src/compliance/eu_ai_act/templates/03_article_12_automatic_logs.ts
+5	server/src/compliance/eu_ai_act/templates/04_risk_management_summary.ts
+2	server/src/compliance/eu_ai_act/templates/05_human_oversight_statement.ts
+6	server/src/compliance/eu_ai_act/templates/06_cryptographic_attestations.ts
+3	server/src/compliance/eu_ai_act/templates/07_annex_iii_classification.ts
+4	server/src/compliance/eu_ai_act/templates/08_delta.ts
+5	server/src/compliance/eu_ai_act/templates/shared.ts
+1	server/src/config.ts
+37	server/src/core/anti-rollback.ts
+1	server/src/core/identity.ts
+34	server/src/core/master-custody.ts
+19	server/src/core/master-rotation.ts
+15	server/src/dashboard-standalone.ts
+8	server/src/dashboard/aggregator.ts
+1	server/src/dashboard/api.ts
+1	server/src/dashboard/html.ts
+5	server/src/dashboard/multi-html.ts
+2	server/src/disclosure/broker/backend-interface.ts
+3	server/src/disclosure/broker/keychain-backend.ts
+4	server/src/disclosure/broker/open.ts
+2	server/src/disclosure/policies.ts
+1	server/src/disclosure/tools.ts
+2	server/src/disclosure/zk-proofs.ts
+1	server/src/distress/config.ts
+3	server/src/distress/listener.ts
+1	server/src/distress/local-secret.ts
+5	server/src/distress/tools.ts
+2	server/src/exit/cli.ts
+4	server/src/federation/registry.ts
+2	server/src/federation/tools.ts
+4	server/src/handshake/protocol.ts
+5	server/src/handshake/tools.ts
+22	server/src/index.ts
+2	server/src/intelligence/selector.ts
+1	server/src/intelligence/substrates/local.ts
+9	server/src/mesh/audit-batch.ts
+4	server/src/mesh/envelope.ts
+10	server/src/mesh/failure-modes/detector.ts
+1	server/src/mesh/guardian/errors.ts
+1	server/src/mesh/guardian/guardian-roster.ts
+5	server/src/mesh/guardian/master-rotation.ts
+1	server/src/mesh/in-memory-transport.ts
+1	server/src/mesh/libp2p-transport/peer-id.ts
+6	server/src/mesh/libp2p-transport/transport.ts
+1	server/src/mesh/lifecycle/bootstrap-token.ts
+3	server/src/mesh/lifecycle/counters.ts
+13	server/src/mesh/lifecycle/file-stores.ts
+12	server/src/mesh/lifecycle/mesh-node.ts
+2	server/src/mesh/lifecycle/node-key-binding.ts
+2	server/src/mesh/recovery-flows/canonical-audit-promotion.ts
+2	server/src/mesh/recovery-flows/device-recovery.ts
+1	server/src/mesh/recovery-flows/master-rotation.ts
+7	server/src/mesh/trust-root.ts
+25	server/src/operational/audit-log.ts
+4	server/src/operational/call-governor.ts
+1	server/src/operational/context-gate-enforcer.ts
+4	server/src/operational/context-gate-recommend.ts
+7	server/src/operational/context-gate-tools.ts
+2	server/src/operational/context-gate.ts
+4	server/src/operational/governor-tools.ts
+1	server/src/operational/hardening-tools.ts
+5	server/src/policy-engine/auto-trigger-ladder.ts
+4	server/src/policy-engine/canonical-policy.ts
+1	server/src/policy-engine/commitment-boundary.ts
+1	server/src/policy-engine/null-policy.ts
+4	server/src/principal-policy/approval-channel.ts
+47	server/src/principal-policy/dashboard-html.ts
+10	server/src/principal-policy/dashboard.ts
+5	server/src/principal-policy/gate.ts
+2	server/src/principal-policy/loader.ts
+3	server/src/principal-policy/posture-home-html.ts
+2	server/src/principal-policy/tools.ts
+1	server/src/principal-policy/webhook.ts
+2	server/src/proxy/client-manager.ts
+2	server/src/proxy/proxy-router.ts
+3	server/src/reputation/reputation-store.ts
+6	server/src/sanctuary-tools.ts
+4	server/src/sdw/export.ts
+5	server/src/sdw/import.ts
+2	server/src/sdw/lmdb-backend.ts
+10	server/src/sdw/tools.ts
+1	server/src/sdw/write-gate.ts
+8	server/src/security/injection-detector.ts
+4	server/src/sentinel/sentinels/suspicious-tool-call-detector.ts
+1	server/src/shr/decommission-generator.ts
+1	server/src/shr/decommission-verifier.ts
+12	server/src/shr/gateway-adapter.ts
+6	server/src/shr/generator.ts
+4	server/src/shr/verifier.ts
+3	server/src/storage/filesystem.ts
+2	server/src/substrate/governance.ts
+1	server/src/substrate/manifest.ts
+1	server/src/substrate/strict-json.ts
+2	server/src/substrate/verdict.ts
+3	server/src/supervisor/spawn-launcher.ts
+2	server/src/supervisor/supervisor.ts
+12	server/src/system-prompt-generator.ts
+2	server/src/templates/cli.ts
+5	server/src/transparency/anchoring.ts
+2	server/src/transparency/checkpoint.ts
+4	server/src/transparency/emitter.ts
+3	server/src/transparency/verify.ts
+1	server/src/update-check.ts
+6	server/src/v1/agents.ts
+10	server/src/v1/federation.ts
+1	server/src/v1/operator-signed.ts
+10	server/src/workload-lifecycle/host-attestation.ts
+8	server/src/workload-lifecycle/payload.ts
+3	server/src/workload-lifecycle/undeclared-finding.ts
+24	server/src/wrap/config-reader.ts
+2	server/src/wrap/custody-flow.ts
+1	server/src/wrap/fortress-view.ts
+3	server/src/wrap/hermes-yaml.ts
+8	server/src/wrap/init.ts
+1	server/src/wrap/keychain-custody.ts
+1	server/src/wrap/passphrase.ts
+1	server/src/wrap/recovery-key-disclosure.ts

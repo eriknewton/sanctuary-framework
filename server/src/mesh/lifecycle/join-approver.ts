@@ -32,6 +32,7 @@ export function issueCertificateForApprovedJoin(params: {
   issuing_principal_cert: PrincipalCertificate;
   issuing_principal_private_key: Uint8Array;
   master_private_key?: Uint8Array;
+  expires_at?: string;
 }) {
   return issueNodeIdentityCertificate({
     node_id: params.request.bootstrap_token.intended_node_id,
@@ -45,6 +46,7 @@ export function issueCertificateForApprovedJoin(params: {
       principal_pubkey: params.issuing_principal_cert.principal_pubkey,
     },
     principal_private_key: params.issuing_principal_private_key,
+    expires_at: params.expires_at,
     tee_attestation_hash: params.request.attestation,
     master_private_key: params.master_private_key,
   });

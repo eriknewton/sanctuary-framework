@@ -685,6 +685,22 @@ describe("InjectionDetector", () => {
 
       expect(elapsed).toBeLessThan(20); // More generous for large structures
     });
+
+    it("does not backtrack on email-shaped input with no terminator", { retry: 3 }, () => {
+      const pathological = `${"a".repeat(5000)}@${"b".repeat(5000)}`;
+
+      const start = performance.now();
+      const result = detector.scan("test/tool", { message: pathological });
+      const elapsed = performance.now() - start;
+
+      expect(elapsed).toBeLessThan(50);
+      expect(result).toBeDefined();
+      expect(
+        result.signals.some(
+          (s) => s.type === "data_exfiltration" && s.pattern === "email_in_string",
+        ),
+      ).toBe(false);
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────

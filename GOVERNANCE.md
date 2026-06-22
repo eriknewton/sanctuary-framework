@@ -15,7 +15,7 @@ Bug fixes, documentation improvements, test additions, dependency updates.
 
 - **Review:** 1 maintainer approval
 - **SLA:** 72 hours
-- **Merge criteria:** All tests pass (1071+ tests), no breaking changes
+- **Merge criteria:** The full test suite (thousands of tests across hundreds of files) passes on every PR via the test-baseline guard in CI; no breaking changes. The enforced minimum is tracked in `.test-baseline` at the repo root.
 
 ### Tier 2: Feature Additions
 New MCP tools within existing layers, new integrations, adapter implementations.

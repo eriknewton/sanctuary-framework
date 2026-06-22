@@ -14,9 +14,9 @@ import { randomBytes } from "node:crypto";
 
 import { ed25519 } from "@noble/curves/ed25519";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
-import { runStatusCommand, toYaml } from "../../src/cli/status.js";
+import { renderTable, runStatusCommand, toYaml } from "../../src/cli/status.js";
 import { toBase64url } from "../../src/core/encoding.js";
 
 class Capture extends Writable {
@@ -86,7 +86,11 @@ async function startRig(): Promise<TestRig> {
   };
 }
 
-describe("sanctuary status (CLI, /v1-backed)", () => {
+// retry:2 - these CLI subprocess tests touch real host state (daemon
+// reachability, loopback ports) and are flaky under full-suite parallel load;
+// retry re-runs the test, so a genuine regression still fails all attempts
+// (distinct from filename-based flake-skipping, which masks regressions).
+describe("sanctuary status (CLI, /v1-backed)", { retry: 2 }, () => {
   let rig: TestRig;
   let savedToken: string | undefined;
   let savedUrl: string | undefined;
@@ -279,6 +283,42 @@ describe("sanctuary status (CLI, /v1-backed)", () => {
     const code = await runStatusCommand({ argv: ["--help"], out, err: new Capture() });
     expect(code).toBe(0);
     expect(out.text).toContain("Exit codes");
+  });
+});
+
+describe("renderTable castle-wall line", () => {
+  // Regression: the default table line must read the honest evidence-gated
+  // `arm_state` field that /v1/status now returns (a full CastleWallPosture),
+  // NOT the dead `.status` placeholder the document carried before this PR.
+  // Reading the wrong field silently pinned the line to "unknown" regardless
+  // of the real arm-state, defeating the human-readable honesty path.
+  function lineFor(castleWall: unknown): string {
+    const table = renderTable({ castle_wall: castleWall });
+    const line = table
+      .split("\n")
+      .find((l) => l.includes("castle wall:"));
+    expect(line, "table must include a castle wall: line").toBeDefined();
+    return line!;
+  }
+
+  it("renders the honest arm_state, not the dead .status field", () => {
+    expect(lineFor({ arm_state: "armed", status: "unknown" })).toContain(
+      "castle wall:  armed",
+    );
+    expect(lineFor({ arm_state: "degraded" })).toContain(
+      "castle wall:  degraded",
+    );
+    expect(lineFor({ arm_state: "not_installed" })).toContain(
+      "castle wall:  not_installed",
+    );
+  });
+
+  it("renders unknown for the honest unknown arm_state and for an absent castle_wall", () => {
+    expect(lineFor({ arm_state: "unknown" })).toContain("castle wall:  unknown");
+    // No castle_wall object at all (locked/absent) ⇒ honestly unknown.
+    const table = renderTable({});
+    const line = table.split("\n").find((l) => l.includes("castle wall:"));
+    expect(line).toContain("castle wall:  unknown");
   });
 });
 

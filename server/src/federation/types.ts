@@ -16,8 +16,8 @@
  */
 
 import type { HandshakeResult } from "../handshake/types.js";
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
-import type { ReputationBundle } from "../l4-reputation/reputation-store.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
+import type { ReputationBundle } from "../reputation/reputation-store.js";
 
 // ── Federation Peer ─────────────────────────────────────────────────────
 

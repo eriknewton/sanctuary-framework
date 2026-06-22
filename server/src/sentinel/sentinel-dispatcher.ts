@@ -21,7 +21,7 @@
 
 import { randomUUID } from "node:crypto";
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { Sentinel } from "./sentinel.js";
 import type { SentinelRegistry } from "./sentinel-registry.js";
 import type { SentinelFindingStore } from "./sentinel-finding-store.js";

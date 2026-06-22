@@ -38,7 +38,7 @@ import type { IpcTransport } from "../../../src/castle-wall/runtime/ipc-client.j
 import { createIdentity } from "../../../src/core/identity.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../../src/core/random.js";
-import { AuditLog } from "../../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import {

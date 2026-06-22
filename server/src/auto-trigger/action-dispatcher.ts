@@ -23,7 +23,7 @@
  * fortresses; no outbound surface. `notify_operator` is server-local.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { SentinelFinding } from "../sentinel/types.js";
 
 import {

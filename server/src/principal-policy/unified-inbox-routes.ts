@@ -22,6 +22,7 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
+import { sendCaughtError } from "../http/error-envelope.js";
 import {
   UnifiedInboxBridge,
   type InboxQuery,
@@ -51,7 +52,7 @@ export interface UnifiedInboxRouterDeps {
   retentionPolicy?: UnifiedInboxRetentionPolicy;
   retentionPolicyStore?: UnifiedInboxRetentionPolicyStore;
   prefsStore?: UnifiedInboxPrefsStore;
-  auditLog?: import("../l2-operational/audit-log.js").AuditLog;
+  auditLog?: import("../operational/audit-log.js").AuditLog;
   identityId?: string;
   fortressId?: string;
 }
@@ -428,8 +429,10 @@ export async function handleUnifiedInboxRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "unified-inbox",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

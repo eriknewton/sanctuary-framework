@@ -10,10 +10,10 @@ import { access, readFile as fsReadFile, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { AuditLog } from "../l2-operational/audit-log.js";
-import { StateStore } from "../l1-cognitive/state-store.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
-import { ReputationStore } from "../l4-reputation/reputation-store.js";
+import { AuditLog } from "../operational/audit-log.js";
+import { StateStore } from "../cognitive/state-store.js";
+import { IdentityManager } from "../cognitive/tools.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
@@ -163,7 +163,7 @@ Usage: sanctuary exit <command> [options]
 
 Commands:
   export --out <dir>          Create a SANCTUARY_EXIT_BUNDLE_V1 directory
-  verify <dir>                Verify manifest, audit receipts, and reputation bundle
+  verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
 
@@ -320,6 +320,10 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(
             out,
             `reputation: ${result.reputation.verified_attestations}/${result.reputation.attestation_count} attestations verified\n`
+          );
+          write(
+            out,
+            `reputation completeness: ${result.reputation.completeness}\n`
           );
         }
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);

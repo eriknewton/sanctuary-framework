@@ -49,7 +49,7 @@ import { randomBytes } from "node:crypto";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import { INTEL_OPS } from "./audit-events.js";
 import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRADEOFF_KEYS, LOCAL_MODEL_LABELS } from "./templates.js";
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";
@@ -123,6 +123,11 @@ const RECENT_FAILURES_WINDOW_MS = 24 * 60 * 60 * 1000;
  * into the transparency UI. The L2 audit log retains the full context.
  */
 const FAILURE_SNIPPET_MAX_LEN = 200;
+const FALLBACK_CHAIN = ["local", "venice", "frontier-with-filter"] as const;
+
+type InvocationMethod = "summarize" | "classify" | "redact";
+type SubstrateInvoker = (arg: SummarizeRequest | ClassifyRequest | RedactRequest) => Promise<SubstrateResponse>;
+type FallbackTaken = IntelligenceSubstrateFailurePayload["fallback_taken"];
 
 /**
  * Identity redactor used as the default for the frontier-with-filter
@@ -653,35 +658,60 @@ export class SubstrateSelector {
 
   private async invoke(
     surface: Surface,
-    method: "summarize" | "classify" | "redact",
+    method: InvocationMethod,
     req: SummarizeRequest | ClassifyRequest | RedactRequest,
   ): Promise<SubstrateResponse> {
     await this.ensureLoaded();
+    const startedAt = Date.now();
     const choice = this.config.perSurface[surface];
     const handle = this.buildHandle(surface, choice);
     const requestHash = hashOfRequest(req);
+    const primary = await this.invokeHandle(surface, handle, method, req);
+    let response = primary.response;
+    let primaryFailure: { response: SubstrateResponse; fallbackTaken: FallbackTaken } | null = null;
+    let emitInvoked = primary.methodAvailable;
 
-    const fn = handle[method] as
-      | ((arg: SummarizeRequest | ClassifyRequest | RedactRequest) => Promise<SubstrateResponse>)
-      | undefined;
-    if (!fn) {
-      const failurePayload: IntelligenceSubstrateFailurePayload = {
-        version: "1.2",
-        event_id: makeEventId(),
-        emitted_at: new Date().toISOString(),
-        identity_id: this.identityId,
-        kind: "substrate_failure",
-        surface,
-        substrate: choice,
-        failure_class: "substrate_capability_unsupported",
-        fallback_taken: this.fallbackAction(surface),
-      };
-      this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
-      this.recordRecentFailure(surface, "substrate_capability_unsupported", `${choice} does not support ${method}`);
-      return disabledResponse(method, choice, "substrate_capability_unsupported");
+    if (primary.response.failureClass) {
+      const fallback = await this.tryNextSubstrate(surface, handle.substrate, method, req);
+      if (fallback && !fallback.response.failureClass) {
+        response = fallback.response;
+        primaryFailure = { response: primary.response, fallbackTaken: "next-substrate" };
+        emitInvoked = true;
+      } else {
+        response = fallback?.response ?? primary.response;
+        primaryFailure = {
+          response: fallback?.response ?? primary.response,
+          fallbackTaken: fallback?.exhausted
+            ? "all-exhausted"
+            : this.fallbackFailureAction(surface, handle.substrate),
+        };
+        if (fallback) emitInvoked = true;
+      }
     }
 
-    const response = await fn(req);
+    response = withTotalLatency(response, startedAt);
+    if (!emitInvoked) {
+      if (primaryFailure) {
+        const failurePayload: IntelligenceSubstrateFailurePayload = {
+          version: "1.2",
+          event_id: makeEventId(),
+          emitted_at: new Date().toISOString(),
+          identity_id: this.identityId,
+          kind: "substrate_failure",
+          surface,
+          substrate: choice,
+          failure_class: primaryFailure.response.failureClass ?? "internal_error",
+          fallback_taken: primaryFailure.fallbackTaken,
+        };
+        this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
+        const snippet = primaryFailure.response.body.kind === "failure"
+          ? primaryFailure.response.body.message
+          : `${choice} ${method} failed`;
+        this.recordRecentFailure(surface, primaryFailure.response.failureClass ?? "internal_error", snippet);
+      }
+      return response;
+    }
+
     const invokedPayload: IntelligenceSubstrateInvokedPayload = {
       version: "1.2",
       event_id: makeEventId(),
@@ -698,7 +728,7 @@ export class SubstrateSelector {
     };
     this.emit(INTEL_OPS.SUBSTRATE_INVOKED, invokedPayload, response.failureClass ? "failure" : "success");
 
-    if (response.failureClass) {
+    if (primaryFailure) {
       const failurePayload: IntelligenceSubstrateFailurePayload = {
         version: "1.2",
         event_id: makeEventId(),
@@ -707,12 +737,14 @@ export class SubstrateSelector {
         kind: "substrate_failure",
         surface,
         substrate: choice,
-        failure_class: response.failureClass,
-        fallback_taken: this.fallbackAction(surface),
+        failure_class: primaryFailure.response.failureClass ?? "internal_error",
+        fallback_taken: primaryFailure.fallbackTaken,
       };
       this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
-      const snippet = response.body.kind === "failure" ? response.body.message : `${choice} ${method} failed`;
-      this.recordRecentFailure(surface, response.failureClass, snippet);
+      const snippet = primaryFailure.response.body.kind === "failure"
+        ? primaryFailure.response.body.message
+        : `${choice} ${method} failed`;
+      this.recordRecentFailure(surface, primaryFailure.response.failureClass ?? "internal_error", snippet);
     }
 
     return response;
@@ -780,6 +812,66 @@ export class SubstrateSelector {
     snippet: string,
   ): void {
     this.recordRecentFailure(surface, failureClass, snippet);
+  }
+
+  private async invokeHandle(
+    surface: Surface,
+    handle: SubstrateHandle,
+    method: InvocationMethod,
+    req: SummarizeRequest | ClassifyRequest | RedactRequest,
+  ): Promise<{ response: SubstrateResponse; methodAvailable: boolean }> {
+    const fn = handle[method] as SubstrateInvoker | undefined;
+    if (!fn) {
+      return {
+        response: disabledResponse(
+          handle.substrate,
+          "substrate_capability_unsupported",
+        ),
+        methodAvailable: false,
+      };
+    }
+    try {
+      return { response: await fn(req), methodAvailable: true };
+    } catch {
+      return {
+        response: failureResponse(
+          handle.substrate,
+          "substrate_unavailable",
+          `${handle.substrate} ${surface} invocation failed`,
+        ),
+        methodAvailable: true,
+      };
+    }
+  }
+
+  private async tryNextSubstrate(
+    surface: Surface,
+    primary: SubstrateChoice,
+    method: InvocationMethod,
+    req: SummarizeRequest | ClassifyRequest | RedactRequest,
+  ): Promise<{
+    handle: SubstrateHandle;
+    response: SubstrateResponse;
+    exhausted: boolean;
+  } | null> {
+    if (this.config.fallback[surface] !== "degrade-silent") return null;
+    if (primary === "disabled" || primary === "hybrid") return null;
+    const primaryIndex = FALLBACK_CHAIN.findIndex((choice) => choice === primary);
+    if (primaryIndex < 0) return null;
+
+    let lastFailure: { handle: SubstrateHandle; response: SubstrateResponse } | null = null;
+    for (const choice of FALLBACK_CHAIN.slice(primaryIndex + 1)) {
+      const handle = this.buildHandle(surface, choice);
+      if (handle.substrate !== choice) continue;
+      const fn = handle[method] as SubstrateInvoker | undefined;
+      if (!fn) continue;
+      const attempt = await this.invokeHandle(surface, handle, method, req);
+      if (!attempt.response.failureClass) {
+        return { handle, response: attempt.response, exhausted: false };
+      }
+      lastFailure = { handle, response: attempt.response };
+    }
+    return lastFailure ? { ...lastFailure, exhausted: true } : null;
   }
 
   /**
@@ -966,9 +1058,10 @@ export class SubstrateSelector {
     };
   }
 
-  private fallbackAction(surface: Surface): "next-substrate" | "deny" | "disable-surface" {
+  private fallbackFailureAction(surface: Surface, primary: SubstrateChoice): FallbackTaken {
+    if (primary === "disabled") return "disable-surface";
     const behavior = this.config.fallback[surface];
-    if (behavior === "degrade-silent") return "next-substrate";
+    if (behavior === "degrade-silent") return "primary-failed";
     if (behavior === "disable-surface") return "disable-surface";
     return "deny";
   }
@@ -1060,31 +1153,33 @@ function countOverriddenSurfaces(cfg: SubstrateConfig): number {
   return n;
 }
 
-function disabledResponse(method: "summarize" | "classify" | "redact", servedBy: SubstrateChoice, failureClass: SubstrateFailureClass): SubstrateResponse {
-  if (method === "summarize") {
-    return {
-      servedBy,
-      failureClass,
-      body: { kind: "failure", message: "substrate disabled or unsupported for this method" },
-      completedAt: new Date().toISOString(),
-      latencyMs: 0,
-    };
-  }
-  if (method === "classify") {
-    return {
-      servedBy,
-      failureClass,
-      body: { kind: "failure", message: "substrate disabled or unsupported for this method" },
-      completedAt: new Date().toISOString(),
-      latencyMs: 0,
-    };
-  }
+function disabledResponse(servedBy: SubstrateChoice, failureClass: SubstrateFailureClass): SubstrateResponse {
+  return failureResponse(
+    servedBy,
+    failureClass,
+    "substrate disabled or unsupported for this method",
+  );
+}
+
+function failureResponse(
+  servedBy: SubstrateChoice,
+  failureClass: SubstrateFailureClass,
+  message: string,
+): SubstrateResponse {
   return {
     servedBy,
     failureClass,
-    body: { kind: "failure", message: "substrate disabled or unsupported for this method" },
+    body: { kind: "failure", message },
     completedAt: new Date().toISOString(),
     latencyMs: 0,
+  };
+}
+
+function withTotalLatency(resp: SubstrateResponse, startedAt: number): SubstrateResponse {
+  return {
+    ...resp,
+    completedAt: new Date().toISOString(),
+    latencyMs: Date.now() - startedAt,
   };
 }
 

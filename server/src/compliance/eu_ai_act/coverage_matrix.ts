@@ -897,7 +897,7 @@ const ROWS: CoverageRow[] = [
       "outcome. CORRECTIONS APPLIED during verification: earlier " +
       "drafts claimed 'Ed25519-signed entries' and 'hash-chained " +
       "transcript' — neither is true. The AuditEntry schema in " +
-      "l2-operational/audit-log.ts has no signature field, and " +
+      "operational/audit-log.ts has no signature field, and " +
       "entries are stored as individual encrypted files with no " +
       "inter-entry hash chain. AES-256-GCM authenticated encryption " +
       "provides integrity against third-party tampering; that is the " +
@@ -945,8 +945,11 @@ const ROWS: CoverageRow[] = [
     review_notes:
       "Verified against v0.7.0 source on 2026-04-10: audit/siem-tools." +
       "ts:18-77 registers audit_export_siem with CEF and OCSF format " +
-      "support and the full filter set. Classified Tier 3 (auto-allow, " +
-      "read-only) in loader.ts. No corrections to the original draft.",
+      "support and the full filter set. Re-tiered to Tier 1 (operator " +
+      "approval required) in loader.ts on 2026-06-15: the bulk export " +
+      "reveals each operation's policy tier and decision, so SIEM " +
+      "forwarding is an operator function, not an agent auto-allow " +
+      "(CISO MED-1).",
   },
 
   {
@@ -1430,7 +1433,7 @@ const ROWS: CoverageRow[] = [
       "Verified against v0.7.0 source on 2026-04-10. MAJOR " +
       "CORRECTIONS APPLIED from earlier drafts: (1) Earlier drafts " +
       "claimed Merkle integrity on the audit log — that is wrong. " +
-      "Merkle trees exist on the state store (l1-cognitive/state-" +
+      "Merkle trees exist on the state store (cognitive/state-" +
       "store.ts) but NOT on the audit log. (2) Earlier drafts " +
       "claimed Ed25519 signatures on audit entries — that is wrong. " +
       "The AuditEntry schema has no signature field; entries are " +

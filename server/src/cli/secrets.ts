@@ -24,12 +24,12 @@
  */
 
 import { createInterface } from "node:readline";
-import type { SecretScope } from "../l3-disclosure/broker/backend-interface.js";
+import type { SecretScope } from "../disclosure/broker/backend-interface.js";
 import {
   openBroker,
   loadBrokerPolicyRaw,
   saveBrokerPolicy,
-} from "../l3-disclosure/broker/open.js";
+} from "../disclosure/broker/open.js";
 
 export interface SecretsArgs {
   argv: string[];
@@ -318,7 +318,10 @@ async function cmdAudit(
     storagePath: ctx.args.storagePath,
   });
   try {
-    const summary = await broker.queryAudit({ since, limit });
+    // OPERATOR CLI: full-fidelity broker audit (secret name, scope, reason).
+    // The operator owns the policy; this is NOT the agent-facing redacted
+    // `broker/audit_query` (which uses broker.queryAudit).
+    const summary = await broker.queryAuditOperator({ since, limit });
     if (summary.entries.length === 0) {
       ctx.out.write("(no broker audit entries)\n");
       return 0;

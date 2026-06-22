@@ -12,7 +12,7 @@
  * implements against, not a dependency Sanctuary requires.
  */
 
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 
 // ─── Concordia Session Metadata ──────────────────────────────────────────
 // These types describe the shape of data Concordia sends to Sanctuary

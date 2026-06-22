@@ -4,14 +4,14 @@
  * Slice L1/R/P built the producer-signing daemon + the re-verifying consumer,
  * but nothing in production ever pulled the daemon's signed events INTO the
  * consumer. This module is that feed: it issues `audit_drain_request` frames to
- * the enforcing Linux daemon (the hybrid PULL model — main drives the pace),
+ * the enforcing Linux daemon (the hybrid PULL model - main drives the pace),
  * maps each returned `AuditDrainEvent` into a `CriticalEventEnvelope` with the
  * per-event producer-signature material attached, and runs it through the audit
  * consumer's fail-closed re-verification gate. A genuine daemon-signed event
  * re-verifies; an in-process forger that minted the `cw_source` marker but
  * cannot mint a valid producer signature is rejected.
  *
- * # Why the consumer — not this loop — decides the verdict
+ * # Why the consumer - not this loop - decides the verdict
  *
  * This loop is deliberately "dumb": it does not inspect signatures, does not
  * decide enforcement basis, and does not gate green/non-green. It only
@@ -27,7 +27,7 @@
  * drive acking: each `CriticalEventEnvelope.ack` we hand it sends an
  * `audit_drain_ack(seq)` for that event. The consumer already enforces the
  * "state durable BEFORE ack" contract and calls `ack()` for every settled event
- * — accepted, rejected-and-recorded, or duplicate-dropped — and skips it only
+ * - accepted, rejected-and-recorded, or duplicate-dropped - and skips it only
  * when ingest throws for a TRANSIENT reason (persistence/transport), so the
  * daemon re-delivers exactly the events that were not durably handled. Reusing
  * the consumer's own ack path (rather than a parallel batch ack) keeps a single
@@ -70,7 +70,7 @@ export interface LinuxAuditDrainOptions {
   /** Poll interval (ms) between drain cycles when running continuously. Default 1000. */
   pollIntervalMs?: number;
   /**
-   * Seq to resume the loop's cursor from (exclusive — the first cycle pulls
+   * Seq to resume the loop's cursor from (exclusive - the first cycle pulls
    * strictly above it). Defaults to null (drain from the start). The activation
    * gate sets this to the cursor its fail-closed initial-drain confirmation
    * probe reached, so the continuous loop neither re-pulls nor skips an event
@@ -83,7 +83,7 @@ export interface LinuxAuditDrainOptions {
   /**
    * Optional sink for non-fatal loop DIAGNOSTICS that do NOT mean the drain
    * stopped making progress: a producer-signature refusal that the consumer
-   * durably recorded + acked (the event SETTLED — a refused forgery, by design),
+   * durably recorded + acked (the event SETTLED - a refused forgery, by design),
    * or any other settled-but-noteworthy condition. The loop CONTINUES after
    * these; in opt-in mode they MUST NOT trip the not-armed health signal, or a
    * forged event could DoS the wall into a false NOT-ARMED. (codex HIGH:
@@ -92,7 +92,7 @@ export interface LinuxAuditDrainOptions {
   onError?: (err: Error) => void;
   /**
    * Optional sink for an UNSETTLED drain FAULT: a condition where the loop could
-   * not advance past an event because it did NOT durably settle — a transient
+   * not advance past an event because it did NOT durably settle - a transient
    * persistence/transport failure that threw BEFORE the ack, a malformed drain
    * entry the consumer cannot even parse, or the `drainRequest` transport itself
    * throwing. These are the load-bearing failures: in opt-in producer-signed
@@ -158,11 +158,11 @@ export function buildCriticalEnvelopeFromDrainEvent(
       : {};
 
   // The chain metadata (`seq`, `prior_sha256_hex`) lives on the WIRE entry, not
-  // inside the signed body — the consumer's WAL-chain validator reads it from
+  // inside the signed body - the consumer's WAL-chain validator reads it from
   // `event.details`, so we graft it on. The signed body remains the
   // authoritative source for evidence fields (the consumer re-parses
   // `producer.eventCanonicalJson` and uses THAT, not these details, for signed
-  // evidence — so there is no staple/strip attack surface here).
+  // evidence - so there is no staple/strip attack surface here).
   const details: Record<string, unknown> = {
     ...bodyDetails,
     seq: drained.seq,
@@ -203,7 +203,7 @@ export function buildCriticalEnvelopeFromDrainEvent(
  * are pending.
  *
  * Settlement = ack. The consumer calls our per-event `ack()` only AFTER the
- * event is durably handled — accepted, rejected-and-recorded, or
+ * event is durably handled - accepted, rejected-and-recorded, or
  * duplicate-dropped. That callback sends `audit_drain_ack(seq)` and advances our
  * cursor. An event whose ingest throws for a TRANSIENT reason never reaches its
  * ack, so the cursor does not advance past it and the daemon re-delivers it.
@@ -215,16 +215,16 @@ export function buildCriticalEnvelopeFromDrainEvent(
  * event we compare `cursor` to the event's seq. If it advanced, the event
  * SETTLED (a refused forgery is recorded + acked, so later genuine events in the
  * batch keep flowing). If it did NOT advance, the event was NOT durably handled
- * (transient failure before ack) and we STOP the batch — never acking past an
+ * (transient failure before ack) and we STOP the batch - never acking past an
  * unpersisted seq, which would let the daemon truncate its WAL through a lost
  * event (FIX 2). The daemon re-delivers from the last settled seq next cycle.
  *
- * # Settled refusal vs unsettled fault — the cursor IS the discriminator (codex HIGH)
+ * # Settled refusal vs unsettled fault - the cursor IS the discriminator (codex HIGH)
  *
  * The cursor check is also the single arbiter of WHICH error channel a throw
  * goes to, so a forged event can never DoS the wall into a false NOT-ARMED:
  *   - cursor ADVANCED past the event ⇒ it SETTLED. If it threw, it was a
- *     producer-signature refusal that the consumer durably recorded + acked —
+ *     producer-signature refusal that the consumer durably recorded + acked -
  *     a DIAGNOSTIC (`onError`), and the loop CONTINUES. A refused forgery is the
  *     gate working as designed, NOT a transport failure.
  *   - cursor did NOT advance ⇒ the event did NOT settle (a transient
@@ -233,7 +233,7 @@ export function buildCriticalEnvelopeFromDrainEvent(
  *     mode the signed evidence is not reaching the consumer, so the wall is
  *     armed-but-not-draining and must read NOT-ARMED. We break the batch.
  * Routing strictly by the cursor (never by error TYPE) means no settled outcome
- * — however it is reported — can ever trip the health machine.
+ * - however it is reported - can ever trip the health machine.
  */
 export async function drainOnce(
   client: IpcClient,
@@ -274,7 +274,7 @@ export async function drainOnce(
       await consumer.ingestCritical(built.envelope);
     } catch (err) {
       // The consumer throws `AuditChainError` for a refused forgery / chain
-      // error — but only AFTER durably recording it AND calling our ack (so the
+      // error - but only AFTER durably recording it AND calling our ack (so the
       // cursor already advanced past it inside the callback above). A TRANSIENT
       // throw (persistence/transport) happens BEFORE ack, so the cursor stays
       // put and the daemon re-delivers. We do NOT classify by error type here;
@@ -282,7 +282,7 @@ export async function drainOnce(
       // (diagnostic) or an unsettled fault (NOT-ARMED).
       ingestError = err instanceof Error ? err : new Error(String(err));
     }
-    // FIX 2 (codex CRITICAL — drain must never ack past an UNPERSISTED event) +
+    // FIX 2 (codex CRITICAL - drain must never ack past an UNPERSISTED event) +
     // settled-refusal-vs-fault split (codex HIGH).
     //
     // The ack callback advances `cursor` to `drainedEvent.seq` ONLY when the
@@ -290,7 +290,7 @@ export async function drainOnce(
     // duplicate-dropped). The cursor is therefore the single discriminator:
     if (cursor === drainedEvent.seq) {
       // SETTLED. If it threw, it was a producer-signature refusal recorded +
-      // acked — a diagnostic, NOT a transport failure. Report it via `onError`;
+      // acked - a diagnostic, NOT a transport failure. Report it via `onError`;
       // the loop CONTINUES so later genuine events in the batch keep flowing.
       // A refused forgery must never stop the loop (else a forger could DoS the
       // wall into a false NOT-ARMED).
@@ -298,8 +298,8 @@ export async function drainOnce(
     } else {
       // NOT SETTLED. A TRANSIENT persistence/transport failure threw before ack
       // (cursor stayed put). Continuing would feed seq N+1 to the consumer,
-      // which — with `lastEventCanonicalHash` still null because seq N never
-      // persisted — would accept N+1 as a fresh bootstrap and ack
+      // which - with `lastEventCanonicalHash` still null because seq N never
+      // persisted - would accept N+1 as a fresh bootstrap and ack
       // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
       // (silent audit data loss). This is an UNSETTLED FAULT → `onDrainFault`
       // (trips NOT-ARMED in opt-in mode). We STOP the batch; the cursor stays at
@@ -329,7 +329,7 @@ export async function drainOnce(
  * diagnostics (a durably-recorded producer-signature refusal) are reported via
  * `onError` and the loop continues; an UNSETTLED FAULT (transport/persistence
  * failure, malformed entry, or a `drainRequest` that itself throws) is reported
- * via `onDrainFault` — the load-bearing NOT-ARMED signal in opt-in mode. Returns
+ * via `onDrainFault` - the load-bearing NOT-ARMED signal in opt-in mode. Returns
  * a handle whose `stop()` halts the loop after the in-flight cycle settles.
  */
 export interface LinuxAuditDrainHandle {
@@ -374,7 +374,7 @@ export function startLinuxAuditDrainLoop(
         morePending = result.morePending;
       }
     } catch (err) {
-      // A `drainRequest` itself threw — the daemon link dropped. The signed
+      // A `drainRequest` itself threw - the daemon link dropped. The signed
       // enforcement evidence is not reaching the consumer, so in opt-in mode the
       // wall is armed-but-not-draining: this is an UNSETTLED transport FAULT
       // (`onDrainFault` → NOT-ARMED), NOT a settled diagnostic. We never throw

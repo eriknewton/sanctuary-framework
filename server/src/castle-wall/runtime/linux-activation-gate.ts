@@ -16,8 +16,8 @@
  *
  *   - FAIL-CLOSED. If the daemon will not start, the unit is not active, the
  *     handshake fails, the pinned producer key is expected-but-unreadable, the
- *     key is ABSENT after an opted-in launch (a key is required on this path —
- *     see FIX 1), or the audit drain transport wedges (armed-but-not-draining —
+ *     key is ABSENT after an opted-in launch (a key is required on this path -
+ *     see FIX 1), or the audit drain transport wedges (armed-but-not-draining -
  *     see FIX 4), the activation THROWS / trips NOT-ARMED. The caller surfaces
  *     NOT-ARMED. There is NO branch that swallows a failure and falls back to
  *     the channel basis when a key is expected. The channel-basis floor applies
@@ -67,7 +67,7 @@ export const LINUX_PRODUCER_SIGNED_ACTIVATION_ENV =
 
 /**
  * True iff the operator has explicitly opted in to the Linux producer-signed
- * close. Default (no flag) is false — the close stays inactive. An optional
+ * close. Default (no flag) is false - the close stays inactive. An optional
  * explicit boolean overrides the env (for callers that thread config).
  */
 export function isLinuxProducerSignedActivationRequested(opts?: {
@@ -100,9 +100,9 @@ export interface ActivateLinuxProducerSignedInput {
   env?: NodeJS.ProcessEnv;
   /** Socket path override (tests / non-default fortress layout). */
   socketPath?: string;
-  /** systemctl runner — injected in tests; defaults to the real one. */
+  /** systemctl runner - injected in tests; defaults to the real one. */
   systemctl?: SystemctlRunner;
-  /** Filesystem ops — injected in tests; defaults to node:fs/promises. */
+  /** Filesystem ops - injected in tests; defaults to node:fs/promises. */
   fs?: LauncherFs;
   /** Daemon binary path override. */
   daemonBinary?: string;
@@ -117,14 +117,14 @@ export interface ActivateLinuxProducerSignedInput {
   connectTransport?: (socketPath: string) => Promise<
     import("./ipc-client.js").IpcTransport
   >;
-  /** Drain-loop options (poll interval, timers) — tests inject deterministic timers. */
+  /** Drain-loop options (poll interval, timers) - tests inject deterministic timers. */
   drainOptions?: LinuxAuditDrainOptions;
   /** Skip starting the continuous drain loop (tests that drive drain manually). */
   startDrainLoop?: boolean;
   /**
    * Whether to PROVE the audit channel is live (one successful drain round-trip)
-   * BEFORE reporting armed (codex round-4 HIGH — fail-open at the arming
-   * boundary). Default true: a handshake-only "armed" is not enough — the signed
+   * BEFORE reporting armed (codex round-4 HIGH - fail-open at the arming
+   * boundary). Default true: a handshake-only "armed" is not enough - the signed
    * enforcement evidence must demonstrably flow, or the activation fails closed
    * (NOT-ARMED) rather than reporting armed for the request-timeout window on an
    * unconfirmed channel. Only honored when the continuous loop runs
@@ -134,7 +134,7 @@ export interface ActivateLinuxProducerSignedInput {
   confirmInitialDrain?: boolean;
   /**
    * Hook for a durable NOT-ARMED / audit-failure signal when the drain loop hits
-   * an UNSETTLED transport/persistence FAULT (FIX 4 — drain health is
+   * an UNSETTLED transport/persistence FAULT (FIX 4 - drain health is
    * load-bearing in opt-in mode). The activation routes only `onDrainFault`
    * (NOT settled producer-signature refusals) here: the FIRST drain fault trips
    * `markDrainUnhealthy`, which DURABLY records the failure and tears the
@@ -148,7 +148,7 @@ export interface ActivateLinuxProducerSignedInput {
   /**
    * Explicit FATAL hook for the "audit unavailable" path: a drain fault was
    * observed (wall reads NOT-ARMED) but the durable not-armed record could NOT
-   * be persisted (the audit sink threw). Fail-closed + loud — there is no silent
+   * be persisted (the audit sink threw). Fail-closed + loud - there is no silent
    * fall-back to a less-secure state. When omitted the fatal is still raised
    * internally (the wall stays not-armed + the loop stops); this hook just lets
    * the operator entrypoint surface it (e.g. crash the supervised process so a
@@ -173,7 +173,7 @@ export interface LinuxProducerSignedActivation {
   drainHealthy(): boolean;
   /**
    * Resolves once the in-flight unhealthy-transition teardown has fully settled
-   * — i.e. the durable NOT-ARMED record was persisted (or the explicit
+   * - i.e. the durable NOT-ARMED record was persisted (or the explicit
    * audit-unavailable fatal path was taken) AND the drain loop was stopped.
    * Resolves immediately when no transition is in flight. Round-3 HIGH: lets a
    * caller/test prove the NOT-ARMED record is DURABLE before treating the
@@ -191,7 +191,7 @@ export interface LinuxProducerSignedActivation {
 
 /**
  * The outcome of consulting the gate: either an active producer-signed
- * activation, or an explicit "not activated" with a reason (NOT an error — the
+ * activation, or an explicit "not activated" with a reason (NOT an error - the
  * caller keeps the macOS/channel basis path). A FAILURE during a REQUESTED
  * activation is thrown, not returned, so it cannot be mistaken for "inactive".
  */
@@ -202,7 +202,7 @@ export type LinuxActivationOutcome =
 /**
  * Consult the gate and, when opted in on Linux, ACTIVATE the producer-signed
  * close end-to-end. Returns `{ activated: false, reason }` when the gate is not
- * engaged (no opt-in, or not Linux) — the caller then keeps its existing path
+ * engaged (no opt-in, or not Linux) - the caller then keeps its existing path
  * (macOS daemon / channel basis). When the gate IS engaged, any failure to
  * reach an armed, key-loaded state THROWS (fail-closed → caller surfaces
  * not-armed).
@@ -255,7 +255,7 @@ export async function activateLinuxProducerSignedCastleWall(
     fs: input.fs,
   });
 
-  // FIX 1 (codex CRITICAL — fail-open on absent key in the opt-in path).
+  // FIX 1 (codex CRITICAL - fail-open on absent key in the opt-in path).
   //
   // We only reach here when the operator OPTED IN on Linux and the daemon was
   // launched. On the opt-in path a published producer key is EXPECTED: the
@@ -264,12 +264,12 @@ export async function activateLinuxProducerSignedCastleWall(
   //
   // Without this check, an ABSENT key would let `startCastleWall` start on the
   // CHANNEL BASIS (lifecycle.ts: `absent` → consumer key-null) and the gate would
-  // still return `activated: true` — reporting armed-but-NOT-enforcing (fake
+  // still return `activated: true` - reporting armed-but-NOT-enforcing (fake
   // green). The channel-basis floor is legitimate ONLY without opt-in; here a key
   // is required, so an absent key after an opted-in launch is fail-closed
   // not-armed. (`unreadable` already throws below via `startCastleWall`; this adds
   // the missing `absent` case so all three loads are handled honestly:
-  // present→enforce, unreadable→throw, absent→throw — none silently channel.)
+  // present→enforce, unreadable→throw, absent→throw - none silently channel.)
   const keyLoad = await loadFortressProducerKey(input.fortressStoragePath);
   if (keyLoad.status !== "present") {
     const reason: RuntimeLinuxActivationError["reason"] =
@@ -282,7 +282,7 @@ export async function activateLinuxProducerSignedCastleWall(
         : keyLoad.reason;
     throw new RuntimeLinuxActivationError(
       `Castle Wall Linux activation failed (fail-closed, not armed): ${detail}. ` +
-        `On the opt-in producer-signed path a published key is REQUIRED — refusing ` +
+        `On the opt-in producer-signed path a published key is REQUIRED - refusing ` +
         `to report armed on the (weaker) channel basis.`,
       reason
     );
@@ -331,7 +331,7 @@ export async function activateLinuxProducerSignedCastleWall(
   // P-2 (drain loop): pull signed events from the daemon into the consumer's
   // fail-closed re-verification gate.
   //
-  // FIX 4 (codex HIGH — swallowed drain failure → armed-but-not-draining) +
+  // FIX 4 (codex HIGH - swallowed drain failure → armed-but-not-draining) +
   // round-3 HIGHs: (1) the NOT-ARMED record must be DURABLE before the
   // health-transition/teardown completes; (2) a SETTLED producer-signature
   // refusal must NOT stop the loop like a transport failure.
@@ -341,7 +341,7 @@ export async function activateLinuxProducerSignedCastleWall(
   // never reaches the consumer, so a "running" lifecycle would be silently
   // armed-but-not-draining. We trip a durable NOT-ARMED signal + tear the
   // activation down ONLY on an UNSETTLED drain FAULT (`onDrainFault`): a
-  // transport/persistence failure or a malformed entry — never on a settled
+  // transport/persistence failure or a malformed entry - never on a settled
   // refusal. A producer-signature REJECTION is the gate working as designed (it
   // is durably recorded + acked by the consumer); routing it here would let a
   // forged event DoS the wall into a false NOT-ARMED. Settled refusals flow
@@ -382,7 +382,7 @@ export async function activateLinuxProducerSignedCastleWall(
             reason: err.message,
             evidence_basis: "producer_signed",
             armed: false,
-            note: "drain transport/persistence fault — wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
+            note: "drain transport/persistence fault - wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
           },
           "failure"
         );
@@ -430,10 +430,10 @@ export async function activateLinuxProducerSignedCastleWall(
       },
     };
 
-    // CODEX HIGH (round-4 — fail-OPEN at the arming boundary): the continuous
+    // CODEX HIGH (round-4 - fail-OPEN at the arming boundary): the continuous
     // loop's first cycle is started fire-and-forget by `startLinuxAuditDrainLoop`,
     // so without this step the activation would return `activated: true` (and
-    // `drainHealthy()` would read true) the instant the loop is *scheduled* —
+    // `drainHealthy()` would read true) the instant the loop is *scheduled* -
     // BEFORE a single drain round-trip has succeeded. A daemon that completes the
     // handshake but then wedges the very first `audit_drain_request` would report
     // ARMED for the whole request-timeout window (`IpcClient.requestTimeoutMs`,
@@ -441,8 +441,8 @@ export async function activateLinuxProducerSignedCastleWall(
     // "armed-but-not-draining" fake-green this file's contract forbids.
     //
     // Fix-CLOSED: PROVE the audit channel is live before reporting armed. Await
-    // ONE drain round-trip (an empty batch counts — it proves the link delivers;
-    // a SETTLED producer-signature refusal in the batch also counts — the channel
+    // ONE drain round-trip (an empty batch counts - it proves the link delivers;
+    // a SETTLED producer-signature refusal in the batch also counts - the channel
     // works and a refused forgery is the gate working, not a transport failure).
     // A transport failure/timeout makes `drainRequest` REJECT, which `drainOnce`
     // propagates → we fail closed. A transient persistence fault during the probe
@@ -466,7 +466,7 @@ export async function activateLinuxProducerSignedCastleWall(
           drainOptions.onDrainFault
         );
         // RESUME from the CONSUMER's durable settled floor, NOT the probe's local
-        // `nextAfterSeq` (codex round-5 — initialCursor must never outrun
+        // `nextAfterSeq` (codex round-5 - initialCursor must never outrun
         // settlement). `lastAckedSeq` is the authoritative high-water mark: the
         // consumer advances it ONLY on durable persistence, so it can never point
         // past an unsettled event even if the probe stopped mid-batch at a fault.
@@ -480,7 +480,7 @@ export async function activateLinuxProducerSignedCastleWall(
       } catch (err) {
         // The initial drain round-trip failed (link dropped / request timed out
         // before any batch arrived). Tear down what we opened and surface
-        // NOT-ARMED — never report armed on an unconfirmed audit channel.
+        // NOT-ARMED - never report armed on an unconfirmed audit channel.
         await lifecycle.stop().catch(() => {});
         const message = err instanceof Error ? err.message : String(err);
         throw new RuntimeLinuxActivationError(

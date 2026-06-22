@@ -12,8 +12,8 @@
  *   rather than silently substituting a default (operator intent preservation).
  */
 
-import { readFile, writeFile, chmod } from "node:fs/promises";
 import { join } from "node:path";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import type {
   PrincipalPolicy,
   Tier2Config,
@@ -64,6 +64,19 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  *   policy can plan to evade it).
  * - context_gate_set_policy / context_gate_apply_template: policy-adjacent
  *   enforcement mutations must not be silently agent-auto-allowed.
+ * - audit_export_siem: bulk-exports decrypted audit events across all
+ *   principals, each carrying its policy tier and approve/deny decision — a
+ *   policy-inference oracle for the agent (no-read invariant). SIEM forwarding
+ *   is an operator function, so it must require operator approval. (CISO MED-1.)
+ * - compliance_generate_eu_ai_act_bundle: the generated bundle body embeds the
+ *   verbatim Tier-2 anomaly policy (e.g. frequency_spike_multiplier), the
+ *   approval-channel timeout, and audit-derived aggregate gate-decision counts —
+ *   the same policy-inference leak class as audit_export_siem, through a
+ *   different door (no-read invariant). It is also a governance conflict of
+ *   interest: an agent must not self-generate its own compliance attestation.
+ *   So it must require operator approval. (CISO NEW-1.)
+ * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
+ *   hand-authored policy once the inert memory tool factory is wired.
  */
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
@@ -72,6 +85,9 @@ const FORCED_TIER1_OPERATIONS = [
   "sanctuary_policy_status",
   "context_gate_set_policy",
   "context_gate_apply_template",
+  "audit_export_siem",
+  "compliance_generate_eu_ai_act_bundle",
+  "memory_delete",
 ] as const;
 
 /**
@@ -120,6 +136,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_policy_status", // Reads Principal Policy status; always requires approval.
     "context_gate_set_policy", // Policy-adjacent enforcement mutation; always requires approval.
     "context_gate_apply_template", // Policy-adjacent enforcement mutation; always requires approval.
+    "audit_export_siem", // Bulk audit export (per-op tier+decision across all principals); operator-only — prevents agent policy-inference (CISO MED-1).
+    "compliance_generate_eu_ai_act_bundle", // Bundle body embeds verbatim Tier-2 thresholds + approval timeout + audit-derived aggregates; operator-only — prevents agent policy-inference + self-attestation (CISO NEW-1).
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -133,6 +151,18 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sdw_export",
     "sdw_import",
     "sdw_export_delete",
+    // SDW memory substrate (company-brain phase 1, wired 2026-06-18). Both the
+    // write and the irreversible delete require operator approval: a passage
+    // insert commits operator data to the sovereign vault, and the delete is a
+    // secure-overwrite (where the backend supports it) that cannot be undone.
+    // memory_delete is ALSO in FORCED_TIER1_OPERATIONS so a hand-authored
+    // policy cannot relax it (the insert MAY be relaxed to Tier 3 by an
+    // operator who wants unattended writes; the irreversible delete may not).
+    // memory_insert's body is redacted from the approval channel by the tool's
+    // approvalTargetArgs (Hard Constraint #1: no pre-approval body to an
+    // external channel).
+    "memory_insert",
+    "memory_delete",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -177,7 +207,6 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "l2_hardening_status",
     "l2_verify_isolation",
     "sovereignty_audit",
-    "audit_export_siem",
     "shr_gateway_export",
     "bridge_commit",
     "bridge_verify",
@@ -188,8 +217,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
     "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
     "memory_attest", // Read-only audit attestation — records that a memory op happened
-    "compliance_generate_eu_ai_act_bundle", // Read-only; emits signed compliance documents from existing state
-    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier
+    // compliance_generate_eu_ai_act_bundle re-tiered Tier-3 → Tier-1 (CISO NEW-1):
+    // its bundle body emits verbatim Tier-2 thresholds + the approval timeout +
+    // audit-derived aggregates, a policy-inference oracle for the agent, and an
+    // agent self-generating its own compliance attestation is a conflict of
+    // interest. See FORCED_TIER1_OPERATIONS + tier1_always_approve above.
+    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier — stays Tier 3 (no policy thresholds in its output)
     "sanctuary_remember",
     "sanctuary_recall",
     "sanctuary_hide",
@@ -537,15 +570,20 @@ export async function loadPrincipalPolicy(
 
   let content: string;
   try {
-    content = await readFile(policyPath, "utf-8");
+    content = await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") {
       // Expected on first boot; generate default
       const defaultYaml = generateDefaultPolicyYaml();
       try {
-        await writeFile(policyPath, defaultYaml, "utf-8");
-        await chmod(policyPath, 0o600);
+        await writeFileCustody(policyPath, defaultYaml, {
+          mode: 0o600,
+          createParent: false,
+        });
       } catch (writeErr) {
         // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.warn(

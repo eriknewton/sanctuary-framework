@@ -10,17 +10,17 @@ import { tightenStoragePermissions } from "./storage/permissions.js";
 import { loadConfig, saveConfig, type SanctuaryConfig } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import type { StorageBackend } from "./storage/interface.js";
-import { StateStore } from "./l1-cognitive/state-store.js";
-import { createL1Tools, createInternalIdentitySigningHelpers } from "./l1-cognitive/tools.js";
+import { StateStore } from "./cognitive/state-store.js";
+import { createCognitiveTools, createInternalIdentitySigningHelpers } from "./cognitive/tools.js";
 import { createDistressTools } from "./distress/tools.js";
 import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
-import { AuditLog } from "./l2-operational/audit-log.js";
-import { createL3Tools } from "./l3-disclosure/tools.js";
-import { createL4Tools } from "./l4-reputation/tools.js";
+import { AuditLog } from "./operational/audit-log.js";
+import { createDisclosureTools } from "./disclosure/tools.js";
+import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
-import type { IdentityManager } from "./l1-cognitive/tools.js";
+import type { IdentityManager } from "./cognitive/tools.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
 import { StderrApprovalChannel } from "./principal-policy/approval-channel.js";
@@ -86,8 +86,8 @@ import {
   bindContextGateEnforcerToProfileStore,
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
-} from "./l2-operational/context-gate-tools.js";
-import { createL2HardeningTools } from "./l2-operational/hardening-tools.js";
+} from "./operational/context-gate-tools.js";
+import { createOperationalHardeningTools } from "./operational/hardening-tools.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
@@ -97,10 +97,13 @@ import {
   DynamicProxyToolRegistry,
   enableToolListChangedNotifications,
 } from "./proxy/dynamic-proxy.js";
-import { CallGovernor } from "./l2-operational/call-governor.js";
-import { createGovernorTools } from "./l2-operational/governor-tools.js";
+import { CallGovernor } from "./operational/call-governor.js";
+import { createGovernorTools } from "./operational/governor-tools.js";
 import { createSanctuaryTools } from "./sanctuary-tools.js";
-import { createMemoryAttestTools } from "./l1-cognitive/memory-attest.js";
+import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
+import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
+import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
+import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
@@ -118,7 +121,7 @@ import {
   readCustodyEpochCount,
   probeAuditHeadAnchor,
   deriveAuditEpochKeys,
-} from "./l2-operational/audit-log.js";
+} from "./operational/audit-log.js";
 import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
 import {
   buildV11Bindings,
@@ -126,10 +129,10 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
-// in l2-operational/agent-audit-redaction.ts so the redact-key set is shared by
+// in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
 // SEARCH in the cooperative surface. The OPERATOR audit path stays full-fidelity.
-import { redactAuditEntryForAgent } from "./l2-operational/agent-audit-redaction.js";
+import { redactAuditEntryForAgent } from "./operational/agent-audit-redaction.js";
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
@@ -412,7 +415,7 @@ export async function createSanctuaryServer(options?: {
   };
 
   // 7. Create L1 tools
-  const { tools: l1Tools, identityManager, namespaceRegistry } = createL1Tools(
+  const { tools: l1Tools, identityManager, namespaceRegistry } = createCognitiveTools(
     stateStore,
     storage,
     masterKey,
@@ -500,11 +503,21 @@ export async function createSanctuaryServer(options?: {
             },
             isolation_level: "process",
             sovereignty_assessment: {
-              l1_state_encrypted: true,
+              // Honesty (audit seam #4): these were literal `true`s asserting
+              // runtime-verified encryption and available proofs on config
+              // presence. Derive from real config and surface the unverified
+              // posture: encryption is *configured* (no runtime integrity check
+              // proves bytes on disk are encrypted), and zero-knowledge proofs
+              // are only "available" when a ZK proof system is configured
+              // (commitment-only has none). The verification status is unknown.
+              l1_state_encrypted: config.state.encryption === "aes-256-gcm",
+              l1_state_encryption_verified: "unknown",
               l1_status: evidence.layers.l1.status,
               l2_execution_isolated: evidence.layers.l2.status,
               l2_isolation_type: "process-level",
-              l3_proofs_available: true,
+              l3_proofs_available:
+                config.disclosure.proof_system !== "commitment-only",
+              l3_status: evidence.layers.l3.status,
               l4_reputation_status: evidence.layers.l4.status,
               overall_level: "mvs",
               degradations: evidence.degradations.map((d) => d.description),
@@ -517,8 +530,13 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_health",
+      // Honesty (audit seam #4): the prior copy promised a "live Castle Wall
+      // enforcement state" that no detector feeds. Castle Wall status reflects
+      // whatever runtime snapshot is wired in (often "unknown" when none is),
+      // and the disclosure/reputation layers report configured-vs-verified, not
+      // observed enforcement. Describe what the tool actually returns.
       description:
-        "Report this instance's live health and sovereignty status: overall state (healthy/degraded/compromised), versions, Castle Wall enforcement state, audit/state/egress posture, and any active degradations. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
+        "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
@@ -551,7 +569,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query this instance's sovereignty audit log, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect recorded operations. Read-only; entries are redacted for agent consumption (no secret material).",
+      description: "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — no details, identity, or policy attribution.",
       inputSchema: {
         type: "object",
         properties: {
@@ -565,16 +583,35 @@ export async function createSanctuaryServer(options?: {
         },
       },
       handler: async (args) => {
+        // OWN-IDENTITY FILTER (CISO MED-3, property #11): an agent may only read
+        // its OWN audit entries. Entries attributed to `system` (every gate /
+        // policy decision, anomaly escalation, injection block) carry operator-
+        // only context and are written with identity_id === "system", so the
+        // own-identity filter alone keeps them off the agent-facing read — the
+        // threshold-bearing free-text `reason` on a `gate_*` entry never reaches
+        // an agent, both because it is a `system` entry AND because the redacted
+        // view drops `details` entirely (defence in depth). Mirrors
+        // sanctuary_audit_search's own_signed scope.
+        const binding = currentSessionBinding();
+        // No bound session identity → fail closed (return nothing) rather than
+        // exposing other identities' (or system) entries. Never degrade open.
+        if (!binding) {
+          return toolResult({ entries: [], count: 0 });
+        }
+        const limit = Math.max(1, (args.limit as number) ?? 50);
+        // Filter to the caller's identity BEFORE the limit (AuditLog.query
+        // applies identity_id before its slice), so `limit` bounds the caller's
+        // OWN entries — a caller with many other-identity entries ahead of theirs
+        // in the window no longer gets undercounted (CISO LOW, 2026-06-16).
         const result = await auditLog.query({
           since: args.since as string | undefined,
           layer: args.layer as "l1" | "l2" | "l3" | "l4" | undefined,
           operation_type: args.operation_type as string | undefined,
-          limit: (args.limit as number) ?? 50,
+          identity_id: binding.identity_id,
+          limit,
         });
-        return toolResult({
-          ...result,
-          entries: result.entries.map((entry) => redactAuditEntryForAgent(entry)),
-        });
+        const own = result.entries.map((entry) => redactAuditEntryForAgent(entry));
+        return toolResult({ entries: own, count: own.length });
       },
     },
   ];
@@ -607,7 +644,14 @@ export async function createSanctuaryServer(options?: {
               "S1.3_integrity_verification": "full",
               "S1.4_selective_state_sharing": "full",
               "S1.5_state_portability": "full",
-              "S1.6_deletion_rights": "full",
+              // Honest grade: deletion is best-effort random-byte overwrite
+              // before unlink; on copy-on-write/SSD media original bytes may
+              // survive, so at-rest confidentiality rests on encryption, not on
+              // the overwrite. The live delete tools (state_delete,
+              // sanctuary_forget, memory_delete) describe it this way and there
+              // is no "proven" ASSURANCE_MATRIX row backing a "full"
+              // right-to-deletion claim, so "partial" is the honest level.
+              "S1.6_deletion_rights": "partial",
               "S1.7_identity_anchoring": "partial",
             },
           },
@@ -635,10 +679,16 @@ export async function createSanctuaryServer(options?: {
             interfaces: ["ReputationStore", "TrustBootstrap"],
             modes: [config.reputation.mode],
             properties: {
-              "S4.1_earned_reputation": "full",
+              // Honest grades: the reputation/SHR/attestation surfaces now
+              // report "unknown" when telemetry is unavailable, and there is no
+              // "proven" ASSURANCE_MATRIX row for earned-reputation or
+              // trust-bootstrapping. "partial" matches the live surfaces rather
+              // than over-declaring a fully-realized capability the human-facing
+              // tools were just corrected to stop claiming.
+              "S4.1_earned_reputation": "partial",
               "S4.2_participant_owned": "full",
               "S4.5_sybil_resistance": "basic",
-              "S4.7_trust_bootstrapping": "full",
+              "S4.7_trust_bootstrapping": "partial",
             },
           },
         },
@@ -660,7 +710,7 @@ export async function createSanctuaryServer(options?: {
   };
 
   // 11. Create L3 tools
-  const { tools: l3Tools } = createL3Tools(storage, masterKey, auditLog);
+  const { tools: l3Tools } = createDisclosureTools(storage, masterKey, auditLog);
 
   // 12. Create Handshake tools (sovereignty handshake protocol)
   // Must be created before L4 so handshakeResults can feed tier resolution
@@ -678,13 +728,14 @@ export async function createSanctuaryServer(options?: {
   // 13. Create L4 tools (reputation with sovereignty-gated tiers)
   // Produces the ReputationStore that feeds SHR L4 evidence, so create
   // this before the SHR tools.
-  const { tools: l4Tools, reputationStore } = createL4Tools(
+  const { tools: l4Tools, reputationStore } = createReputationTools(
     storage,
     masterKey,
     identityManager,
     auditLog,
     handshakeResults,
-    config.verascore.url
+    config.verascore.url,
+    config
   );
 
   // 14. Create SHR tools (machine-readable sovereignty health report).
@@ -714,16 +765,30 @@ export async function createSanctuaryServer(options?: {
     handshakeResults
   );
 
-  // 14d. Create Sovereignty Audit tools (read-only diagnostic)
-  const { tools: auditTools } = createAuditTools(config, auditLog);
-
   // 14d2. Create SIEM Export tools (Tier 2 — CEF and OCSF export)
-  const { tools: siemTools } = createSIEMTools(auditLog);
+  const { tools: siemTools } = createSIEMTools(auditLog, currentSessionBinding);
 
   // 14e. Initialize Sovereignty Profile store. Its context_gating subsection is
   // the persisted source of truth for the runtime context gate enforcer.
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   const loadedProfile = await profileStore.load();
+
+  // 14d (moved below profile load). Create Sovereignty Audit tools (read-only
+  // diagnostic). Honesty (audit seam #5): the audit reads the LIVE profile so
+  // it credits context-gating and zero-knowledge proofs only when they are
+  // actually enabled (both default OFF) rather than from a hardcoded
+  // sanctuary_installed flag. Moved after profileStore.load() so the getter is
+  // bound to the live store; auditTools is only consumed in the tool registry
+  // far below, so the reorder is behavior-preserving.
+  const { tools: auditTools } = createAuditTools(config, auditLog, {
+    getRuntimeSignals: () => {
+      const p = profileStore.get();
+      return {
+        contextGatingEnabled: p.features.context_gating.enabled,
+        zkProofsEnabled: p.features.zk_proofs.enabled,
+      };
+    },
+  });
 
   // 14f. Create Context Gating tools (L2 outbound context control) and bind
   // the live enforcer to the persisted profile state before any proxy tools are
@@ -737,7 +802,7 @@ export async function createSanctuaryServer(options?: {
   bindContextGateEnforcerToProfileStore(profileStore, auditLog, contextGateEnforcer);
 
   // 14g. Create L2 Process Hardening tools
-  const hardeningTools = createL2HardeningTools(config.storage_path, auditLog);
+  const hardeningTools = createOperationalHardeningTools(config.storage_path, auditLog);
 
   // 14h. Create Sovereignty Profile tools
   const { tools: profileTools } = createSovereigntyProfileTools(profileStore, auditLog);
@@ -797,6 +862,9 @@ export async function createSanctuaryServer(options?: {
       shrOpts: { config, identityManager, masterKey },
       sanctuaryConfig: config,
       profileStore,
+      // Recognition panel (P5): storage for the local bridge-commitment list +
+      // local attestation-store reputation evidence (counts, never a score).
+      storage,
     });
     // v1.1.1 hotfix: bind the v1.1 dashboard at /v1.1 + hub API at
     // /api/hub/* on the embedded dashboard path so operators see the
@@ -850,6 +918,24 @@ export async function createSanctuaryServer(options?: {
         config,
       }),
     );
+    // Loopback auto-auth (parity with `sanctuary dashboard`,
+    // dashboard-standalone.ts): the master key that unlocked this fortress
+    // above is strictly stronger than the in-memory dashboard bearer token, so
+    // a loopback caller after a successful unlock should not be re-challenged.
+    // Without this, the embedded native posture surface (castle-wall-macos,
+    // which boots the server via `sanctuary --dashboard`) gets 401'd on its
+    // tokenless loopback reads whenever an operator configures a dashboard auth
+    // token, leaving the badge stuck and the embed rendering a raw 401 page.
+    // Gated identically to the standalone path (loopback host AND at least one
+    // identity decrypted), so the threat model is unchanged. State-changing
+    // approval-decision routes remain token-gated via `requireToken` regardless.
+    const dashboardHostIsLoopback =
+      config.dashboard.host === "127.0.0.1" ||
+      config.dashboard.host === "::1" ||
+      config.dashboard.host === "localhost";
+    if (dashboardHostIsLoopback && loadResult.loaded > 0) {
+      dashboard.setAutoAuthLocalhost(true);
+    }
     await dashboard.start();
     approvalChannel = dashboard;
   } else if (config.webhook.enabled && config.webhook.url && config.webhook.secret) {
@@ -1224,6 +1310,45 @@ export async function createSanctuaryServer(options?: {
     auditLog
   );
 
+  // 16b1. SDW sovereign-memory substrate (company-brain phase 1, wired
+  // 2026-06-18). Exposes the shipped passage store (PR #484) over MCP so a
+  // fleet agent on THIS machine can reach its own sovereign passages. This is
+  // LOCAL-ONLY: the LMDB/filesystem-backed custody store never leaves the
+  // machine. The Anthropic Memory bridge (a real API round-trip, MUST-NEVER
+  // #1) is a SEPARATE, Erik-present phase and is deliberately NOT wired here.
+  //
+  // owner_ref scopes these passages to one engine instance under this fortress
+  // (SDW identifier grammar, no '.'); a single-machine substrate uses one
+  // stable scope. memory_insert/memory_delete are Tier-1 in DEFAULT_POLICY
+  // (the delete additionally force-pinned, un-relaxable); memory_insert's body
+  // is redacted from the approval channel below (Hard Constraint #1).
+  const sdwMemoryAdapter = new SdwMemoryBackendAdapter({
+    storage,
+    masterKey,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    ownerRef: "fleet-self",
+  });
+  const sdwMemoryTools = createSdwMemoryTools({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+  }).map((tool) =>
+    tool.name === "memory_insert"
+      ? {
+          ...tool,
+          // Hard Constraint #1 / C4: redact the passage body from the approval
+          // channel. memoryInsertApprovalArgs projects to operation metadata
+          // only (the body and self-asserted taint are dropped). Shared with
+          // the redaction regression test so the wiring and the test never
+          // drift.
+          approvalTargetArgs: memoryInsertApprovalArgs,
+        }
+      : tool,
+  );
+  const sdwMemoryProvenanceTool = createSdwMemoryProvenanceTool({
+    adapter: sdwMemoryAdapter,
+    auditLog,
+  });
+
   // 16b2. Create EU AI Act compliance bundle tools (Tier 3 auto-allow —
   // read-only; emits Annex IV/Art. 12/13/14/15/26 artifacts signed by
   // the primary identity)
@@ -1328,6 +1453,8 @@ export async function createSanctuaryServer(options?: {
     ...profileTools,
     ...sanctuaryMetaTools,
     ...memoryAttestTools,
+    ...sdwMemoryTools,
+    sdwMemoryProvenanceTool,
     ...complianceTools,
     ...erc8004Tools,
     ...agentNativeTools,
@@ -1527,6 +1654,8 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "identity_set_primary",
   "identity_sign",
   "memory_attest",
+  "memory_delete",
+  "memory_insert",
   "proof_reveal",
   "reputation_export",
   "reputation_import",
@@ -1571,6 +1700,10 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "l2_hardening_status",
   "l2_verify_isolation",
   "manifest",
+  "memory_count",
+  "memory_get",
+  "memory_list",
+  "memory_search",
   "monitor_audit_log",
   "monitor_health",
   "principal_baseline_view",
@@ -1579,6 +1712,7 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "reputation_query",
   "reputation_query_weighted",
   "sanctuary_policy_status",
+  "sdw_memory_provenance",
   "shr_verify",
   "sovereignty_audit",
   "sovereignty_profile_get",
@@ -1610,9 +1744,9 @@ function classifyMcpTools(tools: ToolDefinition[]): ToolDefinition[] {
 }
 
 export { loadConfig, type SanctuaryConfig } from "./config.js";
-export { StateStore } from "./l1-cognitive/state-store.js";
-export { AuditLog } from "./l2-operational/audit-log.js";
-export { CommitmentStore } from "./l3-disclosure/commitments.js";
+export { StateStore } from "./cognitive/state-store.js";
+export { AuditLog } from "./operational/audit-log.js";
+export { CommitmentStore } from "./disclosure/commitments.js";
 export {
   createPedersenCommitment,
   verifyPedersenCommitment,
@@ -1620,54 +1754,54 @@ export {
   verifyProofOfKnowledge,
   createRangeProof,
   verifyRangeProof,
-} from "./l3-disclosure/zk-proofs.js";
+} from "./disclosure/zk-proofs.js";
 export type {
   PedersenCommitment,
   ZKProofOfKnowledge,
   ZKRangeProof,
-} from "./l3-disclosure/zk-proofs.js";
-export { PolicyStore } from "./l3-disclosure/policies.js";
-export { ReputationStore } from "./l4-reputation/reputation-store.js";
+} from "./disclosure/zk-proofs.js";
+export { PolicyStore } from "./disclosure/policies.js";
+export { ReputationStore } from "./reputation/reputation-store.js";
 export {
   resolveTier,
   computeWeightedScore,
   tierDistribution,
   TIER_WEIGHTS,
-} from "./l4-reputation/tiers.js";
-export type { SovereigntyTier, TierMetadata, TieredAttestation } from "./l4-reputation/tiers.js";
+} from "./reputation/tiers.js";
+export type { SovereigntyTier, TierMetadata, TieredAttestation } from "./reputation/tiers.js";
 export { FederationRegistry } from "./federation/registry.js";
 export type {
   FederationPeer,
   FederationCapabilities,
   PeerTrustEvaluation,
 } from "./federation/types.js";
-export { ContextGatePolicyStore } from "./l2-operational/context-gate.js";
+export { ContextGatePolicyStore } from "./operational/context-gate.js";
 export {
   TEMPLATES as CONTEXT_GATE_TEMPLATES,
   getTemplate,
   listTemplateIds,
-} from "./l2-operational/context-gate-templates.js";
-export type { ContextGateTemplate } from "./l2-operational/context-gate-templates.js";
+} from "./operational/context-gate-templates.js";
+export type { ContextGateTemplate } from "./operational/context-gate-templates.js";
 export {
   classifyField,
   recommendPolicy,
-} from "./l2-operational/context-gate-recommend.js";
+} from "./operational/context-gate-recommend.js";
 export type {
   FieldClassification,
   PolicyRecommendation,
-} from "./l2-operational/context-gate-recommend.js";
+} from "./operational/context-gate-recommend.js";
 export {
   InMemoryModelProvenanceStore,
   MODEL_PRESETS,
-} from "./l2-operational/model-provenance.js";
+} from "./operational/model-provenance.js";
 export type {
   ModelProvenance,
   ModelProvenanceStore,
-} from "./l2-operational/model-provenance.js";
+} from "./operational/model-provenance.js";
 export {
   evaluateField,
   filterContext,
-} from "./l2-operational/context-gate.js";
+} from "./operational/context-gate.js";
 export type {
   ContextGatePolicy,
   ContextGateRule,
@@ -1675,15 +1809,15 @@ export type {
   FieldFilterResult,
   ProviderCategory,
   ContextAction,
-} from "./l2-operational/context-gate.js";
+} from "./operational/context-gate.js";
 export { InjectionDetector } from "./security/injection-detector.js";
 export type {
   InjectionDetectorConfig,
   DetectionResult,
   InjectionSignal,
 } from "./security/injection-detector.js";
-export { ContextGateEnforcer } from "./l2-operational/context-gate-enforcer.js";
-export type { EnforcerConfig } from "./l2-operational/context-gate-enforcer.js";
+export { ContextGateEnforcer } from "./operational/context-gate-enforcer.js";
+export type { EnforcerConfig } from "./operational/context-gate-enforcer.js";
 export { SovereigntyProfileStore, createDefaultProfile } from "./sovereignty-profile.js";
 export type { SovereigntyProfile, SovereigntyProfileUpdate, UpstreamServer } from "./sovereignty-profile.js";
 export { ClientManager } from "./proxy/client-manager.js";
@@ -1763,6 +1897,12 @@ export type {
   PendingApproval,
   ReputationLookup,
   AggregatorSources,
+  CognitiveStatus,
+  OperationalStatus,
+  DisclosureStatus,
+  ReputationStatus,
+  // Back-compat aliases (L1-L4 rename PR-3): kept exported so downstream
+  // imports keep working.
   L1Status,
   L2Status,
   L3Status,

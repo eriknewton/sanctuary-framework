@@ -5,19 +5,19 @@
  * from one Sanctuary instance to another with full signature verification.
  *
  * Tests:
- * - Export with known identity → import with signature verification → success
- * - Export → tamper → import with verification → rejection
- * - Export → import without verification → accepts (trust-on-first-import)
+ * - Export with known identity -> import with signature verification -> success
+ * - Export -> tamper -> import with verification -> rejection
+ * - Bundle signature tamper -> import with verification -> rejection
  * - Context-filtered export only includes matching attestations
  */
 
 import { describe, it, expect } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
-import { createL1Tools } from "../../src/l1-cognitive/tools.js";
-import { createL4Tools } from "../../src/l4-reputation/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createL1Tools } from "../../src/cognitive/tools.js";
+import { createL4Tools } from "../../src/reputation/tools.js";
 import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 
 async function callTool(
@@ -94,7 +94,7 @@ describe("Reputation Portability", () => {
     expect(summary.completed).toBe(1);
   });
 
-  it("verified import rejects tampered attestations", async () => {
+  it("verified import rejects tampered reputation bundles before crediting", async () => {
     const instA = await createInstance();
 
     const identity = await callTool(instA.tools, "identity_create", {
@@ -131,9 +131,36 @@ describe("Reputation Portability", () => {
       verify_signatures: true,
     });
 
-    // Tampered attestation should be rejected
     expect(imported.imported_attestations).toBe(0);
-    expect(imported.invalid_attestations).toBe(1);
+    expect(imported.invalid_attestations).toBe(0);
+    expect(imported.completeness_verification).toBe("failed");
+    expect(imported.error).toBe(
+      "Reputation bundle completeness manifest does not match contents"
+    );
+
+    const originalBundleBytes = fromBase64url(exported.bundle as string);
+    const originalBundleJson = JSON.parse(
+      new TextDecoder().decode(originalBundleBytes)
+    );
+    originalBundleJson.bundle_signature = toBase64url(new Uint8Array(64));
+    const badSignatureBundle = toBase64url(
+      new TextEncoder().encode(JSON.stringify(originalBundleJson))
+    );
+
+    const badSignatureImport = await callTool(instB.tools, "reputation_import", {
+      bundle: badSignatureBundle,
+      verify_signatures: true,
+    });
+    expect(badSignatureImport.imported_attestations).toBe(0);
+    expect(badSignatureImport.invalid_attestations).toBe(0);
+    expect(badSignatureImport.completeness_verification).toBe("failed");
+    expect(badSignatureImport.error).toBe(
+      "Reputation bundle signature verification failed"
+    );
+
+    const query = await callTool(instB.tools, "reputation_query", {});
+    const summary = query.summary as Record<string, unknown>;
+    expect(summary.total_interactions).toBe(0);
   });
 
   it("context-filtered export only includes matching attestations", async () => {

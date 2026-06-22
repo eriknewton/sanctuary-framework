@@ -1,5 +1,5 @@
 /**
- * Security Test: SEC-005 — Import Verifies Ed25519 Signatures
+ * Security Test: SEC-005 - Import Verifies Ed25519 Signatures
  *
  * Verifies that the import path rejects entries with:
  * - Forged or invalid signatures
@@ -7,12 +7,12 @@
  *
  * This is the first test in the signature verification cluster
  * (SEC-005, SEC-010, SEC-014). The verification pattern established
- * here — mandatory verification with structured rejection counts —
+ * here - mandatory verification with structured rejection counts -
  * is the reference architecture for the subsequent two findings.
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -23,7 +23,7 @@ import {
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
-import type { StateEntry } from "../../src/l1-cognitive/state-store.js";
+import type { StateEntry } from "../../src/cognitive/state-store.js";
 
 describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
   let storage: MemoryStorage;
@@ -76,9 +76,12 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
    */
   function decodeBundle(bundleBase64: string): {
     sanctuary_export_version: number;
+    format?: string;
     exported_at: string;
     namespaces: string[];
     data: Record<string, Array<{ key: string; entry: StateEntry }>>;
+    completeness_manifest?: unknown;
+    bundle_integrity?: unknown;
   } {
     const bundleBytes = fromBase64url(bundleBase64);
     return JSON.parse(bytesToString(bundleBytes));
@@ -86,6 +89,15 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
 
   function encodeBundle(bundle: ReturnType<typeof decodeBundle>): string {
     return toBase64url(stringToBytes(JSON.stringify(bundle)));
+  }
+
+  function stripCompletenessManifest(
+    bundle: ReturnType<typeof decodeBundle>
+  ): ReturnType<typeof decodeBundle> {
+    delete bundle.completeness_manifest;
+    delete bundle.bundle_integrity;
+    delete bundle.format;
+    return bundle;
   }
 
   it("should accept valid import with correct signatures", async () => {
@@ -112,7 +124,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     ]);
 
     // Tamper with one entry's signature
-    const decoded = decodeBundle(bundle);
+    const decoded = stripCompletenessManifest(decodeBundle(bundle));
     const notesEntries = decoded.data["notes"]!;
     const tamperedEntry = notesEntries.find(
       (e) => e.key === "tampered-entry"
@@ -130,7 +142,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const freshStorage = new MemoryStorage();
     const freshStore = new StateStore(freshStorage, masterKey);
 
-    const result = await freshStore.import(tamperedBundle, "skip", resolver);
+    const result = await freshStore.import(tamperedBundle, "skip", resolver, {
+      allowUnverifiedLegacy: true,
+    });
 
     expect(result.imported_keys).toBe(1); // Only the good entry
     expect(result.skipped_invalid_sig).toBe(1); // The tampered entry
@@ -143,7 +157,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     ]);
 
     // Change the kid to a nonexistent identity
-    const decoded = decodeBundle(bundle);
+    const decoded = stripCompletenessManifest(decodeBundle(bundle));
     decoded.data["notes"]![0]!.entry.kid = "nonexistent-identity-id";
 
     const modifiedBundle = encodeBundle(decoded);
@@ -152,7 +166,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const freshStorage = new MemoryStorage();
     const freshStore = new StateStore(freshStorage, masterKey);
 
-    const result = await freshStore.import(modifiedBundle, "skip", resolver);
+    const result = await freshStore.import(modifiedBundle, "skip", resolver, {
+      allowUnverifiedLegacy: true,
+    });
 
     expect(result.imported_keys).toBe(0);
     expect(result.skipped_unknown_kid).toBe(1);
@@ -167,7 +183,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     ]);
 
     // Tamper with every entry's signature
-    const decoded = decodeBundle(bundle);
+    const decoded = stripCompletenessManifest(decodeBundle(bundle));
     for (const entries of Object.values(decoded.data)) {
       for (const item of entries as Array<{ key: string; entry: StateEntry }>) {
         const sigBytes = fromBase64url(item.entry.sig);
@@ -181,7 +197,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const freshStorage = new MemoryStorage();
     const freshStore = new StateStore(freshStorage, masterKey);
 
-    const result = await freshStore.import(tamperedBundle, "skip", resolver);
+    const result = await freshStore.import(tamperedBundle, "skip", resolver, {
+      allowUnverifiedLegacy: true,
+    });
 
     expect(result.imported_keys).toBe(0);
     expect(result.skipped_invalid_sig).toBe(3);
@@ -194,7 +212,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
       { ns: "notes", key: "legit", value: "legit value" },
     ]);
 
-    const decoded = decodeBundle(validBundle);
+    const decoded = stripCompletenessManifest(decodeBundle(validBundle));
 
     // Copy the legit entry into a reserved namespace
     decoded.data["_identities"] = [
@@ -210,7 +228,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const freshStorage = new MemoryStorage();
     const freshStore = new StateStore(freshStorage, masterKey);
 
-    const result = await freshStore.import(modifiedBundle, "skip", resolver);
+    const result = await freshStore.import(modifiedBundle, "skip", resolver, {
+      allowUnverifiedLegacy: true,
+    });
 
     // The legit entry should import; the reserved namespace entry should be skipped
     expect(result.imported_keys).toBe(1);
@@ -229,7 +249,7 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
       { ns: "notes", key: "legit", value: "legit value" },
     ]);
 
-    const decoded = decodeBundle(validBundle);
+    const decoded = stripCompletenessManifest(decodeBundle(validBundle));
     decoded.data["_escrows"] = [
       {
         key: "injected",
@@ -243,7 +263,9 @@ describe("SEC-005: Import Verifies Ed25519 Signatures", () => {
     const freshStorage = new MemoryStorage();
     const freshStore = new StateStore(freshStorage, masterKey);
 
-    const result = await freshStore.import(modifiedBundle, "skip", resolver);
+    const result = await freshStore.import(modifiedBundle, "skip", resolver, {
+      allowUnverifiedLegacy: true,
+    });
 
     expect(result.imported_keys).toBe(1);
     expect(result.skipped_keys).toBeGreaterThanOrEqual(1);

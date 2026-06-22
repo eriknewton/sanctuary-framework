@@ -12,7 +12,7 @@ import { describe, it, expect, vi } from "vitest";
 import { OperatorChatService } from "../../src/chat/operator-chat-service.js";
 import type { OperatorChatServiceDeps } from "../../src/chat/operator-chat-service.js";
 import type { SubstrateSelector } from "../../src/intelligence/index.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { OperatorChatStore } from "../../src/chat/operator-chat-store.js";
 import type {
   SummarizeRequest,

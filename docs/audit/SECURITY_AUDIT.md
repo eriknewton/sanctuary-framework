@@ -52,7 +52,7 @@
 ### SEC-005 — Import Does Not Verify Ed25519 Signatures on Imported State Entries
 
 **Severity:** High
-**File:** `server/src/l1-cognitive/state-store.ts:518-598`
+**File:** `server/src/cognitive/state-store.ts:518-598`
 **Description:** The `import()` method accepts a base64-encoded bundle, parses it, and writes each `StateEntry` directly to storage without verifying the Ed25519 signature (`sig` field) or the identity reference (`kid` field) on each entry. The import skips reserved namespaces (line 541-546, good), but for all user namespaces, it writes whatever is in the bundle. An entry with a forged signature, a non-existent `kid`, or a `sig` that doesn't match the entry content is accepted and stored.
 **Attack Scenario:** An attacker creates a crafted export bundle with entries whose `kid` references a legitimate identity but whose `sig` is forged (e.g., signed by a different key). After import (which requires Tier 1 approval — so this requires social engineering the human approver), the attacker's data is indistinguishable from legitimately-created data. Subsequent `state_read` calls return these entries with signatures that will fail verification if checked, but the state store does not enforce signature verification on read.
 **Note:** This is partially mitigated by Tier 1 gating on `state_import`, but the CLAUDE.md security invariant states: "Never assume trust across the Sanctuary-Concordia boundary" — the same principle should apply to import bundles. A human approving an import has no way to verify the cryptographic integrity of the bundle's contents.
@@ -267,7 +267,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-025 — Pattern Matching Is Case-Sensitive: Field Name Case Variation Bypasses Redaction
 
 **Severity:** High
-**File:** `server/src/l2-operational/context-gate.ts:280-288`
+**File:** `server/src/operational/context-gate.ts:280-288`
 **Description:** The `matchesPattern()` function used for policy enforcement performs case-sensitive string matching. Pattern `"api_key"` matches field `"api_key"` but NOT `"API_KEY"`, `"Api_Key"`, or `"API_key"`. The recommendation engine (`context-gate-recommend.ts:194`) correctly normalizes to lowercase before matching, but the enforcement path does not. This creates a gap: the recommendation engine would flag `"API_KEY"` as "redact" but the policy enforcer would pass it through as "default action" (which is redact for default_action: "redact", but "allow" if a wildcard allow rule exists, or "deny" for default_action: "deny" which blocks the entire request rather than just redacting the field).
 **Attack Scenario:** An agent or compromised harness renames context fields to use uppercase or mixed case (e.g., `API_KEY` instead of `api_key`, `Secret_Token` instead of `secret_token`). These fields bypass explicit redact patterns while containing the same sensitive data. The default action (redact) catches most cases, but if the policy has any wildcard allow rules (e.g., `allow: ["*_data"]`), the attacker's `Secret_Data` field would match the allow pattern and pass through.
 **Sovereignty Violation:** The context gating module's stated invariant is "Redact rules take absolute priority" — but only when the field name matches the pattern's exact case.
@@ -277,7 +277,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-026 — Logging-Strict Template Allow List Is Dead Code: Wildcard Redact Overrides All Allow Rules
 
 **Severity:** High
-**File:** `server/src/l2-operational/context-gate-templates.ts:216-247`
+**File:** `server/src/operational/context-gate-templates.ts:216-247`
 **Description:** The `logging-strict` template defines both `allow: ["operation", "operation_name", "tool_name", "timestamp", ...]` and `redact: ["*"]`. Since `evaluateField()` checks redact patterns before allow patterns (context-gate.ts:142-148), and `"*"` matches every field name, every field is redacted — including those explicitly listed in `allow`. The `allow` array is entirely dead code. The template description says "Only operation names and timestamps pass through" and the `use_when` field says "usage metrics without content exposure" — but no metrics pass through either. The test at `context-gate-templates.test.ts:194-202` explicitly validates this incorrect behavior ("redacts everything for logging provider (redact * overrides allow)").
 **Attack Scenario:** This is a correctness defect rather than an exploit. A user applies the `logging-strict` template expecting operation metadata to reach their logging service. Nothing reaches the service. The user either (a) gives up on context gating, thinking it's too restrictive, or (b) creates a more permissive custom policy, potentially over-allowing. Either outcome degrades the feature's usability and may lead to less secure configurations.
 **Note:** The same structural issue exists in the `analytics` rule within logging-strict (lines 233-247).
@@ -287,7 +287,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-027 — No Size Limits on Context Objects or Policy Rule Arrays
 
 **Severity:** Medium
-**File:** `server/src/l2-operational/context-gate-tools.ts:130-143, 334-347`, `server/src/l2-operational/context-gate.ts:190-268`
+**File:** `server/src/operational/context-gate-tools.ts:130-143, 334-347`, `server/src/operational/context-gate.ts:190-268`
 **Description:** The `context_gate_filter` tool accepts an arbitrary `context` object without validating the number of keys. The `context_gate_set_policy` tool accepts a `rules` array without validating the number of rules, and each rule's `allow`, `redact`, `hash`, and `summarize` arrays are unbounded. The `filterContext()` function iterates over all keys (O(n)) and for each key evaluates against all patterns in the matched rule (O(m) per action type), yielding O(n × m) work. A context object with 100,000 keys and a rule with 10,000 redact patterns would cause significant CPU load.
 **Attack Scenario:** A compromised agent sends a `context_gate_filter` call with a context object containing 1,000,000 keys, each with a long field name. The server spends significant CPU time iterating over keys and evaluating patterns. Alternatively, the agent creates a policy with 100,000 patterns in the redact list, then filters a moderate context through it. Both achieve denial of service on the Sanctuary MCP server.
 **Mitigation:** Router-level schema validation (`router.ts`) has `MAX_STRING_BYTES` (1MB for strings) but no caps on object key count or array length.
@@ -297,7 +297,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-028 — Context Filter Only Evaluates Top-Level Keys: Nested Sensitive Data Passes Through Unexamined
 
 **Severity:** Medium
-**File:** `server/src/l2-operational/context-gate.ts:190-268`
+**File:** `server/src/operational/context-gate.ts:190-268`
 **Description:** `filterContext()` uses `Object.keys(context)` to get only top-level keys for evaluation. If a field like `task` is allowed and contains a nested object `{description: "...", api_key: "sk-123", memory: "user preferences"}`, the entire nested object passes through unchanged. The tool description says "Each top-level key is evaluated against the policy" which is accurate, but the security implication is not surfaced: redact patterns like `"api_key"` and `"memory"` will NOT catch instances nested inside allowed fields.
 **Attack Scenario:** An agent restructures its context to nest sensitive fields inside an allowed field name. For example: `{task: {description: "summarize", api_key: "sk-ant-xxx", memory: "full agent memory"}}`. The `task` key matches an allow pattern, so the entire nested object including `api_key` and `memory` passes through to the remote provider.
 **Note:** This is inherent to the flat-key design. A recursive evaluator would be more secure but would change the API contract. The minimum fix is to warn users in tool responses and documentation.
@@ -307,7 +307,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-029 — Policy Store Does Not Enforce Identity Binding on Retrieval
 
 **Severity:** Low
-**File:** `server/src/l2-operational/context-gate.ts:336-353`
+**File:** `server/src/operational/context-gate.ts:336-353`
 **Description:** When creating a policy, an optional `identity_id` can be specified to bind the policy to a specific identity. However, `ContextGatePolicyStore.get()` and `list()` return policies regardless of identity binding. Any caller who knows (or guesses) a policy ID can retrieve and use any policy, including ones bound to a different identity. Policy IDs include a timestamp and 8 random bytes (`cg-{timestamp}-{random}`), providing ~64 bits of entropy, making blind guessing impractical. However, `list()` returns all policies including their IDs, so any caller can enumerate all policies.
 **Attack Scenario:** Agent A creates a permissive policy for development use, bound to identity A. Agent B (sharing the same Sanctuary instance) calls `context_gate_list_policies` to discover the policy ID, then uses it with `context_gate_filter` to apply Agent A's permissive policy. Low severity because a shared Sanctuary instance already implies a shared trust boundary.
 
@@ -316,7 +316,7 @@ For the QA engineer reading this next: focus first on SEC-001 (can be tested wit
 ### SEC-030 — No Validation of Provider Category or Rule Array Contents in set_policy
 
 **Severity:** Low
-**File:** `server/src/l2-operational/context-gate-tools.ts:130-143`
+**File:** `server/src/operational/context-gate-tools.ts:130-143`
 **Description:** The `set_policy` handler casts `rawRules` elements without validating that `provider` is a valid `ProviderCategory`, that `allow`/`redact`/`hash`/`summarize` contain only strings, or that patterns are well-formed. Passing `provider: 123` or `allow: [null, {}, []]` results in a policy with non-string values in pattern arrays. The `matchesPattern()` function would then call `.endsWith()` or `.startsWith()` on non-string values, causing runtime errors during `filterContext()`. The `hash` and `summarize` arrays default to `[]` via `?? []`, but `allow` and `redact` also use `?? []` which only applies when the value is `null`/`undefined`, not when it's a non-array type.
 **Attack Scenario:** Agent creates a policy with `rules: [{provider: "inference", allow: "not-an-array", redact: []}]`. The allow value is cast as `string[]` but is actually a string. When `filterContext` is called, `matchesPattern()` iterates over the string's characters instead of array elements, causing incorrect pattern matching. Low severity because the broken policy would likely deny/redact rather than allow.
 
@@ -357,7 +357,7 @@ The modifications to `index.ts`, `loader.ts`, `analyzer.ts`, and `types.ts` are 
 ### SEC-036 — reputation_publish Signs With Derived Key But Publishes Identity Public Key
 
 **Severity:** High
-**File:** `server/src/l4-reputation/tools.ts:659-679`
+**File:** `server/src/reputation/tools.ts:659-679`
 **Description:** The `reputation_publish` tool derives a signing key via `derivePurposeKey(masterKey, "verascore-publish")` (line 665), constructs an Ed25519 private key from those bytes (lines 666-672), and signs the payload. However, it includes `identity.public_key` in the request body (line 687) — this is the agent's identity public key, NOT the public key corresponding to the derived signing key. The Verascore API (or any verifier) cannot verify the signature because the public key doesn't match the private key that produced the signature.
 **Attack Scenario:** An attacker who intercepts or modifies the payload in transit can alter the `data` field, and the Verascore API has no way to detect tampering because the included public key was never the signing key. This creates a false assurance of integrity — the response says `signed_by: identity.did` suggesting cryptographic binding, but the binding is broken. Additionally, on signing failure (line 677-679), the tool falls back to a placeholder all-zeros signature (`toBase64url(new Uint8Array(64))`) and still publishes, silently sending unverified data.
 **Sovereignty Violation:** Contradicts CLAUDE.md §"WHAT THESE TOOLS MUST NEVER DO" #5: "Never silently degrade to a less-secure behavior on error." The placeholder signature is exactly this.
@@ -367,7 +367,7 @@ The modifications to `index.ts`, `loader.ts`, `analyzer.ts`, and `types.ts` are 
 ### SEC-037 — reputation_publish Allows Outbound HTTP to User-Controlled URL
 
 **Severity:** Medium
-**File:** `server/src/l4-reputation/tools.ts:622, 693`
+**File:** `server/src/reputation/tools.ts:622, 693`
 **Description:** The `verascore_url` parameter defaults to `"https://verascore.ai"` but accepts any string value (line 622). The tool makes an HTTP POST to `${veracoreUrl}/api/publish` (line 693) with a JSON body containing the agent's public key and signed data. This creates a server-side request forgery (SSRF) surface — a compromised agent or prompt injection can direct the POST to arbitrary internal or external endpoints.
 **Mitigation:** The tool is not listed in any policy tier, so per the SEC-011 fix it defaults to Tier 1 (requires human approval). The human would see `verascore_url` in the approval context. However, the tool description says "Publish sovereignty data to Verascore (verascore.ai)" — a human approving based on the description might not notice a non-default URL in the args summary.
 **Attack Scenario:** Agent sets `verascore_url` to `http://169.254.169.254` (AWS metadata endpoint) or an internal service URL. The POST request reaches the internal endpoint with the agent's public key and payload data. While the response is returned to the agent (not the attacker), the POST itself could trigger side effects on internal services.

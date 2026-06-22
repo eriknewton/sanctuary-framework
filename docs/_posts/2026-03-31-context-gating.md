@@ -76,7 +76,7 @@ npx @sanctuary-framework/mcp-server
 
 The context gating tools are available immediately in v0.3.1. Start with `context_gate_apply_template` using the `inference-standard` template, then use `context_gate_recommend` to analyze your agent's actual context and tighten from there.
 
-The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). The context gating implementation is in `server/src/l2-operational/context-gate*.ts`.
+The full source is at [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework). The context gating implementation is in `server/src/operational/context-gate*.ts`.
 
 ---
 

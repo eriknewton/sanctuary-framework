@@ -11,10 +11,11 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { IdentityManager } from "../l1-cognitive/tools.js";
+import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
+import { checkNodeVersion } from "./node-version.js";
 import { exportAuditChain } from "./audit-chain-export.js";
 import {
   verifyAuditChainRecords,
@@ -41,6 +42,7 @@ export interface DoctorCommandArgs {
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   storagePath?: string;
+  nodeVersion?: string;
 }
 
 function write(stream: Writable, text: string): void {
@@ -72,6 +74,7 @@ export async function runDoctorCommand(
       storagePath,
       platform: args.platform ?? process.platform,
       execSyncFn: args.execSyncFn,
+      nodeVersion: args.nodeVersion,
     });
     if (json) {
       write(
@@ -103,8 +106,10 @@ export async function runDoctorChecks(opts: {
   storagePath: string;
   platform: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
+  nodeVersion?: string;
 }): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
+  checks.push(checkRequiredNodeVersion(opts.nodeVersion));
   checks.push(await checkStateDir(opts.storagePath));
   const masterKey = await resolveMasterKeyIfAvailable(opts.storagePath, opts.env);
   checks.push(await checkIdentity(opts.storagePath, masterKey));
@@ -114,6 +119,22 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkCastleWall(opts));
   if (masterKey) masterKey.fill(0);
   return checks;
+}
+
+function checkRequiredNodeVersion(nodeVersion?: string): DoctorCheck {
+  const result = checkNodeVersion(nodeVersion);
+  if (result.supported) {
+    return ok(
+      "node version",
+      `Node.js ${result.actualVersion} satisfies ${result.requiredMajor}.x or later`,
+      "none",
+    );
+  }
+  return fail(
+    "node version",
+    result.message,
+    `upgrade Node.js to ${result.requiredMajor}.x or later`,
+  );
 }
 
 async function checkStateDir(storagePath: string): Promise<DoctorCheck> {

@@ -27,7 +27,8 @@ import {
   authMiddleware,
   type AuthConfig,
 } from "../console/auth-middleware.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import { sendCaughtError } from "../http/error-envelope.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   COORDINATION_VIEW_AUDIT_OPS,
   type HandoffLog,
@@ -496,8 +497,10 @@ export async function handleCoordinationRoute(
     writeJSON(res, 404, { ok: false, error: "not_found", path });
     return true;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    sendCaughtError(res, 500, "internal_error", err, {
+      route: "coordination",
+      operation: `${method} ${path}`,
+    });
     return true;
   }
 }

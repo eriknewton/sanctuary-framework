@@ -11,7 +11,7 @@
 import { describe, expect, it } from "vitest";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import {
   mintProvenanceStamp,
   classifyMemoryClass,
@@ -155,7 +155,7 @@ describe("conservative partition — the load-bearing exit boundary", () => {
     expect(result.includable).toHaveLength(0);
     expect(result.excluded).toHaveLength(1);
     expect(result.excluded[0]!.effective_class).toBe("operator_owned");
-    expect(result.excluded[0]!.reason).toBe("unsealed_stamp_defaulted_operator_owned");
+    expect(result.excluded[0]!.reason).toBe("unstamped_defaulted_operator_owned");
     expect(result.excluded[0]!.sealed).toBe(false);
   });
 
@@ -258,7 +258,7 @@ describe("conservative partition — the load-bearing exit boundary", () => {
       ],
     });
     expect(result.includable).toHaveLength(0);
-    expect(result.excluded[0]!.reason).toBe("unsealed_stamp_defaulted_operator_owned");
+    expect(result.excluded[0]!.reason).toBe("unstamped_defaulted_operator_owned");
   });
 });
 

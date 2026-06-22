@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/l2-operational/audit-log.js";
+import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 

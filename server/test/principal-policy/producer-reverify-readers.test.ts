@@ -22,7 +22,7 @@
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
@@ -317,7 +317,7 @@ describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verific
     expect(posture.arm_state).not.toBe("armed");
   });
 
-  it("a marker-only policy_loaded STILL arms when NO key is configured (legacy / macOS floor preserved)", async () => {
+  it("a marker-only policy_loaded does NOT arm even when NO key is configured (no-key floor raised by the arm-set honesty narrowing)", async () => {
     const log = newLog();
     await log.appendCritical({
       layer: "l1",
@@ -334,8 +334,14 @@ describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verific
       now: NOW,
       pinnedProducerKeyB64url: null,
     });
-    expect(posture.arm_state).toBe("armed");
-    expect(posture.producer_authenticity).toBe("channel_authenticated");
+    // UPDATED by the arm-set honesty narrowing: policy_loaded attests
+    // manifest-acceptance, not live adjudication, so it is no longer arm-eligible
+    // on ANY basis. A wall that only loaded a policy now reads unknown (amber),
+    // never armed. This intentionally raises the prior no-key / macOS channel
+    // floor (which armed on a manifest-load alone); posture and feature-health
+    // now share one live-adjudication set so the banner cannot over-claim green.
+    expect(posture.arm_state).not.toBe("armed");
+    expect(posture.producer_authenticity).toBe("not_applicable");
   });
 });
 

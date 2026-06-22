@@ -11,7 +11,7 @@ import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "../../src/principal-policy/deny-vocabulary.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import type { ApprovalChannel } from "../../src/principal-policy/approval-channel.js";

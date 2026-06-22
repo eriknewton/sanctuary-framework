@@ -1,12 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { getServers } from "node:dns";
-import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
-import type { AuditLog } from "../../l2-operational/audit-log.js";
+import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
 import { composeEffectiveRules } from "../allowlist/habeas-port.js";
@@ -26,6 +26,12 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
+import {
+  isCustodyFsError,
+  readFileCustody,
+  readFileCustodyWithStats,
+  writeFileCustody,
+} from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
 import {
@@ -33,6 +39,12 @@ import {
   CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
   resolveCastleWallSocketPath,
 } from "./socket-path.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+} from "../constants.js";
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -56,6 +68,17 @@ export interface DaemonSigner {
 
 export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
   "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
+
+/**
+ * Default cadence (seconds) of the periodic AUDIT liveness heartbeat
+ * (observability Slice 2). Deliberately an AUDIT cadence (45s), an order of
+ * magnitude slower than the 5s IPC arm-lease heartbeat, so a continuously-armed
+ * wall writes a bounded number of heartbeat entries per hour and does not bloat
+ * the audit chain. The reader's enforcement freshness window
+ * (`DEFAULT_ENFORCEMENT_FRESHNESS_MS`, 10 min) is far wider than this, so a live
+ * daemon always lands at least one heartbeat inside the window.
+ */
+export const CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS = 45 as const;
 
 /**
  * launchd label of the safe-mode boot daemon. Mirror of `CASTLE_WALL_BOOT_LABEL`
@@ -158,6 +181,16 @@ export interface MacOSCastleWallDaemonInput {
    */
   armLeaseTtlSeconds?: number | null;
   armLeaseHeartbeatIntervalSeconds?: number;
+  /**
+   * Interval (seconds) of the periodic AUDIT liveness heartbeat (observability
+   * Slice 2). This is a SEPARATE, slower cadence than the ~5s IPC arm-lease
+   * heartbeat above: the IPC lease is an in-memory broadcast (no audit write),
+   * whereas this writes ONE `castle_wall_heartbeat` audit entry so a reader can
+   * tell an alive-but-idle wall from one that silently died in a quiet window.
+   * Audit cadence (default 45s), never the 5s IPC cadence, so the heartbeat does
+   * not bloat the audit chain. Tests inject a small value for determinism.
+   */
+  auditHeartbeatIntervalSeconds?: number;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -248,6 +281,15 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(leaseHeartbeat);
     leaseHeartbeat = undefined;
   };
+  const auditHeartbeatIntervalSeconds =
+    input.auditHeartbeatIntervalSeconds ??
+    CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS;
+  let auditHeartbeat: NodeJS.Timeout | undefined;
+  const stopAuditHeartbeat = (): void => {
+    if (!auditHeartbeat) return;
+    clearInterval(auditHeartbeat);
+    auditHeartbeat = undefined;
+  };
 
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
@@ -301,6 +343,14 @@ export async function startMacOSCastleWallDaemon(
             decision: response.decision,
             learn: response.learn,
             source: "castle-wall-cli",
+            // NB: deliberately NOT stamped with the Castle Wall provenance
+            // marker. An operator CLI decision is broadcast to the extension but
+            // delivery/application is not confirmed here (broadcastDecisionResponse
+            // can reach zero subscribers if the extension disconnected), so it is
+            // not proof of live enforcement. The honest posture arms only from
+            // real adjudicated flows (egress_allowed/egress_blocked via
+            // flow_decision_recorded), never from an unacknowledged operator
+            // decision. Marking this would be a false-green over-claim.
           },
           "success",
         );
@@ -308,8 +358,42 @@ export async function startMacOSCastleWallDaemon(
         return { ok: true };
       },
     },
-    onArmLeaseRevoke() {
+    async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
+      // A revoked arm-lease means the wall is no longer enforcing for this
+      // operator; stop claiming liveness too so the reader does not see a fresh
+      // heartbeat from a daemon that has been told to stand down.
+      stopAuditHeartbeat();
+      // Observability Slice 2 (false-RED fix): RECORD the intentional stand-down.
+      // Stopping the heartbeat without a recorded reason is indistinguishable
+      // from a daemon that was KILLED mid-flight, so the silent-death reader
+      // would raise a false `dead_no_heartbeat`/red alarm for the whole digest
+      // window on a deliberately-revoked wall. A clean `stop()` already files
+      // `filter_stopped`; a lease revoke must leave the same recognizable
+      // "stood down on purpose" signal. Stamped with the SAME `cw_source` marker
+      // the heartbeat carries (constructed fields only, marker LAST, no untrusted
+      // spread), so the reader recognizes it on the heartbeat's trust basis. A
+      // write failure must never crash the stand-down path; the reader fails
+      // toward the alarm (a missing stand-down reads as silent death), so a
+      // dropped marker is surfaced honestly rather than masked.
+      try {
+        await input.auditLog.append(
+          "l1",
+          CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+          input.fortressId,
+          {
+            socket_path: socketPath,
+            source: auditSource,
+            daemon_mode: daemonMode,
+            // Provenance marker LAST, from constructed fields only.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+          },
+          "success",
+        );
+        await input.auditLog.flush();
+      } catch {
+        // Intentional no-op: see comment above (fail toward the alarm).
+      }
     },
   };
   const listener = input.listenerFactory
@@ -357,7 +441,60 @@ export async function startMacOSCastleWallDaemon(
       void emitLease();
     }, heartbeatIntervalSeconds * 1000);
     leaseHeartbeat.unref();
+
+    // Observability Slice 2: periodic AUDIT liveness heartbeat. SEPARATE from the
+    // IPC arm-lease heartbeat above (that is an in-memory broadcast; this writes
+    // ONE audit entry). A reader turns a MISSING heartbeat in a quiet window into
+    // an honest "the wall silently died" alarm instead of `unknown`.
+    //
+    // Provenance: stamped with the SAME `cw_source` marker the audit consumer
+    // stamps on enforcement evidence (`egress_blocked`), built from constructed
+    // fields only (no untrusted spread) and stamped LAST, so a forger cannot mint
+    // a fake "I am alive" beat that out-ranks the marker.
+    //
+    // BASIS HONESTY: this is a DIRECT audit append, NOT routed through the signing
+    // audit consumer, so a genuine beat is CHANNEL-basis (marker only, no producer
+    // signature) on EVERY host, Linux included. The reader gates the heartbeat
+    // with `livenessEntryCounts` (a genuine channel beat counts on a key-bearing
+    // host; only a forged `producer_signed`-claiming beat with a bad signature is
+    // dropped), so the silent-death alarm stays functional on Linux. It does NOT
+    // require the stricter enforcement-evidence signature gate `egress_blocked`
+    // uses (see `principal-policy/feature-health.ts`).
+    //
+    // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
+    // real flow, so the reader keeps it OUT of the green/armed determination.
+    const emitAuditHeartbeat = async (): Promise<void> => {
+      try {
+        await input.auditLog.append(
+          "l1",
+          CASTLE_WALL_HEARTBEAT_OPERATION,
+          input.fortressId,
+          {
+            socket_path: socketPath,
+            source: auditSource,
+            daemon_mode: daemonMode,
+            // Provenance marker LAST, from constructed fields only (no untrusted
+            // spread), mirroring the audit consumer's enforcement-evidence path.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+          },
+          "success",
+        );
+        await input.auditLog.flush();
+      } catch {
+        // A heartbeat write failure must never crash the daemon or take down
+        // enforcement. The reader's silent-death detection fails toward an
+        // alarm (a MISSING heartbeat reads as fault), so a dropped beat is
+        // surfaced honestly rather than masked.
+      }
+    };
+    await emitAuditHeartbeat();
+    auditHeartbeat = setInterval(() => {
+      void emitAuditHeartbeat();
+    }, auditHeartbeatIntervalSeconds * 1000);
+    auditHeartbeat.unref();
   } catch (err) {
+    stopLeaseHeartbeat();
+    stopAuditHeartbeat();
     if (activeConfigWritten) {
       await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     }
@@ -435,6 +572,9 @@ export async function startMacOSCastleWallDaemon(
     async stop() {
       try {
         stopLeaseHeartbeat();
+        // Stop the audit liveness heartbeat in the SAME teardown that stops the
+        // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
+        stopAuditHeartbeat();
         await listener.broadcastArmLease(buildArmLease({
           armed: false,
           ttlSeconds: null,
@@ -445,7 +585,18 @@ export async function startMacOSCastleWallDaemon(
           "l1",
           "filter_stopped",
           input.fortressId,
-          { socket_path: socketPath, source: auditSource },
+          {
+            socket_path: socketPath,
+            source: auditSource,
+            // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
+            // marker the heartbeat carries so the silent-death reader recognizes
+            // this clean operator stop as an INTENTIONAL stand-down (off on
+            // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
+            // Constructed fields only, marker LAST (no untrusted spread). Gated
+            // read-side on the heartbeat's trust basis; it can only relabel red
+            // to a non-green `unknown`, never manufacture green.
+            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+          },
           "success",
         );
         await input.auditLog.flush();
@@ -490,7 +641,10 @@ async function resolveAgentOrigin(
   }
   const filePath = join(fortressPath, "policy", "egress", AGENT_ORIGIN_FILENAME);
   try {
-    const raw = await readFile(filePath, "utf8");
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(raw) as unknown;
     const validated = validateAgentOrigin(parsed);
     if (validated === null) {
@@ -519,15 +673,11 @@ async function resolveOperatorBaseline(
   }
   const filePath = join(fortressPath, "policy", "egress", OPERATOR_BASELINE_FILENAME);
   try {
-    const fileStat = await stat(filePath);
-    if ((fileStat.mode & 0o077) !== 0) {
-      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
-      console.warn(
-        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} must be mode 0600/0700-equivalent for non-owner bits; ignoring`,
-      );
-      return undefined;
-    }
-    const raw = await readFile(filePath, "utf8");
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      mode: { rejectGroupOrOther: true },
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(raw) as unknown;
     const validated = validateOperatorBaseline(parsed);
     if (validated === null) {
@@ -543,6 +693,13 @@ async function resolveOperatorBaseline(
       ? (err as NodeJS.ErrnoException).code
       : undefined;
     if (code === "ENOENT") return undefined;
+    if (isCustodyFsError(err) && err.code === "mode_rejected") {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${OPERATOR_BASELINE_FILENAME} must be mode 0600/0700-equivalent for non-owner bits; ignoring`,
+      );
+      return undefined;
+    }
     throw err;
   }
 }
@@ -595,12 +752,17 @@ async function loadLocalSigningKey(
   fortressPath: string,
   masterKey: Uint8Array,
 ): Promise<DaemonSigner> {
-  const publicKey = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+  const publicKey = await readFileCustody(join(fortressPath, CASTLE_PINNED_PUBKEY), {
+    verifyPathIdentity: true,
+  });
   if (publicKey.length !== 32) {
     throw new Error(`Pinned public key must be 32 bytes (found ${publicKey.length}).`);
   }
   let encryptedPrivateKey = JSON.parse(
-    await readFile(join(fortressPath, CASTLE_PINNED_PRIVKEY), "utf8"),
+    await readFileCustody(join(fortressPath, CASTLE_PINNED_PRIVKEY), {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    }),
   ) as EncryptedPayload;
   const privateKey = decrypt(encryptedPrivateKey, masterKey);
   try {
@@ -646,8 +808,10 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
       recursive: true,
       mode: 0o755,
     });
-    await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, { mode: 0o644 });
-    await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
+    await writeFileCustody(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, {
+      mode: 0o644,
+      createParent: false,
+    });
   } catch (error) {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.warn(
@@ -695,9 +859,10 @@ async function assertGlobalPinMatchesLiveKey(
 ): Promise<void> {
   let pin: { uid: number; bytes: Uint8Array } | null;
   try {
-    const uid = (await stat(pinPath)).uid;
-    const bytes = await readFile(pinPath);
-    pin = { uid, bytes };
+    const { data, stats } = await readFileCustodyWithStats(pinPath, {
+      verifyPathIdentity: true,
+    });
+    pin = { uid: stats.uid, bytes: data };
   } catch {
     // absent / unreadable — additive check, skip
     return;
@@ -738,7 +903,9 @@ async function loadManifestState(input: {
   }
   filenames.sort();
   for (const filename of filenames) {
-    const raw = await readFile(join(rulesDir, filename));
+    const raw = await readFileCustody(join(rulesDir, filename), {
+      verifyPathIdentity: true,
+    });
     const parsed = JSON.parse(bytesToString(raw)) as AllowlistRule;
     const issues = validateRule(parsed);
     if (issues.length > 0) {
@@ -912,12 +1079,10 @@ async function writeActiveConfigAt(
   if (createDir) {
     await mkdir(dirname(configPath), { recursive: true, mode: 0o755 });
   }
-  const tempPath = `${configPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(config)}\n`, {
-    encoding: "utf8",
+  await writeFileCustody(configPath, `${JSON.stringify(config)}\n`, {
     mode: 0o644,
+    createParent: false,
   });
-  await rename(tempPath, configPath);
   return configPath;
 }
 
@@ -948,7 +1113,10 @@ async function readActiveConfig(
 ): Promise<ActiveCastleWallConfig | null> {
   let raw: string;
   try {
-    raw = await readFile(configPath, "utf8");
+    raw = await readFileCustody(configPath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
     const code = err instanceof Error && "code" in err
       ? (err as NodeJS.ErrnoException).code

@@ -26,6 +26,7 @@ import type {
   LocalAgentRecord,
   LocalAgentRegistryFilter,
 } from "../contracts/v1.1/local-agent-records.js";
+import { effectiveLivenessStatus } from "../contracts/v1.1/liveness.js";
 import type { ChannelTemplateId } from "../policy-engine/constants.js";
 import { CHANNEL_TEMPLATE_IDS } from "../policy-engine/constants.js";
 import { applyChannelTemplate } from "../policy-engine/channel-templates.js";
@@ -87,7 +88,7 @@ import {
   type ListTasksFilter,
   type Task,
   type UpdateTaskStatusInput,
-} from "../l2-operational/task-coordination/index.js";
+} from "../operational/task-coordination/index.js";
 
 type HubServiceTaskDeps = HubServiceDeps & {
   taskService?: TaskService;
@@ -117,10 +118,15 @@ function snapshotForRecord(
   record: LocalAgentRecord,
   openInboxItemIds: string[],
 ): HubAgentStatusSnapshot {
+  // Liveness aging: the stored `active` status is the last value written and is
+  // never aged, so a dead agent would keep reading "Running / protected /
+  // verified". Age a stale `active` (last_activity_at past the window) down to
+  // `unknown` in this read-projection. This is display/SSE only; control paths
+  // read the raw record via getAgent, so liveness aging never affects them.
   const snap: HubAgentStatusSnapshot = {
     version: "1.1",
     agent_id: record.agent_id,
-    status: record.status,
+    status: effectiveLivenessStatus(record.status, record.last_activity_at),
     last_activity_at: record.last_activity_at,
     open_inbox_item_ids: openInboxItemIds,
   };

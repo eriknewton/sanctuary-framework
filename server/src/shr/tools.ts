@@ -7,31 +7,31 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import {
   generateSHR,
   type SHRGeneratorOptions,
-  type L4Evidence,
+  type ReputationEvidence,
 } from "./generator.js";
 import { verifySHR } from "./verifier.js";
 import type { SignedSHR } from "./types.js";
 import { transformSHRForGateway, transformSHRGeneric } from "./gateway-adapter.js";
-import type { ReputationStore } from "../l4-reputation/reputation-store.js";
+import type { ReputationStore } from "../reputation/reputation-store.js";
 
 /**
  * Gather L4 reputation evidence for the signing identity.
  *
  * Pulls attestation summary from the reputation store and checks the
  * audit log for at least one successful `reputation_publish` entry
- * attributed to the identity. Returns a plain `L4Evidence` struct
+ * attributed to the identity. Returns a plain `ReputationEvidence` struct
  * consumed by the SHR generator.
  */
-export async function gatherL4Evidence(
+export async function gatherReputationEvidence(
   reputationStore: ReputationStore,
   auditLog: AuditLog,
   identity: { identity_id: string; did: string }
-): Promise<L4Evidence> {
+): Promise<ReputationEvidence> {
   const summary = await reputationStore.summarizeForSHR(identity.did);
 
   // Check the audit log for any successful reputation_publish call
@@ -77,24 +77,24 @@ export function createSHRTools(
    * Returns undefined when no identity exists (the generator will
    * surface a clear error) or when the reputation store is absent.
    */
-  async function resolveL4Evidence(
+  async function resolveReputationEvidence(
     identityId: string | undefined
-  ): Promise<L4Evidence | undefined> {
+  ): Promise<ReputationEvidence | undefined> {
     if (!reputationStore) return undefined;
     const identity = identityId
       ? identityManager.get(identityId)
       : identityManager.getDefault();
     if (!identity) return undefined;
-    return gatherL4Evidence(reputationStore, auditLog, identity);
+    return gatherReputationEvidence(reputationStore, auditLog, identity);
   }
 
   const tools: ToolDefinition[] = [
     {
       name: "shr_generate",
       description:
-        "Generate a signed Sovereignty Health Report (SHR) — a machine-readable, " +
-        "cryptographically signed advertisement of this instance's sovereignty posture. " +
-        "Present this to counterparties to prove your sovereignty capabilities.",
+        "Generate a signed Sovereignty Health Report (SHR), a machine-readable posture claim. " +
+        "Present it as a signed, fresh advertisement whose signature/identity-binding/expiry/schema " +
+        "can be verified; it does not independently prove every advertised runtime capability.",
       inputSchema: {
         type: "object",
         properties: {
@@ -115,7 +115,7 @@ export function createSHRTools(
           : undefined;
 
         const identityId = args.identity_id as string | undefined;
-        const l4Evidence = await resolveL4Evidence(identityId);
+        const l4Evidence = await resolveReputationEvidence(identityId);
 
         const result = generateSHR(identityId, {
           ...generatorOpts,
@@ -198,7 +198,7 @@ export function createSHRTools(
           : undefined;
 
         const identityId = args.identity_id as string | undefined;
-        const l4Evidence = await resolveL4Evidence(identityId);
+        const l4Evidence = await resolveReputationEvidence(identityId);
 
         // Generate a fresh SHR
         const shrResult = generateSHR(identityId, {

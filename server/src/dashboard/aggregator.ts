@@ -10,15 +10,19 @@
  * safe to call repeatedly — callers control freshness.
  */
 
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
-import type { L4Evidence } from "../shr/generator.js";
-import { deriveL4Degradations } from "../shr/generator.js";
+import {
+  buildCastleWallPosture,
+  type CastleWallArmState,
+} from "../principal-policy/posture.js";
+import type { ReputationEvidence } from "../shr/generator.js";
+import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
-import type { SovereigntyTier } from "../l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../reputation/tiers.js";
 
 export type LayerState = "full" | "degraded" | "compromised";
 export type OverallStatus = "healthy" | "degraded" | "compromised";
@@ -31,7 +35,7 @@ export interface AgentInfo {
   primary_identity_id: string | null;
 }
 
-export interface L1Status {
+export interface CognitiveStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -40,7 +44,7 @@ export interface L1Status {
   memory_attest_ready: boolean;
 }
 
-export interface L2Status {
+export interface OperationalStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -50,7 +54,7 @@ export interface L2Status {
   sandbox_status: string;
 }
 
-export interface L3Status {
+export interface DisclosureStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -59,15 +63,15 @@ export interface L3Status {
   proofs_today: number;
 }
 
-/** A single L4 degradation surfaced to the dashboard widget. */
-export interface L4ActiveDegradation {
+/** A single reputation-layer degradation surfaced to the dashboard widget. */
+export interface ReputationActiveDegradation {
   code: string;
   severity: "info" | "warning" | "critical";
   description: string;
   mitigation?: string;
 }
 
-export interface L4Status {
+export interface ReputationStatus {
   label: string;
   state: LayerState;
   headline: string;
@@ -94,8 +98,17 @@ export interface L4Status {
    */
   layer_score?: number;
   /** Active L4 degradations rendered under the widget. */
-  active_degradations?: L4ActiveDegradation[];
+  active_degradations?: ReputationActiveDegradation[];
 }
+
+// ── Back-compat aliases (L1-L4 rename PR-3) ─────────────────────────────
+// The layer-numbered status type names stay exported as aliases so
+// downstream imports keep working. The functional names above are canonical.
+export type L1Status = CognitiveStatus;
+export type L2Status = OperationalStatus;
+export type L3Status = DisclosureStatus;
+export type L4Status = ReputationStatus;
+export type L4ActiveDegradation = ReputationActiveDegradation;
 
 export interface ActivityEntry {
   timestamp: string;
@@ -135,10 +148,10 @@ export interface ProtectionSnapshot {
   };
   agent: AgentInfo;
   layers: {
-    l1: L1Status;
-    l2: L2Status;
-    l3: L3Status;
-    l4: L4Status;
+    l1: CognitiveStatus;
+    l2: OperationalStatus;
+    l3: DisclosureStatus;
+    l4: ReputationStatus;
   };
   activity: ActivityEntry[];
   pending_approvals: PendingApproval[];
@@ -171,11 +184,40 @@ export interface AggregatorSources {
    * Pre-computed L4 reputation evidence for the primary identity. When
    * present the dashboard renders the evidence widget under the L4 tile
    * and computes an SHR-aligned L4 layer score. Providers build this
-   * via `gatherL4Evidence` from `shr/tools.ts`.
+   * via `gatherReputationEvidence` from `shr/tools.ts`.
    */
-  l4Evidence?: L4Evidence;
+  l4Evidence?: ReputationEvidence;
   /** Clock override for deterministic staleness rendering in tests. */
   l4Now?: Date;
+  /**
+   * The reader's pinned producer public key (base64url-no-pad), resolved lazily
+   * so post-provision wiring is observed. Threaded straight into
+   * `buildCastleWallPosture` so the dashboard hero shield arms on the SAME
+   * cryptographic basis as `/v1` G4 (posture-routes). When it returns null
+   * (macOS today / pre-provision) the wall reader falls back to the honest
+   * channel-authenticated basis, never claimed as per-producer authenticated.
+   *
+   * The HIGH never-overclaim fix this closes: without this, a key-bearing host
+   * read the wall posture on the channel basis, so a forged marker-only audit
+   * entry (an in-process writer that stamped `cw_source` but could not sign)
+   * would arm the shield green. With the key present, the reader re-verifies the
+   * producer signature and a forgery fails closed to amber. The dashboard MUST
+   * supply the same key the consumer wrote with, never a weaker basis.
+   */
+  resolvePinnedProducerKey?: () => string | null;
+  /**
+   * Slice P fail-honest signal: a producer key is EXPECTED for this fortress (the
+   * daemon published one) but the dashboard could NOT load it (present but
+   * unreadable / malformed). When true the wall reader refuses to render green on
+   * the channel basis (the posture forces `degraded`, not armed), so the hero
+   * shield goes amber rather than claiming a weaker basis than the consumer wrote
+   * with. Mutually exclusive with a non-null `resolvePinnedProducerKey()`.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for the broker daemon liveness producer. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
 }
 
 /**
@@ -183,20 +225,20 @@ export interface AggregatorSources {
  * gateway-adapter DEGRADATION_IMPACT table so the dashboard and the SHR
  * gateway export agree on the number.
  */
-const L4_DEGRADATION_IMPACT: Record<"critical" | "warning" | "info", number> = {
+const REPUTATION_DEGRADATION_IMPACT: Record<"critical" | "warning" | "info", number> = {
   critical: 40,
   warning: 25,
   info: 10,
 };
 
-function computeL4LayerScore(
+function computeReputationLayerScore(
   degradations: SHRDegradation[],
   status: LayerState
 ): number {
   if (status === "compromised") return 0;
   let score = 100;
   for (const deg of degradations) {
-    score -= L4_DEGRADATION_IMPACT[deg.severity] ?? 10;
+    score -= REPUTATION_DEGRADATION_IMPACT[deg.severity] ?? 10;
   }
   score = Math.max(0, score);
   if (degradations.length === 0 && score > 50) {
@@ -225,6 +267,16 @@ function countInjectionsToday(audit: AuditEntry[]): number {
     return op.includes("injection") || op.includes("blocked");
   }).length;
 }
+
+/**
+ * Window for treating an L2 gate-adjudication audit entry as evidence the
+ * Principal Policy gate is live. The dashboard re-aggregates on operator view
+ * (not a tight poll), so a 15-minute window keeps a genuinely-busy gate reading
+ * "active" between glances without letting a long-idle (or dead) gate keep the
+ * "active" claim indefinitely. Idle-but-loaded falls back to "configured",
+ * which is still honest.
+ */
+const GATE_ADJUDICATION_WINDOW_MS = 15 * 60 * 1000;
 
 /** Proof-creation ops — update this allowlist when adding new ZK tools. */
 const PROOF_CREATION_OPS = new Set([
@@ -277,27 +329,92 @@ function buildAgent(
   };
 }
 
-function buildL1(
+function buildCognitive(
   sources: AggregatorSources,
-  audit: AuditEntry[]
-): L1Status {
+  audit: AuditEntry[],
+  /**
+   * True only when a live audit chain was read AND verified clean this snapshot.
+   * "State encrypted at rest" is an enforcement claim (the namespaces are
+   * encrypted and the tamper-evident chain confirms it); we may assert it only
+   * with live integrity evidence. Absent that (no audit log wired, or a read that
+   * could not confirm the chain) we downgrade to the honest "Encryption
+   * configured" (the crypto is set up, but nothing live confirms it right now).
+   */
+  hasLiveIntegrityEvidence: boolean
+): CognitiveStatus {
   const hasIdentity = !!sources.identityManager?.getDefault();
   const state: LayerState = hasIdentity ? "full" : "degraded";
+  let headline: string;
+  if (!hasIdentity) {
+    headline = "No sovereign identity — run sanctuary_bootstrap";
+  } else if (hasLiveIntegrityEvidence) {
+    headline = "State encrypted at rest";
+  } else {
+    headline = "Encryption configured (no live integrity check)";
+  }
+  // `memory_attest_ready` claims the memory-attestation path can actually
+  // produce a verifiable attestation, not merely that an identity exists. A
+  // bare identity with no live audit chain cannot anchor an attestation, so we
+  // gate on the SAME live-integrity evidence that earns the "encrypted at rest"
+  // claim: a signing identity AND an audit chain that was read and verified
+  // clean this snapshot. Absent that, the honest answer is "not ready".
+  const memoryAttestReady = hasIdentity && hasLiveIntegrityEvidence;
   return {
     label: "L1 Cognitive",
     state,
-    headline: hasIdentity
-      ? "State encrypted at rest"
-      : "No sovereign identity — run sanctuary_bootstrap",
+    headline,
     encryption: "AES-256-GCM + HKDF per namespace",
     injection_blocked_today: countInjectionsToday(audit),
-    memory_attest_ready: hasIdentity,
+    memory_attest_ready: memoryAttestReady,
   };
 }
 
-function buildL2(sources: AggregatorSources): L2Status {
+/**
+ * Recent L2 (Principal Policy gate) adjudication evidence. The gate writes
+ * `layer: "l2"` audit entries with a `gate_*` operation every time it actually
+ * adjudicates an operation (`gate_allow`, `gate_deny`, `gate_injection_block`,
+ * `gate_allow_proxy`, `gate_unclassified`, `gate_approval_proof`, etc.). A
+ * recent such entry is positive evidence the gate is not just loaded but live
+ * and adjudicating.
+ *
+ * Not every `layer: "l2"` entry is an adjudication: boot-time custody/rollback
+ * envelope writes (e.g. `custody_rollback_suspected`) and `principal_policy_view`
+ * (a policy *read*, not an enforcement decision) also carry `layer: "l2"`.
+ * Counting those as adjudications would flip an unexercised or merely-viewed
+ * policy to "active", overclaiming enforcement. We therefore require the
+ * `gate_` operation prefix that only genuine gate decisions emit.
+ */
+function hasRecentGateAdjudication(audit: AuditEntry[]): boolean {
+  const cutoff = Date.now() - GATE_ADJUDICATION_WINDOW_MS;
+  return audit.some((e) => {
+    if (e.layer !== "l2") return false;
+    if (!e.operation?.startsWith("gate_")) return false;
+    const ts = new Date(e.timestamp).getTime();
+    return !isNaN(ts) && ts >= cutoff;
+  });
+}
+
+function buildOperational(
+  sources: AggregatorSources,
+  audit: AuditEntry[]
+): OperationalStatus {
   const teeAvailable = sources.teeAvailable ?? false;
   const state: LayerState = teeAvailable ? "full" : "degraded";
+  // `sandbox_status` previously read the literal "Principal Policy gate active"
+  // unconditionally, even when no policy was loaded. "Active" is an enforcement
+  // claim (the gate is live and adjudicating); a loaded config alone earns only
+  // "configured", and the absence of a policy must read as exactly that. We
+  // reserve "active" for observed adjudication evidence (a recent L2 audit
+  // entry), report "configured" when a policy is loaded but unexercised, and
+  // "No Principal Policy loaded" when nothing gates operations.
+  let sandbox_status: string;
+  if (!sources.policy) {
+    sandbox_status = "No Principal Policy loaded";
+  } else if (hasRecentGateAdjudication(audit)) {
+    sandbox_status = "Principal Policy gate active";
+  } else {
+    sandbox_status = "Principal Policy gate configured (no recent adjudication)";
+  }
   return {
     label: "L2 Operational",
     state,
@@ -307,14 +424,14 @@ function buildL2(sources: AggregatorSources): L2Status {
     isolation_type: teeAvailable ? "hardware-tee" : "process-level",
     tee_available: teeAvailable,
     tee_status: teeAvailable ? "Attested" : "Not available — normal on local dev",
-    sandbox_status: "Principal Policy gate active",
+    sandbox_status,
   };
 }
 
-function buildL3(
+function buildDisclosure(
   sources: AggregatorSources,
   audit: AuditEntry[]
-): L3Status {
+): DisclosureStatus {
   /** L4 attestation-producing ops — update when adding new VC tools. */
   const VC_ISSUING_OPS = new Set([
     "reputation_record",
@@ -337,7 +454,7 @@ function buildL3(
   };
 }
 
-function buildL4(sources: AggregatorSources): L4Status {
+function buildReputation(sources: AggregatorSources): ReputationStatus {
   const rep = sources.reputation;
   const hasDid = !!sources.identityManager?.getDefault()?.did;
 
@@ -345,9 +462,9 @@ function buildL4(sources: AggregatorSources): L4Status {
   // reputation store. These do not replace the Verascore score; they
   // complement it so the dashboard can honestly describe the underlying
   // attestation state even when a Verascore score is attached.
-  const evidenceBlock = buildL4EvidenceBlock(sources);
+  const evidenceBlock = buildReputationEvidenceBlock(sources);
 
-  const base: L4Status = rep?.score != null
+  const base: ReputationStatus = rep?.score != null
     ? {
         label: "L4 Reputation",
         state: "full",
@@ -398,21 +515,21 @@ function buildL4(sources: AggregatorSources): L4Status {
   };
 }
 
-interface L4EvidenceBlock {
-  evidence: NonNullable<L4Status["evidence"]>;
+interface ReputationEvidenceBlock {
+  evidence: NonNullable<ReputationStatus["evidence"]>;
   layer_score: number;
-  active_degradations: L4ActiveDegradation[];
+  active_degradations: ReputationActiveDegradation[];
 }
 
-function buildL4EvidenceBlock(
+function buildReputationEvidenceBlock(
   sources: AggregatorSources
-): L4EvidenceBlock | null {
+): ReputationEvidenceBlock | null {
   const ev = sources.l4Evidence;
   if (!ev) return null;
 
-  const degradations = deriveL4Degradations(ev, sources.l4Now ?? new Date());
+  const degradations = deriveReputationDegradations(ev, sources.l4Now ?? new Date());
   const status: LayerState = degradations.length > 0 ? "degraded" : "full";
-  const layer_score = computeL4LayerScore(degradations, status);
+  const layer_score = computeReputationLayerScore(degradations, status);
 
   return {
     evidence: {
@@ -434,11 +551,22 @@ function buildL4EvidenceBlock(
 }
 
 function computeOverall(
-  l1: L1Status,
-  l2: L2Status,
-  l3: L3Status,
-  l4: L4Status
+  l1: CognitiveStatus,
+  l2: OperationalStatus,
+  l3: DisclosureStatus,
+  l4: ReputationStatus,
+  enforcement: { wallArmState: CastleWallArmState; auditIntegrityOk: boolean }
 ): ProtectionSnapshot["overall"] {
+  // Fail closed on a tamper-flagged or unreadable audit chain: the evidence the
+  // overall light would be judged from is itself untrustworthy, so it can never
+  // render green (mirrors posture.ts chain_verified gating).
+  if (!enforcement.auditIntegrityOk) {
+    return {
+      status: "compromised",
+      light: "red",
+      headline: "Audit chain integrity check failed",
+    };
+  }
   const critical: LayerState[] = [l1.state, l3.state, l4.state];
   if (
     critical.includes("compromised") ||
@@ -451,18 +579,31 @@ function computeOverall(
     };
   }
   const allCriticalFull = critical.every((s) => s === "full");
-  if (allCriticalFull && l2.state === "full") {
+  const wallArmed = enforcement.wallArmState === "armed";
+
+  // GREEN requires the ENFORCING layer to be proven armed, not just the
+  // config-present layers (identity / DID / Verascore). A wall that is dead,
+  // not-enforcing, or never wired keeps the overall light amber even when the
+  // configured layers are all present. Never fake green: a green shield asserts
+  // the agent is being enforced, which the configured layers alone do not prove.
+  if (allCriticalFull && wallArmed && (l2.state === "full" || l2.state === "degraded")) {
     return {
       status: "healthy",
       light: "green",
-      headline: "All layers full",
+      headline:
+        l2.state === "full"
+          ? "All layers full, Castle Wall enforcing"
+          : "Castle Wall enforcing, L2 degraded (no TEE on this host)",
     };
   }
-  if (allCriticalFull && l2.state === "degraded") {
+  if (allCriticalFull && !wallArmed) {
+    // The configured layers are present but enforcement is not confirmed. The
+    // honest amber: identity/disclosure/reputation are set up, but the one
+    // enforcing layer is not proving it is on.
     return {
-      status: "healthy",
-      light: "green",
-      headline: "L1·L3·L4 full — L2 degraded (no TEE on this host)",
+      status: "degraded",
+      light: "yellow",
+      headline: castleWallNotEnforcingHeadline(enforcement.wallArmState),
     };
   }
   return {
@@ -470,6 +611,18 @@ function computeOverall(
     light: "yellow",
     headline: "One or more layers degraded",
   };
+}
+
+/** Honest headline for the configured-but-enforcement-not-confirmed amber. */
+function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
+  switch (arm) {
+    case "degraded":
+      return "Layers configured, Castle Wall degraded (not enforcing)";
+    case "not_installed":
+      return "Layers configured, Castle Wall not installed on this host";
+    default:
+      return "Layers configured, Castle Wall enforcement not confirmed";
+  }
 }
 
 function buildUpstreamServers(
@@ -536,20 +689,74 @@ export async function getProtectionSnapshot(
   sources: AggregatorSources
 ): Promise<ProtectionSnapshot> {
   let audit: AuditEntry[] = [];
+  // A tamper-flagged or unreadable audit chain must NEVER let the rollup render
+  // green: the evidence the overall light is judged from would itself be
+  // untrustworthy. Track integrity here and fail closed in computeOverall.
+  let auditIntegrityOk = true;
+  // POSITIVE integrity evidence: a live audit chain was read AND its
+  // integrity_findings came back present-and-empty THIS snapshot. Unlike
+  // `auditIntegrityOk` (which defaults true so the overall light is not falsely
+  // red with no audit log), this defaults FALSE and is earned only by a clean
+  // live read; it gates the L1 "State encrypted at rest" enforcement claim,
+  // which must never be asserted from config-presence alone (never-overclaim).
+  let hasLiveIntegrityEvidence = false;
   if (sources.auditLog) {
     try {
       const result = await sources.auditLog.query({ limit: MAX_AUDIT });
       audit = result.entries;
+      // A real AuditLog.query always returns integrity_findings; treat an absent
+      // field (non-conforming stub) as "no findings" rather than a false red. A
+      // THROWN read still fails closed below.
+      auditIntegrityOk = (result.integrity_findings?.length ?? 0) === 0;
+      // Only a real, present, empty integrity_findings array is positive
+      // evidence the chain verified clean. An absent field (non-conforming stub)
+      // is NOT live evidence and must not earn the "encrypted at rest" claim.
+      hasLiveIntegrityEvidence =
+        Array.isArray(result.integrity_findings) &&
+        result.integrity_findings.length === 0;
     } catch {
       audit = [];
+      auditIntegrityOk = false;
+      hasLiveIntegrityEvidence = false;
     }
   }
 
   const agent = buildAgent(sources);
-  const l1 = buildL1(sources, audit);
-  const l2 = buildL2(sources);
-  const l3 = buildL3(sources, audit);
-  const l4 = buildL4(sources);
+  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence);
+  const l2 = buildOperational(sources, audit);
+  const l3 = buildDisclosure(sources, audit);
+  const l4 = buildReputation(sources);
+
+  // Castle Wall is the one ENFORCING layer (the thesis-gate). The overall light
+  // must never claim a healthy, enforced posture from the config-present layers
+  // (identity/DID/Verascore) alone while the wall is dead, not-enforcing, or
+  // never wired. Reuse the honest, enforcement-evidenced posture reader (the
+  // SAME signal posture-routes serves at /v1 G4) rather than a second copy.
+  // The producer-key state is threaded straight into the posture reader so the
+  // hero shield arms on the SAME cryptographic basis as /v1 G4: a key-bearing
+  // host re-verifies the producer signature (a forged marker-only entry fails
+  // closed to amber), and an expected-but-unreadable key forces non-green rather
+  // than silently dropping to the weaker channel basis. Mirrors the
+  // posture-routes / dispatchPosture wiring.
+  let wallArmState: CastleWallArmState = "unknown";
+  if (sources.auditLog) {
+    try {
+      const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
+        ? sources.resolvePinnedProducerKey()
+        : null;
+      const wall = await buildCastleWallPosture({
+        auditLog: sources.auditLog,
+        originMachine: agent.primary_identity_id ?? "local",
+        pinnedProducerKeyB64url,
+        ...(sources.producerKeyExpectedButUnavailable
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      });
+      wallArmState = wall.arm_state;
+    } catch {
+      wallArmState = "unknown";
+    }
+  }
 
   const activity = (sources.activity ?? []).slice(0, MAX_ACTIVITY);
   const pending_approvals = sources.pendingApprovals ?? [];
@@ -557,7 +764,7 @@ export async function getProtectionSnapshot(
   const upstream_servers = buildUpstreamServers(sources);
 
   return {
-    overall: computeOverall(l1, l2, l3, l4),
+    overall: computeOverall(l1, l2, l3, l4, { wallArmState, auditIntegrityOk }),
     agent,
     layers: { l1, l2, l3, l4 },
     activity,

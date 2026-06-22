@@ -61,6 +61,11 @@ import {
   signSyncEnvelope,
   type FederationSyncEnvelope,
 } from "./federation-sync-envelope.js";
+import {
+  nodeCertificateExpiresAt,
+  FEDERATION_SYNC_WIRE_VERSION,
+  type FederationNodeCertificateRenewalConfig,
+} from "./federation-revocation.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -112,11 +117,19 @@ export interface FederationContext {
    * fortress), used to wrap the reciprocal outbound slice in a peer-verifiable
    * sync envelope. Optional: when absent, a peer-sync still ACCEPTS inbound
    * (the inbound verification needs only the pinned master), but the response
-   * carries bare events the peer cannot cryptographically attribute.
+   * carries no reciprocal events because bare unattributable events fail closed.
    */
   localNodeCert?: NodeIdentityCertificate;
   /** Transient private key matching `localNodeCert.node_pubkey` (signs the reciprocal envelope). */
   getLocalNodePrivateKey?(): Uint8Array | undefined;
+  /**
+   * Revocation projection hook. Mandatory: join/sync deny a node id that is
+   * already in the grow-only revoked set; if absent or throwing, callers fail
+   * closed rather than issuing/accepting a certificate on stale state.
+   */
+  isNodeRevoked(nodeId: string): boolean;
+  /** Operator-tunable renewal policy for new/renewed node certs. */
+  nodeCertificateRenewal?: FederationNodeCertificateRenewalConfig;
   /**
    * Operator approval gate. Defaults to issuing a certificate for any
    * request that already passed cryptographic verification (the bootstrap
@@ -189,7 +202,24 @@ export class JoinCeremony {
       return { approved: false, denialReason: "unknown node_mode" };
     }
 
-    // 3. HKDF salt proof: the requester must hold the master-derived transport
+    // 3. A revoked node id cannot rejoin through the bootstrap-token path.
+    //    Re-admission requires a fresh node identity. If the revocation state
+    //    cannot be evaluated, deny rather than issue a cert on stale state.
+    try {
+      if (typeof this.ctx.isNodeRevoked !== "function") {
+        return { approved: false, denialReason: "revocation state unavailable" };
+      }
+      if (this.ctx.isNodeRevoked(request.bootstrap_token.intended_node_id)) {
+        return { approved: false, denialReason: "node revoked" };
+      }
+    } catch {
+      return {
+        approved: false,
+        denialReason: "revocation state unavailable",
+      };
+    }
+
+    // 4. HKDF salt proof: the requester must hold the master-derived transport
     //    key, not merely a stolen bootstrap token.
     let proofOk: boolean;
     try {
@@ -214,7 +244,7 @@ export class JoinCeremony {
       };
     }
 
-    // 4. node_pubkey must be a well-formed Ed25519 key.
+    // 5. node_pubkey must be a well-formed Ed25519 key.
     try {
       const key = fromBase64url(request.node_pubkey);
       if (key.length !== 32) {
@@ -224,7 +254,7 @@ export class JoinCeremony {
       return { approved: false, denialReason: "node_pubkey is malformed" };
     }
 
-    // 5. Operator approval gate. Default approver issues a certificate for the
+    // 6. Operator approval gate. Default approver issues a certificate for the
     //    (now crypto-verified) request; an injected approver may deny.
     const approver = this.ctx.approver ?? this.defaultApprover();
     let result;
@@ -258,6 +288,7 @@ export class JoinCeremony {
           issuing_principal_cert: ctx.issuingPrincipalCert,
           issuing_principal_private_key: ctx.getIssuingPrincipalPrivateKey(),
           master_private_key: ctx.getMasterPrivateKey?.(),
+          expires_at: nodeCertificateExpiresAt(ctx.nodeCertificateRenewal),
         });
         return { approved: true, certificate };
       },
@@ -296,7 +327,10 @@ export interface V1FederationDeps {
   /** Local append-only events available for exchange. */
   listFederationEvents(since?: FederationSyncCursor): FederationEvent[];
   /** Validate and append remote sync events. */
-  appendFederationEvents(events: FederationEvent[]): FederationAppendResult;
+  appendFederationEvents(
+    events: FederationEvent[],
+    options?: FederationAppendOptions,
+  ): FederationAppendResult;
   /**
    * Highest peer-sync high-water already accepted from `senderNodeId`, or null
    * if none. Gates whole-envelope rollback on the cross-node `/sync/peer` path
@@ -307,6 +341,10 @@ export interface V1FederationDeps {
   recordAcceptedHighWater(senderNodeId: string, highWater: number): void;
   /** Monotonic outbound high-water this daemon stamps on reciprocal envelopes. */
   nextOutboundHighWater(): number;
+  /** Grow-only revocation projection. Throws/false distinction is security-significant. */
+  isNodeRevoked(nodeId: string): boolean;
+  /** Best-effort local cert auto-renewal tick before this daemon presents its cert. */
+  renewLocalNodeCertificate(): void;
 }
 
 export interface FederationNodeView {
@@ -341,6 +379,11 @@ export interface FederationSyncCursor {
 export interface FederationAppendResult {
   accepted: FederationEvent[];
   rejected: Array<{ event_id: string; reason: string }>;
+}
+
+export interface FederationAppendOptions {
+  senderNodeId?: string;
+  wireVersion?: unknown;
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -585,7 +628,8 @@ async function handleSync(
     writeJson(res, 400, { error: "bad request" });
     return;
   }
-  const { node_id, events, cursor, idempotency_key, operator_signature } = body as {
+  const { wire_version, node_id, events, cursor, idempotency_key, operator_signature } = body as {
+    wire_version?: unknown;
     node_id?: unknown;
     events?: unknown;
     cursor?: unknown;
@@ -594,6 +638,16 @@ async function handleSync(
   };
   if (typeof node_id !== "string" || node_id.length === 0 || !Array.isArray(events)) {
     writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  if (wire_version !== FEDERATION_SYNC_WIRE_VERSION) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "unsupported_wire_version" },
+    });
+    denyForbidden(res);
     return;
   }
   const parsedEvents = parseFederationEvents(events);
@@ -608,6 +662,7 @@ async function handleSync(
   }
 
   const signedPayload: Record<string, unknown> = {
+    wire_version,
     node_id,
     events: parsedEvents,
   };
@@ -636,8 +691,26 @@ async function handleSync(
     return;
   }
 
-  const append = deps.appendFederationEvents(parsedEvents);
-  const outbound = deps.listFederationEvents(parsedCursor ?? undefined);
+  const append = deps.appendFederationEvents(parsedEvents, {
+    senderNodeId: node_id,
+    wireVersion: wire_version,
+  });
+  let senderRevoked: boolean;
+  try {
+    senderRevoked = deps.isNodeRevoked(node_id);
+  } catch {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "revocation_state_unavailable" },
+    });
+    denyForbidden(res);
+    return;
+  }
+  const outbound = senderRevoked
+    ? []
+    : deps.listFederationEvents(parsedCursor ?? undefined);
   await deps.audit({
     operation,
     result: append.rejected.length === 0 ? "success" : "failure",
@@ -645,12 +718,13 @@ async function handleSync(
     details: {
       accepted: append.accepted.length,
       rejected: append.rejected.length,
+      sender_revoked: senderRevoked,
     },
   });
   writeJson(res, 200, {
     accepted: append.accepted.map((event) => event.event_id),
     rejected: append.rejected,
-    events: outbound,
+    ...(senderRevoked ? {} : { events: outbound }),
     nodes: deps.listNodes(),
   });
 }
@@ -715,6 +789,7 @@ async function handlePeerSync(
     pinnedMaster: ctx.pinnedMasterPubkey,
     recipientNodeId: ctx.nodeId,
     acceptedHighWaterFor: (senderNodeId) => deps.acceptedHighWaterFor(senderNodeId),
+    isNodeRevoked: (senderNodeId) => deps.isNodeRevoked(senderNodeId),
   });
   if (!verification.ok) {
     await deps.audit({
@@ -728,9 +803,9 @@ async function handlePeerSync(
   }
 
   // The peer is a verified member of THIS fortress. Append its slice through
-  // the same hash-chain validator the self-operator path uses. Advance the
-  // per-sender high-water ONLY when the WHOLE slice appended cleanly AND it
-  // actually carried new work (>=1 accepted event):
+  // the single fail-closed revocation chokepoint. Advance the per-sender
+  // high-water ONLY when the WHOLE slice appended cleanly AND it actually
+  // carried new work (>=1 accepted event):
   //   - a partial append (sequence gap / previous_hash mismatch) must NOT burn
   //     the high-water, or a future correct lower-water resend from that sender
   //     would be wrongly rejected as a rollback;
@@ -739,7 +814,25 @@ async function handlePeerSync(
   //     to a huge value with a content-free envelope and self-DoS every future
   //     legitimate sync (codex PR-A5 r2 MEDIUM). High-water is a property of
   //     committed work, never of an empty signed envelope.
-  const append = deps.appendFederationEvents(verification.events);
+  const append = deps.appendFederationEvents(verification.events, {
+    senderNodeId: verification.senderNodeId,
+    wireVersion: verification.wireVersion,
+  });
+
+  let senderRevokedAfterAcceptance: boolean;
+  try {
+    senderRevokedAfterAcceptance = deps.isNodeRevoked(verification.senderNodeId);
+  } catch {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: verification.senderNodeId,
+      details: { reason: "revocation_state_unavailable" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
   if (append.rejected.length === 0 && append.accepted.length > 0) {
     deps.recordAcceptedHighWater(verification.senderNodeId, verification.syncHighWater);
   }
@@ -750,10 +843,14 @@ async function handlePeerSync(
   // events inside its own signed envelope; multi-hop propagation happens through
   // pairwise syncs, not delegated forwarding (which would need its own proof).
   // The cursor still scopes which of this node's own events to return.
-  const outbound = deps
-    .listFederationEvents(verification.cursor ?? undefined)
-    .filter((event) => event.origin_node_id === ctx.nodeId);
-  const responseEnvelope = buildReciprocalEnvelope(deps, ctx, verification.senderNodeId, outbound);
+  const outbound = senderRevokedAfterAcceptance
+    ? []
+    : deps
+        .listFederationEvents(verification.cursor ?? undefined)
+        .filter((event) => event.origin_node_id === ctx.nodeId);
+  const responseEnvelope = senderRevokedAfterAcceptance
+    ? null
+    : buildReciprocalEnvelope(deps, ctx, verification.senderNodeId, outbound);
 
   await deps.audit({
     operation,
@@ -763,16 +860,22 @@ async function handlePeerSync(
       accepted: append.accepted.length,
       rejected: append.rejected.length,
       high_water: verification.syncHighWater,
+      sender_revoked: senderRevokedAfterAcceptance,
+      reply_suppressed: senderRevokedAfterAcceptance,
     },
   });
 
   writeJson(res, 200, {
     accepted: append.accepted.map((event) => event.event_id),
     rejected: append.rejected,
-    // The reciprocal slice, peer-verifiable when this daemon holds its node
-    // identity; otherwise the bare events (the peer keeps its own log honest
-    // via the per-event hash chain it already validates on append).
-    ...(responseEnvelope ? { envelope: responseEnvelope } : { events: outbound }),
+    // The reciprocal slice is peer-verifiable only when this daemon holds its
+    // node identity. Missing identity returns no bare events: unattributable
+    // reciprocal data has no current wire version and fails closed.
+    ...(senderRevokedAfterAcceptance
+      ? {}
+      : responseEnvelope
+        ? { envelope: responseEnvelope }
+        : {}),
     nodes: deps.listNodes(),
   });
 }
@@ -781,8 +884,8 @@ async function handlePeerSync(
  * Wrap this daemon's outbound slice in a reciprocal {@link FederationSyncEnvelope}
  * the peer can verify the same way the daemon just verified the inbound one.
  * Returns null when this daemon does not hold its own node identity (cert +
- * private key) — in that case the response degrades to bare events rather than
- * forging an attribution. The node private key is transient and never logged.
+ * private key) rather than forging an attribution. The caller must not emit
+ * bare events as a fallback. The node private key is transient and never logged.
  */
 function buildReciprocalEnvelope(
   deps: V1FederationDeps,
@@ -790,6 +893,7 @@ function buildReciprocalEnvelope(
   recipientNodeId: string,
   outbound: FederationEvent[],
 ): FederationSyncEnvelope | null {
+  deps.renewLocalNodeCertificate();
   const nodeCert = ctx.localNodeCert;
   const nodePrivateKey = ctx.getLocalNodePrivateKey?.();
   if (!nodeCert || !nodePrivateKey) return null;

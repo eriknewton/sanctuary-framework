@@ -41,18 +41,18 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 
 | Info string | Owner module | Constant name (if any) | Purpose |
 |---|---|---|---|
-| `identity-encryption` | `server/src/l1-cognitive/tools.ts:82`, `server/src/l4-reputation/tools.ts:35`, `server/src/handshake/protocol.ts:96`, `server/src/exit/bundle.ts:524` | (literal) | Wraps Ed25519 identity private keys at rest. |
-| `audit-log` | `server/src/l2-operational/audit-log.ts:68` | (literal) | Encrypts the Operational audit log. |
+| `identity-encryption` | `server/src/cognitive/tools.ts:82`, `server/src/reputation/tools.ts:35`, `server/src/handshake/protocol.ts:96`, `server/src/exit/bundle.ts:524` | (literal) | Wraps Ed25519 identity private keys at rest. |
+| `audit-log` | `server/src/operational/audit-log.ts:68` | (literal) | Encrypts the Operational audit log. |
 | `principal-baseline` | `server/src/principal-policy/baseline.ts:40` | (literal) | Encrypts the Operational baseline-tracker store. |
-| `l2-privacy-policies-v1` | `server/src/l2-operational/privacy-core.ts:157` | (literal) | Encrypts Operational privacy policy state. |
-| `sanctuary-v1.1-privacy-content-hmac` | `server/src/l2-operational/privacy-core.ts:225` | (literal) | HMAC key for privacy-content fingerprints. |
-| `l2-privacy-placeholders` | `server/src/l2-operational/privacy-filter.ts:241` | (literal) | Encrypts Operational placeholder store. |
-| `l2-privacy-placeholder-lookup` | `server/src/l2-operational/privacy-filter.ts:242` | (literal) | Lookup-key derivation for placeholder reverse index. |
-| `l2-context-gate` | `server/src/l2-operational/context-gate.ts:320` | (literal) | Encrypts the context-gate policy store. |
-| `l3-policies` | `server/src/l3-disclosure/policies.ts:140` | (literal) | Encrypts Selective Disclosure policy store. |
-| `l3-commitments` | `server/src/l3-disclosure/commitments.ts:108` | (literal) | Encrypts Selective Disclosure commitment store. |
+| `l2-privacy-policies-v1` | `server/src/operational/privacy-core.ts:157` | (literal) | Encrypts Operational privacy policy state. |
+| `sanctuary-v1.1-privacy-content-hmac` | `server/src/operational/privacy-core.ts:225` | (literal) | HMAC key for privacy-content fingerprints. |
+| `l2-privacy-placeholders` | `server/src/operational/privacy-filter.ts:241` | (literal) | Encrypts Operational placeholder store. |
+| `l2-privacy-placeholder-lookup` | `server/src/operational/privacy-filter.ts:242` | (literal) | Lookup-key derivation for placeholder reverse index. |
+| `l2-context-gate` | `server/src/operational/context-gate.ts:320` | (literal) | Encrypts the context-gate policy store. |
+| `l3-policies` | `server/src/disclosure/policies.ts:140` | (literal) | Encrypts Selective Disclosure policy store. |
+| `l3-commitments` | `server/src/disclosure/commitments.ts:108` | (literal) | Encrypts Selective Disclosure commitment store. |
 | `bridge-commitments` | `server/src/bridge/tools.ts:44` | (literal) | Encrypts Concordia-bridge commitment store. |
-| `l4-reputation` | `server/src/l4-reputation/reputation-store.ts:202` | (literal) | Encrypts Verifiable Reputation store. |
+| `l4-reputation` | `server/src/reputation/reputation-store.ts:202` | (literal) | Encrypts Verifiable Reputation store. |
 | `sovereignty-profile` | `server/src/sovereignty-profile.ts:79` | `HKDF_DOMAIN` | Encrypts the sovereignty profile store. |
 | `intelligence-substrate-config` | `server/src/intelligence/policy-store.ts:39` | `HKDF_INFO` | Encrypts the intelligence-substrate policy store. |
 | `operator-chat-store-v1` | `server/src/chat/operator-chat-store.ts:40` | `HKDF_INFO` | Encrypts the operator-chat (concierge) store. |
@@ -76,16 +76,17 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | `concierge-memory-store-v1` | `server/src/chat/concierge-memory-store.ts:49` | `HKDF_INFO` | Encrypts the concierge memory store. **(scan-reconciled 2026-06-16; decryptable store.)** |
 | `query-anonymity-reverse-mapping-v1` | `server/src/query-anonymity/reverse-mapping-store.ts:21` | `HKDF_INFO` | (Already documented in row above for Rho-3 reverse mappings; constant `HKDF_INFO`.) **(scan note 2026-06-16: confirmed present.)** |
 | `distress-inbox` | `server/src/distress/inbox.ts:60` | (literal) | Encrypts the distress inbox store. **(scan-reconciled 2026-06-16; decryptable store.)** |
-| `audit-head-anchor` | `server/src/l2-operational/audit-log.ts:387,646` | (literal) | MAC key for the audit-log head anchor (tamper-evident chain head). **(scan-reconciled 2026-06-16; MAC/crypto-domain label, not a decryptable store.)** |
-| `audit-rotation-anchor` | `server/src/l2-operational/audit-log.ts:645` | (literal) | MAC key for the audit-log rotation anchor. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
-| `audit-epoch-wrap` | `server/src/l2-operational/audit-log.ts:164` | `AUDIT_EPOCH_WRAP_PURPOSE` | AEAD wrap key for per-epoch audit keys. **(scan-reconciled 2026-06-16; key-wrap/crypto-domain label.)** |
-| `audit-epoch-record-mac` | `server/src/l2-operational/audit-log.ts:165` | `AUDIT_EPOCH_MAC_PURPOSE` | MAC key for per-epoch audit records. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `audit-head-anchor` | `server/src/operational/audit-log.ts:387,646` | (literal) | MAC key for the audit-log head anchor (tamper-evident chain head). **(scan-reconciled 2026-06-16; MAC/crypto-domain label, not a decryptable store.)** |
+| `audit-rotation-anchor` | `server/src/operational/audit-log.ts:645` | (literal) | MAC key for the audit-log rotation anchor. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `audit-epoch-wrap` | `server/src/operational/audit-log.ts:164` | `AUDIT_EPOCH_WRAP_PURPOSE` | AEAD wrap key for per-epoch audit keys. **(scan-reconciled 2026-06-16; key-wrap/crypto-domain label.)** |
+| `audit-epoch-record-mac` | `server/src/operational/audit-log.ts:165` | `AUDIT_EPOCH_MAC_PURPOSE` | MAC key for per-epoch audit records. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
 | `custody-envelope-mac` | `server/src/core/master-custody.ts:577` | (literal) | MAC key for the custody envelope. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
 | `custody-sentinel` | `server/src/core/master-custody.ts:702,823` | (literal) | Custody-sentinel probe key. **(scan-reconciled 2026-06-16; crypto-domain label.)** |
 | `custody-rotation-journal-mac` | `server/src/core/master-rotation.ts:147` | `JOURNAL_MAC_PURPOSE` | MAC key for the custody rotation journal. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
 | `custody-rollback-freeze-mac` | `server/src/core/anti-rollback.ts:181`, `core/master-rotation.ts:450` | `FREEZE_MAC_PURPOSE` / `ROLLBACK_FREEZE_MAC_PURPOSE` | MAC key for the rollback-freeze record. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
 | `custody-epoch-witness-mac` | `server/src/core/anti-rollback.ts:177` | `EPOCH_WITNESS_MAC_PURPOSE` | MAC key for the custody epoch-witness record. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
-| `state-meta-mac` | `server/src/l1-cognitive/state-store.ts:467,1773` | (literal) | MAC key for Cognitive state-store metadata. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `state-meta-mac` | `server/src/cognitive/state-store.ts:467,1773` | (literal) | MAC key for Cognitive state-store metadata. **(scan-reconciled 2026-06-16; MAC/crypto-domain label.)** |
+| `state-export-bundle-mac-v1` | `server/src/cognitive/state-store.ts:77` | (literal) | MAC key binding the portable state-export bundle body + completeness manifest together (anti-lock-in integrity verification). **(scan-reconciled 2026-06-21; MAC/crypto-domain label.)** |
 | `sdw-catalog-v1` | `server/src/sdw/records.ts:8` (`SDW_CATALOG_HKDF_INFO`) | `SDW_CATALOG_HKDF_INFO` | Encrypts the SDW catalog store. **(scan-reconciled 2026-06-16; decryptable store.)** |
 | `sdw-working-state-v1` | `server/src/sdw/records.ts:9` | `SDW_WORKING_STATE_HKDF_INFO` | Encrypts the SDW working-state store. **(scan-reconciled 2026-06-16; decryptable store.)** |
 | `sdw-query-history-v1` | `server/src/sdw/records.ts:10` | `SDW_QUERY_HISTORY_HKDF_INFO` | Encrypts the SDW query-history store. **(scan-reconciled 2026-06-16; decryptable store.)** |
@@ -102,7 +103,7 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 |---|---|---|---|
 | `sanctuary-fortress-mode-v1` | `server/src/fortress/config.ts:44` (constant defined at `fortress/constants.ts:156`) | `HKDF_FORTRESS_MODE_INFO` | Encrypts the fortress-mode config store. |
 | `sanctuary-composition-v1` | `server/src/composition/constants.ts:149` | `HKDF_COMPOSITION_INFO` | Encrypts composition config and per-composition state. |
-| `<arbitrary state-namespace name>` | `server/src/l1-cognitive/state-store.ts:171` | (caller-supplied) | Per-namespace Cognitive-layer state encryption. The namespace name is the agent's namespace identifier. Underscore-prefixed namespaces (e.g. `_meta`, `_context_gate_policies`) are reserved for internal use. |
+| `<arbitrary state-namespace name>` | `server/src/cognitive/state-store.ts:171` | (caller-supplied) | Per-namespace Cognitive-layer state encryption. The namespace name is the agent's namespace identifier. Underscore-prefixed namespaces (e.g. `_meta`, `_context_gate_policies`) are reserved for internal use. |
 
 ### D. Direct hkdf() callers (explicit salt + info)
 
@@ -128,10 +129,10 @@ These strings serve the same domain-separation purpose as HKDF info but appear i
 
 | String | Use site | Purpose |
 |---|---|---|
-| `sanctuary-pedersen-generator-H-v1-a` / `sanctuary-pedersen-generator-H-v1-b` | `server/src/l3-disclosure/zk-proofs.ts:42-43` | Hash-to-curve seed strings for the Pedersen second generator. |
-| `sanctuary-zk-pok-v1` | `server/src/l3-disclosure/zk-proofs.ts:247,277` | Fiat-Shamir transcript label for proof-of-knowledge. |
-| `sanctuary-zk-range-sum-v1` | `server/src/l3-disclosure/zk-proofs.ts:361,418` | Fiat-Shamir transcript label for range-sum proof. |
-| `sanctuary-zk-bit-v1` | `server/src/l3-disclosure/zk-proofs.ts:462,492,529` | Fiat-Shamir transcript label for bit-decomposition proof. |
+| `sanctuary-pedersen-generator-H-v1-a` / `sanctuary-pedersen-generator-H-v1-b` | `server/src/disclosure/zk-proofs.ts:42-43` | Hash-to-curve seed strings for the Pedersen second generator. |
+| `sanctuary-zk-pok-v1` | `server/src/disclosure/zk-proofs.ts:247,277` | Fiat-Shamir transcript label for proof-of-knowledge. |
+| `sanctuary-zk-range-sum-v1` | `server/src/disclosure/zk-proofs.ts:361,418` | Fiat-Shamir transcript label for range-sum proof. |
+| `sanctuary-zk-bit-v1` | `server/src/disclosure/zk-proofs.ts:462,492,529` | Fiat-Shamir transcript label for bit-decomposition proof. |
 | `sanctuary-sign-challenge-v1` | `server/src/sanctuary-tools.ts:563` | Domain-separation prefix for signed challenges. |
 | `key-17:x402-signer:v1` | `server/src/key-17/x402-signer.ts:61` (direct `hkdf()` info) | Derives the x402 payment-signer key. The `key-17` folder token is embedded in the label, so the folder must NEVER be renamed without a crypto migration. **(scan-reconciled 2026-06-16.)** |
 | `key-17:erc8004-identity:v1` | `server/src/key-17/erc8004-identity-signer.ts:58` (direct `hkdf()` info) | Derives the ERC-8004 identity-signer key. Folder token embedded. **(scan-reconciled 2026-06-16.)** |

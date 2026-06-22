@@ -13,8 +13,8 @@
 
 import type { ToolDefinition } from "./router.js";
 import { toolResult } from "./router.js";
-import type { IdentityManager } from "./l1-cognitive/tools.js";
-import type { AuditLog } from "./l2-operational/audit-log.js";
+import type { IdentityManager } from "./cognitive/tools.js";
+import type { AuditLog } from "./operational/audit-log.js";
 import type { PrincipalPolicy } from "./principal-policy/types.js";
 import type { SanctuaryConfig } from "./config.js";
 import { sign as identitySign } from "./core/identity.js";
@@ -26,9 +26,9 @@ const PASSPHRASE_BACKUP_WARNING =
 import { derivePurposeKey } from "./core/key-derivation.js";
 import { toBase64url } from "./core/encoding.js";
 import { createIdentity } from "./core/identity.js";
-import { generateSHR, type L4Evidence } from "./shr/generator.js";
-import { gatherL4Evidence } from "./shr/tools.js";
-import type { ReputationStore } from "./l4-reputation/reputation-store.js";
+import { generateSHR, type ReputationEvidence } from "./shr/generator.js";
+import { gatherReputationEvidence } from "./shr/tools.js";
+import type { ReputationStore } from "./reputation/reputation-store.js";
 
 export interface SanctuaryToolsOptions {
   config: SanctuaryConfig;
@@ -90,11 +90,11 @@ export function createSanctuaryTools(
    * Build L4 evidence for an existing identity. Returns undefined when
    * no reputation store is configured (generator then leaves L4 alone).
    */
-  async function l4EvidenceForIdentity(
+  async function reputationEvidenceForIdentity(
     identity: { identity_id: string; did: string }
-  ): Promise<L4Evidence | undefined> {
+  ): Promise<ReputationEvidence | undefined> {
     if (!reputationStore) return undefined;
-    return gatherL4Evidence(reputationStore, auditLog, identity);
+    return gatherReputationEvidence(reputationStore, auditLog, identity);
   }
 
   /**
@@ -102,7 +102,7 @@ export function createSanctuaryTools(
    * The identity was just created so `NO_REPUTATION_HISTORY` and
    * `NO_VERASCORE_LINK` will always fire — that's the truth of the state.
    */
-  function emptyL4Evidence(): L4Evidence {
+  function emptyReputationEvidence(): ReputationEvidence {
     return {
       attestation_count: 0,
       tier_distribution: {
@@ -125,8 +125,8 @@ export function createSanctuaryTools(
       description:
         "One-shot bootstrap for a new sovereign agent identity. " +
         "Generates an Ed25519 keypair, stores the encrypted identity, " +
-        "constructs a Sovereignty Health Report (SHR), and publishes it to Verascore. " +
-        "Returns { did, profileUrl, tier } for the newly-minted agent.",
+        "constructs an SHR, and OPTIONALLY publishes to Verascore when publish=true " +
+        "and auto-publish is enabled. Returns DID/profile URL/tier plus published status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -170,7 +170,7 @@ export function createSanctuaryTools(
           config,
           identityManager,
           masterKey,
-          l4Evidence: emptyL4Evidence(),
+          l4Evidence: emptyReputationEvidence(),
         });
         if (typeof shr === "string") {
           return toolResult({
@@ -297,9 +297,9 @@ export function createSanctuaryTools(
     {
       name: "sanctuary_policy_status",
       description:
-        "Return a summary of the active Principal Policy: which operations " +
-        "require approval (Tier 1), which are subject to anomaly detection " +
-        "(Tier 2), and which auto-allow with audit (Tier 3).",
+        "Return active Principal Policy summary: explicit Tier 1 and Tier 3 operation " +
+        "lists plus Tier 2 anomaly-detection configuration. Tier 2 is not exposed as " +
+        "a named operation list.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -367,7 +367,7 @@ export function createSanctuaryTools(
           });
         }
 
-        const l4Evidence = await l4EvidenceForIdentity(identity);
+        const l4Evidence = await reputationEvidenceForIdentity(identity);
         const shr = generateSHR(identity.identity_id, {
           config,
           identityManager,

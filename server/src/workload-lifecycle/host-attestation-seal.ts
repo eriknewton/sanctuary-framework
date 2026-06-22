@@ -30,7 +30,7 @@
  * a `consent_ref` is ever recorded). No workload content enters the entry.
  */
 
-import type { AuditEntryInput, AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditEntryInput, AuditLog } from "../operational/audit-log.js";
 import { WORKLOAD_LIFECYCLE_OPS } from "./constants.js";
 import {
   hostAttestationBundleHash,

@@ -34,8 +34,8 @@ function bytesToHex(bytes: Uint8Array): string {
   return hex;
 }
 import type { SanctuaryConfig } from "../../config.js";
-import type { IdentityManager } from "../../l1-cognitive/tools.js";
-import type { AuditLog, AuditEntry } from "../../l2-operational/audit-log.js";
+import type { IdentityManager } from "../../cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../../operational/audit-log.js";
 import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StoredIdentity } from "../../core/identity.js";
 import type { ToolDefinition } from "../../router.js";
@@ -910,7 +910,7 @@ function renderDelta(
 
 /**
  * Allowed Verascore hostnames for the SSRF allow-list. Matches the
- * set used by `reputation_publish` in `src/l4-reputation/tools.ts`.
+ * set used by `reputation_publish` in `src/reputation/tools.ts`.
  * Mirrored here rather than imported so the compliance generator
  * does not couple to the reputation module's internals.
  */
@@ -1198,9 +1198,22 @@ export async function generateEuAiActBundle(
 // ── MCP tool factory ─────────────────────────────────────────────────
 
 /**
- * Factory for the `compliance_generate_eu_ai_act_bundle` MCP tool.
- * Tier 3 (auto-allow, read-only) — the tool emits documents based
- * on existing Sanctuary state and does not modify anything.
+ * Factory for the EU AI Act compliance MCP tools.
+ *
+ * - compliance_eu_ai_act_annex_iii_classify: Tier 3 (auto-allow, read-only).
+ *   A rule-based classifier over free text; its output carries no policy
+ *   thresholds, so it stays agent-callable.
+ * - compliance_generate_eu_ai_act_bundle: Tier 1 (operator approval required).
+ *   It does not modify state, but the generated bundle BODY embeds the verbatim
+ *   Tier-2 anomaly policy (e.g. frequency_spike_multiplier), the approval-channel
+ *   timeout, and audit-derived aggregate gate-decision counts. Auto-allowing it
+ *   would hand the agent a policy-inference oracle (no-read invariant,
+ *   CLAUDE.md #7), the same leak class as audit_export_siem through a different
+ *   door. It is also a governance conflict of interest: an agent must not
+ *   generate its own compliance attestation (cf. the self-attested-reputation
+ *   vuln). The OPERATOR who approves the bundle may see this structure, so the
+ *   document bodies are unchanged; only the gate moved (Tier 3 to Tier 1, CISO
+ *   NEW-1).
  */
 export function createComplianceTools(deps: GeneratorDeps): {
   tools: ToolDefinition[];
@@ -1246,14 +1259,18 @@ export function createComplianceTools(deps: GeneratorDeps): {
       name: "compliance_generate_eu_ai_act_bundle",
       description:
         "Generate an EU AI Act compliance bundle for a given agent " +
-        "and reporting period. Produces 6 Markdown documents plus a " +
-        "signed JSON manifest, covering Annex IV technical " +
+        "and reporting period. Produces 7 core Markdown documents plus a signed JSON " +
+        "manifest, and may add 08_delta.md when delta_from_bundle_path is supplied. Covers Annex IV technical " +
         "documentation (Art. 11), Art. 12 automatic record-keeping, " +
         "Art. 13 transparency, Art. 14 human oversight, Art. 15 " +
         "cybersecurity, and Art. 26 deployer obligations. Every " +
         "file is individually SHA-256 hashed and signed with the " +
-        "provider's primary Ed25519 identity. NOT LEGAL ADVICE — " +
-        "consult qualified counsel before filing.",
+        "provider's primary Ed25519 identity. NOT LEGAL ADVICE - " +
+        "consult qualified counsel before filing. " +
+        "Tier 1 (operator approval required): the bundle body embeds your " +
+        "anomaly-detection thresholds, approval timeout, and audit-derived " +
+        "decision counts, so it is not auto-allowed (prevents policy-inference), " +
+        "and an agent must not generate its own compliance attestation.",
       inputSchema: {
         type: "object",
         properties: {

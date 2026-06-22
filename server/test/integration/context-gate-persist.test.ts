@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { SovereigntyProfileStore } from "../../src/sovereignty-profile.js";
 import {
   createContextGateTools,
   initializeContextGateEnforcerFromProfile,
-} from "../../src/l2-operational/context-gate-tools.js";
+} from "../../src/operational/context-gate-tools.js";
 
 describe("context gate restart persistence", () => {
   let tempDir: string | null = null;
@@ -28,8 +28,23 @@ describe("context gate restart persistence", () => {
     const firstStorage = new FilesystemStorage(tempDir);
     const firstProfileStore = new SovereigntyProfileStore(firstStorage, masterKey);
     await firstProfileStore.load();
+    const firstAuditLog = new AuditLog(firstStorage, masterKey);
+    const { policyStore } = createContextGateTools(firstStorage, masterKey, firstAuditLog);
+    const policy = await policyStore.create(
+      "persisted-policy",
+      [
+        {
+          provider: "tool-api",
+          allow: ["payload"],
+          redact: ["api_key"],
+          hash: [],
+          summarize: [],
+        },
+      ],
+      "redact"
+    );
     await firstProfileStore.update({
-      context_gating: { enabled: true, policy_id: "persisted-policy" },
+      context_gating: { enabled: true, policy_id: policy.policy_id },
     });
 
     const restartedStorage = new FilesystemStorage(tempDir);
@@ -43,7 +58,7 @@ describe("context gate restart persistence", () => {
     expect(restartedProfile.features.context_gating.enabled).toBe(true);
     expect(enforcer.getStatus()).toMatchObject({
       enabled: true,
-      default_policy_id: "persisted-policy",
+      default_policy_id: policy.policy_id,
     });
   });
 });

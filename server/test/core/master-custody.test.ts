@@ -556,7 +556,7 @@ describe("two-factor custody floor", () => {
     const storage = new MemoryStorage();
     const master = await envelopeWith(storage, "interactive", 1);
 
-    const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
     const { createIdentity } = await import("../../src/core/identity.js");
     const mgr = new IdentityManager(storage, master);
     const { storedIdentity } = createIdentity(
@@ -571,7 +571,7 @@ describe("two-factor custody floor", () => {
     const storage = new MemoryStorage();
     const master = await envelopeWith(storage, "interactive", 1);
 
-    const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
     const { createIdentity } = await import("../../src/core/identity.js");
     const mgr = new IdentityManager(storage, master);
     const { storedIdentity } = createIdentity(
@@ -586,7 +586,7 @@ describe("two-factor custody floor", () => {
     const storage = new MemoryStorage();
     const master = await envelopeWith(storage, "headless", 1);
 
-    const { IdentityManager } = await import("../../src/l1-cognitive/tools.js");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
     const { createIdentity } = await import("../../src/core/identity.js");
     const mgr = new IdentityManager(storage, master);
     const { storedIdentity } = createIdentity(
@@ -643,7 +643,7 @@ describe("two-factor custody floor", () => {
     const master = await envelopeWith(storage, "interactive", 1);
 
     const { ReputationStore } = await import(
-      "../../src/l4-reputation/reputation-store.js"
+      "../../src/reputation/reputation-store.js"
     );
     const store = new ReputationStore(storage, master);
     await expect(

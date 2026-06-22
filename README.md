@@ -1,5 +1,9 @@
 # Sanctuary
 
+[![CI](https://github.com/eriknewton/sanctuary-framework/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eriknewton/sanctuary-framework/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@sanctuary-framework/mcp-server.svg)](https://www.npmjs.com/package/@sanctuary-framework/mcp-server)
+[![License](https://img.shields.io/npm/l/@sanctuary-framework/mcp-server.svg)](LICENSE)
+
 **Your Agent. Your Machine. Your Keys.**
 
 Sanctuary wraps any AI agent harness in a substrate that protects you at the kernel, signs every action with keys you hold, and keeps the data and reputation your agents accumulate on your hardware. Whether you run one agent or a fleet, the substrate stays yours.
@@ -8,7 +12,7 @@ Sovereignty used to be embodied. In the physical world, your body provided the p
 
 Today: cryptographic identity you hold, kernel-level enforcement that holds even when the agent doesn't cooperate (Linux proven; macOS in flight), and a portable audit trail that travels across machines and vendors. In scope: the Sovereign Data Warehouse (your working data, query history, and document corpus on your substrate, not a vendor's silo) and federation across your own machines.
 
-Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline?
+Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra?
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --openclaw
@@ -18,13 +22,13 @@ npx @sanctuary-framework/mcp-server protect --openclaw
 
 ## Install
 
-Already running OpenClaw, Hermes, Claude Code, Cursor, or Cline? One command wraps it.
+Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra? One command wraps it.
 
 ```bash
 npx @sanctuary-framework/mcp-server protect --openclaw
 ```
 
-Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
+Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for any other MCP-compatible harness. Compatibility for the named harnesses is exercised on every release; other MCP-compatible harnesses work via the `--wrap` flag and are covered as drills extend the matrix. See the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md) for the current per-harness status. You keep using the harness you already like. Sanctuary adds the substrate underneath, invisibly.
 
 What happens when you run protect:
 
@@ -48,7 +52,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.3.3** on the npm `latest` channel (shipped 2026-05-26). v1.3.3 lands Castle Wall macOS Phase 2.5 retail UX, the Track 4A server-to-sysext IPC integration, and the Track 4A.2 sysext socket-path discovery file. See the [v1.3.3 release notes](docs/releases/v1.3.3.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.4.0** on the npm `latest` channel (cut 2026-06-15, the first tag since v1.3.2). v1.4.0 brings the published package back in line with `main`: it adds the macOS Castle Wall per-uid allow/deny enforcement demonstration (drill 2026-06-11), a wave of Sentinel and audit-surface hardening, the agent-native cooperative surface, the Sovereign Data Workspace storage spine, federation v1 plumbing, and signed transparency checkpoints with opt-in external-anchoring scaffolding. See the [v1.4.0 release notes](docs/releases/v1.4.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
@@ -66,7 +70,7 @@ Current capability summary:
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Castle Wall (OS-level egress enforcement): Linux | Shipped (Phase 1, 2026-05-06) |
-| Castle Wall macOS: signed sysext, host app, Phase 2.5 retail UX, IPC integration | Sysext + activation wiring shipped in v1.3.3; active enforcement code (NEFilterManager arming) on main post-v1.3.3; end-to-end Mini1 drill PASS pending |
+| Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; per-uid allow/deny egress-enforcement demonstrated on a real host (drill 2026-06-11, one host / one OS version). Not reboot-survival; not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
 | Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
@@ -79,7 +83,7 @@ Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sys
 
 ## For AI coding agents installing Sanctuary on behalf of an operator
 
-If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
+If you are an LLM-powered coding agent (OpenClaw, Hermes Agent, Claude Code, Cursor, Cline, Mastra, Codex, or any other harness with shell access) and an operator has asked you to install Sanctuary, follow this section. Humans can skip to "Installation reference" below; you will arrive at the same commands.
 
 **Operator-facing summary first.** Before running anything, give the operator one paragraph:
 
@@ -104,6 +108,9 @@ test -d "$HOME/Library/Application Support/Cursor" && echo "harness=cursor"
 
 # Cline (VS Code extension config)
 test -d "$HOME/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev" && echo "harness=cline"
+
+# Mastra (config presence)
+{ test -f "$HOME/.mastra/mcp.json" || test -f "$HOME/mastra/mcp.json" || test -f "$HOME/.config/mastra/mcp.json"; } && echo "harness=mastra"
 ```
 
 If multiple match, ask the operator which one to wrap. If none match, the operator does not have a recognized harness installed; offer to install one or use the raw MCP server path (Step 4 below).
@@ -114,7 +121,7 @@ If multiple match, ask the operator which one to wrap. If none match, the operat
 npx @sanctuary-framework/mcp-server protect --<harness>
 ```
 
-Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, or `cline`. For any harness not in that list, see Step 4.
+Substitute `<harness>` with the value detected in Step 1: `openclaw`, `hermes`, `claude-code`, `cursor`, `cline`, or `mastra`. For any harness not in that list, see Step 4.
 
 Wait for the command to complete (typically 20-40 seconds). Expected output ends with a line like:
 
@@ -236,7 +243,7 @@ Store it securely. It derives the encryption keys for all persistent state. If l
 sovereignty_audit
 ```
 
-Scores your setup 0-100 across security, isolation, and privacy. Detects problems and tells you exactly what to fix. Available as both a CLI command and an MCP tool inside any wrapped harness.
+Scores your setup 0-100 across security, isolation, and privacy from your live configuration and profile. Optional features that default off (context gating, zero-knowledge proofs) only count toward the score once you enable them, and the top "full" verdict is reserved for a posture where those optional layers are actually on, so a fresh install scores below full, reads below the full verdict, and the report flags the gaps with the steps to close them. Available as both a CLI command and an MCP tool inside any wrapped harness.
 
 ---
 
@@ -284,7 +291,7 @@ The operator holds the keys in every mode. The sovereign-managed mode will requi
 
 Sanctuary installs the substrate sovereignty used to come with. Architecturally it ships as five named mechanisms.
 
-**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) shipped in v1.3.3; active enforcement code on main awaiting end-to-end Mini1 drill PASS. Windows on the roadmap.
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) has a proven per-uid allow/deny egress-enforcement demonstration captured on a real host (drill 2026-06-11): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected. That is a demonstration on one host and one OS version, not reboot-survival and not an audited per-rule-per-flow trail. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 
@@ -323,7 +330,8 @@ Sanctuary wraps MCP-compatible harnesses. The named harnesses below are exercise
 - **Claude Code** (`sanctuary protect --claude-code`)
 - **Cursor** (`sanctuary protect --cursor`)
 - **Cline** (`sanctuary protect --cline`)
-- **Mastra**, **LangGraph**, and custom harnesses (`sanctuary protect --wrap <path>`)
+- **Mastra** (`sanctuary protect --mastra`)
+- **LangGraph** and custom harnesses (`sanctuary protect --wrap <path>`)
 - Any other MCP-compatible harness via direct MCP config
 
 ---

@@ -12,10 +12,17 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { AuditLog } from "../../src/l2-operational/audit-log.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { createSIEMTools } from "../../src/audit/siem-tools.js";
+import { fingerprintIdentityId } from "../../src/agent-native/safety-base.js";
+
+// The agent-callable SIEM export is scoped to the CALLER's own identity and
+// emits only the agent ALLOWLIST view (no tier, no agent DID, no session id, no
+// raw gate decision; severity from result/decision only). These tests seed all
+// entries under the bound caller identity and assert the safe contract.
+const CALLER = "agent-001";
 
 describe("SIEM Export Integration", () => {
   let auditLog: AuditLog;
@@ -26,25 +33,32 @@ describe("SIEM Export Integration", () => {
     const masterKey = generateRandomKey();
     auditLog = new AuditLog(storage, masterKey);
 
-    // Create SIEM tools and extract the audit_export_siem tool
-    const { tools } = createSIEMTools(auditLog);
+    // Bind the SIEM tools to the caller identity (own-identity filter).
+    const { tools } = createSIEMTools(auditLog, () => ({
+      identity_id: CALLER,
+      requester_identity_fingerprint: fingerprintIdentityId(CALLER),
+    }));
     tool = tools.find((t) => t.name === "audit_export_siem");
     expect(tool).toBeDefined();
 
-    // Seed the audit log with test entries
-    // Note: AuditLog.append() always uses current timestamp, so we can't
-    // set historical timestamps directly. All entries will be recent.
+    // Seed the audit log with test entries (all owned by CALLER so the
+    // own-identity filter returns them). The agent-safe coarse `decision` is
+    // taken from the allowlisted `decision` detail; `tier`/`agent_did`/
+    // `session_id` are intentionally still seeded to PROVE they never escape.
+    // Note: AuditLog.append() always uses current timestamp.
 
-    // Entry 1: sovereignty_audit, approve/T2, success
-    await auditLog.append("l2", "sovereignty_audit", "agent-001", {
+    // Entry 1: sovereignty_audit, allow, success
+    await auditLog.append("l2", "sovereignty_audit", CALLER, {
+      decision: "allow",
       gate_decision: "approve",
       tier: 2,
       session_id: "sess-audit-1",
       agent_did: "did:key:z6MkhaXgBZDvotDkL5257faWxcqV7aGHRH694QuspGGbLsEU",
     });
 
-    // Entry 2: state_read, auto-allow/T3, success
-    await auditLog.append("l2", "state_read", "agent-001", {
+    // Entry 2: state_read, auto-allow, success
+    await auditLog.append("l2", "state_read", CALLER, {
+      decision: "allow",
       gate_decision: "auto-allow",
       tier: 3,
       session_id: "sess-read-1",
@@ -52,7 +66,8 @@ describe("SIEM Export Integration", () => {
     });
 
     // Entry 3: state_delete, deny, failure
-    await auditLog.append("l2", "state_delete", "agent-002", {
+    await auditLog.append("l2", "state_delete", CALLER, {
+      decision: "deny_once",
       gate_decision: "deny",
       tier: 1,
       session_id: "sess-delete-1",
@@ -60,7 +75,8 @@ describe("SIEM Export Integration", () => {
     }, "failure");
 
     // Entry 4: reputation_import, deny, failure
-    await auditLog.append("l4", "reputation_import", "agent-003", {
+    await auditLog.append("l4", "reputation_import", CALLER, {
+      decision: "deny_once",
       gate_decision: "deny",
       tier: 1,
       session_id: "sess-rep-1",
@@ -94,20 +110,26 @@ describe("SIEM Export Integration", () => {
       });
     });
 
-    it("should include gate decisions in CEF output", async () => {
+    it("should include agent-safe coarse decisions in CEF output", async () => {
       const result = await tool.handler({ format: "cef" });
       const cefOutput = result.content[1].text;
 
-      expect(cefOutput).toContain("outcome=approve");
-      expect(cefOutput).toContain("outcome=auto-allow");
+      // Coarse, agent-safe outcomes (allow / auto-allow / deny) — derived from
+      // the allowlisted `decision` value and result, NOT the raw gate decision.
+      expect(cefOutput).toContain("outcome=allow");
       expect(cefOutput).toContain("outcome=deny");
     });
 
-    it("should include agent DIDs in CEF src field", async () => {
+    it("never leaks agent DID, tier, or session id in CEF output (allowlist)", async () => {
       const result = await tool.handler({ format: "cef" });
       const cefOutput = result.content[1].text;
 
-      expect(cefOutput).toContain("src=did:key:");
+      // Policy/identity attribution must NOT ride out through a SIEM record.
+      expect(cefOutput).not.toContain("src=did:key:");
+      expect(cefOutput).not.toContain("did:key:");
+      expect(cefOutput).not.toContain("tier=");
+      expect(cefOutput).not.toContain("cs1=sess-");
+      expect(cefOutput).not.toContain("SessionId");
     });
 
     it("should map deny to CEF severity 8", async () => {
@@ -376,6 +398,31 @@ describe("SIEM Export Integration", () => {
       const metadata = JSON.parse(result.content[0].text);
 
       expect(metadata.count).toBeLessThanOrEqual(metadata.total_available);
+    });
+
+    it("operator export still carries the coarse SIEM signal after the Tier-1 re-tier (CISO MED-1)", async () => {
+      // Re-tiering audit_export_siem to Tier 1 gates the AGENT; the OPERATOR who
+      // approves the export runs the handler exactly as below. #573 reduced the
+      // SIEM formatter to the agent-safe allowlist (coarse allow/deny outcome
+      // derived from `result`, plus severity/disposition; the fine gate decision
+      // and tier/agent_did/session were stripped as defense-in-depth). The export
+      // still carries the security signal a SIEM consumer needs. NOTE: whether to
+      // restore richer operator-only fields now that this surface is Tier-1 is a
+      // tracked CISO re-review follow-up, intentionally NOT decided here.
+
+      // CEF: coarse per-event outcome (allow/deny derived from result) + severity.
+      const cef = (await tool.handler({ format: "cef" })).content[1].text;
+      expect(cef).toContain("outcome=allow");
+      expect(cef).toContain("outcome=deny");
+      expect(cef).toMatch(/^CEF:0\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|\d+\|/m); // severity field
+
+      // OCSF: severity_id + disposition_id (coarse security signal) preserved.
+      const ocsf = JSON.parse((await tool.handler({ format: "ocsf" })).content[1].text);
+      expect(ocsf.length).toBeGreaterThan(0);
+      for (const obj of ocsf) {
+        expect(obj).toHaveProperty("severity_id");
+        expect(obj).toHaveProperty("disposition_id");
+      }
     });
   });
 });

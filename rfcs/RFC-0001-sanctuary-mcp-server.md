@@ -1471,18 +1471,18 @@ MVS satisfies the following Sanctuary Framework requirements at the following le
 │   │   ├── key-derivation.ts       # Argon2id, HKDF
 │   │   └── random.ts               # Secure random generation
 │   │
-│   ├── l1-cognitive/               # Layer 1: Cognitive Sovereignty
+│   ├── cognitive/               # Layer 1: Cognitive Sovereignty
 │   │   ├── state-store.ts          # Encrypted state read/write
 │   │   ├── identity-root.ts        # Identity management tools
 │   │   ├── merkle.ts               # Merkle tree maintenance
 │   │   └── migration.ts            # State export/import
 │   │
-│   ├── l2-operational/             # Layer 2: Operational Isolation
+│   ├── operational/             # Layer 2: Operational Isolation
 │   │   ├── attestation.ts          # Environment attestation
 │   │   ├── monitor.ts              # Health and resource reporting
 │   │   └── audit-log.ts            # Sovereignty audit log
 │   │
-│   ├── l3-disclosure/              # Layer 3: Selective Disclosure
+│   ├── disclosure/              # Layer 3: Selective Disclosure
 │   │   ├── commitments.ts          # Commitment schemes (MVS)
 │   │   ├── proof-engine.ts         # ZK proof generation (v0.2+)
 │   │   ├── disclosure-policy.ts    # Policy evaluation
@@ -1492,7 +1492,7 @@ MVS satisfies the following Sanctuary Framework requirements at the following le
 │   │       ├── threshold-proof.wasm
 │   │       └── ...
 │   │
-│   ├── l4-reputation/              # Layer 4: Verifiable Reputation
+│   ├── reputation/              # Layer 4: Verifiable Reputation
 │   │   ├── reputation-store.ts     # Attestation recording and query
 │   │   ├── reputation-proofs.ts    # ZK reputation proofs (v0.2+)
 │   │   ├── trust-bootstrap.ts      # Escrow and guarantees

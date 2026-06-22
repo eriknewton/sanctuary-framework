@@ -10,12 +10,12 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
-import type { AuditLog } from "../l2-operational/audit-log.js";
+import type { AuditLog } from "../operational/audit-log.js";
 import type { HandshakeResult } from "../handshake/types.js";
-import { ReputationStore } from "../l4-reputation/reputation-store.js";
-import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../l4-reputation/tiers.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import { resolveTierByDid, TIER_WEIGHTS, type TierMetadata } from "../reputation/tiers.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
@@ -354,9 +354,10 @@ export function createBridgeTools(
       name: "bridge_attest",
       description:
         "Record a Concordia negotiation as a Sanctuary L4 reputation attestation, " +
-        "linked to a bridge commitment. This completes the bridge: the commitment " +
-        "(L3) proves the terms were agreed, and the attestation (L4) feeds the " +
-        "sovereignty-weighted reputation score. The attestation is automatically " +
+        "linked to a bridge commitment. The commitment (L3) proves the revealed " +
+        "outcome matches the committer's signed commitment and terms hash; it does " +
+        "not independently prove Concordia agreement or counterparty assent. The " +
+        "attestation (L4) feeds the sovereignty-weighted reputation score. The attestation is automatically " +
         "tagged with the counterparty's sovereignty tier from any completed handshake.",
       inputSchema: {
         type: "object",

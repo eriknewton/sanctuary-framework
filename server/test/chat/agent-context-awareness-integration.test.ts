@@ -17,7 +17,7 @@ import {
   type AgentContextSnapshot,
 } from "../../src/chat/agent-context-cache.js";
 import type { SubstrateSelector } from "../../src/intelligence/index.js";
-import type { AuditLog } from "../../src/l2-operational/audit-log.js";
+import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { OperatorChatStore } from "../../src/chat/operator-chat-store.js";
 import type {
   ConciergeMemoryStore,

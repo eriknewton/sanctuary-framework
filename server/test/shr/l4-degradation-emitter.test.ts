@@ -13,7 +13,7 @@ import {
   DEFAULT_LOW_TIER_DOMINANCE_THRESHOLD,
   type L4Evidence,
 } from "../../src/shr/generator.js";
-import type { SovereigntyTier } from "../../src/l4-reputation/tiers.js";
+import type { SovereigntyTier } from "../../src/reputation/tiers.js";
 
 function zeroTiers(): Record<SovereigntyTier, number> {
   return {

@@ -6,8 +6,8 @@ import { Writable } from "node:stream";
 
 import { runExitCommand } from "../../src/exit/cli.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { StateStore } from "../../src/l1-cognitive/state-store.js";
-import { IdentityManager } from "../../src/l1-cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import {
   deriveMasterKey,
   derivePurposeKey,

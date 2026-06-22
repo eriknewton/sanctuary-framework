@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
-import type { AuditEntry, AuditLog } from "../l2-operational/audit-log.js";
-import { buildAgentSearchCorpus } from "../l2-operational/agent-audit-redaction.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
+import {
+  buildAgentSearchCorpus,
+  redactAuditEntryForAgent,
+} from "../operational/agent-audit-redaction.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
@@ -305,6 +308,52 @@ export function createAgentNativeCooperativeTools(
     };
   }
 
+  function forgetModeIsSecure(args: Record<string, unknown>): boolean {
+    return args.mode === "secure";
+  }
+
+  async function applyHideSideEffects(
+    args: Record<string, unknown>,
+    primitiveArgs: Record<string, unknown>,
+    read: Record<string, unknown>
+  ): Promise<{ marker: HiddenMarker; auditRef: string } | null> {
+    if (!isVerifiedRead(read) || typeof read.version !== "number") {
+      return null;
+    }
+    const opts = (args.opts as Record<string, unknown> | undefined) ?? {};
+    const ttl = typeof opts.ttl === "number" ? opts.ttl : undefined;
+    const marker: HiddenMarker = {
+      namespace: primitiveArgs.namespace as string,
+      key: primitiveArgs.key as string,
+      version: read.version,
+      content_hash: stateContentHash(read),
+      hidden_at: new Date().toISOString(),
+      ...(ttl ? { ttl_expires_at: new Date(Date.now() + ttl * 1000).toISOString() } : {}),
+    };
+    await storeHiddenMarker(marker);
+    const auditRef = await audit("sanctuary_hide", {
+      marker_namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
+      marker_hash: sha256(canonicalJson(marker)),
+      target: `${marker.namespace}/${marker.key}`,
+    });
+    return { marker, auditRef };
+  }
+
+  async function applyForgetSideEffects(
+    args: Record<string, unknown>,
+    primitiveArgs: Record<string, unknown>
+  ): Promise<string> {
+    await deleteHiddenMarker(
+      primitiveArgs.namespace as string,
+      primitiveArgs.key as string
+    );
+    return await audit("sanctuary_forget", {
+      primitive_tool: "state_delete",
+      primitive_args_hash: normalizedArgsHash(primitiveArgs),
+      facade_call: { key: args.key, mode: args.mode },
+    });
+  }
+
   function classifyIntent(intent: string): {
     safety_class: "ordinary" | "sensitive" | "gated";
     tool: string | null;
@@ -482,14 +531,7 @@ export function createAgentNativeCooperativeTools(
   function redactEvent(entry: AuditEntry, index: number): Record<string, unknown> {
     return {
       cursor_event_id: index,
-      timestamp: entry.timestamp,
-      layer: entry.layer,
-      operation: entry.operation,
-      result: entry.result,
-      identity_match: entry.identity_id === active().identity_id,
-      summary: {
-        has_details: !!entry.details,
-      },
+      ...redactAuditEntryForAgent(entry),
     };
   }
 
@@ -613,25 +655,12 @@ export function createAgentNativeCooperativeTools(
         try {
           const primitiveArgs = recallPrimitiveArgs(args);
           const read = await callPrimitive("state_read", primitiveArgs);
-          if (read.denied || !isVerifiedRead(read) || typeof read.version !== "number") {
+          if (read.denied) {
             return deny("audit:sanctuary_hide");
           }
-          const opts = (args.opts as Record<string, unknown> | undefined) ?? {};
-          const ttl = typeof opts.ttl === "number" ? opts.ttl : undefined;
-          const marker: HiddenMarker = {
-            namespace: primitiveArgs.namespace as string,
-            key: primitiveArgs.key as string,
-            version: read.version,
-            content_hash: stateContentHash(read),
-            hidden_at: new Date().toISOString(),
-            ...(ttl ? { ttl_expires_at: new Date(Date.now() + ttl * 1000).toISOString() } : {}),
-          };
-          await storeHiddenMarker(marker);
-          const auditRef = await audit("sanctuary_hide", {
-            marker_namespace: FACADE_HIDDEN_MARKER_NAMESPACE,
-            marker_hash: sha256(canonicalJson(marker)),
-            target: `${marker.namespace}/${marker.key}`,
-          });
+          const hiddenResult = await applyHideSideEffects(args, primitiveArgs, read);
+          if (!hiddenResult) return deny("audit:sanctuary_hide");
+          const { marker, auditRef } = hiddenResult;
           return toolResult({
             hidden: true,
             erased: false,
@@ -646,7 +675,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_forget",
-      description: "Permanently and securely delete a memory key (random-overwrite then remove) via state_delete. Tier 1: requires operator approval; pass the approval proof. Irreversible. Returns an audit_ref for the deletion event.",
+      description: "Permanently delete a memory key via state_delete: the entry is removed and its file gets a best-effort random-byte overwrite before unlinking. On copy-on-write/SSD media (APFS, ext4, flash) the original bytes may persist, so at-rest confidentiality rests on encryption (data is stored as ciphertext), not on the overwrite. Tier 1: requires operator approval; pass the approval proof. Returns an audit_ref for the deletion event.",
       tool_class: "write",
       approvalTargetToolName: "state_delete",
       approvalTargetArgs: deletePrimitiveArgs,
@@ -665,19 +694,12 @@ export function createAgentNativeCooperativeTools(
         required: ["key", "mode", "approval_ref"],
       },
       handler: async (args) => {
-        if (args.mode !== "secure") return deny("audit:sanctuary_forget");
+        if (!forgetModeIsSecure(args)) return deny("audit:sanctuary_forget");
         try {
           const primitiveArgs = deletePrimitiveArgs(args);
           const result = await callPrimitive("state_delete", primitiveArgs);
-          await deleteHiddenMarker(
-            primitiveArgs.namespace as string,
-            primitiveArgs.key as string
-          );
-          const auditRef = await audit("sanctuary_forget", {
-            primitive_tool: "state_delete",
-            primitive_args_hash: normalizedArgsHash(primitiveArgs),
-            facade_call: { key: args.key, mode: args.mode },
-          });
+          if (result.denied || result.error) return deny("audit:sanctuary_forget");
+          const auditRef = await applyForgetSideEffects(args, primitiveArgs);
           return toolResult({ ...result, mode: "secure", audit_ref: auditRef });
         } catch {
           return deny("audit:sanctuary_forget");
@@ -686,7 +708,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_help",
-      description: "Given a free-text intent, return policy-aware guidance on which Sanctuary tools to use and how, including a runnable example for ordinary (non-gated) intents. Use to discover the right tool before acting. Read-only; returns the classified guidance plus an audit_ref.",
+      description: "Given a free-text intent, return static safety-class guidance on which Sanctuary tools to use and how, including a runnable example for ordinary (non-gated) intents. Use to discover the right tool before acting. Read-only; returns the classified guidance plus an audit_ref.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -810,16 +832,26 @@ export function createAgentNativeCooperativeTools(
           cursor.reads += 1;
           if (cursor.reads > 10) return deny("audit:sanctuary_events_read", "wait", "minutes");
           const limit = Math.min(25, Math.max(1, Number((args.opts as Record<string, unknown> | undefined)?.limit ?? 10)));
+          // Scope to the caller's identity BEFORE the limit (AuditLog.query
+          // filters identity_id before its slice) so the 500-entry window is
+          // entirely the caller's OWN entries — cursor paging no longer drops a
+          // caller's older entries that sat behind other identities' (CISO LOW,
+          // 2026-06-16).
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
-            options.auditLog.query({ operation_type: cursor.operation, limit: 500 })
+            options.auditLog.query({
+              operation_type: cursor.operation,
+              identity_id: activeIdentity.identity_id,
+              limit: 500,
+            })
           );
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
-          const own = queried.entries.filter((entry) => entry.identity_id === activeIdentity.identity_id);
-          const page = own.slice(cursor.offset, cursor.offset + limit);
-          cursor.offset += page.length;
+          const own = queried.entries;
+          const startOffset = cursor.offset;
+          const page = own.slice(startOffset, startOffset + limit);
+          cursor.offset = startOffset + page.length;
           const auditRef = await audit("sanctuary_events_read", { count: page.length });
           return toolResult({
-            events: page.map((entry, index) => redactEvent(entry, cursor.offset + index)),
+            events: page.map((entry, index) => redactEvent(entry, startOffset + index)),
             next_cursor: cursor.cursor_id,
             audit_ref: auditRef,
           });
@@ -864,26 +896,36 @@ export function createAgentNativeCooperativeTools(
         try {
           if (args.scope && args.scope !== "own_signed") return deny("audit:sanctuary_audit_search");
           const activeIdentity = active();
+          // Scope to the caller's identity BEFORE the limit (AuditLog.query
+          // filters identity_id before its slice) so the 500-entry search window
+          // is entirely the caller's OWN entries — a caller with many
+          // other-identity entries ahead of theirs no longer has older own
+          // entries pushed out of the searchable window (CISO LOW, 2026-06-16).
           const queried = await options.auditLog.runAllowingIntegrityFindings(() =>
-            options.auditLog.query({ limit: 500 })
+            options.auditLog.query({
+              identity_id: activeIdentity.identity_id,
+              limit: 500,
+            })
           );
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_audit_search");
           const needle = String(args.query).toLowerCase();
           const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10)));
           const matches = queried.entries
-            .filter((entry) => entry.identity_id === activeIdentity.identity_id)
             // Search the AGENT search-corpus projection, never the raw entry
-            // (property #11, no-policy-inference). The returned rows already omit
-            // details, but filtering over raw details would leak their presence
-            // differentially: an agent could probe a guessed `rule_id` /
-            // `rule_id_matched` / `decision_provenance` / signed-canonical-blob
-            // value and read a match off `result_count`. buildAgentSearchCorpus
-            // OMITS those keys entirely — value, key NAME, and the `[redacted]`
-            // sentinel are all absent — so a probe for a sensitive value, a
-            // sensitive key name, or the sentinel can never hit. Legitimate
-            // search over `operation` and non-sensitive detail fields is
-            // preserved. The OPERATOR audit-search path stays full-fidelity (it
-            // does not call this projection).
+            // (property #11, no-policy-inference; LOW-1). The needle is matched
+            // ONLY against the operation name plus the search-ALLOWLIST of safe
+            // detail keys (buildAgentSearchCorpus) — a tiny, explicitly non-
+            // policy subset (dest_host/destination — the egress targets the agent
+            // itself supplied). Every other key — the free-text `reason`, the
+            // fine-grained `decision` (REMOVED 2026-06-16: it let an agent probe
+            // WHICH policy disposition fired off `result_count`), every
+            // `*rule_id*`, `tier`/`policy_*`, `decision_provenance`, the
+            // signed-canonical blob, and any NEW operator-attribution field — is
+            // absent from the corpus, so a probe for a sensitive value, a
+            // sensitive key NAME, or any sentinel can never differentially match
+            // off `result_count`. Because it is an allowlist, adding a sensitive
+            // detail key later cannot regress this. The OPERATOR audit-search
+            // path stays full-fidelity (it does not call this projection).
             .filter((entry) =>
               `${entry.operation} ${canonicalJson(buildAgentSearchCorpus(entry))}`
                 .toLowerCase()
@@ -928,6 +970,9 @@ export function createAgentNativeCooperativeTools(
             const stepArgs = (step.args && typeof step.args === "object" && !Array.isArray(step.args))
               ? step.args as Record<string, unknown>
               : {};
+            if (tool === "sanctuary_forget" && !forgetModeIsSecure(stepArgs)) {
+              throw new Error(FIXED_DENIAL_MESSAGE);
+            }
             const primitive =
               tool === "sanctuary_forget" ? deletePrimitiveArgs(stepArgs) :
               tool === "sanctuary_remember" ? rememberPrimitiveArgs(stepArgs) :
@@ -1014,6 +1059,26 @@ export function createAgentNativeCooperativeTools(
               step.tool === "sanctuary_recall" || step.tool === "sanctuary_hide" ? await callPrimitive("state_read", step.primitive) :
               await callPrimitive("state_delete", step.primitive);
             if (result.denied || result.error) {
+              releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
+              const auditRef = await audit("sanctuary_compound_execute", {
+                plan_hash: planHash,
+                completed_steps: completed,
+                failed_step: step.step_id,
+                release_not_consume: true,
+              }, "failure");
+              return toolResult({ status: "partial_failed", completed_steps: completed, failed_step: step.step_id, audit_ref: auditRef });
+            }
+            let sideEffectsApplied = true;
+            try {
+              if (step.tool === "sanctuary_hide") {
+                sideEffectsApplied = (await applyHideSideEffects(step.args, step.primitive, result)) !== null;
+              } else if (step.tool === "sanctuary_forget") {
+                await applyForgetSideEffects(step.args, step.primitive);
+              }
+            } catch {
+              sideEffectsApplied = false;
+            }
+            if (!sideEffectsApplied) {
               releaseReservedApprovals(reservedApprovals.filter((approval) => approval.step_id !== step.step_id));
               const auditRef = await audit("sanctuary_compound_execute", {
                 plan_hash: planHash,

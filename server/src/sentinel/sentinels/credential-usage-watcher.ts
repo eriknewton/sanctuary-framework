@@ -22,7 +22,7 @@
  *      signal class; the token-denied audit op covers those).
  *   3. Group by `details.agent` (the wrapped agent id) and
  *      `details.secret` (the secret id). The audit payload shape
- *      comes from `l3-disclosure/broker/token-issuer.ts`.
+ *      comes from `disclosure/broker/token-issuer.ts`.
  *   4. Bucket into 24h windows ending at `now()`. Window 0 = current
  *      24h, windows 1..7 = the prior 7 days. Same shape Phi-1's
  *      egress-volume watcher uses.
@@ -50,7 +50,7 @@
  */
 
 import { Sentinel } from "../sentinel.js";
-import type { AuditEntry } from "../../l2-operational/audit-log.js";
+import type { AuditEntry } from "../../operational/audit-log.js";
 import type { SentinelFinding } from "../types.js";
 
 export const CREDENTIAL_USAGE_SENTINEL_ID = "credential-usage" as const;

@@ -12,7 +12,7 @@ import {
 import {
   AuditLog,
   type PersistedAuditEnvelopeV2,
-} from "../../../../server/src/l2-operational/audit-log.js";
+} from "../../../../server/src/operational/audit-log.js";
 import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import { verifyAuditChainRecords } from "../../../../server/src/cli/audit-chain-verify.js";
 import { registerFixture } from "../../registry.js";
@@ -24,7 +24,7 @@ import {
 
 // Entrypoints: AuditLog checkpoint writing, audit/chain checkpoint signing
 // helpers, and cli/audit-chain-verify standalone verification.
-// Existing mirrors: server/test/l2/audit-log-chain.test.ts and
+// Existing mirrors: server/test/operational/audit-log-chain.test.ts and
 // server/test/audit/external-verifier-drill.test.ts.
 // ASSURANCE_MATRIX row: 4, Tamper-evident audit chain.
 

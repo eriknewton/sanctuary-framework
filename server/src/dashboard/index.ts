@@ -6,8 +6,8 @@
  * for tests and callers that want to wire in live events.
  */
 
-import type { AuditLog } from "../l2-operational/audit-log.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
@@ -16,7 +16,7 @@ import type {
   PendingApproval,
   ReputationLookup,
 } from "./aggregator.js";
-import type { L4Evidence } from "../shr/generator.js";
+import type { ReputationEvidence } from "../shr/generator.js";
 import {
   startDashboardServer,
   type DashboardHandle,
@@ -35,7 +35,19 @@ export type {
   ProtectionSnapshot,
   ReputationLookup,
 } from "./aggregator.js";
-export type { AggregatorSources, L1Status, L2Status, L3Status, L4Status } from "./aggregator.js";
+export type {
+  AggregatorSources,
+  CognitiveStatus,
+  OperationalStatus,
+  DisclosureStatus,
+  ReputationStatus,
+  // Back-compat aliases (L1-L4 rename PR-3): kept exported so downstream
+  // imports keep working.
+  L1Status,
+  L2Status,
+  L3Status,
+  L4Status,
+} from "./aggregator.js";
 export type { DashboardHandle, DashboardServerOptions } from "./server.js";
 export type { ApprovalHandlers, StreamEvent } from "./api.js";
 
@@ -63,7 +75,35 @@ export interface StartDashboardOptions {
    * disputes, freshness, active degradations). Typically supplied by the
    * server after L4 tools are constructed.
    */
-  l4Evidence?: L4Evidence;
+  l4Evidence?: ReputationEvidence;
+  /**
+   * HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): the reader's
+   * pinned producer public key (base64url-no-pad), resolved lazily so a
+   * post-provision write is observed. Threaded straight into the
+   * AggregatorSources `getProtectionSnapshot` consumes, so the wrap-auto /
+   * standalone snapshot server arms the hero shield on the SAME cryptographic
+   * basis as the `DashboardApprovalChannel` (MCP-boot / `sanctuary dashboard`)
+   * path. Without this, a key-bearing host reached via THIS server read the
+   * wall posture on the bare channel basis, so a forged marker-only audit entry
+   * could arm the shield green. Returns null on macOS / pre-provision Linux
+   * (no key published) → the honest channel-authenticated floor, never claimed
+   * as per-producer authenticated.
+   */
+  resolvePinnedProducerKey?: () => string | null;
+  /**
+   * HIGH never-overclaim fix fail-honest signal: a producer key is EXPECTED for
+   * this fortress (the daemon published one) but the dashboard could NOT load it
+   * (present but unreadable / malformed). When true the wall reader refuses to
+   * render green on the channel basis (posture forces `degraded`, not armed), so
+   * the hero shield goes amber rather than claiming a weaker basis than the
+   * consumer wrote with. Mutually exclusive with a non-null
+   * `resolvePinnedProducerKey()`.
+   */
+  producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for broker daemon liveness producer verification. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
 }
 
 /**
@@ -92,6 +132,22 @@ export async function startDashboard(
     ...(options.reputation ? { reputation: options.reputation } : {}),
     ...(options.teeAvailable != null ? { teeAvailable: options.teeAvailable } : {}),
     ...(options.l4Evidence ? { l4Evidence: options.l4Evidence } : {}),
+    // HIGH never-overclaim fix (seam #2): thread the producer-key re-verification
+    // basis into the snapshot sources the same way the DashboardApprovalChannel
+    // path does, so a forged marker-only entry on a key-bearing host fails closed
+    // to amber here too. Absent on macOS / pre-provision → channel basis (honest).
+    ...(options.resolvePinnedProducerKey
+      ? { resolvePinnedProducerKey: options.resolvePinnedProducerKey }
+      : {}),
+    ...(options.producerKeyExpectedButUnavailable
+      ? { producerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(options.resolveBrokerPinnedProducerKey
+      ? { resolveBrokerPinnedProducerKey: options.resolveBrokerPinnedProducerKey }
+      : {}),
+    ...(options.brokerProducerKeyExpectedButUnavailable
+      ? { brokerProducerKeyExpectedButUnavailable: true }
+      : {}),
     activity,
     pendingApprovals: pending,
   };

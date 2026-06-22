@@ -51,8 +51,13 @@ export interface V1RouterContext {
   sessions: V1SessionService;
   /** Loopback check shared with the dashboard's auth paths. */
   isLoopbackRequest(req: IncomingMessage): boolean;
-  /** Full (SESSION_TOKEN) status document. Must contain no key material. */
-  buildFullStatus(): Record<string, unknown>;
+  /**
+   * Full (SESSION_TOKEN) status document. Must contain no key material. May be
+   * async so the `castle_wall` field can carry the evidence-gated arm-state the
+   * dashboard derives from the audit log (Delta Review A3), instead of a dead
+   * `"unknown"` placeholder.
+   */
+  buildFullStatus(): Record<string, unknown> | Promise<Record<string, unknown>>;
   /** Server version string for the PUBLIC minimal status variant. */
   version: string;
   /**
@@ -181,7 +186,7 @@ export async function handleV1Request(
       denyForbidden(res);
       return true;
     }
-    writeJson(res, 200, ctx.buildFullStatus());
+    writeJson(res, 200, await ctx.buildFullStatus());
     return true;
   }
 

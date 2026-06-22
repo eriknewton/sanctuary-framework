@@ -10,9 +10,13 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
-import { StateStore, isReservedNamespace, type StateEntry } from "../l1-cognitive/state-store.js";
-import type { IdentityManager } from "../l1-cognitive/tools.js";
-import type { AuditLog, AuditEntry } from "../l2-operational/audit-log.js";
+import {
+  StateStore,
+  isReservedNamespace,
+  type StateEntry,
+} from "../cognitive/state-store.js";
+import type { IdentityManager } from "../cognitive/tools.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { SanctuaryConfig } from "../config.js";
 import { defaultConfig, SANCTUARY_VERSION } from "../config.js";
@@ -61,14 +65,15 @@ import {
 } from "../core/identity.js";
 import {
   ReputationStore,
+  ReputationBundleVerificationError,
   type ReputationBundle,
-} from "../l4-reputation/reputation-store.js";
+} from "../reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
 import {
   partitionByMemoryClass,
   type PartitionConsentRelease,
+  type PartitionCandidate,
   type PartitionResult,
-  type SealedProvenanceStamp,
 } from "./memory-class.js";
 
 const ARTIFACT_DIR = "artifacts";
@@ -122,7 +127,7 @@ const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
  * Custody-envelope re-key block (post-#496). Carries a wrap of the SOURCE
  * master under a fresh, random, export-scoped "bundle re-key key" minted at
  * export time and disclosed to the operator (never written into the
- * bundle). Import recovers the source master by unwrapping with that key —
+ * bundle). Import recovers the source master by unwrapping with that key -
  * no parallel derivation path, no fortress credential travels.
  *
  * Deliberately NOT the fortress's own envelope wraps (codex round-1 MED):
@@ -149,10 +154,15 @@ export interface ExitEncryptedStateBundle {
   exported_at: string;
   key_source: "passphrase" | "recovery-key" | "unknown";
   /**
+   * Additive Slice-2 signal: true when this artifact was filtered through the
+   * verified ownership partition, false/absent for legacy full-fortress exports.
+   */
+  ownership_partitioned?: boolean;
+  /**
    * Legacy re-key parameters (pre-envelope custody): Argon2id params under
    * which `master = Argon2id(passphrase, params)`. Still emitted when the
    * legacy `_meta/key-params` marker exists (migrated fortresses keep their
-   * markers — #496) so older importers keep working on those bundles. For
+   * markers - #496) so older importers keep working on those bundles. For
    * envelope-custody fortresses this mechanism is legacy-only; the
    * authoritative re-key path is `source_custody`.
    */
@@ -278,7 +288,7 @@ export interface ExportExitBundleOptions {
    * must have a secure, non-persisted channel to the operator: the exit
    * CLI prints it to the operator's terminal; callers whose results are
    * persisted (e.g. the hub's `resolution_payload`) must NOT enable this
-   * (key material must never be persisted — CLAUDE.md #6).
+   * (key material must never be persisted - CLAUDE.md #6).
    *
    * Without it, an envelope-custody bundle's state can only be re-keyed by
    * a programmatic `sourceMasterKey` (legacy fortresses keep the legacy
@@ -291,30 +301,28 @@ export interface ExportExitBundleOptions {
    * included in the outbound (agent) bundle ONLY when the caller supplies a
    * sealed `agent_owned` stamp BOUND to its `namespace/key` (or an audited
    * consent receipt releases its `shared_entangled` lineage). Every other entry
-   * — unsealed, binding-mismatched, operator-owned, or shared-entangled without
-   * consent — is EXCLUDED and fails toward "stays with the operator," never
+   * - unsealed, binding-mismatched, operator-owned, or shared-entangled without
+   * consent - is EXCLUDED and fails toward "stays with the operator," never
    * `agent_owned`.
    *
-   * `stampsByEntryKey` keys are `"<namespace>/<key>"`; each stamp must have been
-   * minted with `entry_binding` equal to that same `"<namespace>/<key>"`. Only
-   * the live, in-process sealed stamp object is trusted; a deserialized stamp is
-   * not sealed and the entry is conservatively excluded.
+   * Slice 2: the export path no longer trusts caller-supplied stamp maps. It
+   * verifies each state envelope first and re-mints a live sealed stamp from the
+   * signed `provenance_stamp` field. Legacy or unstamped records are excluded.
    */
   memoryClassPartition?: {
-    readonly stampsByEntryKey: ReadonlyMap<string, SealedProvenanceStamp>;
     readonly consentReleases?: readonly PartitionConsentRelease[];
   };
   /**
    * Codex HIGH (06-13) reconciliation: backward compatibility requires the
    * pre-Slice-1 single-operator export (every non-`_` namespace, no ownership
-   * partition) to remain the behavior when no partition is supplied — the
+   * partition) to remain the behavior when no partition is supplied - the
    * shipped CLI, hub, dashboard, and drill paths all rely on it, and Slice 1 is
    * explicitly scoped as an OPT-IN ownership axis.
    *
    * To keep that compatibility WITHOUT silently masking the absence, an
    * unpartitioned export now requires the caller to acknowledge it explicitly
    * with `unpartitionedLegacyExport: true`. An export that supplies neither
-   * `memoryClassPartition` nor this flag throws — so an *agent-exit* caller
+   * `memoryClassPartition` nor this flag throws - so an *agent-exit* caller
    * (which must partition) cannot accidentally fall through to "export
    * everything." Operator-driven full-fortress exports pass this flag; agent
    * exit flows pass `memoryClassPartition`.
@@ -350,6 +358,7 @@ export interface ExportExitBundleResult {
   state_partition?: {
     included: number;
     excluded: number;
+    excluded_unstamped: number;
     excluded_unsealed: number;
   };
 }
@@ -426,8 +435,8 @@ export interface ImportExitBundleOptions {
  */
 export class ExitBundleImportError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
-    super(message);
+  constructor(code: string, message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "ExitBundleImportError";
     this.code = code;
   }
@@ -515,7 +524,7 @@ const SOURCE_CUSTODY_MAX_WRAPS = 4;
 /**
  * Mint the bundle re-key key and the source_custody block that carries the
  * source master wrapped under it. The key is returned for operator
- * disclosure and is NEVER written into the bundle — it is the only
+ * disclosure and is NEVER written into the bundle - it is the only
  * credential that re-keys this bundle's state, held separately from it.
  *
  * Fortress envelope wraps are deliberately not copied (see
@@ -571,7 +580,7 @@ async function exportEncryptedState(
   );
   const collected: ExitEncryptedStateBundle["entries"] = [];
   for (const namespace of [...namespaceSet].sort()) {
-    // F6: never export internal `_`-prefixed namespaces — the rekey/import path
+    // F6: never export internal `_`-prefixed namespaces - the rekey/import path
     // rejects them, so exporting one (e.g. an explicit `--state-namespace _x`)
     // would silently fail to round-trip. Symmetric with the import guard.
     if (namespace.startsWith("_") || isReservedNamespace(namespace)) continue;
@@ -594,7 +603,7 @@ async function exportEncryptedState(
   // Exit machinery Slice 1: apply the conservative ownership partition. The
   // caller MUST make an explicit choice (codex HIGH): supply
   // `memoryClassPartition` (partition on) OR `unpartitionedLegacyExport: true`
-  // (loud, named full-export opt-out). Supplying neither — or both — throws, so
+  // (loud, named full-export opt-out). Supplying neither - or both - throws, so
   // an agent-exit caller cannot silently fall through to "export everything."
   const hasPartition = opts.memoryClassPartition !== undefined;
   const hasLegacyOptOut = opts.unpartitionedLegacyExport === true;
@@ -614,19 +623,37 @@ async function exportEncryptedState(
   let partition: PartitionResult | undefined;
   let entries = collected;
   if (opts.memoryClassPartition !== undefined) {
-    const stamps = opts.memoryClassPartition.stampsByEntryKey;
-    partition = partitionByMemoryClass(
-      collected.map((entry) => {
-        const stamp = stamps.get(`${entry.namespace}/${entry.key}`);
-        return {
-          id: `${entry.namespace}/${entry.key}`,
-          ...(stamp !== undefined ? { sealedStamp: stamp } : {}),
-        };
-      }),
-      {
-        consentReleases: opts.memoryClassPartition.consentReleases,
-      },
-    );
+    const stateStore = new StateStore(opts.storage, opts.masterKey);
+    const candidates: PartitionCandidate[] = [];
+    for (const entry of collected) {
+      const id = `${entry.namespace}/${entry.key}`;
+      const reminted = await stateStore.remintVerifiedProvenanceStampForExport(
+        entry.entry,
+        entry.namespace,
+        entry.key,
+      );
+      if (reminted.status === "sealed") {
+        candidates.push({
+          id,
+          declaredStamp: reminted.declaredStamp,
+          sealedStamp: reminted.sealedStamp,
+        });
+      } else if (reminted.status === "unsealed") {
+        candidates.push({
+          id,
+          ...(reminted.declaredStamp !== undefined
+            ? { declaredStamp: reminted.declaredStamp }
+            : {}),
+        });
+      } else if (reminted.status === "verification_failed") {
+        candidates.push({ id, verificationFailed: true });
+      } else {
+        candidates.push({ id });
+      }
+    }
+    partition = partitionByMemoryClass(candidates, {
+      consentReleases: opts.memoryClassPartition.consentReleases,
+    });
     const includableIds = new Set(
       partition.includable.map((decision) => decision.id),
     );
@@ -648,6 +675,7 @@ async function exportEncryptedState(
       format: "SANCTUARY_EXIT_ENCRYPTED_STATE_V1",
       exported_at: new Date().toISOString(),
       key_source: opts.keySource ?? "unknown",
+      ownership_partitioned: opts.memoryClassPartition !== undefined,
       source_key_derivation: await readSourceKeyParams(opts.storage),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
       namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
@@ -966,7 +994,24 @@ export async function exportExitBundle(
       },
     );
   }
+  if (encryptedStateExport.partition !== undefined) {
+    const partitionSummary = summarizePartition(encryptedStateExport.partition);
+    void opts.auditLog.append(
+      "l1",
+      "exit_bundle_state_partition",
+      identity.identity_id,
+      {
+        approval_id: exportApprovalAuditId,
+        state_partition: partitionSummary,
+      },
+    );
+  }
   await opts.auditLog.flush();
+
+  const statePartitionSummary =
+    encryptedStateExport.partition !== undefined
+      ? summarizePartition(encryptedStateExport.partition)
+      : undefined;
 
   return {
     bundle_dir: bundleDir,
@@ -979,20 +1024,24 @@ export async function exportExitBundle(
     ...(encryptedStateExport.rekeyKey !== undefined
       ? { state_rekey_key: encryptedStateExport.rekeyKey }
       : {}),
-    ...(encryptedStateExport.partition !== undefined
-      ? {
-          state_partition: {
-            included: encryptedStateExport.partition.includable.length,
-            excluded: encryptedStateExport.partition.excluded.length,
-            excluded_unsealed: encryptedStateExport.partition.excluded.filter(
-              (decision) =>
-                decision.reason === "unsealed_stamp_defaulted_operator_owned" ||
-                decision.reason ===
-                  "stamp_binding_mismatch_defaulted_operator_owned",
-            ).length,
-          },
-        }
+    ...(statePartitionSummary !== undefined
+      ? { state_partition: statePartitionSummary }
       : {}),
+  };
+}
+
+function summarizePartition(partition: PartitionResult): ExportExitBundleResult["state_partition"] {
+  return {
+    included: partition.includable.length,
+    excluded: partition.excluded.length,
+    excluded_unstamped: partition.excluded.filter(
+      (decision) => decision.reason === "unstamped_defaulted_operator_owned",
+    ).length,
+    excluded_unsealed: partition.excluded.filter(
+      (decision) =>
+        decision.reason === "unsealed_stamp_defaulted_operator_owned" ||
+        decision.reason === "stamp_binding_mismatch_defaulted_operator_owned",
+    ).length,
   };
 }
 
@@ -1112,7 +1161,7 @@ function importIdForManifest(manifest: ExitBundleManifest): string {
  * Shape-check a bundle's `source_custody` block before any wrap is tried.
  * A crafted or corrupted block fails closed with a structured error rather
  * than being silently ignored (which would demote the import to the legacy
- * derivation path — a downgrade, #5).
+ * derivation path - a downgrade, #5).
  */
 function validateSourceCustody(custody: ExitSourceCustody): void {
   const malformed =
@@ -1165,11 +1214,11 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  *     check in `rekeyState` (SOURCE_KEY_MISMATCH).
  *  3. Passphrase WITHOUT legacy params: fails closed. Envelope-era bundles
  *     deliberately carry no passphrase-checkable material (no offline
- *     oracle), so a passphrase cannot re-key them — the error points the
+ *     oracle), so a passphrase cannot re-key them - the error points the
  *     operator at the bundle re-key key. No silent staging, no fallback.
  *  4. Recovery key + `source_custody`: the bundle re-key key minted at
  *     export, GCM-authenticated against the embedded wrap. A key that
- *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` —
+ *     unwraps nothing FAILS CLOSED with `SOURCE_CREDENTIAL_INVALID` -
  *     never falls through to the legacy raw-key path (that would silently
  *     treat an arbitrary 32 bytes as the master and drop every entry).
  *  5. Recovery key on a legacy bundle: pre-envelope semantics (the
@@ -1178,7 +1227,7 @@ function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
  * The recovered master is transient: it only decrypts bundle entries, which
  * are immediately re-encrypted and re-signed under the DESTINATION
  * fortress's custody (whose master is established exclusively by
- * `establishMaster` — import has no parallel establishment path).
+ * `establishMaster` - import has no parallel establishment path).
  */
 async function resolveSourceMasterKey(
   encryptedState: ExitEncryptedStateBundle | null,
@@ -1250,6 +1299,166 @@ interface StagedLocation {
   key: string;
 }
 
+interface StorageSnapshot extends StagedLocation {
+  data: Uint8Array | null;
+}
+
+interface StorageNamespaceSnapshot {
+  namespace: string;
+  entries: StorageSnapshot[];
+}
+
+function locationDedupeKey(loc: StagedLocation): string {
+  return `${loc.namespace.length}:${loc.namespace}${loc.key}`;
+}
+
+function dedupeLocations(locations: StagedLocation[]): StagedLocation[] {
+  const seen = new Set<string>();
+  const deduped: StagedLocation[] = [];
+  for (const loc of locations) {
+    const key = locationDedupeKey(loc);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(loc);
+  }
+  return deduped;
+}
+
+async function snapshotStorageLocations(
+  storage: StorageBackend,
+  locations: StagedLocation[]
+): Promise<StorageSnapshot[]> {
+  const snapshots: StorageSnapshot[] = [];
+  for (const loc of dedupeLocations(locations)) {
+    snapshots.push({
+      ...loc,
+      data: await storage.read(loc.namespace, loc.key),
+    });
+  }
+  return snapshots;
+}
+
+async function snapshotStorageNamespace(
+  storage: StorageBackend,
+  namespace: string
+): Promise<StorageNamespaceSnapshot> {
+  const entries: StorageSnapshot[] = [];
+  for (const entry of await storage.list(namespace)) {
+    const data = await storage.read(namespace, entry.key);
+    if (!data) continue;
+    entries.push({ namespace, key: entry.key, data });
+  }
+  return { namespace, entries };
+}
+
+async function restoreStorageSnapshots(
+  storage: StorageBackend,
+  snapshots: StorageSnapshot[],
+  namespaceSnapshots: StorageNamespaceSnapshot[] = []
+): Promise<{
+  removed: number;
+  restored: number;
+  failed: StagedLocation[];
+}> {
+  let removed = 0;
+  let restored = 0;
+  const failed: StagedLocation[] = [];
+  for (const namespaceSnapshot of namespaceSnapshots) {
+    const originalKeys = new Set(
+      namespaceSnapshot.entries.map((entry) => entry.key)
+    );
+    try {
+      for (const current of await storage.list(namespaceSnapshot.namespace)) {
+        if (originalKeys.has(current.key)) continue;
+        try {
+          const ok = await storage.delete(
+            namespaceSnapshot.namespace,
+            current.key
+          );
+          if (ok) removed++;
+        } catch {
+          failed.push({
+            namespace: namespaceSnapshot.namespace,
+            key: current.key,
+          });
+        }
+      }
+    } catch {
+      failed.push({ namespace: namespaceSnapshot.namespace, key: "*" });
+    }
+  }
+
+  const allSnapshots = [
+    ...snapshots,
+    ...namespaceSnapshots.flatMap((snapshot) => snapshot.entries),
+  ];
+  for (const snapshot of allSnapshots) {
+    try {
+      if (snapshot.data) {
+        await storage.write(snapshot.namespace, snapshot.key, snapshot.data);
+        restored++;
+      } else {
+        const ok = await storage.delete(snapshot.namespace, snapshot.key);
+        if (ok) removed++;
+      }
+    } catch {
+      failed.push({ namespace: snapshot.namespace, key: snapshot.key });
+    }
+  }
+  return { removed, restored, failed };
+}
+
+function activationSnapshotLocations(
+  importId: string,
+  identityArtifact: { json: ExitPublicIdentityArtifact } | null,
+  encryptedState: { json: ExitEncryptedStateBundle } | null,
+  reputationArtifact: { json: ReputationBundle } | null,
+  policySet: { json: ExitPolicySetArtifact } | null,
+  auditReceipts: { json: ExitAuditReceiptsArtifact } | null,
+  commitments: { json: ExitCommitmentsArtifact } | null,
+  placeholderMetadata: { json: ExitPlaceholderVaultMetadataArtifact } | null
+): StagedLocation[] {
+  const locations: StagedLocation[] = [];
+  if (identityArtifact) {
+    locations.push({
+      namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+      key: identityArtifact.json.bundle.identity_id,
+    });
+  }
+  if (policySet) {
+    locations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
+  }
+  if (auditReceipts) {
+    locations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
+  }
+  if (commitments) {
+    locations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
+  }
+  if (placeholderMetadata) {
+    locations.push({
+      namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+      key: importId,
+    });
+  }
+  locations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
+
+  for (const attestation of reputationArtifact?.json.attestations ?? []) {
+    locations.push({
+      namespace: "_reputation",
+      key: attestation.attestation_id,
+    });
+  }
+
+  for (const item of encryptedState?.json.entries ?? []) {
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+      continue;
+    }
+    locations.push({ namespace: item.namespace, key: item.key });
+  }
+
+  return locations;
+}
+
 async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
@@ -1288,7 +1497,7 @@ async function rekeyState(
   // many entries reached AEAD decryption and how many failed it. When the
   // source master decrypts NOTHING, the key is wrong (e.g. a legacy bundle
   // from a dual-path-damaged fortress whose key-params derive a divergent
-  // master) — that must fail closed, not silently skip every entry.
+  // master) - that must fail closed, not silently skip every entry.
   let decryptAttempts = 0;
   let decryptFailures = 0;
 
@@ -1358,7 +1567,7 @@ async function rekeyState(
     } catch {
       // AEAD verification failed for this entry. When OTHER entries
       // decrypt fine this is a per-entry data issue (skip and continue);
-      // when EVERY entry fails, the source master itself is wrong — the
+      // when EVERY entry fails, the source master itself is wrong - the
       // post-loop check below fails the import closed.
       decryptFailures++;
       skippedInvalidSig++;
@@ -1393,7 +1602,7 @@ async function rekeyState(
   if (decryptAttempts > 0 && decryptFailures === decryptAttempts) {
     // Nothing decrypted under the recovered source master: wrong source
     // credential (legacy derivation path) or a bundle whose embedded key
-    // material does not match its entries. Fail closed — never report a
+    // material does not match its entries. Fail closed - never report a
     // "successful" re-key that silently imported zero entries (#5). No
     // state writes happened on this path; the caller's cleanup handler
     // removes the staged artifacts.
@@ -1416,34 +1625,6 @@ async function rekeyState(
     skipped_unknown_kid: skippedUnknownKid,
     conflicts,
   };
-}
-
-/**
- * Best-effort cleanup of staged paths after a re-key failure. Each
- * delete is independent, one delete failing should not prevent later
- * deletes from running. Failures are collected and surfaced in the
- * thrown ExitBundleImportError so the operator sees what was and was
- * not cleaned. Hardening wave 6 finding #78.
- */
-async function cleanupStagedPaths(
-  storage: StorageBackend,
-  staged: StagedLocation[]
-): Promise<{ removed: number; failed: StagedLocation[] }> {
-  let removed = 0;
-  const failed: StagedLocation[] = [];
-  for (const loc of staged) {
-    try {
-      const ok = await storage.delete(loc.namespace, loc.key);
-      if (ok) {
-        removed++;
-      } else {
-        failed.push(loc);
-      }
-    } catch {
-      failed.push(loc);
-    }
-  }
-  return { removed, failed };
 }
 
 async function stageArtifact(
@@ -1495,6 +1676,57 @@ export async function importExitBundle(
 
   const manifest = await readManifest(opts.bundleDir);
   const importWarnings: string[] = [];
+
+  const identityArtifact = await loadExitArtifact<ExitPublicIdentityArtifact>(
+    opts.bundleDir,
+    manifest,
+    "public_identity"
+  );
+  const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
+    opts.bundleDir,
+    manifest,
+    "encrypted_state"
+  );
+  const policySet = await loadExitArtifact<ExitPolicySetArtifact>(
+    opts.bundleDir,
+    manifest,
+    "policy_set"
+  );
+  const auditReceipts = await loadExitArtifact<ExitAuditReceiptsArtifact>(
+    opts.bundleDir,
+    manifest,
+    "audit_receipts"
+  );
+  const reputationArtifact = await loadExitArtifact<ReputationBundle>(
+    opts.bundleDir,
+    manifest,
+    "reputation_bundle"
+  );
+  const commitments = await loadExitArtifact<ExitCommitmentsArtifact>(
+    opts.bundleDir,
+    manifest,
+    "commitments"
+  );
+  const placeholderMetadata =
+    await loadExitArtifact<ExitPlaceholderVaultMetadataArtifact>(
+      opts.bundleDir,
+      manifest,
+      "placeholder_vault_metadata"
+    );
+
+  const publicKeys = identityArtifact
+    ? publicKeysFromIdentityArtifact(identityArtifact.json)
+    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
+
+  const reputationStore = reputationArtifact
+    ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
+    : null;
+  if (opts.activate === true && reputationArtifact && reputationStore) {
+    reputationStore.verifyBundle(reputationArtifact.json, publicKeys.byDid, {
+      allowUnverifiableAttestations:
+        opts.acceptUnverifiableAttestations === true,
+    });
+  }
 
   // Recognition-Layer Path C primary build 2: did:web cross-check.
   // The manifest signature has already verified above; the did:web
@@ -1644,43 +1876,6 @@ export async function importExitBundle(
     );
   }
 
-  const identityArtifact = await loadExitArtifact<ExitPublicIdentityArtifact>(
-    opts.bundleDir,
-    manifest,
-    "public_identity"
-  );
-  const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
-    opts.bundleDir,
-    manifest,
-    "encrypted_state"
-  );
-  const policySet = await loadExitArtifact<ExitPolicySetArtifact>(
-    opts.bundleDir,
-    manifest,
-    "policy_set"
-  );
-  const auditReceipts = await loadExitArtifact<ExitAuditReceiptsArtifact>(
-    opts.bundleDir,
-    manifest,
-    "audit_receipts"
-  );
-  const reputationArtifact = await loadExitArtifact<ReputationBundle>(
-    opts.bundleDir,
-    manifest,
-    "reputation_bundle"
-  );
-  const commitments = await loadExitArtifact<ExitCommitmentsArtifact>(
-    opts.bundleDir,
-    manifest,
-    "commitments"
-  );
-  const placeholderMetadata =
-    await loadExitArtifact<ExitPlaceholderVaultMetadataArtifact>(
-      opts.bundleDir,
-      manifest,
-      "placeholder_vault_metadata"
-    );
-
   const conflicts = await conflictReport(
     opts.storage,
     identityArtifact?.json ?? null,
@@ -1773,113 +1968,129 @@ export async function importExitBundle(
     );
   }
   const stagedArtifacts: string[] = [];
-  // Hardening wave 6 finding #78: track every staged storage location so
-  // a re-key failure can roll back the partial import. Each entry is a
-  // (namespace, key) tuple suitable for opts.storage.delete().
+  const activationSnapshots = await snapshotStorageLocations(
+    opts.storage,
+    activationSnapshotLocations(
+      importId,
+      identityArtifact ?? null,
+      encryptedState ?? null,
+      reputationArtifact ?? null,
+      policySet ?? null,
+      auditReceipts ?? null,
+      commitments ?? null,
+      placeholderMetadata ?? null
+    )
+  );
+  const activationNamespaceSnapshots = [
+    await snapshotStorageNamespace(opts.storage, "_meta"),
+  ];
+  // Track every staged storage location for result telemetry and cleanup
+  // accounting. Snapshot restoration below is what preserves overwritten
+  // pre-existing bytes.
   const stagedLocations: StagedLocation[] = [];
   // Same accumulator for the per-entry rekey writes, populated by
   // rekeyState as it succeeds, consumed on failure.
   const importedRekeyEntries: StagedLocation[] = [];
-  if (identityArtifact) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_PUBLIC_IDENTITIES_NAMESPACE,
-      identityArtifact.json.bundle.identity_id,
-      identityArtifact.json
-    );
-    stagedArtifacts.push("public_identity");
-    stagedLocations.push({
-      namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
-      key: identityArtifact.json.bundle.identity_id,
-    });
-  }
-  if (policySet) {
-    await stageArtifact(opts.storage, EXIT_POLICY_SETS_NAMESPACE, importId, policySet.json);
-    stagedArtifacts.push("policy_set");
-    stagedLocations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
-  }
-  if (auditReceipts) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_AUDIT_RECEIPTS_NAMESPACE,
-      importId,
-      auditReceipts.json
-    );
-    stagedArtifacts.push("audit_receipts");
-    stagedLocations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
-  }
-  if (commitments) {
-    await stageArtifact(opts.storage, EXIT_COMMITMENTS_NAMESPACE, importId, commitments.json);
-    stagedArtifacts.push("commitments");
-    stagedLocations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
-  }
-  if (placeholderMetadata) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_PLACEHOLDER_METADATA_NAMESPACE,
-      importId,
-      placeholderMetadata.json
-    );
-    stagedArtifacts.push("placeholder_vault_metadata");
-    stagedLocations.push({
-      namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
-      key: importId,
-    });
-  }
-  await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
-    manifest: manifest.body,
-    verified_at: verification.verified_at,
-    activated_at: new Date().toISOString(),
-  });
-  stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
-
-  const publicKeys = identityArtifact
-    ? publicKeysFromIdentityArtifact(identityArtifact.json)
-    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
-
-  // Anti-rollback Stage 1 (#506) interaction: the activation path above emits
-  // its audit entries fire-and-forget (`void opts.auditLog.append(...)`), so a
-  // head-anchor write for the first such entry can still be in flight when the
-  // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
-  // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
-  // "audit entries exist on disk but no head anchor file yet" as the custody
-  // SPLICE signature — a FALSE rollback freeze that fails a LEGITIMATE import
-  // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
-  // queue here makes the gate observe a settled, self-consistent audit state
-  // (entry on disk ⟹ its head anchor on disk), so a genuine import is never
-  // mistaken for a credential-resurrecting splice. This weakens nothing: a real
-  // splice (old custody envelope grafted onto an audit chain written under a
-  // different master) still fails the head-anchor MAC after the flush.
-  await opts.auditLog.flush();
-
   let reputationResult = {
     imported_attestations: 0,
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
-  if (reputationArtifact) {
-    const reputationStore =
-      opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey);
-    const imported = await reputationStore.importBundle(
-      reputationArtifact.json,
-      true,
-      publicKeys.byDid
-    );
-    reputationResult = {
-      imported_attestations: imported.imported,
-      invalid_attestations: imported.invalid,
-      unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
-    };
-    stagedArtifacts.push("reputation_bundle");
-  }
-
   let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
   // source_custody) must roll back the artifacts staged above, exactly like
-  // a re-key failure — otherwise a refused import leaves staged state behind.
+  // a re-key failure - otherwise a refused import leaves staged state behind.
   let sourceMasterKey: Uint8Array | null = null;
+  let stateRekeyStarted = false;
   try {
+    if (identityArtifact) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+        identityArtifact.json.bundle.identity_id,
+        identityArtifact.json
+      );
+      stagedArtifacts.push("public_identity");
+      stagedLocations.push({
+        namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+        key: identityArtifact.json.bundle.identity_id,
+      });
+    }
+    if (policySet) {
+      await stageArtifact(opts.storage, EXIT_POLICY_SETS_NAMESPACE, importId, policySet.json);
+      stagedArtifacts.push("policy_set");
+      stagedLocations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
+    }
+    if (auditReceipts) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_AUDIT_RECEIPTS_NAMESPACE,
+        importId,
+        auditReceipts.json
+      );
+      stagedArtifacts.push("audit_receipts");
+      stagedLocations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
+    }
+    if (commitments) {
+      await stageArtifact(opts.storage, EXIT_COMMITMENTS_NAMESPACE, importId, commitments.json);
+      stagedArtifacts.push("commitments");
+      stagedLocations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
+    }
+    if (placeholderMetadata) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+        importId,
+        placeholderMetadata.json
+      );
+      stagedArtifacts.push("placeholder_vault_metadata");
+      stagedLocations.push({
+        namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+        key: importId,
+      });
+    }
+    await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
+      manifest: manifest.body,
+      verified_at: verification.verified_at,
+      activated_at: new Date().toISOString(),
+    });
+    stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
+
+    // Anti-rollback Stage 1 (#506) interaction: the activation path above emits
+    // its audit entries fire-and-forget (`void opts.auditLog.append(...)`), so a
+    // head-anchor write for the first such entry can still be in flight when the
+    // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
+    // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
+    // "audit entries exist on disk but no head anchor file yet" as the custody
+    // SPLICE signature - a FALSE rollback freeze that fails a LEGITIMATE import
+    // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
+    // queue here makes the gate observe a settled, self-consistent audit state
+    // (entry on disk => its head anchor on disk), so a genuine import is never
+    // mistaken for a credential-resurrecting splice. This weakens nothing: a real
+    // splice (old custody envelope grafted onto an audit chain written under a
+    // different master) still fails the head-anchor MAC after the flush.
+    await opts.auditLog.flush();
+
+    if (reputationArtifact && reputationStore) {
+      const imported = await reputationStore.importBundle(
+        reputationArtifact.json,
+        true,
+        publicKeys.byDid,
+        {
+          allowUnverifiableAttestations:
+            opts.acceptUnverifiableAttestations === true,
+        }
+      );
+      reputationResult = {
+        imported_attestations: imported.imported,
+        invalid_attestations: imported.invalid,
+        unverifiable_attestations: imported.unverifiable,
+      };
+      stagedArtifacts.push("reputation_bundle");
+    }
+
+    stateRekeyStarted = true;
     sourceMasterKey = await resolveSourceMasterKey(
       encryptedState?.json ?? null,
       opts
@@ -1910,19 +2121,27 @@ export async function importExitBundle(
             skipped_unknown_kid: 0,
             conflicts: 0,
           };
+    void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
+      import_id: importId,
+      manifest_version: manifest.body.manifest_version,
+      state_status: stateResult.status,
+      state_imported_keys: stateResult.imported_keys,
+      reputation_imported_attestations: reputationResult.imported_attestations,
+    });
+    await opts.auditLog.flush();
   } catch (err) {
-    // Hardening wave 6 finding #78: re-key failed partway through.
-    // Walk back through every successfully staged artifact and every
-    // successfully imported state entry, then re-throw with an error
-    // that names the cleanup so the operator can see what was undone.
-    const toCleanup: StagedLocation[] = [
-      ...importedRekeyEntries,
-      ...stagedLocations,
-    ];
-    const cleanup = await cleanupStagedPaths(opts.storage, toCleanup);
+    const cleanup = await restoreStorageSnapshots(
+      opts.storage,
+      activationSnapshots,
+      activationNamespaceSnapshots
+    );
+    const cleanupOperation =
+      stateRekeyStarted || err instanceof ExitBundleImportError
+        ? "exit_bundle_rekey_failed_cleanup"
+        : "exit_bundle_activation_failed_cleanup";
     void opts.auditLog.append(
       "l1",
-      "exit_bundle_rekey_failed_cleanup",
+      cleanupOperation,
       manifest.body.identity_binding.identity_id,
       {
         import_id: importId,
@@ -1930,37 +2149,42 @@ export async function importExitBundle(
         rekey_entries_removed: importedRekeyEntries.length,
         staged_artifacts_removed: stagedLocations.length,
         removed_total: cleanup.removed,
+        restored_total: cleanup.restored,
         cleanup_failed_count: cleanup.failed.length,
         original_error: err instanceof Error ? err.message : String(err),
+        meta_namespace_snapshotted: true,
       },
       "failure"
     );
     await opts.auditLog.flush();
     const originalMessage = err instanceof Error ? err.message : String(err);
+    const failureKind =
+      stateRekeyStarted || err instanceof ExitBundleImportError
+        ? "re-key"
+        : "activation";
+    const fallbackCode = err instanceof ReputationBundleVerificationError
+      ? "REPUTATION_IMPORT_FAILED_AND_CLEANED"
+      : stateRekeyStarted
+        ? "REKEY_FAILED_AND_CLEANED"
+        : "ACTIVATION_FAILED_AND_CLEANED";
     throw new ExitBundleImportError(
       // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
       // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
       // generic code covers non-structured failures (disk full, etc.).
-      err instanceof ExitBundleImportError ? err.code : "REKEY_FAILED_AND_CLEANED",
-      `Exit-bundle re-key failed: ${originalMessage}. ` +
-        `Cleanup removed ${cleanup.removed} of ${toCleanup.length} staged paths ` +
+      err instanceof ExitBundleImportError ? err.code : fallbackCode,
+      `Exit-bundle ${failureKind} failed: ${originalMessage}. ` +
+        `Cleanup removed ${cleanup.removed} and restored ${cleanup.restored} of ` +
+        `${activationSnapshots.length} snapshotted paths ` +
+        `plus ${activationNamespaceSnapshots.length} snapshotted namespaces ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
-        `${cleanup.failed.length} cleanup deletes failed).`
+        `${cleanup.failed.length} cleanup writes/deletes failed).`,
+      { cause: err }
     );
   } finally {
     if (sourceMasterKey instanceof Uint8Array) {
       sourceMasterKey.fill(0);
     }
   }
-
-  void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
-    import_id: importId,
-    manifest_version: manifest.body.manifest_version,
-    state_status: stateResult.status,
-    state_imported_keys: stateResult.imported_keys,
-    reputation_imported_attestations: reputationResult.imported_attestations,
-  });
-  await opts.auditLog.flush();
 
   return {
     verified: true,

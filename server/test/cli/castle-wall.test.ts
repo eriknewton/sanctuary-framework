@@ -10,7 +10,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   AuditLog,
   type PersistedAuditEnvelopeV2,
-} from "../../src/l2-operational/audit-log.js";
+} from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { hashToString } from "../../src/core/hashing.js";

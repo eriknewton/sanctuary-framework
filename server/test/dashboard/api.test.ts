@@ -58,9 +58,9 @@ describe("Dashboard HTTP API", () => {
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
     // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
-    // Root and /dashboard now route to the v1.1 SPA via dispatchV11 in
-    // production wiring (this rig boots without v11Bindings, so the
-    // dispatch is dormant and legacy serves at the new /v1.0 URL).
+    // Root serves the posture shell; /dashboard and /v1.1 are v1.1 SPA
+    // compatibility aliases when production wiring provides v11Bindings. This
+    // rig boots without v11Bindings, so legacy serves at the new /v1.0 URL.
     handle = await startForTest();
     const res = await fetch(`${handle.url}/v1.0`);
     expect(res.status).toBe(200);
@@ -79,6 +79,21 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(401);
   });
 
+  it("serves /api/health without auth when auth token is configured and exposes only liveness fields", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
+    expect(body).toEqual({ ok: true, mode: "co-located" });
+  });
+
+  it("keeps /api/snapshot auth-gated without auth when auth token is configured", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/snapshot`);
+    expect(res.status).toBe(401);
+  });
+
   it("returns 200 when auth token is provided via Authorization header", async () => {
     handle = await startForTest({ authToken: "secret-xyz" });
     const res = await fetch(`${handle.url}/api/snapshot`, {
@@ -87,10 +102,10 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(200);
   });
 
-  it("returns 200 when auth token is provided via ?token= query param", async () => {
+  it("rejects auth token provided via ?token= query param", async () => {
     handle = await startForTest({ authToken: "secret-xyz" });
     const res = await fetch(`${handle.url}/api/snapshot?token=secret-xyz`);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
   });
 
   it("rejects approve/deny when no approval handler is configured", async () => {
@@ -116,6 +131,75 @@ describe("Dashboard HTTP API", () => {
     expect(denied).toEqual(["xyz"]);
   });
 
+  it("rejects approval mutation auth via long-lived ?token= query param", async () => {
+    const allowed: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow?token=secret-xyz`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+    expect(allowed).toEqual([]);
+  });
+
+  it("accepts approval mutation auth via Authorization header", async () => {
+    const allowed: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(res.status).toBe(200);
+    expect(allowed).toEqual(["abc"]);
+  });
+
+  it("rejects approval mutations with a valid short-lived session but still accepts SSE", async () => {
+    const allowed: string[] = [];
+    const denied: string[] = [];
+    handle = await startForTest({
+      authToken: "secret-xyz",
+      approvals: {
+        allow: async (id: string) => { allowed.push(id); return true; },
+        deny: async (id: string) => { denied.push(id); return true; },
+      },
+    });
+    const sessionRes = await fetch(`${handle.url}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(sessionRes.status).toBe(200);
+    const session = await sessionRes.json() as { session_id: string };
+    const allowRes = await fetch(
+      `${handle.url}/api/approvals/abc/allow?session=${encodeURIComponent(session.session_id)}`,
+      { method: "POST" },
+    );
+    const denyRes = await fetch(
+      `${handle.url}/api/approvals/xyz/deny?session=${encodeURIComponent(session.session_id)}`,
+      { method: "POST" },
+    );
+    expect(allowRes.status).toBe(401);
+    expect(denyRes.status).toBe(401);
+    expect(allowed).toEqual([]);
+    expect(denied).toEqual([]);
+
+    const streamRes = await fetch(
+      `${handle.url}/api/stream?session=${encodeURIComponent(session.session_id)}`,
+    );
+    expect(streamRes.status).toBe(200);
+    await streamRes.body?.cancel();
+  });
+
   it("emits an initial 'snapshot' event on SSE connect", async () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/api/stream`);
@@ -131,6 +215,31 @@ describe("Dashboard HTTP API", () => {
     }
     expect(buf).toContain("event: snapshot");
     expect(buf).toContain("\"layers\"");
+    await reader.cancel();
+  });
+
+  it("authenticates SSE with a short-lived session URL", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const sessionRes = await fetch(`${handle.url}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
+    expect(sessionRes.status).toBe(200);
+    const session = await sessionRes.json() as { session_id: string };
+    const res = await fetch(
+      `${handle.url}/api/stream?session=${encodeURIComponent(session.session_id)}`,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") || "").toContain("text/event-stream");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (let i = 0; i < 6 && !buf.includes("event: snapshot"); i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    expect(buf).toContain("event: snapshot");
     await reader.cancel();
   });
 
@@ -172,6 +281,7 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/api/health`);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
     expect(body.ok).toBe(true);
     expect(body.mode).toBe("co-located");
   });
@@ -180,5 +290,37 @@ describe("Dashboard HTTP API", () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/does-not-exist`);
     expect(res.status).toBe(404);
+  });
+
+  // ERROR-DETAIL-001: completes the #604 error-envelope sweep. The legacy
+  // dashboard 500-paths used to serialize `(err as Error).message` to the
+  // client. The fix keeps the specific public error code but emits no
+  // exception message, stack, or internal path. Operators still get the
+  // redacted detail via logCaughtError (server-side only).
+  it("does not leak the caught-exception message on a 500 approval failure", async () => {
+    const leakyMessage =
+      "ENOENT: /Users/eriknewton/secret/path/.sanctuary/state at innerHandler";
+    handle = await startForTest({
+      approvals: {
+        allow: async () => {
+          throw new Error(leakyMessage);
+        },
+        deny: async () => true,
+      },
+    });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(500);
+    const raw = await res.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    // Specific public code is preserved.
+    expect(body.error).toBe("approval_failed");
+    // No exception detail field, and nothing from the raw error reaches the wire.
+    expect(body).not.toHaveProperty("message");
+    expect(raw).not.toContain(leakyMessage);
+    expect(raw).not.toContain("ENOENT");
+    expect(raw).not.toContain("/Users/eriknewton/secret/path");
+    expect(raw).not.toContain("innerHandler");
   });
 });
