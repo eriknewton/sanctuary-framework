@@ -220,6 +220,11 @@ export function renderPostureHomeHTML(): string {
   .conn.live .dot { background: var(--green); }
   .conn.reconnecting .dot { background: var(--amber); }
   .conn .updated { color: var(--muted); }
+  .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0; }
+  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; user-select: none; }
+  .story-toggle input { margin: 0; }
+  .story-summary { margin: 0; }
 </style>
 </head>
 <body>
@@ -246,7 +251,13 @@ export function renderPostureHomeHTML(): string {
   </section>
 
   <section>
-    <h2>Today's story</h2>
+    <div class="section-head">
+      <h2>Today's story</h2>
+      <label class="story-toggle">
+        <input type="checkbox" id="story-plain-summary" />
+        Plain summary
+      </label>
+    </div>
     <div class="panel" id="story"><span class="empty">Loading…</span></div>
   </section>
 
@@ -581,19 +592,19 @@ export function renderPostureHomeHTML(): string {
     }
     // Exit / portability: the honest capability statement. The Tier-1-gated CLI
     // export exists; the FULL clean-exit guarantee is NOT yet earned, so we say
-    // "export available" and never assert the full clean-exit claim on Home.
+    // "evidence bundle" and never assert the full clean-exit claim on Home.
     html +=
       '<div class="evidence" style="margin-top:10px">Exit and portability: ' +
       (panel.exit_state === "export_available"
-        ? '<span class="pill amber">export available</span> ' +
-          "Export your fortress as a portable bundle with <code>" +
+        ? '<span class="pill amber">evidence bundle</span> ' +
+          "Create a portable evidence bundle with <code>" +
           esc(panel.exit_command || "sanctuary exit") +
           "</code> (a Tier-1 operation: it requires your approval before it runs)."
         : "unknown") +
       "</div>";
     html +=
-      '<div class="fh-note">Export available does not yet mean a guaranteed clean exit: ' +
-      "the portable-bundle export ships, but the full clean-exit guarantee (complete, " +
+      '<div class="fh-note">An evidence bundle does not yet mean a guaranteed clean exit: ' +
+      "the portable evidence-bundle command ships, but the full clean-exit guarantee (complete, " +
       "verifiable handover with nothing left behind) is not yet earned, so it is not claimed here.</div>";
     el.innerHTML = html;
   }
@@ -959,8 +970,53 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
+  var STORY_PLAIN_SUMMARY_KEY = "postureStoryPlainSummary";
+  var lastStoryDigest = null;
+
+  function readStoryPlainSummaryPreference() {
+    try {
+      return typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(STORY_PLAIN_SUMMARY_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setStoryPlainSummaryPreference(enabled) {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem(STORY_PLAIN_SUMMARY_KEY, enabled ? "1" : "0");
+      }
+    } catch (e) {}
+  }
+
+  function syncStoryToggle() {
+    var toggle = document.getElementById("story-plain-summary");
+    if (!toggle) return;
+    toggle.checked = readStoryPlainSummaryPreference();
+  }
+
+  function renderStoryPlainSummary(d) {
+    var chainText = d.chain_verified
+      ? "The audit log verified clean: no tampering."
+      : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
+    return '<p class="story-summary">Today your agents ran <strong>' + esc(d.total_operations) +
+      "</strong> operations in the last 24h. Sanctuary blocked <strong>" + esc(d.kernel_blocks) +
+      "</strong> outbound connections and allowed <strong>" + esc(d.kernel_allows) +
+      "</strong>. You denied <strong>" + esc(d.approvals_denied) +
+      "</strong> approvals and granted <strong>" + esc(d.approvals_granted) +
+      "</strong>. " + esc(chainText) + "</p>" +
+      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+  }
+
   function renderStory(d) {
     var el = document.getElementById("story");
+    lastStoryDigest = d;
+    syncStoryToggle();
+    if (readStoryPlainSummaryPreference()) {
+      el.innerHTML = renderStoryPlainSummary(d);
+      return;
+    }
     var lines = [];
     lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h.");
     lines.push("<strong>" + d.kernel_blocks + "</strong> outbound connections blocked at the kernel; " +
@@ -972,6 +1028,16 @@ export function renderPostureHomeHTML(): string {
       : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
     el.innerHTML = lines.map(function (l) { return '<div class="story-line">' + l + "</div>"; }).join("") +
       '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+  }
+
+  function wireStoryToggle() {
+    var toggle = document.getElementById("story-plain-summary");
+    if (!toggle) return;
+    syncStoryToggle();
+    toggle.addEventListener("change", function () {
+      setStoryPlainSummaryPreference(toggle.checked === true);
+      if (lastStoryDigest) renderStory(lastStoryDigest);
+    });
   }
 
   function renderAnomalies(findings) {
@@ -1231,6 +1297,7 @@ export function renderPostureHomeHTML(): string {
   // first paint even before the stream connects), then attach the live stream.
   // If SSE is unavailable, this degrades to the prior poll-only behavior.
   setConn("reconnecting");
+  wireStoryToggle();
   pollOnce().then(function () {
     if (!supportsSSE || !streamAvailable) startPolling();
   });
