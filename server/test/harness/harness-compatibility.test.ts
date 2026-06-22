@@ -271,7 +271,9 @@ describe("harness compatibility negative paths", () => {
     await expect(
       runWrap({ wrap: configPath, noOpen: true, port: 4500 }, deps({ startDashboard: busyStarter }))
     ).rejects.toThrow(
-      `No free dashboard port in the ${PORT_FALLBACK_ATTEMPTS} ports starting at 4500`
+      `No free dashboard port in the range 4500-${
+        4500 + PORT_FALLBACK_ATTEMPTS - 1
+      } (all ${PORT_FALLBACK_ATTEMPTS} tried)`
     );
   });
 
