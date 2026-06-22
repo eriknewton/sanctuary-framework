@@ -38,6 +38,10 @@ import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import {
+  reputationBundleSigningBytes,
+  type ReputationBundle,
+} from "../reputation/reputation-store.js";
+import {
   readFileCustody,
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
@@ -261,17 +265,7 @@ function verifyReputationArtifact(
   reputationArtifact: unknown,
   publicKeysByDid: Map<string, Uint8Array>
 ): ExitBundleDetailedVerifierResult["reputation"] {
-  const bundle = reputationArtifact as {
-    version?: string;
-    attestations?: Array<{
-      data: unknown;
-      signature: string;
-      signer: string;
-    }>;
-    exported_at?: string;
-    exporter_did?: string;
-    bundle_signature?: string;
-  };
+  const bundle = reputationArtifact as Partial<ReputationBundle>;
   const attestations = Array.isArray(bundle.attestations)
     ? bundle.attestations
     : [];
@@ -279,6 +273,7 @@ function verifyReputationArtifact(
   let bundleSignatureValid: boolean | "unverifiable" = "unverifiable";
   if (
     bundle.version === "SANCTUARY_REP_V1" &&
+    typeof bundle.exported_at === "string" &&
     typeof bundle.exporter_did === "string" &&
     typeof bundle.bundle_signature === "string"
   ) {
@@ -289,12 +284,29 @@ function verifyReputationArtifact(
         attestations,
         exported_at: bundle.exported_at,
         exporter_did: bundle.exporter_did,
+        completeness_manifest: bundle.completeness_manifest,
       };
-      bundleSignatureValid = ed25519.verify(
-        fromBase64url(bundle.bundle_signature),
-        stringToBytes(JSON.stringify(signedBody)),
+      const signature = fromBase64url(bundle.bundle_signature);
+      const currentSignatureValid = ed25519.verify(
+        signature,
+        reputationBundleSigningBytes(signedBody),
         exporterKey
       );
+      const legacySignatureValid =
+        bundle.completeness_manifest === undefined &&
+        ed25519.verify(
+          signature,
+          stringToBytes(
+            JSON.stringify({
+              version: signedBody.version,
+              attestations: signedBody.attestations,
+              exported_at: signedBody.exported_at,
+              exporter_did: signedBody.exporter_did,
+            })
+          ),
+          exporterKey
+        );
+      bundleSignatureValid = currentSignatureValid || legacySignatureValid;
     }
   }
 
