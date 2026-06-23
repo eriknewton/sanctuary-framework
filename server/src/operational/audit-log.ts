@@ -102,6 +102,15 @@ export interface AuditLogConfig {
   checkpointPublicKeyResolver?: (signerKid: string) => string | Uint8Array | undefined;
   /** Optional in-process subscribers notified when audit-chain integrity fails. */
   integrityAnomalySubscribers?: AuditIntegrityAnomalySubscriber[];
+  /**
+   * Backstop interval (ms) between full on-disk re-verifications on the eager
+   * read path. Defaults to {@link DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS}
+   * (30s); also overridable via the `AUDIT_EAGER_REVERIFY_INTERVAL_MS` env var.
+   * Exposed primarily so tests can drive the backstop deterministically. The
+   * sentinel fingerprint check (event-driven out-of-band detection) is NOT
+   * gated by this interval; this is only the residual same-length+mtime backstop.
+   */
+  eagerReverifyIntervalMs?: number;
 }
 
 export interface AuditIntegrityAnomalyEvent {
@@ -501,21 +510,45 @@ const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 // fails closed once the deadline passes.
 const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
 const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
-// Eager-read throttle. The posture dashboard composes several full-chain reads
-// per board paint and pushes the same payload on an SSE cadence; re-reading +
-// re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
+// Eager-read backstop throttle. The posture dashboard composes several full-chain
+// reads per board paint and pushes the same payload on an SSE cadence; re-reading
+// + re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
 // read pegs the event loop (the #714 drill: 11-30s/paint, Node at 203% CPU). The
-// in-memory verified view is maintained EAGERLY on every append (the server is
-// the sole appender, and `persistChainedEntry` verifies + records each new entry
-// under the write lock), so an eager read is already current for everything this
-// process wrote, with NO lag for a just-appended entry. A full on-disk re-scan
-// is therefore needed ONLY to catch OUT-OF-BAND tampering (a direct file edit
-// that bypasses the server). We keep that detection but BOUND its cadence to at
-// most once per this interval, so an open auto-refreshing board no longer
-// recomputes the whole chain on every paint. The load-time full verify is
-// unconditional (it ignores this throttle), so an out-of-band edit present at
-// boot still fails loud immediately.
-const AUDIT_EAGER_REVERIFY_INTERVAL_MS = 30_000;
+// in-memory view is maintained EAGERLY on every append (the server is the sole
+// appender; `persistChainedEntry` records + chains each new entry under the write
+// lock), so an eager read is already current for everything this process wrote,
+// with NO lag for a just-appended entry. A full on-disk re-scan is therefore
+// needed ONLY to catch OUT-OF-BAND tampering (a direct file edit that bypasses
+// the server). Out-of-band edits that change the cheap listing fingerprint (entry
+// count / newest key / per-entry size+mtime aggregate) are caught EVENT-DRIVEN on
+// the NEXT eager read by the sentinel below; this full re-scan is the BACKSTOP for
+// the residual case the sentinel cannot see (a same-length, mtime-preserved byte
+// edit). The load-time full verify is unconditional (it ignores this throttle), so
+// an out-of-band edit present at boot still fails loud immediately. Injectable via
+// AuditLogConfig.eagerReverifyIntervalMs / AUDIT_EAGER_REVERIFY_INTERVAL_MS env so
+// tests can drive the backstop timing deterministically.
+const DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS = 30_000;
+// Sentinel self-throttle. The fingerprint sentinel runs a metadata-only
+// `storage.list()` (no decrypt, no full hash) to catch out-of-band edits on the
+// hot SSE path event-driven, but a full per-read `list()` over 10k entries on a
+// ~5s SSE cadence would itself start to load the event loop, so we cap the
+// sentinel's OWN cadence to this short interval. It stays far below the backstop
+// interval, so an out-of-band fingerprint change is still caught within seconds.
+const AUDIT_EAGER_SENTINEL_INTERVAL_MS = 2_000;
+
+/** Parse the eager-reverify backstop interval from config / env, defaulting to
+ * {@link DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS}. A positive finite override
+ * wins (config first, then env); anything else falls back to the default. */
+function resolveEagerReverifyIntervalMs(configured?: number): number {
+  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+  const env = Number(process.env.AUDIT_EAGER_REVERIFY_INTERVAL_MS);
+  if (Number.isFinite(env) && env >= 0) {
+    return env;
+  }
+  return DEFAULT_AUDIT_EAGER_REVERIFY_INTERVAL_MS;
+}
 
 /** True iff `pid` names a live process this user could signal. Used to detect a
  * stale audit-write lock left by a crashed/killed holder. */
@@ -684,6 +717,24 @@ export class AuditLog {
    * verify is running.
    */
   private eagerReverifyInFlight: Promise<void> | null = null;
+  /**
+   * Cheap metadata fingerprint of the audit store (entry count + newest key +
+   * per-entry size/mtime aggregate; see {@link auditStoreFingerprint}) as it
+   * stood at the last point this process KNOWS the store was consistent: refreshed
+   * after every completed full re-verify AND after each of THIS process's own
+   * appends. On each eager read the sentinel recomputes the live fingerprint and
+   * compares it to this expected value; a mismatch means an on-disk change NOT
+   * attributable to this process (out-of-band tamper) and forces an IMMEDIATE full
+   * re-verify regardless of the backstop throttle. Null until first computed.
+   */
+  private expectedStoreFingerprint: string | null = null;
+  /** Wall-clock of the last sentinel fingerprint check, to self-throttle the
+   * sentinel's own `storage.list()` to {@link AUDIT_EAGER_SENTINEL_INTERVAL_MS}
+   * so the hot SSE path does not list the whole store on every read. */
+  private lastSentinelCheckAtMs = 0;
+  /** Backstop interval (ms) between full on-disk re-verifies on the eager path;
+   * resolved once from config/env. See {@link resolveEagerReverifyIntervalMs}. */
+  private readonly eagerReverifyIntervalMs: number;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
@@ -705,6 +756,9 @@ export class AuditLog {
     this.checkpointSigner = config?.checkpointSigner;
     this.checkpointPublicKeyResolver = config?.checkpointPublicKeyResolver;
     this.integrityAnomalySubscribers = config?.integrityAnomalySubscribers ?? [];
+    this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
+      config?.eagerReverifyIntervalMs
+    );
     this.filesystemCapabilities = asFilesystemCapabilities(storage);
     if (this.filesystemCapabilities) {
       this.auditWriteLockPath = join(
@@ -894,6 +948,14 @@ export class AuditLog {
       await this.maybeRotate().catch(() => {
         // Rotation failure is non-fatal
       });
+
+      // Re-baseline the eager-read sentinel fingerprint to the post-append (and
+      // post-rotation) on-disk state. This is what keeps the server's OWN appends
+      // from tripping the sentinel into a redundant full re-verify (which would
+      // kill the perf win); only out-of-band edits (NOT attributable to this
+      // process) change the fingerprint away from this baseline. Cheap metadata
+      // list, no decrypt. Best-effort: a list failure leaves the prior baseline.
+      await this.refreshExpectedStoreFingerprint();
     } finally {
       if (!options.critical && this.pendingVisibleEntries > 0) {
         this.pendingVisibleEntries--;
@@ -1635,39 +1697,55 @@ export class AuditLog {
    * SSE cadence makes an open board recompute it continuously, wedging the server.
    *
    * This path serves from the EAGERLY-MAINTAINED in-memory verified view instead:
-   *   - {@link persistChainedEntry} updates `this.entries` / `this.chainEntries` /
-   *     `this.integrityFindings` and advances the verified head on EVERY append,
-   *     under the write lock, having already verified the new entry chains. So the
-   *     in-memory view is always current for everything THIS process wrote, with
-   *     NO lag, so a just-appended entry is visible to the very next eager read.
+   *   - {@link persistChainedEntry} appends to `this.entries` / `this.chainEntries`
+   *     and advances the verified head (`nextSequence` / `lastEntryHash`) on EVERY
+   *     append, under the write lock, after chaining the new entry from the
+   *     freshened-from-disk head (so an append is valid by construction). It does
+   *     NOT touch `this.integrityFindings`: that array is the OUT-OF-BAND verdict
+   *     and is (re)computed only by a full rescan: at load (`loadPersistedEntries`,
+   *     which assigns `this.integrityFindings`), by the sentinel-forced rescan
+   *     below, or by the throttled backstop rescan. So the in-memory ENTRY view is
+   *     always current for everything THIS process wrote, with NO lag, and a
+   *     just-appended entry is visible to the very next eager read.
    *   - We `await this.appendQueue` first, so all queued appends are reflected
    *     before we read (never-stale: an in-flight append is drained, not skipped).
-   *   - A FULL on-disk re-scan (the expensive `loadPersistedEntries`) is run only
-   *     when the view was never loaded OR more than
-   *     `AUDIT_EAGER_REVERIFY_INTERVAL_MS` has elapsed since the last full verify.
-   *     That re-scan exists ONLY to catch OUT-OF-BAND tampering (a direct on-disk
-   *     edit that bypasses the server); throttling its CADENCE never makes a
-   *     server-written entry stale, because those are reflected eagerly above.
+   *   - SENTINEL (event-driven out-of-band detection): each eager read recomputes a
+   *     CHEAP listing fingerprint of the store (count + newest key + per-entry
+   *     size/mtime aggregate; metadata only, NO decrypt, NO full hash; see
+   *     {@link auditStoreFingerprint}) and compares it to the expected fingerprint
+   *     refreshed after each completed rescan AND after each of this process's own
+   *     appends. A mismatch is an on-disk change NOT attributable to this process,
+   *     so it forces an IMMEDIATE full re-scan regardless of the backstop throttle.
+   *     The sentinel's own `list()` is self-throttled to
+   *     `AUDIT_EAGER_SENTINEL_INTERVAL_MS` so the hot SSE path stays bounded at 10k.
+   *   - BACKSTOP: a FULL on-disk re-scan (the expensive `loadPersistedEntries`) also
+   *     runs when the view was never loaded OR more than the configured
+   *     `eagerReverifyIntervalMs` has elapsed since the last full verify. This is
+   *     the residual safety net for the ONE out-of-band shape the sentinel cannot
+   *     see (a same-length, mtime-preserved byte edit), and the boot floor.
    *
    * NEVER-STALE-GREEN GUARANTEE: `integrity_findings` returned here is the EAGER
-   * verdict. Because the verdict is maintained on each append (not lazily cached
-   * and invalidated), there is no window where a just-appended-but-unverified
-   * entry reads green, and a load-time / throttled re-scan that detects a problem
-   * leaves the finding in `this.integrityFindings`, which every subsequent eager
-   * read inherits. The strict-mode contract is preserved: when integrity findings
-   * are present, this throws `AuditIntegrityError` (unless the caller opted into
+   * verdict. There is no window where a just-appended-but-unverified entry reads
+   * green (appends chain from the verified head by construction), and a load-time /
+   * sentinel-forced / backstop re-scan that detects a problem assigns the finding
+   * to `this.integrityFindings`, which every subsequent eager read inherits. The
+   * strict-mode contract is preserved: when integrity findings are present, this
+   * throws `AuditIntegrityError` (unless the caller opted into
    * `runAllowingIntegrityFindings`), exactly as `query` does.
    *
    * OUT-OF-BAND TAMPER DETECTION BOUNDARY (documented, intentional): an on-disk
-   * edit made by a non-server process is caught (a) unconditionally at load, and
-   * (b) within at most `AUDIT_EAGER_REVERIFY_INTERVAL_MS` on the eager path,
-   * versus immediately-per-request on the legacy `query` path. The agent-facing
-   * audit query (`query`) is UNCHANGED and still re-verifies on every call, so the
-   * inspectable audit surface keeps per-request on-disk tamper detection; only the
-   * high-frequency posture composition is throttled. Within the throttle window an
-   * eager read can serve the last verified verdict for an on-disk edit not yet
-   * re-scanned, but it can NEVER serve stale-green for anything the server itself
-   * did, and the boundary is bounded + documented, never silent.
+   * edit made by a non-server process is caught (a) unconditionally at load, (b)
+   * on the NEXT eager read by the sentinel whenever it changes the listing
+   * fingerprint (count / newest key / per-entry size or mtime), event-driven, not
+   * up to the backstop interval, and (c) within at most `eagerReverifyIntervalMs`
+   * by the backstop for the residual same-length + mtime-preserved byte edit. The
+   * agent-facing audit query (`query`) is UNCHANGED and still re-verifies on every
+   * call, so the inspectable audit surface keeps per-request on-disk tamper
+   * detection; only the high-frequency posture composition is throttled. The ONLY
+   * remaining stale-green window on the eager path is a fingerprint-PRESERVING
+   * out-of-band content edit between backstop re-scans; it can NEVER serve
+   * stale-green for anything the server itself did, and the boundary is bounded +
+   * documented, never silent.
    */
   async queryEager(options: {
     since?: string;
@@ -1699,20 +1777,30 @@ export class AuditLog {
 
   /**
    * Bring the in-memory verified view up to date for an eager read. Drains the
-   * append queue (so every queued append is reflected, never-stale), runs a full
-   * on-disk re-scan only when never loaded or the re-verify throttle has elapsed,
-   * and then enforces the SAME strict-mode integrity contract as `query`
-   * (findings → throw unless the caller opted in). See {@link queryEager}.
+   * append queue (so every queued append is reflected, never-stale), then decides
+   * whether a full on-disk re-scan is needed:
+   *   - the backstop throttle (never loaded, or `eagerReverifyIntervalMs` elapsed
+   *     since the last full verify), AND
+   *   - the SENTINEL: a cheap metadata fingerprint of the store compared to the
+   *     expected fingerprint (refreshed after each rescan and after this process's
+   *     own appends). A mismatch is an out-of-band change and forces an IMMEDIATE
+   *     full re-scan even if the backstop has not elapsed.
+   * It then enforces the SAME strict-mode integrity contract as `query` (findings
+   * → throw unless the caller opted in). See {@link queryEager}.
    */
   private async ensureFreshEagerView(): Promise<void> {
     await this.appendQueue;
-    const dueForFullReverify =
+    const backstopDue =
       !this.loaded ||
-      Date.now() - this.lastFullVerifyAtMs >= AUDIT_EAGER_REVERIFY_INTERVAL_MS;
-    if (dueForFullReverify) {
-      // Full disk re-scan (also stamps lastFullVerifyAtMs + refreshes findings),
-      // single-flighted so concurrent board reads share ONE scan instead of
-      // racing redundant scans over the same shared chain state.
+      Date.now() - this.lastFullVerifyAtMs >= this.eagerReverifyIntervalMs;
+    // SENTINEL: only worth the metadata `list()` when we are NOT already going to
+    // rescan, and at most once per the sentinel self-throttle so the hot SSE path
+    // does not list the whole store on every read.
+    const sentinelTripped = backstopDue ? false : await this.sentinelDetectsDrift();
+    if (backstopDue || sentinelTripped) {
+      // Full disk re-scan (also stamps lastFullVerifyAtMs + refreshes findings +
+      // the expected fingerprint), single-flighted so concurrent board reads share
+      // ONE scan instead of racing redundant scans over the same shared chain state.
       if (this.eagerReverifyInFlight === null) {
         this.eagerReverifyInFlight = (async () => {
           try {
@@ -1734,6 +1822,81 @@ export class AuditLog {
       !contextAllowsIntegrityFindings
     ) {
       throw new AuditIntegrityError(this.integrityFindings);
+    }
+  }
+
+  /**
+   * Cheap, self-throttled out-of-band drift check for the eager read path.
+   * Returns true iff the live store fingerprint differs from the expected one
+   * (an on-disk change NOT attributable to this process's own appends), which
+   * forces an immediate full re-verify in {@link ensureFreshEagerView}.
+   *
+   * Self-throttled to {@link AUDIT_EAGER_SENTINEL_INTERVAL_MS}: between checks it
+   * returns false so the hot SSE path does not run `storage.list()` on every read
+   * at 10k entries. Drift is therefore caught on the first eager read after the
+   * sentinel interval has elapsed: within seconds, far below the backstop. If no
+   * expected fingerprint has been established yet (no rescan/append since boot),
+   * it returns false: the backstop / load-time verify owns that first pass.
+   */
+  private async sentinelDetectsDrift(): Promise<boolean> {
+    const now = Date.now();
+    if (now - this.lastSentinelCheckAtMs < AUDIT_EAGER_SENTINEL_INTERVAL_MS) {
+      return false;
+    }
+    this.lastSentinelCheckAtMs = now;
+    if (this.expectedStoreFingerprint === null) return false;
+    const actual = await this.auditStoreFingerprint();
+    return actual !== this.expectedStoreFingerprint;
+  }
+
+  /**
+   * Cheap metadata fingerprint of the audit namespace: entry count, newest key,
+   * and a per-entry size+mtime aggregate. Built from ONE `storage.list()` (no
+   * read, NO decrypt, NO full hash), so it is safe to run on the hot eager path.
+   * Any out-of-band change that adds/removes an entry (count / newest key) or
+   * rewrites one in place (its `size_bytes` and/or `modified_at` change) flips
+   * this value. The ONLY out-of-band edit it cannot see is a same-length,
+   * mtime-preserved byte rewrite, caught by the throttled backstop full re-scan.
+   */
+  private async auditStoreFingerprint(): Promise<string> {
+    let metas;
+    try {
+      metas = await this.storage.list(AUDIT_NAMESPACE);
+    } catch {
+      // A listing error is itself a drift signal: returning a sentinel distinct
+      // from any real fingerprint makes the comparison unequal and forces a rescan.
+      return "list-error";
+    }
+    if (metas.length === 0) return "0";
+    metas.sort((a, b) => a.key.localeCompare(b.key));
+    const newestKey = metas[metas.length - 1]!.key;
+    // Order-independent aggregate of per-entry size+mtime: catches an in-place
+    // rewrite (size or mtime changes) without paying a per-read full sort/hash
+    // beyond the cheap list above.
+    let sizeSum = 0;
+    let mtimeAgg = 0;
+    for (const m of metas) {
+      sizeSum += m.size_bytes;
+      // Fold the mtime string into a small rolling integer; collisions only cost
+      // a missed event-driven catch (the backstop still covers it), never a false
+      // green for a server-written entry.
+      for (let i = 0; i < m.modified_at.length; i++) {
+        mtimeAgg = (mtimeAgg * 31 + m.modified_at.charCodeAt(i)) >>> 0;
+      }
+    }
+    return `${metas.length}:${newestKey}:${sizeSum}:${mtimeAgg}`;
+  }
+
+  /** Recompute + cache the expected store fingerprint as the current on-disk
+   * state. Called after a completed full re-verify and after each of this
+   * process's own appends, so the sentinel treats only OUT-OF-BAND changes as
+   * drift. A failure to list leaves the prior expected value untouched rather
+   * than poisoning it (the next sentinel/ backstop pass re-establishes it). */
+  private async refreshExpectedStoreFingerprint(): Promise<void> {
+    try {
+      this.expectedStoreFingerprint = await this.auditStoreFingerprint();
+    } catch {
+      // Leave the prior fingerprint in place; do not mask drift with a stale-clear.
     }
   }
 
@@ -2207,9 +2370,12 @@ export class AuditLog {
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
-      // A complete on-disk re-scan just ran: reset the eager-read throttle so the
-      // next eager read serves from this freshly-verified view without re-paying.
+      // A complete on-disk re-scan just ran: reset the eager-read backstop throttle
+      // so the next eager read serves from this freshly-verified view without
+      // re-paying, and re-baseline the sentinel fingerprint to this verified state
+      // so subsequent out-of-band edits read as drift.
       this.lastFullVerifyAtMs = Date.now();
+      await this.refreshExpectedStoreFingerprint();
     } catch (err) {
       findings.push({
         kind: "storage_unavailable",
@@ -2218,8 +2384,10 @@ export class AuditLog {
       this.integrityFindings = findings;
       // Even a failed listing is a completed (failed) full pass; stamp it so the
       // throttle does not hot-loop full scans, but the findings above keep the
-      // read honest (an eager read inherits these findings → never green).
+      // read honest (an eager read inherits these findings → never green). Re-baseline
+      // the fingerprint best-effort; on a list failure it stays a sentinel value.
       this.lastFullVerifyAtMs = Date.now();
+      await this.refreshExpectedStoreFingerprint();
     }
   }
 

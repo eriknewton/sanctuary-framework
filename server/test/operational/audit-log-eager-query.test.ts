@@ -22,6 +22,7 @@ import {
   type PersistedAuditEnvelopeV2,
 } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import type { StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { encrypt } from "../../src/core/encryption.js";
@@ -271,5 +272,315 @@ describe("AuditLog eager read - never-stale-green honesty", () => {
     expect(a.integrity_findings).toEqual([]);
     expect(b.total).toBe(500);
     expect(c.total).toBe(500);
+  });
+});
+
+/**
+ * Flip one byte of a victim entry's ciphertext IN PLACE (same length), bypassing
+ * the server. Through `storage.write` this also refreshes the entry's `modified_at`
+ * (mtime), so the cheap listing fingerprint (size+mtime aggregate) changes and the
+ * sentinel must catch it on the NEXT eager read without waiting out the backstop.
+ */
+async function tamperOneByteChangingFingerprint(
+  storage: MemoryStorage,
+  victimKey: string,
+): Promise<void> {
+  const raw = await storage.read("_audit", victimKey);
+  const env = JSON.parse(bytesToString(raw!)) as PersistedAuditEnvelopeV2;
+  env.encrypted_payload_bytes = env.encrypted_payload_bytes
+    .split("")
+    .reverse()
+    .join("");
+  await storage.write("_audit", victimKey, stringToBytes(JSON.stringify(env)));
+}
+
+/**
+ * In-memory storage whose `write` PRESERVES an entry's `modified_at` when an
+ * overwrite keeps the same byte length, mimicking a real-FS edit that does not
+ * advance mtime. Used to construct the ONE residual out-of-band shape the
+ * fingerprint sentinel cannot see (same count, same newest key, same size, same
+ * mtime), proving the throttled backstop full re-verify is the safety net for it.
+ */
+class MtimeStableStorage extends MemoryStorage {
+  private mtimes = new Map<string, string>();
+  override async write(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    const composite = `${namespace}/${key}`;
+    const prior = (await this.list(namespace)).find((m) => m.key === key);
+    await super.write(namespace, key, data);
+    // If an entry of identical size already existed, pin mtime back to its prior
+    // value so the fingerprint is byte-for-byte preserved across this overwrite.
+    if (prior && prior.size_bytes === data.length) {
+      const pinned = this.mtimes.get(composite) ?? prior.modified_at;
+      this.mtimes.set(composite, pinned);
+    }
+  }
+  override async list(
+    namespace: string,
+    prefix?: string,
+  ): Promise<StorageEntryMeta[]> {
+    const metas = await super.list(namespace, prefix);
+    return metas.map((m) => {
+      const pinned = this.mtimes.get(`${namespace}/${m.key}`);
+      return pinned ? { ...m, modified_at: pinned } : m;
+    });
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("AuditLog eager read - out-of-band sentinel + backstop (injectable interval)", () => {
+  it("sentinel catches an out-of-band tamper on the NEXT eager read (no backstop wait) on a long-lived instance", async () => {
+    const { storage, masterKey } = await buildChain(200);
+    // Long-lived instance with a HUGE backstop so the catch can ONLY come from the
+    // event-driven fingerprint sentinel, never the throttled full re-verify.
+    const server = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+      eagerReverifyIntervalMs: 60 * 60 * 1000,
+    });
+    // Cold read: pays the load-time full verify, establishes the sentinel baseline.
+    const clean = await server.queryEager({ limit: 50 });
+    expect(clean.integrity_findings).toEqual([]);
+
+    // Out-of-band tamper that changes the listing fingerprint (mtime via write()).
+    const keys = (await storage.list("_audit"))
+      .map((m) => m.key)
+      .sort((a, b) => a.localeCompare(b));
+    await tamperOneByteChangingFingerprint(storage, keys[100]!);
+
+    // The VERY NEXT eager read - same long-lived instance, backstop nowhere near
+    // due - must surface the tamper because the sentinel fingerprint changed.
+    const after = await server.queryEager({ limit: 50 });
+    expect(after.integrity_findings.length).toBeGreaterThan(0);
+  });
+
+  it("backstop full re-verify fires after the interval for a fingerprint-PRESERVING tamper", async () => {
+    const storage = new MtimeStableStorage();
+    const masterKey = generateRandomKey();
+    // Build the chain inside the mtime-stable store.
+    const encryptionKey = derivePurposeKey(masterKey, "audit-log");
+    let prevHash = AUDIT_CHAIN_GENESIS;
+    const total = 120;
+    for (let i = 0; i < total - 1; i++) {
+      const sequence = i + 1;
+      const timestamp = new Date(Date.now() - (total - sequence) * 1000).toISOString();
+      const normalized = {
+        timestamp,
+        layer: "l1" as const,
+        operation: "egress_allowed",
+        identity_id: `agent-${i % 4}`,
+        result: "success" as const,
+        details: { op: i },
+      };
+      const encrypted = encrypt(stringToBytes(JSON.stringify(normalized)), encryptionKey);
+      const encryptedPayloadBytes = toBase64url(stringToBytes(JSON.stringify(encrypted)));
+      const entryHash = computeAuditEntryHash({
+        sequence,
+        prev_hash: prevHash,
+        timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+      });
+      const envelope: PersistedAuditEnvelopeV2 = {
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+        sequence,
+        prev_hash: prevHash,
+        entry_hash: entryHash,
+        timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+      };
+      await storage.write(
+        "_audit",
+        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`,
+        stringToBytes(JSON.stringify(envelope)),
+      );
+      prevHash = entryHash;
+    }
+    const bootstrap = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+    });
+    await bootstrap.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: "agent-tail",
+      result: "success",
+      details: { op: "tail" },
+    });
+    await bootstrap.flush();
+
+    const INTERVAL = 120;
+    const server = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+      eagerReverifyIntervalMs: INTERVAL,
+    });
+    const clean = await server.queryEager({ limit: 50 });
+    expect(clean.integrity_findings).toEqual([]);
+
+    // Fingerprint-PRESERVING tamper: same length AND same mtime (MtimeStableStorage
+    // pins it back), so the sentinel cannot see it.
+    const keys = (await storage.list("_audit"))
+      .filter((m) => m.key.startsWith("entry-"))
+      .map((m) => m.key)
+      .sort((a, b) => a.localeCompare(b));
+    const victim = keys[60]!;
+    const raw = await storage.read("_audit", victim);
+    const env = JSON.parse(bytesToString(raw!)) as PersistedAuditEnvelopeV2;
+    const chars = env.encrypted_payload_bytes.split("");
+    // Swap two characters: same length, and reuse existing chars so it stays valid
+    // base64url but no longer decrypts/hashes correctly (a real byte rewrite).
+    [chars[0], chars[chars.length - 1]] = [chars[chars.length - 1]!, chars[0]!];
+    env.encrypted_payload_bytes = chars.join("");
+    const tamperedBytes = stringToBytes(JSON.stringify(env));
+    expect(tamperedBytes.length).toBe(raw!.length); // size preserved
+    await storage.write("_audit", victim, tamperedBytes);
+
+    // Sanity: the fingerprint did NOT change, so an immediate read within the
+    // backstop window does NOT catch it (the documented residual).
+    const within = await server.queryEager({ limit: 50 });
+    expect(within.integrity_findings).toEqual([]);
+
+    // After the backstop interval elapses, the full re-verify fires and catches it.
+    await sleep(INTERVAL + 40);
+    const afterBackstop = await server.queryEager({ limit: 50 });
+    expect(afterBackstop.integrity_findings.length).toBeGreaterThan(0);
+  });
+
+  it("AUDIT_EAGER_REVERIFY_INTERVAL_MS env overrides the backstop interval", async () => {
+    const prior = process.env.AUDIT_EAGER_REVERIFY_INTERVAL_MS;
+    process.env.AUDIT_EAGER_REVERIFY_INTERVAL_MS = "0";
+    try {
+      const { storage, masterKey } = await buildChain(80);
+      // interval 0 => every eager read's backstop is due => full re-verify each time.
+      const server = new AuditLog(storage, masterKey, {
+        checkpointInterval: 0,
+        integrityMode: "lenient",
+      });
+      const clean = await server.queryEager({ limit: 50 });
+      expect(clean.integrity_findings).toEqual([]);
+      // Fingerprint-changing tamper is caught even though the sentinel self-throttle
+      // would skip - because the backstop runs on every read at interval 0.
+      const keys = (await storage.list("_audit"))
+        .map((m) => m.key)
+        .sort((a, b) => a.localeCompare(b));
+      await tamperOneByteChangingFingerprint(storage, keys[40]!);
+      const after = await server.queryEager({ limit: 50 });
+      expect(after.integrity_findings.length).toBeGreaterThan(0);
+    } finally {
+      if (prior === undefined) delete process.env.AUDIT_EAGER_REVERIFY_INTERVAL_MS;
+      else process.env.AUDIT_EAGER_REVERIFY_INTERVAL_MS = prior;
+    }
+  });
+});
+
+describe("AuditLog eager scope isolation - agent/evidence reads stay per-request honest", () => {
+  it("while queryEager is warm, the agent-facing query() path STILL catches an out-of-band tamper immediately", async () => {
+    const { storage, masterKey } = await buildChain(150);
+    // Long-lived server: warm the EAGER path with a clean read and a huge backstop,
+    // so the eager view would happily serve a stale-green verdict for the window.
+    const server = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+      eagerReverifyIntervalMs: 60 * 60 * 1000,
+    });
+    const eagerClean = await server.queryEager({ limit: 50 });
+    expect(eagerClean.integrity_findings).toEqual([]);
+
+    // Out-of-band tamper AFTER the eager view is warm.
+    const keys = (await storage.list("_audit"))
+      .map((m) => m.key)
+      .sort((a, b) => a.localeCompare(b));
+    await tamperOneByteChangingFingerprint(storage, keys[75]!);
+
+    // The AGENT-FACING default `query()` (NOT inside runEagerReads) must re-verify
+    // on this very call and surface the finding immediately - the ALS eager mode
+    // does not leak into the inspectable audit / evidence read path.
+    const agentRead = await server.query({ limit: 50 });
+    expect(agentRead.integrity_findings.length).toBeGreaterThan(0);
+  });
+
+  it("a tamper the eager sentinel would only catch later is still caught NOW by query()/buildEvidence-class reads", async () => {
+    const storage = new MtimeStableStorage();
+    const masterKey = generateRandomKey();
+    const encryptionKey = derivePurposeKey(masterKey, "audit-log");
+    let prevHash = AUDIT_CHAIN_GENESIS;
+    const total = 90;
+    for (let i = 0; i < total - 1; i++) {
+      const sequence = i + 1;
+      const timestamp = new Date(Date.now() - (total - sequence) * 1000).toISOString();
+      const normalized = {
+        timestamp,
+        layer: "l1" as const,
+        operation: "egress_allowed",
+        identity_id: `agent-${i % 4}`,
+        result: "success" as const,
+        details: { op: i },
+      };
+      const encrypted = encrypt(stringToBytes(JSON.stringify(normalized)), encryptionKey);
+      const encryptedPayloadBytes = toBase64url(stringToBytes(JSON.stringify(encrypted)));
+      const entryHash = computeAuditEntryHash({
+        sequence,
+        prev_hash: prevHash,
+        timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+      });
+      const envelope: PersistedAuditEnvelopeV2 = {
+        schema_version: AUDIT_CHAIN_SCHEMA_VERSION,
+        sequence,
+        prev_hash: prevHash,
+        entry_hash: entryHash,
+        timestamp,
+        encrypted_payload_bytes: encryptedPayloadBytes,
+      };
+      await storage.write(
+        "_audit",
+        `entry-${String(sequence).padStart(20, "0")}-fixture-${i}`,
+        stringToBytes(JSON.stringify(envelope)),
+      );
+      prevHash = entryHash;
+    }
+    const bootstrap = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+    });
+    await bootstrap.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: "agent-tail",
+      result: "success",
+      details: { op: "tail" },
+    });
+    await bootstrap.flush();
+
+    const server = new AuditLog(storage, masterKey, {
+      checkpointInterval: 0,
+      integrityMode: "lenient",
+      eagerReverifyIntervalMs: 60 * 60 * 1000,
+    });
+    await server.queryEager({ limit: 50 }); // warm the eager view clean
+
+    // Fingerprint-preserving tamper (residual case for the eager path).
+    const keys = (await storage.list("_audit"))
+      .filter((m) => m.key.startsWith("entry-"))
+      .map((m) => m.key)
+      .sort((a, b) => a.localeCompare(b));
+    const victim = keys[45]!;
+    const raw = await storage.read("_audit", victim);
+    const env = JSON.parse(bytesToString(raw!)) as PersistedAuditEnvelopeV2;
+    const chars = env.encrypted_payload_bytes.split("");
+    [chars[0], chars[chars.length - 1]] = [chars[chars.length - 1]!, chars[0]!];
+    env.encrypted_payload_bytes = chars.join("");
+    await storage.write("_audit", victim, stringToBytes(JSON.stringify(env)));
+
+    // The eager path would NOT catch this until the backstop (residual), BUT the
+    // agent-facing query() re-verifies on EVERY call and catches it right now.
+    const agentRead = await server.query({ limit: 50 });
+    expect(agentRead.integrity_findings.length).toBeGreaterThan(0);
   });
 });

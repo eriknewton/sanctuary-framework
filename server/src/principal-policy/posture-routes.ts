@@ -529,8 +529,9 @@ export async function handlePostureRoute(
 // The always-on posture surface (home board + per-panel endpoints + SSE push)
 // composes several full-window audit reads per paint. Each helper below wraps its
 // build in `AuditLog.runEagerReads` so those reads serve from the eagerly-
-// maintained verified view with a THROTTLED out-of-band re-verify, instead of a
-// full chain re-scan per request. On a real 10k-entry / 40MB chain the old path
+// maintained verified view with an EVENT-DRIVEN out-of-band fingerprint sentinel
+// plus a throttled backstop re-verify, instead of a full chain re-scan per request.
+// On a real 10k-entry / 40MB chain the old path
 // was 11-30s and pegged the event loop, and the SSE cadence made an open board
 // recompute it continuously and wedge the server (the #714 drill). HONESTY is
 // preserved: the eager view reflects every server-written entry with NO lag (the
@@ -582,13 +583,15 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
  * records it), so the panel always reflects the current chain head with NO lag.
  * A post-fault refresh can never show stale green. This is NOT a lazily-cached
  * value that could fall behind an append: it is the eagerly-maintained verified
- * state, and a detected integrity finding (at load, or on the throttled out-of-
- * band re-verify) forces every row to `unknown`/non-green via the existing
- * `audit_integrity_ok=false` lever. What the eager path changes versus the old
- * code is ONLY the cadence of the OUT-OF-BAND on-disk re-scan (a direct file edit
- * that bypasses the server), bounded to once per `AUDIT_EAGER_REVERIFY_INTERVAL_MS`
- * instead of once-per-request, so an auto-refreshing board no longer re-verifies
- * the whole chain on every paint (the #714 wedge).
+ * state, and a detected integrity finding (at load, on the next eager read via the
+ * fingerprint sentinel, or on the throttled backstop out-of-band re-verify) forces
+ * every row to `unknown`/non-green via the existing `audit_integrity_ok=false`
+ * lever. What the eager path changes versus the old code is ONLY the cadence of the
+ * OUT-OF-BAND on-disk re-scan (a direct file edit that bypasses the server): a
+ * fingerprint-changing edit (count / newest key / per-entry size or mtime) is
+ * caught EVENT-DRIVEN on the next eager read, and only the residual same-length,
+ * mtime-preserved edit waits for the throttled backstop re-verify, instead of
+ * re-verifying the whole chain on every paint (the #714 wedge).
  */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
