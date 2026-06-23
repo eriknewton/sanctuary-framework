@@ -23,7 +23,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -954,9 +954,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       return false;
     };
     const walkDir = (dir: string) => {
-      for (const name of readdirSync(dir)) {
+      // withFileTypes: the dir/file decision comes from the directory listing
+      // itself (the Dirent), not a separate statSync(p), so there is no
+      // check-then-use (TOCTOU) gap on p between the type check and the read.
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const name = entry.name;
         const p = join(dir, name);
-        if (statSync(p).isDirectory()) {
+        if (entry.isDirectory()) {
           if (name === "node_modules") continue;
           walkDir(p);
           continue;
@@ -964,9 +968,15 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         if (!name.endsWith(".ts") || name.endsWith(".d.ts") || name.endsWith(".test.ts")) {
           continue;
         }
+        let source: string;
+        try {
+          source = readFileSync(p, "utf8");
+        } catch {
+          continue; // file vanished mid-walk: skip, don't crash
+        }
         const sf = ts.createSourceFile(
           p,
-          readFileSync(p, "utf8"),
+          source,
           ts.ScriptTarget.Latest,
           /*setParentNodes*/ false
         );
@@ -1453,9 +1463,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       return "(module-scope)";
     };
     const walkDir = (dir: string) => {
-      for (const name of readdirSync(dir)) {
+      // withFileTypes: the dir/file decision comes from the directory listing
+      // itself (the Dirent), not a separate statSync(p), so there is no
+      // check-then-use (TOCTOU) gap on p between the type check and the read.
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const name = entry.name;
         const p = join(dir, name);
-        if (statSync(p).isDirectory()) {
+        if (entry.isDirectory()) {
           if (name === "node_modules") continue;
           walkDir(p);
           continue;
@@ -1469,7 +1483,12 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         }
         const rel = relative(SERVER_SRC, p).split(sep).join("/");
         if (excludeModules.has(rel)) continue; // agent-facing → out of scope
-        const source = readFileSync(p, "utf8");
+        let source: string;
+        try {
+          source = readFileSync(p, "utf8");
+        } catch {
+          continue; // file vanished mid-walk: skip, don't crash
+        }
         const sf = ts.createSourceFile(
           p,
           source,
@@ -1699,9 +1718,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         eager: boolean;
       }> = [];
       const walkDir = (dir: string) => {
-        for (const name of readdirSync(dir)) {
+        // withFileTypes: the dir/file decision comes from the directory listing
+        // itself (the Dirent), not a separate statSync(p), so there is no
+        // check-then-use (TOCTOU) gap on p between the type check and the read.
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const name = entry.name;
           const p = join(dir, name);
-          if (statSync(p).isDirectory()) {
+          if (entry.isDirectory()) {
             if (name === "node_modules") continue;
             walkDir(p);
             continue;
@@ -1715,9 +1738,15 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
           }
           const rel = relative(SERVER_SRC, p).split(sep).join("/");
           if (exclude.has(rel)) continue; // agent-facing → out of scope
+          let source: string;
+          try {
+            source = readFileSync(p, "utf8");
+          } catch {
+            continue; // file vanished mid-walk: skip, don't crash
+          }
           const sf = ts.createSourceFile(
             p,
-            readFileSync(p, "utf8"),
+            source,
             ts.ScriptTarget.Latest,
             /*setParentNodes*/ true,
           );
