@@ -694,14 +694,14 @@ async function buildEvidence(
   // Result filter is applied as a post-filter (AuditLog.query has no result
   // param).  We re-derive total to reflect post-filter count.
   let entries = queryResult.entries;
-  let total = queryResult.total;
+  const total = queryResult.total;
   if (resultParam === "success" || resultParam === "failure") {
     entries = entries.filter((e) => e.result === resultParam);
-    // total was pre-limit; re-compute honestly from the filtered set so the
-    // client knows if truncation occurred.  A slight undercount is possible
-    // when the limit slice also contained non-matching entries, but it is
-    // honest ("at least N matched") and never an overclaim.
-    total = queryResult.total; // leave original total; client sees entries.length
+    // total is queryResult.total: the in-window count BEFORE the result
+    // post-filter (and before the limit slice).  It is NOT the count of matched
+    // entries; the client can compare entries.length against total to detect
+    // truncation at the query level, but cannot infer how many in-window entries
+    // matched the result filter.  This is the honest reading of the number.
   }
 
   return {
