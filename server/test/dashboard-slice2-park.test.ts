@@ -247,6 +247,58 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
     expect(dashboard.isParked()).toBe(false);
   });
 
+  it("a CORRECT-credential unlock whose dependency WIRING fails leaves the dashboard CLEANLY PARKED (atomic-wiring: no half-unlocked state)", async () => {
+    // Custody fail-open regression guard. establishMaster SUCCEEDS (the
+    // credential is correct), but a fault is injected into wireUnlockedDeps
+    // AFTER every dep is constructed/loaded/saved and BEFORE any is attached.
+    // The unlock must fail closed (401) and the dashboard must remain provably
+    // fully parked: isParked() true, readiness "locked", audit-log empty, and
+    // loopback auto-auth OFF (a co-resident agent cannot read protected state).
+    await seedWrappedFortress(storagePath);
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "park-token-wirefault";
+
+    const result = await startOnFreePort({
+      host: "127.0.0.1",
+      allowPark: true,
+      __testFaultAfterLoads: () => {
+        throw new Error("injected post-load wiring fault");
+      },
+    });
+    dashboard = result.dashboard;
+    const base = `http://127.0.0.1:${result.port}`;
+    const auth = { Authorization: "Bearer park-token-wirefault" };
+
+    // Pre-unlock: parked + locked.
+    expect(dashboard.isParked()).toBe(true);
+    expect((await (await fetch(`${base}/api/readiness`, { headers: auth })).json()).ready).toBe("locked");
+
+    // Correct token + correct credential, but wiring throws after the loads.
+    const unlock = await fetch(`${base}/api/unlock`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: PASSPHRASE }),
+    });
+    expect(unlock.status).toBe(401);
+
+    // PROVE fully parked: every attach was rolled back / never happened.
+    expect(dashboard.isParked()).toBe(true);
+
+    const ready = await fetch(`${base}/api/readiness`, { headers: auth });
+    expect((await ready.json()).ready).toBe("locked");
+
+    const audit = await fetch(`${base}/api/audit-log`, { headers: auth });
+    expect(audit.status).toBe(200);
+    const auditData = await audit.json();
+    const entries = Array.isArray(auditData) ? auditData : (auditData.entries ?? []);
+    expect(entries.length).toBe(0);
+
+    // Loopback auto-auth MUST be off: an UNAUTHENTICATED loopback request to a
+    // protected route must still be rejected (if auto-auth had leaked on, the
+    // co-resident agent could read protected state without the token).
+    const noAuthReadiness = await fetch(`${base}/api/readiness`);
+    expect(noAuthReadiness.status).toBe(401);
+  });
+
   it("the CORRECT-token + CORRECT-credential unlock lights up the read surface (locked -> serving) WITHOUT a restart", async () => {
     await seedWrappedFortress(storagePath);
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "park-token-unlock";
@@ -351,7 +403,7 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
 
     await expect(
       startOnFreePort({ host: "127.0.0.1" /* allowPark omitted */ }),
-    ).rejects.toThrow(/no credentials provided|encrypted data found/i);
+    ).rejects.toThrow(/cannot unlock this fortress|valid credential/i);
   });
 });
 

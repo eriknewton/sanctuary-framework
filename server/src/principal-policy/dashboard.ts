@@ -3537,12 +3537,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // A co-resident agent sharing the loopback interface holds no proxy for
     // operator identity, so loopback auto-auth is explicitly suppressed here:
     // the agent cannot self-unlock the fortress by POSTing a guessed/known
-    // credential from localhost. It rides the `decisions` rate-limit class
-    // (the auth brute-force budget). It returns GENERIC errors (no oracle
-    // about which rule/tier failed; invariant 7) and serves NO protected state
-    // until a CORRECT unlock. It NEVER auto-generates a weaker credential and
-    // NEVER weakens establishMaster (the handler calls the same establishMaster
-    // the boot path calls).
+    // credential from localhost. It is registered in the `decisions` rate-limit
+    // class, but note that `checkRateLimit` short-circuits `return true` for
+    // loopback callers (operator-local tooling must never 429), so loopback
+    // unlock attempts are NOT actually rate-limited; the rate limit only bites
+    // remote callers. Credential brute-force on loopback is instead bounded by
+    // the deliberately-slow Argon2id KDF inside establishMaster (each attempt
+    // pays the full key-derivation cost), and the operator bearer token is
+    // STILL required even on loopback (the custody carve-out above). It returns
+    // GENERIC errors (no oracle about which rule/tier failed; invariant 7) and
+    // serves NO protected state until a CORRECT unlock. It NEVER auto-generates
+    // a weaker credential and NEVER weakens establishMaster (the handler calls
+    // the same establishMaster the boot path calls).
     if (method === "POST" && url.pathname === "/api/unlock") {
       if (!this.checkRateLimit(req, res, "decisions")) return;
       if (!this.checkAuth(req, url, res, { requireToken: true })) return;

@@ -142,6 +142,17 @@ export interface StandaloneDashboardOptions {
    * LaunchAgent already owns the port.
    */
   allowPark?: boolean;
+  /**
+   * TEST-ONLY. Injected fault that fires inside `wireUnlockedDeps` AFTER every
+   * master-key-derived dependency has been constructed/loaded/saved but BEFORE
+   * any of them is attached to the dashboard channel. Throwing from this hook
+   * simulates a post-`establishMaster` wiring failure (e.g. a malformed
+   * baseline) so a test can assert the atomic-wiring invariant: a failed unlock
+   * leaves the dashboard CLEANLY PARKED (no deps attached, `/api/readiness`
+   * `locked`, `/api/audit-log` empty, loopback auto-auth off). Production
+   * callers never set this; it has no effect when undefined.
+   */
+  __testFaultAfterLoads?: () => void | Promise<void>;
 }
 
 /**
@@ -752,7 +763,25 @@ async function wireUnlockedDeps(args: {
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   await profileStore.load();
 
-  dashboard.setDependencies({
+  // ── ATOMIC WIRING (custody fail-open fix) ────────────────────────────────
+  // Slice 2 invariant: a parked dashboard holds NO master-key-derived deps and
+  // serves NO protected state. The in-process unlock path therefore must be
+  // all-or-nothing: if ANY load/save/construct below throws AFTER we have
+  // attached even one dep, the dashboard would be HALF-UNLOCKED (it would lie
+  // that it is parked via isParked() while `/api/readiness` serves and the
+  // identity/audit/sovereignty routes hand back REAL decrypted state, and (if
+  // the throw landed after the auto-auth attach) a co-resident loopback agent
+  // could read it without the token). To make a failed unlock provably leave
+  // the dashboard CLEANLY PARKED, every throwing await (construct, load, save,
+  // writeTenantRuntime) runs FIRST, into local variables; the dashboard channel
+  // is mutated ONLY in the synchronous, non-throwing ATTACH TAIL at the very
+  // end. A failure anywhere above the tail throws BEFORE a single attach, so
+  // nothing is attached and the dashboard stays parked. The caller's unlock
+  // handler then fails closed (401) and releases its single-shot guard so a
+  // legitimate retry still works.
+  //
+  // Build the dependency bundle as a local value; do NOT attach it yet.
+  const deps = {
     policy,
     baseline,
     auditLog,
@@ -767,7 +796,7 @@ async function wireUnlockedDeps(args: {
     // not silently degrade the committed-receipt count / reputation row to
     // the audit-event lower bound when composition is enabled.
     storage,
-  });
+  } as const;
   // (setStandaloneMode(true) is already called on the channel by the caller.)
 
   // Federation Slice 3a: a federation rotate-root journal means the signing
@@ -982,7 +1011,10 @@ async function wireUnlockedDeps(args: {
     policy,
     config,
   });
-  dashboard.setV11Bindings(v11Bindings);
+  // NOTE: v11Bindings is attached in the synchronous ATTACH TAIL below, not
+  // here; see the ATOMIC WIRING note. setTaskService (next block) mutates the
+  // LOCAL hubService inside v11Bindings, not the dashboard channel, so it is
+  // safe to run before the tail.
 
   // v1.3 cycle 2: wire TaskService into the hub so `sanctuary task`
   // CLI commands (which hit /api/hub/tasks/*) work in standalone mode.
@@ -1028,9 +1060,11 @@ async function wireUnlockedDeps(args: {
     dashboardHost === "127.0.0.1" ||
     dashboardHost === "::1" ||
     dashboardHost === "localhost";
-  if (hostIsLoopback && loadResult.loaded > 0) {
-    dashboard.setAutoAuthLocalhost(true);
-  }
+  // Decide the auto-auth posture now, but DO NOT attach it here; attaching
+  // loopback auto-auth before the remaining throwing awaits (distress load,
+  // writeTenantRuntime) is exactly the fail-open the atomic-wiring fix closes.
+  // It is applied in the synchronous ATTACH TAIL below.
+  const enableLoopbackAutoAuth = hostIsLoopback && loadResult.loaded > 0;
 
   // HABEAS PORT local distress lane. The standalone dashboard is the
   // long-lived operator process on the machine (launchd/systemd), so it is
@@ -1046,8 +1080,61 @@ async function wireUnlockedDeps(args: {
   // distress lane (stderr + audit, emitted server-side) is never affected.
   const distressInbox = new DistressInbox(storage, masterKey);
   await distressInbox.load();
-  dashboard.setDistressInbox(distressInbox);
+  // distressInbox is attached in the synchronous ATTACH TAIL below (not here):
+  // the writeTenantRuntime await further down can still throw, and attaching
+  // the inbox before it would re-open the half-unlocked window.
 
+  // NOTE: dashboard.start() is owned by the CALLER (startStandaloneDashboard /
+  // the unlock handler). On the unlock-later path the listener is ALREADY bound
+  // (parked), so this wiring just attaches the unlocked deps to the running
+  // server. On the unlocked-boot path the caller starts immediately after.
+
+  // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
+  // aggregator. Best-effort, cleaned up on graceful shutdown.
+  // This is the LAST throwing await before the synchronous ATTACH TAIL: if it
+  // throws, NOTHING has been attached and the dashboard stays cleanly parked.
+  await writeTenantRuntime(config.storage_path, {
+    version: SANCTUARY_VERSION,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    dashboard_host: dashboardHost,
+    dashboard_port: dashboardPort,
+    ...(typeof config.webhook?.callback_port === "number"
+      ? {
+          webhook_callback_port: config.webhook.callback_port,
+          webhook_callback_host: config.webhook.callback_host,
+        }
+      : {}),
+    mode: "standalone",
+  });
+
+  // Test-only fault injection (never set by production callers). Fires here:
+  // after every construct/load/save has SUCCEEDED but BEFORE any attach, so a
+  // test can prove the atomic-wiring invariant: a post-establishMaster wiring
+  // failure leaves the dashboard fully parked (no deps attached, auto-auth off).
+  if (options.__testFaultAfterLoads) {
+    await options.__testFaultAfterLoads();
+  }
+
+  // ── ATTACH TAIL (synchronous, non-throwing) ──────────────────────────────
+  // Every throwing await is above this line. From here on we only mutate the
+  // dashboard channel with the fully-constructed, fully-loaded local values.
+  // If control reaches this point the unlock is committed; there is no longer
+  // any half-unlocked window. Order within the tail is irrelevant for safety
+  // (none of these throw), but mirrors the historical sequence for clarity.
+  dashboard.setDependencies(deps);
+  dashboard.setV11Bindings(v11Bindings);
+  dashboard.setDistressInbox(distressInbox);
+  if (enableLoopbackAutoAuth) {
+    dashboard.setAutoAuthLocalhost(true);
+  }
+  // ── end ATTACH TAIL ──────────────────────────────────────────────────────
+
+  // HABEAS PORT local distress listener: best-effort background service started
+  // AFTER the attach tail. It does not attach to the dashboard (the inbox is the
+  // attach, done above) and never throws out, so it cannot re-open a
+  // half-unlocked window. A bad secret mode or port conflict logs and leaves the
+  // dashboard fully unlocked; the in-process distress lane is unaffected.
   let distressListener: DistressListener | undefined;
   try {
     const localSecret = await loadOrCreateLocalListenerSecret(config.storage_path);
@@ -1075,27 +1162,6 @@ async function wireUnlockedDeps(args: {
     distressListener = undefined;
   }
 
-  // NOTE: dashboard.start() is owned by the CALLER (startStandaloneDashboard /
-  // the unlock handler). On the unlock-later path the listener is ALREADY bound
-  // (parked), so this wiring just attaches the unlocked deps to the running
-  // server. On the unlocked-boot path the caller starts immediately after.
-
-  // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
-  // aggregator. Best-effort, cleaned up on graceful shutdown.
-  await writeTenantRuntime(config.storage_path, {
-    version: SANCTUARY_VERSION,
-    pid: process.pid,
-    started_at: new Date().toISOString(),
-    dashboard_host: dashboardHost,
-    dashboard_port: dashboardPort,
-    ...(typeof config.webhook?.callback_port === "number"
-      ? {
-          webhook_callback_port: config.webhook.callback_port,
-          webhook_callback_host: config.webhook.callback_host,
-        }
-      : {}),
-    mode: "standalone",
-  });
   const clearRuntime = () => {
     clearTenantRuntime(config.storage_path).catch(() => {});
     distressListener?.stop().catch(() => {});
