@@ -28,6 +28,11 @@ import { encrypt, decrypt } from "../../src/core/encryption.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import { deriveNamespaceKey } from "../../src/core/key-derivation.js";
 
+// These tests inject a MemoryStorage backend, so the boot path does NOT own a
+// filesystem fortress and the durable off-host escrow gate does not apply
+// (the caller owns key custody). The recovery-key reconstruction invariant
+// under test is unchanged.
+
 // Save and restore env vars between tests
 let savedPassphrase: string | undefined;
 let savedRecoveryKey: string | undefined;

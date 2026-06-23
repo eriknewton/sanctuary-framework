@@ -1,17 +1,23 @@
 /**
  * Custody unification — server-level incident regression
- * (sovereign-custody build, 2026-06-12).
+ * (sovereign-custody build, 2026-06-12; durable-escrow fix, 2026-06-23).
  *
  * The D4 Hermes drill nearly lost a fortress because the printed
  * recovery-key.txt held a PARALLEL master that did not reconstruct the
- * passphrase-derived master the data actually lived under. These tests
- * boot the real MCP server twice against a real filesystem fortress and
- * prove the disclosed recovery key now unlocks the same master the
- * passphrase does — for both first-run modes.
+ * passphrase-derived master the data actually lived under. These tests boot
+ * the real MCP server twice against a real filesystem fortress and prove the
+ * disclosed recovery key now unlocks the same master the passphrase does — for
+ * both first-run modes.
+ *
+ * Durable-escrow fix: the boot path NO LONGER writes recovery-key.txt inside
+ * the fortress (the orphaning bug). The freshly minted key is escrowed to an
+ * OFF-HOST path via SANCTUARY_RECOVERY_OUT, which is how these tests now
+ * recover the disclosed key. The invariant under test is unchanged: the
+ * disclosed key reconstructs the same master, with no parallel master.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,16 +38,24 @@ function extractRecoveryKey(fileContent: string): string {
 let savedPassphrase: string | undefined;
 let savedRecoveryKey: string | undefined;
 let savedStoragePath: string | undefined;
+let savedRecoveryOut: string | undefined;
 let fortress: string;
+let escrowDir: string;
+let escrowPath: string;
 
 beforeEach(async () => {
   savedPassphrase = process.env.SANCTUARY_PASSPHRASE;
   savedRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
   savedStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  savedRecoveryOut = process.env.SANCTUARY_RECOVERY_OUT;
   delete process.env.SANCTUARY_PASSPHRASE;
   delete process.env.SANCTUARY_RECOVERY_KEY;
   fortress = await mkdtemp(join(tmpdir(), "sanctuary-custody-unify-"));
+  escrowDir = await mkdtemp(join(tmpdir(), "sanctuary-custody-unify-escrow-"));
+  escrowPath = join(escrowDir, "recovery.txt");
   process.env.SANCTUARY_STORAGE_PATH = fortress;
+  // Durable off-host escrow target (replaces the orphaning in-fortress file).
+  process.env.SANCTUARY_RECOVERY_OUT = escrowPath;
 });
 
 afterEach(async () => {
@@ -51,7 +65,10 @@ afterEach(async () => {
   else delete process.env.SANCTUARY_RECOVERY_KEY;
   if (savedStoragePath !== undefined) process.env.SANCTUARY_STORAGE_PATH = savedStoragePath;
   else delete process.env.SANCTUARY_STORAGE_PATH;
+  if (savedRecoveryOut !== undefined) process.env.SANCTUARY_RECOVERY_OUT = savedRecoveryOut;
+  else delete process.env.SANCTUARY_RECOVERY_OUT;
   await rm(fortress, { recursive: true, force: true });
+  await rm(escrowDir, { recursive: true, force: true });
 });
 
 describe("custody unification (incident regression)", () => {
@@ -60,13 +77,13 @@ describe("custody unification (incident regression)", () => {
     const first = await createSanctuaryServer({});
     const firstMaster = toBase64url(first.masterKey);
 
-    // The server disclosed a recovery key on first run — for the
+    // The server escrowed a recovery key off-host on first run — for the
     // passphrase mode too (the drill gap: passphrase fortresses had no
-    // working recovery artifact at all).
-    const fileContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    // working recovery artifact at all). It is NOT inside the fortress.
+    await expect(
+      stat(join(fortress, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+    const fileContent = await readFile(escrowPath, "utf-8");
     const recoveryKey = extractRecoveryKey(fileContent);
 
     // Boot 2: recovery key ONLY (passphrase lost — the T1 scenario).
@@ -86,10 +103,11 @@ describe("custody unification (incident regression)", () => {
     const first = await createSanctuaryServer({});
     const firstMaster = toBase64url(first.masterKey);
 
-    const fileContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    // Escrowed off-host, never inside the fortress.
+    await expect(
+      stat(join(fortress, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+    const fileContent = await readFile(escrowPath, "utf-8");
     const recoveryKey = extractRecoveryKey(fileContent);
 
     process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
@@ -105,5 +123,19 @@ describe("custody unification (incident regression)", () => {
     await expect(createSanctuaryServer({})).rejects.toThrow(
       /does not unlock/
     );
+  });
+
+  it("boot first-run FAILS CLOSED with no off-host escrow target (durable-fix gate)", async () => {
+    // No SANCTUARY_RECOVERY_OUT, no passphrase, no tty: the boot must refuse
+    // to finish rather than leave the freshly minted key uncaptured.
+    delete process.env.SANCTUARY_RECOVERY_OUT;
+    delete process.env.SANCTUARY_PASSPHRASE;
+    await expect(createSanctuaryServer({})).rejects.toThrow(
+      /no way to hand it to you safely|off-host escrow target/i,
+    );
+    // And nothing was written inside the fortress.
+    await expect(
+      stat(join(fortress, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
   });
 });
