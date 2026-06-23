@@ -1035,9 +1035,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   // WHAT THIS CHOKEPOINT DOES AND DOES NOT CLAIM (no overclaim — the v1 lesson):
   //   DOES: force every NEW operator audit read (any module, including a brand-new
   //     one; direct or same-file-aliased) to be EITHER eager-scoped OR a conscious
-  //     enumerated escape; catch a dropped eager wrap on ANY single builder caller
-  //     ANYWHERE in the tree (incl. a bare builder call from a brand-new module —
-  //     not just the three former hard-coded entry-point modules); keep the
+  //     enumerated escape; catch a dropped eager wrap on any directly-named builder
+  //     call anywhere in the tree (incl. a bare builder call from a brand-new
+  //     module, not just the three former hard-coded entry-point modules; the
+  //     lexical-alias caveat is in the H3 RESIDUAL below); keep the
   //     registry honest (enum kind + real reason + no stale escapes);
   //     keep the agent-facing honesty boundary disjoint; and surface (not bless)
   //     the known HOT read backlog.
@@ -1052,8 +1053,12 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   //     `const x = auditLog; x.query()` IS tracked (best-effort, lexical). NOT
   //     tracked without the TS type checker: cross-file / cross-function aliases,
   //     a param typed AuditLog passed under a new name, a let-reassigned alias, a
-  //     destructured `{ query } = auditLog`. Honesty over completeness: we take
-  //     the cheap heuristic and surface the gap rather than build a type resolver.
+  //     destructured `{ query } = auditLog`. The SAME lexical limit applies to the
+  //     builder-call axis (H4): a builder invoked under a lexical alias or
+  //     import-rename (`const f = buildAuditDigest; f()` or
+  //     `import { buildAuditDigest as d }; d()`) is NOT caught, for the same reason.
+  //     Honesty over completeness: we take the cheap heuristic and surface the gap
+  //     rather than build a type resolver.
 
   type EagerEscapeKind =
     // Posture shaper whose internal `query` runs inside the entry point's
