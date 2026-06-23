@@ -69,6 +69,11 @@ function stubAuditLog(
 ): AuditLog {
   return {
     query: async () => ({ entries, total: entries.length, integrity_findings }),
+    // The aggregator runs the Castle Wall badge read inside `runEagerReads` (the
+    // #717 eager scope). On the real AuditLog this opens an AsyncLocalStorage
+    // scope and runs `fn`; for this in-memory stub (whose `query` is already a
+    // constant return) it is a transparent pass-through that simply invokes `fn`.
+    runEagerReads: <T>(fn: () => Promise<T>): Promise<T> => fn(),
     append: () => undefined,
     size: entries.length,
   } as unknown as AuditLog;

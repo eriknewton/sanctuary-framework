@@ -95,6 +95,11 @@ export interface StandaloneDashboardOptions {
    * (CI/launchd/systemd) callers that would otherwise refuse to start.
    */
   noConfirm?: boolean;
+  /**
+   * Optional tenant-discovery scope override for tests. Production callers
+   * leave this undefined so discovery still scans the real ~/.sanctuary root.
+   */
+  discoveryOptions?: DiscoveryOptions;
 }
 
 /**
@@ -179,9 +184,9 @@ export async function startStandaloneDashboard(
   // 0. Resolve --tenant before loadConfig so the rest of the boot path picks
   //    up the per-tenant storage path. Operator-typed --tenant beats env var.
   if (options.tenant !== undefined) {
-    const match = await findTenant(options.tenant);
+    const match = await findTenant(options.tenant, options.discoveryOptions);
     if (!match) {
-      const available = await discoverTenants();
+      const available = await discoverTenants(options.discoveryOptions);
       const names = available.map((t) => t.name).join(", ") || "(none — run `sanctuary wrap`)";
       throw new Error(
         `Sanctuary Dashboard: --tenant "${options.tenant}" did not match any wrapped tenant.\n` +
@@ -258,7 +263,10 @@ export async function startStandaloneDashboard(
     // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
     // recovery key in the default root, which made the operator think they
     // had just lost access to N other tenants.
-    const otherTenants = await discoverableSubTenants(config.storage_path);
+    const otherTenants = await discoverableSubTenants(
+      config.storage_path,
+      options.discoveryOptions,
+    );
     if (otherTenants.length > 0) {
       throw new Error(
         `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
@@ -316,7 +324,10 @@ export async function startStandaloneDashboard(
     // Re-shape credential-missing failures with the dashboard's tenant
     // discovery hints (v0.10.4 behavior).
     if (err instanceof CustodyUnlockError && !passphrase && !envRecoveryKey) {
-      const otherTenants = await discoverableSubTenants(config.storage_path);
+      const otherTenants = await discoverableSubTenants(
+        config.storage_path,
+        options.discoveryOptions,
+      );
       throw new Error(
         `Sanctuary Dashboard: Existing encrypted data found at ${config.storage_path} but no credentials provided.\n` +
         `Provide SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY (or the per-tenant Keychain item\n` +
@@ -676,7 +687,10 @@ export async function startStandaloneDashboard(
         : passphraseSource === "fallback-file"
         ? "encrypted fallback file"
         : "recovery key";
-    const otherTenants = await discoverableSubTenants(config.storage_path);
+    const otherTenants = await discoverableSubTenants(
+      config.storage_path,
+      options.discoveryOptions,
+    );
     const hint =
       otherTenants.length > 0
         ? `\n     ${renderTenantDiscoveryHint(otherTenants).split("\n").join("\n     ")}\n`

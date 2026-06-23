@@ -54,6 +54,7 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
   getProtectionSnapshot,
   type AggregatorSources,
@@ -67,6 +68,7 @@ import {
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
   POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
@@ -247,8 +249,19 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     // operator page load), so it is exempt from the general rate limit the
     // same way `/posture` and `/fortress` are. Its data fetches still hit the
     // throttled JSON endpoints.
-    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+    // The Evidence View HTML shell is a dashboard view route: an operator page
+    // load that loads the filterable audit table. Its data fetch (`GET
+    // /api/posture/evidence`) still hits the throttled JSON endpoints.
+    path === POSTURE_EVIDENCE_PATH
   );
+}
+
+interface FederationDashboardState {
+  eventLog: FederationEvent[];
+  revoked: Set<string>;
+  evictionMaxSerial: number;
+  nodes: Map<string, FederationNodeView>;
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
@@ -396,10 +409,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
   private readonly _federationRoster = new Set<string>();
-  private readonly _federationNodes = new Map<string, FederationNodeView>();
-  private readonly _federationEventLog: FederationEvent[] = [];
-  private readonly _federationRevoked = new Set<string>();
-  private _federationEvictionMaxSerial = 0;
+  private _federationState: FederationDashboardState = {
+    eventLog: [],
+    revoked: new Set<string>(),
+    evictionMaxSerial: 0,
+    nodes: new Map<string, FederationNodeView>(),
+  };
   private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
   /**
    * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
@@ -1170,15 +1185,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           producer_authenticity: "not_applicable",
         };
       }
-      return await buildCastleWallPosture({
-        auditLog: this.auditLog,
-        originMachine,
-        pinnedProducerKeyB64url:
-          load?.status === "present" ? load.keyB64url : null,
-        ...(load?.status === "unreadable"
-          ? { producerKeyExpectedButUnavailable: true }
-          : {}),
-      });
+      // EAGER SCOPE (badge surface): `/v1/status` is the SESSION_TOKEN-gated
+      // operator status document the native app polls for the arm badge, exactly
+      // like the `/api/posture/castle-wall` route #717 already wraps. Run the
+      // shaper's audit read on the eagerly-maintained verified view so a badge
+      // poll on a 10k-entry chain is bounded-cost (O(1)) instead of an 11-30s
+      // full-chain re-verify per request. Honesty is unchanged: the eager view
+      // reflects every server-written entry with NO lag, the #717 fingerprint
+      // sentinel plus throttled backstop catch out-of-band tampering, and the
+      // shaper's own freshness/evidence gating (unknown / degraded, never armed
+      // without fresh verified evidence) is untouched: only WHERE its `query`
+      // runs changes. This is the operator/badge read, NOT the agent-facing
+      // `/api/posture/evidence` audit surface (which deliberately stays
+      // per-request re-verified).
+      return await this.auditLog.runEagerReads(() =>
+        buildCastleWallPosture({
+          auditLog: this.auditLog as AuditLog,
+          originMachine,
+          pinnedProducerKeyB64url:
+            load?.status === "present" ? load.keyB64url : null,
+          ...(load?.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
     } catch {
       // Defensive: a health probe must never fail. Fall back to an honest
       // `unknown` posture rather than throwing or claiming green.
@@ -1465,8 +1495,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this._federationContext = ctx;
     if (ctx === null) {
       this._federationEnabled = false;
-      this._federationRevoked.clear();
-      this._federationEvictionMaxSerial = 0;
+      this._federationState = {
+        ...this._federationState,
+        revoked: new Set<string>(),
+        evictionMaxSerial: 0,
+      };
       return;
     }
     this.reprojectFederationRevocations(ctx);
@@ -1502,7 +1535,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           node_id: nodeId,
         });
       },
-      listNodes: () => [...this._federationNodes.values()],
+      listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
       appendFederationEvents: (events, options) =>
         this.appendFederationEvents(events, options),
@@ -1570,18 +1603,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   private isFederationNodeRevoked(nodeId: string): boolean {
-    return this._federationRevoked.has(nodeId);
+    return this._federationState.revoked.has(nodeId);
   }
 
   private reprojectFederationRevocations(ctx: FederationContext): void {
-    this._federationRevoked.clear();
-    this._federationEvictionMaxSerial = 0;
-
     const projection = {
-      revokedNodeIds: this._federationRevoked,
-      highestEvictionSerial: this._federationEvictionMaxSerial,
+      revokedNodeIds: new Set<string>(),
+      highestEvictionSerial: 0,
     };
-    const events = this._federationEventLog
+    const events = this._federationState.eventLog
       .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
       .sort((a, b) => a.sequence - b.sequence);
     for (const event of events) {
@@ -1590,21 +1620,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         projection,
         fortressId: ctx.fortressId,
       });
-      if (folded.ok) {
-        this._federationEvictionMaxSerial = projection.highestEvictionSerial;
-      }
+      if (!folded.ok) continue;
     }
+    this._federationState = {
+      ...this._federationState,
+      revoked: projection.revokedNodeIds,
+      evictionMaxSerial: projection.highestEvictionSerial,
+    };
   }
 
-  private foldFederationEvictionEvent(event: FederationEvent):
-    | { ok: true }
-    | { ok: false; reason: string } {
+  private foldFederationEvictionEvent(
+    event: FederationEvent,
+    projection: {
+      revokedNodeIds: Set<string>;
+      highestEvictionSerial: number;
+    },
+  ): { ok: true } | { ok: false; reason: string } {
     const ctx = this._federationContext;
     if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
-    const projection = {
-      revokedNodeIds: this._federationRevoked,
-      highestEvictionSerial: this._federationEvictionMaxSerial,
-    };
     const folded = foldFederationNodeEvictionEvent({
       event,
       projection,
@@ -1613,7 +1646,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       operatorPrincipalCert: ctx.issuingPrincipalCert,
     });
     if (!folded.ok) return { ok: false, reason: folded.reason };
-    this._federationEvictionMaxSerial = projection.highestEvictionSerial;
     return { ok: true };
   }
 
@@ -1623,9 +1655,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
     },
   ): FederationNodeView {
+    const nextNodes = new Map(this._federationState.nodes);
+    const node = this.buildFederationNodeUpsert(nextNodes, nodeId, update);
+    nextNodes.set(nodeId, node);
+    this._federationState = {
+      ...this._federationState,
+      nodes: nextNodes,
+    };
+    return node;
+  }
+
+  private buildFederationNodeUpsert(
+    nodes: Map<string, FederationNodeView>,
+    nodeId: string,
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+      last_sync?: Partial<FederationNodeView["last_sync"]>;
+    },
+  ): FederationNodeView {
     const now = new Date().toISOString();
-    const existing = this._federationNodes.get(nodeId);
-    const node: FederationNodeView = {
+    const existing = nodes.get(nodeId);
+    return {
       node_id: nodeId,
       label: update?.label ?? existing?.label ?? null,
       attestation_status: update?.attestation_status ?? existing?.attestation_status ?? "unknown",
@@ -1637,8 +1686,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
       },
     };
-    this._federationNodes.set(nodeId, node);
-    return node;
   }
 
   /**
@@ -1658,7 +1705,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private appendLocalFederationEvent(kind: string, payload: Record<string, unknown>): FederationEvent {
     const originNodeId = this._federationContext?.nodeId ?? "local";
-    const previous = [...this._federationEventLog]
+    const previous = [...this._federationState.eventLog]
       .reverse()
       .find((event) => event.origin_node_id === originNodeId);
     const eventWithoutHash = {
@@ -1674,14 +1721,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...eventWithoutHash,
       event_hash: federationEventHash(eventWithoutHash),
     };
-    this._federationEventLog.push(event);
+    this._federationState = {
+      ...this._federationState,
+      eventLog: [...this._federationState.eventLog, event],
+    };
     return event;
   }
 
   private listFederationEvents(since?: FederationSyncCursor): FederationEvent[] {
     const nodeId = since?.node_id;
     const after = since?.after_sequence ?? 0;
-    return this._federationEventLog.filter((event) => {
+    return this._federationState.eventLog.filter((event) => {
       if (nodeId && event.origin_node_id !== nodeId) return false;
       return event.sequence > after;
     });
@@ -1707,16 +1757,43 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       senderNodeId: options?.senderNodeId,
       wireVersion: options?.wireVersion,
       isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      validateEvents: (batch) =>
+        this.validateFederationEventsAfterRevocationGate(batch),
       appendEvents: (batch) =>
         this.appendFederationEventsAfterRevocationGate(batch),
     });
   }
 
+  private validateFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
   private appendFederationEventsAfterRevocationGate(
     events: FederationEvent[],
   ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    this._federationState = staged.nextState;
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
+  private stageFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult & {
+    nextState: FederationDashboardState;
+  } {
     const accepted: FederationEvent[] = [];
     const rejected: Array<{ event_id: string; reason: string }> = [];
+    const currentState = this._federationState;
+    const nextEventLog = [...currentState.eventLog];
+    const knownEventIds = new Set(currentState.eventLog.map((event) => event.event_id));
+    const nextNodes = new Map(currentState.nodes);
+    const evictionProjection = {
+      revokedNodeIds: new Set(currentState.revoked),
+      highestEvictionSerial: currentState.evictionMaxSerial,
+    };
     const byNode = new Map<string, FederationEvent[]>();
     for (const event of events) {
       const list = byNode.get(event.origin_node_id) ?? [];
@@ -1726,7 +1803,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     for (const [nodeId, nodeEvents] of byNode) {
       nodeEvents.sort((a, b) => a.sequence - b.sequence);
-      let last = [...this._federationEventLog]
+      let last = [...nextEventLog]
         .reverse()
         .find((event) => event.origin_node_id === nodeId);
       for (const event of nodeEvents) {
@@ -1734,7 +1811,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "hash_mismatch" });
           continue;
         }
-        if (this._federationEventLog.some((existing) => existing.event_id === event.event_id)) {
+        if (knownEventIds.has(event.event_id)) {
           rejected.push({ event_id: event.event_id, reason: "replay" });
           continue;
         }
@@ -1761,27 +1838,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
             continue;
           }
-          const folded = this.foldFederationEvictionEvent(event);
+          const folded = this.foldFederationEvictionEvent(event, evictionProjection);
           if (!folded.ok) {
             rejected.push({ event_id: event.event_id, reason: folded.reason });
             continue;
           }
         }
-        this._federationEventLog.push(event);
+        nextEventLog.push(event);
+        knownEventIds.add(event.event_id);
         accepted.push(event);
         last = event;
         if (!isAuthorityOrigin) {
-          this.upsertFederationNode(nodeId, {
+          nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
             attestation_status: "verified",
             last_sync: {
               received_at: new Date().toISOString(),
               last_sequence: event.sequence,
             },
-          });
+          }));
         }
       }
     }
-    return { accepted, rejected };
+    return {
+      accepted,
+      rejected,
+      nextState: {
+        eventLog: nextEventLog,
+        revoked: evictionProjection.revokedNodeIds,
+        evictionMaxSerial: evictionProjection.highestEvictionSerial,
+        nodes: nextNodes,
+      },
+    };
   }
 
   /**
@@ -2543,7 +2630,50 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+      // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
+      // `since` restart-detection signal. NO `ready`/`supervisor` here -
+      // those would be a co-resident-agent oracle on this unauthenticated
+      // probe (brief HIGH-1) and live ONLY on the auth-gated /api/readiness.
+      res.end(
+        JSON.stringify({
+          ok: true,
+          mode: "principal-policy",
+          instance: getProcessInstance(),
+          since: getProcessSince(),
+        }),
+      );
+      return;
+    }
+
+    // /api/readiness (AUTH-GATED, brief D3): the readiness/supervisor signal
+    // lives behind the SAME auth as the other authenticated read routes
+    // (checkAuth: bearer token, session, or loopback auto-auth). It reports
+    // readiness, never posture - "serving" means unlocked + read surface
+    // live, NOT "your agents are protected" (that stays on the evidence-gated
+    // /api/posture/castle-wall).
+    //
+    // `supervisor` reports the REAL bridge state, not a mask. This dashboard
+    // CAN run Protect: protect routes through `this.supervisorBridge`
+    // (launchProtect), and when that bridge is null Protect fails closed with
+    // 503 (see buildV1Bindings). So an absent bridge is not "not applicable"
+    // here - it GUARANTEES a 503 - and the honest signal is "unwired", never
+    // "n/a". The bridge is wired post-unlock via setSupervisorBridge(); until
+    // then "unwired" tells the host app Protect will 503. (setSupervisorBridge
+    // is not called in production yet, so today this honestly reports
+    // "unwired".)
+    if (method === "GET" && url.pathname === "/api/readiness") {
+      if (!this.checkRateLimit(req, res, "general")) return;
+      if (!this.checkAuth(req, url, res)) return;
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          ready: this.identityManager ? "serving" : "locked",
+          supervisor: this.supervisorBridge ? "wired" : "unwired",
+        }),
+      );
       return;
     }
 
@@ -2608,6 +2738,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+      // Phase 2: the Evidence View HTML shell is served by the posture router
+      // AFTER checkAuth (same gate), so it gets the same auth model as the
+      // per-agent drill-down and the JSON endpoints.
+      url.pathname === POSTURE_EVIDENCE_PATH ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
       // Phase 2: the query-privacy stats endpoint is dispatched through the

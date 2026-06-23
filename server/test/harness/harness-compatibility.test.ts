@@ -98,7 +98,7 @@ const harnesses: HarnessFixture[] = [
   {
     label: "Mastra",
     localKind: "mastra",
-    options: {},
+    options: { mastra: true },
     configPath: (home) => join(home, "mastra", "mcp.json"),
     fixture: "flat-mcp.json",
     serversKey: "mcpServers",
@@ -271,7 +271,9 @@ describe("harness compatibility negative paths", () => {
     await expect(
       runWrap({ wrap: configPath, noOpen: true, port: 4500 }, deps({ startDashboard: busyStarter }))
     ).rejects.toThrow(
-      `No free dashboard port in the ${PORT_FALLBACK_ATTEMPTS} ports starting at 4500`
+      `No free dashboard port in the range 4500-${
+        4500 + PORT_FALLBACK_ATTEMPTS - 1
+      } (all ${PORT_FALLBACK_ATTEMPTS} tried)`
     );
   });
 
@@ -329,7 +331,10 @@ describe("harness README parity", () => {
     const readme = await readFile(readmePath, "utf-8");
     const records = await readFile(localAgentRecordsPath, "utf-8");
     const kinds = new Set(
-      Array.from(records.matchAll(/\|\s+"([^"]+)"/g), (match) => match[1])
+      Array.from(
+        records.matchAll(/^\s*(?:\|\s*)?"([^"]+)"/gm),
+        (match) => match[1],
+      )
     );
 
     for (const kind of [
@@ -387,7 +392,7 @@ function resolveOptions(
   extra: WrapOptions
 ): WrapOptions {
   const base =
-    harness.localKind === "mastra" || harness.localKind === "generic_mcp"
+    harness.localKind === "generic_mcp"
       ? { wrap: configPath }
       : harness.options;
   return { ...base, ...extra };

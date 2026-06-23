@@ -12,15 +12,30 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { ReputationStore } from "../../src/reputation/reputation-store.js";
+import {
+  REPUTATION_LEGACY_REJECT_MESSAGE,
+  ReputationStore,
+  buildReputationCompletenessManifest,
+  reputationBundleSigningBytes,
+  verifyReputationBundleCompleteness,
+  type ReputationBundle,
+} from "../../src/reputation/reputation-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   createIdentity,
+  sign,
   verify,
 } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
-import { fromBase64url, stringToBytes } from "../../src/core/encoding.js";
+import {
+  fromBase64url,
+  stringToBytes,
+  toBase64url,
+} from "../../src/core/encoding.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { createReputationTools } from "../../src/reputation/tools.js";
 
 function setupIdentity(masterKey: Uint8Array) {
   const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -32,7 +47,78 @@ function setupIdentity(masterKey: Uint8Array) {
   return { identity: storedIdentity, encryptionKey };
 }
 
+function publicKeysFor(identity: ReturnType<typeof setupIdentity>["identity"]) {
+  const publicKeys = new Map<string, Uint8Array>();
+  publicKeys.set(identity.did, fromBase64url(identity.public_key));
+  return publicKeys;
+}
+
+function cloneBundle(bundle: ReputationBundle): ReputationBundle {
+  return JSON.parse(JSON.stringify(bundle)) as ReputationBundle;
+}
+
+function stripManifest(bundle: ReputationBundle): ReputationBundle {
+  const legacy = cloneBundle(bundle);
+  delete legacy.completeness_manifest;
+  return legacy;
+}
+
+function stripManifestAndResign(
+  bundle: ReputationBundle,
+  identity: ReturnType<typeof setupIdentity>["identity"],
+  encryptionKey: Uint8Array
+): ReputationBundle {
+  const legacy = stripManifest(bundle);
+  // Sign exactly like a genuine pre-manifest export / older exit artifact:
+  // plain JSON.stringify over the four-field body (insertion order), with no
+  // completeness_manifest key. This exercises the real legacy signing-bytes
+  // verification path, not the manifest-inclusive canonical path.
+  legacy.bundle_signature = toBase64url(
+    sign(
+      stringToBytes(
+        JSON.stringify({
+          version: legacy.version,
+          attestations: legacy.attestations,
+          exported_at: legacy.exported_at,
+          exporter_did: legacy.exporter_did,
+        })
+      ),
+      identity.encrypted_private_key,
+      encryptionKey
+    )
+  );
+  return legacy;
+}
+
 describe("L4 Reputation Store", () => {
+  describe("tool honesty", () => {
+    it("describes exported-set completeness without claiming lifetime history", () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const identityManager = new IdentityManager(storage, masterKey);
+      const auditLog = new AuditLog(storage, masterKey);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        auditLog
+      );
+
+      const exportTool = tools.find((tool) => tool.name === "reputation_export");
+      const importTool = tools.find((tool) => tool.name === "reputation_import");
+      expect(exportTool?.description).toContain(
+        "It does not prove the export is the agent's complete lifetime history"
+      );
+      expect(importTool?.description).toContain(
+        "it does not prove a complete lifetime history"
+      );
+      expect(exportTool?.description).not.toMatch(/complete track record/i);
+      expect(importTool?.description).not.toMatch(/complete track record/i);
+      expect(exportTool?.description).not.toMatch(/complete history of/i);
+      expect(importTool?.description).not.toMatch(/complete history of/i);
+    });
+  });
+
   describe("record + query", () => {
     it("records an attestation and queries it back", async () => {
       const storage = new MemoryStorage();
@@ -172,17 +258,39 @@ describe("L4 Reputation Store", () => {
       expect(bundle.version).toBe("SANCTUARY_REP_V1");
       expect(bundle.attestations).toHaveLength(2);
       expect(bundle.bundle_signature).toBeTruthy();
+      expect(bundle.completeness_manifest).toBeDefined();
+      expect(bundle.completeness_manifest?.schema_version).toBe(1);
+      expect(bundle.completeness_manifest?.format).toBe("SANCTUARY_REP_V1");
+      expect(bundle.completeness_manifest?.exported_at).toBe(
+        bundle.exported_at
+      );
+      expect(bundle.completeness_manifest?.total_attestation_count).toBe(2);
+      expect(bundle.completeness_manifest?.context_count).toBe(2);
+      expect(bundle.completeness_manifest?.contexts).toEqual([
+        "commerce",
+        "support",
+      ]);
+      expect(
+        bundle.completeness_manifest?.context_attestations["commerce"]
+          ?.attestation_count
+      ).toBe(1);
+      expect(
+        bundle.completeness_manifest?.context_attestations["support"]
+          ?.content_checksum_sha256
+      ).toMatch(/^[A-Za-z0-9_-]{43}$/);
 
       // Import into fresh store
       const storage2 = new MemoryStorage();
       const store2 = new ReputationStore(storage2, masterKey);
 
-      const publicKeys = new Map<string, Uint8Array>();
-      publicKeys.set(identity.did, fromBase64url(identity.public_key));
-
-      const result = await store2.importBundle(bundle, true, publicKeys);
+      const result = await store2.importBundle(
+        bundle,
+        true,
+        publicKeysFor(identity)
+      );
       expect(result.imported).toBe(2);
       expect(result.invalid).toBe(0);
+      expect(result.completeness_verification).toBe("verified");
       expect(result.contexts).toContain("commerce");
       expect(result.contexts).toContain("support");
 
@@ -191,7 +299,152 @@ describe("L4 Reputation Store", () => {
       expect(summary.total_interactions).toBe(2);
     });
 
-    it("rejects attestations with invalid signatures on import", async () => {
+    it("verifyBundle matches importBundle verification without writing", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "verify-only-1", "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      const verified = store2.verifyBundle(bundle, publicKeys);
+      const standaloneCompleteness = verifyReputationBundleCompleteness(bundle);
+      expect(verified).toEqual({
+        invalid: 0,
+        unverifiable: 0,
+        contexts: ["commerce"],
+        completeness_verification: "verified",
+      });
+      expect(standaloneCompleteness).toBe(
+        verified.completeness_verification
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+
+      const imported = await store2.importBundle(bundle, true, publicKeys);
+      expect(imported.invalid).toBe(verified.invalid);
+      expect(imported.unverifiable).toBe(verified.unverifiable);
+      expect(imported.contexts).toEqual(verified.contexts);
+      expect(imported.completeness_verification).toBe(
+        verified.completeness_verification
+      );
+
+      const tampered = cloneBundle(bundle);
+      tampered.completeness_manifest!.total_attestation_count = 2;
+      const storage3 = new MemoryStorage();
+      const store3 = new ReputationStore(storage3, masterKey);
+      expect(() => verifyReputationBundleCompleteness(tampered)).toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      expect(() => store3.verifyBundle(tampered, publicKeys)).toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(
+        store3.importBundle(tampered, true, publicKeys)
+      ).rejects.toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(storage3.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects a dropped attestation before any import write", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "drop-1", "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "test", identity, encryptionKey
+      );
+      await store.record(
+        "drop-2", "did:key:cp2",
+        { type: "transaction", result: "completed" },
+        "test", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const tampered = cloneBundle(bundle);
+      tampered.attestations.pop();
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+
+      await expect(
+        store2.importBundle(tampered, true, publicKeysFor(identity))
+      ).rejects.toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects a wrong context count before any import write", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "count-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const tampered = cloneBundle(bundle);
+      tampered.completeness_manifest!.context_attestations[
+        "commerce"
+      ]!.attestation_count = 2;
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+
+      await expect(
+        store2.importBundle(tampered, true, publicKeysFor(identity))
+      ).rejects.toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects an altered context checksum before any import write", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "checksum-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const tampered = cloneBundle(bundle);
+      tampered.completeness_manifest!.context_attestations[
+        "commerce"
+      ]!.content_checksum_sha256 = "0".repeat(64);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+
+      await expect(
+        store2.importBundle(tampered, true, publicKeysFor(identity))
+      ).rejects.toThrow(
+        "Reputation bundle completeness manifest does not match contents"
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects per-attestation signature failures before any import write even when verifySignatures is false", async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);
@@ -204,42 +457,123 @@ describe("L4 Reputation Store", () => {
       );
 
       const bundle = await store.exportBundle(identity, encryptionKey);
+      const tampered = cloneBundle(bundle);
+      tampered.attestations[0]!.signature = "AAAA_tampered_signature_AAAA";
+      tampered.completeness_manifest = buildReputationCompletenessManifest(
+        tampered.exported_at,
+        tampered.attestations
+      );
+      tampered.bundle_signature = toBase64url(
+        sign(
+          reputationBundleSigningBytes(tampered),
+          identity.encrypted_private_key,
+          encryptionKey
+        )
+      );
 
-      // Tamper with the attestation signature
-      bundle.attestations[0]!.signature = "AAAA_tampered_signature_AAAA";
+      for (const verifySignatures of [true, false]) {
+        const storage2 = new MemoryStorage();
+        const store2 = new ReputationStore(storage2, masterKey);
 
-      const storage2 = new MemoryStorage();
-      const store2 = new ReputationStore(storage2, masterKey);
-
-      const publicKeys = new Map<string, Uint8Array>();
-      publicKeys.set(identity.did, fromBase64url(identity.public_key));
-
-      const result = await store2.importBundle(bundle, true, publicKeys);
-      expect(result.imported).toBe(0);
-      expect(result.invalid).toBe(1);
+        await expect(
+          store2.importBundle(tampered, verifySignatures, publicKeysFor(identity))
+        ).rejects.toThrow(
+          "Reputation bundle contains attestations with invalid or unverifiable signatures"
+        );
+        await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+      }
     });
 
-    it("accepts attestations without verification when verify_signatures=false", async () => {
+    it("rejects manifestless legacy bundles unless explicitly opted in", async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
       const store = new ReputationStore(storage, masterKey);
       const { identity, encryptionKey } = setupIdentity(masterKey);
 
       await store.record(
-        "no-verify", "did:key:cp",
+        "legacy-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "test", identity, encryptionKey
+      );
+
+      const legacyBundle = stripManifestAndResign(
+        await store.exportBundle(identity, encryptionKey),
+        identity,
+        encryptionKey
+      );
+      const badSignatureLegacyBundle = cloneBundle(legacyBundle);
+      badSignatureLegacyBundle.bundle_signature = toBase64url(new Uint8Array(64));
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+
+      await expect(
+        store2.importBundle(legacyBundle, true, publicKeysFor(identity))
+      ).rejects.toThrow(REPUTATION_LEGACY_REJECT_MESSAGE);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+
+      const storageWithBadSignature = new MemoryStorage();
+      const storeWithBadSignature = new ReputationStore(
+        storageWithBadSignature,
+        masterKey
+      );
+      await expect(
+        storeWithBadSignature.importBundle(
+          badSignatureLegacyBundle,
+          true,
+          publicKeysFor(identity),
+          { allowUnverifiedLegacy: true }
+        )
+      ).rejects.toThrow("Reputation bundle signature verification failed");
+      await expect(
+        storageWithBadSignature.list("_reputation")
+      ).resolves.toHaveLength(0);
+
+      const result = await store2.importBundle(
+        legacyBundle,
+        true,
+        publicKeysFor(identity),
+        { allowUnverifiedLegacy: true }
+      );
+      expect(
+        verifyReputationBundleCompleteness(legacyBundle, {
+          allowUnverifiedLegacy: true,
+        })
+      ).toBe(result.completeness_verification);
+      expect(result.imported).toBe(1);
+      expect(result.invalid).toBe(0);
+      expect(result.unverifiable).toBe(0);
+      expect(result.completeness_verification).toBe(
+        "unverified-completeness-legacy-bundle"
+      );
+      expect(result.completeness_verification).not.toBe("verified");
+    });
+
+    it("rejects newer manifest schema versions fail closed", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "newer-1", "did:key:cp",
         { type: "transaction", result: "completed" },
         "test", identity, encryptionKey
       );
 
       const bundle = await store.exportBundle(identity, encryptionKey);
-      bundle.attestations[0]!.signature = "AAAA_tampered_AAAA";
+      const tampered = cloneBundle(bundle);
+      tampered.completeness_manifest!.schema_version = 2 as 1;
 
       const storage2 = new MemoryStorage();
       const store2 = new ReputationStore(storage2, masterKey);
 
-      const result = await store2.importBundle(bundle, false, new Map());
-      expect(result.imported).toBe(1);
-      expect(result.invalid).toBe(0);
+      await expect(
+        store2.importBundle(tampered, true, publicKeysFor(identity))
+      ).rejects.toThrow(
+        "Reputation bundle completeness schema version is newer than this build supports"
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
     });
   });
 

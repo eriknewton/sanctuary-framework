@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
+import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
@@ -36,6 +37,8 @@ const { version: PKG_VERSION } = require("../package.json");
 const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
 
 async function main(): Promise<void> {
+  assertSupportedNodeVersion();
+
   // Parse CLI flags
   const invokedAs = basename(process.argv[1] ?? "");
   let args = process.argv.slice(2);
@@ -100,7 +103,7 @@ async function main(): Promise<void> {
     // split-process supervisor, the transient master key arrives on an
     // inherited one-shot fd (never env/argv). Consume + close it at the
     // earliest point so it cannot linger for a same-uid `/proc/<pid>/fd` race,
-    // and FAIL CLOSED in supervisor mode — never silently fall through to the
+    // and FAIL CLOSED in supervisor mode: never silently fall through to the
     // passphrase/keychain path. Threading the raw master into wrap custody
     // (`establishWrapCustody`) is the drill-gated last mile (S1 acceptance is
     // Erik-present on the signing host); until that lands, supervisor mode
@@ -1112,6 +1115,7 @@ function printWrapHelpEarly(): void {
     sanctuary protect --claude-code    Protect Claude Code
     sanctuary protect --cursor         Protect Cursor
     sanctuary protect --cline          Protect Cline (VS Code extension)
+    sanctuary protect --mastra         Protect Mastra
     sanctuary protect --wrap <path>    Protect a specific MCP config file
     sanctuary protect --unwrap         Restore original config
 
@@ -1123,6 +1127,7 @@ function printWrapHelpEarly(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)

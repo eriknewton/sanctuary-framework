@@ -74,6 +74,8 @@ import type {
   LifecycleState,
   ModelProvider,
 } from "../constants.js";
+import type { LocalHarnessKind } from "../../contracts/v1.1/local-agent-records.js";
+import type { AgentPlatform } from "../../wrap/config-reader.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Shared types
@@ -536,16 +538,54 @@ export class StubHarness {
  * through this registry. Reference adapters register themselves on import.
  */
 export interface TierBAdapterRegistration {
-  id: string;
+  id: TierBAdapterId;
   /** Short human-readable label shown in `sanctuary wrap --list`. */
   label: string;
   /** Factory used by the CLI. */
   factory: (params: TierBAdapterParams) => TierBAdapter;
 }
 
-const REGISTRY = new Map<string, TierBAdapterRegistration>();
+export const TIER_B_ADAPTER_SUPERVISOR_HARNESSES = {
+  "claude-code": "claude_code",
+  cline: "cline",
+  hermes: "hermes",
+  mastra: "mastra",
+} as const satisfies Record<string, LocalHarnessKind>;
+
+export type TierBAdapterId = keyof typeof TIER_B_ADAPTER_SUPERVISOR_HARNESSES;
+
+export const TIER_B_ADAPTER_WRAP_PLATFORMS = {
+  "claude-code": "claude-code",
+  cline: "cline",
+  hermes: "hermes",
+  mastra: "mastra",
+} as const satisfies Record<TierBAdapterId, AgentPlatform>;
+
+const REGISTRY = new Map<TierBAdapterId, TierBAdapterRegistration>();
+
+export function supervisorHarnessForTierBAdapter(
+  id: string,
+): LocalHarnessKind | undefined {
+  return TIER_B_ADAPTER_SUPERVISOR_HARNESSES[id as TierBAdapterId];
+}
+
+export function wrapPlatformForTierBAdapter(
+  id: string,
+): AgentPlatform | undefined {
+  return TIER_B_ADAPTER_WRAP_PLATFORMS[id as TierBAdapterId];
+}
 
 export function registerTierBAdapter(r: TierBAdapterRegistration): void {
+  if (!supervisorHarnessForTierBAdapter(r.id)) {
+    throw new TierBInvariantError(
+      `adapter id "${r.id}" has no supervisor harness mapping`
+    );
+  }
+  if (!wrapPlatformForTierBAdapter(r.id)) {
+    throw new TierBInvariantError(
+      `adapter id "${r.id}" has no wrap platform mapping`
+    );
+  }
   if (REGISTRY.has(r.id)) {
     throw new TierBInvariantError(
       `adapter id "${r.id}" already registered`
@@ -563,5 +603,5 @@ export function listTierBAdapters(): TierBAdapterRegistration[] {
 export function getTierBAdapter(
   id: string
 ): TierBAdapterRegistration | undefined {
-  return REGISTRY.get(id);
+  return REGISTRY.get(id as TierBAdapterId);
 }

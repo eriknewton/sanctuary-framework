@@ -283,6 +283,42 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     expect(faultingSink.entries[0]!.details?.seq).toBe(5);
   });
 
+  it("refuses to BOOTSTRAP-accept a later event after a prior event failed to persist (codex CRITICAL FIX 2)", async () => {
+    // The data-loss vector: seq 1 fails to persist (no ack, anchor stays null),
+    // then seq 2 arrives chaining off seq 1. If the consumer treated seq 2 as a
+    // fresh bootstrap it would accept + ack it, letting the daemon truncate its
+    // WAL THROUGH the unpersisted seq 1 (silent audit data loss). The consumer
+    // MUST reject seq 2 and never ack past the failed seq.
+    const faultingSink = new FaultingCriticalSink();
+    const faultingConsumer = new AuditConsumer(faultingSink);
+
+    const eventSeq1 = chainedEvent(1, null);
+    await expect(
+      faultingConsumer.ingestCritical({ event: eventSeq1, ack: async () => {} })
+    ).rejects.toThrow("audit disk unavailable");
+    // Anchor never advanced: no durable seq 1.
+    expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
+    expect(faultingConsumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+
+    // seq 2 chains off the (unpersisted) seq 1 → non-null prior-hash in the
+    // still-bootstrap state → MUST be refused, MUST NOT ack.
+    const eventSeq2 = chainedEvent(2, eventHash(eventSeq1));
+    let seq2Acked = false;
+    await expect(
+      faultingConsumer.ingestCritical({
+        event: eventSeq2,
+        ack: async () => {
+          seq2Acked = true;
+        },
+      })
+    ).rejects.toThrow(/wal_chain_bootstrap_after_unpersisted_event/);
+    expect(seq2Acked).toBe(false);
+    expect(faultingConsumer.getStats().acceptedCriticalEvents).toBe(0);
+    expect(faultingConsumer.getWalChainState().lastAckedSeq).toBeNull();
+    // The refusal was durably recorded for audit.
+    expect(faultingSink.entries.at(-1)!.operation).toBe("wal_chain_verification_failed");
+  });
+
   // ─── #92 ACK failure handling + duplicate replay ────────────────────────
 
   it("emits critical_event_ack_failed on ACK exception, does not throw (#92)", async () => {

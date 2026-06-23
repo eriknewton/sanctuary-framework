@@ -10,7 +10,11 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
-import { StateStore, isReservedNamespace, type StateEntry } from "../cognitive/state-store.js";
+import {
+  StateStore,
+  isReservedNamespace,
+  type StateEntry,
+} from "../cognitive/state-store.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { PrincipalPolicy } from "../principal-policy/types.js";
@@ -61,6 +65,7 @@ import {
 } from "../core/identity.js";
 import {
   ReputationStore,
+  ReputationBundleVerificationError,
   type ReputationBundle,
 } from "../reputation/reputation-store.js";
 import { verifyExitBundle, readManifest, loadExitArtifact } from "./verifier.js";
@@ -430,8 +435,8 @@ export interface ImportExitBundleOptions {
  */
 export class ExitBundleImportError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
-    super(message);
+  constructor(code: string, message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "ExitBundleImportError";
     this.code = code;
   }
@@ -1294,6 +1299,166 @@ interface StagedLocation {
   key: string;
 }
 
+interface StorageSnapshot extends StagedLocation {
+  data: Uint8Array | null;
+}
+
+interface StorageNamespaceSnapshot {
+  namespace: string;
+  entries: StorageSnapshot[];
+}
+
+function locationDedupeKey(loc: StagedLocation): string {
+  return `${loc.namespace.length}:${loc.namespace}${loc.key}`;
+}
+
+function dedupeLocations(locations: StagedLocation[]): StagedLocation[] {
+  const seen = new Set<string>();
+  const deduped: StagedLocation[] = [];
+  for (const loc of locations) {
+    const key = locationDedupeKey(loc);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(loc);
+  }
+  return deduped;
+}
+
+async function snapshotStorageLocations(
+  storage: StorageBackend,
+  locations: StagedLocation[]
+): Promise<StorageSnapshot[]> {
+  const snapshots: StorageSnapshot[] = [];
+  for (const loc of dedupeLocations(locations)) {
+    snapshots.push({
+      ...loc,
+      data: await storage.read(loc.namespace, loc.key),
+    });
+  }
+  return snapshots;
+}
+
+async function snapshotStorageNamespace(
+  storage: StorageBackend,
+  namespace: string
+): Promise<StorageNamespaceSnapshot> {
+  const entries: StorageSnapshot[] = [];
+  for (const entry of await storage.list(namespace)) {
+    const data = await storage.read(namespace, entry.key);
+    if (!data) continue;
+    entries.push({ namespace, key: entry.key, data });
+  }
+  return { namespace, entries };
+}
+
+async function restoreStorageSnapshots(
+  storage: StorageBackend,
+  snapshots: StorageSnapshot[],
+  namespaceSnapshots: StorageNamespaceSnapshot[] = []
+): Promise<{
+  removed: number;
+  restored: number;
+  failed: StagedLocation[];
+}> {
+  let removed = 0;
+  let restored = 0;
+  const failed: StagedLocation[] = [];
+  for (const namespaceSnapshot of namespaceSnapshots) {
+    const originalKeys = new Set(
+      namespaceSnapshot.entries.map((entry) => entry.key)
+    );
+    try {
+      for (const current of await storage.list(namespaceSnapshot.namespace)) {
+        if (originalKeys.has(current.key)) continue;
+        try {
+          const ok = await storage.delete(
+            namespaceSnapshot.namespace,
+            current.key
+          );
+          if (ok) removed++;
+        } catch {
+          failed.push({
+            namespace: namespaceSnapshot.namespace,
+            key: current.key,
+          });
+        }
+      }
+    } catch {
+      failed.push({ namespace: namespaceSnapshot.namespace, key: "*" });
+    }
+  }
+
+  const allSnapshots = [
+    ...snapshots,
+    ...namespaceSnapshots.flatMap((snapshot) => snapshot.entries),
+  ];
+  for (const snapshot of allSnapshots) {
+    try {
+      if (snapshot.data) {
+        await storage.write(snapshot.namespace, snapshot.key, snapshot.data);
+        restored++;
+      } else {
+        const ok = await storage.delete(snapshot.namespace, snapshot.key);
+        if (ok) removed++;
+      }
+    } catch {
+      failed.push({ namespace: snapshot.namespace, key: snapshot.key });
+    }
+  }
+  return { removed, restored, failed };
+}
+
+function activationSnapshotLocations(
+  importId: string,
+  identityArtifact: { json: ExitPublicIdentityArtifact } | null,
+  encryptedState: { json: ExitEncryptedStateBundle } | null,
+  reputationArtifact: { json: ReputationBundle } | null,
+  policySet: { json: ExitPolicySetArtifact } | null,
+  auditReceipts: { json: ExitAuditReceiptsArtifact } | null,
+  commitments: { json: ExitCommitmentsArtifact } | null,
+  placeholderMetadata: { json: ExitPlaceholderVaultMetadataArtifact } | null
+): StagedLocation[] {
+  const locations: StagedLocation[] = [];
+  if (identityArtifact) {
+    locations.push({
+      namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+      key: identityArtifact.json.bundle.identity_id,
+    });
+  }
+  if (policySet) {
+    locations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
+  }
+  if (auditReceipts) {
+    locations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
+  }
+  if (commitments) {
+    locations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
+  }
+  if (placeholderMetadata) {
+    locations.push({
+      namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+      key: importId,
+    });
+  }
+  locations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
+
+  for (const attestation of reputationArtifact?.json.attestations ?? []) {
+    locations.push({
+      namespace: "_reputation",
+      key: attestation.attestation_id,
+    });
+  }
+
+  for (const item of encryptedState?.json.entries ?? []) {
+    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+      continue;
+    }
+    locations.push({ namespace: item.namespace, key: item.key });
+  }
+
+  return locations;
+}
+
 async function rekeyState(
   encryptedState: ExitEncryptedStateBundle,
   opts: ImportExitBundleOptions,
@@ -1462,34 +1627,6 @@ async function rekeyState(
   };
 }
 
-/**
- * Best-effort cleanup of staged paths after a re-key failure. Each
- * delete is independent, one delete failing should not prevent later
- * deletes from running. Failures are collected and surfaced in the
- * thrown ExitBundleImportError so the operator sees what was and was
- * not cleaned. Hardening wave 6 finding #78.
- */
-async function cleanupStagedPaths(
-  storage: StorageBackend,
-  staged: StagedLocation[]
-): Promise<{ removed: number; failed: StagedLocation[] }> {
-  let removed = 0;
-  const failed: StagedLocation[] = [];
-  for (const loc of staged) {
-    try {
-      const ok = await storage.delete(loc.namespace, loc.key);
-      if (ok) {
-        removed++;
-      } else {
-        failed.push(loc);
-      }
-    } catch {
-      failed.push(loc);
-    }
-  }
-  return { removed, failed };
-}
-
 async function stageArtifact(
   storage: StorageBackend,
   namespace: string,
@@ -1539,6 +1676,57 @@ export async function importExitBundle(
 
   const manifest = await readManifest(opts.bundleDir);
   const importWarnings: string[] = [];
+
+  const identityArtifact = await loadExitArtifact<ExitPublicIdentityArtifact>(
+    opts.bundleDir,
+    manifest,
+    "public_identity"
+  );
+  const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
+    opts.bundleDir,
+    manifest,
+    "encrypted_state"
+  );
+  const policySet = await loadExitArtifact<ExitPolicySetArtifact>(
+    opts.bundleDir,
+    manifest,
+    "policy_set"
+  );
+  const auditReceipts = await loadExitArtifact<ExitAuditReceiptsArtifact>(
+    opts.bundleDir,
+    manifest,
+    "audit_receipts"
+  );
+  const reputationArtifact = await loadExitArtifact<ReputationBundle>(
+    opts.bundleDir,
+    manifest,
+    "reputation_bundle"
+  );
+  const commitments = await loadExitArtifact<ExitCommitmentsArtifact>(
+    opts.bundleDir,
+    manifest,
+    "commitments"
+  );
+  const placeholderMetadata =
+    await loadExitArtifact<ExitPlaceholderVaultMetadataArtifact>(
+      opts.bundleDir,
+      manifest,
+      "placeholder_vault_metadata"
+    );
+
+  const publicKeys = identityArtifact
+    ? publicKeysFromIdentityArtifact(identityArtifact.json)
+    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
+
+  const reputationStore = reputationArtifact
+    ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
+    : null;
+  if (opts.activate === true && reputationArtifact && reputationStore) {
+    reputationStore.verifyBundle(reputationArtifact.json, publicKeys.byDid, {
+      allowUnverifiableAttestations:
+        opts.acceptUnverifiableAttestations === true,
+    });
+  }
 
   // Recognition-Layer Path C primary build 2: did:web cross-check.
   // The manifest signature has already verified above; the did:web
@@ -1688,43 +1876,6 @@ export async function importExitBundle(
     );
   }
 
-  const identityArtifact = await loadExitArtifact<ExitPublicIdentityArtifact>(
-    opts.bundleDir,
-    manifest,
-    "public_identity"
-  );
-  const encryptedState = await loadExitArtifact<ExitEncryptedStateBundle>(
-    opts.bundleDir,
-    manifest,
-    "encrypted_state"
-  );
-  const policySet = await loadExitArtifact<ExitPolicySetArtifact>(
-    opts.bundleDir,
-    manifest,
-    "policy_set"
-  );
-  const auditReceipts = await loadExitArtifact<ExitAuditReceiptsArtifact>(
-    opts.bundleDir,
-    manifest,
-    "audit_receipts"
-  );
-  const reputationArtifact = await loadExitArtifact<ReputationBundle>(
-    opts.bundleDir,
-    manifest,
-    "reputation_bundle"
-  );
-  const commitments = await loadExitArtifact<ExitCommitmentsArtifact>(
-    opts.bundleDir,
-    manifest,
-    "commitments"
-  );
-  const placeholderMetadata =
-    await loadExitArtifact<ExitPlaceholderVaultMetadataArtifact>(
-      opts.bundleDir,
-      manifest,
-      "placeholder_vault_metadata"
-    );
-
   const conflicts = await conflictReport(
     opts.storage,
     identityArtifact?.json ?? null,
@@ -1817,113 +1968,129 @@ export async function importExitBundle(
     );
   }
   const stagedArtifacts: string[] = [];
-  // Hardening wave 6 finding #78: track every staged storage location so
-  // a re-key failure can roll back the partial import. Each entry is a
-  // (namespace, key) tuple suitable for opts.storage.delete().
+  const activationSnapshots = await snapshotStorageLocations(
+    opts.storage,
+    activationSnapshotLocations(
+      importId,
+      identityArtifact ?? null,
+      encryptedState ?? null,
+      reputationArtifact ?? null,
+      policySet ?? null,
+      auditReceipts ?? null,
+      commitments ?? null,
+      placeholderMetadata ?? null
+    )
+  );
+  const activationNamespaceSnapshots = [
+    await snapshotStorageNamespace(opts.storage, "_meta"),
+  ];
+  // Track every staged storage location for result telemetry and cleanup
+  // accounting. Snapshot restoration below is what preserves overwritten
+  // pre-existing bytes.
   const stagedLocations: StagedLocation[] = [];
   // Same accumulator for the per-entry rekey writes, populated by
   // rekeyState as it succeeds, consumed on failure.
   const importedRekeyEntries: StagedLocation[] = [];
-  if (identityArtifact) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_PUBLIC_IDENTITIES_NAMESPACE,
-      identityArtifact.json.bundle.identity_id,
-      identityArtifact.json
-    );
-    stagedArtifacts.push("public_identity");
-    stagedLocations.push({
-      namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
-      key: identityArtifact.json.bundle.identity_id,
-    });
-  }
-  if (policySet) {
-    await stageArtifact(opts.storage, EXIT_POLICY_SETS_NAMESPACE, importId, policySet.json);
-    stagedArtifacts.push("policy_set");
-    stagedLocations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
-  }
-  if (auditReceipts) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_AUDIT_RECEIPTS_NAMESPACE,
-      importId,
-      auditReceipts.json
-    );
-    stagedArtifacts.push("audit_receipts");
-    stagedLocations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
-  }
-  if (commitments) {
-    await stageArtifact(opts.storage, EXIT_COMMITMENTS_NAMESPACE, importId, commitments.json);
-    stagedArtifacts.push("commitments");
-    stagedLocations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
-  }
-  if (placeholderMetadata) {
-    await stageArtifact(
-      opts.storage,
-      EXIT_PLACEHOLDER_METADATA_NAMESPACE,
-      importId,
-      placeholderMetadata.json
-    );
-    stagedArtifacts.push("placeholder_vault_metadata");
-    stagedLocations.push({
-      namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
-      key: importId,
-    });
-  }
-  await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
-    manifest: manifest.body,
-    verified_at: verification.verified_at,
-    activated_at: new Date().toISOString(),
-  });
-  stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
-
-  const publicKeys = identityArtifact
-    ? publicKeysFromIdentityArtifact(identityArtifact.json)
-    : { byIdentityId: new Map<string, Uint8Array>(), byDid: new Map<string, Uint8Array>() };
-
-  // Anti-rollback Stage 1 (#506) interaction: the activation path above emits
-  // its audit entries fire-and-forget (`void opts.auditLog.append(...)`), so a
-  // head-anchor write for the first such entry can still be in flight when the
-  // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
-  // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
-  // "audit entries exist on disk but no head anchor file yet" as the custody
-  // SPLICE signature - a FALSE rollback freeze that fails a LEGITIMATE import
-  // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
-  // queue here makes the gate observe a settled, self-consistent audit state
-  // (entry on disk ⟹ its head anchor on disk), so a genuine import is never
-  // mistaken for a credential-resurrecting splice. This weakens nothing: a real
-  // splice (old custody envelope grafted onto an audit chain written under a
-  // different master) still fails the head-anchor MAC after the flush.
-  await opts.auditLog.flush();
-
   let reputationResult = {
     imported_attestations: 0,
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
-  if (reputationArtifact) {
-    const reputationStore =
-      opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey);
-    const imported = await reputationStore.importBundle(
-      reputationArtifact.json,
-      true,
-      publicKeys.byDid
-    );
-    reputationResult = {
-      imported_attestations: imported.imported,
-      invalid_attestations: imported.invalid,
-      unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
-    };
-    stagedArtifacts.push("reputation_bundle");
-  }
-
   let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
   // source_custody) must roll back the artifacts staged above, exactly like
   // a re-key failure - otherwise a refused import leaves staged state behind.
   let sourceMasterKey: Uint8Array | null = null;
+  let stateRekeyStarted = false;
   try {
+    if (identityArtifact) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+        identityArtifact.json.bundle.identity_id,
+        identityArtifact.json
+      );
+      stagedArtifacts.push("public_identity");
+      stagedLocations.push({
+        namespace: EXIT_PUBLIC_IDENTITIES_NAMESPACE,
+        key: identityArtifact.json.bundle.identity_id,
+      });
+    }
+    if (policySet) {
+      await stageArtifact(opts.storage, EXIT_POLICY_SETS_NAMESPACE, importId, policySet.json);
+      stagedArtifacts.push("policy_set");
+      stagedLocations.push({ namespace: EXIT_POLICY_SETS_NAMESPACE, key: importId });
+    }
+    if (auditReceipts) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_AUDIT_RECEIPTS_NAMESPACE,
+        importId,
+        auditReceipts.json
+      );
+      stagedArtifacts.push("audit_receipts");
+      stagedLocations.push({ namespace: EXIT_AUDIT_RECEIPTS_NAMESPACE, key: importId });
+    }
+    if (commitments) {
+      await stageArtifact(opts.storage, EXIT_COMMITMENTS_NAMESPACE, importId, commitments.json);
+      stagedArtifacts.push("commitments");
+      stagedLocations.push({ namespace: EXIT_COMMITMENTS_NAMESPACE, key: importId });
+    }
+    if (placeholderMetadata) {
+      await stageArtifact(
+        opts.storage,
+        EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+        importId,
+        placeholderMetadata.json
+      );
+      stagedArtifacts.push("placeholder_vault_metadata");
+      stagedLocations.push({
+        namespace: EXIT_PLACEHOLDER_METADATA_NAMESPACE,
+        key: importId,
+      });
+    }
+    await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
+      manifest: manifest.body,
+      verified_at: verification.verified_at,
+      activated_at: new Date().toISOString(),
+    });
+    stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
+
+    // Anti-rollback Stage 1 (#506) interaction: the activation path above emits
+    // its audit entries fire-and-forget (`void opts.auditLog.append(...)`), so a
+    // head-anchor write for the first such entry can still be in flight when the
+    // trust-bearing-write gate below runs. `enforceCustodyFloor` (reached via
+    // reputation import / state re-key) calls `probeAuditHeadAnchor`, which reads
+    // "audit entries exist on disk but no head anchor file yet" as the custody
+    // SPLICE signature - a FALSE rollback freeze that fails a LEGITIMATE import
+    // (exit-bundle establish into a fresh epoch-0 destination). Draining the audit
+    // queue here makes the gate observe a settled, self-consistent audit state
+    // (entry on disk => its head anchor on disk), so a genuine import is never
+    // mistaken for a credential-resurrecting splice. This weakens nothing: a real
+    // splice (old custody envelope grafted onto an audit chain written under a
+    // different master) still fails the head-anchor MAC after the flush.
+    await opts.auditLog.flush();
+
+    if (reputationArtifact && reputationStore) {
+      const imported = await reputationStore.importBundle(
+        reputationArtifact.json,
+        true,
+        publicKeys.byDid,
+        {
+          allowUnverifiableAttestations:
+            opts.acceptUnverifiableAttestations === true,
+        }
+      );
+      reputationResult = {
+        imported_attestations: imported.imported,
+        invalid_attestations: imported.invalid,
+        unverifiable_attestations: imported.unverifiable,
+      };
+      stagedArtifacts.push("reputation_bundle");
+    }
+
+    stateRekeyStarted = true;
     sourceMasterKey = await resolveSourceMasterKey(
       encryptedState?.json ?? null,
       opts
@@ -1954,19 +2121,27 @@ export async function importExitBundle(
             skipped_unknown_kid: 0,
             conflicts: 0,
           };
+    void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
+      import_id: importId,
+      manifest_version: manifest.body.manifest_version,
+      state_status: stateResult.status,
+      state_imported_keys: stateResult.imported_keys,
+      reputation_imported_attestations: reputationResult.imported_attestations,
+    });
+    await opts.auditLog.flush();
   } catch (err) {
-    // Hardening wave 6 finding #78: re-key failed partway through.
-    // Walk back through every successfully staged artifact and every
-    // successfully imported state entry, then re-throw with an error
-    // that names the cleanup so the operator can see what was undone.
-    const toCleanup: StagedLocation[] = [
-      ...importedRekeyEntries,
-      ...stagedLocations,
-    ];
-    const cleanup = await cleanupStagedPaths(opts.storage, toCleanup);
+    const cleanup = await restoreStorageSnapshots(
+      opts.storage,
+      activationSnapshots,
+      activationNamespaceSnapshots
+    );
+    const cleanupOperation =
+      stateRekeyStarted || err instanceof ExitBundleImportError
+        ? "exit_bundle_rekey_failed_cleanup"
+        : "exit_bundle_activation_failed_cleanup";
     void opts.auditLog.append(
       "l1",
-      "exit_bundle_rekey_failed_cleanup",
+      cleanupOperation,
       manifest.body.identity_binding.identity_id,
       {
         import_id: importId,
@@ -1974,37 +2149,42 @@ export async function importExitBundle(
         rekey_entries_removed: importedRekeyEntries.length,
         staged_artifacts_removed: stagedLocations.length,
         removed_total: cleanup.removed,
+        restored_total: cleanup.restored,
         cleanup_failed_count: cleanup.failed.length,
         original_error: err instanceof Error ? err.message : String(err),
+        meta_namespace_snapshotted: true,
       },
       "failure"
     );
     await opts.auditLog.flush();
     const originalMessage = err instanceof Error ? err.message : String(err);
+    const failureKind =
+      stateRekeyStarted || err instanceof ExitBundleImportError
+        ? "re-key"
+        : "activation";
+    const fallbackCode = err instanceof ReputationBundleVerificationError
+      ? "REPUTATION_IMPORT_FAILED_AND_CLEANED"
+      : stateRekeyStarted
+        ? "REKEY_FAILED_AND_CLEANED"
+        : "ACTIVATION_FAILED_AND_CLEANED";
     throw new ExitBundleImportError(
       // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
       // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
       // generic code covers non-structured failures (disk full, etc.).
-      err instanceof ExitBundleImportError ? err.code : "REKEY_FAILED_AND_CLEANED",
-      `Exit-bundle re-key failed: ${originalMessage}. ` +
-        `Cleanup removed ${cleanup.removed} of ${toCleanup.length} staged paths ` +
+      err instanceof ExitBundleImportError ? err.code : fallbackCode,
+      `Exit-bundle ${failureKind} failed: ${originalMessage}. ` +
+        `Cleanup removed ${cleanup.removed} and restored ${cleanup.restored} of ` +
+        `${activationSnapshots.length} snapshotted paths ` +
+        `plus ${activationNamespaceSnapshots.length} snapshotted namespaces ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
-        `${cleanup.failed.length} cleanup deletes failed).`
+        `${cleanup.failed.length} cleanup writes/deletes failed).`,
+      { cause: err }
     );
   } finally {
     if (sourceMasterKey instanceof Uint8Array) {
       sourceMasterKey.fill(0);
     }
   }
-
-  void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
-    import_id: importId,
-    manifest_version: manifest.body.manifest_version,
-    state_status: stateResult.status,
-    state_imported_keys: stateResult.imported_keys,
-    reputation_imported_attestations: reputationResult.imported_attestations,
-  });
-  await opts.auditLog.flush();
 
   return {
     verified: true,

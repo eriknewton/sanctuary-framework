@@ -701,8 +701,36 @@ export async function getProtectionSnapshot(
   // which must never be asserted from config-presence alone (never-overclaim).
   let hasLiveIntegrityEvidence = false;
   if (sources.auditLog) {
+    // Local binding so the eager-scope closure keeps the AuditLog type (and the
+    // `.query` receiver terminal name stays `auditLog`, which the agent-audit
+    // STRUCTURE TRIPWIRE auto-discovers + classifies this OPERATOR read under).
+    const auditLog = sources.auditLog;
     try {
-      const result = await sources.auditLog.query({ limit: MAX_AUDIT });
+      // EAGER SCOPE (snapshot audit listing): this is the operator-facing rollup,
+      // the SAME always-on posture surface the hero-shield arm read below already
+      // wraps in the #717/#719 eager scope. This `query({ limit: MAX_AUDIT })` is
+      // the snapshot's OTHER full-chain read: outside the eager scope it re-reads,
+      // re-decrypts, re-hashes and chain-walks every surviving entry from disk on
+      // EVERY snapshot poll (11-30s on a real 10k-entry chain, the #714 wedge), so
+      // the snapshot stayed only half-bounded after #719. Run it on the
+      // eagerly-maintained verified view so a poll on a 10k-entry chain is
+      // bounded-cost (O(1)) instead of a full-chain re-verify per request. The
+      // result shape, filtering, the `MAX_AUDIT` limit, and what entries are
+      // returned are UNCHANGED: only WHERE the read runs changes. Honesty is
+      // unchanged: the eager view reflects every server-written entry with NO lag,
+      // `integrity_findings` is returned identically (the same `this.integrityFindings`
+      // array), so `auditIntegrityOk` / `hasLiveIntegrityEvidence` are derived from
+      // the same evidence, and the #717 fingerprint sentinel plus throttled backstop
+      // catch out-of-band tampering. PER-TENANT SAFE: `runEagerReads` opens an
+      // AsyncLocalStorage scope around THIS specific AuditLog instance's `query`,
+      // which reads that instance's own in-memory verified view; a different tenant's
+      // snapshot passes its own `sources.auditLog`, so there is no shared mutable
+      // state and no cross-tenant read. This is an OPERATOR snapshot read only; the
+      // agent-facing `query` callers and `/api/posture/evidence` keep their
+      // per-request on-disk re-verification (they never open this scope).
+      const result = await auditLog.runEagerReads(() =>
+        auditLog.query({ limit: MAX_AUDIT }),
+      );
       audit = result.entries;
       // A real AuditLog.query always returns integrity_findings; treat an absent
       // field (non-conforming stub) as "no findings" rather than a false red. A
@@ -744,14 +772,31 @@ export async function getProtectionSnapshot(
       const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
         ? sources.resolvePinnedProducerKey()
         : null;
-      const wall = await buildCastleWallPosture({
-        auditLog: sources.auditLog,
-        originMachine: agent.primary_identity_id ?? "local",
-        pinnedProducerKeyB64url,
-        ...(sources.producerKeyExpectedButUnavailable
-          ? { producerKeyExpectedButUnavailable: true }
-          : {}),
-      });
+      // EAGER SCOPE (hero-shield arm badge): the snapshot is the operator-facing
+      // rollup; this is the SAME enforcement-evidenced arm-state the
+      // `/api/posture/castle-wall` route serves and #717 already wraps. Run the
+      // shaper's audit read on the eagerly-maintained verified view so a snapshot
+      // poll on a 10k-entry chain is bounded-cost (O(1)) instead of an 11-30s
+      // full-chain re-verify per request. PER-TENANT SAFE: `runEagerReads` opens
+      // an AsyncLocalStorage scope around THIS specific AuditLog instance's call
+      // and the shaper's `query` reads that instance's own in-memory verified
+      // view (`this.entries`); a different tenant's snapshot passes its own
+      // `sources.auditLog`, so there is no shared mutable state and no
+      // cross-tenant read. Honesty is unchanged: the eager view reflects every
+      // server-written entry with NO lag, the #717 fingerprint sentinel plus
+      // throttled backstop catch out-of-band tampering, and the shaper's
+      // freshness/evidence gating (unknown / degraded, never armed without fresh
+      // verified evidence) is untouched: only WHERE its `query` runs changes.
+      const wall = await sources.auditLog.runEagerReads(() =>
+        buildCastleWallPosture({
+          auditLog: sources.auditLog as AuditLog,
+          originMachine: agent.primary_identity_id ?? "local",
+          pinnedProducerKeyB64url,
+          ...(sources.producerKeyExpectedButUnavailable
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
       wallArmState = wall.arm_state;
     } catch {
       wallArmState = "unknown";

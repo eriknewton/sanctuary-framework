@@ -115,7 +115,21 @@ export interface ConcordiaReceipt {
     budget_ref: string;
   };
   /** Concordia attestation metadata (behavioral signals only, no raw terms). */
-  attestation_metadata?: Record<string, unknown>;
+  attestation_metadata?: ConcordiaAttestationMetadata;
+}
+
+/**
+ * Allowed Concordia attestation metadata. These are behavioral signals only:
+ * counters, classes, magnitudes, and booleans. Raw prices, quantities, deal
+ * terms, currencies, deliverables, and budgets do not belong here.
+ */
+export interface ConcordiaAttestationMetadata {
+  commitment_class?: string;
+  references_count?: number;
+  counterparty_count?: number;
+  offers_made?: number;
+  concession_magnitude?: number;
+  reasoning_provided?: boolean;
 }
 
 /**

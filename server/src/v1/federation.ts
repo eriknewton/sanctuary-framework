@@ -718,6 +718,7 @@ async function handleSync(
     details: {
       accepted: append.accepted.length,
       rejected: append.rejected.length,
+      sender_revoked: senderRevoked,
     },
   });
   writeJson(res, 200, {
@@ -859,6 +860,8 @@ async function handlePeerSync(
       accepted: append.accepted.length,
       rejected: append.rejected.length,
       high_water: verification.syncHighWater,
+      sender_revoked: senderRevokedAfterAcceptance,
+      reply_suppressed: senderRevokedAfterAcceptance,
     },
   });
 

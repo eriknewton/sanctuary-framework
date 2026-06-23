@@ -28,9 +28,9 @@ import type { Surface } from "../../src/intelligence/types.js";
 
 function makeFetchStub(responses: Record<string, { status: number; body: unknown }>): typeof fetch {
   return (async (input: RequestInfo | URL): Promise<Response> => {
-    const url = typeof input === "string" ? input : input.toString();
+    const url = requestUrl(input);
     for (const [pattern, resp] of Object.entries(responses)) {
-      if (url.includes(pattern)) {
+      if (urlPathnameIs(url, pattern)) {
         return new Response(JSON.stringify(resp.body), {
           status: resp.status,
           headers: { "Content-Type": "application/json" },
@@ -39,6 +39,26 @@ function makeFetchStub(responses: Record<string, { status: number; body: unknown
     }
     return new Response("", { status: 404 });
   }) as typeof fetch;
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  return input instanceof Request ? input.url : typeof input === "string" ? input : input.toString();
+}
+
+function urlPathnameIs(url: string, pathname: string): boolean {
+  try {
+    return new URL(url, "http://localhost").pathname === pathname;
+  } catch {
+    return false;
+  }
+}
+
+function urlHostnameIs(url: string, hostname: string): boolean {
+  try {
+    return new URL(url).hostname === hostname;
+  } catch {
+    return false;
+  }
 }
 
 function buildSelector(opts: { fetchImpl?: typeof fetch; redactor?: typeof IDENTITY_REDACTOR } = {}) {
@@ -280,7 +300,193 @@ describe("SubstrateSelector — invoke + audit emission", () => {
     expect(details.failure_class).toBeNull();
   });
 
-  it("invokeSummarize on local surface with unreachable Ollama emits invoked + failure", async () => {
+  it("primary local failure with configured Venice fallback is actually served by Venice", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/generate")) {
+        return new Response("", { status: 500 });
+      }
+      if (urlHostnameIs(url, "api.venice.ai")) {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: "fallback answer" } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("", { status: 404 });
+    }) as unknown as typeof fetch;
+    const { selector, auditLog } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setVeniceApiKey("test-venice-key");
+
+    const resp = await selector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "ctx",
+      query: "q",
+    });
+    expect(resp.failureClass).toBeNull();
+    expect(resp.servedBy).toBe("venice");
+    expect(resp.body).toEqual({ kind: "summarize", text: "fallback answer" });
+
+    const invoked = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_INVOKED });
+    expect(invoked.entries.length).toBe(1);
+    expect(invoked.entries[0]!.result).toBe("success");
+    const invokedDetails = invoked.entries[0]!.details as {
+      substrate: string;
+      served_by: string;
+      failure_class: string | null;
+      response_hash: string | null;
+    };
+    expect(invokedDetails.substrate).toBe("local");
+    expect(invokedDetails.served_by).toBe("venice");
+    expect(invokedDetails.failure_class).toBeNull();
+    expect(invokedDetails.response_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const failures = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_FAILURE });
+    expect(failures.entries.length).toBe(1);
+    const failureDetails = failures.entries[0]!.details as {
+      fallback_taken: string;
+      failure_class: string;
+      substrate: string;
+    };
+    expect(failureDetails.substrate).toBe("local");
+    expect(failureDetails.failure_class).toBe("substrate_unavailable");
+    expect(failureDetails.fallback_taken).toBe("next-substrate");
+  });
+
+  it("walks past a failed Venice fallback and is actually served by frontier-with-filter", async () => {
+    const calls: string[] = [];
+    const redactor = vi.fn(async (text: string) => ({ redacted: text, matchCount: 0 }));
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/generate")) {
+        calls.push("local");
+        return new Response("", { status: 500 });
+      }
+      if (urlHostnameIs(url, "api.venice.ai")) {
+        calls.push("venice");
+        return new Response(JSON.stringify({ error: "venice down" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (urlHostnameIs(url, "api.anthropic.com")) {
+        calls.push("frontier-with-filter");
+        return new Response(
+          JSON.stringify({ content: [{ type: "text", text: "frontier answer" }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("", { status: 404 });
+    }) as unknown as typeof fetch;
+    const { selector, auditLog } = buildSelector({ fetchImpl, redactor });
+    await selector.load();
+    await selector.setVeniceApiKey("test-venice-key");
+    await selector.setFrontierApiKey("anthropic", "test-anthropic-key");
+    calls.length = 0;
+
+    const resp = await selector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "ctx",
+      query: "q",
+    });
+    expect(resp.failureClass).toBeNull();
+    expect(resp.servedBy).toBe("frontier-with-filter");
+    expect(resp.body).toEqual({ kind: "summarize", text: "frontier answer" });
+    expect(calls).toEqual(["local", "venice", "frontier-with-filter"]);
+    expect(redactor).toHaveBeenCalledWith("ctx");
+    expect(redactor).toHaveBeenCalledWith("q");
+
+    const invoked = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_INVOKED });
+    expect(invoked.entries.length).toBe(1);
+    expect(invoked.entries[0]!.result).toBe("success");
+    const invokedDetails = invoked.entries[0]!.details as {
+      substrate: string;
+      served_by: string;
+      failure_class: string | null;
+      response_hash: string | null;
+    };
+    expect(invokedDetails.substrate).toBe("local");
+    expect(invokedDetails.served_by).toBe("frontier-with-filter");
+    expect(invokedDetails.failure_class).toBeNull();
+    expect(invokedDetails.response_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const failures = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_FAILURE });
+    expect(failures.entries.length).toBe(1);
+    const failureDetails = failures.entries[0]!.details as {
+      fallback_taken: string;
+      failure_class: string;
+      substrate: string;
+    };
+    expect(failureDetails.substrate).toBe("local");
+    expect(failureDetails.failure_class).toBe("substrate_unavailable");
+    expect(failureDetails.fallback_taken).toBe("next-substrate");
+  });
+
+  it("audits all-exhausted when primary and every configured fallback fail", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/generate")) {
+        calls.push("local");
+        return new Response("", { status: 500 });
+      }
+      if (urlHostnameIs(url, "api.venice.ai")) {
+        calls.push("venice");
+        return new Response(JSON.stringify({ error: "venice down" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (urlHostnameIs(url, "api.anthropic.com")) {
+        calls.push("frontier-with-filter");
+        return new Response(JSON.stringify({ error: "frontier down" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 404 });
+    }) as unknown as typeof fetch;
+    const { selector, auditLog } = buildSelector({ fetchImpl });
+    await selector.load();
+    await selector.setVeniceApiKey("test-venice-key");
+    await selector.setFrontierApiKey("anthropic", "test-anthropic-key");
+    calls.length = 0;
+
+    const resp = await selector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "ctx",
+      query: "q",
+    });
+    expect(resp.failureClass).toBe("substrate_unavailable");
+    expect(resp.servedBy).toBe("frontier-with-filter");
+    expect(calls).toEqual(["local", "venice", "frontier-with-filter"]);
+
+    const invoked = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_INVOKED });
+    expect(invoked.entries.length).toBe(1);
+    expect(invoked.entries[0]!.result).toBe("failure");
+    const invokedDetails = invoked.entries[0]!.details as {
+      served_by: string;
+      failure_class: string | null;
+      response_hash: string | null;
+    };
+    expect(invokedDetails.served_by).toBe("frontier-with-filter");
+    expect(invokedDetails.failure_class).toBe("substrate_unavailable");
+    expect(invokedDetails.response_hash).toBeNull();
+
+    const failures = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_FAILURE });
+    expect(failures.entries.length).toBe(1);
+    const failureDetails = failures.entries[0]!.details as {
+      fallback_taken: string;
+      failure_class: string;
+      substrate: string;
+    };
+    expect(failureDetails.substrate).toBe("local");
+    expect(failureDetails.failure_class).toBe("substrate_unavailable");
+    expect(failureDetails.fallback_taken).toBe("all-exhausted");
+    expect(failureDetails.fallback_taken).not.toBe("next-substrate");
+  });
+
+  it("invokeSummarize on local surface with unreachable Ollama and no next substrate emits truthful failure", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("connection refused");
     }) as unknown as typeof fetch;
@@ -301,8 +507,8 @@ describe("SubstrateSelector — invoke + audit emission", () => {
     const failures = await auditLog.query({ operation_type: INTEL_OPS.SUBSTRATE_FAILURE });
     expect(failures.entries.length).toBe(1);
     const fdetails = failures.entries[0]!.details as { fallback_taken: string };
-    // concierge default fallback is degrade-silent which maps to next-substrate
-    expect(fdetails.fallback_taken).toBe("next-substrate");
+    expect(fdetails.fallback_taken).toBe("primary-failed");
+    expect(fdetails.fallback_taken).not.toBe("next-substrate");
   });
 
   it("sentinel-scoring failure maps to deny fallback per default", async () => {
@@ -698,14 +904,14 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
     // /api/generate fail at runtime to trigger the recentFailures path.
     let calls = 0;
     const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/api/tags")) {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/tags")) {
         return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
       }
-      if (url.includes("/api/generate")) {
+      if (urlPathnameIs(url, "/api/generate")) {
         calls++;
         return new Response("", { status: 500 });
       }
@@ -758,8 +964,8 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
     try {
       // Simulate runtime failure (fail Ollama) so a real entry lands.
       const failingFetch = (async (input: RequestInfo | URL): Promise<Response> => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.includes("/api/tags")) {
+        const url = requestUrl(input);
+        if (urlPathnameIs(url, "/api/tags")) {
           return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
             status: 200,
             headers: { "Content-Type": "application/json" },
@@ -784,8 +990,8 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
 
   it("recentFailures is capped at 5 entries (FIFO eviction)", async () => {
     const failingFetch = (async (input: RequestInfo | URL): Promise<Response> => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/api/tags")) {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/tags")) {
         return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -807,14 +1013,14 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
     // with model-not-found body. Concierge is on 'local' by default; we
     // bind it to Venice so the post-set probe records to that surface.
     const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/api/tags")) {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/tags")) {
         return new Response(JSON.stringify({ models: [{ name: "gemma2:2b" }] }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
       }
-      if (url.includes("api.venice.ai")) {
+      if (urlHostnameIs(url, "api.venice.ai")) {
         return new Response(
           JSON.stringify({ error: "Specified model not found: llama-3.3-70b. Did you mean: llama-3.4-70b" }),
           { status: 404, headers: { "Content-Type": "application/json" } },
@@ -840,11 +1046,11 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
 
   it("setVeniceApiKey with invalid key (401) flips badge to degraded", async () => {
     const fetchImpl = (async (input: RequestInfo | URL): Promise<Response> => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/api/tags")) {
+      const url = requestUrl(input);
+      if (urlPathnameIs(url, "/api/tags")) {
         return new Response(JSON.stringify({ models: [] }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
-      if (url.includes("api.venice.ai")) {
+      if (urlHostnameIs(url, "api.venice.ai")) {
         return new Response("", { status: 401 });
       }
       return new Response("", { status: 404 });

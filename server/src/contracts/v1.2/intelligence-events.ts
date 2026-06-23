@@ -127,8 +127,8 @@ export interface IntelligenceSubstrateFailurePayload extends IntelligenceAuditPa
   surface: Surface;
   substrate: SubstrateChoice;
   failure_class: SubstrateFailureClass;
-  /** Operator-action taken: which fallback fired, or which surface was disabled. */
-  fallback_taken: "next-substrate" | "deny" | "disable-surface";
+  /** Operator-action taken: which fallback fired, or why no fallback served. */
+  fallback_taken: "next-substrate" | "primary-failed" | "all-exhausted" | "deny" | "disable-surface";
 }
 
 /**

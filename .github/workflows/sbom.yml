@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # anchore/sbom-action wraps Syft and emits CycloneDX. Scanning the
       # checked-out tree captures the declared dependency manifests

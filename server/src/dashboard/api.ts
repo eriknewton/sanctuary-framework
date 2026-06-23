@@ -23,6 +23,7 @@ import { findTenant } from "../cli/agents/discovery.js";
 import { dispatchV11Request } from "./v1_1/dispatch.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 import { constantTimeEquals } from "../http/auth.js";
+import { getProcessInstance, getProcessSince } from "./process-identity.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { renderPostureHomeHTML } from "../principal-policy/posture-home-html.js";
 import {
@@ -76,6 +77,30 @@ export interface APIDeps {
    * operator UX one-click from the wrap-emitted URL.
    */
   loopbackAutoAuth?: boolean;
+  /**
+   * Honest readiness provider for the auth-gated `/api/readiness` endpoint
+   * (Dashboard Server Lifecycle Hardening brief D3). Returns:
+   *   - "serving": the fortress is unlocked and the read surface is live.
+   *   - "locked": the process is up but not yet unlocked.
+   * It must report real server state, never a guess. When omitted, the
+   * endpoint derives an honest fallback from whether the identity manager
+   * is wired (the read surface is supplied post-unlock via
+   * `updateSources`, so its presence is a truthful "serving" proxy and its
+   * absence is a truthful "locked"). NEVER exposed on `/api/health`.
+   */
+  readiness?: () => "locked" | "serving";
+  /**
+   * Honest Consumer-A agent-supervisor bridge readiness for
+   * `/api/readiness`. Returns "wired" / "unwired" / "n/a". When a provider
+   * is supplied it reports the REAL bridge state ("wired"/"unwired"). When
+   * omitted, the honest default is "n/a" - and that is truthful here because
+   * this api.ts dashboard is a read-only aggregator with NO Protect launch
+   * route, so an absent bridge does NOT guarantee a 503 in this mode. (The
+   * principal-policy dashboard, by contrast, DOES route Protect through its
+   * bridge, so there an absent bridge => 503 and the honest value is
+   * "unwired", never "n/a".) NEVER exposed on `/api/health`.
+   */
+  supervisorStatus?: () => "wired" | "unwired" | "n/a";
 }
 
 export interface DashboardSession {
@@ -295,9 +320,50 @@ export async function handleRequest(
 
   // ── Health (unauthenticated liveness only) ───────────────────────────
   // Mirrors the principal-policy dashboard contract exactly: `{ ok, mode }`
-  // only, with no state, config, posture, agent, token, or count data.
+  // plus the opaque per-process `instance` + `since` (restart-detection
+  // signal, brief D3). No state, config, posture, agent, token, count, or
+  // readiness data: `ready`/`supervisor` are auth-gated on /api/readiness
+  // because an unauthenticated `ready: locked` would be a co-resident-agent
+  // oracle for fortress-unlock state (brief HIGH-1).
   if (method === "GET" && path === "/api/health") {
-    writeJSON(res, 200, { ok: true, mode: deps.sources.mode });
+    writeJSON(res, 200, {
+      ok: true,
+      mode: deps.sources.mode,
+      instance: getProcessInstance(),
+      since: getProcessSince(),
+    });
+    return true;
+  }
+
+  // ── Readiness (AUTH-GATED, brief D3) ─────────────────────────────────
+  // Separate from /api/health precisely because `ready`/`supervisor` would
+  // be a co-resident-agent oracle if unauthenticated (brief HIGH-1). Uses
+  // the SAME read-auth as the other authenticated read routes
+  // (bearer token, session, or loopback auto-auth). Reports readiness, never
+  // posture: "serving" means "unlocked and the read surface is live", NOT
+  // "your agents are protected" - protection truth stays exclusively on
+  // /api/posture/castle-wall (evidence-gated). No state/config/agent/tenant
+  // /token/count data leaks here either.
+  if (method === "GET" && path === "/api/readiness") {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    const ready = deps.readiness
+      ? deps.readiness()
+      : deps.sources.identityManager
+        ? "serving"
+        : "locked";
+    // `supervisor` reports the REAL bridge state when a provider is supplied
+    // ("wired"/"unwired"). "n/a" is honest ONLY here because this co-located /
+    // unified read-aggregator dashboard has NO Protect launch route at all
+    // (no launchProtect; getProtectionSnapshot is the read-only posture view,
+    // not Protect execution). A missing bridge therefore does NOT guarantee a
+    // 503 in this mode, so "not applicable" is the truthful default - unlike
+    // the principal-policy dashboard, where an absent bridge guarantees a
+    // Protect 503 and the honest value is "unwired".
+    const supervisor = deps.supervisorStatus ? deps.supervisorStatus() : "n/a";
+    writeJSON(res, 200, { ready, supervisor });
     return true;
   }
 

@@ -28,6 +28,7 @@ import { randomBytes } from "../core/random.js";
 import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type { SovereigntyTier } from "./tiers.js";
+import { hashToString } from "../core/hashing.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -111,12 +112,52 @@ export interface ReputationAttestationSummary {
 // The functional name above is canonical.
 export type L4AttestationSummary = ReputationAttestationSummary;
 
+export const REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION = 1;
+export const REPUTATION_LEGACY_REJECT_MESSAGE =
+  "reputation export predates completeness verification; re-export, or re-run with allow_unverified_legacy to import without completeness guarantees";
+
+export type ReputationBundleCompletenessVerification =
+  | "verified"
+  | "unverified-completeness-legacy-bundle";
+
+export interface ReputationContextCompleteness {
+  attestation_count: number;
+  content_checksum_sha256: string;
+}
+
+export interface ReputationCompletenessManifest {
+  schema_version: typeof REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION;
+  format: "SANCTUARY_REP_V1";
+  exported_at: string;
+  total_attestation_count: number;
+  context_count: number;
+  contexts: string[];
+  context_attestations: Record<string, ReputationContextCompleteness>;
+}
+
+export class ReputationBundleVerificationError extends Error {
+  readonly invalidAttestations: number;
+  readonly unverifiableAttestations: number;
+
+  constructor(
+    message: string,
+    invalidAttestations = 0,
+    unverifiableAttestations = 0
+  ) {
+    super(message);
+    this.name = "ReputationBundleVerificationError";
+    this.invalidAttestations = invalidAttestations;
+    this.unverifiableAttestations = unverifiableAttestations;
+  }
+}
+
 /** Portable reputation bundle */
 export interface ReputationBundle {
   version: "SANCTUARY_REP_V1";
   attestations: Attestation[];
   exported_at: string;
   exporter_did: string;
+  completeness_manifest?: ReputationCompletenessManifest;
   bundle_signature: string;
 }
 
@@ -197,6 +238,172 @@ function aggregateMetrics(
   }
 
   return result;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function compareStrings(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+function sortedAttestations(attestations: Attestation[]): Attestation[] {
+  return [...attestations].sort((a, b) =>
+    compareStrings(canonicalJson(a), canonicalJson(b))
+  );
+}
+
+export function buildReputationCompletenessManifest(
+  exportedAt: string,
+  attestations: Attestation[]
+): ReputationCompletenessManifest {
+  const contexts = Array.from(
+    new Set(attestations.map((a) => a.data.context))
+  ).sort(compareStrings);
+  const contextAttestations: Record<string, ReputationContextCompleteness> = {};
+
+  for (const context of contexts) {
+    const inContext = sortedAttestations(
+      attestations.filter((a) => a.data.context === context)
+    );
+    contextAttestations[context] = {
+      attestation_count: inContext.length,
+      content_checksum_sha256: hashToString(
+        stringToBytes(canonicalJson(inContext))
+      ),
+    };
+  }
+
+  return {
+    schema_version: REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION,
+    format: "SANCTUARY_REP_V1",
+    exported_at: exportedAt,
+    total_attestation_count: attestations.length,
+    context_count: contexts.length,
+    contexts,
+    context_attestations: contextAttestations,
+  };
+}
+
+export function reputationBundleSigningBytes(bundle: {
+  version: "SANCTUARY_REP_V1";
+  attestations: Attestation[];
+  exported_at: string;
+  exporter_did: string;
+  completeness_manifest?: ReputationCompletenessManifest;
+}): Uint8Array {
+  return stringToBytes(
+    canonicalJson({
+      version: bundle.version,
+      attestations: bundle.attestations,
+      exported_at: bundle.exported_at,
+      exporter_did: bundle.exporter_did,
+      completeness_manifest: bundle.completeness_manifest,
+    })
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertSupportedReputationBundleShape(
+  bundle: unknown
+): asserts bundle is ReputationBundle {
+  if (!isRecord(bundle)) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle must be a JSON object"
+    );
+  }
+  if (
+    bundle.version !== "SANCTUARY_REP_V1" ||
+    !Array.isArray(bundle.attestations) ||
+    typeof bundle.exported_at !== "string" ||
+    typeof bundle.exporter_did !== "string" ||
+    typeof bundle.bundle_signature !== "string"
+  ) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle schema is unsupported"
+    );
+  }
+}
+
+/**
+ * Recompute and verify the public completeness manifest for a reputation
+ * bundle. This does not verify bundle or attestation signatures; callers that
+ * need provenance verification must run signature checks separately.
+ */
+export function verifyReputationBundleCompleteness(
+  bundle: unknown,
+  options: { allowUnverifiedLegacy?: boolean } = {}
+): ReputationBundleCompletenessVerification {
+  assertSupportedReputationBundleShape(bundle);
+
+  const manifest = bundle.completeness_manifest;
+  if (manifest === undefined) {
+    if (options.allowUnverifiedLegacy !== true) {
+      throw new ReputationBundleVerificationError(
+        REPUTATION_LEGACY_REJECT_MESSAGE
+      );
+    }
+    return "unverified-completeness-legacy-bundle";
+  }
+
+  if (!isRecord(manifest)) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness manifest is malformed"
+    );
+  }
+
+  const schemaVersion = manifest.schema_version;
+  if (typeof schemaVersion !== "number") {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema metadata is malformed"
+    );
+  }
+  if (schemaVersion > REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema version is newer than this build supports"
+    );
+  }
+  if (schemaVersion !== REPUTATION_COMPLETENESS_MANIFEST_SCHEMA_VERSION) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness schema version is unsupported"
+    );
+  }
+
+  const expectedManifest = buildReputationCompletenessManifest(
+    bundle.exported_at,
+    bundle.attestations
+  );
+  if (
+    manifest.format !== "SANCTUARY_REP_V1" ||
+    manifest.exported_at !== bundle.exported_at ||
+    manifest.total_attestation_count !== bundle.attestations.length ||
+    canonicalJson(manifest) !== canonicalJson(expectedManifest)
+  ) {
+    throw new ReputationBundleVerificationError(
+      "Reputation bundle completeness manifest does not match contents"
+    );
+  }
+
+  return "verified";
 }
 
 // ─── Reputation Store ─────────────────────────────────────────────────────
@@ -360,17 +567,22 @@ export class ReputationStore {
     }
 
     const attestations = all.map((a) => a.attestation);
+    const exportedAt = new Date().toISOString();
+    const completenessManifest = buildReputationCompletenessManifest(
+      exportedAt,
+      attestations
+    );
     const bundleData = {
       version: "SANCTUARY_REP_V1" as const,
       attestations,
-      exported_at: new Date().toISOString(),
+      exported_at: exportedAt,
       exporter_did: identity.did,
+      completeness_manifest: completenessManifest,
     };
 
     // Sign the bundle
-    const bundleBytes = stringToBytes(JSON.stringify(bundleData));
     const bundleSignature = sign(
-      bundleBytes,
+      reputationBundleSigningBytes(bundleData),
       identity.encrypted_private_key,
       identityEncryptionKey
     );
@@ -383,44 +595,44 @@ export class ReputationStore {
 
   /**
    * Import attestations from a reputation bundle.
-   * Verifies signatures if requested (default: true).
+   * Always verifies bundle and attestation signatures before crediting.
+   * The verifySignatures parameter is retained for older internal callers but
+   * no longer disables per-attestation verification.
    *
    * @param publicKeys - Map of DID → public key bytes for signature verification
    */
   async importBundle(
     bundle: ReputationBundle,
-    verifySignatures: boolean,
-    publicKeys: Map<string, Uint8Array>
-  ): Promise<{ imported: number; invalid: number; contexts: string[] }> {
+    _verifySignatures: boolean,
+    publicKeys: Map<string, Uint8Array>,
+    options: {
+      allowUnverifiedLegacy?: boolean;
+      allowUnverifiableAttestations?: boolean;
+    } = {}
+  ): Promise<{
+    imported: number;
+    invalid: number;
+    unverifiable: number;
+    contexts: string[];
+    completeness_verification: ReputationBundleCompletenessVerification;
+  }> {
     // Two-factor custody floor (I4/F6): reputation is trust-bearing state.
     // Enforced in the core so no CLI/SDK path can bypass it.
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
     await enforceCustodyFloor(this.storage, "reputation_import", this.masterKey);
 
+    const verification = this.verifyBundle(
+      bundle,
+      publicKeys,
+      options
+    );
+
     let imported = 0;
-    let invalid = 0;
     const contexts = new Set<string>();
 
     for (const attestation of bundle.attestations) {
-      if (verifySignatures) {
-        const signerKey = publicKeys.get(attestation.signer);
-        if (!signerKey) {
-          invalid++;
-          continue;
-        }
-
-        const dataBytes = stringToBytes(
-          JSON.stringify(attestation.data)
-        );
-        const sigBytes = fromBase64url(attestation.signature);
-
-        if (!verify(dataBytes, sigBytes, signerKey)) {
-          invalid++;
-          continue;
-        }
-      }
-
-      // Store the imported attestation
+      // Store the imported attestation only after all bundle-level and
+      // per-attestation validation succeeds.
       const stored: StoredAttestation = {
         attestation,
         counterparty_confirmed: false,
@@ -441,9 +653,168 @@ export class ReputationStore {
 
     return {
       imported,
-      invalid,
+      invalid: verification.invalid,
+      unverifiable: verification.unverifiable,
       contexts: Array.from(contexts),
+      completeness_verification: verification.completeness_verification,
     };
+  }
+
+  /**
+   * Verify a reputation bundle without writing imported attestations.
+   * This is the exact semantic verification that importBundle uses after
+   * its custody gate and before the first _reputation write.
+   */
+  verifyBundle(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>,
+    options: {
+      allowUnverifiedLegacy?: boolean;
+      allowUnverifiableAttestations?: boolean;
+    } = {}
+  ): {
+    invalid: number;
+    unverifiable: number;
+    contexts: string[];
+    completeness_verification: ReputationBundleCompletenessVerification;
+  } {
+    const completenessVerification = this.verifyBundleCompleteness(
+      bundle,
+      publicKeys,
+      options.allowUnverifiedLegacy === true
+    );
+
+    const attestationVerification = this.inspectAttestationSignatures(
+      bundle,
+      publicKeys,
+      options.allowUnverifiableAttestations === true
+    );
+    const { invalid, unverifiable } = attestationVerification;
+    if (invalid > 0) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle contains attestations with invalid or unverifiable signatures",
+        invalid,
+        unverifiable
+      );
+    }
+
+    return {
+      invalid,
+      unverifiable,
+      contexts: Array.from(
+        new Set(bundle.attestations.map((attestation) => attestation.data.context))
+      ),
+      completeness_verification: completenessVerification,
+    };
+  }
+
+  private verifyBundleCompleteness(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>,
+    allowUnverifiedLegacy: boolean
+  ): ReputationBundleCompletenessVerification {
+    assertSupportedReputationBundleShape(bundle);
+
+    if (bundle.completeness_manifest === undefined) {
+      this.verifyBundleSignature(bundle, publicKeys);
+      return verifyReputationBundleCompleteness(bundle, {
+        allowUnverifiedLegacy,
+      });
+    }
+
+    const completenessVerification = verifyReputationBundleCompleteness(bundle, {
+      allowUnverifiedLegacy,
+    });
+    this.verifyBundleSignature(bundle, publicKeys);
+
+    return completenessVerification;
+  }
+
+  private verifyBundleSignature(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>
+  ): void {
+    const exporterKey = publicKeys.get(bundle.exporter_did);
+    if (!exporterKey) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle signer is unknown"
+      );
+    }
+
+    let signatureBytes: Uint8Array;
+    try {
+      signatureBytes = fromBase64url(bundle.bundle_signature);
+    } catch {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle signature is malformed"
+      );
+    }
+
+    const manifestInclusiveValid = verify(
+      reputationBundleSigningBytes(bundle),
+      signatureBytes,
+      exporterKey
+    );
+    // Legacy (pre-completeness-manifest) reputation exports and older exit
+    // artifacts were signed over the four-field body via plain JSON.stringify,
+    // with no completeness_manifest key. Accept that signing payload ONLY when
+    // the manifest is genuinely absent (mirrors exit/verifier). This does NOT
+    // reopen the strip-downgrade: a current bundle with its manifest removed was
+    // signed over the manifest-inclusive canonical bytes, so neither the current
+    // nor the legacy payload matches its signature, and it is rejected.
+    const legacyValid =
+      bundle.completeness_manifest === undefined &&
+      verify(
+        stringToBytes(
+          JSON.stringify({
+            version: bundle.version,
+            attestations: bundle.attestations,
+            exported_at: bundle.exported_at,
+            exporter_did: bundle.exporter_did,
+          })
+        ),
+        signatureBytes,
+        exporterKey
+      );
+    if (!manifestInclusiveValid && !legacyValid) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle signature verification failed"
+      );
+    }
+  }
+
+  private inspectAttestationSignatures(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>,
+    allowUnverifiableAttestations: boolean
+  ): { invalid: number; unverifiable: number } {
+    let invalid = 0;
+    let unverifiable = 0;
+    for (const attestation of bundle.attestations) {
+      const signerKey = publicKeys.get(attestation.signer);
+      if (!signerKey) {
+        unverifiable++;
+        if (allowUnverifiableAttestations) {
+          continue;
+        }
+        invalid++;
+        continue;
+      }
+
+      let sigBytes: Uint8Array;
+      try {
+        sigBytes = fromBase64url(attestation.signature);
+      } catch {
+        invalid++;
+        continue;
+      }
+
+      const dataBytes = stringToBytes(JSON.stringify(attestation.data));
+      if (!verify(dataBytes, sigBytes, signerKey)) {
+        invalid++;
+      }
+    }
+    return { invalid, unverifiable };
   }
 
   // ─── Escrow ───────────────────────────────────────────────────────────
