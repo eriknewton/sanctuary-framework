@@ -54,6 +54,7 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
   getProtectionSnapshot,
   type AggregatorSources,
@@ -2614,7 +2615,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+      // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
+      // `since` restart-detection signal. NO `ready`/`supervisor` here -
+      // those would be a co-resident-agent oracle on this unauthenticated
+      // probe (brief HIGH-1) and live ONLY on the auth-gated /api/readiness.
+      res.end(
+        JSON.stringify({
+          ok: true,
+          mode: "principal-policy",
+          instance: getProcessInstance(),
+          since: getProcessSince(),
+        }),
+      );
+      return;
+    }
+
+    // /api/readiness (AUTH-GATED, brief D3): the readiness/supervisor signal
+    // lives behind the SAME auth as the other authenticated read routes
+    // (checkAuth: bearer token, session, or loopback auto-auth). It reports
+    // readiness, never posture - "serving" means unlocked + read surface
+    // live, NOT "your agents are protected" (that stays on the evidence-gated
+    // /api/posture/castle-wall). The agent-supervisor bridge wiring is Slice 3
+    // and is NOT built here, so `supervisor` is the honest "n/a".
+    if (method === "GET" && url.pathname === "/api/readiness") {
+      if (!this.checkRateLimit(req, res, "general")) return;
+      if (!this.checkAuth(req, url, res)) return;
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          ready: this.identityManager ? "serving" : "locked",
+          supervisor: "n/a",
+        }),
+      );
       return;
     }
 

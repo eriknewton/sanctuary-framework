@@ -168,10 +168,15 @@ these subsystems are largely independent. The fix is documentation, not deletion
   v1.1 SPA compatibility aliases at `/dashboard` and `/v1.1`; its `/api/status` remains
   `decision_capable:false` because that process cannot release live approval promises. Do NOT
   confuse this dashboard posture with the
-  unauthenticated `/api/health` probe: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
-  ONLY (no arm-state, no audit scan); the detailed evidence-gated Castle Wall arm-state is served
-  exclusively behind auth, via `/api/posture/castle-wall` and the SESSION_TOKEN-gated `/v1/status`
-  document. The Phase 2 Evidence View (`posture-evidence-html.ts`, `GET /posture/evidence` HTML +
+  unauthenticated `/api/health` probe: `/api/health` is a cheap O(1) liveness answer carrying ONLY
+  `{ ok, mode, instance, since }` (no arm-state, no audit scan) - `instance` is an opaque per-process
+  boot id and `since` is the process start time (`dashboard/process-identity.ts`, a single shared
+  source across all three health handlers), so the host app can detect a restart honestly. The
+  readiness/supervisor signal is AUTH-GATED on the SEPARATE `/api/readiness` endpoint, NEVER on
+  `/api/health`: an unauthenticated `ready: locked` would be a co-resident-agent oracle for fortress
+  unlock state (Dashboard Server Lifecycle Hardening brief HIGH-1). The detailed evidence-gated
+  Castle Wall arm-state is served exclusively behind auth, via `/api/posture/castle-wall` and the
+  SESSION_TOKEN-gated `/v1/status` document. The Phase 2 Evidence View (`posture-evidence-html.ts`, `GET /posture/evidence` HTML +
   `GET /api/posture/evidence` JSON) is the third IA level: a filterable, operator-gated audit-entry
   table with integrity_findings surfaced on-view; it reuses `AuditLog.query()` verbatim and adds no
   new backend query logic.

@@ -66,6 +66,15 @@ const MAX_BODY_BYTES = 4096;
 /**
  * Validate the `/api/health` body shape: `{ ok: true, mode: <string> }`.
  * A foreign 200 (e.g. an unrelated web server on a reused port) will not match.
+ *
+ * The probe keys ONLY on `ok` + `mode`, the frozen liveness contract. Newer
+ * builds also emit additive opaque fields on `/api/health` (`instance`, a
+ * per-boot id, and `since`, the process start time, per the Dashboard Server
+ * Lifecycle Hardening brief D3); those are tolerated and ignored here, so an
+ * older probe accepts a newer server and a newer probe accepts an older one.
+ * Readiness/posture (`ready`/`supervisor`) never appear on `/api/health` (they
+ * are auth-gated on `/api/readiness`), so this unauthenticated probe must not
+ * key on them.
  */
 function isSanctuaryHealthBody(raw: string): boolean {
   let parsed: unknown;
