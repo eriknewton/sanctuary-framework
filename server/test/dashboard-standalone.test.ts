@@ -36,6 +36,11 @@ async function startDashboardOnFreePort(
   return bindWithRetry(async () => {
     const port = randomTestPort();
     const dashboard = await startStandaloneDashboard({
+      // Durable-fix: a first-run mint now requires confirmed off-host capture.
+      // In CI there is no tty, so default to noConfirm + an off-host escrow
+      // target (SANCTUARY_RECOVERY_OUT, set per-test) so the gate is satisfied
+      // deterministically. Individual tests may still override noConfirm.
+      noConfirm: true,
       ...options,
       discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
       port,
@@ -47,9 +52,11 @@ async function startDashboardOnFreePort(
 describe("Standalone Dashboard", () => {
   let dashboard: DashboardApprovalChannel | null = null;
   let tempDir: string;
+  let escrowDir: string;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "sanctuary-test-dashboard-"));
+    escrowDir = await mkdtemp(join(tmpdir(), "sanctuary-test-dash-escrow-"));
     const discoveryRoot = join(tempDir, "discovery-root");
     const discoveryHome = join(tempDir, "discovery-home");
     await mkdir(discoveryRoot, { recursive: true, mode: 0o700 });
@@ -61,6 +68,10 @@ describe("Standalone Dashboard", () => {
     };
     // Ensure test environment flags are set (auto-open is skipped in test)
     process.env.VITEST = "true";
+    // Durable-fix: off-host recovery escrow target for first-run mints, so the
+    // provisioning gate is satisfied non-interactively (no tty in CI). In a
+    // SEPARATE temp dir so it is always outside the fortress storage path.
+    process.env.SANCTUARY_RECOVERY_OUT = join(escrowDir, "recovery.txt");
   });
 
   afterEach(async () => {
@@ -70,11 +81,13 @@ describe("Standalone Dashboard", () => {
     }
     // Clean up temp storage
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await rm(escrowDir, { recursive: true, force: true }).catch(() => {});
     // Clean up env vars
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
+    delete process.env.SANCTUARY_RECOVERY_OUT;
     isolatedDiscoveryOptions = undefined;
   });
 

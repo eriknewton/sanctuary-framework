@@ -585,6 +585,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let multi = false;
   let tenant: string | undefined;
   let noConfirm = false;
+  let recoveryOut: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -603,6 +604,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       tenant = args[++i];
     } else if (args[i] === "--no-confirm") {
       noConfirm = true;
+    } else if (args[i] === "--recovery-out" && args[i + 1]) {
+      recoveryOut = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -647,6 +650,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     port,
     host,
     ...(tenant !== undefined ? { tenant } : {}),
+    ...(recoveryOut !== undefined ? { recoveryOut } : {}),
     noConfirm,
   });
 
@@ -855,8 +859,16 @@ Options:
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state; scans every
                        tenant on the host and deep-links into per-tenant dashboards.
-  --no-confirm         Skip the recovery-key confirmation prompt on first run.
-                       Required for non-TTY callers (CI, launchd, systemd).
+  --no-confirm         Skip the interactive recovery-key off-host-capture
+                       confirmation on first run. Required for non-TTY callers
+                       (CI, launchd, systemd). When set, an off-host escrow
+                       target MUST exist (--recovery-out / SANCTUARY_RECOVERY_OUT,
+                       or SANCTUARY_PASSPHRASE for OS-keyring escrow) or the boot
+                       fails closed rather than leaving the key uncaptured.
+  --recovery-out <path>
+                       On a first-run mint, write the plaintext recovery key to
+                       this exact path OUTSIDE the fortress directory (durable
+                       off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
   --help, -h           Show this help
 
 Environment variables:
@@ -864,6 +876,7 @@ Environment variables:
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
+  SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
   SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode

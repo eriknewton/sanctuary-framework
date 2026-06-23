@@ -13,6 +13,7 @@ import { createRequire } from "node:module";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
+import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { checkNodeVersion } from "./node-version.js";
@@ -115,10 +116,55 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkIdentity(opts.storagePath, masterKey));
   checks.push(await checkPolicy(opts.storagePath));
   checks.push(await checkAuditChain(opts.storagePath));
+  checks.push(await checkCustodyFactors(opts.storagePath));
   checks.push(checkRuntime());
   checks.push(await checkCastleWall(opts));
   if (masterKey) masterKey.fill(0);
   return checks;
+}
+
+/**
+ * Custody-factor orphan check (element 5): WARN before a lockout. If the
+ * envelope enrolled an OS-keyring custody factor but the keyring item is GONE,
+ * surface a WARN so the operator re-enrolls / confirms their recovery key
+ * before they are locked out. A locked/unreachable keyring is inconclusive
+ * (no GUI / SSH) and reports OK rather than a false alarm; no enrolled keychain
+ * factor is OK (nothing to orphan). Read-only; never unlocks anything.
+ */
+async function checkCustodyFactors(storagePath: string): Promise<DoctorCheck> {
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let result;
+  try {
+    result = await detectCustodyFactorOrphan(storage, storagePath);
+  } catch (error) {
+    return warn(
+      "custody factors",
+      `could not check custody factors: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after unlocking the OS keyring",
+    );
+  }
+  if (result.verdict === "orphaned") {
+    return warn(
+      "custody factors",
+      `enrolled OS-keyring custody factor is MISSING (service ${result.custodyService})`,
+      "confirm your recovery key is saved off-host, then re-run sanctuary wrap / init to re-enroll the keychain factor",
+    );
+  }
+  if (result.verdict === "inconclusive") {
+    return ok(
+      "custody factors",
+      "OS keyring unreachable this session; keychain factor not verified",
+      "unlock the OS keyring (GUI) to verify, or provide SANCTUARY_RECOVERY_KEY",
+    );
+  }
+  if (result.verdict === "no-factor") {
+    return ok("custody factors", "no OS-keyring custody factor enrolled", "none");
+  }
+  return ok(
+    "custody factors",
+    `enrolled OS-keyring custody factor present (service ${result.custodyService})`,
+    "none",
+  );
 }
 
 function checkRequiredNodeVersion(nodeVersion?: string): DoctorCheck {

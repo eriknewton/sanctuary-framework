@@ -62,6 +62,12 @@ describe("rotate-master --recovery-out", () => {
         output: output.stream,
       },
       err: output.stream,
+      // Hermetic: never touch the real OS keyring. --recovery-out already
+      // satisfies the off-host escrow precondition.
+      recoveryKeychain: {
+        platformOverride: "linux",
+        exec: async () => ({ stdout: "", stderr: "no keyring", code: 1 }),
+      },
     });
 
     expect(captured).toBe(true);
@@ -142,5 +148,79 @@ describe("rotate-master --recovery-out", () => {
       "--recovery-out requires a path value"
     );
     expect(out.writes.join("")).not.toContain("Sanctuary rotate-master");
+  });
+});
+
+describe("rotate-master anti-strand: refuse without off-host capture (element 4)", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-rotate-antistrand-"));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(tmp, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  });
+
+  it("refuses capture (so the rotation aborts) when there is no off-host target", async () => {
+    const fortressPath = join(tmp, "fortress");
+    const output = captureStream();
+
+    const captured = await captureRotatedRecoveryKey({
+      recoveryKey: FIXTURE_KEY,
+      verify: async () => true,
+      storagePath: fortressPath,
+      fortressId: "fortress-test-002",
+      // NO recoveryKeyFilePath, and the keyring is unavailable:
+      io: {
+        input: Readable.from([`${FIXTURE_KEY}\n`]),
+        output: output.stream,
+      },
+      err: output.stream,
+      recoveryKeychain: {
+        platformOverride: "linux",
+        exec: async () => ({ stdout: "", stderr: "no keyring", code: 1 }),
+      },
+    });
+
+    expect(captured).toBe(false);
+    expect(output.writes.join("")).toContain("Refusing to rotate");
+    // The new key was NOT written inside the fortress directory.
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+  });
+
+  it("never writes the new recovery key inside the fortress, even on success", async () => {
+    const fortressPath = join(tmp, "fortress");
+    const recoveryOut = join(tmp, "external", "rotated.txt");
+    const output = captureStream();
+
+    const captured = await captureRotatedRecoveryKey({
+      recoveryKey: FIXTURE_KEY,
+      verify: async (entered) => entered === FIXTURE_KEY,
+      storagePath: fortressPath,
+      fortressId: "fortress-test-003",
+      recoveryKeyFilePath: recoveryOut,
+      io: {
+        input: Readable.from([`${FIXTURE_KEY}\n`]),
+        output: output.stream,
+      },
+      err: output.stream,
+      recoveryKeychain: {
+        platformOverride: "linux",
+        exec: async () => ({ stdout: "", stderr: "no keyring", code: 1 }),
+      },
+    });
+
+    expect(captured).toBe(true);
+    await expect(
+      stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
+    ).rejects.toThrow();
+    expect(await readFile(recoveryOut, "utf-8")).toContain(FIXTURE_KEY);
   });
 });

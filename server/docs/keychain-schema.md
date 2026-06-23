@@ -243,6 +243,52 @@ for `sanctuary` (no wrap) and for non-interactive deployments. It is mutually
 exclusive with the passphrase path: a tenant has either `key-params` or
 `recovery-key-hash`, never both.
 
+### Boot-path recovery-key escrow (durable fix, 2026-06-23)
+
+When the MCP stdio server or the standalone dashboard mints a fresh recovery
+key on a real-host first run, that key is NEVER written inside the fortress
+directory. The co-located `recovery-key.txt` file was an orphaning bug: it sat
+in the one place that gets scratch-cleared, so the only durable copy of the
+recovery key was routinely lost.
+
+Instead, the boot paths now escrow the freshly minted key OFF the fortress:
+
+- The key is disclosed ONLY on the interactive controlling terminal
+  (`/dev/tty`), for the operator to store in their password manager. It is
+  never printed to stdout/stderr (which the host harness captures), never
+  written to a file in the fortress, and never passed through a logger.
+- An optional explicit off-host destination is honored:
+  `--recovery-out <path outside the fortress>` /
+  `SANCTUARY_RECOVERY_OUT=<path>` (the path is enforced to be outside the
+  fortress, written single-issuance with `O_CREAT|O_EXCL|O_NOFOLLOW`).
+- A HARD provisioning gate: the boot does not finish a usable fortress until
+  the operator confirms off-host capture at the terminal, OR an explicit
+  off-host escrow target was supplied. With neither an interactive terminal
+  nor an escrow target, the boot FAILS CLOSED rather than silently leaving the
+  key uncaptured. Nothing trust-bearing is stored before the gate, so
+  re-provisioning with an escrow target is safe.
+
+NO disk-fallback: the recovery key is human-held. The unlock path never
+auto-reads an on-disk `recovery-key.txt`. The disk-resident key is usable only
+when the operator explicitly presents it (`SANCTUARY_RECOVERY_KEY=...`).
+Auto-reading a disk copy would collapse the recovery key from a user-held
+secret to an at-rest secret co-located with the data it protects.
+
+The same off-host capture is now a hard precondition of `sanctuary
+rotate-master`: a rotation refuses to finalize unless the NEW recovery key is
+captured off-host (re-entry verified AND escrowed), so a rotation can never
+strand the operator with a key that exists only inside the fortress.
+
+### Orphan detection (warn before lockout)
+
+At boot and in `sanctuary doctor`, Sanctuary compares the custody factors the
+envelope expects against what actually exists in the OS keyring. If the
+envelope enrolled an OS-keyring custody factor but the keyring item is GONE
+(reachable keyring, missing item), it WARNS that the operator is one missing
+factor away from needing the recovery key, before a lockout happens. A locked /
+unreachable keyring (error 36 over SSH, no D-Bus on Linux) is reported as
+inconclusive, not a false alarm. Boot is never refused on this signal.
+
 ---
 
 ## How identity files map to tenants
