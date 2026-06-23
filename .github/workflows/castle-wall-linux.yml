@@ -23,7 +23,7 @@ jobs:
     # without additional capability grants. CAP_NET_ADMIN is available
     # to root by default on GitHub Actions Ubuntu runners.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -138,7 +138,7 @@ jobs:
   sanctuary-jail-static:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install cross/static toolchain packages
         run: |
