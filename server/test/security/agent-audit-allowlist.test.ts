@@ -1018,9 +1018,12 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   // no-eager bucket": a brand-new bare operator read in ANY module — including a
   // new module — REDS until it is either eager-wrapped or consciously escaped.
   // This closes H1/H2 (scope is all operator reads), H3 (best-effort local-alias
-  // tracking, residual documented), H4 (per-CALL-SITE caller-wraps proof: drop
-  // the wrap on ONE caller and it reds), and M1 (enum kind + non-empty reason +
-  // stale-escape guard).
+  // tracking, residual documented), H4 (WHOLE-TREE per-CALL-SITE caller-wraps
+  // proof: discover EVERY call site of EVERY caller-wrapped builder across ALL
+  // src modules — not a hard-coded entry-point list — so dropping the wrap on ONE
+  // caller, OR calling a builder bare from a NEW/4th module, reds; a deliberately
+  // per-request standalone builder call needs a conscious BARE_BUILDER_CALL_ESCAPE),
+  // and M1 (enum kind + non-empty reason + stale-escape guard).
   //
   // HONESTY BOUNDARY (preserved, structurally): the inverted scope is the
   // OPERATOR universe = (every src module with a direct OR aliased auditLog.query
@@ -1032,8 +1035,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   // WHAT THIS CHOKEPOINT DOES AND DOES NOT CLAIM (no overclaim — the v1 lesson):
   //   DOES: force every NEW operator audit read (any module, including a brand-new
   //     one; direct or same-file-aliased) to be EITHER eager-scoped OR a conscious
-  //     enumerated escape; catch a dropped eager wrap on ANY single builder caller;
-  //     keep the registry honest (enum kind + real reason + no stale escapes);
+  //     enumerated escape; catch a dropped eager wrap on ANY single builder caller
+  //     ANYWHERE in the tree (incl. a bare builder call from a brand-new module —
+  //     not just the three former hard-coded entry-point modules); keep the
+  //     registry honest (enum kind + real reason + no stale escapes);
   //     keep the agent-facing honesty boundary disjoint; and surface (not bless)
   //     the known HOT read backlog.
   //   DOES NOT: prove the eager READ PATH is itself correct/fast (that is the
@@ -1349,6 +1354,36 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     },
   ];
 
+  // CONSCIOUS BARE-BUILDER-CALL ESCAPE REGISTRY (the H4 axis).
+  // A `caller-wrapped-builder` claims its OWN internal `auditLog.query` runs
+  // inside the eager scope its CALLER opens. The H4 proof below discovers EVERY
+  // call site of every such builder across the WHOLE tree (not a hard-coded
+  // entry-point list) and requires each call to be lexically inside an
+  // `runEagerReads`/`queryEager` scope. A builder call that is DELIBERATELY
+  // per-request (a standalone, low-frequency, human-paced operator endpoint that
+  // is NOT on the SSE board cadence) is permitted ONLY if its enclosing function
+  // is registered here with a kind + reason — the SAME conscious-named-act
+  // discipline as EAGER_QUERY_ESCAPES, but on the builder-CALL-site axis rather
+  // than the query-site axis. A NEW bare builder call whose enclosing function is
+  // absent here REDS — including a brand-new builder call in a brand-new module.
+  // Keyed by module:fn (the ENCLOSING function of the bare builder call).
+  const BARE_BUILDER_CALL_ESCAPES: ReadonlyArray<{
+    module: string;
+    fn: string;
+    builder: string;
+    kind: EagerEscapeKind;
+    reason: string;
+  }> = [
+    {
+      module: "query-anonymity/query-anonymity-routes.ts",
+      fn: "handleQueryAnonymityStatsRequest",
+      builder: "computeQueryAnonymityStats",
+      kind: "operator-per-request",
+      reason:
+        "/api/query-anonymity/stats standalone endpoint: a discrete, human-paced operator dashboard fetch (NO SPA consumer yet; not the 5s SSE posture cadence; the SSE board reads the SAME stats through posture-routes buildQueryPrivacy, which IS eager-wrapped). computeQueryAnonymityStats is dual-nature: eager on the board path, deliberately per-request on this standalone stats route where honest immediate on-disk re-verify is the chosen contract, exactly like dashboard handleAuditLog / approval-aggregator getAuditTrail.",
+    },
+  ];
+
   interface OperatorQuerySite {
     module: string;
     fn: string;
@@ -1596,100 +1631,201 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       ).toBe(true);
     });
 
-    it("H4: each caller-wrapped builder is wrapped AT EVERY call site by a posture entry point (drop one wrap → red)", () => {
+    it("H4: each caller-wrapped builder is wrapped AT EVERY call site across the WHOLE tree (drop one wrap or call it bare from a new module → red)", () => {
       // The "caller-wrapped-builder" escape claims the eager scope is opened one
-      // frame up. v1's proof only checked the builder NAME appeared inside SOME
-      // runEagerReads call anywhere — so dropping the wrap on ONE caller while
-      // another still wrapped it passed. v2 is CALL-SITE specific: across the
-      // entry-point modules, find EVERY call to the builder; each such call MUST
-      // be the direct callee of an `runEagerReads`/`queryEager` arrow (i.e. the
-      // builder call is lexically inside the eager scope). One unwrapped call reds.
-      const ENTRY_POINT_MODULES = [
-        "principal-policy/posture-routes.ts",
-        "principal-policy/dashboard.ts",
-        "dashboard/aggregator.ts",
-      ] as const;
-
+      // frame up by the CALLER. v1's proof only checked the builder NAME appeared
+      // inside SOME runEagerReads call anywhere — so dropping the wrap on ONE
+      // caller while another still wrapped it passed. The first v2 cut narrowed
+      // to per-CALL-SITE but only scanned THREE hard-coded ENTRY_POINT_MODULES —
+      // so a bare call to a caller-wrapped builder from a NEW/4th operator module
+      // (no surrounding runEagerReads) evaded the whole suite: the builder's own
+      // read is the escaped `caller-wrapped-builder` (not flagged), and the bare
+      // call site is a call to the BUILDER, not an `auditLog.query`, so THE TEETH's
+      // query-site walk never sees it either. At runtime the builder's internal
+      // `auditLog.query({ limit: 10_000 | 50_000 })` then runs NON-eager = the
+      // #714 wedge, silently. (Empirically real: this inversion surfaced exactly
+      // such a site — handleQueryAnonymityStatsRequest calling
+      // computeQueryAnonymityStats bare — which the 3-module scan never saw.)
+      //
+      // THE INVERSION (same shape THE TEETH was inverted): discover EVERY call
+      // site of EVERY caller-wrapped builder across ALL src modules MINUS the
+      // agent-facing buckets — NOT a hard-coded entry-point list. Each such call
+      // MUST be lexically inside an `runEagerReads`/`queryEager` scope, OR its
+      // enclosing function must be a conscious, enumerated BARE_BUILDER_CALL_ESCAPE
+      // (a deliberately per-request standalone operator endpoint). A bare builder
+      // call from ANY module — including a brand-new one — with no escape REDS.
       const builderFns = new Set(
         EAGER_QUERY_ESCAPES.filter((e) => e.kind === "caller-wrapped-builder").map(
           (e) => e.fn,
         ),
       );
 
-      // For each entry-point module, find every CallExpression whose callee is one
-      // of the builder names, and record whether it is lexically inside an
-      // runEagerReads/queryEager scope.
-      const builderCallSites: Array<{
-        module: string;
-        fn: string;
-        line: number;
-        eager: boolean;
-      }> = [];
       const isEagerEntry = (call: ts.CallExpression): boolean => {
         if (!ts.isPropertyAccessExpression(call.expression)) return false;
         const m = call.expression.name.text;
         return m === "runEagerReads" || m === "queryEager";
       };
-      for (const mod of ENTRY_POINT_MODULES) {
-        const abs = join(SERVER_SRC, ...mod.split("/"));
-        const sf = ts.createSourceFile(
-          abs,
-          readFileSync(abs, "utf8"),
-          ts.ScriptTarget.Latest,
-          /*setParentNodes*/ true,
-        );
-        const visit = (node: ts.Node) => {
+      const enclosingFnName = (node: ts.Node): string => {
+        let p: ts.Node | undefined = node.parent;
+        while (p) {
+          if (ts.isFunctionDeclaration(p) && p.name) return p.name.text;
+          if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) return p.name.text;
           if (
-            ts.isCallExpression(node) &&
-            ts.isIdentifier(node.expression) &&
-            builderFns.has(node.expression.text)
+            (ts.isFunctionExpression(p) || ts.isArrowFunction(p)) &&
+            ts.isVariableDeclaration(p.parent) &&
+            ts.isIdentifier(p.parent.name)
           ) {
-            let eager = false;
-            let anc: ts.Node | undefined = node.parent;
-            while (anc) {
-              if (ts.isCallExpression(anc) && isEagerEntry(anc)) {
-                eager = true;
-                break;
-              }
-              anc = anc.parent;
-            }
-            const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
-            builderCallSites.push({
-              module: mod,
-              fn: node.expression.text,
-              line: line + 1,
-              eager,
-            });
+            return p.parent.name.text;
           }
-          ts.forEachChild(node, visit);
-        };
-        visit(sf);
-      }
+          p = p.parent;
+        }
+        return "(module-scope)";
+      };
 
-      // Every caller-wrapped-builder escape must have AT LEAST ONE real call site
-      // in the entry points (else the escape is unfounded), and EVERY call site of
-      // a builder must be eager-wrapped (drop one → red).
+      // WHOLE-TREE DISCOVERY: walk every src module (minus the agent-facing
+      // buckets) and record every CallExpression whose callee is a builder name,
+      // with its enclosing function and whether it is lexically eager-contained.
+      const exclude = agentFacingExclusions();
+      const builderCallSites: Array<{
+        module: string;
+        fn: string;
+        enclosingFn: string;
+        line: number;
+        eager: boolean;
+      }> = [];
+      const walkDir = (dir: string) => {
+        for (const name of readdirSync(dir)) {
+          const p = join(dir, name);
+          if (statSync(p).isDirectory()) {
+            if (name === "node_modules") continue;
+            walkDir(p);
+            continue;
+          }
+          if (
+            !name.endsWith(".ts") ||
+            name.endsWith(".d.ts") ||
+            name.endsWith(".test.ts")
+          ) {
+            continue;
+          }
+          const rel = relative(SERVER_SRC, p).split(sep).join("/");
+          if (exclude.has(rel)) continue; // agent-facing → out of scope
+          const sf = ts.createSourceFile(
+            p,
+            readFileSync(p, "utf8"),
+            ts.ScriptTarget.Latest,
+            /*setParentNodes*/ true,
+          );
+          const visit = (node: ts.Node) => {
+            if (
+              ts.isCallExpression(node) &&
+              ts.isIdentifier(node.expression) &&
+              builderFns.has(node.expression.text)
+            ) {
+              let eager = false;
+              let anc: ts.Node | undefined = node.parent;
+              while (anc) {
+                if (ts.isCallExpression(anc) && isEagerEntry(anc)) {
+                  eager = true;
+                  break;
+                }
+                anc = anc.parent;
+              }
+              const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+              builderCallSites.push({
+                module: rel,
+                fn: node.expression.text,
+                enclosingFn: enclosingFnName(node),
+                line: line + 1,
+                eager,
+              });
+            }
+            ts.forEachChild(node, visit);
+          };
+          visit(sf);
+        }
+      };
+      walkDir(SERVER_SRC);
+
+      // Vacuous-green guard: whole-tree discovery must actually find builder calls
+      // (one per registered caller-wrapped builder at minimum). An empty walk —
+      // or a builder-name set that drifted out of sync — would make the
+      // set-difference checks below trivially pass.
+      expect(
+        builderCallSites.length,
+        "whole-tree builder-call discovery found no call sites — the walk or the builder-name set is broken",
+      ).toBeGreaterThanOrEqual(builderFns.size);
+
+      // (1) Every caller-wrapped-builder escape must have AT LEAST ONE real call
+      // site SOMEWHERE in the tree (else the escape is unfounded — a builder that
+      // is never invoked needs no caller-wraps claim).
       const builderHasCall = new Set(builderCallSites.map((c) => c.fn));
       const unfounded = [...builderFns]
         .filter((fn) => !builderHasCall.has(fn))
         .map(
           (fn) =>
-            `${fn}: no call site found in the entry-point modules — the ` +
+            `${fn}: no call site found anywhere in src — the ` +
             `caller-wrapped-builder escape is unfounded (the builder must be ` +
             `invoked by a posture entry point that opens the eager scope).`,
         );
       expect(unfounded, unfounded.join("\n")).toEqual([]);
 
+      // (2) THE H4 TEETH: every builder call site must be eager-wrapped OR carry a
+      // conscious BARE_BUILDER_CALL_ESCAPE for its enclosing function. A bare call
+      // from ANY module — including a brand-new one — with no escape REDS.
+      const escapeFor = (c: { module: string; enclosingFn: string }) =>
+        BARE_BUILDER_CALL_ESCAPES.find(
+          (e) => e.module === c.module && e.fn === c.enclosingFn,
+        );
       const droppedWraps = builderCallSites
-        .filter((c) => !c.eager)
+        .filter((c) => !c.eager && !escapeFor(c))
         .map(
           (c) =>
             `${c.module}:${c.line} calls ${c.fn} OUTSIDE an ` +
-            `runEagerReads/queryEager scope. A caller-wrapped-builder must be ` +
-            `eager-wrapped at EVERY call site; wrap this call or make the ` +
-            `builder's own read eager and drop the escape.`,
+            `runEagerReads/queryEager scope (in ${c.enclosingFn}). A ` +
+            `caller-wrapped-builder must be eager-wrapped at EVERY call site; wrap ` +
+            `this call, make the builder's own read eager and drop the escape, or, ` +
+            `if it is a deliberately per-request standalone operator endpoint, ` +
+            `register ${c.module}:${c.enclosingFn} in BARE_BUILDER_CALL_ESCAPES ` +
+            `with a kind + reason.`,
         );
       expect(droppedWraps, droppedWraps.join("\n")).toEqual([]);
+
+      // (3) M1 on the builder-call axis: every BARE_BUILDER_CALL_ESCAPE has a
+      // valid enum kind, a substantive reason, and is NOT stale (it must match a
+      // real, currently-non-eager builder call site — so a wrap landing on that
+      // site later forces the escape's removal).
+      for (const e of BARE_BUILDER_CALL_ESCAPES) {
+        expect(
+          (EAGER_ESCAPE_KINDS as readonly string[]).includes(e.kind),
+          `bare-builder escape ${e.module} (${e.fn}) has non-enum kind "${e.kind}"`,
+        ).toBe(true);
+        const reason = e.reason.trim();
+        expect(
+          reason.length,
+          `bare-builder escape ${e.module} (${e.fn}) needs a substantive reason`,
+        ).toBeGreaterThanOrEqual(40);
+        expect(
+          builderFns.has(e.builder),
+          `bare-builder escape ${e.module} (${e.fn}) names builder "${e.builder}" which is not a caller-wrapped-builder`,
+        ).toBe(true);
+      }
+      const liveBareBuilderCalls = builderCallSites.filter((c) => !c.eager);
+      const staleBuilderEscapes = BARE_BUILDER_CALL_ESCAPES.filter(
+        (e) =>
+          !liveBareBuilderCalls.some(
+            (c) =>
+              c.module === e.module &&
+              c.enclosingFn === e.fn &&
+              c.fn === e.builder,
+          ),
+      ).map((e) => `${e.module} (${e.fn} → ${e.builder})`);
+      expect(
+        staleBuilderEscapes,
+        `Stale BARE_BUILDER_CALL_ESCAPE(s) — the function no longer has a ` +
+          `non-eager call to the named builder (renamed, removed, or now ` +
+          `eager-wrapped). Remove: ${staleBuilderEscapes.join(", ")}`,
+      ).toEqual([]);
     });
 
     it("HOT-read alarm: the operator-hot-pending-triage set is the explicit HIGH backlog (kept honest, not hidden)", () => {
