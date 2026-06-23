@@ -23,7 +23,7 @@ jobs:
     # PR-check workflow (castle-wall-macos.yml, PR #376) and COWORK lesson #78.
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Show toolchain
         run: |
