@@ -141,17 +141,30 @@ struct ContentView: View {
         // error visible instead of silently lost. Posture truth never renders
         // here — the toast carries only Mac-control action feedback.
         ZStack(alignment: .bottom) {
-            // Only embed the web view once server health is CONFIRMED reachable.
-            // During the initial `.unknown` state (cold start, before the first
-            // health probe returns) and `.unreachable`, show the native
-            // empty-state instead — otherwise the web view would load and render
-            // a raw connection-refused page on a cold launch (spec §3).
-            if serverBridge.serverStatus == .reachable {
+            // Three honest surface states (Slice 1a design §3.1), read from
+            // `serverBridge.surfaceState` (derived in `postureSurfaceState`):
+            //
+            //   .live          server reachable -> embedded board (unchanged).
+            //   .reconnecting  was reachable, now failing inside the recovery
+            //                  budget -> the dimmed, timestamped last-known board
+            //                  + "reconnecting..." banner. The operator stays
+            //                  oriented (sees what WAS true, clearly marked
+            //                  stale) while recovery is attempted; the badge has
+            //                  already fallen to `.unknown` (never green).
+            //   .unreachable   cold start (no last-known frame) OR down past the
+            //                  recovery budget -> the native down-screen. We
+            //                  never mount the web view onto a connection-refused
+            //                  page, and never fabricate a stale frame on cold
+            //                  start (spec §3).
+            switch serverBridge.surfaceState {
+            case .live:
                 // The embedded board renders the live posture page inside the
                 // app. Loopback-pinned; loaded only because the server is
-                // confirmed reachable above.
+                // confirmed reachable.
                 PostureWebView(url: Self.postureBoardURL)
-            } else {
+            case .reconnecting:
+                reconnectingView
+            case .unreachable:
                 serverDownView
             }
 
@@ -161,23 +174,99 @@ struct ContentView: View {
         }
     }
 
-    /// NATIVE empty-state shown while server health is `.unknown` (cold start)
-    /// or `.unreachable`. The app already knows server health via
+    /// The honest Reconnecting state (Slice 1a design §3.1, §3.2). The server was
+    /// reachable and is now failing probes inside the bounded recovery budget. We
+    /// keep the operator oriented by showing the last-known posture board DIMMED
+    /// behind a visible banner that timestamps when it was last live and says we
+    /// are reconnecting. Honesty rules enforced here:
+    ///
+    ///   - The last-known frame is NEVER presented as current: it is dimmed
+    ///     (reduced opacity), made non-interactive (`allowsHitTesting(false)`) so
+    ///     a stale control cannot be clicked as if live, and overlaid with a
+    ///     timestamped "as of HH:MM:SS, reconnecting..." banner.
+    ///   - The arm badge is untouched here; it has already fallen to `.unknown`
+    ///     on the failed posture read (never-fake-green across time). This view
+    ///     only governs the board area, not the badge.
+    ///   - We render the SAME `PostureWebView` (not a SwiftUI re-render of the
+    ///     board), so we never fork the honesty model into a second code path.
+    ///     The web view's own `updateNSView` does not reload on re-render, so the
+    ///     operator's last-known frame stays put (it is not refetched from a dead
+    ///     server) until a real reachable probe restores `.live`.
+    private var reconnectingView: some View {
+        ZStack(alignment: .top) {
+            // Last-known posture, dimmed + non-interactive. Loopback-pinned, same
+            // single honesty model as the live board.
+            PostureWebView(url: Self.postureBoardURL)
+                .opacity(0.45)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+            reconnectingBanner
+        }
+    }
+
+    /// Timestamped, plain-English banner overlaid on the dimmed last-known board
+    /// during the Reconnecting state. Hyphens only (no em-dashes), per the
+    /// public-artifact rule.
+    private var reconnectingBanner: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .scaleEffect(0.6)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Reconnecting to the local Sanctuary server...")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Text(reconnectingStaleNotice)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background(.regularMaterial)
+        .cornerRadius(10)
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+        .shadow(radius: 2, y: 1)
+    }
+
+    /// "Showing your last-known posture as of HH:MM:SS - this view is stale."
+    /// The timestamp is the moment we last confirmed the server alive
+    /// (`lastReachableAt`), so the operator knows exactly how old the dimmed
+    /// frame is. If we somehow have no timestamp, say so plainly rather than
+    /// inventing a time.
+    private var reconnectingStaleNotice: String {
+        guard let at = serverBridge.lastReachableAt else {
+            return "Showing your last-known posture - this view is stale."
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return "Showing your last-known posture as of \(formatter.string(from: at)) - this view is stale."
+    }
+
+    /// NATIVE down-screen, shown for the genuinely-`.unreachable` surface state:
+    /// cold start before any successful probe (nothing live to show yet), OR a
+    /// previously-reachable server that stayed down past the recovery budget
+    /// (Reconnecting gave up). The app already knows server health via
     /// `checkServerHealth`, so we present this instead of letting the web view
     /// load a raw browser connection-refused page (spec §3).
+    ///
+    /// Slice 1a reword (design §3.2): plain-English, a SPECIFIC reason for each of
+    /// the two cases, a manual restart affordance (kept), and the last-known
+    /// timestamp when we have one. Hyphens only (no em-dashes).
     private var serverDownView: some View {
         VStack(spacing: 14) {
             Spacer()
             Image(systemName: "bolt.horizontal.circle")
                 .font(.largeTitle)
                 .foregroundColor(.secondary)
-            Text("Sanctuary server not running")
+            Text(serverDownTitle)
                 .font(.headline)
-            Text("The posture board lives in the local Sanctuary server. Start it to see your agents' sovereignty posture.")
+            Text(serverDownDetail)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 360)
+                .frame(maxWidth: 380)
             if serverBridge.sanctuaryPath != nil {
                 Button("Start Sanctuary server") {
                     Task {
@@ -200,6 +289,33 @@ struct ContentView: View {
             Spacer()
         }
         .padding(24)
+    }
+
+    /// Down-screen title, specific to the case. If we had previously reached the
+    /// server (we have a last-known frame), the honest statement is that it
+    /// stopped and did not come back; on a cold start it is simply not running
+    /// yet.
+    private var serverDownTitle: String {
+        serverBridge.hasLastKnownPosture
+            ? "The local Sanctuary server stopped"
+            : "Sanctuary server not running"
+    }
+
+    /// Down-screen detail. For the "stopped and did not come back" case we say
+    /// exactly that and surface the last-known timestamp so the operator knows
+    /// how long ago they last saw real posture; for cold start we explain where
+    /// the board lives and how to bring it up.
+    private var serverDownDetail: String {
+        if serverBridge.hasLastKnownPosture {
+            let base = "The local server that serves your posture board stopped and did not come back on its own. Start it again to restore your live view."
+            if let at = serverBridge.lastReachableAt {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "HH:mm:ss"
+                return base + " Last seen live at \(formatter.string(from: at))."
+            }
+            return base
+        }
+        return "The posture board lives in the local Sanctuary server. Start it to see your agents' protection posture."
     }
 
     private func errorToast(_ message: String) -> some View {

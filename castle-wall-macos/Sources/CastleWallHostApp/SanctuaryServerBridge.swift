@@ -10,6 +10,34 @@ final class SanctuaryServerBridge: ObservableObject {
         case unreachable
     }
 
+    /// What the operator's posture surface should show, derived from the raw
+    /// `ServerStatus` plus whether we have a last-known snapshot to orient them
+    /// with. This is the three-honest-states model (Slice 1a design §3.1):
+    ///
+    ///   - `.live`          server reachable + fresh read -> embedded board.
+    ///   - `.reconnecting`  server WAS reachable, now failing probes, still
+    ///                      inside the bounded recovery budget. We have a
+    ///                      last-known posture to show DIMMED + timestamped +
+    ///                      banner-marked "reconnecting" so the operator stays
+    ///                      oriented while recovery is attempted. NEVER green
+    ///                      (the badge falls to `.unknown` independently).
+    ///   - `.unreachable`   genuinely down: cold start with no successful probe
+    ///                      yet (no snapshot to show), OR a previously-reachable
+    ///                      server that has stayed down past the recovery budget
+    ///                      with no progress. Shows the native down-screen.
+    ///
+    /// Honest by construction: `.reconnecting` is reachable ONLY when we actually
+    /// have a last-known frame to dim (`hasLastKnownPosture`). Cold start (never
+    /// reachable) can never enter `.reconnecting`; it falls straight to the
+    /// native empty-state, preserving today's correct cold-start behavior.
+    enum PostureSurfaceState: Equatable {
+        case live
+        case reconnecting
+        case unreachable
+    }
+
+    @Published private(set) var serverStatus: ServerStatus = .unknown
+
     /// Enforcement-evidenced arm state, mirroring the server's
     /// `CastleWallArmState` (`server/src/principal-policy/posture.ts`). This is
     /// the ONE source of truth for "is protection actually enforcing." It is
@@ -58,7 +86,6 @@ final class SanctuaryServerBridge: ObservableObject {
         }
     }
 
-    @Published private(set) var serverStatus: ServerStatus = .unknown
     @Published private(set) var sanctuaryPath: String?
 
     /// Latest enforcement-evidenced arm state from `/api/posture/castle-wall`.
@@ -72,6 +99,30 @@ final class SanctuaryServerBridge: ObservableObject {
     /// channel-authenticated macOS floor); it never affects the green/red
     /// determination, which is `wallArmState` alone.
     @Published private(set) var producerAuthenticity: ProducerAuthenticity?
+
+    /// Timestamp of the most recent CONFIRMED-reachable health probe. `nil` until
+    /// the server is reached for the first time (cold start). Drives the honest
+    /// "as of HH:MM:SS, reconnecting..." banner in the Reconnecting state: it is
+    /// the moment we last saw the server alive, NOT the current time, so the
+    /// operator knows exactly how stale the dimmed last-known frame is. Reset
+    /// every time a reachable probe lands (so it always reflects the latest live
+    /// contact, never an older one).
+    @Published private(set) var lastReachableAt: Date?
+
+    /// Whether the server has EVER been confirmed reachable in this app session.
+    /// This is the honesty gate that keeps cold start from ever rendering a
+    /// stale-posture frame: only once we have actually loaded the board (so there
+    /// is a real last-known frame behind the dimming) can the surface enter
+    /// `.reconnecting`. Before the first successful probe it stays false, so the
+    /// surface falls to the native empty-state, not a fabricated stale view.
+    @Published private(set) var hasLastKnownPosture: Bool = false
+
+    /// The operator-facing surface state, recomputed on every health probe from
+    /// the raw `serverStatus`, the failure count, and `hasLastKnownPosture`. The
+    /// view layer reads THIS (not raw `serverStatus`) to choose between the live
+    /// board, the dimmed reconnecting frame, and the native down-screen. See
+    /// `Self.postureSurfaceState`.
+    @Published private(set) var surfaceState: PostureSurfaceState = .unreachable
 
     private let dashboardPort: Int = 3501
 
@@ -102,6 +153,22 @@ final class SanctuaryServerBridge: ObservableObject {
     /// `.reachable` to `.unreachable`. Two probes at the 5s cadence means a real
     /// outage still surfaces in ~5-10s, while a single-tick blip is absorbed.
     static let unreachableHysteresisThreshold = 2
+
+    /// The bounded recovery budget, in consecutive failed probes since the server
+    /// was last reachable, during which a previously-reachable server shows the
+    /// honest Reconnecting state (dimmed last-known posture + "reconnecting..."
+    /// banner) instead of the bare down-screen. Once failures reach this budget
+    /// with no successful probe, the surface falls to `.unreachable` (the native
+    /// down-screen): we have given recovery a fair window and it did not arrive,
+    /// so continuing to show a "reconnecting" promise would be dishonest.
+    ///
+    /// At the 5s poll cadence, 6 failures is roughly a 30s recovery window. This
+    /// is deliberately generous: Slice 1a has no restart producer signal yet
+    /// (`/api/health.instance`/`since` is Slice 1b), so the budget is the only
+    /// thing distinguishing "transient, likely coming back" from "genuinely
+    /// down." A user-driven manual restart (the "Start Sanctuary server" button)
+    /// is still available from the down-screen if recovery never arrives.
+    static let recoveryBudgetFailures = 6
 
     init() {
         // Resolve the CLI OFF the calling thread. Resolution probes candidate
@@ -270,6 +337,65 @@ final class SanctuaryServerBridge: ObservableObject {
         )
         consecutiveHealthFailures = transition.consecutiveFailures
         serverStatus = transition.status
+
+        // On a confirmed-reachable probe, record that we now have a real
+        // last-known frame to dim during a future outage, and stamp the moment we
+        // last saw the server alive (the "as of HH:MM:SS" the banner shows). Only
+        // a genuine reachable probe sets these, so cold start (never reachable)
+        // can never present a fabricated stale frame.
+        if probeReachable {
+            hasLastKnownPosture = true
+            lastReachableAt = Date()
+        }
+
+        // Recompute the operator-facing surface state. The view reads THIS to
+        // choose live board / dimmed reconnecting frame / native down-screen, so
+        // the three-state honesty model lives in one tested place.
+        surfaceState = Self.postureSurfaceState(
+            status: serverStatus,
+            consecutiveFailures: consecutiveHealthFailures,
+            hasLastKnownPosture: hasLastKnownPosture,
+            recoveryBudget: Self.recoveryBudgetFailures
+        )
+    }
+
+    /// Pure derivation of the operator-facing surface state (Slice 1a §3.1),
+    /// factored out so the three-state honesty model is unit-testable without a
+    /// network or a view.
+    ///
+    /// Rules (honesty is the whole point):
+    ///   - `.reachable`                                  -> `.live`.
+    ///   - failing, but we HAVE a last-known frame AND failures are still inside
+    ///     the recovery budget                            -> `.reconnecting`
+    ///     (show the dimmed, timestamped last-known board + "reconnecting..."
+    ///     banner; the badge falls to `.unknown` independently).
+    ///   - failing with NO last-known frame (cold start)  -> `.unreachable`
+    ///     (native empty-state; never a fabricated stale frame).
+    ///   - failing past the recovery budget               -> `.unreachable`
+    ///     (recovery was given a fair window and did not arrive; the
+    ///     "reconnecting" promise would now be dishonest).
+    ///   - `.unknown` (cold start, below hysteresis)       -> `.unreachable`
+    ///     surface, which the caller renders as the native empty-state. (There is
+    ///     nothing live to show yet, and we never invent a stale frame.)
+    ///
+    /// `recoveryBudget` is clamped to at least 1 so the function terminates for
+    /// any caller-supplied value.
+    static func postureSurfaceState(
+        status: ServerStatus,
+        consecutiveFailures: Int,
+        hasLastKnownPosture: Bool,
+        recoveryBudget: Int
+    ) -> PostureSurfaceState {
+        if status == .reachable {
+            return .live
+        }
+        // Not reachable. Only a server we have actually seen alive can show the
+        // honest "reconnecting" frame, and only inside the bounded budget.
+        let budget = max(1, recoveryBudget)
+        if hasLastKnownPosture && consecutiveFailures < budget {
+            return .reconnecting
+        }
+        return .unreachable
     }
 
     /// Pure server-status transition with failure hysteresis. Factored out so the
