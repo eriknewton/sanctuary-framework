@@ -386,10 +386,14 @@ export async function startStandaloneDashboard(
         storagePath: config.storage_path,
         fortressId: fortressIdFromStoragePath(config.storage_path),
         // Durability comes from the controlling-terminal disclosure (the human
-        // stores it in their password manager) and/or an explicit off-host
-        // target (--recovery-out / SANCTUARY_RECOVERY_OUT). The OS-keyring
-        // recovery escrow is NOT auto-written here; it is the documented escape
-        // hatch provisioned by `sanctuary init` / `sanctuary wrap`.
+        // stores it in their password manager, confirmed interactively) and/or
+        // an explicit off-host target (--recovery-out / SANCTUARY_RECOVERY_OUT).
+        // When a passphrase is in play we ALSO escrow the recovery key to the
+        // OS keyring (best-effort, read-back-verified) exactly as
+        // `sanctuary init` does, giving a passphrase-provisioned fortress a
+        // recoverable second factor. Under --no-confirm the gate then requires
+        // one of those durable targets and fails closed otherwise.
+        attemptKeychainEscrow: !!passphrase,
       };
       if (options.recoveryOut !== undefined) {
         escrowOpts.recoveryOut = options.recoveryOut;

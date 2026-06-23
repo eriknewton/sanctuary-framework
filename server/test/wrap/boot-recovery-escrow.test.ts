@@ -73,26 +73,59 @@ describe("escrowBootRecoveryKey — durable boot-path escrow", () => {
     await rm(fortress, { recursive: true, force: true });
   });
 
-  it("discloses on the tty ONLY and never writes recovery-key.txt in the fortress", async () => {
-    const result = await escrowBootRecoveryKey({
-      recoveryKey: FIXTURE_KEY,
-      storagePath: fortress,
-      recoveryKeychain: NO_KEYRING,
-      noConfirm: true,
-      ttyChannel: { write: tty.write },
-    });
+  it("discloses on the tty and never writes recovery-key.txt in the fortress", async () => {
+    // A durable off-host target satisfies the gate under noConfirm; the key is
+    // still disclosed on the tty for the human, and never co-located inside the
+    // fortress dir.
+    const outDir = await mkdtemp(join(tmpdir(), "sanctuary-recovery-out-"));
+    const outPath = join(outDir, "recovery.txt");
+    try {
+      const result = await escrowBootRecoveryKey({
+        recoveryKey: FIXTURE_KEY,
+        storagePath: fortress,
+        recoveryOut: outPath,
+        recoveryKeychain: NO_KEYRING,
+        noConfirm: true,
+        ttyChannel: { write: tty.write },
+      });
 
-    // Key appears on the tty channel, and nowhere else.
-    expect(tty.writes.join("")).toContain(FIXTURE_KEY);
-    expect(result.disclosedOnTty).toBe(true);
+      // Key appears on the tty channel and the off-host target, never the fortress.
+      expect(tty.writes.join("")).toContain(FIXTURE_KEY);
+      expect(result.disclosedOnTty).toBe(true);
 
-    // No recovery-key.txt anywhere under the fortress directory.
-    const entries = await readdir(fortress);
-    expect(entries).not.toContain("recovery-key.txt");
+      // No recovery-key.txt anywhere under the fortress directory.
+      const entries = await readdir(fortress);
+      expect(entries).not.toContain("recovery-key.txt");
+      await expect(stat(join(fortress, "recovery-key.txt"))).rejects.toThrow();
+      await expect(
+        stat(join(fortress, "state", "recovery-key.txt")),
+      ).rejects.toThrow();
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed under noConfirm even WITH a controlling terminal when no durable target exists (orphaning regression)", async () => {
+    // The dangerous case the durable fix must close: noConfirm + a tty present
+    // (interactive seam, no nonInteractive flag) + NO off-host target. An
+    // unconfirmed one-shot tty flash is NOT proof of capture, so the gate must
+    // fail closed rather than mint an uncaptured sole-factor recovery key.
+    let threw: unknown;
+    try {
+      await escrowBootRecoveryKey({
+        recoveryKey: FIXTURE_KEY,
+        storagePath: fortress,
+        recoveryKeychain: NO_KEYRING,
+        noConfirm: true,
+        ttyChannel: { write: tty.write },
+      });
+    } catch (err) {
+      threw = err;
+    }
+    expect(threw).toBeInstanceOf(BootRecoveryKeyEscrowRequiredError);
+    expect((threw as Error).message).not.toContain(FIXTURE_KEY);
+    // Nothing precious survives: no in-fortress recovery copy was written.
     await expect(stat(join(fortress, "recovery-key.txt"))).rejects.toThrow();
-    await expect(
-      stat(join(fortress, "state", "recovery-key.txt")),
-    ).rejects.toThrow();
   });
 
   it("never leaks the recovery key into the return value or an exception", async () => {

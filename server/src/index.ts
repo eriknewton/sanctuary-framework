@@ -1657,15 +1657,17 @@ export async function createSanctuaryServer(options?: {
       recoveryKey,
       storagePath: config.storage_path,
       fortressId: fortressIdFromStoragePath(config.storage_path),
-      // The host harness owns stdin: no interactive confirmation. Durability
-      // comes from the off-host escrow target the gate then requires
-      // (SANCTUARY_RECOVERY_OUT, or the controlling terminal when present).
-      // The MCP stdio boot deliberately does NOT auto-write the OS-keyring
-      // recovery escrow: this path is the unattended-harness mode, and the
-      // recoverable second factor is provisioned by `sanctuary init` /
-      // `sanctuary wrap` (interactive) rather than silently on every stdio
-      // first run.
+      // The host harness owns stdin, so there is no interactive confirmation
+      // (noConfirm). The hard provisioning gate then requires a DURABLE
+      // off-host target and fails closed otherwise. When a passphrase is in
+      // play we escrow the recovery key to the OS keyring (best-effort,
+      // read-back-verified) exactly as `sanctuary init` does, so a
+      // passphrase-provisioned fortress gets a recoverable second factor; with
+      // no passphrase the operator must supply SANCTUARY_RECOVERY_OUT (or run
+      // interactively) or boot fails closed rather than minting an uncaptured
+      // sole-factor key.
       noConfirm: true,
+      attemptKeychainEscrow: !!passphrase,
     };
     await escrowBootRecoveryKey(escrowOpts);
   }

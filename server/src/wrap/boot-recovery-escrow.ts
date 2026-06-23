@@ -38,7 +38,7 @@
  * no automatic on-disk copy and the unlock path never auto-reads one.
  */
 
-import { createReadStream, openSync, writeSync } from "node:fs";
+import { closeSync, createReadStream, openSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
 
@@ -186,25 +186,30 @@ function buildTtyDisclosure(recoveryKey: string, escrowedNote: string): string {
 function openTty():
   | { write: (text: string) => void; input: NodeJS.ReadableStream; close: () => void }
   | null {
-  let writeFd: number;
+  let fd: number;
   try {
-    writeFd = openSync("/dev/tty", "w");
+    // ONE read+write fd for the controlling terminal. A single open (not a
+    // write-open plus a separate read-open of the same path) avoids both the
+    // js/file-system-race heuristic and the fd leak the two-fd shape had (the
+    // write fd was never closed). `/dev/tty` resolves to THIS process's
+    // controlling terminal at open time; it is a per-process device, not a
+    // path-swappable file, so there is no real TOCTOU here.
+    fd = openSync("/dev/tty", "r+");
   } catch {
     return null;
   }
   let input: NodeJS.ReadableStream;
-  let readFd: number;
   try {
-    readFd = openSync("/dev/tty", "r");
+    // The path arg is ignored when `fd` is supplied; the stream reads from fd.
+    // autoClose:true makes the stream own the single fd's close on destroy().
     input = createReadStream("/dev/tty", {
-      fd: readFd,
+      fd,
       autoClose: true,
       encoding: "utf8",
     });
   } catch {
     try {
-      // Best-effort close of the write fd if the read side failed.
-      writeSync(writeFd, "");
+      closeSync(fd);
     } catch {
       // ignore
     }
@@ -212,12 +217,12 @@ function openTty():
   }
   return {
     write: (text: string) => {
-      writeSync(writeFd, text);
+      writeSync(fd, text);
     },
     input,
     close: () => {
       try {
-        (input as Readable).destroy();
+        (input as Readable).destroy(); // closes the single fd (autoClose)
       } catch {
         // ignore
       }
@@ -331,8 +336,12 @@ export async function escrowBootRecoveryKey(
     opts.ttyChannel.write(buildTtyDisclosure(opts.recoveryKey, escrowedNote));
     result.disclosedOnTty = true;
     if (opts.noConfirm) {
-      result.confirmed = false;
-      return result;
+      // noConfirm suppresses the interactive capture prompt, so an UNCONFIRMED
+      // one-shot tty flash is NOT proof of capture. The gate is satisfied only
+      // by a durable off-host target; otherwise fail closed. (Else a stdio
+      // first-run with a controlling terminal but no escrow target would
+      // reintroduce the exact orphaning this fix exists to close.)
+      return finishWithoutTty(opts, hasDurableTarget, result, /*disclosed*/ true);
     }
     const input = opts.ttyChannel.input;
     if (!input) {
@@ -354,8 +363,9 @@ export async function escrowBootRecoveryKey(
     tty.write(buildTtyDisclosure(opts.recoveryKey, escrowedNote));
     result.disclosedOnTty = true;
     if (opts.noConfirm) {
-      result.confirmed = false;
-      return result;
+      // See the ttyChannel branch: noConfirm requires a durable target; an
+      // unconfirmed tty disclosure alone does not satisfy the gate.
+      return finishWithoutTty(opts, hasDurableTarget, result, /*disclosed*/ true);
     }
     const ok = await confirmCaptureAtTty(tty.write, tty.input);
     if (!ok) throw new BootRecoveryKeyCaptureDeclinedError();
