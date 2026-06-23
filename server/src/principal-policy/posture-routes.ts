@@ -526,63 +526,92 @@ export async function handlePostureRoute(
 
 // ── Composition helpers ──────────────────────────────────────────────
 
+// The always-on posture surface (home board + per-panel endpoints + SSE push)
+// composes several full-window audit reads per paint. Each helper below wraps its
+// build in `AuditLog.runEagerReads` so those reads serve from the eagerly-
+// maintained verified view with a THROTTLED out-of-band re-verify, instead of a
+// full chain re-scan per request. On a real 10k-entry / 40MB chain the old path
+// was 11-30s and pegged the event loop, and the SSE cadence made an open board
+// recompute it continuously and wedge the server (the #714 drill). HONESTY is
+// preserved: the eager view reflects every server-written entry with NO lag (the
+// server is the sole appender and verifies each entry as it appends), and the
+// strict integrity-findings contract is unchanged, so `chain_verified` /
+// `integrity_finding_count` / feature-health can never serve stale-green. The
+// agent-facing `/api/posture/evidence` read (`buildEvidence`) deliberately stays
+// on the full per-request re-verify path, keeping per-request on-disk tamper
+// detection on the inspectable audit surface.
 async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPosture> {
-  return buildCastleWallPosture({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCastleWallPosture({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
-  return buildAuditDigest({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildAuditDigest({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
- * Feature-usage health panel. Cache-invalidation rule (review must-fix #4): the
- * panel is recomputed from the audit chain on every request via
- * `buildFeatureHealthPanel`, which reads `AuditLog.query` fresh and re-scans for
- * integrity findings each call. Because each response reflects the current
- * chain head, a post-fault refresh can never show stale green - there is no
- * cross-request cache to invalidate at this layer.
+ * Feature-usage health panel. NEVER-STALE-GREEN rule (the new honesty argument,
+ * superseding the prior "uncached by design" note): the panel reads the audit
+ * chain through `buildFeatureHealthPanel`, which goes via the AuditLog's EAGER
+ * read path here (wrapped in `runEagerReads`). The eager view is maintained on
+ * EVERY append (the server is the sole appender and verifies each new entry as it
+ * records it), so the panel always reflects the current chain head with NO lag.
+ * A post-fault refresh can never show stale green. This is NOT a lazily-cached
+ * value that could fall behind an append: it is the eagerly-maintained verified
+ * state, and a detected integrity finding (at load, or on the throttled out-of-
+ * band re-verify) forces every row to `unknown`/non-green via the existing
+ * `audit_integrity_ok=false` lever. What the eager path changes versus the old
+ * code is ONLY the cadence of the OUT-OF-BAND on-disk re-scan (a direct file edit
+ * that bypasses the server), bounded to once per `AUDIT_EAGER_REVERIFY_INTERVAL_MS`
+ * instead of once-per-request, so an auto-refreshing board no longer re-verifies
+ * the whole chain on every paint (the #714 wedge).
  */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
 ): Promise<FeatureHealthPanel> {
-  return buildFeatureHealthPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
-      ? deps.resolveBrokerPinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-    ...(deps.brokerProducerKeyExpectedButUnavailable
-      ? { brokerProducerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildFeatureHealthPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
+        ? deps.resolveBrokerPinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(deps.brokerProducerKeyExpectedButUnavailable
+        ? { brokerProducerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
@@ -598,10 +627,13 @@ async function buildQueryPrivacy(
 ): Promise<QueryPrivacySection> {
   let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null;
   try {
-    const computed = await computeQueryAnonymityStats({
-      auditLog: deps.auditLog as AuditLog,
-      ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
-    });
+    // Eager read (posture surface): bounded-cost, throttled out-of-band re-verify.
+    const computed = await (deps.auditLog as AuditLog).runEagerReads(() =>
+      computeQueryAnonymityStats({
+        auditLog: deps.auditLog as AuditLog,
+        ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
+      }),
+    );
     stats = {
       window: computed.window,
       total_outbound_calls: computed.total_outbound_calls,
@@ -632,11 +664,13 @@ async function buildQueryPrivacy(
 async function buildCustodyExit(
   deps: PostureRouteDeps,
 ): Promise<CustodyExitPanel> {
-  return buildCustodyExitPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCustodyExitPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+    }),
+  );
 }
 
 /**
@@ -744,13 +778,15 @@ async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPane
     }
   }
 
-  return buildRecognitionPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
-    reputationEvidence,
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildRecognitionPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
+      reputationEvidence,
+    }),
+  );
 }
 
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {

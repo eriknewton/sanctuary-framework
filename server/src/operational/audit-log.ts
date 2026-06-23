@@ -501,6 +501,21 @@ const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 // fails closed once the deadline passes.
 const AUDIT_READ_CONSISTENCY_MAX_MS = 2_000;
 const AUDIT_READ_CONSISTENCY_RETRY_MS = 10;
+// Eager-read throttle. The posture dashboard composes several full-chain reads
+// per board paint and pushes the same payload on an SSE cadence; re-reading +
+// re-decrypting + re-verifying a 10k-entry / 40MB chain from disk on EVERY such
+// read pegs the event loop (the #714 drill: 11-30s/paint, Node at 203% CPU). The
+// in-memory verified view is maintained EAGERLY on every append (the server is
+// the sole appender, and `persistChainedEntry` verifies + records each new entry
+// under the write lock), so an eager read is already current for everything this
+// process wrote, with NO lag for a just-appended entry. A full on-disk re-scan
+// is therefore needed ONLY to catch OUT-OF-BAND tampering (a direct file edit
+// that bypasses the server). We keep that detection but BOUND its cadence to at
+// most once per this interval, so an open auto-refreshing board no longer
+// recomputes the whole chain on every paint. The load-time full verify is
+// unconditional (it ignores this throttle), so an out-of-band edit present at
+// boot still fails loud immediately.
+const AUDIT_EAGER_REVERIFY_INTERVAL_MS = 30_000;
 
 /** True iff `pid` names a live process this user could signal. Used to detect a
  * stale audit-write lock left by a crashed/killed holder. */
@@ -598,6 +613,18 @@ const auditIntegrityContext = new AsyncLocalStorage<{
   allowIntegrityFindings: boolean;
 }>();
 
+/**
+ * When set, `query` serves from the eagerly-maintained in-memory verified view
+ * and throttles the OUT-OF-BAND on-disk re-verification (see {@link
+ * AuditLog.queryEager}). The always-on posture surface (home board + per-panel
+ * endpoints + SSE push) opens this scope via {@link AuditLog.runEagerReads} so
+ * every read it composes is bounded-cost, WITHOUT touching the agent-facing
+ * `query` callers (who keep per-request on-disk re-verification). The flag never
+ * weakens honesty: the eager view is current for every server-written entry and
+ * the strict-mode findings contract is unchanged.
+ */
+const auditEagerReadContext = new AsyncLocalStorage<{ eager: boolean }>();
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
@@ -636,6 +663,27 @@ export class AuditLog {
   private lastCheckpointSequence = 0;
   private criticalAppendsSinceCheckpoint = 0;
   private checkpointInFlight = false;
+  /**
+   * Wall-clock of the most recent FULL on-disk re-verification (a complete
+   * `loadPersistedEntries` pass that re-read, re-decrypted, re-hashed and
+   * chain-walked every surviving entry). Drives the throttle on the eager read
+   * path (`queryEager`): the in-memory verified view is maintained on EVERY
+   * append (the server is the sole appender), so reads do not need a full disk
+   * re-scan to be current for this-process writes; the periodic full re-scan
+   * exists ONLY to catch OUT-OF-BAND on-disk tampering (a direct file edit that
+   * bypasses the server). Initialized to 0 so the first eager read always pays a
+   * full verify. See {@link queryEager}.
+   */
+  private lastFullVerifyAtMs = 0;
+  /**
+   * Single-flight guard for the eager-read full re-verify. A board paint fires
+   * several eager reads concurrently (the `buildHome` `Promise.all`); without
+   * this they could all trip the throttle and launch redundant full chain scans
+   * at once (a thundering herd that mutates shared in-memory chain state in
+   * parallel). They instead share ONE in-flight scan. Null when no eager full
+   * verify is running.
+   */
+  private eagerReverifyInFlight: Promise<void> | null = null;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
@@ -1531,13 +1579,21 @@ export class AuditLog {
     total: number;
     integrity_findings: AuditIntegrityFinding[];
   }> {
-    await this.appendQueue;
-    // Re-scan so read-class operations fail loud as soon as corruption appears.
-    // Reads do NOT take the cross-process write lock: stale reads are tolerable,
-    // and acquiring the write lock here would create the audit namespace dir as
-    // a side effect for fortresses that have never written, breaking
-    // non-recursive cleanup in tests that only construct an AuditLog.
-    await this.reloadPersistedEntries();
+    // EAGER SCOPE (posture surface): serve from the eagerly-maintained verified
+    // view with the throttled on-disk re-verify, so the high-frequency board
+    // composition does not re-scan the whole chain per request (the #714 wedge).
+    // OUTSIDE the scope (the agent-facing default): re-scan on EVERY call so
+    // read-class operations fail loud as soon as corruption appears. Reads do NOT
+    // take the cross-process write lock: stale reads are tolerable, and acquiring
+    // the write lock here would create the audit namespace dir as a side effect
+    // for fortresses that have never written, breaking non-recursive cleanup in
+    // tests that only construct an AuditLog.
+    if (auditEagerReadContext.getStore()?.eager === true) {
+      await this.ensureFreshEagerView();
+    } else {
+      await this.appendQueue;
+      await this.reloadPersistedEntries();
+    }
 
     let filtered = this.entries;
 
@@ -1566,6 +1622,119 @@ export class AuditLog {
     const entries = filtered.slice(-limit); // Most recent entries
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };
+  }
+
+  /**
+   * Eager, bounded-cost read for the always-on posture surface (the home board,
+   * its per-panel endpoints, and the SSE live-refresh push).
+   *
+   * Identical filtering + result shape to {@link query}, but the per-request cost
+   * does NOT scale with chain length. `query` re-reads, re-decrypts, re-hashes and
+   * chain-walks every surviving entry from disk on EVERY call; at a real 10k-entry
+   * / 40MB chain that is 11-30s and pegs the event loop (the #714 drill), and the
+   * SSE cadence makes an open board recompute it continuously, wedging the server.
+   *
+   * This path serves from the EAGERLY-MAINTAINED in-memory verified view instead:
+   *   - {@link persistChainedEntry} updates `this.entries` / `this.chainEntries` /
+   *     `this.integrityFindings` and advances the verified head on EVERY append,
+   *     under the write lock, having already verified the new entry chains. So the
+   *     in-memory view is always current for everything THIS process wrote, with
+   *     NO lag, so a just-appended entry is visible to the very next eager read.
+   *   - We `await this.appendQueue` first, so all queued appends are reflected
+   *     before we read (never-stale: an in-flight append is drained, not skipped).
+   *   - A FULL on-disk re-scan (the expensive `loadPersistedEntries`) is run only
+   *     when the view was never loaded OR more than
+   *     `AUDIT_EAGER_REVERIFY_INTERVAL_MS` has elapsed since the last full verify.
+   *     That re-scan exists ONLY to catch OUT-OF-BAND tampering (a direct on-disk
+   *     edit that bypasses the server); throttling its CADENCE never makes a
+   *     server-written entry stale, because those are reflected eagerly above.
+   *
+   * NEVER-STALE-GREEN GUARANTEE: `integrity_findings` returned here is the EAGER
+   * verdict. Because the verdict is maintained on each append (not lazily cached
+   * and invalidated), there is no window where a just-appended-but-unverified
+   * entry reads green, and a load-time / throttled re-scan that detects a problem
+   * leaves the finding in `this.integrityFindings`, which every subsequent eager
+   * read inherits. The strict-mode contract is preserved: when integrity findings
+   * are present, this throws `AuditIntegrityError` (unless the caller opted into
+   * `runAllowingIntegrityFindings`), exactly as `query` does.
+   *
+   * OUT-OF-BAND TAMPER DETECTION BOUNDARY (documented, intentional): an on-disk
+   * edit made by a non-server process is caught (a) unconditionally at load, and
+   * (b) within at most `AUDIT_EAGER_REVERIFY_INTERVAL_MS` on the eager path,
+   * versus immediately-per-request on the legacy `query` path. The agent-facing
+   * audit query (`query`) is UNCHANGED and still re-verifies on every call, so the
+   * inspectable audit surface keeps per-request on-disk tamper detection; only the
+   * high-frequency posture composition is throttled. Within the throttle window an
+   * eager read can serve the last verified verdict for an on-disk edit not yet
+   * re-scanned, but it can NEVER serve stale-green for anything the server itself
+   * did, and the boundary is bounded + documented, never silent.
+   */
+  async queryEager(options: {
+    since?: string;
+    layer?: AuditEntry["layer"];
+    operation_type?: string;
+    identity_id?: string;
+    limit?: number;
+  }): Promise<{
+    entries: AuditEntry[];
+    total: number;
+    integrity_findings: AuditIntegrityFinding[];
+  }> {
+    return this.runEagerReads(() => this.query(options));
+  }
+
+  /**
+   * Run `fn` with the audit eager-read mode active: every `query` call inside it
+   * serves from the eagerly-maintained verified view with the throttled on-disk
+   * re-verify (see {@link queryEager}). Used by the posture route layer to wrap
+   * the whole home-board composition (the digest, feature-health, castle-wall,
+   * custody-exit, recognition and query-privacy reads, plus the SSE push) in ONE
+   * bounded-cost scope WITHOUT plumbing a flag through every builder. Honesty is
+   * unchanged: the eager view is current for every server-written entry and the
+   * strict-mode integrity contract still applies inside the scope.
+   */
+  async runEagerReads<T>(fn: () => Promise<T>): Promise<T> {
+    return auditEagerReadContext.run({ eager: true }, fn);
+  }
+
+  /**
+   * Bring the in-memory verified view up to date for an eager read. Drains the
+   * append queue (so every queued append is reflected, never-stale), runs a full
+   * on-disk re-scan only when never loaded or the re-verify throttle has elapsed,
+   * and then enforces the SAME strict-mode integrity contract as `query`
+   * (findings → throw unless the caller opted in). See {@link queryEager}.
+   */
+  private async ensureFreshEagerView(): Promise<void> {
+    await this.appendQueue;
+    const dueForFullReverify =
+      !this.loaded ||
+      Date.now() - this.lastFullVerifyAtMs >= AUDIT_EAGER_REVERIFY_INTERVAL_MS;
+    if (dueForFullReverify) {
+      // Full disk re-scan (also stamps lastFullVerifyAtMs + refreshes findings),
+      // single-flighted so concurrent board reads share ONE scan instead of
+      // racing redundant scans over the same shared chain state.
+      if (this.eagerReverifyInFlight === null) {
+        this.eagerReverifyInFlight = (async () => {
+          try {
+            await this.loadPersistedEntriesWithReadConsistency();
+            this.loaded = true;
+          } finally {
+            this.eagerReverifyInFlight = null;
+          }
+        })();
+      }
+      await this.eagerReverifyInFlight;
+    }
+    await this.reportIntegrityFindingsIfAny();
+    const contextAllowsIntegrityFindings =
+      auditIntegrityContext.getStore()?.allowIntegrityFindings === true;
+    if (
+      this.integrityMode === "strict" &&
+      this.integrityFindings.length > 0 &&
+      !contextAllowsIntegrityFindings
+    ) {
+      throw new AuditIntegrityError(this.integrityFindings);
+    }
   }
 
   private async ensureLoaded(options?: { allowIntegrityFindings?: boolean }): Promise<void> {
@@ -2038,12 +2207,19 @@ export class AuditLog {
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
+      // A complete on-disk re-scan just ran: reset the eager-read throttle so the
+      // next eager read serves from this freshly-verified view without re-paying.
+      this.lastFullVerifyAtMs = Date.now();
     } catch (err) {
       findings.push({
         kind: "storage_unavailable",
         message: `audit storage could not be listed: ${failureMessage(err)}`,
       });
       this.integrityFindings = findings;
+      // Even a failed listing is a completed (failed) full pass; stamp it so the
+      // throttle does not hot-loop full scans, but the findings above keep the
+      // read honest (an eager read inherits these findings → never green).
+      this.lastFullVerifyAtMs = Date.now();
     }
   }
 
