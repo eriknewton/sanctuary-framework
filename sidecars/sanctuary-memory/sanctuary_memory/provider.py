@@ -133,6 +133,11 @@ def agent_tag_for(agent_id: str) -> str:
     return f"agent_id:{_hash_component('sdw-ms-agent-v1', agent_id)}"
 
 
+def ms_scope_tag_for(operator_id: str, agent_id: str, session_id: str) -> str:
+    body = f"{operator_id}\0{agent_id}\0{session_id}"
+    return f"ms_scope:{_hash_component('sanctuary-ms-scope-v1', body)}"
+
+
 def foundry_memory_type_tag(memory_type: str) -> str:
     if memory_type not in VALID_MEMORY_TYPES:
         raise ValueError(f"unsupported memory_type: {memory_type}")
@@ -159,8 +164,8 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
         server_command: Sequence[str] | None = None,
         server_cwd: str | None = None,
         server_env: Mapping[str, str] | None = None,
-        operator_id: str = "operator",
-        agent_id: str = "agent",
+        operator_id: str | None = None,
+        agent_id: str | None = None,
         search_limit: int = 5,
         default_memory_type: str = "chat-summary",
         default_taint: str = "agent_derived_clean",
@@ -179,6 +184,10 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
             raise ValueError(f"unsupported default_memory_type: {default_memory_type}")
         if default_taint not in VALID_TAINTS:
             raise ValueError(f"unsupported default_taint: {default_taint}")
+        if not operator_id or not agent_id:
+            raise ValueError(
+                "operator_id and agent_id are required for memory scope isolation"
+            )
         self.operator_id = operator_id
         self.agent_id = agent_id
         self.owner_ref = owner_ref_for(operator_id, agent_id)
@@ -216,11 +225,12 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
         session_id = self._session_id(session, state)
         query = self._query_text(context, state)
         session_tag = session_tag_for(session_id)
+        scope_tag = ms_scope_tag_for(self.operator_id, self.agent_id, session_id)
         payload = self._call_tool(
             "memory_search",
             {
                 "text": query,
-                "tag": session_tag,
+                "tag": scope_tag,
                 "limit": self.search_limit,
             },
         )
@@ -230,6 +240,7 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
             "owner_ref": self.owner_ref,
             "session_id": session_id,
             "session_tag": session_tag,
+            "ms_scope_tag": scope_tag,
             "query": query,
             "memories": [memory.as_dict() for memory in memories],
             "context_text": context_text,
@@ -410,9 +421,6 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
             text = _mapping_get_string(context, "sanctuary_memory_text")
         if text:
             return [{"text": text}]
-        latest = _latest_message_text(_mapping_get(context, "messages"))
-        if latest:
-            return [{"text": latest}]
         return []
 
     def _tags_for(
@@ -425,6 +433,7 @@ class SanctuaryContextProvider(_MicrosoftContextProvider):  # type: ignore[misc]
             "ms_agent_framework",
             "sdw_context_provider",
             foundry_memory_type_tag(memory_type),
+            ms_scope_tag_for(self.operator_id, self.agent_id, session_id),
             session_tag_for(session_id),
             agent_tag_for(self.agent_id),
         ]

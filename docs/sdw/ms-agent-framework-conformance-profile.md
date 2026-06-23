@@ -79,34 +79,37 @@ The profile metadata convention for bindings that expose metadata is:
 |---|---|
 | `ms_agent_framework_provider` | `SanctuaryContextProvider` |
 | `ms_memory_type` | `procedural`, `user-profile`, or `chat-summary` |
-| `session_id_hash` | Base64url SHA-256 hash of the Microsoft session id |
-| `agent_id_hash` | Base64url SHA-256 hash of the agent id |
+| `session_id_hash` | `base64url_sha256("sdw-ms-session-v1\0" || session_id)` |
+| `agent_id_hash` | `base64url_sha256("sdw-ms-agent-v1\0" || agent_id)` |
 | `sdw_owner_ref` | Deterministic owner reference for the operator and agent |
 | `ttl_policy` | `operator_controlled_no_silent_expiry` |
 
 The current shipped MCP `memory_insert` tool accepts tags, text, taint, and an
 optional passage id. It does not accept a metadata argument. The provider
-therefore emits the type, session, and agent conventions as tags on the current
-MCP path, and exposes the metadata convention in its write result for future
-adapter bindings that can pass metadata through directly.
+therefore emits the type, combined scope, session, and agent conventions as tags
+on the current MCP path, and exposes the metadata convention in its write result
+for future adapter bindings that can pass metadata through directly.
 
 ## Session Mapping
 
 The provider maps Microsoft session and agent identity to SDW-safe identifiers:
 
 - `owner_ref = base64url_sha256("sdw-ms-owner-v1\0" || operator_id || "\0" || agent_id)`
-- `session_tag = "session_id:" || base64url_sha256(session_id)`
-- `agent_tag = "agent_id:" || base64url_sha256(agent_id)`
+- `ms_scope_tag = "ms_scope:" || base64url_sha256("sanctuary-ms-scope-v1\0" || operator_id || "\0" || agent_id || "\0" || session_id)`
+- `session_tag = "session_id:" || base64url_sha256("sdw-ms-session-v1\0" || session_id)`
+- `agent_tag = "agent_id:" || base64url_sha256("sdw-ms-agent-v1\0" || agent_id)`
 
 The `owner_ref` is the stable memory archive scope for one operator plus one
-agent. The `session_id:*` tag narrows context retrieval to one Microsoft session
-using the existing `memory_search` tag filter.
+agent. The `ms_scope:*` tag is the isolation boundary for current reads and
+writes: the provider writes it on `memory_insert` and passes the exact same tag
+to the existing `memory_search` tag filter. `session_id:*` and `agent_id:*`
+remain observability tags but are not the retrieval isolation boundary.
 
 Live Sanctuary currently wires the memory MCP tools to a configured adapter
 owner scope inside the Sanctuary server. The Python provider cannot pass
 `owner_ref` as a tool argument through the existing six-tool surface. This
 profile therefore treats `owner_ref` as the provider's documented scope value
-and `session_id:*` as the interoperable filter on the current MCP surface.
+and `ms_scope:*` as the interoperable filter on the current MCP surface.
 
 ## Taint and Secret Boundary
 

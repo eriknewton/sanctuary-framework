@@ -66,8 +66,8 @@ Offline interface-shaped demo:
 `before_run`:
 
 1. Resolves the Microsoft session id.
-2. Builds the SDW session tag `session_id:<hash>`.
-3. Calls `memory_search` with the query and session tag.
+2. Builds the combined SDW scope tag `ms_scope:<hash>`.
+3. Calls `memory_search` with the query and combined scope tag.
 4. Calls `memory_get` for each search hit.
 5. Recomputes the SDW content hash and fails closed on mismatch.
 6. Injects `sanctuary_memory_context` and `sanctuary_memories` into `state` and
@@ -76,8 +76,8 @@ Offline interface-shaped demo:
 `after_run`:
 
 1. Reads explicit `sanctuary_memory_items` or `sanctuary_memory_text` from
-   state or context.
-2. Adds SDW tags for Microsoft memory type, session, and agent.
+   state or context. No context message is persisted without one of these fields.
+2. Adds SDW tags for Microsoft memory type, combined scope, session, and agent.
 3. Calls `memory_insert` with a persistable taint.
 4. Raises `MemoryWriteRejected` if SDW returns the fixed denial payload.
 5. Verifies the returned content hash.
@@ -101,6 +101,7 @@ It also emits:
 
 - `ms_agent_framework`
 - `sdw_context_provider`
+- `ms_scope:<hash>`
 - `session_id:<hash>`
 - `agent_id:<hash>`
 
@@ -119,9 +120,11 @@ Run from the repository root:
 The tests use a fake six-tool MCP layer. They assert:
 
 - store and retrieve round-trip mapping;
-- session tag and owner scope derivation;
+- combined scope tag, session tag, and owner scope derivation;
+- same-session cross-agent memory isolation;
 - content-hash verification;
 - secret-bearing writes are rejected by the stubbed write gate;
+- explicit-only memory persistence;
 - delete reports pending operator approval;
 - no-memory `after_run` still reaches the audited MCP layer via `memory_count`.
 

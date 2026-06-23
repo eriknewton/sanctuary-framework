@@ -11,6 +11,7 @@ from sanctuary_memory import (
     MemoryWriteRejected,
     SanctuaryContextProvider,
     content_hash_for_text,
+    ms_scope_tag_for,
     owner_ref_for,
     session_tag_for,
 )
@@ -120,13 +121,22 @@ class FakeMemoryTools:
         return {"found": True, "passage": out}
 
 
+def make_provider(
+    fake: FakeMemoryTools,
+    *,
+    operator_id: str = "operator-a",
+    agent_id: str = "agent-a",
+) -> SanctuaryContextProvider:
+    return SanctuaryContextProvider(
+        client=fake,
+        operator_id=operator_id,
+        agent_id=agent_id,
+    )
+
+
 def test_round_trip_store_and_retrieve_with_content_hash() -> None:
     fake = FakeMemoryTools()
-    provider = SanctuaryContextProvider(
-        client=fake,
-        operator_id="operator-a",
-        agent_id="agent-a",
-    )
+    provider = make_provider(fake)
     state: dict[str, Any] = {
         "sanctuary_memory_text": "The user prefers concise release notes.",
         "sanctuary_memory_query": "release notes",
@@ -140,6 +150,9 @@ def test_round_trip_store_and_retrieve_with_content_hash() -> None:
         "The user prefers concise release notes."
     )
     assert "mem_type:chat-summary" in writes[0]["tags"]
+    assert (
+        ms_scope_tag_for("operator-a", "agent-a", "session-1") in writes[0]["tags"]
+    )
     assert session_tag_for("session-1") in writes[0]["tags"]
 
     read_state: dict[str, Any] = {"sanctuary_memory_query": "release notes"}
@@ -158,15 +171,14 @@ def test_round_trip_store_and_retrieve_with_content_hash() -> None:
         "memory_search",
         "memory_get",
     ]
+    assert fake.calls[1][1]["tag"] == ms_scope_tag_for(
+        "operator-a", "agent-a", "session-1"
+    )
 
 
 def test_session_mapping_adds_scope_and_tags() -> None:
     fake = FakeMemoryTools()
-    provider = SanctuaryContextProvider(
-        client=fake,
-        operator_id="operator-a",
-        agent_id="agent-a",
-    )
+    provider = make_provider(fake)
     state: dict[str, Any] = {
         "sanctuary_memory_items": [
             {
@@ -183,14 +195,49 @@ def test_session_mapping_adds_scope_and_tags() -> None:
     assert provider.owner_ref == owner_ref_for("operator-a", "agent-a")
     assert "mem_type:procedural" in insert_args["tags"]
     assert "workflow:finance" in insert_args["tags"]
+    assert (
+        ms_scope_tag_for("operator-a", "agent-a", "session-42")
+        in insert_args["tags"]
+    )
     assert session_tag_for("session-42") in insert_args["tags"]
     metadata = state["sanctuary_memory_writes"][0]["profile_metadata"]
-    assert {"key": "ttl_policy", "value": "operator_controlled_no_silent_expiry"} in metadata
+    assert {
+        "key": "ttl_policy",
+        "value": "operator_controlled_no_silent_expiry",
+    } in metadata
+
+
+def test_same_session_different_agent_cannot_retrieve_another_agent_memory() -> None:
+    fake = FakeMemoryTools()
+    agent_a = make_provider(fake, agent_id="agent-a")
+    agent_b = make_provider(fake, agent_id="agent-b")
+    session = FakeSession("shared-session")
+    agent_a_scope = ms_scope_tag_for("operator-a", "agent-a", "shared-session")
+    agent_b_scope = ms_scope_tag_for("operator-a", "agent-b", "shared-session")
+    state_a: dict[str, Any] = {
+        "sanctuary_memory_text": "The launch password is not here; use launch checklist.",
+        "sanctuary_memory_query": "launch",
+    }
+
+    agent_a.after_run(session=session, context={}, state=state_a)
+    read_state_b: dict[str, Any] = {"sanctuary_memory_query": "launch"}
+    context_b: dict[str, Any] = {}
+    agent_b.before_run(session=session, context=context_b, state=read_state_b)
+
+    assert agent_a_scope != agent_b_scope
+    assert agent_a_scope in fake.calls[0][1]["tags"]
+    assert fake.calls[1] == (
+        "memory_search",
+        {"text": "launch", "tag": agent_b_scope, "limit": 5},
+    )
+    assert read_state_b["sanctuary_memories"] == []
+    assert read_state_b["sanctuary_memory_context"] == ""
+    assert context_b["sanctuary_memories"] == []
 
 
 def test_content_hash_mismatch_fails_closed() -> None:
     fake = FakeMemoryTools(tamper_get_hash=True)
-    provider = SanctuaryContextProvider(client=fake)
+    provider = make_provider(fake)
     state: dict[str, Any] = {
         "sanctuary_memory_text": "Quarterly planning memory.",
         "sanctuary_memory_query": "planning",
@@ -207,7 +254,7 @@ def test_content_hash_mismatch_fails_closed() -> None:
 
 def test_secret_bearing_memory_is_rejected_by_write_gate_stub() -> None:
     fake = FakeMemoryTools()
-    provider = SanctuaryContextProvider(client=fake)
+    provider = make_provider(fake)
 
     with pytest.raises(MemoryWriteRejected) as exc_info:
         provider.after_run(
@@ -222,7 +269,7 @@ def test_secret_bearing_memory_is_rejected_by_write_gate_stub() -> None:
 
 def test_delete_request_surfaces_pending_operator_approval() -> None:
     fake = FakeMemoryTools()
-    provider = SanctuaryContextProvider(client=fake)
+    provider = make_provider(fake)
 
     result = provider.request_delete("p1")
 
@@ -234,12 +281,25 @@ def test_delete_request_surfaces_pending_operator_approval() -> None:
 
 def test_after_run_without_memory_still_calls_audited_read_tool() -> None:
     fake = FakeMemoryTools()
-    provider = SanctuaryContextProvider(client=fake)
+    provider = make_provider(fake)
     state: dict[str, Any] = {}
 
     provider.after_run(session=FakeSession("session-1"), context={}, state=state)
 
     assert fake.calls == [("memory_count", {})]
+    assert state["sanctuary_memory_writes"] == []
+
+
+def test_after_run_without_explicit_memory_fields_does_not_insert_messages() -> None:
+    fake = FakeMemoryTools()
+    provider = make_provider(fake)
+    state: dict[str, Any] = {}
+    context = {"messages": [{"content": "Do not silently persist this reply."}]}
+
+    provider.after_run(session=FakeSession("session-1"), context=context, state=state)
+
+    assert [name for name, _args in fake.calls] == ["memory_count"]
+    assert fake.passages == {}
     assert state["sanctuary_memory_writes"] == []
 
 
