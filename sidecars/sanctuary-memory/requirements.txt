@@ -1,0 +1,8 @@
+#
+# No third-party runtime dependencies.
+#
+# This file is intentionally empty apart from comments so CI can still install
+# it with `pip install --require-hashes -r requirements.txt`.
+#
+# Tests are run by the repository-provided venv:
+#   ./.sdw-build-venv/bin/python -m pytest sidecars/sanctuary-memory
