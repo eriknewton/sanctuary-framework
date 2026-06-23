@@ -200,9 +200,28 @@ export async function loadPinnedProducerKeyB64url(
   return toBase64url(bytes);
 }
 
+/**
+ * Strip a contiguous run of '=' from the END of a string in LINEAR time.
+ *
+ * This is the byte-for-byte equivalent of `.replace(/=+$/, "")` but without the
+ * super-linear backtracking that regex exhibits: matching `=+$` against a long
+ * run of '=' followed by a non-'=' char is O(n^2) (the engine re-tries the
+ * anchored `$` after backtracking each '=' and restarts at every offset). A
+ * single reverse scan is O(n) and produces the identical result for ALL inputs
+ * (embedded '=' are preserved exactly as `=+$` leaves them; only the trailing
+ * run is removed). See CodeQL `js/polynomial-redos`.
+ */
+function stripTrailingPadding(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 0x3d /* '=' */) end -= 1;
+  return end === s.length ? s : s.slice(0, end);
+}
+
 /** Decode an unpadded base64url string to bytes. Throws on malformed input. */
 export function fromBase64url(s: string): Uint8Array {
-  const normalized = s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const normalized = stripTrailingPadding(
+    s.replace(/\+/g, "-").replace(/\//g, "_")
+  );
   const pad = (4 - (normalized.length % 4)) % 4;
   const std = (normalized + "=".repeat(pad)).replace(/-/g, "+").replace(/_/g, "/");
   const bin = atob(std);
@@ -265,6 +284,17 @@ export function verifyProducerSignature(
     input.signatureB64url.length === 0
   ) {
     return { ok: false, reason: "producer_signature_missing" };
+  }
+  // Defense-in-depth: bound the attacker-controlled blob BEFORE decoding it.
+  // `fromBase64url` allocates ~3/4 of the input length, so a multi-megabyte
+  // valid-base64 blob over daemon IPC would allocate megabytes only to be
+  // rejected on the `sig.length !== 64` check below. A real 64-byte Ed25519
+  // signature is 88 base64url chars padded / 86 unpadded; 128 leaves clear
+  // headroom over any legitimate signature while capping the decode at a few
+  // dozen bytes. This fails closed with the SAME verdict shape as any other
+  // malformed signature: it neither throws nor leaks why.
+  if (input.signatureB64url.length > 128) {
+    return { ok: false, reason: "producer_signature_wrong_length" };
   }
   if (input.keyId !== expectedKeyId) {
     return {
