@@ -1738,14 +1738,17 @@ export class AuditLog {
    * on the NEXT eager read by the sentinel whenever it changes the listing
    * fingerprint (count / newest key / per-entry size or mtime), event-driven, not
    * up to the backstop interval, and (c) within at most `eagerReverifyIntervalMs`
-   * by the backstop for the residual same-length + mtime-preserved byte edit. The
+   * by the backstop for the residual cases below. The
    * agent-facing audit query (`query`) is UNCHANGED and still re-verifies on every
    * call, so the inspectable audit surface keeps per-request on-disk tamper
-   * detection; only the high-frequency posture composition is throttled. The ONLY
-   * remaining stale-green window on the eager path is a fingerprint-PRESERVING
-   * out-of-band content edit between backstop re-scans; it can NEVER serve
-   * stale-green for anything the server itself did, and the boundary is bounded +
-   * documented, never silent.
+   * detection; only the high-frequency posture composition is throttled. The
+   * remaining stale-green windows on the eager path both fall to the backstop
+   * (never beyond `eagerReverifyIntervalMs`, because a server append never advances
+   * the backstop clock): (1) a fingerprint-PRESERVING out-of-band content edit
+   * between backstop re-scans, and (2) a fingerprint-CHANGING out-of-band edit that
+   * a subsequent legitimate server append re-baselines over before the next
+   * sentinel check. Neither can EVER serve stale-green for anything the server
+   * itself did, and the boundary is bounded + documented, never silent.
    */
   async queryEager(options: {
     since?: string;
