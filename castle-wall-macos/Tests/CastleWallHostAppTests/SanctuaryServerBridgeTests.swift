@@ -406,4 +406,55 @@ final class SanctuaryServerBridgeTests: XCTestCase {
             SanctuaryServerBridge.unreachableHysteresisThreshold
         )
     }
+
+    // MARK: - Stale-timestamp copy (Slice 1a Fix 2: do not understate staleness)
+    //
+    // The Reconnecting banner and the down-screen both stamp the last-reachable
+    // moment so the operator knows how old the dimmed frame is. A bare HH:mm:ss
+    // would read an overnight or multi-day outage as if it were seconds old; the
+    // formatted string must therefore include the DATE, not just the time-of-day.
+
+    func testStaleTimestampIncludesTheDateNotJustTime() {
+        // Pin a known instant well in the past (2026-01-15). The formatted copy
+        // must contain a date component, so a frame stamped today vs. weeks ago is
+        // visibly different to the operator (honesty across time).
+        var comps = DateComponents()
+        comps.year = 2026
+        comps.month = 1
+        comps.day = 15
+        comps.hour = 14
+        comps.minute = 13
+        comps.second = 7
+        let cal = Calendar.current
+        let date = cal.date(from: comps)!
+
+        let formatted = ContentView.staleTimestamp(date)
+
+        // The day-of-month and the year must both be present (a pure HH:mm:ss
+        // string would contain neither). This is the regression guard: if the
+        // formatter is ever narrowed back to time-only, this fails.
+        XCTAssertTrue(formatted.contains("15"), "stale timestamp must include the day: \(formatted)")
+        XCTAssertTrue(formatted.contains("2026"), "stale timestamp must include the year: \(formatted)")
+    }
+
+    func testStaleTimestampDistinguishesDifferentDaysAtSameClockTime() {
+        // Two frames captured at the same wall-clock time on different days must
+        // produce DIFFERENT copy. A time-only formatter would collapse them to the
+        // same string and understate a day-old frame as if it were current.
+        let cal = Calendar.current
+        func at(year: Int, month: Int, day: Int) -> Date {
+            var c = DateComponents()
+            c.year = year; c.month = month; c.day = day
+            c.hour = 9; c.minute = 0; c.second = 0
+            return cal.date(from: c)!
+        }
+        let today = at(year: 2026, month: 6, day: 22)
+        let weeksAgo = at(year: 2026, month: 6, day: 1)
+
+        XCTAssertNotEqual(
+            ContentView.staleTimestamp(today),
+            ContentView.staleTimestamp(weeksAgo),
+            "same clock time on different days must format differently so staleness is not understated"
+        )
+    }
 }

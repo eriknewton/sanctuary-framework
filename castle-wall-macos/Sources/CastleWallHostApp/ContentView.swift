@@ -146,9 +146,10 @@ struct ContentView: View {
             //
             //   .live          server reachable -> embedded board (unchanged).
             //   .reconnecting  was reachable, now failing inside the recovery
-            //                  budget -> the dimmed, timestamped last-known board
-            //                  + "reconnecting..." banner. The operator stays
-            //                  oriented (sees what WAS true, clearly marked
+            //                  budget -> the SAME last-known board, dimmed +
+            //                  non-interactive, with a timestamped
+            //                  "reconnecting..." banner overlaid. The operator
+            //                  stays oriented (sees what WAS true, clearly marked
             //                  stale) while recovery is attempted; the badge has
             //                  already fallen to `.unknown` (never green).
             //   .unreachable   cold start (no last-known frame) OR down past the
@@ -156,14 +157,29 @@ struct ContentView: View {
             //                  never mount the web view onto a connection-refused
             //                  page, and never fabricate a stale frame on cold
             //                  start (spec §3).
+            //
+            // View-identity invariant (honesty fix, PR #715 review): `.live` and
+            // `.reconnecting` mount EXACTLY ONE `PostureWebView` at the SAME
+            // structural position in the tree, so SwiftUI keeps the same
+            // `WKWebView` instance across the live<->reconnecting transition. The
+            // dim + non-interactivity + stale banner are applied as a CONDITIONAL
+            // OVERLAY on top of that single stable web view, not by mounting a
+            // second `PostureWebView` inside a different container. If we instead
+            // moved the representable to a different position, SwiftUI's
+            // positional structural identity would treat it as a new view and
+            // call `makeNSView` for a FRESH `WKWebView` whose `load()` fires
+            // against the now-dead server -> the operator would see a blank or
+            // connection-refused frame, NOT the genuinely last-rendered board,
+            // and the "showing your last-known posture" banner would over-claim.
+            // Keeping one instance guarantees the dimmed frame really is the last
+            // board the operator saw (the web view does not reload on re-render).
+            //
+            // `.unreachable` (cold start or past the recovery budget) tears the
+            // web view down on purpose: there is genuinely nothing to preserve
+            // there, so the native down-screen replaces it.
             switch serverBridge.surfaceState {
-            case .live:
-                // The embedded board renders the live posture page inside the
-                // app. Loopback-pinned; loaded only because the server is
-                // confirmed reachable.
-                PostureWebView(url: Self.postureBoardURL)
-            case .reconnecting:
-                reconnectingView
+            case .live, .reconnecting:
+                postureBoardWithStaleOverlay
             case .unreachable:
                 serverDownView
             }
@@ -174,34 +190,42 @@ struct ContentView: View {
         }
     }
 
-    /// The honest Reconnecting state (Slice 1a design §3.1, §3.2). The server was
-    /// reachable and is now failing probes inside the bounded recovery budget. We
-    /// keep the operator oriented by showing the last-known posture board DIMMED
-    /// behind a visible banner that timestamps when it was last live and says we
-    /// are reconnecting. Honesty rules enforced here:
+    /// The one embedded posture board, plus the conditional stale overlay that
+    /// turns it into the honest Reconnecting state (Slice 1a design §3.1, §3.2).
     ///
-    ///   - The last-known frame is NEVER presented as current: it is dimmed
-    ///     (reduced opacity), made non-interactive (`allowsHitTesting(false)`) so
-    ///     a stale control cannot be clicked as if live, and overlaid with a
-    ///     timestamped "as of HH:MM:SS, reconnecting..." banner.
+    /// There is exactly ONE `PostureWebView` here, mounted at a STABLE structural
+    /// position for both `.live` and `.reconnecting`, so SwiftUI reuses the same
+    /// `WKWebView` across the transition and the operator's genuinely
+    /// last-rendered board is what gets dimmed (the web view does not reload on
+    /// re-render; it is not refetched from the dead server). When the surface is
+    /// `.reconnecting` we layer a dim + non-interactivity + timestamped banner ON
+    /// TOP of that same board; in `.live` the overlay is absent and the board is
+    /// fully interactive. Honesty rules enforced here:
+    ///
+    ///   - The last-known frame is NEVER presented as current while
+    ///     reconnecting: it is dimmed (reduced opacity), made non-interactive
+    ///     (`allowsHitTesting(false)`) so a stale control cannot be clicked as if
+    ///     live, and overlaid with a timestamped "as of ..., reconnecting..."
+    ///     banner.
     ///   - The arm badge is untouched here; it has already fallen to `.unknown`
     ///     on the failed posture read (never-fake-green across time). This view
     ///     only governs the board area, not the badge.
-    ///   - We render the SAME `PostureWebView` (not a SwiftUI re-render of the
-    ///     board), so we never fork the honesty model into a second code path.
-    ///     The web view's own `updateNSView` does not reload on re-render, so the
-    ///     operator's last-known frame stays put (it is not refetched from a dead
-    ///     server) until a real reachable probe restores `.live`.
-    private var reconnectingView: some View {
+    @ViewBuilder
+    private var postureBoardWithStaleOverlay: some View {
+        let reconnecting = serverBridge.surfaceState == .reconnecting
         ZStack(alignment: .top) {
-            // Last-known posture, dimmed + non-interactive. Loopback-pinned, same
-            // single honesty model as the live board.
+            // The single, stable embedded board. Loopback-pinned; loaded once and
+            // reused. Dimmed + non-interactive ONLY while reconnecting, so the
+            // exact same WKWebView instance carries the live view into the stale
+            // view without a reload.
             PostureWebView(url: Self.postureBoardURL)
-                .opacity(0.45)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
+                .opacity(reconnecting ? 0.45 : 1.0)
+                .allowsHitTesting(!reconnecting)
+                .accessibilityHidden(reconnecting)
 
-            reconnectingBanner
+            if reconnecting {
+                reconnectingBanner
+            }
         }
     }
 
@@ -230,18 +254,31 @@ struct ContentView: View {
         .shadow(radius: 2, y: 1)
     }
 
-    /// "Showing your last-known posture as of HH:MM:SS - this view is stale."
+    /// "Showing your last-known posture as of <date+time> - this view is stale."
     /// The timestamp is the moment we last confirmed the server alive
     /// (`lastReachableAt`), so the operator knows exactly how old the dimmed
-    /// frame is. If we somehow have no timestamp, say so plainly rather than
-    /// inventing a time.
+    /// frame is. We include the DATE, not just the time, so a long or overnight
+    /// outage cannot read as a few seconds stale (a bare HH:mm:ss understates an
+    /// hours-old or day-old frame). If we somehow have no timestamp, say so
+    /// plainly rather than inventing a time.
     private var reconnectingStaleNotice: String {
         guard let at = serverBridge.lastReachableAt else {
             return "Showing your last-known posture - this view is stale."
         }
+        return "Showing your last-known posture as of \(Self.staleTimestamp(at)) - this view is stale."
+    }
+
+    /// Format a last-reachable timestamp for the stale-state copy. Uses the
+    /// system locale's medium date + medium time (for example "Jun 22, 2026 at
+    /// 2:13:07 PM"), so the operator sees the DATE as well as the time. A bare
+    /// HH:mm:ss would understate an overnight or multi-day outage as if the frame
+    /// were seconds old; including the date keeps the staleness honest. Pure +
+    /// static so the format is unit-testable without a view. Hyphens only.
+    static func staleTimestamp(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return "Showing your last-known posture as of \(formatter.string(from: at)) - this view is stale."
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .medium
+        return formatter.string(from: date)
     }
 
     /// NATIVE down-screen, shown for the genuinely-`.unreachable` surface state:
@@ -309,9 +346,9 @@ struct ContentView: View {
         if serverBridge.hasLastKnownPosture {
             let base = "The local server that serves your posture board stopped and did not come back on its own. Start it again to restore your live view."
             if let at = serverBridge.lastReachableAt {
-                let formatter = DateFormatter()
-                formatter.dateFormat = "HH:mm:ss"
-                return base + " Last seen live at \(formatter.string(from: at))."
+                // Date + time (not a bare HH:mm:ss) so a long outage cannot read
+                // as seconds-old.
+                return base + " Last seen live at \(Self.staleTimestamp(at))."
             }
             return base
         }
