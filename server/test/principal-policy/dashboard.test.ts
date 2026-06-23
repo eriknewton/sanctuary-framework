@@ -128,6 +128,43 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── /api/readiness supervisor bridge (brief D3, Fix 1) ───────────────
+  // The principal-policy dashboard CAN run Protect: it routes through the
+  // supervisor bridge, and an absent bridge means Protect fails closed with
+  // 503. So `supervisor` must report the REAL bridge state - "unwired" when
+  // null (the production reality today, since setSupervisorBridge is not yet
+  // called in production), "wired" once a bridge is bound. It must never mask
+  // an absent bridge as "n/a" here, because absence guarantees a 503.
+  describe("/api/readiness supervisor signal", () => {
+    it("reports supervisor=unwired when no bridge is bound (Protect would 503)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.supervisor).toBe("unwired");
+      // It must NOT mask the absent bridge as "n/a": absence => 503.
+      expect(body.supervisor).not.toBe("n/a");
+    });
+
+    it("reports supervisor=wired once a bridge is bound via setSupervisorBridge", async () => {
+      // The readiness handler only checks the bridge for presence (truthiness);
+      // it never calls into it for the readiness value, so a bare stub is
+      // sufficient ground truth for "a bridge is bound".
+      const stubBridge = {
+        launchProtect: async () => ({ ok: false }),
+      } as unknown as Parameters<typeof dashboard.setSupervisorBridge>[0];
+      dashboard.setSupervisorBridge(stubBridge);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.supervisor).toBe("wired");
+      } finally {
+        // Detach so we don't leak the stub into sibling tests.
+        dashboard.setSupervisorBridge(null);
+      }
+    });
+  });
+
   // ── Approval Flow ────────────────────────────────────────────────────
 
   describe("Approval Flow", () => {
@@ -374,6 +411,56 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
+    });
+
+    // ── /api/readiness (auth-gated, brief D3) ─────────────────────────
+    it("rejects /api/readiness without an auth token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      // It must not leak readiness in the unauthorized body.
+      expect(data.ready).toBeUndefined();
+      expect(data.supervisor).toBeUndefined();
+    });
+
+    it("rejects /api/readiness with a same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${wrongToken}` },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it("returns { ready, supervisor } with a valid bearer token (locked by default)", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(Object.keys(data).sort()).toEqual(["ready", "supervisor"]);
+      // No identity manager wired on this rig -> honest "locked". No supervisor
+      // bridge bound on this rig -> honest "unwired" (the principal-policy
+      // dashboard CAN run Protect, so an absent bridge guarantees a Protect 503;
+      // masking that as "n/a" would be dishonest, brief Fix 1).
+      expect(data.ready).toBe("locked");
+      expect(data.supervisor).toBe("unwired");
+    });
+
+    it("reports ready=serving once an identity manager is wired (unlocked)", async () => {
+      authDashboard.setDependencies({
+        policy: {} as never,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: {} as never,
+        identityManager: {} as never,
+      });
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ready).toBe("serving");
+      // Still no supervisor bridge bound -> honest "unwired" (see above).
+      expect(data.supervisor).toBe("unwired");
     });
 
     it("includes approval_redirect mode in /api/status for folded approval routing", async () => {
@@ -974,6 +1061,9 @@ describe("Principal Dashboard", () => {
       const data = await res.json();
       expect(data.ok).toBe(true);
       expect(data.mode).toBe("principal-policy");
+      // brief D3: opaque restart-detection signal is present.
+      expect(typeof data.instance).toBe("string");
+      expect(typeof data.since).toBe("number");
     });
 
     it("/api/health has no-store cache header (XXXXX)", async () => {
@@ -1098,19 +1188,27 @@ describe("Principal Dashboard", () => {
     // is reverted: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
     // ONLY. The honest arm-state lives behind auth (`/api/posture/castle-wall`,
     // `/v1/status`), never here.
-    it("returns ONLY { ok, mode } — no castle_wall, no posture telemetry", async () => {
+    it("returns ONLY { ok, mode, instance, since } — no castle_wall, no posture, no readiness", async () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.ok).toBe(true);
       expect(data.mode).toBe("principal-policy");
+      // brief D3: the opaque restart-detection signal is allowed (instance is a
+      // per-boot id, since is the process start time - neither is state).
+      expect(typeof data.instance).toBe("string");
+      expect(typeof data.since).toBe("number");
       // The detailed posture (and the fields that would leak operator identity
       // or enforcement telemetry) must NOT be on the unauthenticated probe.
       expect(data.castle_wall).toBeUndefined();
       expect(data.arm_state).toBeUndefined();
       expect(data.origin_machine).toBeUndefined();
       expect(data.verdict_counts).toBeUndefined();
-      expect(Object.keys(data).sort()).toEqual(["mode", "ok"]);
+      // brief HIGH-1: readiness/supervisor MUST NOT appear on the unauthenticated
+      // probe - those are a co-resident-agent oracle and live only behind auth.
+      expect(data.ready).toBeUndefined();
+      expect(data.supervisor).toBeUndefined();
+      expect(Object.keys(data).sort()).toEqual(["instance", "mode", "ok", "since"]);
     });
 
     it("/api/health keeps its no-store cache header", async () => {
