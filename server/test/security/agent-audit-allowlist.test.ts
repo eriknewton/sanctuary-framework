@@ -887,7 +887,46 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
   // agent-audit-redaction.ts header they MUST NOT use the agent redaction. Listed
   // explicitly so that adding a NEW audit reader forces a conscious classification
   // (asserted by the auto-discovery closure test below).
-  const OPERATOR_INTERNAL_AUDIT_READS = [
+  // OPERATOR-POSTURE sub-bucket (carved out of OPERATOR_INTERNAL below).
+  // ------------------------------------------------------------------------
+  // The modules whose `auditLog.query` reads compose the always-on OPERATOR
+  // posture surface (dashboard home board, the /v1/status + hero-shield arm
+  // badge, feature-health, the protection snapshot, query-privacy stats). These
+  // are the high-frequency / SSE-reachable reads that, on a real long-lived
+  // fortress (10k entries / 40MB), turned an honest full-chain re-verify into an
+  // 11-30s wedge per poll (the #714 incident). #717/#719/#721 fixed it by
+  // serving those reads from the audit log's eagerly-maintained verified view
+  // (an `runEagerReads`/`queryEager` scope) which is O(1) and STILL honest
+  // (fingerprint sentinel + 30s backstop catch out-of-band tamper). That fix is
+  // OPT-IN per call site, so the same defect recurred three times in three code
+  // paths. This sub-bucket + the EAGER-SCOPE ASSERTION below is the chokepoint
+  // that ends the whack-a-mole: a posture-module `auditLog.query` that is not
+  // eager-scoped (and not on the conscious per-call escape registry) REDS CI.
+  //
+  // This enforces an ALREADY-established honesty boundary; it does NOT change it.
+  // It NEVER pushes the agent-facing reads (in the allowlist / non-entry buckets)
+  // into eager mode: those keep their per-request on-disk re-verify. The split is
+  // ENTRY-POINTS (open the eager scope directly) vs caller-wrapped BUILDERS (the
+  // shaper functions whose internal `query` runs inside the entry point's scope).
+  const OPERATOR_POSTURE_AUDIT_READS = [
+    // entry points: open the eager scope (or carry a conscious per-request escape)
+    "dashboard/aggregator.ts",
+    "principal-policy/dashboard.ts",
+    "principal-policy/posture-routes.ts",
+    // caller-wrapped builders: their internal `query` runs inside the entry
+    // point's `runEagerReads` scope (asserted caller-wrapped via the registry +
+    // the builder-marker guard below). They are NOT entry points; they never open
+    // the scope themselves.
+    "principal-policy/posture.ts",
+    "principal-policy/feature-health.ts",
+    "query-anonymity/query-anonymity-routes.ts",
+  ] as const;
+
+  // Operator / internal / principal audit reads that legitimately see FULL
+  // fidelity AND are NOT on the high-frequency posture surface (batch reads, CLI,
+  // background analyzers, the per-request activity feed) where the eager view is
+  // not the relevant cost lever. Kept per-request by design.
+  const OPERATOR_NON_POSTURE_AUDIT_READS = [
     // anomaly detection — internal scoring over the audit stream
     "anomaly-detection/detectors/audit-event-class-distribution-detector.ts",
     "anomaly-detection/feature-extractors/audit-event-class-distribution.ts",
@@ -901,14 +940,14 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "sentinel/sentinels/cross-agent-chatter-watcher.ts",
     "sentinel/sentinels/egress-volume-watcher.ts",
     "sentinel/sentinels/suspicious-tool-call-detector.ts",
-    // operator dashboards / hub / activity feed — human-facing HTTP surfaces
-    "dashboard/aggregator.ts",
+    // operator dashboards - human-facing HTTP surfaces
     "dashboard/v1_1/wiring.ts",
+    // operator activity feed: per-message, identity-filtered projection. Bursty
+    // but NOT the 5s SSE posture cadence, so deliberately kept per-request (the
+    // narrow scoping per the design doc's open-question 3: start narrow). Its
+    // honest on-disk tamper detection on every read is the safe default.
     "hub/activity-feed.ts",
-    "principal-policy/dashboard.ts",
     "principal-policy/approval-aggregator.ts",
-    "principal-policy/feature-health.ts",
-    "principal-policy/posture.ts",
     "principal-policy/unified-inbox-producers.ts",
     // operator CLI
     "cli/audit.ts",
@@ -920,14 +959,21 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "concierge/sanctuary-context-reader.ts",
     // cross-agent coordination handoff log — internal
     "coordination/handoff-log.ts",
-    // query-anonymity routes — operator analytics
-    "query-anonymity/query-anonymity-routes.ts",
-    // posture routes — operator/principal Evidence View (Phase 2 section 2.5):
-    // the filterable audit-entry table at /api/posture/evidence.  Full-fidelity
-    // read behind the SAME checkAuth gate as /api/audit-log; never agent-facing.
-    "principal-policy/posture-routes.ts",
     // principal Exit bundle — full-fidelity receipts, Tier-1 approval-gated
     "exit/bundle.ts",
+  ] as const;
+
+  // The full operator/internal set (posture + non-posture) - preserves the
+  // closure + disjointness contract the auto-discovery test relies on. NONE is
+  // reachable by an agent calling an MCP tool: they are internal analyzers, CLI
+  // commands, the human operator's HTTP dashboard/hub routes, cross-agent
+  // coordination internals, or the principal's own Tier-1-approval-gated Exit
+  // export. Per the agent-audit-redaction.ts header they MUST NOT use the agent
+  // redaction. Listed explicitly so that adding a NEW audit reader forces a
+  // conscious classification (asserted by the auto-discovery closure test below).
+  const OPERATOR_INTERNAL_AUDIT_READS = [
+    ...OPERATOR_POSTURE_AUDIT_READS,
+    ...OPERATOR_NON_POSTURE_AUDIT_READS,
   ] as const;
 
   // ── AUTO-DISCOVERY ──────────────────────────────────────────────────────
@@ -987,6 +1033,316 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     walkDir(SERVER_SRC);
     return [...found].sort();
   }
+
+  // ── EAGER-POSTURE CHOKEPOINT: per-call-site discovery ────────────────────
+  // The module-level discovery above answers "which files read the audit log".
+  // The chokepoint needs finer grain: for each `auditLog.query` CALL SITE in a
+  // posture module, is it lexically inside an `runEagerReads`/`queryEager` scope,
+  // and what function encloses it (so the conscious per-call escape registry can
+  // be keyed by a stable function name, not a drifting line number)?
+  interface PostureQuerySite {
+    module: string;
+    fn: string;
+    line: number;
+    eagerContained: boolean;
+  }
+
+  function discoverPostureQuerySites(modules: readonly string[]): PostureQuerySite[] {
+    const sites: PostureQuerySite[] = [];
+    const isAuditLogReceiver = (expr: ts.Expression): boolean => {
+      if (ts.isIdentifier(expr)) return expr.text === "auditLog";
+      if (ts.isPropertyAccessExpression(expr)) return expr.name.text === "auditLog";
+      return false;
+    };
+    // CANONICAL POSTURE ENTRY: a `query` is "eager-contained" iff a lexical
+    // ancestor in the SAME source file is a call to `runEagerReads` or
+    // `queryEager` on an auditLog-shaped receiver. These two are blessed as THE
+    // operator-posture entry API (no new symbol; fewer surfaces, per the design
+    // doc's open-question 2). A bare `query` outside such a scope is the wedge.
+    const isEagerEntry = (call: ts.CallExpression): boolean => {
+      if (!ts.isPropertyAccessExpression(call.expression)) return false;
+      const m = call.expression.name.text;
+      return m === "runEagerReads" || m === "queryEager";
+    };
+    const enclosingFnName = (node: ts.Node): string => {
+      let p: ts.Node | undefined = node.parent;
+      while (p) {
+        if (ts.isFunctionDeclaration(p) && p.name) return p.name.text;
+        if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) return p.name.text;
+        if (
+          (ts.isFunctionExpression(p) || ts.isArrowFunction(p)) &&
+          ts.isVariableDeclaration(p.parent) &&
+          ts.isIdentifier(p.parent.name)
+        ) {
+          return p.parent.name.text;
+        }
+        p = p.parent;
+      }
+      return "(module-scope)";
+    };
+    for (const mod of modules) {
+      const abs = join(SERVER_SRC, ...mod.split("/"));
+      const source = readFileSync(abs, "utf8");
+      const sf = ts.createSourceFile(
+        abs,
+        source,
+        ts.ScriptTarget.Latest,
+        /*setParentNodes*/ true
+      );
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          node.expression.name.text === "query" &&
+          isAuditLogReceiver(node.expression.expression)
+        ) {
+          let eager = false;
+          let anc: ts.Node | undefined = node.parent;
+          while (anc) {
+            if (ts.isCallExpression(anc) && isEagerEntry(anc)) {
+              eager = true;
+              break;
+            }
+            anc = anc.parent;
+          }
+          const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+          sites.push({
+            module: mod,
+            fn: enclosingFnName(node),
+            line: line + 1,
+            eagerContained: eager,
+          });
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    return sites;
+  }
+
+  // CONSCIOUS PER-CALL ESCAPE REGISTRY. A posture-module `auditLog.query` that is
+  // NOT lexically eager-contained is permitted ONLY if its enclosing function is
+  // registered here with a reason. This makes "I chose NOT to be eager" (or "my
+  // caller opens the scope") a reviewed, named act, never an accident. A NEW bare
+  // posture query whose function is absent here REDS the build - the chokepoint.
+  //
+  // kind:
+  //   "caller-wrapped-builder"   - shaper whose internal `query` runs inside the
+  //        entry point's `runEagerReads` scope (the AsyncLocalStorage scope is
+  //        opened one frame up; a lexical check cannot see it). The caller-wraps
+  //        proof below ties this to a real entry point that wraps the builder.
+  //   "operator-per-request"     - a deliberately per-request operator read
+  //        (honest immediate on-disk tamper detection is the chosen default).
+  //   "agent-facing-per-request" - an AGENT-facing read that MUST stay
+  //        per-request (the honesty boundary; never pushed into eager mode).
+  const POSTURE_QUERY_ESCAPES: ReadonlyArray<{
+    module: string;
+    fn: string;
+    kind:
+      | "caller-wrapped-builder"
+      | "operator-per-request"
+      | "agent-facing-per-request";
+    reason: string;
+  }> = [
+    // Builders: the entry points (posture-routes home builders, the dashboard
+    // /v1/status badge, the aggregator hero shield) wrap these in runEagerReads,
+    // so their internal query reads the eager view at runtime. (#717/#719/#721.)
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildCastleWallPosture",
+      kind: "caller-wrapped-builder",
+      reason:
+        "arm-state shaper; callers (posture-routes buildWallPosture, dashboard buildStatusCastleWall, aggregator hero shield) open the eager scope.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildAuditDigest",
+      kind: "caller-wrapped-builder",
+      reason: "audit-digest shaper; posture-routes buildDigest opens the eager scope.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildCustodyExitPanel",
+      kind: "caller-wrapped-builder",
+      reason: "custody-exit shaper; posture-routes buildCustodyExit opens the eager scope.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildRecognitionPanel",
+      kind: "caller-wrapped-builder",
+      reason: "recognition shaper; posture-routes buildRecognition opens the eager scope.",
+    },
+    {
+      module: "principal-policy/feature-health.ts",
+      fn: "buildFeatureHealthPanel",
+      kind: "caller-wrapped-builder",
+      reason: "feature-health shaper; posture-routes buildFeatureHealth opens the eager scope.",
+    },
+    {
+      module: "query-anonymity/query-anonymity-routes.ts",
+      fn: "computeQueryAnonymityStats",
+      kind: "caller-wrapped-builder",
+      reason:
+        "query-privacy stats shaper; posture-routes buildQueryPrivacy opens the eager scope (the operator query-anonymity route is a low-frequency batch read).",
+    },
+    // Deliberate per-request operator read (OPEN QUESTION for Erik): the legacy
+    // dashboard raw audit JSON listing. Treated like the inspectable evidence
+    // surface (keep immediate on-disk tamper detection), NOT made eager. Confirm.
+    {
+      module: "principal-policy/dashboard.ts",
+      fn: "handleAuditLog",
+      kind: "operator-per-request",
+      reason:
+        "legacy /api/audit-log raw listing: inspectable surface kept per-request by design pending Erik's confirm (honest default; not the SSE hot path).",
+    },
+    // Agent-facing read on the posture-routes module: /api/posture/evidence. The
+    // HONESTY BOUNDARY - must stay per-request fully re-verified. NEVER eager.
+    {
+      module: "principal-policy/posture-routes.ts",
+      fn: "buildEvidence",
+      kind: "agent-facing-per-request",
+      reason:
+        "/api/posture/evidence inspectable audit surface: per-request on-disk tamper detection is the honesty contract; must never be pushed into eager mode.",
+    },
+  ];
+
+  it("EAGER-POSTURE CHOKEPOINT: every operator-posture audit read is eager-scoped or a registered conscious per-request escape", () => {
+    const sites = discoverPostureQuerySites(OPERATOR_POSTURE_AUDIT_READS);
+
+    // Sanity: the walk actually found posture query sites (guards a vacuous
+    // green if a refactor moved every read out of these modules).
+    expect(
+      sites.length,
+      "no auditLog.query sites found in the posture modules - the call-site walk is broken or the modules moved"
+    ).toBeGreaterThanOrEqual(OPERATOR_POSTURE_AUDIT_READS.length);
+
+    const escapeFor = (s: PostureQuerySite) =>
+      POSTURE_QUERY_ESCAPES.find((e) => e.module === s.module && e.fn === s.fn);
+
+    // THE TEETH: a posture-module query that is neither eager-contained nor on
+    // the conscious escape registry is a bare operator-posture read - exactly the
+    // 11-30s wedge the chokepoint exists to forbid.
+    const violations = sites
+      .filter((s) => !s.eagerContained && !escapeFor(s))
+      .map(
+        (s) =>
+          `${s.module}:${s.line} (${s.fn}) - bare auditLog.query outside an ` +
+          `runEagerReads/queryEager scope. Wrap the read in the eager scope, or, ` +
+          `if it is deliberately per-request (operator-inspectable or agent-facing), ` +
+          `register the function in POSTURE_QUERY_ESCAPES with a reason.`
+      );
+    expect(violations, violations.join("\n")).toEqual([]);
+
+    // NO STALE ESCAPES: every registered escape must match a real, currently
+    // NON-eager-contained query site. If a builder is refactored to wrap its own
+    // read (becoming eager-contained), or a function is renamed/removed, its
+    // escape goes stale and must be pruned - otherwise the registry rots and a
+    // future bare read could hide behind a dead entry.
+    const liveNonEager = sites.filter((s) => !s.eagerContained);
+    const staleEscapes = POSTURE_QUERY_ESCAPES.filter(
+      (e) => !liveNonEager.some((s) => s.module === e.module && s.fn === e.fn)
+    ).map((e) => `${e.module} (${e.fn})`);
+    expect(
+      staleEscapes,
+      `Stale POSTURE_QUERY_ESCAPES entr(ies) - the function no longer has a ` +
+        `non-eager auditLog.query (renamed, removed, or now eager-wrapped). ` +
+        `Remove: ${staleEscapes.join(", ")}`
+    ).toEqual([]);
+
+    // The honesty boundary, pinned: at least one site IS genuinely eager-contained
+    // (proves the eager-detection arm is not vacuously passing every site via the
+    // escape registry). #721 wrapped the aggregator snapshot listing read.
+    expect(
+      sites.some((s) => s.eagerContained),
+      "no eager-contained posture query site found - the eager-detection arm may be broken (expected at least the #721 aggregator snapshot listing read)"
+    ).toBe(true);
+  });
+
+  it("EAGER-POSTURE CHOKEPOINT: each caller-wrapped builder is actually wrapped in an eager scope by a posture entry point", () => {
+    // The "caller-wrapped-builder" escape asserts the eager scope is opened one
+    // frame up (in AsyncLocalStorage), invisible to the builder's own lexical
+    // check. Pin that contract to REAL SOURCE, not a doc-comment: each such
+    // builder function name must appear lexically inside an
+    // `runEagerReads`/`queryEager` call in at least one ENTRY-POINT posture module
+    // (the modules that open the scope). So a builder whose every caller drops the
+    // eager wrap (re-introducing the wedge) reds HERE - the escape can no longer
+    // be claimed once no entry point actually wraps it.
+    const ENTRY_POINT_MODULES = [
+      "principal-policy/posture-routes.ts",
+      "principal-policy/dashboard.ts",
+      "dashboard/aggregator.ts",
+    ] as const;
+
+    // Collect, per entry-point module, the set of identifier names that appear
+    // lexically inside any `runEagerReads(...)` / `queryEager(...)` call.
+    const wrappedBuilderNames = new Set<string>();
+    for (const mod of ENTRY_POINT_MODULES) {
+      const abs = join(SERVER_SRC, ...mod.split("/"));
+      const sf = ts.createSourceFile(
+        abs,
+        readFileSync(abs, "utf8"),
+        ts.ScriptTarget.Latest,
+        /*setParentNodes*/ false
+      );
+      const collectIdentifiers = (node: ts.Node) => {
+        if (ts.isIdentifier(node)) wrappedBuilderNames.add(node.text);
+        ts.forEachChild(node, collectIdentifiers);
+      };
+      const visit = (node: ts.Node) => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          (node.expression.name.text === "runEagerReads" ||
+            node.expression.name.text === "queryEager")
+        ) {
+          // Walk the eager-call body (its argument closure) collecting every
+          // identifier referenced inside the scope.
+          for (const arg of node.arguments) collectIdentifiers(arg);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+
+    const builderFns = POSTURE_QUERY_ESCAPES.filter(
+      (e) => e.kind === "caller-wrapped-builder"
+    );
+    const unwrapped = builderFns
+      .filter((e) => !wrappedBuilderNames.has(e.fn))
+      .map(
+        (e) =>
+          `${e.module} (${e.fn}) - no posture entry point wraps a call to ` +
+          `${e.fn} in runEagerReads/queryEager. Either an entry point must open ` +
+          `the eager scope around it, or this builder's read must be made eager ` +
+          `directly and the escape removed.`
+      );
+    expect(unwrapped, unwrapped.join("\n")).toEqual([]);
+  });
+
+  it("EAGER-POSTURE CHOKEPOINT: agent-facing reads are NEVER required to be eager (honesty boundary preserved)", () => {
+    // Structural proof the chokepoint does not bleed across the honesty boundary:
+    // the eager assertion runs ONLY over OPERATOR_POSTURE_AUDIT_READS, and that
+    // set must be disjoint from the agent-facing buckets. So no agent-facing read
+    // is ever asked to become eager; they keep their per-request re-verify.
+    const posture = new Set<string>(OPERATOR_POSTURE_AUDIT_READS);
+    const agentFacing = [
+      ...AGENT_FACING_AUDIT_READ_MODULES,
+      ...AGENT_FACING_NON_ENTRY_AUDIT_READS,
+    ];
+    const crossed = agentFacing.filter((m) => posture.has(m));
+    expect(
+      crossed,
+      `agent-facing audit-read module(s) leaked into the operator-posture eager ` +
+        `bucket: ${crossed.join(", ")}. Agent reads must stay per-request re-verified.`
+    ).toEqual([]);
+    // And the lone agent-facing read that lives ON a posture module
+    // (posture-routes buildEvidence) is registered as agent-facing-per-request,
+    // never asked to be eager.
+    const evidenceEscape = POSTURE_QUERY_ESCAPES.find(
+      (e) => e.fn === "buildEvidence"
+    );
+    expect(evidenceEscape?.kind).toBe("agent-facing-per-request");
+  });
 
   it("every agent-facing audit-read module imports the allowlist projection", () => {
     for (const mod of AGENT_FACING_AUDIT_READ_MODULES) {
