@@ -11,6 +11,8 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   producerSigningBytes,
   verifyProducerSignature,
+  fromBase64url,
+  toBase64url,
   type ProducerSignatureInput,
 } from "../../../src/castle-wall/runtime/producer-signature.js";
 import {
@@ -161,5 +163,127 @@ describe("castle-wall producer-signature : verifyProducerSignature", () => {
       keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
     };
     expect(verifyProducerSignature(input, pubB64).ok).toBe(false);
+  });
+});
+
+describe("castle-wall producer-signature : fromBase64url ReDoS hardening", () => {
+  // CodeQL js/polynomial-redos flagged the old `.replace(/=+$/, "")` strip:
+  // the signature blob fed to fromBase64url is, by this module's threat model,
+  // untrusted material being verified, and was decoded BEFORE any length check.
+  // A long run of '=' followed by a non-'=' char drove the regex into O(n^2)
+  // backtracking. The strip is now a linear reverse scan.
+
+  it("decodes a pathological all-'=' input in bounded (linear) time", () => {
+    // A 2,000,000-char run of '=' followed by a non-'=' char is the exact
+    // shape that drove the old `=+$` regex super-linear (it took multiple
+    // SECONDS at only 160k chars). The linear strip handles it in well under
+    // the generous bound below; the value is then rejected on length by the
+    // verifier, never accepted as a signature.
+    const pathological = "=".repeat(2_000_000) + "x";
+    const start = performance.now();
+    // Decoding malformed base64 throws (atob on invalid input); either way the
+    // call must RETURN/THROW quickly, not hang. We only assert it is bounded.
+    try {
+      fromBase64url(pathological);
+    } catch {
+      // expected for malformed base64 — the point is it completed fast.
+    }
+    const elapsedMs = performance.now() - start;
+    // The old regex was ~9s at 160k chars (O(n^2)); at 2M chars it would be
+    // wall-clock-infeasible. A linear scan finishes in single-digit ms. 1000ms
+    // is a wide margin that still fails loudly if super-linear behavior returns.
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it("verifyProducerSignature rejects an oversized signature blob in bounded time", () => {
+    const { pubB64 } = freshKeypair();
+    const input: ProducerSignatureInput = {
+      eventCanonicalJson: CANONICAL,
+      capturedAtUnixMs: 1,
+      seq: 7,
+      // Attacker-shaped: a giant trailing-'=' run is the ReDoS payload. It must
+      // fail closed (wrong length) quickly, never wedge the verifier.
+      signatureB64url: "A" + "=".repeat(2_000_000),
+      keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    };
+    const start = performance.now();
+    const verdict = verifyProducerSignature(input, pubB64);
+    const elapsedMs = performance.now() - start;
+    expect(verdict.ok).toBe(false);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it("preserves exact decode behavior for valid signatures (no regression)", () => {
+    // Round-trip every byte value through a real 64-byte Ed25519 signature so a
+    // behavior change in the strip/padding path would surface as a mismatch.
+    const { priv } = freshKeypair();
+    const sigB64 = signEvent(priv, CANONICAL, 100, 7);
+    const decoded = fromBase64url(sigB64);
+    expect(decoded.length).toBe(64);
+    // Re-encoding the decoded bytes reproduces the canonical base64url-no-pad
+    // string: round-trip is identity for legitimate inputs.
+    expect(toBase64url(decoded)).toBe(sigB64);
+  });
+
+  it("strips only the TRAILING '=' run, exactly like the prior regex", () => {
+    // Trailing padding is tolerated and recomputed; embedded chars are intact.
+    // 'AAAA' decodes to three zero bytes; trailing '=' must not change that.
+    expect(Array.from(fromBase64url("AAAA"))).toEqual([0, 0, 0]);
+    expect(Array.from(fromBase64url("AAAA=="))).toEqual([0, 0, 0]);
+    // A genuine signature with explicit padding decodes identically to no-pad.
+    const { priv } = freshKeypair();
+    const sigNoPad = signEvent(priv, CANONICAL, 1, 1);
+    const padded = sigNoPad + "=".repeat((4 - (sigNoPad.length % 4)) % 4);
+    expect(Array.from(fromBase64url(padded))).toEqual(
+      Array.from(fromBase64url(sigNoPad))
+    );
+  });
+});
+
+describe("castle-wall producer-signature : early signature-length bound", () => {
+  // Defense-in-depth (review LOW): verifyProducerSignature bounds the
+  // attacker-controlled signatureB64url BEFORE fromBase64url allocates, so a
+  // large valid-base64 blob over daemon IPC is rejected without decoding ~3/4
+  // its length into memory. The bound (128 chars) sits clearly above any real
+  // 64-byte Ed25519 signature (88 padded / 86 unpadded base64url chars), so it
+  // can reject no legitimate signature.
+
+  it("rejects an oversized blob WITHOUT decoding it (fail-closed, bounded)", () => {
+    const { pubB64 } = freshKeypair();
+    // 200k chars of VALID base64 (not a trailing-'=' run): if the bound were
+    // absent, fromBase64url would allocate ~150kB before the length check. With
+    // the bound it is rejected on string length, never decoded.
+    const oversized = "A".repeat(200_000);
+    const input: ProducerSignatureInput = {
+      eventCanonicalJson: CANONICAL,
+      capturedAtUnixMs: 1,
+      seq: 7,
+      signatureB64url: oversized,
+      keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    };
+    const start = performance.now();
+    const verdict = verifyProducerSignature(input, pubB64);
+    const elapsedMs = performance.now() - start;
+    expect(verdict).toEqual({
+      ok: false,
+      reason: "producer_signature_wrong_length",
+    });
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it("admits a real signature (<=88 chars): the bound rejects no valid sig", () => {
+    const { priv, pubB64 } = freshKeypair();
+    const sigB64 = signEvent(priv, CANONICAL, 1718000000000, 7);
+    // A genuine 64-byte Ed25519 signature base64url-no-pads to 86 chars, well
+    // under the 128 ceiling. It must still verify.
+    expect(sigB64.length).toBeLessThanOrEqual(88);
+    const input: ProducerSignatureInput = {
+      eventCanonicalJson: CANONICAL,
+      capturedAtUnixMs: 1718000000000,
+      seq: 7,
+      signatureB64url: sigB64,
+      keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    };
+    expect(verifyProducerSignature(input, pubB64)).toEqual({ ok: true });
   });
 });
