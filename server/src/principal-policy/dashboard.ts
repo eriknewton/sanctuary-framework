@@ -2635,8 +2635,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // (checkAuth: bearer token, session, or loopback auto-auth). It reports
     // readiness, never posture - "serving" means unlocked + read surface
     // live, NOT "your agents are protected" (that stays on the evidence-gated
-    // /api/posture/castle-wall). The agent-supervisor bridge wiring is Slice 3
-    // and is NOT built here, so `supervisor` is the honest "n/a".
+    // /api/posture/castle-wall).
+    //
+    // `supervisor` reports the REAL bridge state, not a mask. This dashboard
+    // CAN run Protect: protect routes through `this.supervisorBridge`
+    // (launchProtect), and when that bridge is null Protect fails closed with
+    // 503 (see buildV1Bindings). So an absent bridge is not "not applicable"
+    // here - it GUARANTEES a 503 - and the honest signal is "unwired", never
+    // "n/a". The bridge is wired post-unlock via setSupervisorBridge(); until
+    // then "unwired" tells the host app Protect will 503. (setSupervisorBridge
+    // is not called in production yet, so today this honestly reports
+    // "unwired".)
     if (method === "GET" && url.pathname === "/api/readiness") {
       if (!this.checkRateLimit(req, res, "general")) return;
       if (!this.checkAuth(req, url, res)) return;
@@ -2647,7 +2656,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       res.end(
         JSON.stringify({
           ready: this.identityManager ? "serving" : "locked",
-          supervisor: "n/a",
+          supervisor: this.supervisorBridge ? "wired" : "unwired",
         }),
       );
       return;

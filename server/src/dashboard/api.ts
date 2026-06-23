@@ -91,11 +91,14 @@ export interface APIDeps {
   readiness?: () => "locked" | "serving";
   /**
    * Honest Consumer-A agent-supervisor bridge readiness for
-   * `/api/readiness`. Returns "wired" / "unwired" / "n/a". The bridge
-   * wiring is Slice 3 of the hardening brief and is NOT built in this
-   * slice, so the honest default is "n/a" (not applicable in this mode
-   * yet) until a server supplies a real provider. NEVER exposed on
-   * `/api/health`.
+   * `/api/readiness`. Returns "wired" / "unwired" / "n/a". When a provider
+   * is supplied it reports the REAL bridge state ("wired"/"unwired"). When
+   * omitted, the honest default is "n/a" - and that is truthful here because
+   * this api.ts dashboard is a read-only aggregator with NO Protect launch
+   * route, so an absent bridge does NOT guarantee a 503 in this mode. (The
+   * principal-policy dashboard, by contrast, DOES route Protect through its
+   * bridge, so there an absent bridge => 503 and the honest value is
+   * "unwired", never "n/a".) NEVER exposed on `/api/health`.
    */
   supervisorStatus?: () => "wired" | "unwired" | "n/a";
 }
@@ -351,6 +354,14 @@ export async function handleRequest(
       : deps.sources.identityManager
         ? "serving"
         : "locked";
+    // `supervisor` reports the REAL bridge state when a provider is supplied
+    // ("wired"/"unwired"). "n/a" is honest ONLY here because this co-located /
+    // unified read-aggregator dashboard has NO Protect launch route at all
+    // (no launchProtect; getProtectionSnapshot is the read-only posture view,
+    // not Protect execution). A missing bridge therefore does NOT guarantee a
+    // 503 in this mode, so "not applicable" is the truthful default - unlike
+    // the principal-policy dashboard, where an absent bridge guarantees a
+    // Protect 503 and the honest value is "unwired".
     const supervisor = deps.supervisorStatus ? deps.supervisorStatus() : "n/a";
     writeJSON(res, 200, { ready, supervisor });
     return true;

@@ -128,6 +128,43 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── /api/readiness supervisor bridge (brief D3, Fix 1) ───────────────
+  // The principal-policy dashboard CAN run Protect: it routes through the
+  // supervisor bridge, and an absent bridge means Protect fails closed with
+  // 503. So `supervisor` must report the REAL bridge state - "unwired" when
+  // null (the production reality today, since setSupervisorBridge is not yet
+  // called in production), "wired" once a bridge is bound. It must never mask
+  // an absent bridge as "n/a" here, because absence guarantees a 503.
+  describe("/api/readiness supervisor signal", () => {
+    it("reports supervisor=unwired when no bridge is bound (Protect would 503)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.supervisor).toBe("unwired");
+      // It must NOT mask the absent bridge as "n/a": absence => 503.
+      expect(body.supervisor).not.toBe("n/a");
+    });
+
+    it("reports supervisor=wired once a bridge is bound via setSupervisorBridge", async () => {
+      // The readiness handler only checks the bridge for presence (truthiness);
+      // it never calls into it for the readiness value, so a bare stub is
+      // sufficient ground truth for "a bridge is bound".
+      const stubBridge = {
+        launchProtect: async () => ({ ok: false }),
+      } as unknown as Parameters<typeof dashboard.setSupervisorBridge>[0];
+      dashboard.setSupervisorBridge(stubBridge);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.supervisor).toBe("wired");
+      } finally {
+        // Detach so we don't leak the stub into sibling tests.
+        dashboard.setSupervisorBridge(null);
+      }
+    });
+  });
+
   // ── Approval Flow ────────────────────────────────────────────────────
 
   describe("Approval Flow", () => {
@@ -401,10 +438,12 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(Object.keys(data).sort()).toEqual(["ready", "supervisor"]);
-      // No identity manager wired on this rig -> honest "locked". Slice 3
-      // (agent-supervisor bridge) is not built here -> honest "n/a".
+      // No identity manager wired on this rig -> honest "locked". No supervisor
+      // bridge bound on this rig -> honest "unwired" (the principal-policy
+      // dashboard CAN run Protect, so an absent bridge guarantees a Protect 503;
+      // masking that as "n/a" would be dishonest, brief Fix 1).
       expect(data.ready).toBe("locked");
-      expect(data.supervisor).toBe("n/a");
+      expect(data.supervisor).toBe("unwired");
     });
 
     it("reports ready=serving once an identity manager is wired (unlocked)", async () => {
@@ -420,7 +459,8 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.ready).toBe("serving");
-      expect(data.supervisor).toBe("n/a");
+      // Still no supervisor bridge bound -> honest "unwired" (see above).
+      expect(data.supervisor).toBe("unwired");
     });
 
     it("includes approval_redirect mode in /api/status for folded approval routing", async () => {

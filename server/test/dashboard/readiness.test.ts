@@ -17,7 +17,7 @@
  * Ports are OS-assigned via port: 0 (Sigma rule option 1, collision-proof).
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { startDashboardServer } from "../../src/dashboard/server.js";
 import type { DashboardHandle } from "../../src/dashboard/server.js";
 import type { AggregatorSources } from "../../src/dashboard/aggregator.js";
@@ -119,8 +119,12 @@ describe("/api/readiness (auth-gated, brief D3)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ready).toBe("locked");
-    // Slice 3 (agent-supervisor bridge wiring) is NOT built here, so the
-    // honest supervisor value is "n/a".
+    // "n/a" is honest in THIS mode: the co-located/unified read-aggregator
+    // dashboard has NO Protect launch route at all, so an absent supervisor
+    // bridge does NOT guarantee a 503 here (unlike the principal-policy
+    // dashboard, where absence => 503 and the honest value is "unwired" -
+    // covered in test/principal-policy/dashboard.test.ts). No supervisorStatus
+    // provider is supplied to this rig, so the truthful default is "n/a".
     expect(body.supervisor).toBe("n/a");
   });
 
@@ -135,6 +139,8 @@ describe("/api/readiness (auth-gated, brief D3)", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ready).toBe("serving");
+    // Honest "n/a" for the read-aggregator mode (no Protect launch route);
+    // see the locked-case comment above.
     expect(body.supervisor).toBe("n/a");
   });
 
@@ -173,6 +179,28 @@ describe("/api/readiness (auth-gated, brief D3)", () => {
     // value, so the wire id equals the in-process accessor.
     expect(a.instance).toBe(getProcessInstance());
     expect(a.since).toBe(getProcessSince());
+  });
+
+  it("instance CHANGES across a restart (the whole point of restart detection)", async () => {
+    // A restart loads process-identity fresh in a NEW process, minting a NEW
+    // boot id. vi.resetModules() drops the module cache so a re-import re-runs
+    // module init - the closest in-test simulation of a process relaunch. If
+    // the id did NOT change here, restart detection (the host app's
+    // Reconnecting -> Live transition) would be silently broken.
+    const first = getProcessInstance();
+
+    vi.resetModules();
+    const reloaded = await import("../../src/dashboard/process-identity.js");
+    const second = reloaded.getProcessInstance();
+
+    expect(second).not.toBe(first);
+    // Both are still well-formed opaque ids (not empty / degenerate).
+    expect(typeof second).toBe("string");
+    expect(second.length).toBe(first.length);
+    expect(second.length).toBeGreaterThan(0);
+
+    // Restore the module registry so sibling suites see the original module.
+    vi.resetModules();
   });
 
   it("multi-tenant dashboard is EXCLUDED from /api/readiness but still emits instance/since on /api/health", async () => {

@@ -245,6 +245,10 @@ describe("Dashboard API", () => {
       const body = JSON.parse(res._body);
       expect(Object.keys(body).sort()).toEqual(["ready", "supervisor"]);
       expect(body.ready).toBe("locked");
+      // "n/a" is honest in THIS mode only: the api.ts co-located read-aggregator
+      // dashboard has no Protect launch route, so an absent bridge does NOT
+      // guarantee a 503 (contrast the principal-policy dashboard, where absence
+      // => 503 and the honest value is "unwired", brief Fix 1).
       expect(body.supervisor).toBe("n/a");
     });
 

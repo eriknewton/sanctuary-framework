@@ -33,12 +33,19 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 /** Opaque per-process boot id, minted once at module load. */
 const INSTANCE_ID: string = randomBytes(16).toString("hex");
 
-/** Process start time (unix-ms), captured once at module load. */
-const SINCE_MS: number = Date.now();
+/**
+ * Process/time origin (unix-ms), the exact instant the Node process began.
+ * `performance.timeOrigin` is the high-resolution process start, so this is a
+ * truthful "process start time" rather than a module-load approximation
+ * (`Date.now()` at import would drift by however long startup took). Floored to
+ * a whole millisecond to keep it a non-secret, opaque value on the wire.
+ */
+const SINCE_MS: number = Math.floor(performance.timeOrigin);
 
 /**
  * The opaque per-process boot id. Stable for the life of this process;
