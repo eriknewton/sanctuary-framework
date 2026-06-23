@@ -84,8 +84,16 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/api/health`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
-    expect(body).toEqual({ ok: true, mode: "co-located" });
+    // brief D3: `{ ok, mode }` plus the opaque restart-detection signal
+    // (`instance` per-boot id + `since` start time). NO readiness/posture.
+    expect(Object.keys(body).sort()).toEqual(["instance", "mode", "ok", "since"]);
+    expect(body.ok).toBe(true);
+    expect(body.mode).toBe("co-located");
+    expect(typeof body.instance).toBe("string");
+    expect(typeof body.since).toBe("number");
+    // brief HIGH-1: these stay OFF the unauthenticated probe.
+    expect(body.ready).toBeUndefined();
+    expect(body.supervisor).toBeUndefined();
   });
 
   it("keeps /api/snapshot auth-gated without auth when auth token is configured", async () => {
@@ -281,9 +289,13 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/api/health`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
+    // brief D3: `{ ok, mode }` plus the opaque `instance`/`since` restart
+    // signal; NO readiness/posture (brief HIGH-1).
+    expect(Object.keys(body).sort()).toEqual(["instance", "mode", "ok", "since"]);
     expect(body.ok).toBe(true);
     expect(body.mode).toBe("co-located");
+    expect(typeof body.instance).toBe("string");
+    expect(typeof body.since).toBe("number");
   });
 
   it("404s unknown paths", async () => {

@@ -406,8 +406,8 @@ export interface IntelligenceSubstrateFailureDetails {
   surface: Surface;
   substrate: SubstrateChoice;
   failureClass: SubstrateFailureClass;
-  /** Operator-action taken: which fallback fired, or which surface was disabled. */
-  fallbackTaken: "next-substrate" | "deny" | "disable-surface";
+  /** Operator-action taken: which fallback fired, or why no fallback served. */
+  fallbackTaken: "next-substrate" | "primary-failed" | "all-exhausted" | "deny" | "disable-surface";
 }
 
 export interface IntelligencePiiRedactionEventDetails {

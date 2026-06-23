@@ -137,6 +137,87 @@ describe("posture route layer", () => {
     expect(body.origin_machine).toBe(FORTRESS);
   });
 
+  it("home digest reflects a just-appended entry with NO stale lag (eager-read never-stale-green, #714)", async () => {
+    // The home route composes its reads through the AuditLog EAGER path (bounded
+    // cost on a long chain). This guards the honesty side of that change: an
+    // entry appended through the SAME log instance must be visible to the very
+    // next home read, and the chain must stay honestly verified - no stale-green,
+    // no lag waiting out a re-verify throttle.
+    const log = newLog();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: FORTRESS,
+      result: "success",
+      details: { cw_source: "castle_wall_audit_consumer" },
+      timestamp: new Date(Date.now() - 30_000).toISOString(),
+    });
+    const base = await serve(baseDeps(log, []));
+
+    const first = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
+    expect(first.digest.total_operations).toBe(1);
+    expect(first.digest.chain_verified).toBe(true);
+    expect(first.digest.integrity_finding_count).toBe(0);
+
+    // Append a second entry through the same instance, then re-read the board.
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: FORTRESS,
+      result: "failure",
+      details: { cw_source: "castle_wall_audit_consumer" },
+      timestamp: new Date(Date.now() - 15_000).toISOString(),
+    });
+    const second = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
+    // Immediately reflected - the eager view is maintained on append, not lazily
+    // cached. No throttle wait, no stale count.
+    expect(second.digest.total_operations).toBe(2);
+    expect(second.digest.chain_verified).toBe(true);
+    expect(second.digest.integrity_finding_count).toBe(0);
+  });
+
+  it("home reports chain_verified=false (never green) when the on-disk chain is tampered (#714 eager path)", async () => {
+    // Out-of-band tamper detected at load is surfaced honestly through the eager
+    // home read: chain_verified=false with a finding, never a clean green board.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const writer = new AuditLog(storage, masterKey);
+    for (let i = 0; i < 5; i++) {
+      await writer.appendCritical({
+        layer: "l1",
+        operation: "egress_allowed",
+        identity_id: FORTRESS,
+        result: "success",
+        details: { cw_source: "castle_wall_audit_consumer" },
+      });
+    }
+    await writer.flush();
+    // Corrupt an on-disk entry's ciphertext directly (bypassing the server).
+    const keys = (await storage.list("_audit"))
+      .map((m) => m.key)
+      .sort((a, b) => a.localeCompare(b));
+    const victim = keys[2]!;
+    const raw = await storage.read("_audit", victim);
+    const env = JSON.parse(new TextDecoder().decode(raw!));
+    env.encrypted_payload_bytes = String(env.encrypted_payload_bytes)
+      .split("")
+      .reverse()
+      .join("");
+    await storage.write(
+      "_audit",
+      victim,
+      new TextEncoder().encode(JSON.stringify(env)),
+    );
+
+    // A fresh reader (the dashboard's log) loads + full-verifies on first read;
+    // the eager home read must report the tampered chain as NOT verified.
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const base = await serve(baseDeps(reader, []));
+    const home = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
+    expect(home.digest.chain_verified).toBe(false);
+    expect(home.digest.integrity_finding_count).toBeGreaterThan(0);
+  });
+
   it("serves the feature-health panel and includes it in the home payload", async () => {
     const log = newLog();
     const now = Date.now();

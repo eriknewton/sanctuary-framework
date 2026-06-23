@@ -163,7 +163,7 @@ export type HostAppInvoker = (
 /**
  * Runs `open` (or a test double). The default LaunchServices invoker launches
  * the host app through `open` so the child runs as a real LaunchServices
- * instance — the only way to reach NE preferences on macOS Tahoe, where a
+ * instance - the only way to reach NE preferences on macOS Tahoe, where a
  * directly-exec'd binary's `NEFilterManager.loadFromPreferences` hangs forever
  * (Mini1 Tahoe drill, 2026-06-10, finding 1).
  */
@@ -191,7 +191,7 @@ interface HeadlessReport {
 /**
  * The CLI's `armed` status shape. It sources from the live daemon lease/IPC
  * (`source: "castle-wall-cli"`), NOT from the audit-marker read path, so it does
- * not re-verify per-event producer signatures (Slice R) — and, importantly, it
+ * not re-verify per-event producer signatures (Slice R) - and, importantly, it
  * makes NO per-producer-authenticity claim at all. `armed` here means "the
  * daemon holds a live, non-revoked enforcement lease"; it is liveness, not an
  * authenticity assertion. Because it asserts no authenticity basis, it cannot
@@ -225,7 +225,7 @@ interface RunningAppController {
 
 /**
  * Distinct CLI exit code for "the system extension is installed but toggled
- * OFF" — the Tahoe-specific state that needs a one-time console toggle in
+ * OFF" - the Tahoe-specific state that needs a one-time console toggle in
  * System Settings (drill finding 1). Kept separate from the generic failure (1)
  * and the consent-missing path (3) so an operator/runbook can branch on it.
  */
@@ -266,7 +266,7 @@ async function resolveMasterKey(
 
   // Unified custody path (master-custody.ts): envelope-first, legacy markers
   // migrated in place, first runs recorded as a headless establishment. This
-  // is the same path the MCP server boots through — the CLI can no longer
+  // is the same path the MCP server boots through - the CLI can no longer
   // derive a *different* master for the same fortress (the 2026-06-12
   // incident class). SANCTUARY_RECOVERY_KEY keeps its historical precedence
   // over the passphrase for this CLI.
@@ -296,7 +296,7 @@ async function resolveMasterKey(
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
  * consent entry. Parallels the MCP router's `mcp_accept_broken_chain_override`
- * (router.ts) — a privileged CLI action (daemon bring-up, re-pin) past audit
+ * (router.ts) - a privileged CLI action (daemon bring-up, re-pin) past audit
  * integrity findings records the operator's consent BEFORE it proceeds, so the
  * override is itself auditable. The broken history is NEVER repaired or deleted;
  * it stays on disk, visible to `sanctuary castle-wall audit-findings`.
@@ -310,17 +310,17 @@ const CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP = "castle_wall_accept_broken_chain_over
  *
  *  - No `--accept-broken-chain`: return a default (strict) `AuditLog`. If the
  *    chain has integrity findings, the verb's first append throws
- *    `AuditIntegrityError` exactly as today — fail-closed default, unchanged.
+ *    `AuditIntegrityError` exactly as today - fail-closed default, unchanged.
  *  - `--accept-broken-chain` + findings present: emit a loud stderr warning,
  *    write an audited critical override entry FIRST (so the consent lands in the
  *    log before the privileged action runs), then return a lenient `AuditLog`
  *    so the verb's own appends proceed past the findings. Nothing is repaired,
- *    rewritten, or deleted — anti-rollback stays intact.
+ *    rewritten, or deleted - anti-rollback stays intact.
  *  - `--accept-broken-chain` + no findings: return a default (strict)
  *    `AuditLog` and write NO override entry (no spurious consent record).
  *
  * Findings are probed via `getIntegrityFindings()`, which surfaces findings
- * without throwing — the override decision must be made on the actual finding
+ * without throwing - the override decision must be made on the actual finding
  * set, not on a thrown error.
  */
 async function buildAuditLogForPrivilegedAction(opts: {
@@ -468,7 +468,7 @@ export async function runProvisionPin(
     const masterKey = await resolveMasterKey(storagePath, env);
 
     // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
-    // material. Enforced in the core verb — not the wrapping CLI — so
+    // material. Enforced in the core verb - not the wrapping CLI - so
     // scripted provisioning hits it too.
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
     await enforceCustodyFloor(
@@ -515,7 +515,7 @@ async function writeGlobalPinnedPublicKey(
     // exactly the gap the helper-as-signer design closes (an operator-owned dir
     // lets same-UID malware swap the key + pin). The root signer helper creates
     // + owns the directory. Best-effort write only IF the dir already exists
-    // root-owned (it will EACCES, handled below) — never bring it into being.
+    // root-owned (it will EACCES, handled below) - never bring it into being.
     await writeFile(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, publicKey, { mode: 0o644 });
     await chmod(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, 0o644);
   } catch (error) {
@@ -527,7 +527,7 @@ async function writeGlobalPinnedPublicKey(
     // Under A2 the global pin is root:wheel 0644 and owned by the signer helper;
     // an operator-UID provision-pin CANNOT (and must not) overwrite it, and the
     // directory may not exist yet (ENOENT) because only the helper creates it.
-    // Both are expected — the trust anchor is migrated via `castle-wall re-pin`.
+    // Both are expected - the trust anchor is migrated via `castle-wall re-pin`.
     if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
       console.warn(
         `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
@@ -615,7 +615,7 @@ function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
  * This brings the signer-client surface to PARITY with the host-app surface.
  * NOTE: stronger same-UID hardening (designated-requirement / codesign
  * validation) is a broader follow-up that, if pursued, must apply UNIFORMLY to
- * BOTH the host-app and signer-client surfaces — deliberately out of scope here
+ * BOTH the host-app and signer-client surfaces - deliberately out of scope here
  * to stay consistent with the established owner-trust model.
  */
 async function resolveSignerClientPath(
@@ -646,7 +646,7 @@ async function resolveSignerClientPath(
  * re-asserts state rather than rotating again.
  *
  * This is a Tier-1-class irreversible op (hard constraint #3): it runs only when
- * the operator is present and has just approved the helper — never silently,
+ * the operator is present and has just approved the helper - never silently,
  * never agent-triggerable.
  */
 export async function runRePin(
@@ -666,13 +666,13 @@ export async function runRePin(
 
   const storagePath = resolveStoragePath(env);
 
-  // F2a — loud target-fortress announcement (visibility, NOT a gating change).
+  // F2a - loud target-fortress announcement (visibility, NOT a gating change).
   // `resolveStoragePath` silently defaults to ~/.sanctuary when
   // SANCTUARY_STORAGE_PATH is unset; the 2026-06-13 drill pain was an UNSCOPED
   // invocation touching the real default fortress's audit lock with no signal.
   // Print the resolved target before any state-touching work, and call out the
   // default-fortress case. NOTE: a stricter opt-in confirm/refuse gate on the
-  // DEFAULT fortress was considered and deliberately DEFERRED to Erik — re-pinning
+  // DEFAULT fortress was considered and deliberately DEFERRED to Erik - re-pinning
   // the real default fortress is the legitimate operator path, so this stays a
   // pure-visibility change with no gating effect.
   const usingDefaultFortress = !env.SANCTUARY_STORAGE_PATH;
@@ -703,7 +703,7 @@ export async function runRePin(
   });
 
   // PRE-MIGRATION phase: any failure here (shim unreachable, bad key length,
-  // etc.) means the trust anchor did NOT move — report failure and return 1.
+  // etc.) means the trust anchor did NOT move - report failure and return 1.
   let helperPub: Uint8Array;
   try {
     // Ask the helper to (re)write the root-owned pin with K_helper and return it.
@@ -721,13 +721,13 @@ export async function runRePin(
   // POST-MIGRATION phase: `installPin()` succeeded, so the trust anchor IS
   // migrated to the helper key. Everything below is audit bookkeeping (reading
   // the retiring key, deriving the master key, recording the rotation proof).
-  // F2b — a failure HERE (e.g. `aes/gcm: invalid ghash tag` when the fortress
+  // F2b - a failure HERE (e.g. `aes/gcm: invalid ghash tag` when the fortress
   // material can't be decrypted) must NOT be reported as a re-pin failure:
   // telling the operator the migration failed when the anchor actually moved is
   // the more dangerous lie. Degrade to a loud warning and still return 0,
   // printing the migrated fingerprint.
   //
-  // FIX 3 — `masterKey` (decrypted fortress secret) is hoisted so a `finally`
+  // FIX 3 - `masterKey` (decrypted fortress secret) is hoisted so a `finally`
   // zeroes it on EVERY exit from this block: success returns, the
   // AuditIntegrityError exit-1 path, and the F2b degraded-warning exit-0 path.
   // A throw between resolveMasterKey() and a return must never leave the
@@ -824,7 +824,7 @@ export async function runRePin(
       write(err, `Error: ${error.message}\n`);
       return 1;
     }
-    // F2b — the pin migrated, but recording the rotation proof failed for an
+    // F2b - the pin migrated, but recording the rotation proof failed for an
     // incidental reason (e.g. `aes/gcm: invalid ghash tag` when fortress
     // material can't be decrypted). Do NOT report re-pin failure: emit a
     // warning, print the migrated fingerprint, and return 0. The anchor IS
@@ -838,7 +838,7 @@ export async function runRePin(
     );
     return 0;
   } finally {
-    // FIX 3 — zero the decrypted fortress key on every exit (success,
+    // FIX 3 - zero the decrypted fortress key on every exit (success,
     // AuditIntegrityError exit-1, F2b degraded exit-0, or any throw between
     // resolveMasterKey() and a return). No-op when resolveMasterKey() never ran.
     masterKey?.fill(0);
@@ -850,7 +850,7 @@ export async function runRePin(
  * Returns the 32-byte key on success, `"none"` when no global pin is
  * provisioned (ENOENT), or `"unreadable"` when it exists but is root-owned and
  * not readable without elevation (EACCES/EPERM). Any other error also degrades
- * to `"unreadable"` rather than throwing — status is a diagnostic, not a gate.
+ * to `"unreadable"` rather than throwing - status is a diagnostic, not a gate.
  * Test-injectable via `ctx.globalPinReader`.
  */
 async function readGlobalPinForStatus(
@@ -874,7 +874,7 @@ async function readGlobalPinForStatus(
 }
 
 /**
- * F3 — print the global enforcement pin and a trust-anchor consistency verdict.
+ * F3 - print the global enforcement pin and a trust-anchor consistency verdict.
  * AUTHORITATIVE approach: the signer helper exposes a non-mutating `get-pubkey`
  * query (`HelperSignerClient.getPublicKey`), so when a signer-client shim is
  * resolvable we compare the global pin against the live helper key and print
@@ -930,7 +930,7 @@ async function reportGlobalPinAndVerdict(
       }
       return;
     } catch {
-      // Helper query unreachable — fall through to the softer local comparison.
+      // Helper query unreachable - fall through to the softer local comparison.
     }
   }
 
@@ -995,7 +995,7 @@ export async function runStatus(
     } else {
       // DEGRADE, never throw: `status` is the diagnostic an operator runs WHEN
       // the anchor is broken (e.g. a malformed-length local pin). Throwing out
-      // here would defeat the F3 global-pin verdict below — the very thing
+      // here would defeat the F3 global-pin verdict below - the very thing
       // needed to diagnose the break. Warn, leave localFingerprint = null, and
       // fall through to global-pin reporting. (ENOENT keeps its message above.)
       const reason = error instanceof Error ? error.message : String(error);
@@ -1008,14 +1008,14 @@ export async function runStatus(
     return 0;
   }
 
-  // F3 — surface the GLOBAL pin (the actual enforcement anchor) and a
+  // F3 - surface the GLOBAL pin (the actual enforcement anchor) and a
   // trust-anchor consistency verdict. A box can sit un-armable for days with no
   // signal when the global pin diverges from the signer-helper key (the
   // 06-11b→06-13 situation). Reading the global pin NEVER throws out of status:
   // ENOENT = no global pin provisioned; EACCES/EPERM = root-owned and
   // unreadable without elevation. The consistency check is AUTHORITATIVE: the
   // signer helper exposes a non-mutating `get-pubkey` query (HelperSignerClient
-  // .getPublicKey — NOT installPin(), which would MUTATE the pin), so we compare
+  // .getPublicKey - NOT installPin(), which would MUTATE the pin), so we compare
   // the global pin against the live helper key directly.
   await reportGlobalPinAndVerdict(out, env, platform, ctx, localFingerprint);
 
@@ -1097,7 +1097,7 @@ export async function runStatus(
  *
  * B2: by default the daemon signs via the root signer helper, so signing no
  * longer needs the passphrase at all. The derived master key is still required
- * to open the encrypted audit log (residual R2 — a boot-time daemon still needs
+ * to open the encrypted audit log (residual R2 - a boot-time daemon still needs
  * it; that is F1's problem, not closed here). The legacy local-sign path
  * (`SANCTUARY_CASTLE_LOCAL_SIGN=1`) still decrypts `castle-pinned-privkey.enc`
  * and proves the passphrase matches the pin by construction.
@@ -1123,13 +1123,31 @@ export async function runDaemon(
   const platform = ctx.platform ?? process.platform;
   const acceptBrokenChain = parseCastleWallArgs(argv).acceptBrokenChain ?? false;
 
-  if (platform !== "darwin") {
-    write(err, "castle-wall daemon is macOS-only.\n");
+  // FIX 3 (codex HIGH - wire the opt-in producer-signed close into production).
+  // The daemon verb is macOS by default. On Linux it stays unsupported UNLESS the
+  // operator explicitly opts in to the producer-signed close, in which case it
+  // routes to the Linux activation gate (fail-closed, off-by-default,
+  // drill-pending). The gate re-checks platform + opt-in internally.
+  const { isLinuxProducerSignedActivationRequested } = await import(
+    "../castle-wall/runtime/index.js"
+  );
+  const linuxProducerSigned =
+    platform === "linux" &&
+    isLinuxProducerSignedActivationRequested({ env });
+
+  if (platform !== "darwin" && !linuxProducerSigned) {
+    write(
+      err,
+      platform === "linux"
+        ? "castle-wall daemon is macOS-only by default. To run the opt-in Linux producer-signed close, set SANCTUARY_CASTLE_LINUX_PRODUCER_SIGNED=1 (drill-pending, off by default).\n"
+        : "castle-wall daemon is macOS-only.\n",
+    );
     return 1;
   }
 
-  // F1 Option C: the launchd boot service comes up in SAFE MODE — it holds
+  // F1 Option C: the launchd boot service comes up in SAFE MODE - it holds
   // only the software-protected boot token, never the fortress master key.
+  // (macOS-only path; Linux never reaches here with --safe-mode.)
   if (argv.includes("--safe-mode")) {
     return runSafeModeDaemon(argv, ctx);
   }
@@ -1183,7 +1201,7 @@ export async function runDaemon(
   }
 
   // Require an already-provisioned fortress (custody envelope or legacy
-  // key-params); never establish a fresh master from the daemon verb — a
+  // key-params); never establish a fresh master from the daemon verb - a
   // fresh key could not match the pin and arming with it would fail-closed
   // the whole machine.
   const storage = new FilesystemStorage(join(storagePath, "state"));
@@ -1212,46 +1230,101 @@ export async function runDaemon(
     err,
   });
 
-  // F1 — resolve the signer-client shim the same way `re-pin` does: explicit
-  // ctx → env → auto-discovered bundled shim. Lets a normally-installed box arm
-  // without the operator having to set SANCTUARY_CASTLE_SIGNER_CLIENT by hand
-  // (the 2026-06-13 drill operability gap). Only used in helper-sign mode.
-  const resolvedSignerClient = localSign
-    ? undefined
-    : await resolveSignerClientPath(env, platform, ctx);
-
-  const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
   let daemon: { socketPath: string; stop: () => Promise<void> };
-  try {
-    daemon = await startMacOSCastleWallDaemon({
-      fortressPath: storagePath,
-      fortressId: fortressIdFromStoragePath(storagePath),
-      masterKey: derived.key,
-      auditLog,
-      ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
-      ...(localSign ? { localSign: true } : {}),
-      ...(resolvedSignerClient
-        ? { signerClientPath: resolvedSignerClient }
-        : {}),
-    });
-  } catch (error) {
-    write(err, `Daemon failed to start: ${(error as Error).message}\n`);
-    if (localSign) {
-      write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
-    } else {
-      write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+
+  if (linuxProducerSigned) {
+    // FIX 3: opt-in Linux producer-signed close. Route through the fail-closed
+    // activation gate using the fortress's existing pinned key as the IPC
+    // handshake identity. No macOS helper signer is involved (the systemd daemon
+    // holds its own root-owned producer key). Off-by-default + drill-pending.
+    const {
+      maybeActivateLinuxProducerSignedCastleWall,
+      buildLinuxIpcClientKeyMaterial,
+    } = await import("../castle-wall/runtime/index.js");
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    try {
+      const key = await buildLinuxIpcClientKeyMaterial({
+        fortressPath: storagePath,
+        fortressId,
+        masterKey: derived.key,
+      });
+      const outcome = await maybeActivateLinuxProducerSignedCastleWall({
+        fortressId,
+        fortressStoragePath: storagePath,
+        key,
+        auditSink: auditLog,
+        env,
+      });
+      if (!outcome.activated) {
+        // Not possible here (we already gated on platform + opt-in), but never
+        // fake-arm: surface not-armed rather than pretend.
+        write(
+          err,
+          `Refusing to report armed: Linux producer-signed activation did not engage (${outcome.reason}).\n`,
+        );
+        return 1;
+      }
+      const socketPath = resolveCastleWallSocketPath({
+        platform,
+        fortressId,
+        fortressPath: storagePath,
+      }).path;
+      daemon = { socketPath, stop: () => outcome.activation.stop() };
+    } catch (error) {
+      write(err, `Daemon failed to start (Linux producer-signed, fail-closed): ${(error as Error).message}\n`);
+      write(err, "The producer-signed close is fail-closed: a daemon-start, key, handshake, or drain failure surfaces NOT-ARMED rather than degrading to the channel basis.\n");
+      return 1;
     }
-    return 1;
+  } else {
+    // F1 - resolve the signer-client shim the same way `re-pin` does: explicit
+    // ctx → env → auto-discovered bundled shim. Lets a normally-installed box arm
+    // without the operator having to set SANCTUARY_CASTLE_SIGNER_CLIENT by hand
+    // (the 2026-06-13 drill operability gap). Only used in helper-sign mode.
+    const resolvedSignerClient = localSign
+      ? undefined
+      : await resolveSignerClientPath(env, platform, ctx);
+
+    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    try {
+      daemon = await startMacOSCastleWallDaemon({
+        fortressPath: storagePath,
+        fortressId: fortressIdFromStoragePath(storagePath),
+        masterKey: derived.key,
+        auditLog,
+        ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
+        ...(localSign ? { localSign: true } : {}),
+        ...(resolvedSignerClient
+          ? { signerClientPath: resolvedSignerClient }
+          : {}),
+      });
+    } catch (error) {
+      write(err, `Daemon failed to start: ${(error as Error).message}\n`);
+      if (localSign) {
+        write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
+      } else {
+        write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+      }
+      return 1;
+    }
   }
 
   write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
-  if (launchdBoot) {
-    write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");
-  }
-  if (localSign) {
-    write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
+  if (linuxProducerSigned) {
+    write(
+      out,
+      `Linux producer-signed close ACTIVE (opt-in): the systemd daemon signs every ` +
+        `enforcement event with its root-owned producer key; the in-process server ` +
+        `re-verifies against pin ${pinFingerprint}. Drill-acceptance pending.\n`,
+    );
   } else {
-    write(out, `Signing via the root signer helper (no passphrase used for signing); pin ${pinFingerprint}.\n`);
+    if (launchdBoot) {
+      write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");
+    }
+    if (localSign) {
+      write(out, `Signing via the local key; matches pin ${pinFingerprint} (decryption succeeded).\n`);
+    } else {
+      write(out, `Signing via the root signer helper (no passphrase used for signing); pin ${pinFingerprint}.\n`);
+    }
   }
   write(out, "Daemon running in the foreground. Ctrl-C (SIGINT) or SIGTERM to stop.\n");
 
@@ -1394,11 +1467,11 @@ export async function runDaemon(
 }
 
 /**
- * F1 Option C — the SAFE-MODE boot daemon (the anti-brick half).
+ * F1 Option C - the SAFE-MODE boot daemon (the anti-brick half).
  *
  * This is what `install-boot`'s LaunchDaemon runs (`castle-wall daemon
  * --safe-mode --launchd`) at boot, before any user login. It comes up holding
- * ONLY the software-protected boot token — never the fortress passphrase or
+ * ONLY the software-protected boot token - never the fortress passphrase or
  * master key, which are not present pre-login. Concretely it differs from the
  * full `runDaemon` in three ways:
  *
@@ -1420,12 +1493,12 @@ export async function runDaemon(
  * Full operation (approvals that touch fortress state, the master-key audit
  * log) resumes when the operator logs in and starts the full daemon.
  *
- * HANDOFF (#450 item 4 — de-scoped, no automatic supersede): this boot daemon
+ * HANDOFF (#450 item 4 - de-scoped, no automatic supersede): this boot daemon
  * is a ROOT launchd KeepAlive unit. The full operator daemon runs unprivileged
  * and CANNOT stop it, so it does not silently "supersede" this one (an earlier
  * doc comment claimed it did; that coordination was never implemented). Until
- * the boot daemon is explicitly stood down — `sudo launchctl bootout
- * system/<boot-label>`, after which it returns on the next reboot — a starting
+ * the boot daemon is explicitly stood down - `sudo launchctl bootout
+ * system/<boot-label>`, after which it returns on the next reboot - a starting
  * full daemon detects the live boot daemon (via the active-config `mode` marker)
  * and refuses with handoff guidance rather than orphaning it. The box stays
  * safely in safe mode meanwhile. SSH / operator endpoints stay reachable
@@ -1770,7 +1843,7 @@ export async function runAuditDump(
     // to the rule that decided it; they do NOT change emission, schema, or
     // enforcement, and they do NOT make the trail tamper-evident (that is the
     // separate, currently-inert producer-signed-audit capability). The rule id
-    // shown here is operator-only — this CLI runs in operator context.
+    // shown here is operator-only - this CLI runs in operator context.
     if (parsed.byRule || parsed.rule !== undefined) {
       const flows = attributeFlows(castleWallEntries);
       if (parsed.rule !== undefined) {
@@ -2059,7 +2132,7 @@ export interface LaunchServicesInvokerOptions {
  * code from the report, and returns it in the same shape as the direct invoker.
  *
  * Fail-closed: a missing, empty, or unparseable report file yields a generic
- * failure (exit 1) — never a silent success.
+ * failure (exit 1) - never a silent success.
  */
 export function makeLaunchServicesHostAppInvoke(
   opts: LaunchServicesInvokerOptions,
@@ -2517,7 +2590,7 @@ async function runArmDisarm(
   if (action === "enable" && !parsed.force) {
     // Composition guard (#450 item 5): "arming implies a persistent BOOT service
     // is installed." The daemon-reachability gate above only proves a daemon is
-    // up NOW — a manually-started daemon passes it, yet leaves the box with an
+    // up NOW - a manually-started daemon passes it, yet leaves the box with an
     // armed filter and NO boot daemon, so the NEXT REBOOT comes up deny-all with
     // SSH locked out (the exact F1 boot-cut). Require the persistent boot service
     // to exist so you cannot arm into the reboot-brick state. --force overrides
@@ -2542,7 +2615,7 @@ async function runArmDisarm(
       write(
         err,
         "Refusing to arm: no persistent Castle Wall boot service is installed.\n" +
-          "Reachability of a daemon NOW does not survive a reboot — arming without the\n" +
+          "Reachability of a daemon NOW does not survive a reboot - arming without the\n" +
           "boot service means the NEXT REBOOT comes up deny-all with no daemon (SSH\n" +
           "locked out, the F1 boot-cut).\n" +
           "Install it first:  sudo sanctuary castle-wall install-boot\n" +
@@ -2568,7 +2641,7 @@ async function runArmDisarm(
     // Tahoe ships the sysext toggled OFF; arming over it would save an NE config
     // that never enforces (the false-assurance trap). Detect that distinct state
     // and route the operator to the one-time console toggle. Disable never gates
-    // here — it stays the unconditional dead-man lever.
+    // here - it stays the unconditional dead-man lever.
     const sysextProbe = ctx.sysextProbe ?? (() => defaultSysextProbe(ctx));
     if ((await sysextProbe()) === "[activated disabled]") {
       write(err, SYSEXT_DISABLED_GUIDANCE);
@@ -2677,7 +2750,7 @@ async function runArmDisarm(
     // mutation itself (saveToPreferences returned ok, above); the status
     // re-read is only corroboration. On macOS Tahoe that re-read spawns a
     // SECOND LaunchServices app instance, which can time out or yield no report
-    // even though the wall is already down — so an INCONCLUSIVE corroboration
+    // even though the wall is already down - so an INCONCLUSIVE corroboration
     // must not flip a genuine recovery into a reported failure, or the lever
     // stops being trustworthy (the whole point of the SSH-only drill is that
     // `disable` reliably means "wall down"). A corroboration that
@@ -2689,7 +2762,7 @@ async function runArmDisarm(
         err,
         `castle-wall disable: disarm reported success but post-change ` +
           `verification still shows the wall ENABLED. The wall may still be ` +
-          `up — re-run 'sanctuary castle-wall disable' and confirm with ` +
+          `up - re-run 'sanctuary castle-wall disable' and confirm with ` +
           `'sanctuary castle-wall status'.\n`,
       );
       return 1;
@@ -2792,7 +2865,7 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
       // `--rule` requires a value. If the next token is missing or is itself a
-      // flag, do NOT consume it — flag the omission so the caller emits a usage
+      // flag, do NOT consume it - flag the omission so the caller emits a usage
       // error rather than silently falling back to the raw audit dump.
       const next = argv[i + 1];
       if (next === undefined || next.startsWith("-")) {

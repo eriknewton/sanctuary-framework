@@ -139,6 +139,11 @@ describe("multi-server", () => {
     const parsed = JSON.parse(res.body);
     expect(parsed.ok).toBe(true);
     expect(parsed.mode).toBe("multi");
+    // brief D3: opaque restart-detection signal; NO readiness/posture.
+    expect(typeof parsed.instance).toBe("string");
+    expect(typeof parsed.since).toBe("number");
+    expect(parsed.ready).toBeUndefined();
+    expect(parsed.supervisor).toBeUndefined();
   });
 
   it("returns 401 on missing/invalid bearer token when auth enabled", async () => {

@@ -201,7 +201,7 @@ describe("Dashboard API", () => {
       expect(create).not.toHaveBeenCalled();
     });
 
-    it("serves /api/health without auth and only ok/mode", async () => {
+    it("serves /api/health without auth with ok/mode + opaque instance/since (brief D3)", async () => {
       const res = mockRes();
       const deps = makeDeps();
       const req = mockReq({ url: "/api/health" });
@@ -209,8 +209,85 @@ describe("Dashboard API", () => {
       expect(matched).toBe(true);
       expect(res._status).toBe(200);
       const body = JSON.parse(res._body);
-      expect(Object.keys(body).sort()).toEqual(["mode", "ok"]);
-      expect(body).toEqual({ ok: true, mode: "co-located" });
+      // brief D3: `{ ok, mode }` plus the opaque restart-detection signal.
+      expect(Object.keys(body).sort()).toEqual(["instance", "mode", "ok", "since"]);
+      expect(body.ok).toBe(true);
+      expect(body.mode).toBe("co-located");
+      expect(typeof body.instance).toBe("string");
+      expect(typeof body.since).toBe("number");
+      // brief HIGH-1: readiness/posture MUST NOT be on the unauthenticated probe.
+      expect(body.ready).toBeUndefined();
+      expect(body.supervisor).toBeUndefined();
+    });
+
+    it("/api/readiness returns 401 without auth (brief D3 auth gate)", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({ url: "/api/readiness" });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBeUndefined();
+      expect(body.supervisor).toBeUndefined();
+    });
+
+    it("/api/readiness returns ready=locked + supervisor=n/a with auth, no identity manager", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(Object.keys(body).sort()).toEqual(["ready", "supervisor"]);
+      expect(body.ready).toBe("locked");
+      // "n/a" is honest in THIS mode only: the api.ts co-located read-aggregator
+      // dashboard has no Protect launch route, so an absent bridge does NOT
+      // guarantee a 503 (contrast the principal-policy dashboard, where absence
+      // => 503 and the honest value is "unwired", brief Fix 1).
+      expect(body.supervisor).toBe("n/a");
+    });
+
+    it("/api/readiness reports ready=serving when an identity manager is wired", async () => {
+      const res = mockRes();
+      const deps = makeDeps({
+        sources: {
+          mode: "co-located" as const,
+          identityManager: {} as any,
+          auditLog: { query: vi.fn(async () => ({ entries: [], total: 0 })) },
+        } as any,
+      });
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBe("serving");
+    });
+
+    it("/api/readiness honors an explicit readiness + supervisor provider", async () => {
+      const res = mockRes();
+      const deps = makeDeps({
+        readiness: () => "serving",
+        supervisorStatus: () => "wired",
+      });
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBe("serving");
+      expect(body.supervisor).toBe("wired");
     });
 
     it("wrap-auto posture home reports no live stream when no stream registry is wired", async () => {

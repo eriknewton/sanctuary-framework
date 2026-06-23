@@ -1288,6 +1288,11 @@
         "bundle": {
           "type": "string",
           "description": "Base64url-encoded reputation bundle"
+        },
+        "allow_unverified_legacy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicitly import a manifestless legacy reputation bundle without completeness guarantees. Default false rejects bundles that predate signed completeness verification."
         }
       },
       "required": [

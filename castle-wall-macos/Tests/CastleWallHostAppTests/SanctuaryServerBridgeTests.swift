@@ -285,4 +285,176 @@ final class SanctuaryServerBridgeTests: XCTestCase {
         // absorbed (the whole point of the hysteresis).
         XCTAssertGreaterThanOrEqual(SanctuaryServerBridge.unreachableHysteresisThreshold, 2)
     }
+
+    // MARK: - Posture surface state (Slice 1a: the three honest states)
+    //
+    // The operator-facing surface is one of three honest states (design §3.1):
+    //   .live          reachable -> embedded board
+    //   .reconnecting  WAS reachable, now failing inside the recovery budget ->
+    //                  dimmed, timestamped last-known frame + "reconnecting"
+    //   .unreachable   cold start (no last-known frame) OR down past the budget
+    //                  -> native down-screen
+    // The honesty invariant under test: `.reconnecting` is reachable ONLY when we
+    // actually have a last-known frame to dim, and only inside the bounded budget.
+
+    func testReachableSurfaceIsLive() {
+        let s = SanctuaryServerBridge.postureSurfaceState(
+            status: .reachable,
+            consecutiveFailures: 0,
+            hasLastKnownPosture: true,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(s, .live)
+    }
+
+    func testReachableSurfaceIsLiveEvenWithoutPriorPosture() {
+        // First successful probe: reachable is always live regardless of history.
+        let s = SanctuaryServerBridge.postureSurfaceState(
+            status: .reachable,
+            consecutiveFailures: 0,
+            hasLastKnownPosture: false,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(s, .live)
+    }
+
+    func testWasReachableNowFailingInsideBudgetIsReconnecting() {
+        // The new state: we have a last-known frame and are inside the budget ->
+        // show the dimmed reconnecting frame, NOT the dead screen.
+        let s = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 2,
+            hasLastKnownPosture: true,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(s, .reconnecting)
+    }
+
+    func testReconnectingHoldsUpToButNotIncludingBudget() {
+        // Just below the budget still reconnects.
+        let justBelow = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 5,
+            hasLastKnownPosture: true,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(justBelow, .reconnecting)
+    }
+
+    func testFailingPastBudgetFallsToUnreachable() {
+        // At/over the budget, the honest "reconnecting" promise expires -> the
+        // native down-screen. Recovery was given a fair window and did not come.
+        let atBudget = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 6,
+            hasLastKnownPosture: true,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(atBudget, .unreachable)
+
+        let overBudget = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 9,
+            hasLastKnownPosture: true,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(overBudget, .unreachable)
+    }
+
+    func testColdStartNeverReachableIsUnreachableNotReconnecting() {
+        // Cold start honesty (design §3.2): with no last-known frame we NEVER
+        // fabricate a stale "reconnecting" view, even inside the budget window.
+        let coldUnreachable = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 1,
+            hasLastKnownPosture: false,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(coldUnreachable, .unreachable)
+
+        // Even `.unknown` (cold start, below hysteresis) with no posture maps to
+        // the unreachable surface (the caller renders the native empty-state).
+        let coldUnknown = SanctuaryServerBridge.postureSurfaceState(
+            status: .unknown,
+            consecutiveFailures: 0,
+            hasLastKnownPosture: false,
+            recoveryBudget: 6
+        )
+        XCTAssertEqual(coldUnknown, .unreachable)
+    }
+
+    func testRecoveryBudgetIsClampedToAtLeastOne() {
+        // A nonsensical budget (<= 0) must not make every failed probe
+        // "reconnecting forever": clamp to 1 so a single failure past it falls to
+        // the down-screen.
+        let s = SanctuaryServerBridge.postureSurfaceState(
+            status: .unreachable,
+            consecutiveFailures: 1,
+            hasLastKnownPosture: true,
+            recoveryBudget: 0
+        )
+        XCTAssertEqual(s, .unreachable)
+    }
+
+    func testConfiguredRecoveryBudgetExceedsHysteresisThreshold() {
+        // Lock the shipped relationship: the recovery budget must be strictly
+        // greater than the hysteresis threshold, otherwise the Reconnecting state
+        // could never appear (the surface would flip straight to the down-screen
+        // the same probe it became `.unreachable`).
+        XCTAssertGreaterThan(
+            SanctuaryServerBridge.recoveryBudgetFailures,
+            SanctuaryServerBridge.unreachableHysteresisThreshold
+        )
+    }
+
+    // MARK: - Stale-timestamp copy (Slice 1a Fix 2: do not understate staleness)
+    //
+    // The Reconnecting banner and the down-screen both stamp the last-reachable
+    // moment so the operator knows how old the dimmed frame is. A bare HH:mm:ss
+    // would read an overnight or multi-day outage as if it were seconds old; the
+    // formatted string must therefore include the DATE, not just the time-of-day.
+
+    func testStaleTimestampIncludesTheDateNotJustTime() {
+        // Pin a known instant well in the past (2026-01-15). The formatted copy
+        // must contain a date component, so a frame stamped today vs. weeks ago is
+        // visibly different to the operator (honesty across time).
+        var comps = DateComponents()
+        comps.year = 2026
+        comps.month = 1
+        comps.day = 15
+        comps.hour = 14
+        comps.minute = 13
+        comps.second = 7
+        let cal = Calendar.current
+        let date = cal.date(from: comps)!
+
+        let formatted = ContentView.staleTimestamp(date)
+
+        // The day-of-month and the year must both be present (a pure HH:mm:ss
+        // string would contain neither). This is the regression guard: if the
+        // formatter is ever narrowed back to time-only, this fails.
+        XCTAssertTrue(formatted.contains("15"), "stale timestamp must include the day: \(formatted)")
+        XCTAssertTrue(formatted.contains("2026"), "stale timestamp must include the year: \(formatted)")
+    }
+
+    func testStaleTimestampDistinguishesDifferentDaysAtSameClockTime() {
+        // Two frames captured at the same wall-clock time on different days must
+        // produce DIFFERENT copy. A time-only formatter would collapse them to the
+        // same string and understate a day-old frame as if it were current.
+        let cal = Calendar.current
+        func at(year: Int, month: Int, day: Int) -> Date {
+            var c = DateComponents()
+            c.year = year; c.month = month; c.day = day
+            c.hour = 9; c.minute = 0; c.second = 0
+            return cal.date(from: c)!
+        }
+        let today = at(year: 2026, month: 6, day: 22)
+        let weeksAgo = at(year: 2026, month: 6, day: 1)
+
+        XCTAssertNotEqual(
+            ContentView.staleTimestamp(today),
+            ContentView.staleTimestamp(weeksAgo),
+            "same clock time on different days must format differently so staleness is not understated"
+        )
+    }
 }

@@ -123,6 +123,12 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
       reason: "exit import stages only internal _exit_* artifact namespaces",
     },
     {
+      path: "server/src/exit/bundle.ts",
+      context: "for (const snapshot of allSnapshots)",
+      reason:
+        "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires",
+    },
+    {
       path: "server/src/transparency/anchoring.ts",
       context: "storage.write(namespace, key, bytes)",
       reason: "transparency checkpoint helper uses frozen internal namespaces",

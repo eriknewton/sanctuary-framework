@@ -105,6 +105,11 @@ export interface AcceptFederationEventsFailClosedParams {
   wireVersion?: unknown;
   senderNodeId?: string;
   isNodeRevoked?: (nodeId: string) => boolean;
+  /**
+   * Validate append eligibility without mutating durable federation state.
+   * Used to project same-batch eviction effects before the single commit.
+   */
+  validateEvents?(events: FederationAcceptanceEvent[]): FederationAcceptanceAppendResult;
   appendEvents(events: FederationAcceptanceEvent[]): FederationAcceptanceAppendResult;
 }
 
@@ -341,9 +346,10 @@ export function foldFederationNodeEvictionEvent(input: {
  * mixed batch cannot smuggle ordinary events alongside an unsupported or
  * unauthorized reserved event.
  *
- * Operator-authority evictions are appended first so the post-batch revoked set
- * is visible before any ordinary event is accepted. If revocation state cannot
- * be evaluated, no event in the batch is trusted.
+ * Operator-authority evictions are projected in memory so the post-batch
+ * revoked set is visible before any ordinary event is accepted. The durable
+ * append is called once with the whole accepted set so a mid-batch persistence
+ * failure cannot leave evictions and ordinary events split across commits.
  */
 export function acceptFederationEventsFailClosed(
   params: AcceptFederationEventsFailClosedParams,
@@ -393,39 +399,28 @@ export function acceptFederationEventsFailClosed(
     }
   }
 
-  const appendEvictions =
-    evictionEvents.length > 0
-      ? params.appendEvents(evictionEvents)
-      : { accepted: [], rejected: [] };
-
-  const postEvictionEval = evaluateRevocationState(
-    idsToEvaluate(ordinaryEvents, params.senderNodeId),
-    isNodeRevoked,
-  );
-  if (!postEvictionEval.ok) {
-    return {
-      accepted: appendEvictions.accepted,
-      rejected: [
-        ...appendEvictions.rejected,
-        ...ordinaryEvents.map((event) => ({
-          event_id: event.event_id,
-          reason: "revocation_state_unavailable",
-        })),
-      ],
-      senderRevoked: false,
-      revocationStateAvailable: false,
-      batchRejected: false,
-    };
+  let appendEvictions: FederationAcceptanceAppendResult;
+  try {
+    appendEvictions =
+      evictionEvents.length > 0
+        ? validateEventsForProjection(params, evictionEvents)
+        : { accepted: [], rejected: [] };
+  } catch {
+    return rejectAllForBatchReason(events, "append_failed");
   }
 
+  const pendingEvictedNodeIds = pendingEvictionNodeIds(appendEvictions.accepted);
+  const projectedRevoked = (nodeId: string): boolean =>
+    evaluatorReady.revoked.get(nodeId) === true ||
+    pendingEvictedNodeIds.has(nodeId);
   const senderRevoked =
     params.senderNodeId === undefined
       ? false
-      : postEvictionEval.revoked.get(params.senderNodeId) === true;
+      : projectedRevoked(params.senderNodeId);
   const ordinaryCandidates: FederationAcceptanceEvent[] = [];
   const revokedRejections: FederationAcceptanceAppendResult["rejected"] = [];
   for (const event of ordinaryEvents) {
-    if (senderRevoked || postEvictionEval.revoked.get(event.origin_node_id) === true) {
+    if (senderRevoked || projectedRevoked(event.origin_node_id)) {
       revokedRejections.push({
         event_id: event.event_id,
         reason: "node_revoked",
@@ -435,22 +430,53 @@ export function acceptFederationEventsFailClosed(
     ordinaryCandidates.push(event);
   }
 
-  const appendOrdinary =
-    ordinaryCandidates.length > 0
-      ? params.appendEvents(ordinaryCandidates)
-      : { accepted: [], rejected: [] };
+  const acceptedCandidates = [...appendEvictions.accepted, ...ordinaryCandidates];
+  let appendAccepted: FederationAcceptanceAppendResult;
+  try {
+    appendAccepted =
+      acceptedCandidates.length > 0
+        ? params.appendEvents(acceptedCandidates)
+        : { accepted: [], rejected: [] };
+  } catch {
+    return rejectAllForBatchReason(events, "append_failed");
+  }
 
   return {
-    accepted: [...appendEvictions.accepted, ...appendOrdinary.accepted],
+    accepted: appendAccepted.accepted,
     rejected: [
       ...appendEvictions.rejected,
       ...revokedRejections,
-      ...appendOrdinary.rejected,
+      ...appendAccepted.rejected,
     ],
     senderRevoked,
     revocationStateAvailable: true,
     batchRejected: false,
   };
+}
+
+function validateEventsForProjection(
+  params: AcceptFederationEventsFailClosedParams,
+  events: FederationAcceptanceEvent[],
+): FederationAcceptanceAppendResult {
+  if (typeof params.validateEvents === "function") {
+    return params.validateEvents(events);
+  }
+  return {
+    accepted: [],
+    rejected: events.map((event) => ({
+      event_id: event.event_id,
+      reason: "revocation_validation_unavailable",
+    })),
+  };
+}
+
+function pendingEvictionNodeIds(events: FederationAcceptanceEvent[]): Set<string> {
+  const nodeIds = new Set<string>();
+  for (const event of events) {
+    const payload = parseNodeEvictionPayload(event.payload);
+    if (payload !== null) nodeIds.add(payload.node_id);
+  }
+  return nodeIds;
 }
 
 function reservedEventBatchRejection(

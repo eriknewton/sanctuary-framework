@@ -864,6 +864,18 @@ describe("Slice 3 — Custody & Exit panel (evidence-based, honest)", () => {
     expect(panel.clean_exit_guaranteed).toBe(false);
   });
 
+  it("keeps the exit_state wire token unchanged while display copy names the evidence bundle", async () => {
+    const { log } = newAuditLog();
+    const panel = await buildCustodyExitPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: Date.now(),
+    });
+
+    expect(panel.exit_state).toBe("export_available");
+    expect(JSON.stringify(panel)).not.toContain("evidence_bundle");
+  });
+
   it("a future-dated damage event (beyond skew) does not keep custody DAMAGED", async () => {
     const { log } = newAuditLog();
     const now = Date.now();

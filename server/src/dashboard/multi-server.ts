@@ -13,6 +13,7 @@
 import { createServer, type Server } from "node:http";
 import { getMultiTenantSnapshot } from "./multi-aggregator.js";
 import { renderMultiAgentHTML } from "./multi-html.js";
+import { getProcessInstance, getProcessSince } from "./process-identity.js";
 import { sendCaughtError } from "../http/error-envelope.js";
 
 export interface MultiDashboardOptions {
@@ -96,7 +97,21 @@ export async function startMultiDashboardServer(
           "Content-Type": "application/json",
           "Cache-Control": "no-store",
         });
-        res.end(JSON.stringify({ ok: true, mode: "multi" }));
+        // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
+        // `since`. The `instance` is per-process, so a per-tenant dashboard
+        // and this multi-tenant aggregator each mint their own id; it CANNOT
+        // be used to correlate tenants. The multi-tenant aggregator holds no
+        // single-tenant unlock state, so it has NO /api/readiness route
+        // (brief D3 / sec invariant 6.4): readiness is reported only by each
+        // per-tenant dashboard about itself, never aggregated here.
+        res.end(
+          JSON.stringify({
+            ok: true,
+            mode: "multi",
+            instance: getProcessInstance(),
+            since: getProcessSince(),
+          }),
+        );
         return;
       }
 

@@ -34,8 +34,17 @@
  *                                  EVIDENCE (counts, never a score) + the portable-
  *                                  identity export capability. No score-fetch path;
  *                                  counterparty verification is local bridge crypto.
+ *   GET /api/posture/evidence    - Phase 2 Evidence View (design section 2.5):
+ *                                  filterable audit-entry table with chain
+ *                                  integrity_findings surfaced ON-VIEW. Operator-
+ *                                  gated (same checkAuth as all other posture JSON
+ *                                  routes); never unauthenticated. Filters: agent,
+ *                                  since, operation_type, layer, result, limit.
+ *                                  Reuses AuditLog.query() verbatim; adds NO new
+ *                                  backend query logic.
  *   GET /posture                 - the posture home HTML.
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
+ *   GET /posture/evidence        - the Phase 2 Evidence View HTML shell.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -78,6 +87,7 @@ import {
   QUERY_ANONYMITY_API_PREFIX,
 } from "../query-anonymity/query-anonymity-routes.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
+import { renderPostureEvidenceHTML } from "./posture-evidence-html.js";
 import {
   handlePostureStream,
   type PostureStreamRegistry,
@@ -104,6 +114,13 @@ export const POSTURE_STREAM_PATH = `${POSTURE_API_PREFIX}/stream`;
  * from the path in the browser, so the route only matches the prefix here.
  */
 export const POSTURE_AGENT_PATH_PREFIX = "/posture/agent/";
+/**
+ * Evidence View HTML page (Phase 2, design section 2.5): `/posture/evidence`.
+ * A filterable audit-entry table with chain integrity_findings surfaced on-view.
+ * Served behind the SAME checkAuth gate as `/posture/agent/:id` and the posture
+ * JSON endpoints. The data comes from `/api/posture/evidence` (JSON, same gate).
+ */
+export const POSTURE_EVIDENCE_PATH = "/posture/evidence";
 
 /**
  * Dependencies the route layer needs from the dashboard. All are resolved
@@ -261,6 +278,19 @@ export async function handlePostureRoute(
     return true;
   }
 
+  // Evidence View HTML shell (Phase 2, design section 2.5). A static shell that
+  // fetches `/api/posture/evidence` client-side behind this same auth gate. The
+  // page filters are applied client-side via URL params passed to the JSON API.
+  // Operator-gated: served only AFTER checkAuth (same gate as the JSON routes).
+  if (method === "GET" && path === POSTURE_EVIDENCE_PATH) {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureEvidenceHTML());
+    return true;
+  }
+
   // Query-privacy stats (Phase 2): mount the previously-orphaned
   // `/api/query-anonymity/stats` endpoint behind the SAME checkAuth gate as the
   // rest of the posture surface (the caller ran it before dispatch). It
@@ -391,6 +421,32 @@ export async function handlePostureRoute(
       return true;
     }
 
+    // Evidence View JSON endpoint (Phase 2, design section 2.5). Filterable
+    // audit-entry table with integrity_findings surfaced ON-VIEW.  Reuses
+    // AuditLog.query() verbatim; adds NO new backend query logic.
+    //
+    // HONESTY: integrity_findings are returned as-is from the query result and
+    // must be surfaced by the client.  A chain with findings must NEVER render
+    // green on the client side.  The operator audit is their own data, but it is
+    // ALWAYS operator-gated (this route is behind checkAuth, unreachable to any
+    // unauthenticated caller or non-operator, and cross-tenant is structurally
+    // impossible because each fortress runs a separate AuditLog instance keyed
+    // to its own encrypted storage namespace).
+    //
+    // Supported query params (all optional, all map to existing AuditLog.query()
+    // options; any unrecognised param is silently ignored):
+    //   ?agent=<identity_id>         filter by identity_id
+    //   ?since=<ISO-string>          filter entries at or after this timestamp
+    //   ?operation_type=<string>     filter by operation name
+    //   ?layer=<l1|l2|l3|l4>        filter by layer
+    //   ?result=<success|failure>    filter by result
+    //   ?limit=<number>              max entries to return (default 50, cap 500)
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/evidence`) {
+      const result = await buildEvidence(deps, url);
+      writeJSON(res, 200, result);
+      return true;
+    }
+
     // Recognition + portability panel (P5). GATED on composition-enabled: when
     // composition is OFF the panel is ABSENT entirely (404 within the namespace,
     // NOT a greyed/empty payload), so its mere existence never implies a
@@ -470,63 +526,95 @@ export async function handlePostureRoute(
 
 // ── Composition helpers ──────────────────────────────────────────────
 
+// The always-on posture surface (home board + per-panel endpoints + SSE push)
+// composes several full-window audit reads per paint. Each helper below wraps its
+// build in `AuditLog.runEagerReads` so those reads serve from the eagerly-
+// maintained verified view with an EVENT-DRIVEN out-of-band fingerprint sentinel
+// plus a throttled backstop re-verify, instead of a full chain re-scan per request.
+// On a real 10k-entry / 40MB chain the old path
+// was 11-30s and pegged the event loop, and the SSE cadence made an open board
+// recompute it continuously and wedge the server (the #714 drill). HONESTY is
+// preserved: the eager view reflects every server-written entry with NO lag (the
+// server is the sole appender and verifies each entry as it appends), and the
+// strict integrity-findings contract is unchanged, so `chain_verified` /
+// `integrity_finding_count` / feature-health can never serve stale-green. The
+// agent-facing `/api/posture/evidence` read (`buildEvidence`) deliberately stays
+// on the full per-request re-verify path, keeping per-request on-disk tamper
+// detection on the inspectable audit surface.
 async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPosture> {
-  return buildCastleWallPosture({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCastleWallPosture({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
-  return buildAuditDigest({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildAuditDigest({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
- * Feature-usage health panel. Cache-invalidation rule (review must-fix #4): the
- * panel is recomputed from the audit chain on every request via
- * `buildFeatureHealthPanel`, which reads `AuditLog.query` fresh and re-scans for
- * integrity findings each call. Because each response reflects the current
- * chain head, a post-fault refresh can never show stale green - there is no
- * cross-request cache to invalidate at this layer.
+ * Feature-usage health panel. NEVER-STALE-GREEN rule (the new honesty argument,
+ * superseding the prior "uncached by design" note): the panel reads the audit
+ * chain through `buildFeatureHealthPanel`, which goes via the AuditLog's EAGER
+ * read path here (wrapped in `runEagerReads`). The eager view is maintained on
+ * EVERY append (the server is the sole appender and verifies each new entry as it
+ * records it), so the panel always reflects the current chain head with NO lag.
+ * A post-fault refresh can never show stale green. This is NOT a lazily-cached
+ * value that could fall behind an append: it is the eagerly-maintained verified
+ * state, and a detected integrity finding (at load, on the next eager read via the
+ * fingerprint sentinel, or on the throttled backstop out-of-band re-verify) forces
+ * every row to `unknown`/non-green via the existing `audit_integrity_ok=false`
+ * lever. What the eager path changes versus the old code is ONLY the cadence of the
+ * OUT-OF-BAND on-disk re-scan (a direct file edit that bypasses the server): a
+ * fingerprint-changing edit (count / newest key / per-entry size or mtime) is
+ * caught EVENT-DRIVEN on the next eager read, and only the residual same-length,
+ * mtime-preserved edit waits for the throttled backstop re-verify, instead of
+ * re-verifying the whole chain on every paint (the #714 wedge).
  */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
 ): Promise<FeatureHealthPanel> {
-  return buildFeatureHealthPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
-      ? deps.resolveBrokerPinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-    ...(deps.brokerProducerKeyExpectedButUnavailable
-      ? { brokerProducerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildFeatureHealthPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
+        ? deps.resolveBrokerPinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(deps.brokerProducerKeyExpectedButUnavailable
+        ? { brokerProducerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
@@ -542,10 +630,13 @@ async function buildQueryPrivacy(
 ): Promise<QueryPrivacySection> {
   let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null;
   try {
-    const computed = await computeQueryAnonymityStats({
-      auditLog: deps.auditLog as AuditLog,
-      ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
-    });
+    // Eager read (posture surface): bounded-cost, throttled out-of-band re-verify.
+    const computed = await (deps.auditLog as AuditLog).runEagerReads(() =>
+      computeQueryAnonymityStats({
+        auditLog: deps.auditLog as AuditLog,
+        ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
+      }),
+    );
     stats = {
       window: computed.window,
       total_outbound_calls: computed.total_outbound_calls,
@@ -576,11 +667,86 @@ async function buildQueryPrivacy(
 async function buildCustodyExit(
   deps: PostureRouteDeps,
 ): Promise<CustodyExitPanel> {
-  return buildCustodyExitPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCustodyExitPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+    }),
+  );
+}
+
+/**
+ * Evidence View JSON endpoint (Phase 2, design section 2.5). Reads the audit
+ * chain via `AuditLog.query()` with the operator-supplied filter params and
+ * returns entries + integrity_findings.  Adds NO new backend query logic; it is
+ * a thin URL-param-to-query-options adapter over the existing query API.
+ *
+ * Supported URL params (all optional; unrecognised params are ignored):
+ *   ?agent=<string>            - maps to query.identity_id
+ *   ?since=<ISO-string>        - maps to query.since
+ *   ?operation_type=<string>   - maps to query.operation_type
+ *   ?layer=<l1|l2|l3|l4>      - maps to query.layer
+ *   ?result=<success|failure>  - applied as post-filter (query has no result
+ *                                field; we filter after the query returns)
+ *   ?limit=<number>            - capped at 500; defaults to 50
+ */
+async function buildEvidence(
+  deps: PostureRouteDeps,
+  url: URL,
+): Promise<{
+  origin_machine: string;
+  entries: import("../operational/audit-log.js").AuditEntry[];
+  total: number;
+  integrity_findings: import("../operational/audit-log.js").AuditIntegrityFinding[];
+}> {
+  const auditLog = deps.auditLog as AuditLog;
+
+  // Parse filter params defensively: invalid values are silently ignored so the
+  // endpoint degrades gracefully (a bad param gives unfiltered results, not 500).
+  const agentParam = url.searchParams.get("agent") ?? undefined;
+  const sinceParam = url.searchParams.get("since") ?? undefined;
+  const opParam = url.searchParams.get("operation_type") ?? undefined;
+  const resultParam = url.searchParams.get("result") ?? undefined;
+
+  const layerRaw = url.searchParams.get("layer");
+  const validLayers = ["l1", "l2", "l3", "l4"] as const;
+  type Layer = (typeof validLayers)[number];
+  const layerParam: Layer | undefined =
+    validLayers.includes(layerRaw as Layer) ? (layerRaw as Layer) : undefined;
+
+  const limitRaw = Number(url.searchParams.get("limit") ?? "50");
+  const limitParam = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.min(Math.floor(limitRaw), 500)
+    : 50;
+
+  const queryResult = await auditLog.query({
+    since: sinceParam,
+    layer: layerParam,
+    operation_type: opParam,
+    identity_id: agentParam,
+    limit: limitParam,
   });
+
+  // Result filter is applied as a post-filter (AuditLog.query has no result
+  // param).  We re-derive total to reflect post-filter count.
+  let entries = queryResult.entries;
+  const total = queryResult.total;
+  if (resultParam === "success" || resultParam === "failure") {
+    entries = entries.filter((e) => e.result === resultParam);
+    // total is queryResult.total: the in-window count BEFORE the result
+    // post-filter (and before the limit slice).  It is NOT the count of matched
+    // entries; the client can compare entries.length against total to detect
+    // truncation at the query level, but cannot infer how many in-window entries
+    // matched the result filter.  This is the honest reading of the number.
+  }
+
+  return {
+    origin_machine: deps.originMachine,
+    entries,
+    total,
+    integrity_findings: queryResult.integrity_findings,
+  };
 }
 
 /**
@@ -615,13 +781,15 @@ async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPane
     }
   }
 
-  return buildRecognitionPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
-    reputationEvidence,
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildRecognitionPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
+      reputationEvidence,
+    }),
+  );
 }
 
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
