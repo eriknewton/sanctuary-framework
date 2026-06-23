@@ -744,14 +744,31 @@ export async function getProtectionSnapshot(
       const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
         ? sources.resolvePinnedProducerKey()
         : null;
-      const wall = await buildCastleWallPosture({
-        auditLog: sources.auditLog,
-        originMachine: agent.primary_identity_id ?? "local",
-        pinnedProducerKeyB64url,
-        ...(sources.producerKeyExpectedButUnavailable
-          ? { producerKeyExpectedButUnavailable: true }
-          : {}),
-      });
+      // EAGER SCOPE (hero-shield arm badge): the snapshot is the operator-facing
+      // rollup; this is the SAME enforcement-evidenced arm-state the
+      // `/api/posture/castle-wall` route serves and #717 already wraps. Run the
+      // shaper's audit read on the eagerly-maintained verified view so a snapshot
+      // poll on a 10k-entry chain is bounded-cost (O(1)) instead of an 11-30s
+      // full-chain re-verify per request. PER-TENANT SAFE: `runEagerReads` opens
+      // an AsyncLocalStorage scope around THIS specific AuditLog instance's call
+      // and the shaper's `query` reads that instance's own in-memory verified
+      // view (`this.entries`); a different tenant's snapshot passes its own
+      // `sources.auditLog`, so there is no shared mutable state and no
+      // cross-tenant read. Honesty is unchanged: the eager view reflects every
+      // server-written entry with NO lag, the #717 fingerprint sentinel plus
+      // throttled backstop catch out-of-band tampering, and the shaper's
+      // freshness/evidence gating (unknown / degraded, never armed without fresh
+      // verified evidence) is untouched: only WHERE its `query` runs changes.
+      const wall = await sources.auditLog.runEagerReads(() =>
+        buildCastleWallPosture({
+          auditLog: sources.auditLog as AuditLog,
+          originMachine: agent.primary_identity_id ?? "local",
+          pinnedProducerKeyB64url,
+          ...(sources.producerKeyExpectedButUnavailable
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
       wallArmState = wall.arm_state;
     } catch {
       wallArmState = "unknown";

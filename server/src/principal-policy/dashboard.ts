@@ -1185,15 +1185,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           producer_authenticity: "not_applicable",
         };
       }
-      return await buildCastleWallPosture({
-        auditLog: this.auditLog,
-        originMachine,
-        pinnedProducerKeyB64url:
-          load?.status === "present" ? load.keyB64url : null,
-        ...(load?.status === "unreadable"
-          ? { producerKeyExpectedButUnavailable: true }
-          : {}),
-      });
+      // EAGER SCOPE (badge surface): `/v1/status` is the SESSION_TOKEN-gated
+      // operator status document the native app polls for the arm badge, exactly
+      // like the `/api/posture/castle-wall` route #717 already wraps. Run the
+      // shaper's audit read on the eagerly-maintained verified view so a badge
+      // poll on a 10k-entry chain is bounded-cost (O(1)) instead of an 11-30s
+      // full-chain re-verify per request. Honesty is unchanged: the eager view
+      // reflects every server-written entry with NO lag, the #717 fingerprint
+      // sentinel plus throttled backstop catch out-of-band tampering, and the
+      // shaper's own freshness/evidence gating (unknown / degraded, never armed
+      // without fresh verified evidence) is untouched: only WHERE its `query`
+      // runs changes. This is the operator/badge read, NOT the agent-facing
+      // `/api/posture/evidence` audit surface (which deliberately stays
+      // per-request re-verified).
+      return await this.auditLog.runEagerReads(() =>
+        buildCastleWallPosture({
+          auditLog: this.auditLog as AuditLog,
+          originMachine,
+          pinnedProducerKeyB64url:
+            load?.status === "present" ? load.keyB64url : null,
+          ...(load?.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
     } catch {
       // Defensive: a health probe must never fail. Fall back to an honest
       // `unknown` posture rather than throwing or claiming green.
