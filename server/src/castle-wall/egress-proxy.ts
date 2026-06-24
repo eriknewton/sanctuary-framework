@@ -6,6 +6,9 @@ import { domainToASCII } from "node:url";
 
 import type { AllowlistRule } from "./allowlist/schema.js";
 import { ipMatches, cidrMatches } from "./allowlist/ip-cidr.js";
+import type { AuditEntryInput } from "../operational/audit-log.js";
+import type { PluginContribution } from "../substrate/attribution.js";
+import { intersectVerdicts, type EnforcementDecision, type HostDecision } from "../substrate/verdict.js";
 
 export interface CanonicalConnectAuthority {
   host: string;
@@ -34,8 +37,36 @@ export class ConnectAuthorityError extends Error {
 }
 
 export type EgressProxyDecision =
-  | { disposition: "deny"; reason: "canonicalization_failed" | "allowlist_miss" | "non_public_resolved_address" }
-  | { disposition: "allow"; target: CanonicalConnectAuthority; address: string };
+  | {
+      disposition: "deny";
+      reason:
+        | "canonicalization_failed"
+        | "allowlist_miss"
+        | "non_public_resolved_address"
+        | "plugin_decision"
+        | "audit_failed";
+      contributors?: PluginContribution[];
+    }
+  | { disposition: "allow"; target: CanonicalConnectAuthority; address: string; contributors?: PluginContribution[] };
+
+export interface EgressPluginConsultationRequest {
+  target: CanonicalConnectAuthority;
+  hostDecision: HostDecision;
+  protocol: "tcp";
+}
+
+export interface EgressPluginConsultationResult {
+  decisions: EnforcementDecision[];
+  contributors: PluginContribution[];
+}
+
+export interface EgressPluginConsultant {
+  consultEgress(request: EgressPluginConsultationRequest): Promise<EgressPluginConsultationResult>;
+}
+
+export interface EgressAuditSink {
+  appendCritical(entry: AuditEntryInput): Promise<void>;
+}
 
 export interface EgressProxyResolver {
   resolve(host: string): Promise<string[]>;
@@ -46,6 +77,11 @@ export interface EgressProxyOptions {
   resolver?: EgressProxyResolver;
   /** Override the public-routability check (for testing with local upstreams). */
   isRoutable?: (address: string) => boolean;
+  /** Optional plugin-host S4 hook. Absence preserves the pre-plugin path exactly. */
+  pluginConsultant?: EgressPluginConsultant;
+  /** Optional audit sink for egress decisions with plugin participation. */
+  auditSink?: EgressAuditSink;
+  auditIdentityId?: string;
   /** Called after every CONNECT decision, before the response is sent. */
   onDecision?: (authority: string, decision: EgressProxyDecision) => void;
 }
@@ -146,7 +182,7 @@ export async function decideEgressProxyConnect(
   }
 
   if (!allowlistAllowsTarget(options.rules, target)) {
-    return { disposition: "deny", reason: "allowlist_miss" };
+    return applyEgressPlugins(authority, { disposition: "deny", reason: "allowlist_miss" }, target, options);
   }
 
   const addresses = target.isIpLiteral
@@ -155,9 +191,78 @@ export async function decideEgressProxyConnect(
   const routableCheck = options.isRoutable ?? isPublicRoutableIp;
   const publicAddress = addresses.find(routableCheck);
   if (!publicAddress) {
-    return { disposition: "deny", reason: "non_public_resolved_address" };
+    return applyEgressPlugins(
+      authority,
+      { disposition: "deny", reason: "non_public_resolved_address" },
+      target,
+      options
+    );
   }
-  return { disposition: "allow", target, address: publicAddress };
+  return applyEgressPlugins(authority, { disposition: "allow", target, address: publicAddress }, target, options);
+}
+
+async function applyEgressPlugins(
+  authority: string,
+  hostDecision: EgressProxyDecision,
+  target: CanonicalConnectAuthority,
+  options: EgressProxyOptions
+): Promise<EgressProxyDecision> {
+  if (!options.pluginConsultant) return hostDecision;
+
+  const hostVerdict: HostDecision = hostDecision.disposition === "allow" ? "permit" : "deny";
+  let consultation: EgressPluginConsultationResult;
+  try {
+    consultation = await options.pluginConsultant.consultEgress({
+      target,
+      hostDecision: hostVerdict,
+      protocol: "tcp",
+    });
+  } catch {
+    if (hostVerdict === "deny") return hostDecision;
+    return { disposition: "deny", reason: "plugin_decision" };
+  }
+
+  const contributors =
+    consultation.contributors.length > 0 ? { contributors: consultation.contributors } : {};
+  const composed = intersectVerdicts(hostVerdict, consultation.decisions);
+  const decision =
+    hostVerdict === "deny"
+      ? { ...hostDecision, ...contributors }
+      : composed === "permit"
+        ? { ...hostDecision, ...contributors }
+        : ({ disposition: "deny", reason: "plugin_decision", ...contributors } as EgressProxyDecision);
+  return appendPluginAuditIfConfigured(authority, decision, options);
+}
+
+async function appendPluginAuditIfConfigured(
+  authority: string,
+  decision: EgressProxyDecision,
+  options: EgressProxyOptions
+): Promise<EgressProxyDecision> {
+  if (!options.auditSink || !decision.contributors || decision.contributors.length === 0) {
+    return decision;
+  }
+  try {
+    await options.auditSink.appendCritical({
+      layer: "l1",
+      operation: "egress_decision",
+      identity_id: options.auditIdentityId ?? "system",
+      result: decision.disposition === "allow" ? "success" : "failure",
+      details: {
+        authority,
+        disposition: decision.disposition,
+        reason: decision.disposition === "deny" ? decision.reason : "allow",
+      },
+      contributors: decision.contributors,
+    });
+    return decision;
+  } catch {
+    return {
+      disposition: "deny",
+      reason: "audit_failed",
+      contributors: decision.contributors,
+    };
+  }
 }
 
 export function createCastleWallEgressProxyServer(options: EgressProxyOptions): http.Server {
