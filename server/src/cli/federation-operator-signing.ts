@@ -37,6 +37,10 @@ import { sign } from "../core/identity.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { loadConfig } from "../config.js";
 import { buildOperatorSignedMessage } from "../v1/operator-signed.js";
+import {
+  buildOperatorAttestationMessage,
+  type OperatorEd25519Attestation,
+} from "../v1/operator-attestation.js";
 
 /** Raised when no operator identity can be unlocked; mapped to a fail-closed exit. */
 export class OperatorSigningError extends Error {
@@ -67,6 +71,16 @@ export interface OperatorSigner {
    * signature ready to attach as `operator_signature` in the request body.
    */
   signPayload(action: string, payload: unknown): string;
+  /**
+   * Sign a durable Ed25519 operator attestation binding `clientPubkey` (the
+   * ephemeral /v1 session client key) at `issuedAtMs`. The admin verbs use this
+   * to OPEN a /v1 session before driving a session-gated `/v1/federation/*`
+   * endpoint: the same operator identity that authorizes the write also opens
+   * the session, so the operator is unlocked exactly once. The attestation is
+   * the credentialed `/v1` session path (works regardless of loopback
+   * auto-auth), verified by the daemon against this same operator key.
+   */
+  signAttestation(clientPubkey: Uint8Array, issuedAtMs: number): OperatorEd25519Attestation;
 }
 
 /**
@@ -145,6 +159,27 @@ export async function openOperatorSigner(
       const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
       try {
         return toBase64url(signature);
+      } finally {
+        signature.fill(0);
+      }
+    },
+    signAttestation(clientPubkey: Uint8Array, issuedAtMs: number): OperatorEd25519Attestation {
+      // Reuse the SAME encrypted-key sign() path (constraint 6: the private key
+      // is decrypted transiently and zeroed in sign()'s finally; never exposed
+      // here). Mirrors signOperatorAttestation but without a raw private key.
+      const message = buildOperatorAttestationMessage(
+        operatorPublicKey,
+        clientPubkey,
+        issuedAtMs,
+      );
+      const signature = sign(message, encryptedPrivateKey, identityEncryptionKey);
+      try {
+        return {
+          type: "operator_ed25519",
+          operator_pubkey: toBase64url(operatorPublicKey),
+          issued_at: issuedAtMs,
+          signature: toBase64url(signature),
+        };
       } finally {
         signature.fill(0);
       }
