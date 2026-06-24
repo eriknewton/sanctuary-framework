@@ -1,7 +1,7 @@
 /**
  * `sanctuary federation join` (Federation PR-A3).
  *
- * Runs on the JOINING node. Wraps the existing mesh lifecycle primitives —
+ * Runs on the JOINING node. Wraps the existing mesh lifecycle primitives --
  * it generates the node keypair, derives the master-bound HKDF salt proof,
  * and assembles a JoinRequest from an operator-issued bootstrap token, then
  * submits it to the fortress's `/v1/federation/authorize/complete` endpoint
@@ -10,7 +10,7 @@
  * The bootstrap token comes from the operator (who minted it via
  * `/v1/federation/authorize/init`). The fortress master secret is delivered
  * out of band when a node joins a local-mode fortress (SANCTUARY mesh design
- * §3.1) — here it is supplied explicitly via env/flag, which IS that
+ * §3.1) -- here it is supplied explicitly via env/flag, which IS that
  * out-of-band channel. The node private key is generated transiently and
  * never leaves this process; only the public key rides in the JoinRequest.
  */
@@ -29,15 +29,27 @@ import {
   type OperatorCloudProvisionBundle,
 } from "../mesh/operator-cloud-provision.js";
 import type { BootstrapToken, JoinRequest } from "../mesh/lifecycle/types.js";
+import type {
+  FortressMasterPublicKey,
+  NodeIdentityCertificate,
+  PrincipalCertificate,
+} from "../mesh/types.js";
+import type { NodeMode } from "../mesh/constants.js";
+import { persistFederationJoinerTrustRoot } from "../mesh/federation-joiner-trust-root-store.js";
 import {
   dashboardRequest,
   DashboardRequestError,
   type DashboardRequestContext,
 } from "./dashboard-request.js";
+import {
+  openOperatorSigner,
+  OperatorSigningError,
+  type OperatorSigner,
+} from "./federation-operator-signing.js";
 
 export interface AssembledJoin {
   joinRequest: JoinRequest;
-  /** Transient node Ed25519 private key — caller MUST zero after use. */
+  /** Transient node Ed25519 private key -- caller MUST zero after use. */
   nodePrivateKey: Uint8Array;
   nodePublicKey: Uint8Array;
 }
@@ -140,6 +152,16 @@ interface JoinFlags {
   deliveryKeyB64?: string;
   /** Operator Cloud Slice 2: delivery target string bound into the bundle digest. */
   deliveryTarget?: string;
+  /** Slice 3b: persist the issued joiner trust root after a successful join (default OFF). */
+  persist: boolean;
+  /** Slice 3b: out-of-band pinned master JSON (FortressMasterPublicKey) for --persist. */
+  pinnedMasterJson?: string;
+  /** Slice 3b: custody passphrase for --persist (opens the local fortress to write the joiner store). */
+  passphrase?: string;
+  /** Slice 3b: custody recovery key for --persist (alternative to passphrase). */
+  recoveryKey?: string;
+  /** Slice 3b: fortress path override for --persist. */
+  fortressPath?: string;
 }
 
 function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
@@ -154,6 +176,11 @@ function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
     provisionBundleJson: flag("--provision-bundle"),
     deliveryKeyB64: flag("--delivery-key") ?? env.SANCTUARY_OC_DELIVERY_KEY,
     deliveryTarget: flag("--delivery-target"),
+    persist: argv.includes("--persist"),
+    pinnedMasterJson: flag("--pinned-master"),
+    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    fortressPath: flag("--fortress"),
   };
 }
 
@@ -168,16 +195,56 @@ export async function runFederationJoin(args: {
   out?: Writable;
   err?: Writable;
   request?: typeof dashboardRequest;
+  /**
+   * Slice 3b seam: opens the local fortress + writes the joiner trust root for
+   * `--persist`. Defaults to the real custody-unlocking implementation; tests
+   * inject a stub to assert the persist contract (out-of-band pinned master,
+   * cert-chain refusal) without unlocking a real fortress.
+   */
+  persistJoinerTrustRoot?: typeof persistJoinerTrustRootFromJoin;
 }): Promise<number> {
   const env = args.env ?? process.env;
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const request = args.request ?? dashboardRequest;
+  const persistJoiner = args.persistJoinerTrustRoot ?? persistJoinerTrustRootFromJoin;
   const flags = parseJoinFlags(args.argv, env);
 
   if (!flags.fortressUrl) {
     err.write("sanctuary federation join: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n");
     return 1;
+  }
+
+  // Slice 3b: --persist requires an OUT-OF-BAND pinned master (never inferred
+  // from the server response, constraint 4) and a custody credential to open
+  // the local fortress. Validate up front so a missing prerequisite fails the
+  // verb cleanly BEFORE a join ceremony runs (do not join, then discover we
+  // cannot persist).
+  let pinnedMaster: FortressMasterPublicKey | null = null;
+  if (flags.persist) {
+    if (!flags.pinnedMasterJson) {
+      err.write(
+        "sanctuary federation join: --persist requires --pinned-master <json> " +
+          "(the out-of-band fortress-master public key this joiner trusts; " +
+          "the server response is never the trust source)\n",
+      );
+      return 1;
+    }
+    pinnedMaster = parsePinnedMaster(flags.pinnedMasterJson);
+    if (pinnedMaster === null) {
+      err.write(
+        "sanctuary federation join: --pinned-master is not a valid FortressMasterPublicKey " +
+          "(needs public_key, fortress_id, created_at)\n",
+      );
+      return 1;
+    }
+    if (!flags.passphrase && !flags.recoveryKey) {
+      err.write(
+        "sanctuary federation join: --persist needs an unlocked operator identity " +
+          "(set SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY)\n",
+      );
+      return 1;
+    }
   }
 
   // Operator Cloud Slice 2: a scoped provision bundle REPLACES the raw fortress
@@ -306,10 +373,56 @@ export async function runFederationJoin(args: {
       err.write("sanctuary federation join: fortress returned no certificate\n");
       return 3;
     }
+
+    let persisted = false;
+    if (flags.persist) {
+      // pinnedMaster + custody credential were validated up front. Persist the
+      // joiner trust root BEFORE printing and BEFORE the finally zeroes the node
+      // key. The store re-runs the full cert-chain verification against the
+      // OUT-OF-BAND pinned master and refuses a cert that does not chain to it
+      // (constraint 4), so a server response that does not match the pinned
+      // anchor fails the verb non-zero rather than persisting bad trust.
+      if (
+        typeof response.issuing_principal_cert !== "object" ||
+        response.issuing_principal_cert === null
+      ) {
+        err.write(
+          "sanctuary federation join: --persist requires the issuing principal cert " +
+            "in the join response; the fortress returned none\n",
+        );
+        return 3;
+      }
+      try {
+        await persistJoiner({
+          pinnedMaster: pinnedMaster as FortressMasterPublicKey,
+          issuingPrincipalCert:
+            response.issuing_principal_cert as PrincipalCertificate,
+          localNodeCert: response.certificate as NodeIdentityCertificate,
+          localNodePrivateKey: assembled.nodePrivateKey,
+          ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+          ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+          ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+        });
+        persisted = true;
+      } catch (persistErr) {
+        const reason =
+          persistErr instanceof OperatorSigningError
+            ? persistErr.message
+            : "the issued certificate does not chain to --pinned-master, or the " +
+              "local fortress could not be opened";
+        err.write(
+          `sanctuary federation join: joined, but refused to persist the joiner ` +
+            `trust root: ${reason}\n`,
+        );
+        return 3;
+      }
+    }
+
     out.write(
       `${JSON.stringify(
         {
           joined: true,
+          persisted,
           node_id: bootstrapToken.intended_node_id,
           node_pubkey: toBase64url(assembled.nodePublicKey),
           certificate: response.certificate,
@@ -324,7 +437,7 @@ export async function runFederationJoin(args: {
     if (cause instanceof DashboardRequestError) {
       if (cause.kind === "auth") {
         err.write(
-          "sanctuary federation join: join denied — the fortress rejected this request " +
+          "sanctuary federation join: join denied -- the fortress rejected this request " +
             "(bad/expired bootstrap token, wrong master secret, or operator denial)\n",
         );
         return 3;
@@ -341,15 +454,327 @@ export async function runFederationJoin(args: {
   }
 }
 
-const FEDERATION_HELP = `sanctuary federation — cross-machine federation (Wave 1, PR-A3)
+/** Parse + structurally validate an out-of-band FortressMasterPublicKey JSON. */
+function parsePinnedMaster(json: string): FortressMasterPublicKey | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const candidate = parsed as Record<string, unknown>;
+  if (
+    typeof candidate.public_key !== "string" ||
+    candidate.public_key.length === 0 ||
+    typeof candidate.fortress_id !== "string" ||
+    candidate.fortress_id.length === 0 ||
+    typeof candidate.created_at !== "string" ||
+    candidate.created_at.length === 0
+  ) {
+    return null;
+  }
+  return {
+    public_key: candidate.public_key,
+    fortress_id: candidate.fortress_id,
+    created_at: candidate.created_at,
+  };
+}
 
-Usage:
+/**
+ * Real `--persist` implementation: open the local fortress headless
+ * (keychain-safe, no modal) and write the joiner trust root, encrypted under
+ * the joiner's own custody master. The pinned master is the OUT-OF-BAND trust
+ * anchor; `persistFederationJoinerTrustRoot` re-runs the full cert-chain
+ * verification and refuses a cert that does not chain to it (constraint 4).
+ * The node private key is zeroed by the caller's `finally`; the master key is
+ * zeroed here after the write.
+ */
+export async function persistJoinerTrustRootFromJoin(opts: {
+  pinnedMaster: FortressMasterPublicKey;
+  issuingPrincipalCert: PrincipalCertificate;
+  localNodeCert: NodeIdentityCertificate;
+  localNodePrivateKey: Uint8Array;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}): Promise<void> {
+  // Reuse the same keychain-safe custody-unlock path the admin verbs use; it
+  // fails closed (OperatorSigningError) when only a keychain credential exists
+  // in a headless session. We need only the master key + storage from it.
+  const signer = await openOperatorSigner({
+    ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
+    ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
+    ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
+  });
+  try {
+    await persistFederationJoinerTrustRoot({
+      storage: signer.storage,
+      masterKey: signer.masterKey,
+      pinnedMasterPubkey: opts.pinnedMaster,
+      issuingPrincipalCert: opts.issuingPrincipalCert,
+      localNodeCert: opts.localNodeCert,
+      localNodePrivateKey: opts.localNodePrivateKey,
+    });
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+interface AdminFlags {
+  fortressUrl?: string;
+  authToken?: string;
+  idempotencyKey?: string;
+  nodeId?: string;
+  nodeMode: NodeMode;
+  nodeModeValid: boolean;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}
+
+function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  const rawMode = flag("--node-mode") ?? "local";
+  const nodeModeValid = (["local", "operator_cloud", "sovereign_tee"] as const).includes(
+    rawMode as NodeMode,
+  );
+  return {
+    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    authToken: flag("--auth-token") ?? env.SANCTUARY_DASHBOARD_AUTH_TOKEN,
+    idempotencyKey: flag("--idempotency-key"),
+    nodeId: flag("--node-id"),
+    nodeMode: rawMode as NodeMode,
+    nodeModeValid,
+    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    fortressPath: flag("--fortress"),
+  };
+}
+
+function adminRequestContext(flags: AdminFlags): DashboardRequestContext {
+  // An explicit auth token overrides; otherwise rely on loopback auto-auth
+  // (an empty token sends NO Authorization header -- the local operator session
+  // path the dashboard auto-authorizes for 127.0.0.1).
+  return {
+    ...(flags.fortressUrl !== undefined ? { dashboardUrl: flags.fortressUrl } : {}),
+    authToken: flags.authToken ?? "",
+  };
+}
+
+/**
+ * Open the operator signer (keychain-safe) for an admin verb, mapping the
+ * fail-closed `OperatorSigningError` to a clear message + non-zero exit. The
+ * caller MUST zero `signer.masterKey` after use.
+ */
+async function openAdminSigner(
+  verb: string,
+  flags: AdminFlags,
+  err: Writable,
+): Promise<OperatorSigner | number> {
+  try {
+    return await openOperatorSigner({
+      ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+      ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+      ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+    });
+  } catch (cause) {
+    if (cause instanceof OperatorSigningError) {
+      err.write(`sanctuary federation ${verb}: ${cause.message}\n`);
+      return 3;
+    }
+    err.write(`sanctuary federation ${verb}: unexpected error: ${String(cause)}\n`);
+    return 1;
+  }
+}
+
+/** Map a DashboardRequestError to the catalog exit code + a clear message. */
+function mapAdminRequestError(
+  verb: string,
+  cause: unknown,
+  fortressUrl: string,
+  err: Writable,
+): number {
+  if (cause instanceof DashboardRequestError) {
+    if (cause.kind === "auth") {
+      err.write(`sanctuary federation ${verb}: operator authorization rejected\n`);
+      return 3;
+    }
+    if (cause.kind === "server") {
+      err.write(
+        `sanctuary federation ${verb}: federation is not provisioned on this fortress\n`,
+      );
+      return 3;
+    }
+    if (cause.kind === "not-implemented") {
+      err.write(
+        `sanctuary federation ${verb}: this endpoint is not available on the fortress\n`,
+      );
+      return 3;
+    }
+    err.write(`sanctuary federation ${verb}: fortress unreachable at ${fortressUrl}\n`);
+    return 2;
+  }
+  err.write(`sanctuary federation ${verb}: unexpected error: ${String(cause)}\n`);
+  return 1;
+}
+
+/**
+ * `sanctuary federation enable` / `disable`. Operator-signed Tier-1 admin verbs
+ * that drive the existing `/v1/federation/enable` (resp. `/disable`) endpoint.
+ * Thin client: produces the inline operator signature the server independently
+ * verifies; introduces no second trust-decision path. Fails closed when no
+ * operator identity can be unlocked.
+ */
+export async function runFederationEnableDisable(args: {
+  enable: boolean;
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const request = args.request ?? dashboardRequest;
+  const verb = args.enable ? "enable" : "disable";
+  const action = args.enable ? "/v1/federation/enable" : "/v1/federation/disable";
+  const flags = parseAdminFlags(args.argv, env);
+
+  if (!flags.fortressUrl) {
+    err.write(
+      `sanctuary federation ${verb}: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n`,
+    );
+    return 1;
+  }
+
+  const signer = await openAdminSigner(verb, flags, err);
+  if (typeof signer === "number") return signer;
+  try {
+    // The signed payload MUST match the server's reconstruction exactly: the
+    // server includes idempotency_key only when it is a string.
+    const signedPayload: Record<string, unknown> = {};
+    if (flags.idempotencyKey !== undefined) {
+      signedPayload.idempotency_key = flags.idempotencyKey;
+    }
+    const operatorSignature = signer.signPayload(action, signedPayload);
+    const body = { ...signedPayload, operator_signature: operatorSignature };
+
+    const response = (await request(
+      action,
+      { method: "POST", body: JSON.stringify(body) },
+      adminRequestContext(flags),
+    )) as { enabled?: unknown };
+    out.write(`${JSON.stringify({ enabled: response.enabled === true }, null, 2)}\n`);
+    return 0;
+  } catch (cause) {
+    return mapAdminRequestError(verb, cause, flags.fortressUrl, err);
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+/**
+ * `sanctuary federation authorize [init]`. Operator-signed Tier-1 verb that
+ * mints a bootstrap token for a node the operator is authorizing to join, via
+ * `/v1/federation/authorize/init`. Prints the bootstrap token JSON (the
+ * intended output) ready to hand to the joiner's `federation join`.
+ */
+export async function runFederationAuthorize(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const request = args.request ?? dashboardRequest;
+  const action = "/v1/federation/authorize/init";
+  // Accept both `authorize` and `authorize init`; strip a leading `init`.
+  const argv = args.argv[0] === "init" ? args.argv.slice(1) : args.argv;
+  const flags = parseAdminFlags(argv, env);
+
+  if (!flags.fortressUrl) {
+    err.write(
+      "sanctuary federation authorize: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n",
+    );
+    return 1;
+  }
+  if (!flags.nodeId) {
+    err.write("sanctuary federation authorize: --node-id <id> is required\n");
+    return 1;
+  }
+  if (!flags.nodeModeValid) {
+    err.write(
+      "sanctuary federation authorize: --node-mode must be local, operator_cloud, or sovereign_tee\n",
+    );
+    return 1;
+  }
+
+  const signer = await openAdminSigner("authorize", flags, err);
+  if (typeof signer === "number") return signer;
+  try {
+    const signedPayload: Record<string, unknown> = {
+      intended_node_id: flags.nodeId,
+      intended_node_mode: flags.nodeMode,
+    };
+    const operatorSignature = signer.signPayload(action, signedPayload);
+    const body = { ...signedPayload, operator_signature: operatorSignature };
+
+    const response = (await request(
+      action,
+      { method: "POST", body: JSON.stringify(body) },
+      adminRequestContext(flags),
+    )) as { bootstrap_token?: unknown };
+    if (typeof response.bootstrap_token !== "object" || response.bootstrap_token === null) {
+      err.write("sanctuary federation authorize: fortress returned no bootstrap token\n");
+      return 3;
+    }
+    // The bootstrap token is the intended output of authorize (NOT a secret to
+    // suppress): hand it to the joiner's `federation join --bootstrap-token`.
+    out.write(`${JSON.stringify({ bootstrap_token: response.bootstrap_token }, null, 2)}\n`);
+    return 0;
+  } catch (cause) {
+    return mapAdminRequestError("authorize", cause, flags.fortressUrl, err);
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+const FEDERATION_HELP = `sanctuary federation -- cross-machine federation (Wave 1)
+
+Operator (issuer) verbs -- operator-signed, run on the home fortress:
+  sanctuary federation enable  --fortress-url <url> [--idempotency-key <s>]
+  sanctuary federation disable --fortress-url <url> [--idempotency-key <s>]
+  sanctuary federation authorize [init] --fortress-url <url> --node-id <id> \\
+    [--node-mode local|operator_cloud|sovereign_tee]
+
+  enable / disable   Turn federation on/off for this fortress. Operator-signed
+                     Tier-1: needs an unlocked default operator identity
+                     (SANCTUARY_PASSPHRASE / --passphrase / SANCTUARY_RECOVERY_KEY).
+                     Enable fails closed if the fortress is not provisioned.
+
+  authorize [init]   Mint a bootstrap token for a node you are authorizing to
+                     join (POST /v1/federation/authorize/init). Prints the
+                     bootstrap token JSON to hand to the joiner's
+                     'federation join --bootstrap-token'. Operator-signed Tier-1.
+
+Joiner verb -- runs on the joining node:
   Local / sovereign_tee node:
   sanctuary federation join --fortress-url <url> --bootstrap-token <json> [--master-secret <b64url>]
 
   Operator-cloud node (Slice 2 scoped custody):
   sanctuary federation join --fortress-url <url> --provision-bundle <json> \\
     --delivery-key <b64url> --delivery-target <target>
+
+  Persist the joiner trust root (boots this node provisioned next start):
+  sanctuary federation join ... --persist --pinned-master <FortressMasterPublicKey json>
 
   join     Submit a JoinRequest to a fortress and install the issued node
            certificate. The bootstrap token is minted by the operator on the
@@ -363,8 +788,13 @@ Usage:
            operator-approved channel. The bundle carries only this node's scoped
            proof key and assigned grants; the master secret stays home.
 
-Federation enable/disable/status and join authorization are operator actions
-driven from the dashboard / host app over the session-gated /v1/federation API.
+           --persist (default OFF) writes the issued joiner trust root to the
+           local fortress so this node boots provisioned. It requires the
+           OUT-OF-BAND --pinned-master (the fortress-master public key you trust;
+           the server response is never the trust source) and refuses to persist
+           a certificate that does not chain to it. It opens the local fortress,
+           so an operator credential is required (SANCTUARY_PASSPHRASE /
+           --passphrase / SANCTUARY_RECOVERY_KEY).
 `;
 
 export async function runFederationCommand(args: {
@@ -381,6 +811,16 @@ export async function runFederationCommand(args: {
   }
   if (sub === "join") {
     return runFederationJoin({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "enable" || sub === "disable") {
+    return runFederationEnableDisable({
+      ...args,
+      enable: sub === "enable",
+      argv: args.argv.slice(1),
+    });
+  }
+  if (sub === "authorize") {
+    return runFederationAuthorize({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
     `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,
