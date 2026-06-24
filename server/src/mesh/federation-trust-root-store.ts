@@ -27,7 +27,9 @@ import {
   verifyCertChain,
   verifyPrincipalCertificate,
 } from "./trust-root.js";
+import { FEDERATION_ROOT_ROTATION_KIND } from "./trust-root.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   NodeIdentityCertificate,
   PrincipalCertificate,
@@ -49,6 +51,21 @@ export interface FederationTrustRootRecord {
   issuing_principal_private_key: Uint8Array;
   local_node_cert: NodeIdentityCertificate;
   local_node_private_key: Uint8Array;
+  /**
+   * Slice 3a (rotate-root --renew): the monotonic rotation serial of the CURRENT
+   * master. Absent on a freshly-provisioned root (serial 0 implicitly); set to a
+   * strictly-advancing integer by each renewal so a replayed/stale rotation cert
+   * is rejected. Additive + optional: pre-rotation records omit it.
+   */
+  rotation_serial?: number;
+  /**
+   * Slice 3a: the rotation certificate signed by the PREVIOUS master attesting
+   * THIS master. Present once the root has been rotated at least once; a joiner
+   * that still pins the previous master adopts the new key by verifying this cert
+   * (Slice 3b). PUBLIC (an old-key signature over the new PUBLIC key); safe at
+   * rest and exportable. Absent on a freshly-provisioned root.
+   */
+  rotation_cert?: FederationRootRotationCertificate;
 }
 
 interface PersistedFederationTrustRootRecord {
@@ -61,6 +78,8 @@ interface PersistedFederationTrustRootRecord {
   issuing_principal_private_key: string;
   local_node_cert: NodeIdentityCertificate;
   local_node_private_key: string;
+  rotation_serial?: number;
+  rotation_cert?: FederationRootRotationCertificate;
 }
 
 export class FederationTrustRootStoreError extends Error {
@@ -317,6 +336,12 @@ function encodePersistedRecord(
       record.local_node_private_key,
       "local_node_private_key",
     ),
+    ...(typeof record.rotation_serial === "number"
+      ? { rotation_serial: record.rotation_serial }
+      : {}),
+    ...(record.rotation_cert
+      ? { rotation_cert: { ...record.rotation_cert } }
+      : {}),
   };
 }
 
@@ -356,6 +381,15 @@ function decodePersistedRecord(value: unknown): FederationTrustRootRecord {
       readString(value, "local_node_private_key"),
       "local_node_private_key",
     ),
+    ...(typeof value.rotation_serial === "number"
+      ? { rotation_serial: value.rotation_serial }
+      : {}),
+    ...(isObject(value.rotation_cert)
+      ? {
+          rotation_cert:
+            value.rotation_cert as unknown as FederationRootRotationCertificate,
+        }
+      : {}),
   };
   validateRecord(record);
   return record;
@@ -415,6 +449,49 @@ function validateRecord(record: FederationTrustRootRecord): void {
     record.issuing_principal_cert,
     record.pinned_master_pubkey,
   );
+  // Slice 3a: when a rotation cert / serial is present they must cohere with the
+  // record's CURRENT master (the cert attests the new master K2 == this record's
+  // pinned master, names this record's fortress_id and serial). A record carrying
+  // a rotation cert that does not match its own master is rejected: a renewal
+  // record must be self-consistent before it can serve laggard joiners (3b).
+  if (record.rotation_cert !== undefined || record.rotation_serial !== undefined) {
+    if (
+      typeof record.rotation_serial !== "number" ||
+      !Number.isInteger(record.rotation_serial) ||
+      record.rotation_serial < 1
+    ) {
+      throw new FederationTrustRootStoreError(
+        "rotation_serial must be a positive integer when a rotation has occurred",
+      );
+    }
+    if (record.rotation_cert === undefined) {
+      throw new FederationTrustRootStoreError(
+        "rotation_serial present without a rotation_cert",
+      );
+    }
+    const cert = record.rotation_cert;
+    if (cert.kind !== FEDERATION_ROOT_ROTATION_KIND) {
+      throw new FederationTrustRootStoreError("rotation_cert kind is not the rotation tag");
+    }
+    if (cert.fortress_id !== record.fortress_id) {
+      throw new FederationTrustRootStoreError("rotation_cert fortress_id mismatch");
+    }
+    if (cert.new_master.public_key !== record.pinned_master_pubkey.public_key) {
+      throw new FederationTrustRootStoreError(
+        "rotation_cert new_master does not match the record's current pinned master",
+      );
+    }
+    if (cert.rotation_serial !== record.rotation_serial) {
+      throw new FederationTrustRootStoreError(
+        "rotation_cert rotation_serial does not match the record rotation_serial",
+      );
+    }
+    if (cert.old_master_pubkey === record.pinned_master_pubkey.public_key) {
+      throw new FederationTrustRootStoreError(
+        "rotation_cert old_master_pubkey must differ from the new (current) master",
+      );
+    }
+  }
 }
 
 function assertKeyLength(value: Uint8Array, label: string): void {

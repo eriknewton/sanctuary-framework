@@ -1421,6 +1421,20 @@ export async function rotateMaster(
     );
   }
 
+  // Mutual exclusion with the federation rotate-root journal (Slice 3a). A
+  // federation signing-master rotation re-keys the _federation/trust-root-v1
+  // payload; running a custody rotation concurrently could re-encrypt a
+  // half-rotated payload. Refuse until the federation rotation is resumed. The
+  // namespace/key are the literal mesh constants (core must not import mesh, the
+  // wrong layering direction): FEDERATION_TRUST_ROOT_NAMESPACE +
+  // FEDERATION_ROTATE_ROOT_JOURNAL_KEY in mesh/federation-rotate-root.ts.
+  if (await storage.read("_federation", "rotate-root-journal")) {
+    throw new RotationPreflightError(
+      "a federation rotate-root is in progress on this fortress; finish it " +
+        "(`sanctuary federation rotate-root --resume`) before rotating the custody master"
+    );
+  }
+
   // Clean orphaned staged artifacts from a pre-journal crash (the fortress
   // is fully old-keyed; the previously disclosed recovery key never became
   // active). Loud, so a stale disclosure is never silently trusted.
