@@ -48,6 +48,13 @@ export {
   generateNodeKeypair,
 } from "./join-approver.js";
 export {
+  OperatorCloudProvisionClaimStore,
+  createOperatorCloudJoinApprover,
+  type OperatorCloudProvisionClaim,
+  type RecordProvisionClaimParams,
+  type OperatorCloudJoinApproverParams,
+} from "./operator-cloud-join-approver.js";
+export {
   NodeRoster,
   type DropoutListener,
   type PresenceChangeListener,

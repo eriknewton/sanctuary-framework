@@ -20,6 +20,14 @@ import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { generateNodeKeypair } from "../mesh/lifecycle/join-approver.js";
 import { computeJoinHkdfSaltProof } from "../mesh/lifecycle/bootstrap-token.js";
 import { deriveNodeTransportKey } from "../mesh/trust-root.js";
+import {
+  computeOperatorCloudJoinProof,
+  computeBundleDigest,
+  computeManifestDigest,
+  computeScopedSecretCiphertextDigest,
+  openScopedSecret,
+  type OperatorCloudProvisionBundle,
+} from "../mesh/operator-cloud-provision.js";
 import type { BootstrapToken, JoinRequest } from "../mesh/lifecycle/types.js";
 import {
   dashboardRequest,
@@ -68,10 +76,70 @@ export function assembleJoinRequest(params: {
   return { joinRequest, nodePrivateKey: privateKey, nodePublicKey: publicKey };
 }
 
+/**
+ * Operator Cloud Slice 2: assemble a JoinRequest from a SCOPED PROVISION BUNDLE
+ * instead of the raw fortress master secret. The cloud node:
+ *   - opens the scoped-secret section with the one-time delivery key,
+ *   - takes the node-scoped proof key (NOT the master secret) it carries,
+ *   - generates its OWN node keypair locally,
+ *   - computes the operator-cloud join proof bound to {bootstrap nonce, this
+ *     node's public key, bundle digest} under the node-scoped proof key.
+ *
+ * A substituted bundle (different manifest/ciphertext/delivery target) yields a
+ * different bundle digest, so the proof no longer matches the approved claim and
+ * the join is denied. The node_join_proof_key is zeroed after the proof.
+ */
+export function assembleOperatorCloudJoinRequest(params: {
+  bundle: OperatorCloudProvisionBundle;
+  deliveryKey: Uint8Array;
+  deliveryTarget: string;
+}): AssembledJoin {
+  const { bundle, deliveryKey, deliveryTarget } = params;
+  const manifest = bundle.manifest;
+  const scoped = openScopedSecret(bundle, deliveryKey);
+  const nodeJoinProofKey = fromBase64url(scoped.node_join_proof_key);
+  const { publicKey, privateKey } = generateNodeKeypair();
+
+  const manifestDigest = computeManifestDigest(manifest);
+  const scopedCtDigest = computeScopedSecretCiphertextDigest(bundle.scoped_secret);
+  // Recompute the SAME canonical bundle digest the home node recorded in the
+  // claim (manifest + scoped ciphertext + delivery target; no pubkey). The proof
+  // then binds that digest plus this node's pubkey plus the bootstrap nonce.
+  const bundleDigest = computeBundleDigest({
+    manifestDigest,
+    scopedSecretCiphertextDigest: scopedCtDigest,
+    deliveryTarget,
+  });
+
+  const proof = computeOperatorCloudJoinProof({
+    nodeJoinProofKey,
+    fortressId: manifest.fortress_id,
+    nodeId: manifest.node_id,
+    bootstrapNonce: manifest.bootstrap_token.nonce,
+    nodePubkeyB64: toBase64url(publicKey),
+    bundleDigest,
+  });
+  nodeJoinProofKey.fill(0);
+
+  const joinRequest: JoinRequest = {
+    bootstrap_token: manifest.bootstrap_token,
+    node_pubkey: toBase64url(publicKey),
+    node_mode: "operator_cloud",
+    hkdf_salt_proof: proof,
+  };
+  return { joinRequest, nodePrivateKey: privateKey, nodePublicKey: publicKey };
+}
+
 interface JoinFlags {
   fortressUrl?: string;
   bootstrapTokenJson?: string;
   masterSecretB64?: string;
+  /** Operator Cloud Slice 2: path to / inline JSON of the scoped provision bundle. */
+  provisionBundleJson?: string;
+  /** Operator Cloud Slice 2: one-time delivery key (base64url) for the bundle's scoped secret. */
+  deliveryKeyB64?: string;
+  /** Operator Cloud Slice 2: delivery target string bound into the bundle digest. */
+  deliveryTarget?: string;
 }
 
 function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
@@ -83,6 +151,9 @@ function parseJoinFlags(argv: string[], env: NodeJS.ProcessEnv): JoinFlags {
     fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
     bootstrapTokenJson: flag("--bootstrap-token"),
     masterSecretB64: flag("--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
+    provisionBundleJson: flag("--provision-bundle"),
+    deliveryKeyB64: flag("--delivery-key") ?? env.SANCTUARY_OC_DELIVERY_KEY,
+    deliveryTarget: flag("--delivery-target"),
   };
 }
 
@@ -108,47 +179,121 @@ export async function runFederationJoin(args: {
     err.write("sanctuary federation join: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n");
     return 1;
   }
-  if (!flags.bootstrapTokenJson) {
-    err.write("sanctuary federation join: --bootstrap-token <json> is required\n");
-    return 1;
-  }
-  if (!flags.masterSecretB64) {
+
+  // Operator Cloud Slice 2: a scoped provision bundle REPLACES the raw fortress
+  // master secret for operator-cloud nodes. The cloud node never receives the
+  // master secret; it joins with the bundle's node-scoped proof key.
+  const useBundle = flags.provisionBundleJson !== undefined;
+  if (useBundle && flags.masterSecretB64) {
     err.write(
-      "sanctuary federation join: the fortress master secret is required " +
-        "(--master-secret or SANCTUARY_FORTRESS_MASTER_SECRET, base64url)\n",
+      "sanctuary federation join: --provision-bundle and --master-secret are mutually exclusive; " +
+        "operator-cloud nodes never receive the fortress master secret\n",
     );
     return 1;
   }
 
+  let assembled: AssembledJoin;
   let bootstrapToken: BootstrapToken;
-  try {
-    bootstrapToken = JSON.parse(flags.bootstrapTokenJson) as BootstrapToken;
-  } catch {
-    err.write("sanctuary federation join: --bootstrap-token is not valid JSON\n");
-    return 1;
-  }
-  if (
-    typeof bootstrapToken.intended_node_id !== "string" ||
-    typeof bootstrapToken.intended_node_mode !== "string" ||
-    typeof bootstrapToken.signature !== "string"
-  ) {
-    err.write("sanctuary federation join: --bootstrap-token is missing required fields\n");
-    return 1;
+  let masterSecret: Uint8Array | null = null;
+
+  if (useBundle) {
+    if (!flags.deliveryKeyB64) {
+      err.write(
+        "sanctuary federation join: --delivery-key (or SANCTUARY_OC_DELIVERY_KEY, base64url) " +
+          "is required with --provision-bundle\n",
+      );
+      return 1;
+    }
+    if (!flags.deliveryTarget) {
+      err.write("sanctuary federation join: --delivery-target is required with --provision-bundle\n");
+      return 1;
+    }
+    let bundle: OperatorCloudProvisionBundle;
+    try {
+      bundle = JSON.parse(flags.provisionBundleJson as string) as OperatorCloudProvisionBundle;
+    } catch {
+      err.write("sanctuary federation join: --provision-bundle is not valid JSON\n");
+      return 1;
+    }
+    if (
+      typeof bundle.manifest !== "object" ||
+      bundle.manifest === null ||
+      typeof bundle.scoped_secret !== "object" ||
+      bundle.scoped_secret === null
+    ) {
+      err.write("sanctuary federation join: --provision-bundle is malformed\n");
+      return 1;
+    }
+    let deliveryKey: Uint8Array;
+    try {
+      deliveryKey = fromBase64url(flags.deliveryKeyB64);
+    } catch {
+      err.write("sanctuary federation join: --delivery-key is not valid base64url\n");
+      return 1;
+    }
+    if (deliveryKey.length !== 32) {
+      err.write("sanctuary federation join: delivery key must be 32 bytes\n");
+      return 1;
+    }
+    bootstrapToken = bundle.manifest.bootstrap_token;
+    try {
+      assembled = assembleOperatorCloudJoinRequest({
+        bundle,
+        deliveryKey,
+        deliveryTarget: flags.deliveryTarget,
+      });
+    } catch {
+      err.write("sanctuary federation join: failed to open the provision bundle (bad delivery key?)\n");
+      return 1;
+    } finally {
+      deliveryKey.fill(0);
+    }
+  } else {
+    if (!flags.bootstrapTokenJson) {
+      err.write("sanctuary federation join: --bootstrap-token <json> is required\n");
+      return 1;
+    }
+    if (!flags.masterSecretB64) {
+      err.write(
+        "sanctuary federation join: the fortress master secret is required " +
+          "(--master-secret or SANCTUARY_FORTRESS_MASTER_SECRET, base64url)\n",
+      );
+      return 1;
+    }
+    try {
+      bootstrapToken = JSON.parse(flags.bootstrapTokenJson) as BootstrapToken;
+    } catch {
+      err.write("sanctuary federation join: --bootstrap-token is not valid JSON\n");
+      return 1;
+    }
+    if (
+      typeof bootstrapToken.intended_node_id !== "string" ||
+      typeof bootstrapToken.intended_node_mode !== "string" ||
+      typeof bootstrapToken.signature !== "string"
+    ) {
+      err.write("sanctuary federation join: --bootstrap-token is missing required fields\n");
+      return 1;
+    }
+    if (bootstrapToken.intended_node_mode === "operator_cloud") {
+      err.write(
+        "sanctuary federation join: operator-cloud nodes must join with --provision-bundle, " +
+          "not the raw fortress master secret\n",
+      );
+      return 1;
+    }
+    try {
+      masterSecret = fromBase64url(flags.masterSecretB64);
+    } catch {
+      err.write("sanctuary federation join: --master-secret is not valid base64url\n");
+      return 1;
+    }
+    if (masterSecret.length !== 32) {
+      err.write("sanctuary federation join: master secret must be 32 bytes\n");
+      return 1;
+    }
+    assembled = assembleJoinRequest({ bootstrapToken, fortressMasterSecret: masterSecret });
   }
 
-  let masterSecret: Uint8Array;
-  try {
-    masterSecret = fromBase64url(flags.masterSecretB64);
-  } catch {
-    err.write("sanctuary federation join: --master-secret is not valid base64url\n");
-    return 1;
-  }
-  if (masterSecret.length !== 32) {
-    err.write("sanctuary federation join: master secret must be 32 bytes\n");
-    return 1;
-  }
-
-  const assembled = assembleJoinRequest({ bootstrapToken, fortressMasterSecret: masterSecret });
   try {
     const ctx: DashboardRequestContext = { dashboardUrl: flags.fortressUrl, authToken: "" };
     const response = (await request(
@@ -192,19 +337,31 @@ export async function runFederationJoin(args: {
   } finally {
     // Constraint 6: the node private key never persists past this call.
     assembled.nodePrivateKey.fill(0);
-    masterSecret.fill(0);
+    masterSecret?.fill(0);
   }
 }
 
 const FEDERATION_HELP = `sanctuary federation — cross-machine federation (Wave 1, PR-A3)
 
 Usage:
+  Local / sovereign_tee node:
   sanctuary federation join --fortress-url <url> --bootstrap-token <json> [--master-secret <b64url>]
+
+  Operator-cloud node (Slice 2 scoped custody):
+  sanctuary federation join --fortress-url <url> --provision-bundle <json> \\
+    --delivery-key <b64url> --delivery-target <target>
 
   join     Submit a JoinRequest to a fortress and install the issued node
            certificate. The bootstrap token is minted by the operator on the
-           fortress (POST /v1/federation/authorize/init). The fortress master
-           secret is delivered out of band (env SANCTUARY_FORTRESS_MASTER_SECRET).
+           fortress (POST /v1/federation/authorize/init).
+
+           Local-mode nodes derive the join proof from the fortress master
+           secret, delivered out of band (env SANCTUARY_FORTRESS_MASTER_SECRET).
+
+           Operator-cloud nodes NEVER receive the fortress master secret. They
+           join with a scoped provision bundle delivered after VM boot over an
+           operator-approved channel. The bundle carries only this node's scoped
+           proof key and assigned grants; the master secret stays home.
 
 Federation enable/disable/status and join authorization are operator actions
 driven from the dashboard / host app over the session-gated /v1/federation API.

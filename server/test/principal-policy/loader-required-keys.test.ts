@@ -100,6 +100,8 @@ approval_channel:
       "audit_export_siem",
       "compliance_generate_eu_ai_act_bundle",
       "memory_delete",
+      "operator_cloud_provision",
+      "federation_node_join",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -121,6 +123,8 @@ approval_channel:
       "audit_export_siem",
       "compliance_generate_eu_ai_act_bundle",
       "memory_delete",
+      "operator_cloud_provision",
+      "federation_node_join",
     ]);
   });
 

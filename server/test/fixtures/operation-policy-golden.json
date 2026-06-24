@@ -17,6 +17,7 @@
     "lockdown",
     "memory_delete",
     "memory_insert",
+    "operator_cloud_provision",
     "policy_change",
     "principal_baseline_view",
     "principal_policy_view",

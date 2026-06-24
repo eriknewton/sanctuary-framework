@@ -78,6 +78,23 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
  *   hand-authored policy once the inert memory tool factory is wired.
  */
+/**
+ * Operator Cloud Slice 2 (non-relaxable cloud-custody gate, MANDATORY): minting
+ * a scoped cloud-custody export (`operator_cloud_provision`) and admitting any
+ * federation node (`federation_node_join`) are exports of custody material /
+ * trust-boundary changes that a hand-authored policy must NEVER be able to relax
+ * into Tier 3 or auto-approve. This is the SINGLE SOURCE OF TRUTH consumed by
+ * BOTH enforcement points: the policy loader (`FORCED_TIER1_OPERATIONS` below,
+ * applied at policy-load merge time) AND the runtime classifier
+ * (`gate.ts`'s `FORCED_TIER1_OPERATIONS`, applied at `classifyRiskTier` time).
+ * Both lists spread this set so they cannot drift apart silently; a drift guard
+ * test pins that both contain every entry here.
+ */
+export const NON_RELAXABLE_CLOUD_TIER1_OPERATIONS = [
+  "operator_cloud_provision",
+  "federation_node_join",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -88,6 +105,7 @@ const FORCED_TIER1_OPERATIONS = [
   "audit_export_siem",
   "compliance_generate_eu_ai_act_bundle",
   "memory_delete",
+  ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -142,6 +160,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
     "federation_node_join",
+    // Operator Cloud Slice 2: minting a scoped cloud-custody provision bundle is
+    // a custody export and must always require operator approval. Also enrolled
+    // in NON_RELAXABLE_CLOUD_TIER1_OPERATIONS so a hand-authored policy cannot
+    // relax it.
+    "operator_cloud_provision",
     "sanctuary_forget",
     "sanctuary_compound_execute",
     "sanctuary_audit_search_widen",

@@ -19,7 +19,11 @@ import { randomBytes } from "node:crypto";
 import type { PrincipalPolicy, GateResult, ApprovalRequest, ApprovalResponse } from "./types.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import { BaselineTracker } from "./baseline.js";
-import { extractOperationName, FORCED_TIER3_OPERATIONS } from "./loader.js";
+import {
+  extractOperationName,
+  FORCED_TIER3_OPERATIONS,
+  NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
+} from "./loader.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
 import { AGENT_VISIBLE_DENY_REASONS } from "./deny-vocabulary.js";
@@ -45,7 +49,17 @@ export type InjectionAlertCallback = (alert: {
 /** Resolver for proxy tool tiers — provided by the ProxyRouter */
 export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 
-const FORCED_TIER1_OPERATIONS = ["memory_delete"] as const;
+// Runtime-classifier non-relaxable Tier-1 set. `memory_delete` plus the
+// operator-cloud cloud-custody operations, which are spread from the SINGLE
+// SOURCE OF TRUTH in loader.ts so this list and the loader's
+// FORCED_TIER1_OPERATIONS cannot drift apart (Operator Cloud Slice 2 MED-1; a
+// drift guard test pins the relationship). classifyRiskTier checks this list
+// first, so even a policy file that lists these under Tier 3 still classifies
+// them Tier 1 at runtime.
+const FORCED_TIER1_OPERATIONS = [
+  "memory_delete",
+  ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
+] as const;
 
 /**
  * Approval-lifecycle callback. Wired in v1.3 Upsilon-1 by the Cross-
