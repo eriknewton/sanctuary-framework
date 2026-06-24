@@ -16,6 +16,7 @@ import {
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
 import { resolveStoragePath } from "../paths.js";
+import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
@@ -1355,11 +1356,12 @@ export async function runDaemon(
       const { resolveTransparencySigner } = await import(
         "../transparency/signer.js"
       );
-      const { createRequire } = await import("node:module");
       const { realpathSync } = await import("node:fs");
-      const { version: pkgVersion } = createRequire(import.meta.url)(
-        "../../package.json",
-      ) as { version: string };
+      // Canonical version source. A bare require("../../package.json") resolves
+      // to the repo-root package.json (no `version`) once bundled to
+      // server/dist/, which corrupts the persisted checkpoint chain; the helper
+      // reads server/package.json from both src/ and dist/.
+      const pkgVersion = getSanctuaryVersion();
       transparencyScheduler = startTransparencyScheduler({
         intervalMs,
         emit: async () => {

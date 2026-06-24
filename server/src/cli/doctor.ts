@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { access, constants, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { createRequire } from "node:module";
+import { getSanctuaryVersion } from "../version.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
@@ -23,8 +23,11 @@ import {
   type ExportRecord,
 } from "./audit-chain-verify.js";
 
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../../package.json");
+// Canonical version source. A bare `require("../../package.json")` resolves to
+// the repo-root package.json (no `version`) when bundled to server/dist/; the
+// helper reads server/package.json from both src/ and dist/ and never returns
+// undefined.
+const PKG_VERSION = getSanctuaryVersion();
 
 export type DoctorStatus = "OK" | "WARN" | "FAIL";
 
