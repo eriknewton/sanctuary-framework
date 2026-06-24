@@ -52,6 +52,7 @@ Every entry in §B and §C below routes through one of these two helpers OR call
 | `l3-policies` | `server/src/disclosure/policies.ts:140` | (literal) | Encrypts Selective Disclosure policy store. |
 | `l3-commitments` | `server/src/disclosure/commitments.ts:108` | (literal) | Encrypts Selective Disclosure commitment store. |
 | `bridge-commitments` | `server/src/bridge/tools.ts:44` | (literal) | Encrypts Concordia-bridge commitment store. |
+| `federation-trust-root` | `server/src/mesh/federation-trust-root-store.ts:38` | `FEDERATION_TRUST_ROOT_HKDF_INFO` | Encrypts the `_federation/trust-root-v1` mesh federation trust-root record. **(scan-reconciled 2026-06-23; decryptable store; frozen at-rest contract.)** |
 | `l4-reputation` | `server/src/reputation/reputation-store.ts:202` | (literal) | Encrypts Verifiable Reputation store. |
 | `sovereignty-profile` | `server/src/sovereignty-profile.ts:79` | `HKDF_DOMAIN` | Encrypts the sovereignty profile store. |
 | `intelligence-substrate-config` | `server/src/intelligence/policy-store.ts:39` | `HKDF_INFO` | Encrypts the intelligence-substrate policy store. |
