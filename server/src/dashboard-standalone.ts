@@ -83,7 +83,10 @@ import {
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
-import { createAutoDenyJoinApprover } from "./mesh/lifecycle/index.js";
+import {
+  BootstrapNonceStore,
+  createStandaloneJoinApprover,
+} from "./mesh/lifecycle/index.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -590,17 +593,29 @@ export async function startStandaloneDashboard(
     },
   });
   if (federationRoot !== null) {
-    // Slice 1 standalone boot is LOAD-ONLY: federation provisions and serves
-    // /v1/federation reads, but join/issuance is deferred to the federation
-    // enable/authorize slice. Inject an explicit fail-closed approver so the
-    // issuer-context required-approver invariant holds without ever
-    // auto-approving a join; the real operator approval gate is wired by that
-    // later slice. (createAutoApprove is tests-only and must never appear here.)
+    // The real operator-approval gate for a LOCAL / sovereign_tee join. Model:
+    // token-as-approval: the operator's live Tier-1 decision already happened at
+    // the OPERATOR_SIGNED `authorize/init` that minted the bootstrap token, and
+    // by the time this approver runs the ceremony has verified token signature +
+    // fortress binding + expiry + node_mode + revocation + HKDF possession proof.
+    // The approver ADDS the one control the ceremony lacks (single-use nonce
+    // consumption, so a valid local join is NOT replayable for the token TTL),
+    // denies operator_cloud (those route through the operator-cloud approver),
+    // and fails closed on any missing / invalid input. It never auto-approves a
+    // token-less or forged join. The nonce store lives for this boot's federation
+    // context lifetime. (createAutoApprove / createAutoDeny are tests-only and
+    // must never appear here.)
+    const nonceStore = new BootstrapNonceStore();
     dashboard.setFederationContext({
       ...federationRoot.context,
-      approver: createAutoDenyJoinApprover(
-        "standalone dashboard: federation join approval is not available in load-only mode (enable via the federation authorize slice)",
-      ),
+      approver: createStandaloneJoinApprover({
+        pinned_master_pubkey: federationRoot.context.pinnedMasterPubkey,
+        issuing_principal_cert: federationRoot.context.issuingPrincipalCert,
+        getIssuingPrincipalPrivateKey:
+          federationRoot.context.getIssuingPrincipalPrivateKey,
+        getMasterPrivateKey: federationRoot.context.getMasterPrivateKey,
+        nonceStore,
+      }),
     });
   } else {
     // Federation Slice 3a: the JOINER half. A second machine that ran a real

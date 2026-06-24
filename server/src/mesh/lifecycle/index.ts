@@ -55,6 +55,11 @@ export {
   type OperatorCloudJoinApproverParams,
 } from "./operator-cloud-join-approver.js";
 export {
+  BootstrapNonceStore,
+  createStandaloneJoinApprover,
+  type StandaloneJoinApproverParams,
+} from "./standalone-join-approver.js";
+export {
   NodeRoster,
   type DropoutListener,
   type PresenceChangeListener,
