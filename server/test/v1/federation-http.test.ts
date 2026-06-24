@@ -178,6 +178,117 @@ describe("/v1/federation join ceremony end-to-end over HTTP", () => {
     expect(ops).toContainEqual({ operation: "v1_federation_authorize_complete", result: "success" });
   });
 
+  it("surfaces operator-cloud node mode and trust-boundary disclosure additively", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+
+    const initBody = operatorSigned("/v1/federation/authorize/init", {
+      intended_node_id: "cloud-node-1",
+      intended_node_mode: "operator_cloud",
+    });
+    const initRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(initBody),
+    });
+    expect(initRes.status).toBe(200);
+    const { bootstrap_token } = (await initRes.json()) as { bootstrap_token: BootstrapToken };
+    const assembled = assembleJoinRequest({
+      bootstrapToken: bootstrap_token,
+      fortressMasterSecret: materials.masterSecret,
+    });
+
+    const completeRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(assembled.joinRequest),
+    });
+    expect(completeRes.status).toBe(200);
+
+    const nodesRes = await fetch(`${rig.baseUrl}/v1/nodes`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(nodesRes.status).toBe(200);
+    const nodesBody = (await nodesRes.json()) as { nodes: Array<Record<string, any>> };
+    expect(nodesBody.nodes).toHaveLength(1);
+    expect(nodesBody.nodes[0]).toEqual(
+      expect.objectContaining({
+        node_id: "cloud-node-1",
+        node_mode: "operator_cloud",
+        host_provider: "provider",
+        tee_attested: false,
+        disclosure_acknowledged_at: null,
+        drill_status: "unproven",
+      }),
+    );
+    expect(nodesBody.nodes[0].trust_boundary).toEqual(
+      expect.objectContaining({
+        version: "operator-cloud-trust-boundary-v1",
+        label: "provider in trust boundary, not TEE",
+        provider_in_trust_boundary: true,
+        tee_attested: false,
+      }),
+    );
+
+    const fedStatusRes = await fetch(`${rig.baseUrl}/v1/federation/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const fedStatus = (await fedStatusRes.json()) as Record<string, any>;
+    expect(fedStatus).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        provisioned: true,
+        operator_cloud_nodes: 1,
+        provider_in_trust_boundary: true,
+        tee_attested: false,
+      }),
+    );
+    expect(fedStatus.trust_boundary.disclosure).toContain("provider is in this node's trust boundary");
+
+    const v1StatusRes = await fetch(`${rig.baseUrl}/v1/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const v1Status = (await v1StatusRes.json()) as Record<string, any>;
+    expect(v1Status.federation).toEqual(
+      expect.objectContaining({
+        roster_size: 1,
+        operator_cloud_nodes: 1,
+        provider_in_trust_boundary: true,
+        tee_attested: false,
+      }),
+    );
+  });
+
+  it("rejects operator-cloud join requests that self-report TEE attestation", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    const initRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/authorize/init", {
+          intended_node_id: "cloud-node-fake-tee",
+          intended_node_mode: "operator_cloud",
+        }),
+      ),
+    });
+    const { bootstrap_token } = (await initRes.json()) as { bootstrap_token: BootstrapToken };
+    const assembled = assembleJoinRequest({
+      bootstrapToken: bootstrap_token,
+      fortressMasterSecret: materials.masterSecret,
+    });
+    const res = await fetch(`${rig.baseUrl}/v1/federation/authorize/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...assembled.joinRequest,
+        attestation: "fake-self-report",
+      }),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
   it("denies an unverifiable JoinRequest with the uniform 401 and audits the denial", async () => {
     const token = await openDurableSession(rig);
     await enableFederation(token);

@@ -40,9 +40,14 @@ import {
   verifyBootstrapToken,
   verifyJoinHkdfSaltProof,
 } from "../mesh/lifecycle/bootstrap-token.js";
-import { issueCertificateForApprovedJoin } from "../mesh/lifecycle/join-approver.js";
 import { deriveNodeTransportKey } from "../mesh/trust-root.js";
 import type { NodeMode } from "../mesh/constants.js";
+import {
+  NODE_TRUST_BOUNDARY_VERSION,
+  type NodeDrillStatus,
+  type NodeModeForPosture,
+  type NodeTrustBoundary,
+} from "../mesh/node-posture.js";
 import type {
   FortressMasterPublicKey,
   PrincipalCertificate,
@@ -62,7 +67,6 @@ import {
   type FederationSyncEnvelope,
 } from "./federation-sync-envelope.js";
 import {
-  nodeCertificateExpiresAt,
   FEDERATION_SYNC_WIRE_VERSION,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
@@ -100,18 +104,14 @@ export function isFederationCeremonyPath(pathname: string): boolean {
  * fails closed. Private-key/master-secret accessors return TRANSIENT copies
  * the caller is responsible for; this module never persists or logs them.
  */
-export interface FederationContext {
+export interface FederationBaseContext {
   fortressId: string;
   /** This fortress node's id (echoed into status). */
   nodeId: string;
+  /** Mode of this daemon's own node context. Defaults to local when omitted. */
+  nodeMode?: NodeMode;
   pinnedMasterPubkey: FortressMasterPublicKey;
   issuingPrincipalCert: PrincipalCertificate;
-  /** Transient operator principal private key (signs tokens + certs). */
-  getIssuingPrincipalPrivateKey(): Uint8Array;
-  /** Transient fortress-master secret (derives the transport key for proofs). */
-  getFortressMasterSecret(): Uint8Array;
-  /** Transient fortress-master private key, when this node holds it (cert master sig). */
-  getMasterPrivateKey?(): Uint8Array | undefined;
   /**
    * This daemon's OWN node identity certificate (issued when it joined the
    * fortress), used to wrap the reciprocal outbound slice in a peer-verifiable
@@ -130,14 +130,34 @@ export interface FederationContext {
   isNodeRevoked(nodeId: string): boolean;
   /** Operator-tunable renewal policy for new/renewed node certs. */
   nodeCertificateRenewal?: FederationNodeCertificateRenewalConfig;
-  /**
-   * Operator approval gate. Defaults to issuing a certificate for any
-   * request that already passed cryptographic verification (the bootstrap
-   * token IS the operator's prior authorization). Inject a denying approver
-   * to model a policy refusal.
-   */
-  approver?: JoinApprover;
 }
+
+export interface FederationIssuerContext extends FederationBaseContext {
+  nodeMode?: Exclude<NodeMode, "operator_cloud">;
+  /** Transient operator principal private key (signs tokens + certs). */
+  getIssuingPrincipalPrivateKey(): Uint8Array;
+  /** Transient fortress-master secret (derives the transport key for proofs). */
+  getFortressMasterSecret(): Uint8Array;
+  /** Transient fortress-master private key, when this node holds it (cert master sig). */
+  getMasterPrivateKey?(): Uint8Array | undefined;
+  /**
+   * Operator approval gate. Required for issuance. Tests may inject the
+   * test-only auto-approve helper; production must inject a real gate.
+   */
+  approver: JoinApprover;
+}
+
+export interface FederationNonIssuerOperatorCloudContext extends FederationBaseContext {
+  nodeMode: "operator_cloud";
+  getIssuingPrincipalPrivateKey?: never;
+  getFortressMasterSecret?: never;
+  getMasterPrivateKey?: never;
+  approver?: never;
+}
+
+export type FederationContext =
+  | FederationIssuerContext
+  | FederationNonIssuerOperatorCloudContext;
 
 export type AuthorizeCompleteResult =
   | {
@@ -161,12 +181,13 @@ export class JoinCeremony {
     intendedNodeId: string;
     intendedNodeMode: NodeMode;
   }): BootstrapToken {
+    const issuer = this.issuerContext();
     return issueBootstrapToken({
       intended_node_id: params.intendedNodeId,
       intended_node_mode: params.intendedNodeMode,
-      fortress_id: this.ctx.fortressId,
-      issuing_principal: this.ctx.issuingPrincipalCert.principal_id,
-      principal_private_key: this.ctx.getIssuingPrincipalPrivateKey(),
+      fortress_id: issuer.fortressId,
+      issuing_principal: issuer.issuingPrincipalCert.principal_id,
+      principal_private_key: issuer.getIssuingPrincipalPrivateKey(),
     });
   }
 
@@ -201,6 +222,12 @@ export class JoinCeremony {
     if (!NODE_MODES.includes(request.node_mode)) {
       return { approved: false, denialReason: "unknown node_mode" };
     }
+    if (request.node_mode !== "sovereign_tee" && request.attestation !== undefined) {
+      return {
+        approved: false,
+        denialReason: "self-reported TEE attestation is not accepted for this node_mode",
+      };
+    }
 
     // 3. A revoked node id cannot rejoin through the bootstrap-token path.
     //    Re-admission requires a fresh node identity. If the revocation state
@@ -223,8 +250,9 @@ export class JoinCeremony {
     //    key, not merely a stolen bootstrap token.
     let proofOk: boolean;
     try {
+      const issuer = this.issuerContext();
       const transportKey = deriveNodeTransportKey({
-        fortress_master_secret: this.ctx.getFortressMasterSecret(),
+        fortress_master_secret: issuer.getFortressMasterSecret(),
         node_id: request.bootstrap_token.intended_node_id,
         node_mode: request.node_mode,
       });
@@ -254,9 +282,16 @@ export class JoinCeremony {
       return { approved: false, denialReason: "node_pubkey is malformed" };
     }
 
-    // 6. Operator approval gate. Default approver issues a certificate for the
-    //    (now crypto-verified) request; an injected approver may deny.
-    const approver = this.ctx.approver ?? this.defaultApprover();
+    // 6. Operator approval gate. There is no default auto-issuing path here:
+    //    production must inject a real gate and tests inject explicit helpers.
+    const issuer = this.issuerContextOrNull();
+    if (issuer === null || !issuer.approver) {
+      return {
+        approved: false,
+        denialReason: "operator approval gate unavailable",
+      };
+    }
+    const approver = issuer.approver;
     let result;
     try {
       result = await approver.requestApproval(request);
@@ -278,22 +313,51 @@ export class JoinCeremony {
     };
   }
 
-  private defaultApprover(): JoinApprover {
-    const ctx = this.ctx;
-    return {
-      async requestApproval(request: JoinRequest) {
-        const certificate = issueCertificateForApprovedJoin({
-          request,
-          pinned_master_pubkey: ctx.pinnedMasterPubkey,
-          issuing_principal_cert: ctx.issuingPrincipalCert,
-          issuing_principal_private_key: ctx.getIssuingPrincipalPrivateKey(),
-          master_private_key: ctx.getMasterPrivateKey?.(),
-          expires_at: nodeCertificateExpiresAt(ctx.nodeCertificateRenewal),
-        });
-        return { approved: true, certificate };
-      },
-    };
+  private issuerContext(): FederationIssuerContext {
+    const issuer = this.issuerContextOrNull();
+    if (issuer === null) {
+      throw new Error("issuer authority unavailable for this federation context");
+    }
+    return issuer;
   }
+
+  private issuerContextOrNull(): FederationIssuerContext | null {
+    if (this.ctx.nodeMode === "operator_cloud") return null;
+    if (
+      typeof this.ctx.getIssuingPrincipalPrivateKey !== "function" ||
+      typeof this.ctx.getFortressMasterSecret !== "function"
+    ) {
+      return null;
+    }
+    return this.ctx as FederationIssuerContext;
+  }
+}
+
+export function assertOperatorCloudContextHasNoIssuerAuthority(
+  ctx: FederationContext,
+): void {
+  if (ctx.nodeMode !== "operator_cloud") return;
+  const candidate = ctx as FederationContext & Record<string, unknown>;
+  if (
+    "getIssuingPrincipalPrivateKey" in candidate ||
+    "getFortressMasterSecret" in candidate ||
+    "getMasterPrivateKey" in candidate ||
+    "approver" in candidate
+  ) {
+    throw new Error("operator_cloud federation context must not carry issuer authority");
+  }
+}
+
+export function federationContextHasIssuerAuthority(
+  ctx: FederationContext | null,
+): ctx is FederationIssuerContext {
+  return (
+    ctx !== null &&
+    ctx.nodeMode !== "operator_cloud" &&
+    typeof ctx.getIssuingPrincipalPrivateKey === "function" &&
+    typeof ctx.getFortressMasterSecret === "function" &&
+    typeof ctx.approver?.requestApproval === "function"
+  );
 }
 
 function reason(err: unknown): string {
@@ -321,7 +385,7 @@ export interface V1FederationDeps {
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
   /** Record a newly joined node (status roster). */
-  recordJoin(nodeId: string): void;
+  recordJoin(certificate: NodeIdentityCertificate): void;
   /** List federated nodes for GET /v1/nodes. */
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
@@ -338,19 +402,31 @@ export interface V1FederationDeps {
    */
   acceptedHighWaterFor(senderNodeId: string): number | null;
   /** Record a newly-accepted peer-sync high-water for `senderNodeId`. */
-  recordAcceptedHighWater(senderNodeId: string, highWater: number): void;
+  recordAcceptedHighWater(
+    senderNodeId: string,
+    highWater: number,
+    certificate?: NodeIdentityCertificate,
+  ): void;
   /** Monotonic outbound high-water this daemon stamps on reciprocal envelopes. */
   nextOutboundHighWater(): number;
   /** Grow-only revocation projection. Throws/false distinction is security-significant. */
   isNodeRevoked(nodeId: string): boolean;
   /** Best-effort local cert auto-renewal tick before this daemon presents its cert. */
   renewLocalNodeCertificate(): void;
+  /** Structured aggregate disclosure for status surfaces. */
+  federationPosture(): FederationPostureSummary;
 }
 
 export interface FederationNodeView {
   node_id: string;
   label: string | null;
   attestation_status: "verified" | "pending" | "failed" | "unknown";
+  node_mode: NodeModeForPosture;
+  host_provider: string | null;
+  trust_boundary: NodeTrustBoundary;
+  tee_attested: boolean;
+  disclosure_acknowledged_at: string | null;
+  drill_status: NodeDrillStatus;
   first_seen: string;
   last_seen: string;
   last_sync: {
@@ -358,6 +434,17 @@ export interface FederationNodeView {
     sent_at: string | null;
     last_sequence: number;
   };
+}
+
+export interface FederationPostureSummary {
+  version: typeof NODE_TRUST_BOUNDARY_VERSION;
+  local_nodes: number;
+  operator_cloud_nodes: number;
+  sovereign_tee_nodes: number;
+  unknown_nodes: number;
+  provider_in_trust_boundary: boolean;
+  tee_attested: boolean;
+  disclosure: string | null;
 }
 
 export interface FederationEvent {
@@ -443,6 +530,7 @@ function handleNodes(deps: V1FederationDeps, res: ServerResponse): void {
 function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
   const ctx = deps.getContext();
   const enabled = deps.isEnabled() && ctx !== null;
+  const posture = deps.federationPosture();
   // Field discipline: never echo key material; only public identifiers.
   writeJson(res, 200, {
     enabled,
@@ -450,6 +538,10 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
     fortress_id: ctx?.fortressId ?? null,
     node_id: ctx?.nodeId ?? null,
     roster: { size: deps.rosterNodeIds().length },
+    operator_cloud_nodes: posture.operator_cloud_nodes,
+    provider_in_trust_boundary: posture.provider_in_trust_boundary,
+    tee_attested: posture.tee_attested,
+    trust_boundary: posture,
   });
 }
 
@@ -834,7 +926,11 @@ async function handlePeerSync(
   }
 
   if (append.rejected.length === 0 && append.accepted.length > 0) {
-    deps.recordAcceptedHighWater(verification.senderNodeId, verification.syncHighWater);
+    deps.recordAcceptedHighWater(
+      verification.senderNodeId,
+      verification.syncHighWater,
+      verification.senderNodeCert,
+    );
   }
 
   // The reciprocal envelope is signed by THIS node and therefore may only carry
@@ -970,12 +1066,12 @@ export async function handleFederationCeremony(
     return true;
   }
 
-  deps.recordJoin(outcome.nodeId);
+  deps.recordJoin(outcome.certificate);
   await deps.audit({
     operation,
     result: "success",
     identityId: outcome.nodeId,
-    details: { node_id: outcome.nodeId },
+    details: { node_id: outcome.nodeId, node_mode: outcome.certificate.node_mode },
   });
   writeJson(res, 200, {
     certificate: outcome.certificate,

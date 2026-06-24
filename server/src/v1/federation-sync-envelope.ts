@@ -213,6 +213,7 @@ export type SyncEnvelopeVerification =
       ok: true;
       senderNodeId: string;
       senderNodePubkey: string;
+      senderNodeCert: NodeIdentityCertificate;
       wireVersion: typeof FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
       syncHighWater: number;
       events: FederationEvent[];
@@ -370,6 +371,7 @@ export function verifySyncEnvelope(input: {
     ok: true,
     senderNodeId: env.sender_node_id,
     senderNodePubkey: env.sender_node_cert.node_pubkey,
+    senderNodeCert: env.sender_node_cert,
     wireVersion: env.wire_version,
     syncHighWater: env.sync_high_water,
     events: env.events,

@@ -93,6 +93,8 @@ import {
 } from "../v1/agents.js";
 import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
+  assertOperatorCloudContextHasNoIssuerAuthority,
+  federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
   type FederationAppendOptions,
@@ -100,9 +102,16 @@ import {
   type FederationContext,
   type FederationEvent,
   type FederationNodeView,
+  type FederationPostureSummary,
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import {
+  deriveNodePosture,
+  NODE_TRUST_BOUNDARY_VERSION,
+  OPERATOR_CLOUD_DISCLOSURE,
+  type NodeModeForPosture,
+} from "../mesh/node-posture.js";
 import {
   acceptFederationEventsFailClosed,
   FEDERATION_NODE_EVICTION_EVENT_KIND,
@@ -1358,6 +1367,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private async buildV1FullStatus(): Promise<Record<string, unknown>> {
     const identity = this.identityManager?.getDefault();
     const castleWall = await this.buildStatusCastleWall();
+    const federationPosture = this.buildFederationPostureSummary();
     return {
       ok: true,
       version: PKG_VERSION,
@@ -1374,6 +1384,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         enabled: this._federationEnabled && this._federationContext !== null,
         provisioned: this._federationContext !== null,
         roster_size: this._federationRoster.size,
+        operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+        provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+        tee_attested: federationPosture.tee_attested,
+        trust_boundary: federationPosture,
       },
       identity: identity
         ? {
@@ -1492,6 +1506,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setFederationContext(ctx: FederationContext | null): void {
     this.stopFederationCertificateAutoRenewal();
+    if (ctx !== null) {
+      assertOperatorCloudContextHasNoIssuerAuthority(ctx);
+    }
     this._federationContext = ctx;
     if (ctx === null) {
       this._federationEnabled = false;
@@ -1526,13 +1543,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       rosterNodeIds: () => [...this._federationRoster],
-      recordJoin: (nodeId) => {
-        this._federationRoster.add(nodeId);
-        this.upsertFederationNode(nodeId, {
+      recordJoin: (certificate) => {
+        this._federationRoster.add(certificate.node_id);
+        this.upsertFederationNode(certificate.node_id, {
           attestation_status: "verified",
+          node_mode: certificate.node_mode,
         });
         this.appendLocalFederationEvent("node.joined", {
-          node_id: nodeId,
+          node_id: certificate.node_id,
+          node_mode: certificate.node_mode,
         });
       },
       listNodes: () => [...this._federationState.nodes.values()],
@@ -1541,7 +1560,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.appendFederationEvents(events, options),
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
-      recordAcceptedHighWater: (senderNodeId, highWater) => {
+      recordAcceptedHighWater: (senderNodeId, highWater, certificate) => {
         const prior = this._federationAcceptedHighWater.get(senderNodeId) ?? 0;
         // Defensive: only ever advance (the handler already gates rollback).
         if (highWater > prior) {
@@ -1549,6 +1568,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         }
         this.upsertFederationNode(senderNodeId, {
           attestation_status: "verified",
+          ...(certificate ? { node_mode: certificate.node_mode } : {}),
         });
       },
       nextOutboundHighWater: () => ++this._federationOutboundHighWater,
@@ -1556,6 +1576,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       renewLocalNodeCertificate: () => {
         this.renewLocalFederationNodeCertificate();
       },
+      federationPosture: () => this.buildFederationPostureSummary(),
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -1575,6 +1596,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private renewLocalFederationNodeCertificate(): void {
     const ctx = this._federationContext;
     if (ctx === null) return;
+    if (!federationContextHasIssuerAuthority(ctx)) return;
     const result = renewNodeIdentityCertificateIfDue({
       certificate: ctx.localNodeCert ?? null,
       localNodeId: ctx.nodeId,
@@ -1674,10 +1696,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): FederationNodeView {
     const now = new Date().toISOString();
     const existing = nodes.get(nodeId);
+    const nodeMode = update?.node_mode ?? existing?.node_mode ?? "unknown";
+    const posture = this.buildFederationNodePosture(nodeMode);
     return {
       node_id: nodeId,
       label: update?.label ?? existing?.label ?? null,
       attestation_status: update?.attestation_status ?? existing?.attestation_status ?? "unknown",
+      ...posture,
       first_seen: existing?.first_seen ?? update?.first_seen ?? now,
       last_seen: update?.last_seen ?? now,
       last_sync: {
@@ -1685,6 +1710,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         sent_at: update?.last_sync?.sent_at ?? existing?.last_sync.sent_at ?? null,
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
       },
+    };
+  }
+
+  private buildFederationNodePosture(
+    nodeMode: NodeModeForPosture,
+  ): ReturnType<typeof deriveNodePosture> {
+    return deriveNodePosture({
+      nodeMode,
+      verifiedTeeEvidence: false,
+    });
+  }
+
+  private buildFederationPostureSummary(): FederationPostureSummary {
+    const nodes = [...this._federationState.nodes.values()];
+    const localNodes = nodes.filter((node) => node.node_mode === "local").length;
+    const operatorCloudNodes = nodes.filter((node) => node.node_mode === "operator_cloud").length;
+    const sovereignTeeNodes = nodes.filter((node) => node.node_mode === "sovereign_tee").length;
+    const unknownNodes = nodes.filter((node) => node.node_mode === "unknown").length;
+    const providerInTrustBoundary = nodes.some(
+      (node) => node.trust_boundary.provider_in_trust_boundary,
+    );
+    const teeAttested = nodes.some((node) => node.tee_attested === true);
+    return {
+      version: NODE_TRUST_BOUNDARY_VERSION,
+      local_nodes: localNodes,
+      operator_cloud_nodes: operatorCloudNodes,
+      sovereign_tee_nodes: sovereignTeeNodes,
+      unknown_nodes: unknownNodes,
+      provider_in_trust_boundary: providerInTrustBoundary,
+      tee_attested: teeAttested,
+      disclosure: operatorCloudNodes > 0 ? OPERATOR_CLOUD_DISCLOSURE : null,
     };
   }
 
@@ -3203,6 +3259,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       : score >= 65 ? "degraded"
       : score >= 25 ? "minimal"
       : "unverified";
+    const federationPosture = this.buildFederationPostureSummary();
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -3216,6 +3273,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       degradations: shr.body.degradations,
       capabilities: shr.body.capabilities,
+      federation: {
+        operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+        provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+        tee_attested: federationPosture.tee_attested,
+        trust_boundary: federationPosture,
+      },
       config_loaded: this._sanctuaryConfig != null,
     }));
   }
@@ -3301,8 +3364,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     try {
       const profile = this.profileStore.get();
       const prompt = generateSystemPrompt(profile);
+      const federationPosture = this.buildFederationPostureSummary();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ profile, system_prompt: prompt }));
+      res.end(JSON.stringify({
+        profile,
+        system_prompt: prompt,
+        deployment_posture: {
+          operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+          provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+          tee_attested: federationPosture.tee_attested,
+          trust_boundary: federationPosture,
+        },
+      }));
     } catch {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Failed to read sovereignty profile" }));
@@ -3334,6 +3407,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const updates: SovereigntyProfileUpdate = JSON.parse(body);
         const updated = await this.profileStore!.update(updates);
         const prompt = generateSystemPrompt(updated);
+        const federationPosture = this.buildFederationPostureSummary();
+        const deploymentPosture = {
+          operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+          provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+          tee_attested: federationPosture.tee_attested,
+          trust_boundary: federationPosture,
+        };
 
         // Audit log the dashboard-initiated change
         if (this.auditLog) {
@@ -3358,16 +3438,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
               audit_failed: true,
               profile: updated,
               system_prompt: prompt,
+              deployment_posture: deploymentPosture,
             }));
             return;
           }
         }
 
         // Broadcast to SSE clients
-        this.broadcastSSE("sovereignty-profile-update", { profile: updated, system_prompt: prompt });
+        this.broadcastSSE("sovereignty-profile-update", {
+          profile: updated,
+          system_prompt: prompt,
+          deployment_posture: deploymentPosture,
+        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ profile: updated, system_prompt: prompt }));
+        res.end(JSON.stringify({
+          profile: updated,
+          system_prompt: prompt,
+          deployment_posture: deploymentPosture,
+        }));
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON body" }));

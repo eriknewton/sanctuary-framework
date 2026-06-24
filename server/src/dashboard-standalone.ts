@@ -82,6 +82,7 @@ import {
   DistressLocalSecretError,
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
+import { createAutoDenyJoinApprover } from "./mesh/lifecycle/index.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -588,7 +589,18 @@ export async function startStandaloneDashboard(
     },
   });
   if (federationRoot !== null) {
-    dashboard.setFederationContext(federationRoot.context);
+    // Slice 1 standalone boot is LOAD-ONLY: federation provisions and serves
+    // /v1/federation reads, but join/issuance is deferred to the federation
+    // enable/authorize slice. Inject an explicit fail-closed approver so the
+    // issuer-context required-approver invariant holds without ever
+    // auto-approving a join; the real operator approval gate is wired by that
+    // later slice. (createAutoApprove is tests-only and must never appear here.)
+    dashboard.setFederationContext({
+      ...federationRoot.context,
+      approver: createAutoDenyJoinApprover(
+        "standalone dashboard: federation join approval is not available in load-only mode (enable via the federation authorize slice)",
+      ),
+    });
   }
 
   // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator

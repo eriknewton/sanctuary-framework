@@ -196,6 +196,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "deploy") {
+    const { runDeployCommand } = await import("./cli/deploy.js");
+    const code = await runDeployCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "compliance") {
     const { runCompliance } = await import(
       "./compliance/eu_ai_act/cli.js"
@@ -737,6 +743,7 @@ Usage:
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
+  sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary export-passphrase             # Print stored passphrase
@@ -793,6 +800,9 @@ Subcommands:
 
   generate             Emit local deployment templates.
                        Use "sanctuary generate --help" for options.
+
+  deploy               Emit provider-neutral deployment skeletons.
+                       Use "sanctuary deploy --help" for options.
 
   identity             Inspect the active identity (DID, public key).
                        Use "sanctuary identity --help" for options.
@@ -953,6 +963,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "distress": {
       const { runDistressCommand } = await import("./cli/distress.js");
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
+    case "deploy": {
+      const { runDeployCommand } = await import("./cli/deploy.js");
+      await runDeployCommand({ argv: args.slice(1).concat("--help") });
       return true;
     }
     case "castle-wall":

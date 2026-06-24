@@ -18,25 +18,30 @@ import {
   issueNodeIdentityCertificate,
 } from "../../src/mesh/trust-root.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
-import { generateNodeKeypair } from "../../src/mesh/lifecycle/join-approver.js";
+import {
+  createAutoApproveJoinApprover,
+  generateNodeKeypair,
+} from "../../src/mesh/lifecycle/join-approver.js";
 import type {
   FortressMasterPublicKey,
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "../../src/mesh/types.js";
-import type { FederationContext } from "../../src/v1/federation.js";
+import type {
+  FederationIssuerContext,
+} from "../../src/v1/federation.js";
 import type { PeerSyncIdentity } from "../../src/v1/federation-client.js";
 import { assembleJoinRequest } from "../../src/cli/federation.js";
 
 export interface FedMaterials {
-  context: FederationContext;
+  context: FederationIssuerContext;
   fortressId: string;
   /** 32-byte symmetric fortress-master secret (out-of-band to a joining node). */
   masterSecret: Uint8Array;
 }
 
 export function makeFederationMaterials(opts?: {
-  approver?: FederationContext["approver"];
+  approver?: FederationIssuerContext["approver"];
 }): FedMaterials {
   const master = generateFortressMaster();
   const fortressId = master.public.fortress_id;
@@ -53,16 +58,22 @@ export function makeFederationMaterials(opts?: {
     master_private_key: master.private_key,
   });
 
-  const context: FederationContext = {
+  const context: FederationIssuerContext = {
     fortressId,
     nodeId: "fortress-node-1",
+    nodeMode: "local",
     pinnedMasterPubkey: master.public,
     issuingPrincipalCert: principalCert,
     getIssuingPrincipalPrivateKey: () => principalPriv,
     getFortressMasterSecret: () => masterSecret,
     getMasterPrivateKey: () => master.private_key,
     isNodeRevoked: () => false,
-    ...(opts?.approver ? { approver: opts.approver } : {}),
+    approver: opts?.approver ?? createAutoApproveJoinApprover({
+      pinned_master_pubkey: master.public,
+      issuing_principal_cert: principalCert,
+      issuing_principal_private_key: principalPriv,
+      master_private_key: master.private_key,
+    }),
   };
 
   return { context, fortressId, masterSecret };
@@ -76,7 +87,7 @@ export interface FortressNode {
   nodeCert: NodeIdentityCertificate;
   nodePrivateKey: Uint8Array;
   /** FederationContext for this node's daemon (same pinned master as its peers). */
-  context: FederationContext;
+  context: FederationIssuerContext;
   /** PeerSyncIdentity this node uses to drive an outbound peer sync. */
   peerIdentity: PeerSyncIdentity;
 }
@@ -132,9 +143,10 @@ export function makeMultiNodeFortress(nodeIds: string[]): MultiNodeFortress {
       master_private_key: master.private_key,
     });
 
-    const context: FederationContext = {
+    const context: FederationIssuerContext = {
       fortressId,
       nodeId,
+      nodeMode: "local",
       pinnedMasterPubkey: master.public,
       issuingPrincipalCert: principalCert,
       getIssuingPrincipalPrivateKey: () => principalPriv,
@@ -143,6 +155,12 @@ export function makeMultiNodeFortress(nodeIds: string[]): MultiNodeFortress {
       localNodeCert: nodeCert,
       getLocalNodePrivateKey: () => privateKey,
       isNodeRevoked: () => false,
+      approver: createAutoApproveJoinApprover({
+        pinned_master_pubkey: master.public,
+        issuing_principal_cert: principalCert,
+        issuing_principal_private_key: principalPriv,
+        master_private_key: master.private_key,
+      }),
     };
 
     const peerIdentity: PeerSyncIdentity = {

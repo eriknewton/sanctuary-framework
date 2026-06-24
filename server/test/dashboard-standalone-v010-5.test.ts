@@ -280,5 +280,20 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
     expect(body.layers).toHaveProperty("l2");
     expect(body.layers).toHaveProperty("l3");
     expect(body.layers).toHaveProperty("l4");
+    expect(body.federation).toEqual(
+      expect.objectContaining({
+        operator_cloud_nodes: 0,
+        provider_in_trust_boundary: false,
+        tee_attested: false,
+      }),
+    );
+    expect(body.federation.trust_boundary).toEqual(
+      expect.objectContaining({
+        version: "operator-cloud-trust-boundary-v1",
+        operator_cloud_nodes: 0,
+        provider_in_trust_boundary: false,
+        tee_attested: false,
+      }),
+    );
   }, 15000);
 });
