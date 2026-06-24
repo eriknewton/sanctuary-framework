@@ -123,6 +123,7 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "identity-encryption",
   "bridge-commitments",
   "federation-trust-root",
+  "federation-joiner-trust-root",
   "custody-envelope-mac",
   "custody-sentinel",
   "state-meta-mac",
