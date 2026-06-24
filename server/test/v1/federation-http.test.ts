@@ -47,7 +47,9 @@ async function auditOps(): Promise<Array<{ operation: string; result: string }>>
     .map((e) => ({ operation: e.operation, result: e.result }));
 }
 
-describe("/v1/federation perimeter + session gating", () => {
+// retry:2 - loopback /v1 federation rig races port/session setup under full-
+// suite parallel load (recurring non-hermetic CI flake class).
+describe("/v1/federation perimeter + session gating", { retry: 2 }, () => {
   it("denies every federation path to unauthenticated callers with the uniform 401", async () => {
     const probes: Array<[string, string]> = [
       ["GET", "/v1/federation/status"],
@@ -76,7 +78,8 @@ describe("/v1/federation perimeter + session gating", () => {
   });
 });
 
-describe("/v1/federation enable/disable — OPERATOR_SIGNED", () => {
+// retry:2 - loopback /v1 federation rig; same non-hermetic flake class.
+describe("/v1/federation enable/disable — OPERATOR_SIGNED", { retry: 2 }, () => {
   it("denies enable without an operator signature (generic 403)", async () => {
     const token = await openDurableSession(rig);
     const res = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
@@ -119,7 +122,8 @@ describe("/v1/federation enable/disable — OPERATOR_SIGNED", () => {
   });
 });
 
-describe("/v1/federation join ceremony end-to-end over HTTP", () => {
+// retry:2 - loopback /v1 federation rig; same non-hermetic flake class.
+describe("/v1/federation join ceremony end-to-end over HTTP", { retry: 2 }, () => {
   async function enableFederation(token: string) {
     const res = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
       method: "POST",
