@@ -67,6 +67,16 @@ export class DurableSpentSetStore {
   private readonly namespace: string;
   private readonly recordKey: string;
   private readonly encryptionKey: Uint8Array;
+  /**
+   * Serializes persists so two concurrent consumes of DISTINCT keys cannot have
+   * their whole-set rewrites land out of order (an earlier, less-complete
+   * snapshot completing last would drop a just-marked key -> replayable after a
+   * restart). Each persist awaits the prior, and each chained write SNAPSHOTS
+   * the live set at write time, so the last write reflects every key marked so
+   * far. A failed write still rejects THAT caller's promise (so consume rolls
+   * back + denies) but does not poison the chain for later writes.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(params: {
     storage: StorageBackend;
@@ -117,6 +127,17 @@ export class DurableSpentSetStore {
    * durably committed.
    */
   async persist(spent: ReadonlyMap<string, number>): Promise<void> {
+    // Chain after the prior persist so writes run in call order and never
+    // overlap. Snapshot `spent` INSIDE the chained closure (at write time) so the
+    // last write reflects every key marked so far, not a stale call-time copy.
+    const run = this.writeChain.then(() => this.writeNow(spent));
+    // Keep the chain alive even if THIS write throws (catch swallows for the
+    // chain only); the original `run` still rejects so the caller fails closed.
+    this.writeChain = run.catch(() => {});
+    return run;
+  }
+
+  private async writeNow(spent: ReadonlyMap<string, number>): Promise<void> {
     const set: PersistedSpentSet = {
       v: 1,
       entries: [...spent].map(([key, expires_at_ms]) => ({ key, expires_at_ms })),

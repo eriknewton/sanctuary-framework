@@ -76,6 +76,16 @@ import {
   FEDERATION_JOINER_TRUST_ROOT_KEY,
   FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO,
 } from "../../src/mesh/federation-joiner-trust-root-store.js";
+import {
+  BOOTSTRAP_NONCE_STORE_NAMESPACE,
+  BOOTSTRAP_NONCE_STORE_KEY,
+  BOOTSTRAP_NONCE_STORE_HKDF_INFO,
+} from "../../src/mesh/lifecycle/standalone-join-approver.js";
+import {
+  OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE,
+  OPERATOR_CLOUD_CLAIM_STORE_KEY,
+  OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
+} from "../../src/mesh/lifecycle/operator-cloud-join-approver.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -691,6 +701,81 @@ describe("master rotation — fail-closed coverage", () => {
         )
       )
     ).toEqual(joinerPayload);
+  });
+
+  it("rotates ALL FOUR _federation records (trust-root, joiner, spent-nonce set, provision-claim set) without strand", async () => {
+    // Anti-strand for the durable single-use replay stores: the spent-nonce set
+    // and the operator-cloud provision-claim set persist blobs into _federation
+    // under NEW HKDF labels. Without those labels in the _federation recipe's
+    // infos, convertPurposeNamespace throws RotationPreflightError and rotateMaster
+    // is DENIED on any fortress that ever consumed a federation nonce/claim. This
+    // proves the grown infos list re-wraps all four under the new master.
+    //
+    // The store labels MUST equal the recipe strings; assert that explicitly so a
+    // typo in either place is caught here, not only at a real operator's rotation.
+    expect(BOOTSTRAP_NONCE_STORE_HKDF_INFO).toBe("federation-bootstrap-nonce-spent-set");
+    expect(OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO).toBe(
+      "federation-operator-cloud-provision-claim-set"
+    );
+    expect(BOOTSTRAP_NONCE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+
+    const fortress = await buildFortress();
+    const records: Array<{ key: string; info: string; payload: unknown }> = [
+      {
+        key: FEDERATION_TRUST_ROOT_KEY,
+        info: FEDERATION_TRUST_ROOT_HKDF_INFO,
+        payload: { marker: "trust-root" },
+      },
+      {
+        key: FEDERATION_JOINER_TRUST_ROOT_KEY,
+        info: FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO,
+        payload: { marker: "joiner" },
+      },
+      {
+        key: BOOTSTRAP_NONCE_STORE_KEY,
+        info: BOOTSTRAP_NONCE_STORE_HKDF_INFO,
+        payload: { v: 1, entries: [{ key: "f n nonce", expires_at_ms: Date.now() + 60_000 }] },
+      },
+      {
+        key: OPERATOR_CLOUD_CLAIM_STORE_KEY,
+        info: OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
+        payload: { v: 1, entries: [{ key: "f n nonce", claim: { consumed: true } }] },
+      },
+    ];
+    // All four live in the same _federation namespace (no-AAD, purpose-keyed).
+    for (const r of records) {
+      await fortress.storage.write(
+        FEDERATION_TRUST_ROOT_NAMESPACE,
+        r.key,
+        stringToBytes(
+          JSON.stringify(
+            encrypt(
+              stringToBytes(JSON.stringify(r.payload)),
+              derivePurposeKey(fortress.master, r.info)
+            )
+          )
+        )
+      );
+    }
+
+    // Without the two new infos this throws RotationPreflightError (strand).
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+
+    // Every one of the four decrypts + reads back under the NEW master.
+    for (const r of records) {
+      const raw = JSON.parse(
+        bytesToString(
+          (await fortress.storage.read(FEDERATION_TRUST_ROOT_NAMESPACE, r.key))!
+        )
+      ) as EncryptedPayload;
+      const plain = decrypt(raw, derivePurposeKey(est.masterKey, r.info));
+      expect(JSON.parse(bytesToString(plain))).toEqual(r.payload);
+    }
   });
 
   it("aborts BY NAME on unified-inbox operator-prefs records (hash-keyed AAD — codex r2)", async () => {

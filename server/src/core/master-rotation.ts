@@ -346,7 +346,20 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
   _bridge: { kind: "purpose-encrypted", infos: ["bridge-commitments"] },
   _federation: {
     kind: "purpose-encrypted",
-    infos: ["federation-trust-root", "federation-joiner-trust-root"],
+    infos: [
+      "federation-trust-root",
+      "federation-joiner-trust-root",
+      // Durable single-use replay sets persisted under _federation by the
+      // standalone nonce store and the operator-cloud claim store. Both blobs
+      // are derivePurposeKey(master, <label>) with NO AAD (like the trust-root
+      // store), so the no-AAD candidate re-wraps them. Without these labels a
+      // fortress that consumed a federation nonce/claim would strand its replay
+      // set and rotateMaster would abort (RotationPreflightError). The strings
+      // MUST equal BOOTSTRAP_NONCE_STORE_HKDF_INFO and
+      // OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO (asserted in master-rotation.test).
+      "federation-bootstrap-nonce-spent-set",
+      "federation-operator-cloud-provision-claim-set",
+    ],
   },
   _fortress_mode: {
     kind: "namespace-info-encrypted",

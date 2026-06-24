@@ -85,6 +85,47 @@ class CorruptReadStorage implements StorageBackend {
   }
 }
 
+/**
+ * A storage backend that makes the FIRST of the next TWO writes resolve AFTER the
+ * second, by delaying them in decreasing order (the first-armed write waits
+ * longest). Each write's byte-commit to the underlying map happens AFTER its
+ * delay, so the effective on-disk order is the resolution order, not the call
+ * order. `arm()` starts the reorder window so earlier setup writes (e.g. claim
+ * `record`) commit normally and only the concurrent consume-pair is reordered.
+ *
+ * Without per-store persist serialization, two concurrent consumes' whole-set
+ * rewrites are both in-flight at once: the earlier (less-complete) snapshot is
+ * delayed longest and commits LAST, dropping the other key -> replayable after a
+ * restart. With serialization, the second persist does not start its write until
+ * the first persist's write has resolved, so only one write is ever in-flight:
+ * there is nothing to reorder, write order == call order, and the final on-disk
+ * set holds BOTH keys. It cannot deadlock: the delays are independent timers, not
+ * a cross-write gate.
+ */
+class ReorderingWriteStorage extends MemoryStorage {
+  private armedRemaining = 0;
+  private armedSeen = 0;
+
+  /** Reorder the next two writes (the concurrent consume pair). */
+  arm(): void {
+    this.armedRemaining = 2;
+    this.armedSeen = 0;
+  }
+
+  override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    let delayMs = 0;
+    if (this.armedRemaining > 0) {
+      this.armedRemaining--;
+      const n = ++this.armedSeen;
+      // First armed write waits 40ms, second waits 5ms: if both are in-flight the
+      // second commits first and the first commits last (the reorder).
+      delayMs = n === 1 ? 40 : 5;
+    }
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    await MemoryStorage.prototype.write.call(this, namespace, key, data);
+  }
+}
+
 function claimParams(overrides?: Partial<RecordProvisionClaimParams>): RecordProvisionClaimParams {
   return {
     fortress_id: FORTRESS,
@@ -305,6 +346,54 @@ describe("expired entries pruned on load (criterion d)", () => {
     );
     const loaded = await backend.load(Date.now());
     expect(loaded.size).toBe(0);
+  });
+});
+
+describe("concurrent consumes of DISTINCT keys are not lost (serialized persists)", () => {
+  it("nonce store: two concurrent consumes both survive a restart (no lost-update)", async () => {
+    const storage = new ReorderingWriteStorage();
+    const expiresAtMs = Date.now() + 60_000;
+    const store = BootstrapNonceStore.durableFromBoot(storage, masterKey());
+
+    // Fire two consumes of DISTINCT nonces concurrently. The reordering storage
+    // makes the FIRST whole-set write resolve LAST. Without serialized persists
+    // that stale (less-complete) snapshot lands last and drops a key; with
+    // serialization the writes run in order and BOTH keys persist.
+    storage.arm();
+    const [a, b] = await Promise.all([
+      store.consume(FORTRESS, NODE, "nonce-A", expiresAtMs),
+      store.consume(FORTRESS, NODE, "nonce-B", expiresAtMs),
+    ]);
+    expect(a).toBe(true);
+    expect(b).toBe(true);
+
+    // RESTART: a fresh instance over the SAME backend. BOTH nonces must still be
+    // spent (neither replayable). On the unserialized code one of these is true.
+    const restarted = BootstrapNonceStore.durableFromBoot(storage, masterKey());
+    expect(await restarted.consume(FORTRESS, NODE, "nonce-A", expiresAtMs)).toBe(false);
+    expect(await restarted.consume(FORTRESS, NODE, "nonce-B", expiresAtMs)).toBe(false);
+  });
+
+  it("claim store: two concurrent consumes both stay consumed across a restart", async () => {
+    const storage = new ReorderingWriteStorage();
+    const store = OperatorCloudProvisionClaimStore.durableFromBoot(storage, masterKey());
+    // Record two DISTINCT claims first (sequential record; the race is on consume).
+    await store.record(claimParams({ bootstrap_nonce: "nonce-A" }));
+    await store.record(claimParams({ bootstrap_nonce: "nonce-B" }));
+
+    storage.arm();
+    const [a, b] = await Promise.all([
+      store.consume(FORTRESS, NODE, "nonce-A"),
+      store.consume(FORTRESS, NODE, "nonce-B"),
+    ]);
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+
+    // RESTART: both claims must stay consumed (a dropped consumed-flag would let
+    // one cloud join replay mid-TTL).
+    const restarted = OperatorCloudProvisionClaimStore.durableFromBoot(storage, masterKey());
+    expect(await restarted.consume(FORTRESS, NODE, "nonce-A")).toBeNull();
+    expect(await restarted.consume(FORTRESS, NODE, "nonce-B")).toBeNull();
   });
 });
 

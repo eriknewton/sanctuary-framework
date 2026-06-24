@@ -67,6 +67,16 @@ export class DurableClaimSetStore {
   private readonly namespace: string;
   private readonly recordKey: string;
   private readonly encryptionKey: Uint8Array;
+  /**
+   * Serializes persists so two concurrent record/consume of DISTINCT claims
+   * cannot have their whole-set rewrites land out of order (an earlier, less-
+   * complete snapshot completing last would drop a just-flipped claim ->
+   * replayable after a restart). Each persist awaits the prior, and each chained
+   * write SNAPSHOTS the live set at write time, so the last write reflects every
+   * mutation so far. A failed write still rejects THAT caller's promise (so the
+   * caller rolls back + denies) without poisoning the chain for later writes.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(params: {
     storage: StorageBackend;
@@ -108,6 +118,19 @@ export class DurableClaimSetStore {
 
   /** Persist the whole claim set. THROWS on any encrypt/write failure. */
   async persist(
+    claims: ReadonlyMap<string, OperatorCloudProvisionClaim>,
+  ): Promise<void> {
+    // Chain after the prior persist so writes run in call order and never
+    // overlap. Snapshot `claims` INSIDE the chained closure (at write time) so
+    // the last write reflects every mutation so far, not a stale call-time copy.
+    const run = this.writeChain.then(() => this.writeNow(claims));
+    // Keep the chain alive even if THIS write throws; the original `run` still
+    // rejects so the caller fails closed.
+    this.writeChain = run.catch(() => {});
+    return run;
+  }
+
+  private async writeNow(
     claims: ReadonlyMap<string, OperatorCloudProvisionClaim>,
   ): Promise<void> {
     const set: PersistedClaimSet = {
