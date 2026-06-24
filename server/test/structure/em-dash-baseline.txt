@@ -126,7 +126,6 @@
 12	server/src/cli/castle-wall-boot.ts
 1	server/src/cli/did-web.ts
 2	server/src/cli/distress.ts
-2	server/src/cli/federation.ts
 1	server/src/cli/nodes.ts
 2	server/src/cli/restore-attest.ts
 4	server/src/cli/secrets.ts
