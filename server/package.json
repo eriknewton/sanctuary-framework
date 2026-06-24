@@ -83,6 +83,9 @@
     "uint8arraylist": "2.4.9",
     "uint8arrays": "5.1.1"
   },
+  "optionalDependencies": {
+    "@noble/post-quantum": "0.6.1"
+  },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@playwright/test": "1.59.1",
