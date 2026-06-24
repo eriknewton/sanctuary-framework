@@ -93,7 +93,7 @@ import {
 } from "../v1/agents.js";
 import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
-  assertOperatorCloudContextHasNoIssuerAuthority,
+  assertNonIssuerContextHasNoIssuerAuthority,
   federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
@@ -1507,7 +1507,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   setFederationContext(ctx: FederationContext | null): void {
     this.stopFederationCertificateAutoRenewal();
     if (ctx !== null) {
-      assertOperatorCloudContextHasNoIssuerAuthority(ctx);
+      assertNonIssuerContextHasNoIssuerAuthority(ctx);
     }
     this._federationContext = ctx;
     if (ctx === null) {

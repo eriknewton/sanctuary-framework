@@ -154,17 +154,39 @@ export interface FederationIssuerContext extends FederationBaseContext {
   approver: JoinApprover;
 }
 
-export interface FederationNonIssuerOperatorCloudContext extends FederationBaseContext {
-  nodeMode: "operator_cloud";
+/**
+ * A NON-ISSUER federation context. Covers a local-mode JOINER (Slice 3a) and an
+ * operator_cloud node (OC Slice 2) alike: a node that holds its OWN node
+ * identity and can present its cert on `/sync/peer`, but holds NONE of the
+ * issuing material and structurally cannot mint bootstrap tokens or issue certs.
+ *
+ * The `?: never` fields are the structural invariant: a non-issuer context that
+ * carries an issuer accessor is a type error, and {@link
+ * assertNonIssuerContextHasNoIssuerAuthority} rejects it at runtime for ANY
+ * non-issuer node mode.
+ *
+ * `nodeMode` is the full `NodeMode` set here: a `local` node can be EITHER an
+ * issuer or a non-issuer joiner, so the issuer/non-issuer distinction is carried
+ * by the presence of the issuer accessors, NOT by the node mode.
+ */
+export interface FederationNonIssuerContext extends FederationBaseContext {
+  nodeMode: NodeMode;
   getIssuingPrincipalPrivateKey?: never;
   getFortressMasterSecret?: never;
   getMasterPrivateKey?: never;
   approver?: never;
 }
 
+/**
+ * Back-compat alias for OC Slice 2 callers/tests: an operator_cloud node is a
+ * non-issuer context pinned to `nodeMode: "operator_cloud"`.
+ */
+export type FederationNonIssuerOperatorCloudContext =
+  FederationNonIssuerContext & { nodeMode: "operator_cloud" };
+
 export type FederationContext =
   | FederationIssuerContext
-  | FederationNonIssuerOperatorCloudContext;
+  | FederationNonIssuerContext;
 
 export type AuthorizeCompleteResult =
   | {
@@ -341,7 +363,12 @@ export class JoinCeremony {
   }
 
   private issuerContextOrNull(): FederationIssuerContext | null {
+    // operator_cloud is structurally a non-issuer: it can never carry issuer
+    // authority, so it is short-circuited here regardless of accessor shape.
     if (this.ctx.nodeMode === "operator_cloud") return null;
+    // For local / sovereign_tee, issuer authority is carried by the accessors
+    // (a local node can be EITHER an issuer or a non-issuer joiner). A context
+    // missing either required accessor is a non-issuer (e.g. a local joiner).
     if (
       typeof this.ctx.getIssuingPrincipalPrivateKey !== "function" ||
       typeof this.ctx.getFortressMasterSecret !== "function"
@@ -352,20 +379,56 @@ export class JoinCeremony {
   }
 }
 
-export function assertOperatorCloudContextHasNoIssuerAuthority(
+/** The issuer-authority accessor/approver fields a non-issuer must never carry. */
+const ISSUER_AUTHORITY_FIELDS: readonly string[] = [
+  "getIssuingPrincipalPrivateKey",
+  "getFortressMasterSecret",
+  "getMasterPrivateKey",
+  "approver",
+];
+
+/**
+ * Reject any context that should be a NON-ISSUER but carries issuer authority.
+ *
+ * A context is treated as a non-issuer when it is operator_cloud (structurally
+ * never an issuer) OR when it does not present the COMPLETE issuer accessor pair
+ * (`getIssuingPrincipalPrivateKey` + `getFortressMasterSecret`), i.e. a local
+ * joiner or a partially-populated context. In either case, the presence of ANY
+ * issuer-authority field (a function accessor or an approver) is an escalation
+ * and throws. A complete, consistent issuer context passes untouched.
+ *
+ * This generalizes the original operator_cloud-only guard to cover the local
+ * joiner introduced in Federation Slice 3a without weakening the OC invariant.
+ */
+export function assertNonIssuerContextHasNoIssuerAuthority(
   ctx: FederationContext,
 ): void {
-  if (ctx.nodeMode !== "operator_cloud") return;
   const candidate = ctx as FederationContext & Record<string, unknown>;
-  if (
-    "getIssuingPrincipalPrivateKey" in candidate ||
-    "getFortressMasterSecret" in candidate ||
-    "getMasterPrivateKey" in candidate ||
-    "approver" in candidate
-  ) {
-    throw new Error("operator_cloud federation context must not carry issuer authority");
+  const hasCompleteIssuerAccessors =
+    typeof candidate.getIssuingPrincipalPrivateKey === "function" &&
+    typeof candidate.getFortressMasterSecret === "function";
+  // A non-operator_cloud context that DOES present the complete issuer accessor
+  // pair is a legitimate issuer context; leave it untouched.
+  if (ctx.nodeMode !== "operator_cloud" && hasCompleteIssuerAccessors) return;
+  // Otherwise it must be a clean non-issuer: no issuer-authority field at all.
+  for (const field of ISSUER_AUTHORITY_FIELDS) {
+    if (field in candidate && candidate[field] !== undefined) {
+      throw new Error(
+        ctx.nodeMode === "operator_cloud"
+          ? "operator_cloud federation context must not carry issuer authority"
+          : "non-issuer federation context must not carry issuer authority",
+      );
+    }
   }
 }
+
+/**
+ * Back-compat alias for OC Slice 2 callers/tests. The original name asserted the
+ * operator_cloud non-issuer invariant; it now delegates to the generalized
+ * guard (which preserves the operator_cloud-specific error message).
+ */
+export const assertOperatorCloudContextHasNoIssuerAuthority =
+  assertNonIssuerContextHasNoIssuerAuthority;
 
 export function federationContextHasIssuerAuthority(
   ctx: FederationContext | null,

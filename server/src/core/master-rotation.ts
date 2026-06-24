@@ -346,7 +346,7 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
   _bridge: { kind: "purpose-encrypted", infos: ["bridge-commitments"] },
   _federation: {
     kind: "purpose-encrypted",
-    infos: ["federation-trust-root"],
+    infos: ["federation-trust-root", "federation-joiner-trust-root"],
   },
   _fortress_mode: {
     kind: "namespace-info-encrypted",

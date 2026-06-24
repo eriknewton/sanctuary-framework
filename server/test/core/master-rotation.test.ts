@@ -71,6 +71,11 @@ import {
   FEDERATION_TRUST_ROOT_KEY,
   FEDERATION_TRUST_ROOT_HKDF_INFO,
 } from "../../src/mesh/federation-trust-root-store.js";
+import {
+  FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+  FEDERATION_JOINER_TRUST_ROOT_KEY,
+  FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO,
+} from "../../src/mesh/federation-joiner-trust-root-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -559,6 +564,133 @@ describe("master rotation — fail-closed coverage", () => {
       derivePurposeKey(est.masterKey, FEDERATION_TRUST_ROOT_HKDF_INFO)
     );
     expect(JSON.parse(bytesToString(plain))).toEqual(payload);
+  });
+
+  it("rotates the federation JOINER trust-root record (_federation/joiner-trust-root-v1, anti-strand) — re-wraps under the new master, no orphan/lockout", async () => {
+    // Federation Slice 3a anti-strand guard: the _federation recipe's infos
+    // GREW to include "federation-joiner-trust-root". Without it, a custody
+    // rotation would orphan the persisted joiner record, locking the joiner
+    // out of federation. A wrong/changed HKDF info or a stray AAD would fail
+    // this decrypt under the new master.
+    const fortress = await buildFortress();
+    const payload = {
+      fortress_id: "fed-joiner-rotate-1",
+      marker: "joiner-trust-root-survives-rotation",
+    };
+    await fortress.storage.write(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(
+            stringToBytes(JSON.stringify(payload)),
+            derivePurposeKey(
+              fortress.master,
+              FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO
+            )
+          )
+        )
+      )
+    );
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const raw = JSON.parse(
+      bytesToString(
+        (await fortress.storage.read(
+          FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+          FEDERATION_JOINER_TRUST_ROOT_KEY
+        ))!
+      )
+    ) as EncryptedPayload;
+    const plain = decrypt(
+      raw,
+      derivePurposeKey(est.masterKey, FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO)
+    );
+    expect(JSON.parse(bytesToString(plain))).toEqual(payload);
+  });
+
+  it("rotates BOTH _federation keys in one pass (issuer + joiner) without orphaning either", async () => {
+    // The _federation namespace can in principle hold both keys; the
+    // purpose-encrypted convert walker tries each info per blob. This proves
+    // the grown infos list decrypts both under the new master in a single
+    // rotation (the recipe-growth round-trip).
+    const fortress = await buildFortress();
+    const issuerPayload = { marker: "issuer-key" };
+    const joinerPayload = { marker: "joiner-key" };
+    await fortress.storage.write(
+      FEDERATION_TRUST_ROOT_NAMESPACE,
+      FEDERATION_TRUST_ROOT_KEY,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(
+            stringToBytes(JSON.stringify(issuerPayload)),
+            derivePurposeKey(fortress.master, FEDERATION_TRUST_ROOT_HKDF_INFO)
+          )
+        )
+      )
+    );
+    await fortress.storage.write(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(
+            stringToBytes(JSON.stringify(joinerPayload)),
+            derivePurposeKey(
+              fortress.master,
+              FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO
+            )
+          )
+        )
+      )
+    );
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const issuerRaw = JSON.parse(
+      bytesToString(
+        (await fortress.storage.read(
+          FEDERATION_TRUST_ROOT_NAMESPACE,
+          FEDERATION_TRUST_ROOT_KEY
+        ))!
+      )
+    ) as EncryptedPayload;
+    const joinerRaw = JSON.parse(
+      bytesToString(
+        (await fortress.storage.read(
+          FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+          FEDERATION_JOINER_TRUST_ROOT_KEY
+        ))!
+      )
+    ) as EncryptedPayload;
+    expect(
+      JSON.parse(
+        bytesToString(
+          decrypt(
+            issuerRaw,
+            derivePurposeKey(est.masterKey, FEDERATION_TRUST_ROOT_HKDF_INFO)
+          )
+        )
+      )
+    ).toEqual(issuerPayload);
+    expect(
+      JSON.parse(
+        bytesToString(
+          decrypt(
+            joinerRaw,
+            derivePurposeKey(
+              est.masterKey,
+              FEDERATION_JOINER_TRUST_ROOT_HKDF_INFO
+            )
+          )
+        )
+      )
+    ).toEqual(joinerPayload);
   });
 
   it("aborts BY NAME on unified-inbox operator-prefs records (hash-keyed AAD — codex r2)", async () => {

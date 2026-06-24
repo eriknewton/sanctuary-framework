@@ -82,6 +82,7 @@ import {
   DistressLocalSecretError,
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
+import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
 import { createAutoDenyJoinApprover } from "./mesh/lifecycle/index.js";
 
 export interface StandaloneDashboardOptions {
@@ -601,6 +602,37 @@ export async function startStandaloneDashboard(
         "standalone dashboard: federation join approval is not available in load-only mode (enable via the federation authorize slice)",
       ),
     });
+  } else {
+    // Federation Slice 3a: the JOINER half. A second machine that ran a real
+    // join persists a NON-ISSUER joiner trust root; production boot loads it
+    // (never mints; a joiner has no master to mint from) into a non-issuer
+    // context with NO approver. This provisions /v1/federation reads and
+    // /sync/peer (cert-chain verified) but structurally refuses issuance.
+    // Issuer precedence: only attempted when no issuer root exists (Q3). A
+    // malformed/tampered joiner record fails closed (load returns null) and
+    // leaves federation honestly off; boot never crashes, never mints.
+    const joinerRoot = await loadFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      audit: async (event) => {
+        try {
+          await auditLog.append(
+            "l2",
+            event.operation,
+            "federation",
+            event.details,
+            event.result,
+          );
+        } catch {
+          // Federation remains fail-closed; dashboard boot reports
+          // provisioned:false rather than crash or mint a replacement root.
+        }
+      },
+    });
+    if (joinerRoot !== null) {
+      // No approver: a joiner is a non-issuer and cannot run the approval gate.
+      dashboard.setFederationContext(joinerRoot.context);
+    }
   }
 
   // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator
