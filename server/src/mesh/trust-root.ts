@@ -161,6 +161,11 @@ export function issueNodeIdentityCertificate(params: {
       "v0.1 node cert MUST set at least CAP_STANDARD_FORTRESS_NODE (bit 0)"
     );
   }
+  if (params.node_mode !== "sovereign_tee" && params.tee_attestation_hash !== undefined) {
+    throw new MeshChainError(
+      "TEE attestation hash is only accepted for sovereign_tee node certificates"
+    );
+  }
 
   const body = {
     certificate_version: params.expires_at

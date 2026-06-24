@@ -47,7 +47,10 @@ export function issueCertificateForApprovedJoin(params: {
     },
     principal_private_key: params.issuing_principal_private_key,
     expires_at: params.expires_at,
-    tee_attestation_hash: params.request.attestation,
+    tee_attestation_hash:
+      params.request.node_mode === "sovereign_tee"
+        ? params.request.attestation
+        : undefined,
     master_private_key: params.master_private_key,
   });
 }

@@ -280,10 +280,10 @@ Sanctuary is designed to run the same rights substrate in three places. Local mo
 | Mode | Status | What it is | Who picks this |
 |---|---|---|---|
 | **On your machines** (Local) | Shipping | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
-| **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
+| **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account with operator-approved scoped node custody. The provider is inside the node runtime trust boundary until sovereign TEE mode is verified by hardware attestation. | Prosumers, small businesses, operators with light IT but no rack at home. |
 | **In a sealed cloud box we manage** (Sovereign-managed TEE) | Roadmapped (v2) | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
-The operator holds the keys in every mode. The sovereign-managed mode will require hardware attestation before it is treated as shipped.
+The operator remains the custody root in every mode. Commodity operator-cloud mode does not put the cloud provider outside the runtime trust boundary; sovereign-managed mode requires hardware attestation before it is treated as shipped.
 
 ---
 

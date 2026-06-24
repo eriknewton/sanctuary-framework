@@ -10,6 +10,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "compliance",
   "concierge",
   "dashboard",
+  "deploy",
   "did-web",
   "distress",
   "doctor",

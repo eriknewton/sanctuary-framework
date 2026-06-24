@@ -217,6 +217,25 @@ describe("mesh/trust-root — per-node cert chain + hard-gate capability reserva
     expect(() => issueNode(0)).toThrow(MeshChainError);
   });
 
+  it("rejects TEE attestation hashes on non-sovereign-TEE node certs", () => {
+    expect(() =>
+      issueNodeIdentityCertificate({
+        node_id: "cloud-with-self-report",
+        node_pubkey: nodeKeypair.publicKey,
+        node_mode: "operator_cloud",
+        fortress_id: master.public.fortress_id,
+        capabilities: CAP_STANDARD_FORTRESS_NODE,
+        parent_chain: {
+          fortress_master_pubkey: master.public.public_key,
+          principal_id: principalCert.principal_id,
+          principal_pubkey: principalCert.principal_pubkey,
+        },
+        principal_private_key: principalKeypair.privateKey,
+        tee_attestation_hash: "self-reported",
+      }),
+    ).toThrow(MeshChainError);
+  });
+
   it("v0.1 verifier tolerates unknown capability bits on v1.x cert (forward-compat §10.2)", () => {
     // Simulate a v1.x-issued cert carrying bit 3 by hand-crafting the body and
     // signing with the principal key. v0.1 verifier MUST accept (but v01VisibleCapabilities

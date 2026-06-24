@@ -13,7 +13,11 @@ import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes } from "node:crypto";
 
-import { JoinCeremony } from "../../src/v1/federation.js";
+import {
+  assertOperatorCloudContextHasNoIssuerAuthority,
+  JoinCeremony,
+  type FederationContext,
+} from "../../src/v1/federation.js";
 import { verifyBootstrapToken } from "../../src/mesh/lifecycle/bootstrap-token.js";
 import { verifyCertChain } from "../../src/mesh/trust-root.js";
 import { createAutoDenyJoinApprover } from "../../src/mesh/lifecycle/join-approver.js";
@@ -134,6 +138,62 @@ describe("JoinCeremony.authorizeComplete — fail closed on unverifiable peers",
     const outcome = await ceremony.authorizeComplete(assembled.joinRequest);
     expect(outcome.approved).toBe(false);
     if (!outcome.approved) expect(outcome.denialReason).toContain("policy refusal");
+  });
+
+  it("denies issuance when no operator approval gate is injected", async () => {
+    const { materials, assembled } = mintAndAssemble();
+    const { approver: _approver, ...withoutApprover } = materials.context;
+    const outcome = await new JoinCeremony(
+      withoutApprover as unknown as FederationContext,
+    ).authorizeComplete(assembled.joinRequest);
+    expect(outcome.approved).toBe(false);
+    if (!outcome.approved) expect(outcome.denialReason).toContain("approval gate unavailable");
+  });
+
+  it("operator-cloud non-issuer contexts cannot mint tokens or issue certs", async () => {
+    const materials = makeFederationMaterials();
+    const homeCeremony = new JoinCeremony(materials.context);
+    const token = homeCeremony.authorizeInit({
+      intendedNodeId: "another-node",
+      intendedNodeMode: "local",
+    });
+    const assembled = assembleJoinRequest({
+      bootstrapToken: token,
+      fortressMasterSecret: materials.masterSecret,
+    });
+    const cloudContext: FederationContext = {
+      fortressId: materials.fortressId,
+      nodeId: "cloud-node-issuer-test",
+      nodeMode: "operator_cloud",
+      pinnedMasterPubkey: materials.context.pinnedMasterPubkey,
+      issuingPrincipalCert: materials.context.issuingPrincipalCert,
+      isNodeRevoked: () => false,
+    };
+
+    expect(() => assertOperatorCloudContextHasNoIssuerAuthority(cloudContext)).not.toThrow();
+    expect(() =>
+      new JoinCeremony(cloudContext).authorizeInit({
+        intendedNodeId: "forbidden-node",
+        intendedNodeMode: "local",
+      }),
+    ).toThrow(/issuer authority unavailable/);
+
+    const outcome = await new JoinCeremony(cloudContext).authorizeComplete(
+      assembled.joinRequest,
+    );
+    expect(outcome.approved).toBe(false);
+    if (!outcome.approved) expect(outcome.denialReason).toContain("issuer authority unavailable");
+  });
+
+  it("rejects operator-cloud contexts that carry issuer authority", () => {
+    const materials = makeFederationMaterials();
+    const invalidCloudContext = {
+      ...materials.context,
+      nodeMode: "operator_cloud",
+    } as unknown as FederationContext;
+    expect(() => assertOperatorCloudContextHasNoIssuerAuthority(invalidCloudContext)).toThrow(
+      /must not carry issuer authority/,
+    );
   });
 
   it("denies a wholly forged token (random signature, no real principal)", async () => {
