@@ -77,6 +77,13 @@ const NODE_MODES: readonly NodeMode[] = [
   "sovereign_tee",
 ];
 
+/**
+ * Peer sync can carry node+principal certificate chains. Slice 2 hybrid certs
+ * are larger than the default 16 KiB v1 write cap, but still bounded before
+ * JSON parsing to keep malformed peer traffic cheap to reject.
+ */
+export const V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES = 96 * 1024;
+
 /** A path owned by the federation handler (post-session class). */
 export function isFederationPath(pathname: string): boolean {
   return (
@@ -867,7 +874,7 @@ async function handlePeerSync(
     return;
   }
 
-  const body = await readJsonBody(req);
+  const body = await readJsonBody(req, V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES);
   if (typeof body !== "object" || body === null) {
     writeJson(res, 400, { error: "bad request" });
     return;

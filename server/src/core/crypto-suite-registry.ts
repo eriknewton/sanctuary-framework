@@ -1,10 +1,11 @@
 /**
  * Signature-suite registry for new versioned signing surfaces.
  *
- * Slice 1 intentionally enables only crypto-agility infrastructure. It does not
- * add a hybrid or PQC algorithm; the registry is seeded with ed25519-v1 only.
+ * Slice 2 adds the first hybrid suite, ed25519+ml-dsa-v1. Hybrid verification
+ * is fail-closed: both components must be present, ordered, and valid.
  */
 
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { fromBase64url, stringToBytes, toBase64url } from "./encoding.js";
 import { sign as identitySign, verify as identityVerify } from "./identity.js";
 import type { EncryptedPayload } from "./encryption.js";
@@ -12,8 +13,20 @@ import type { EncryptedPayload } from "./encryption.js";
 export const SIGNATURE_BUNDLE_VERSION = "sanctuary.signature-bundle.v1";
 export const SIGNED_SURFACE_DOMAIN = "sanctuary.signed-surface.v1";
 export const ED25519_SIGNATURE_SUITE_ID = "ed25519-v1";
+export const ML_DSA_65_COMPONENT_ALG = "ml-dsa-65-v1";
+export const HYBRID_SIGNATURE_SUITE_ID = "ed25519+ml-dsa-v1";
 
-export type SignatureSuiteId = typeof ED25519_SIGNATURE_SUITE_ID;
+export const ED25519_PUBLIC_KEY_BYTES = 32;
+export const ED25519_SIGNATURE_BYTES = 64;
+export const ML_DSA_65_PUBLIC_KEY_BYTES = 1952;
+export const ML_DSA_65_SECRET_KEY_BYTES = 4032;
+export const ML_DSA_65_SIGNATURE_BYTES = 3309;
+export const ED25519_SIGNATURE_B64URL_MAX_CHARS = 86;
+export const ML_DSA_65_SIGNATURE_B64URL_MAX_CHARS = 4412;
+
+export type SignatureSuiteId =
+  | typeof ED25519_SIGNATURE_SUITE_ID
+  | typeof HYBRID_SIGNATURE_SUITE_ID;
 
 export type CanonicalJsonValue =
   | null
@@ -58,9 +71,16 @@ export interface Ed25519SuiteSigner {
   sign(bytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
 }
 
+/** ML-DSA-65 signing capability used by the hybrid suite. */
+export interface MlDsa65SuiteSigner {
+  readonly key_ref: string;
+  sign(bytes: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
 /** Signing capabilities keyed by algorithm family for suite dispatch. */
 export interface SuiteSigner {
   readonly ed25519?: Ed25519SuiteSigner;
+  readonly ml_dsa_65?: MlDsa65SuiteSigner;
 }
 
 /** Ed25519 public key used by the ed25519-v1 suite. */
@@ -69,9 +89,16 @@ export interface Ed25519SuitePublicKey {
   readonly public_key: Uint8Array;
 }
 
+/** ML-DSA-65 public key used by the hybrid suite. */
+export interface MlDsa65SuitePublicKey {
+  readonly key_ref: string;
+  readonly public_key: Uint8Array;
+}
+
 /** Public keys keyed by algorithm family for suite dispatch. */
 export interface SuitePublicKeys {
   readonly ed25519?: Ed25519SuitePublicKey;
+  readonly ml_dsa_65?: MlDsa65SuitePublicKey;
 }
 
 /** Public registry metadata for one configured signature suite. */
@@ -111,6 +138,7 @@ export class CryptoSuiteRegistry {
 
   constructor() {
     this.addSuite(createEd25519Suite());
+    this.addSuite(createHybridEd25519MlDsa65Suite());
   }
 
   /** Return configured suite metadata without exposing raw suite signers. */
@@ -177,7 +205,7 @@ export class CryptoSuiteRegistry {
   }
 }
 
-/** Shared default registry seeded with ed25519-v1 only. */
+/** Shared default registry seeded with the currently supported signature suites. */
 export const cryptoSuiteRegistry = new CryptoSuiteRegistry();
 
 /**
@@ -230,7 +258,7 @@ export function createEd25519SuitePublicKeys(params: {
   readonly publicKey: Uint8Array;
 }): SuitePublicKeys {
   assertNonEmpty("key_ref", params.key_ref);
-  if (params.publicKey.length !== 32) {
+  if (params.publicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
     throw new CryptoSuiteRegistryError(
       "ed25519-v1 public key must be 32 bytes"
     );
@@ -243,12 +271,43 @@ export function createEd25519SuitePublicKeys(params: {
   };
 }
 
+/** Create ed25519+ml-dsa-v1 public keys for suite verification. */
+export function createHybridSuitePublicKeys(params: {
+  readonly ed25519KeyRef: string;
+  readonly ed25519PublicKey: Uint8Array;
+  readonly mlDsa65KeyRef: string;
+  readonly mlDsa65PublicKey: Uint8Array;
+}): SuitePublicKeys {
+  assertNonEmpty("ed25519KeyRef", params.ed25519KeyRef);
+  assertNonEmpty("mlDsa65KeyRef", params.mlDsa65KeyRef);
+  if (params.ed25519PublicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
+    throw new CryptoSuiteRegistryError(
+      "ed25519+ml-dsa-v1 Ed25519 public key must be 32 bytes"
+    );
+  }
+  if (params.mlDsa65PublicKey.length !== ML_DSA_65_PUBLIC_KEY_BYTES) {
+    throw new CryptoSuiteRegistryError(
+      "ed25519+ml-dsa-v1 ML-DSA-65 public key must be 1952 bytes"
+    );
+  }
+  return {
+    ed25519: {
+      key_ref: params.ed25519KeyRef,
+      public_key: params.ed25519PublicKey,
+    },
+    ml_dsa_65: {
+      key_ref: params.mlDsa65KeyRef,
+      public_key: params.mlDsa65PublicKey,
+    },
+  };
+}
+
 function createEd25519Suite(): RegisteredSignatureSuite {
   return {
     id: ED25519_SIGNATURE_SUITE_ID,
     components: [ED25519_SIGNATURE_SUITE_ID],
-    maxSignatureBytes: 64,
-    maxPublicKeyBytes: 32,
+    maxSignatureBytes: ED25519_SIGNATURE_BYTES,
+    maxPublicKeyBytes: ED25519_PUBLIC_KEY_BYTES,
     async sign(bytes, signer) {
       const ed25519Signer = signer.ed25519;
       if (!ed25519Signer) {
@@ -256,7 +315,7 @@ function createEd25519Suite(): RegisteredSignatureSuite {
       }
       assertNonEmpty("key_ref", ed25519Signer.key_ref);
       const sig = await ed25519Signer.sign(bytes);
-      if (sig.length !== 64) {
+      if (sig.length !== ED25519_SIGNATURE_BYTES) {
         throw new CryptoSuiteRegistryError(
           "ed25519-v1 signer returned a non-64-byte signature"
         );
@@ -277,12 +336,92 @@ function createEd25519Suite(): RegisteredSignatureSuite {
       if (!bundleMatchesSuitePolicy(bundle, this)) return false;
       const ed25519Key = keys.ed25519;
       if (!ed25519Key) return false;
-      if (ed25519Key.public_key.length !== 32) return false;
+      if (ed25519Key.public_key.length !== ED25519_PUBLIC_KEY_BYTES) return false;
       const component = bundle.components[0]!;
       if (component.key_ref !== ed25519Key.key_ref) return false;
-      const sig = decodeCanonicalBase64url(component.sig);
-      if (!sig || sig.length !== 64) return false;
+      const sig = decodeCanonicalBase64url(
+        component.sig,
+        ED25519_SIGNATURE_B64URL_MAX_CHARS
+      );
+      if (!sig || sig.length !== ED25519_SIGNATURE_BYTES) return false;
       return identityVerify(bytes, sig, ed25519Key.public_key);
+    },
+  };
+}
+
+function createHybridEd25519MlDsa65Suite(): RegisteredSignatureSuite {
+  return {
+    id: HYBRID_SIGNATURE_SUITE_ID,
+    components: [ED25519_SIGNATURE_SUITE_ID, ML_DSA_65_COMPONENT_ALG],
+    maxSignatureBytes: ED25519_SIGNATURE_BYTES + ML_DSA_65_SIGNATURE_BYTES,
+    maxPublicKeyBytes: ED25519_PUBLIC_KEY_BYTES + ML_DSA_65_PUBLIC_KEY_BYTES,
+    async sign(bytes, signer) {
+      const ed25519Signer = signer.ed25519;
+      const mlDsa65Signer = signer.ml_dsa_65;
+      if (!ed25519Signer || !mlDsa65Signer) {
+        throw new CryptoSuiteRegistryError(
+          "ed25519+ml-dsa-v1 requires Ed25519 and ML-DSA-65 signers"
+        );
+      }
+      assertNonEmpty("key_ref", ed25519Signer.key_ref);
+      assertNonEmpty("key_ref", mlDsa65Signer.key_ref);
+      const [ed25519Sig, mlDsa65Sig] = await Promise.all([
+        ed25519Signer.sign(bytes),
+        mlDsa65Signer.sign(bytes),
+      ]);
+      if (ed25519Sig.length !== ED25519_SIGNATURE_BYTES) {
+        throw new CryptoSuiteRegistryError(
+          "hybrid Ed25519 signer returned a non-64-byte signature"
+        );
+      }
+      if (mlDsa65Sig.length !== ML_DSA_65_SIGNATURE_BYTES) {
+        throw new CryptoSuiteRegistryError(
+          "hybrid ML-DSA-65 signer returned a non-3309-byte signature"
+        );
+      }
+      return {
+        bundle_version: SIGNATURE_BUNDLE_VERSION,
+        signature_suite: HYBRID_SIGNATURE_SUITE_ID,
+        components: [
+          {
+            alg: ED25519_SIGNATURE_SUITE_ID,
+            key_ref: ed25519Signer.key_ref,
+            sig: toBase64url(ed25519Sig),
+          },
+          {
+            alg: ML_DSA_65_COMPONENT_ALG,
+            key_ref: mlDsa65Signer.key_ref,
+            sig: toBase64url(mlDsa65Sig),
+          },
+        ],
+      };
+    },
+    async verify(bytes, bundle, keys) {
+      if (!bundleMatchesSuitePolicy(bundle, this)) return false;
+      const ed25519Key = keys.ed25519;
+      const mlDsa65Key = keys.ml_dsa_65;
+      if (!ed25519Key || !mlDsa65Key) return false;
+      if (ed25519Key.public_key.length !== ED25519_PUBLIC_KEY_BYTES) return false;
+      if (mlDsa65Key.public_key.length !== ML_DSA_65_PUBLIC_KEY_BYTES) return false;
+      const ed25519Component = bundle.components[0]!;
+      const mlDsa65Component = bundle.components[1]!;
+      if (ed25519Component.key_ref !== ed25519Key.key_ref) return false;
+      if (mlDsa65Component.key_ref !== mlDsa65Key.key_ref) return false;
+      const ed25519Sig = decodeCanonicalBase64url(
+        ed25519Component.sig,
+        ED25519_SIGNATURE_B64URL_MAX_CHARS
+      );
+      const mlDsa65Sig = decodeCanonicalBase64url(
+        mlDsa65Component.sig,
+        ML_DSA_65_SIGNATURE_B64URL_MAX_CHARS
+      );
+      if (!ed25519Sig || ed25519Sig.length !== ED25519_SIGNATURE_BYTES) return false;
+      if (!mlDsa65Sig || mlDsa65Sig.length !== ML_DSA_65_SIGNATURE_BYTES) {
+        return false;
+      }
+      const ed25519Ok = identityVerify(bytes, ed25519Sig, ed25519Key.public_key);
+      if (!ed25519Ok) return false;
+      return ml_dsa65.verify(mlDsa65Sig, bytes, mlDsa65Key.public_key);
     },
   };
 }
@@ -308,7 +447,12 @@ function bundleMatchesSuitePolicy(
   return true;
 }
 
-function decodeCanonicalBase64url(value: string): Uint8Array | null {
+function decodeCanonicalBase64url(
+  value: string,
+  maxEncodedChars: number
+): Uint8Array | null {
+  if (typeof value !== "string") return null;
+  if (value.length > maxEncodedChars) return null;
   if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
   const decoded = fromBase64url(value);
   if (toBase64url(decoded) !== value) return null;

@@ -13,6 +13,7 @@
  * for a spec amendment before changing the schema.
  */
 
+import type { SignatureBundle } from "../core/crypto-suite-registry.js";
 import type { NodeMode, SignatureScheme, V01EventType } from "./constants.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -127,6 +128,84 @@ export interface NodeIdentityCertificate {
   delegated_grants?: unknown[];
   /** RESERVED — TCB attestation lineage history (v1.x deeper attestation). Empty at v0.1. */
   attestation_lineage_chain?: unknown[];
+}
+
+/**
+ * Hybrid public-key pair carried by v2 certificates. Both key refs are signed
+ * into the certificate body and must match the verifying signature bundle.
+ */
+export interface HybridCertificatePublicKeys {
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly ed25519: {
+    readonly key_ref: string;
+    /** Base64url-encoded Ed25519 public key (32 bytes). */
+    readonly public_key: string;
+  };
+  readonly ml_dsa_65: {
+    readonly key_ref: string;
+    /** Base64url-encoded ML-DSA-65 public key (1952 bytes). */
+    readonly public_key: string;
+  };
+}
+
+/**
+ * v2 fortress-master public key descriptor for the hybrid trust-root chain.
+ *
+ * Secret material remains local-only; the ML-DSA-65 private key is generated
+ * and returned only by the bootstrap helper so the caller can immediately store
+ * it in encrypted state and zero the plaintext.
+ */
+export interface FortressMasterPublicKeysV2Hybrid {
+  readonly key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly fortress_id: string;
+  readonly created_at: string;
+  readonly public_keys: HybridCertificatePublicKeys;
+}
+
+/** Principal certificate signed by the v2 hybrid fortress-master key. */
+export interface PrincipalCertificateV2Hybrid {
+  readonly certificate_version: "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly principal_id: string;
+  readonly principal_public_keys: HybridCertificatePublicKeys;
+  readonly role: "root" | "partner" | "associate";
+  readonly fortress_id: string;
+  readonly issued_at: string;
+  readonly expires_at?: string;
+  readonly master_signature_bundle: SignatureBundle;
+}
+
+/** Per-node certificate signed by both principal and fortress-master v2 keys. */
+export interface NodeIdentityCertificateV2Hybrid {
+  readonly certificate_version: "sanctuary.node-cert.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly node_id: string;
+  readonly node_public_keys: HybridCertificatePublicKeys;
+  readonly node_mode: NodeMode;
+  readonly fortress_id: string;
+  readonly joined_at: string;
+  readonly expires_at?: string;
+  readonly capabilities: number;
+  readonly parent_chain: {
+    readonly fortress_master_key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
+    readonly fortress_master_key_refs: {
+      readonly ed25519: string;
+      readonly ml_dsa_65: string;
+    };
+    readonly principal_certificate_version: "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65";
+    readonly principal_id: string;
+    readonly principal_key_refs: {
+      readonly ed25519: string;
+      readonly ml_dsa_65: string;
+    };
+  };
+  readonly tee_attestation_hash?: string;
+  readonly principal_signature_bundle: SignatureBundle;
+  /** Required in v2 hybrid chains; absence is a downgrade failure. */
+  readonly master_signature_bundle: SignatureBundle;
+  readonly delegated_grants?: unknown[];
+  readonly attestation_lineage_chain?: unknown[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════
