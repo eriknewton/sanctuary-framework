@@ -74,7 +74,16 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await rm(fortressPath, { recursive: true, force: true });
+  // maxRetries/retryDelay: the e2e rig writes to fortress storage; on Linux a
+  // late storage flush into state/_meta can race the recursive remove and
+  // surface ENOTEMPTY. Retrying drains the transient race (Node's documented
+  // remedy for EBUSY/ENOTEMPTY on rm).
+  await rm(fortressPath, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 50,
+  });
 });
 
 /** Seed custody + a DEFAULT operator identity (NO trust root) -- the precondition. */
