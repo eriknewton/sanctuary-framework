@@ -102,10 +102,10 @@ describe("operator-cloud provision approval context, external redaction (HIGH-2)
 });
 
 describe("operator-cloud provision claim, bound to the prepared digests (HIGH-1)", () => {
-  it("records a claim that matches the prepared bundle digests + node pubkey", () => {
+  it("records a claim that matches the prepared bundle digests + node pubkey", async () => {
     const prepared = prepare();
     const store = new OperatorCloudProvisionClaimStore();
-    const claim = recordApprovedProvisionClaim({ claimStore: store, prepared });
+    const claim = await recordApprovedProvisionClaim({ claimStore: store, prepared });
     expect(claim.manifest_digest).toBe(prepared.built.digests.manifest_digest);
     expect(claim.bundle_digest).toBe(prepared.built.digests.bundle_digest);
     expect(claim.scope_digest).toBe(prepared.built.digests.scope_digest);

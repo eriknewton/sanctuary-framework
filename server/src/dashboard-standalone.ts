@@ -602,10 +602,12 @@ export async function startStandaloneDashboard(
     // consumption, so a valid local join is NOT replayable for the token TTL),
     // denies operator_cloud (those route through the operator-cloud approver),
     // and fails closed on any missing / invalid input. It never auto-approves a
-    // token-less or forged join. The nonce store lives for this boot's federation
-    // context lifetime. (createAutoApprove / createAutoDeny are tests-only and
-    // must never appear here.)
-    const nonceStore = new BootstrapNonceStore();
+    // token-less or forged join. The nonce store is DURABLE (encrypted at rest
+    // under the custody master), so a spent nonce survives a daemon restart and
+    // a replay is denied for the whole token TTL even across a restart.
+    // (createAutoApprove / createAutoDeny are tests-only and must never appear
+    // here.)
+    const nonceStore = BootstrapNonceStore.durableFromBoot(storage, masterKey);
     dashboard.setFederationContext({
       ...federationRoot.context,
       approver: createStandaloneJoinApprover({

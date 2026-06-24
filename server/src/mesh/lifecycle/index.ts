@@ -50,6 +50,9 @@ export {
 export {
   OperatorCloudProvisionClaimStore,
   createOperatorCloudJoinApprover,
+  OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE,
+  OPERATOR_CLOUD_CLAIM_STORE_KEY,
+  OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
   type OperatorCloudProvisionClaim,
   type RecordProvisionClaimParams,
   type OperatorCloudJoinApproverParams,
@@ -57,8 +60,20 @@ export {
 export {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
+  BOOTSTRAP_NONCE_STORE_NAMESPACE,
+  BOOTSTRAP_NONCE_STORE_KEY,
+  BOOTSTRAP_NONCE_STORE_HKDF_INFO,
   type StandaloneJoinApproverParams,
 } from "./standalone-join-approver.js";
+export {
+  DurableSpentSetStore,
+  DurableSpentSetStoreError,
+} from "./durable-spent-set-store.js";
+export {
+  DurableClaimSetStore,
+  DurableClaimSetStoreError,
+  type PersistedClaimSet,
+} from "./durable-claim-set-store.js";
 export {
   NodeRoster,
   type DropoutListener,

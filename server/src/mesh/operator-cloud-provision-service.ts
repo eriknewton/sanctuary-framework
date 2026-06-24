@@ -131,10 +131,10 @@ export function prepareOperatorCloudProvision(
  * digests + node pubkey the operator approved; the production join approver
  * consumes it once.
  */
-export function recordApprovedProvisionClaim(params: {
+export async function recordApprovedProvisionClaim(params: {
   claimStore: OperatorCloudProvisionClaimStore;
   prepared: PreparedProvision;
-}): OperatorCloudProvisionClaim {
+}): Promise<OperatorCloudProvisionClaim> {
   const { built, nodePubkeyHash } = params.prepared;
   return params.claimStore.record({
     fortress_id: built.bundle.manifest.fortress_id,
