@@ -73,6 +73,7 @@
     "@noble/ciphers": "2.2.0",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
+    "@noble/post-quantum": "0.6.1",
     "hash-wasm": "4.12.0",
     "it-length-prefixed": "9.1.1",
     "it-pipe": "3.0.1",
@@ -82,9 +83,6 @@
     "pgvector": "0.3.0",
     "uint8arraylist": "2.4.9",
     "uint8arrays": "5.1.1"
-  },
-  "optionalDependencies": {
-    "@noble/post-quantum": "0.6.1"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

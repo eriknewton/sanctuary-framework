@@ -313,4 +313,28 @@ describe("CryptoSuiteRegistry", () => {
       registry.verifySurface(descriptor, oversized, publicKeys)
     ).resolves.toBe(false);
   });
+
+  it("rejects a valid Ed25519 half paired with a wrong-key ML-DSA-65 signature (hybrid is AND, not OR)", async () => {
+    // Isolates the post-quantum half of the hybrid AND at the crypto layer: a
+    // well-formed ML-DSA-65 signature (correct alg, key_ref, and byte length)
+    // from a DIFFERENT ML-DSA key must NOT verify, even when the classical
+    // Ed25519 half is genuinely valid. This passes the structural policy gate
+    // (so it cannot be deflected by the stripping/reorder checks) and can only
+    // be rejected by the real ml_dsa65.verify call.
+    const registry = new CryptoSuiteRegistry();
+    const descriptor = makeHybridDescriptor();
+    const rig1 = makeHybridRig();
+    const rig2 = makeHybridRig();
+    const bundle1 = await registry.signSurface(descriptor, rig1.signer);
+    const bundle2 = await registry.signSurface(descriptor, rig2.signer);
+
+    const wrongMlDsaHalf: SignatureBundle = {
+      ...bundle1,
+      components: [bundle1.components[0]!, bundle2.components[1]!],
+    };
+
+    await expect(
+      registry.verifySurface(descriptor, wrongMlDsaHalf, rig1.publicKeys)
+    ).resolves.toBe(false);
+  });
 });

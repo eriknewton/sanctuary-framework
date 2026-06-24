@@ -9,15 +9,23 @@ function readRepoFile(path: string): string {
   return readFileSync(join(REPO_ROOT, path), "utf-8");
 }
 
-describe("PQC slice 1 additive guard", () => {
-  it("does not add a PQC dependency", () => {
+describe("PQC additive guard", () => {
+  it("declares ML-DSA-65 as a pinned runtime dependency (slice 2), not hidden as optional", () => {
     const pkg = JSON.parse(readRepoFile("server/package.json")) as {
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
+      optionalDependencies?: Record<string, string>;
     };
 
-    expect(pkg.dependencies).not.toHaveProperty("@noble/post-quantum");
-    expect(pkg.devDependencies).not.toHaveProperty("@noble/post-quantum");
+    // Slice 2 introduces the hybrid Ed25519+ML-DSA-65 suite, so the PQC library
+    // is now a real runtime dependency: it is statically imported by a core
+    // module and the server fails closed at boot if it is absent. It must be a
+    // pinned exact version in `dependencies` — never hidden in
+    // optionalDependencies (npm would silently ship a partial install that
+    // crashes at boot) or in devDependencies.
+    expect(pkg.dependencies?.["@noble/post-quantum"]).toBe("0.6.1");
+    expect(pkg.devDependencies?.["@noble/post-quantum"]).toBeUndefined();
+    expect(pkg.optionalDependencies?.["@noble/post-quantum"]).toBeUndefined();
   });
 
   it("keeps the suite registry out of legacy frozen serializers", () => {
