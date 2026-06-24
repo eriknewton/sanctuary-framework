@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Writable } from "node:stream";
 
-import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli.js";
+import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 import {
   renderOperatorCloudPlan,
   runDeployCommand,
