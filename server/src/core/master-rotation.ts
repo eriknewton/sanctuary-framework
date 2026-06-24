@@ -344,6 +344,10 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     infos: ["l2-anomaly-classifier-state-v1"],
   },
   _bridge: { kind: "purpose-encrypted", infos: ["bridge-commitments"] },
+  _federation: {
+    kind: "purpose-encrypted",
+    infos: ["federation-trust-root"],
+  },
   _fortress_mode: {
     kind: "namespace-info-encrypted",
     infos: ["sanctuary-fortress-mode-v1"],
@@ -383,7 +387,6 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     kind: "unsupported",
     reason: UNSUPPORTED_DEFERRAL,
   },
-  _federation: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _handshake: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _shr: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _composition: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },

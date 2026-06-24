@@ -18,6 +18,7 @@
     { "label": "l3-policies", "class": "decryptable-store", "owner": "l3-disclosure/policies.ts:140", "fixture": true, "fixture_via": "DisclosurePolicyStore", "note": "LAYER-TOKEN-EMBEDDING." },
     { "label": "l3-commitments", "class": "decryptable-store", "owner": "l3-disclosure/commitments.ts:108", "fixture": true, "fixture_via": "CommitmentStore", "note": "LAYER-TOKEN-EMBEDDING." },
     { "label": "bridge-commitments", "class": "decryptable-store", "owner": "bridge/tools.ts:44", "fixture": false, "fixture_via": "frozen-surfaces guard" },
+    { "label": "federation-trust-root", "class": "decryptable-store", "owner": "mesh/federation-trust-root-store.ts:38", "fixture": false, "fixture_via": "frozen-surfaces guard + federation-trust-root-store test", "note": "FROZEN at-rest contract for _federation/trust-root-v1; scan-reconciled 2026-06-23." },
     { "label": "l4-reputation", "class": "decryptable-store", "owner": "l4-reputation/reputation-store.ts:207", "fixture": true, "fixture_via": "ReputationStore", "note": "LAYER-TOKEN-EMBEDDING." },
     { "label": "sovereignty-profile", "class": "decryptable-store", "owner": "sovereignty-profile.ts:114", "fixture": false, "fixture_via": "frozen-surfaces guard" },
     { "label": "intelligence-substrate-config", "class": "decryptable-store", "owner": "intelligence/policy-store.ts:57", "fixture": false, "fixture_via": "frozen-surfaces guard" },

@@ -66,6 +66,11 @@ import {
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
+import {
+  FEDERATION_TRUST_ROOT_NAMESPACE,
+  FEDERATION_TRUST_ROOT_KEY,
+  FEDERATION_TRUST_ROOT_HKDF_INFO,
+} from "../../src/mesh/federation-trust-root-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -511,6 +516,49 @@ describe("master rotation — fail-closed coverage", () => {
       stringToBytes("chi8|agent-rotate-1")
     );
     expect(JSON.parse(bytesToString(plain)).weights).toEqual([1, 2, 3]);
+  });
+
+  it("rotates the federation trust-root record (_federation/trust-root-v1, purpose-encrypted, no AAD) — re-wraps under the new master, no orphan/lockout", async () => {
+    // Regression guard for the master-rotation recipe flip (_federation:
+    // unsupported -> purpose-encrypted, infos ["federation-trust-root"]).
+    // Without it, rotation would abort or orphan the persisted trust root,
+    // locking the operator out of federation. A wrong/changed HKDF info or a
+    // stray AAD would fail this decrypt under the new master.
+    const fortress = await buildFortress();
+    const payload = {
+      fortress_id: "fed-rotate-1",
+      marker: "trust-root-survives-rotation",
+    };
+    await fortress.storage.write(
+      FEDERATION_TRUST_ROOT_NAMESPACE,
+      FEDERATION_TRUST_ROOT_KEY,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(
+            stringToBytes(JSON.stringify(payload)),
+            derivePurposeKey(fortress.master, FEDERATION_TRUST_ROOT_HKDF_INFO)
+          )
+        )
+      )
+    );
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const raw = JSON.parse(
+      bytesToString(
+        (await fortress.storage.read(
+          FEDERATION_TRUST_ROOT_NAMESPACE,
+          FEDERATION_TRUST_ROOT_KEY
+        ))!
+      )
+    ) as EncryptedPayload;
+    const plain = decrypt(
+      raw,
+      derivePurposeKey(est.masterKey, FEDERATION_TRUST_ROOT_HKDF_INFO)
+    );
+    expect(JSON.parse(bytesToString(plain))).toEqual(payload);
   });
 
   it("aborts BY NAME on unified-inbox operator-prefs records (hash-keyed AAD — codex r2)", async () => {
