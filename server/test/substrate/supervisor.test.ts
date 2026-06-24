@@ -9,6 +9,10 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   PluginInvocationError,
   PluginSupervisor,
+  PLUGIN_CONFINEMENT_KIND,
+  PLUGIN_SECCOMP_PROFILE_ID,
+  parseConfinementReport,
+  validateConfinementReport,
   type Governance,
   type PluginRuntimeClient,
   type PluginSupervisorOptions,
@@ -246,5 +250,77 @@ describe("plugin-host S4 supervisor and egress consultation", () => {
         details: expect.objectContaining({ reason: "deny_flood", suspension_reason: "deny_flood" }),
       }),
     );
+  });
+});
+
+describe("confinement-report gating (refuse-until-confined contract)", () => {
+  const validReport = {
+    kind: PLUGIN_CONFINEMENT_KIND,
+    plugin_id: "ai.example.blocklist",
+    instance_id: "inst-1",
+    privilege_mode: "rootless_userns",
+    namespaces_entered: ["user", "mount", "net"],
+    rootfs_hash: "sha256:abc",
+    cgroup_path: "/sys/fs/cgroup/sanctuary/inst-1",
+    seccomp_profile_id: PLUGIN_SECCOMP_PROFILE_ID,
+    launcher_version: "1.0.0",
+    broker_fd: 4,
+  };
+  const expected = {
+    plugin_id: "ai.example.blocklist",
+    instance_id: "inst-1",
+    mode: "rootless_userns" as const,
+    rootfs_hash: "sha256:abc",
+    cgroup_path: "/sys/fs/cgroup/sanctuary/inst-1",
+    broker_fd: 4,
+    expectedLauncherVersion: "1.0.0",
+  };
+  const reportFor = (override: Record<string, unknown> = {}) =>
+    parseConfinementReport(JSON.stringify({ ...validReport, ...override }));
+
+  it("accepts an exactly matching realized-confinement report", () => {
+    expect(() => validateConfinementReport(reportFor(), expected)).not.toThrow();
+  });
+
+  const fieldMismatches: Array<[string, Record<string, unknown>]> = [
+    ["kind", { kind: "not-the-kind" }],
+    ["plugin_id", { plugin_id: "ai.evil.other" }],
+    ["instance_id", { instance_id: "inst-2" }],
+    ["privilege_mode", { privilege_mode: "privileged" }],
+    ["rootfs_hash", { rootfs_hash: "sha256:tampered" }],
+    ["cgroup_path", { cgroup_path: "/sys/fs/cgroup/elsewhere" }],
+    ["seccomp_profile_id", { seccomp_profile_id: "plugin-v0" }],
+    ["broker_fd", { broker_fd: 7 }],
+    ["launcher_version", { launcher_version: "9.9.9" }],
+    ["namespaces_entered", { namespaces_entered: ["mount", "net"] }],
+  ];
+  for (const [field, override] of fieldMismatches) {
+    it(`fails closed naming the mismatched field: ${field}`, () => {
+      expect(() => validateConfinementReport(reportFor(override), expected)).toThrow(
+        new RegExp(field),
+      );
+    });
+  }
+
+  it("rejects a non-array namespaces field as a clean named deny (not a TypeError)", () => {
+    expect(() =>
+      validateConfinementReport(reportFor({ namespaces_entered: "user,mount,net" }), expected),
+    ).toThrow(/namespaces_entered/);
+  });
+
+  it("rejects a namespaces array with a non-string element", () => {
+    expect(() =>
+      validateConfinementReport(reportFor({ namespaces_entered: ["user", 5, "net"] }), expected),
+    ).toThrow(/namespaces_entered/);
+  });
+
+  it("parseConfinementReport throws when a required field is missing", () => {
+    const missing = { ...validReport } as Record<string, unknown>;
+    delete missing.broker_fd;
+    expect(() => parseConfinementReport(JSON.stringify(missing))).toThrow(/broker_fd/);
+  });
+
+  it("parseConfinementReport rejects a non-object report line", () => {
+    expect(() => parseConfinementReport("[]")).toThrow(/must be an object/);
   });
 });

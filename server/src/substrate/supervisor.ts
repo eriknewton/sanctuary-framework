@@ -22,6 +22,13 @@ export const DEFAULT_INLINE_TIMEOUT_MS = 500;
 export const DEFAULT_EGRESS_TIMEOUT_MS = 150;
 export const MAX_VERDICT_FRAME_BYTES = 16 * 1024;
 export const MAX_REQUEST_FRAME_BYTES = 64 * 1024;
+/** Confinement-report control line cap: the report is a single small JSON line;
+ *  a launcher that floods fd 3 with no newline must not balloon host memory. */
+export const MAX_CONTROL_LINE_BYTES = 64 * 1024;
+/** Bounded FIFO of recently issued request nonces. Host-minted random nonces
+ *  cannot be replayed beyond this recent window, so eviction is safe and the
+ *  set can never grow without bound over the process lifetime. */
+export const MAX_TRACKED_NONCES = 8192;
 
 type InvocationErrorCode = "timeout" | "crash" | "malformed" | "framing" | "closed" | "replay";
 
@@ -319,6 +326,15 @@ export class PluginSupervisor {
     return [...this.plugins.values()].map((plugin) => ({ ...plugin.health, today: { ...plugin.health.today } }));
   }
 
+  /**
+   * Consult every egress_decision plugin for one host-computed egress decision.
+   * NOTE (S4 scope): each plugin's `PluginRuntimeClient` is single-outstanding-
+   * request, so this method is NOT yet safe to call concurrently for the SAME
+   * plugin (a second in-flight call fails closed to deny). The production egress
+   * proxy does not wire a `pluginConsultant` yet, so this path is dormant; when
+   * S5 wires it, the caller must serialize per-plugin consultation (or add a
+   * per-plugin request queue) to avoid spurious denies under concurrent egress.
+   */
   async consultEgress(input: EgressConsultationInput): Promise<EgressConsultationResult> {
     const eligible = [...this.plugins.values()].filter((plugin) => hookFor(plugin, "egress_decision"));
     if (eligible.length === 0) return { decisions: [], contributors: [] };
@@ -332,6 +348,13 @@ export class PluginSupervisor {
       return { decisions: contributors.map(() => "deny"), contributors };
     }
     this.usedNonces.add(nonce);
+    if (this.usedNonces.size > MAX_TRACKED_NONCES) {
+      // Bounded FIFO: drop the oldest tracked nonce (Set preserves insertion
+      // order). The replay guard protects against a plugin echoing a recent
+      // host-minted nonce; nonces older than this window are already useless.
+      const oldest = this.usedNonces.values().next().value;
+      if (oldest !== undefined) this.usedNonces.delete(oldest);
+    }
 
     const decisions: EnforcementDecision[] = [];
     const contributors: PluginContribution[] = [];
@@ -487,7 +510,7 @@ export class PluginSupervisor {
     if (!control || !stdin || !stdout) {
       throw new Error("launcher stdio pipes were not created");
     }
-    const reportLine = await readControlLine(control, DEFAULT_INLINE_TIMEOUT_MS);
+    const reportLine = await readControlLine(control, DEFAULT_INLINE_TIMEOUT_MS, MAX_CONTROL_LINE_BYTES);
     const report = parseConfinementReport(reportLine);
     validateConfinementReport(report, {
       plugin_id: config.governance.plugin_id,
@@ -699,7 +722,16 @@ export function validateConfinementReport(
   if (expected.expectedLauncherVersion && report.launcher_version !== expected.expectedLauncherVersion) {
     failures.push("launcher_version");
   }
-  if (!arraysEqual(report.namespaces_entered, expectedNamespaces)) failures.push("namespaces_entered");
+  const namespaces: unknown = report.namespaces_entered;
+  if (
+    !Array.isArray(namespaces) ||
+    !namespaces.every((value) => typeof value === "string") ||
+    !arraysEqual(namespaces as string[], expectedNamespaces)
+  ) {
+    // A non-array / non-string namespaces field is a clean named deny, never a
+    // raw TypeError from arraysEqual (the report is attacker-influenced input).
+    failures.push("namespaces_entered");
+  }
   if (failures.length > 0) {
     throw new Error(`confinement report mismatch: ${failures.join(",")}`);
   }
@@ -740,7 +772,7 @@ function writeAll(stream: Writable, bytes: Buffer): Promise<void> {
   });
 }
 
-function readControlLine(stream: Readable, timeoutMs: number): Promise<string> {
+function readControlLine(stream: Readable, timeoutMs: number, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let buffer = "";
     const timer = setTimeout(() => {
@@ -749,6 +781,13 @@ function readControlLine(stream: Readable, timeoutMs: number): Promise<string> {
     }, timeoutMs);
     const onData = (chunk: Buffer) => {
       buffer += chunk.toString("utf8");
+      if (buffer.length > maxBytes) {
+        // Bound the pre-confinement read: a launcher flooding fd 3 with no
+        // newline must not balloon host memory within the timeout window.
+        cleanup();
+        reject(new Error(`confinement report exceeded ${maxBytes} bytes before newline`));
+        return;
+      }
       const newline = buffer.indexOf("\n");
       if (newline >= 0) {
         cleanup();
