@@ -46,6 +46,7 @@ import {
   OperatorSigningError,
   type OperatorSigner,
 } from "./federation-operator-signing.js";
+import { openV1Session } from "./v1-session.js";
 
 export interface AssembledJoin {
   joinRequest: JoinRequest;
@@ -555,14 +556,65 @@ function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
   };
 }
 
-function adminRequestContext(flags: AdminFlags): DashboardRequestContext {
-  // An explicit auth token overrides; otherwise rely on loopback auto-auth
-  // (an empty token sends NO Authorization header -- the local operator session
-  // path the dashboard auto-authorizes for 127.0.0.1).
+/**
+ * Build the dashboard-request context for an admin verb's HTTP call, carrying
+ * the resolved /v1 session token (or an explicit `--auth-token` override).
+ */
+function adminRequestContext(flags: AdminFlags, sessionToken: string): DashboardRequestContext {
   return {
     ...(flags.fortressUrl !== undefined ? { dashboardUrl: flags.fortressUrl } : {}),
-    authToken: flags.authToken ?? "",
+    authToken: sessionToken,
   };
+}
+
+/**
+ * Resolve the /v1 bearer token an admin verb attaches to its
+ * session-gated `/v1/federation/*` call.
+ *
+ * The `/v1` surface is session-token only: it does NOT honor loopback auto-auth
+ * at the bearer-header level the way the legacy `/api/*` convenience routes do
+ * (a live drill caught the admin verbs 401ing against a real booted dashboard
+ * because they sent an empty token). So unless the operator supplies an explicit
+ * `--auth-token`, the verb OPENS its own /v1 session via the existing ceremony
+ * client, signing the session attestation with the SAME already-unlocked
+ * operator identity (no second prompt). Fails closed: a session that cannot be
+ * opened maps to a non-zero exit, never an unauthenticated request.
+ */
+async function resolveAdminSessionToken(
+  verb: string,
+  flags: AdminFlags,
+  signer: OperatorSigner,
+  err: Writable,
+  openSession: typeof openV1Session,
+): Promise<string | number> {
+  // Explicit override: the operator handed us a token; use it verbatim.
+  if (flags.authToken !== undefined) return flags.authToken;
+  try {
+    const session = await openSession(
+      flags.fortressUrl !== undefined ? { dashboardUrl: flags.fortressUrl } : undefined,
+      {
+        buildAttestation: (clientPubkey) =>
+          signer.signAttestation(clientPubkey, Date.now()),
+      },
+    );
+    return session.token;
+  } catch (cause) {
+    if (cause instanceof DashboardRequestError) {
+      if (cause.kind === "auth") {
+        err.write(
+          `sanctuary federation ${verb}: could not open a /v1 session ` +
+            `(operator attestation rejected)\n`,
+        );
+        return 3;
+      }
+      err.write(
+        `sanctuary federation ${verb}: fortress unreachable at ${flags.fortressUrl}\n`,
+      );
+      return 2;
+    }
+    err.write(`sanctuary federation ${verb}: unexpected error opening a /v1 session: ${String(cause)}\n`);
+    return 1;
+  }
 }
 
 /**
@@ -636,11 +688,14 @@ export async function runFederationEnableDisable(args: {
   out?: Writable;
   err?: Writable;
   request?: typeof dashboardRequest;
+  /** Test seam: the /v1 session-open ceremony (defaults to the real client). */
+  openSession?: typeof openV1Session;
 }): Promise<number> {
   const env = args.env ?? process.env;
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const request = args.request ?? dashboardRequest;
+  const openSession = args.openSession ?? openV1Session;
   const verb = args.enable ? "enable" : "disable";
   const action = args.enable ? "/v1/federation/enable" : "/v1/federation/disable";
   const flags = parseAdminFlags(args.argv, env);
@@ -655,6 +710,8 @@ export async function runFederationEnableDisable(args: {
   const signer = await openAdminSigner(verb, flags, err);
   if (typeof signer === "number") return signer;
   try {
+    const sessionToken = await resolveAdminSessionToken(verb, flags, signer, err, openSession);
+    if (typeof sessionToken === "number") return sessionToken;
     // The signed payload MUST match the server's reconstruction exactly: the
     // server includes idempotency_key only when it is a string.
     const signedPayload: Record<string, unknown> = {};
@@ -667,7 +724,7 @@ export async function runFederationEnableDisable(args: {
     const response = (await request(
       action,
       { method: "POST", body: JSON.stringify(body) },
-      adminRequestContext(flags),
+      adminRequestContext(flags, sessionToken),
     )) as { enabled?: unknown };
     out.write(`${JSON.stringify({ enabled: response.enabled === true }, null, 2)}\n`);
     return 0;
@@ -690,11 +747,14 @@ export async function runFederationAuthorize(args: {
   out?: Writable;
   err?: Writable;
   request?: typeof dashboardRequest;
+  /** Test seam: the /v1 session-open ceremony (defaults to the real client). */
+  openSession?: typeof openV1Session;
 }): Promise<number> {
   const env = args.env ?? process.env;
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const request = args.request ?? dashboardRequest;
+  const openSession = args.openSession ?? openV1Session;
   const action = "/v1/federation/authorize/init";
   // Accept both `authorize` and `authorize init`; strip a leading `init`.
   const argv = args.argv[0] === "init" ? args.argv.slice(1) : args.argv;
@@ -720,6 +780,8 @@ export async function runFederationAuthorize(args: {
   const signer = await openAdminSigner("authorize", flags, err);
   if (typeof signer === "number") return signer;
   try {
+    const sessionToken = await resolveAdminSessionToken("authorize", flags, signer, err, openSession);
+    if (typeof sessionToken === "number") return sessionToken;
     const signedPayload: Record<string, unknown> = {
       intended_node_id: flags.nodeId,
       intended_node_mode: flags.nodeMode,
@@ -730,7 +792,7 @@ export async function runFederationAuthorize(args: {
     const response = (await request(
       action,
       { method: "POST", body: JSON.stringify(body) },
-      adminRequestContext(flags),
+      adminRequestContext(flags, sessionToken),
     )) as { bootstrap_token?: unknown };
     if (typeof response.bootstrap_token !== "object" || response.bootstrap_token === null) {
       err.write("sanctuary federation authorize: fortress returned no bootstrap token\n");

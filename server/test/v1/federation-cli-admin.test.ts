@@ -51,6 +51,17 @@ function capture() {
   return { stream, get: () => text };
 }
 
+/**
+ * Stub /v1 session-open for the unit tests that inject `request` (they exercise
+ * the verb's signature-production contract against a stub responder, not the
+ * real ceremony). It records the attestation factory was wired and returns a
+ * fixed token. The end-to-end session-gate behavior is covered separately in
+ * `federation-cli-admin-session.test.ts` against a REAL booted dashboard.
+ */
+const STUB_SESSION_TOKEN = "stub-v1-session-token";
+const stubOpenSession = (async () =>
+  ({ token: STUB_SESSION_TOKEN, expiresAt: 0, capabilities: [] })) as never;
+
 let fortressPath: string;
 let issuer: SeededIssuerFortress;
 const PASSPHRASE = "slice3b-drill-passphrase";
@@ -103,11 +114,15 @@ describe("federation enable/disable -- operator-signed, fail-closed", () => {
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: out.stream,
       err: capture().stream,
-      request: async (path, init) => {
+      openSession: stubOpenSession,
+      request: async (path, init, ctx) => {
         captured = {
           action: path,
           body: JSON.parse(String(init?.body)) as Record<string, unknown>,
         };
+        // The verb must attach the /v1 session token it opened (the drill gap:
+        // it used to send an empty token, 401ing against a real dashboard).
+        expect(ctx?.authToken).toBe(STUB_SESSION_TOKEN);
         return { enabled: true };
       },
     });
@@ -138,6 +153,7 @@ describe("federation enable/disable -- operator-signed, fail-closed", () => {
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: capture().stream,
       err: err.stream,
+      openSession: stubOpenSession,
       request: async () => {
         throw new DashboardRequestError("unavailable", "server", 503);
       },
@@ -199,11 +215,13 @@ describe("federation authorize -- operator-signed bootstrap token", () => {
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: out.stream,
       err: capture().stream,
-      request: async (path, init) => {
+      openSession: stubOpenSession,
+      request: async (path, init, ctx) => {
         captured = {
           action: path,
           body: JSON.parse(String(init?.body)) as Record<string, unknown>,
         };
+        expect(ctx?.authToken).toBe(STUB_SESSION_TOKEN);
         return { bootstrap_token: { intended_node_id: "joiner-linux", nonce: "n" } };
       },
     });
@@ -238,6 +256,7 @@ describe("federation authorize -- operator-signed bootstrap token", () => {
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: capture().stream,
       err: capture().stream,
+      openSession: stubOpenSession,
       request: async () => ({ bootstrap_token: { intended_node_id: "joiner-linux" } }),
     });
     expect(code).toBe(0);
