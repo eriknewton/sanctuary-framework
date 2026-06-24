@@ -35,7 +35,19 @@ import type {
   PrincipalCertificate,
 } from "../mesh/types.js";
 import type { NodeMode } from "../mesh/constants.js";
-import { persistFederationJoinerTrustRoot } from "../mesh/federation-joiner-trust-root-store.js";
+import {
+  persistFederationJoinerTrustRoot,
+  FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+  FEDERATION_JOINER_TRUST_ROOT_KEY,
+} from "../mesh/federation-joiner-trust-root-store.js";
+import {
+  provisionOrLoadFederationTrustRoot,
+  FEDERATION_TRUST_ROOT_NAMESPACE,
+  FEDERATION_TRUST_ROOT_KEY,
+  type FederationTrustRootAuditEvent,
+} from "../mesh/federation-trust-root-store.js";
+import { AuditLog } from "../operational/audit-log.js";
+import { CustodyUnlockError } from "../core/master-custody.js";
 import {
   dashboardRequest,
   DashboardRequestError,
@@ -809,7 +821,273 @@ export async function runFederationAuthorize(args: {
   }
 }
 
+interface ProvisionFlags {
+  nodeId?: string;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}
+
+function parseProvisionFlags(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+): ProvisionFlags {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  return {
+    nodeId: flag("--node-id"),
+    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    fortressPath: flag("--fortress"),
+  };
+}
+
+/**
+ * `sanctuary federation provision` (alias `init-issuer`). MINTS the federation
+ * issuer trust root for THIS fortress: a fresh fortress master + a
+ * `_federation/trust-root-v1` record, encrypted under the local custody master.
+ * This is the highest-stakes Tier-1 local write in the system -- it creates the
+ * cross-machine root of trust every joining node will pin out of band.
+ *
+ * SECURITY CONTRACT (the whole point of this verb):
+ *   - REFUSE-IF-EXISTS, HARD. Before minting, it raw-probes BOTH the issuer
+ *     record (`_federation/trust-root-v1`) AND the joiner record
+ *     (`_federation/joiner-trust-root-v1`) via `storage.exists` -- WITHOUT
+ *     decrypting. If EITHER exists (or is present-but-corrupt), it refuses with
+ *     exit 3. Minting over an existing root would create a NEW fortress master +
+ *     fortress_id and silently orphan every node already joined to this mesh.
+ *     There is NO --force and NO rotation in this slice.
+ *   - Operator-gated by custody unlock (NOT a /v1 session, NOT a theater
+ *     signature). It reuses `openOperatorSigner` (passphrase / recovery-key
+ *     only, keychain-safe, fail-closed): no credential / wrong passphrase / no
+ *     default operator identity all -> exit 3, never an unsigned mint, never a
+ *     keychain modal. Possession of the unlock credential IS the authorization;
+ *     the resolved operator pubkey is recorded in the mint audit for attribution.
+ *   - REQUIRES an already-init'd fortress with a default operator identity (the
+ *     non-bootstrap unlock path); it never auto-creates custody or identity.
+ *   - On success prints ONLY safe public material:
+ *     `{ provisioned, fortress_id, node_id, pinned_master }`. The pinned_master
+ *     is the `FortressMasterPublicKey` -- PUBLIC, and the out-of-band trust
+ *     anchor a joiner needs for `--pinned-master`. NEVER prints/logs the master
+ *     secret, master private key, principal private key, or recovery key.
+ *
+ * Exit codes:
+ *   0 minted + persisted · 1 usage (missing --node-id) · 3 refused (already
+ *   provisioned / corrupt record / fail-closed custody / persist failure).
+ *   No exit 2 -- this verb makes no HTTP call.
+ */
+export async function runFederationProvision(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  /**
+   * Test seam: opens the local fortress headless (keychain-safe), resolving the
+   * default operator identity. Defaults to the real `openOperatorSigner`. Tests
+   * seed a real temp fortress and let this default run end to end; the seam
+   * exists for parity with the other verbs.
+   */
+  openSigner?: typeof openOperatorSigner;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const openSigner = args.openSigner ?? openOperatorSigner;
+  const flags = parseProvisionFlags(args.argv, env);
+
+  if (!flags.nodeId) {
+    err.write("sanctuary federation provision: --node-id <id> is required\n");
+    return 1;
+  }
+
+  // Operator gate: open the local fortress keychain-safe. Fails closed
+  // (OperatorSigningError -> exit 3) on no credential, wrong passphrase, or no
+  // default operator identity -- never a keychain modal, never an unsigned mint.
+  let signer: OperatorSigner;
+  try {
+    signer = await openSigner({
+      ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+      ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+      ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+    });
+  } catch (cause) {
+    // Fail-closed custody: a missing/wrong credential, no default operator
+    // identity, or any custody-unlock failure (e.g. wrong passphrase ->
+    // CustodyUnlockError) maps to a refusal (exit 3), never an unsigned mint and
+    // never a keychain modal. Only a genuinely unexpected error is exit 1.
+    if (
+      cause instanceof OperatorSigningError ||
+      cause instanceof CustodyUnlockError
+    ) {
+      err.write(`sanctuary federation provision: ${cause.message}\n`);
+      return 3;
+    }
+    err.write(`sanctuary federation provision: unexpected error: ${String(cause)}\n`);
+    return 1;
+  }
+
+  // The mint must be attributable to the resolving operator. Open the SAME
+  // AuditLog the standalone boot uses (storage + custody master), and record
+  // the resolved operator pubkey (PUBLIC, safe to log). An audit-write failure
+  // must NEVER mask the verb's fail-closed behavior, so audit appends are
+  // best-effort (mirrors dashboard-standalone's federation audit callback).
+  const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
+  const auditLog = new AuditLog(signer.storage, signer.masterKey);
+  const audit = async (event: FederationTrustRootAuditEvent): Promise<void> => {
+    try {
+      await auditLog.append(
+        "l2",
+        event.operation,
+        "federation",
+        { ...event.details, operator_pubkey: operatorPubkeyB64 },
+        event.result,
+      );
+    } catch {
+      // Federation stays fail-closed; never let an audit-write failure block or
+      // mask the mint's refusal / success behavior.
+    }
+  };
+
+  try {
+    // REFUSE-IF-EXISTS (the most important safety property). Raw existence probe
+    // on BOTH record kinds, WITHOUT decrypting -- so a present-but-corrupt record
+    // is refused too (corrupt == do-not-overwrite, NOT == absent). The mint
+    // primitive's load-first behavior is NOT relied on here: we must distinguish
+    // "refused because one exists" from "minted a fresh one", and we must refuse
+    // over a broken record the primitive would treat as absent.
+    const issuerExists = await signer.storage.exists(
+      FEDERATION_TRUST_ROOT_NAMESPACE,
+      FEDERATION_TRUST_ROOT_KEY,
+    );
+    if (issuerExists) {
+      await audit({
+        operation: "federation_trust_root_mint",
+        result: "failure",
+        details: { reason: "refused_issuer_record_exists" },
+      });
+      err.write(
+        "sanctuary federation provision: this fortress already has a federation " +
+          "trust root (_federation/trust-root-v1). Minting a new one would create " +
+          "a NEW fortress master and orphan every node that already joined this " +
+          "mesh. Refusing. To inspect the existing root, boot the dashboard " +
+          "(federation status shows fortress_id + node_id). Rotating the root is a " +
+          "separate, not-yet-built operation (`sanctuary federation rotate-root`, " +
+          "future slice).\n",
+      );
+      return 3;
+    }
+    const joinerExists = await signer.storage.exists(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+    );
+    if (joinerExists) {
+      await audit({
+        operation: "federation_trust_root_mint",
+        result: "failure",
+        details: { reason: "refused_joiner_record_exists" },
+      });
+      err.write(
+        "sanctuary federation provision: this fortress is a federation JOINER " +
+          "(_federation/joiner-trust-root-v1 exists); it cannot also be an issuer. " +
+          "Minting an issuer root here would create an issuer-on-joiner split-brain. " +
+          "Refusing.\n",
+      );
+      return 3;
+    }
+
+    // Mint + persist. The primitive loads-first (defense in depth against a
+    // record that raced in between the probe and here): if it returns
+    // source:"persisted" we REFUSE (never report a fresh mint), and if it
+    // returns null (a record appeared and failed to load) we REFUSE (never
+    // re-mint over it).
+    let provisioned;
+    try {
+      provisioned = await provisionOrLoadFederationTrustRoot({
+        storage: signer.storage,
+        masterKey: signer.masterKey,
+        mint: true,
+        nodeId: flags.nodeId,
+        nodeMode: "local",
+        principalId: "principal-root",
+        audit,
+      });
+    } catch (cause) {
+      err.write(
+        `sanctuary federation provision: failed to mint the federation trust root: ${String(cause)}\n`,
+      );
+      return 3;
+    }
+
+    if (provisioned === null) {
+      err.write(
+        "sanctuary federation provision: refused -- a federation trust root " +
+          "appeared on disk during minting and could not be loaded. Refusing to " +
+          "overwrite it.\n",
+      );
+      return 3;
+    }
+    if (provisioned.source !== "minted") {
+      err.write(
+        "sanctuary federation provision: this fortress already has a federation " +
+          "trust root; refusing to mint a second one (it would orphan the mesh).\n",
+      );
+      return 3;
+    }
+
+    // Print ONLY safe public material. The pinned_master is the
+    // FortressMasterPublicKey (public_key, fortress_id, created_at -- all PUBLIC),
+    // the out-of-band trust anchor a joiner pins via `--pinned-master`. NEVER
+    // print the master secret / private keys (they stay owned by the primitive).
+    out.write(
+      `${JSON.stringify(
+        {
+          provisioned: true,
+          fortress_id: provisioned.record.pinned_master_pubkey.fortress_id,
+          node_id: provisioned.record.node_id,
+          pinned_master: { ...provisioned.record.pinned_master_pubkey },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  } finally {
+    // Keep the audit durable before this short-lived CLI exits, on EVERY path
+    // (success mint, refuse-with-failure-audit, throw). The audit encryption key
+    // was derived in the AuditLog ctor, so flush does not depend on masterKey and
+    // is safe to run here. A non-durable audit append must NEVER turn the verb's
+    // mint/refuse outcome into a different exit code, so flush failures are
+    // swallowed (the trust-root persistence is the source of truth, not the log).
+    try {
+      await auditLog.flush();
+    } catch {
+      // Federation stays fail-closed; audit durability is best-effort here.
+    }
+    // Constraint 6: the custody master never persists past this call (every path:
+    // success, refuse, throw).
+    signer.masterKey.fill(0);
+  }
+}
+
 const FEDERATION_HELP = `sanctuary federation -- cross-machine federation (Wave 1)
+
+Provision (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
+  sanctuary federation provision --node-id <id> \\
+    [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+  (alias: sanctuary federation init-issuer ...)
+
+  provision   MINT this fortress's federation issuer trust root: a fresh fortress
+              master + the local _federation/trust-root-v1 record. This is the
+              cross-machine ROOT OF TRUST every joining node pins out of band.
+              Custody-gated (needs an unlocked default operator identity:
+              SANCTUARY_PASSPHRASE / --passphrase / SANCTUARY_RECOVERY_KEY; never
+              prompts the keychain). REFUSES if this fortress already has a
+              federation root (issuer OR joiner record): minting a second one
+              would orphan the whole mesh. There is no --force and no rotation
+              yet. Prints the pinned_master (the PUBLIC trust anchor) to hand to
+              joiners for their --pinned-master.
 
 Operator (issuer) verbs -- operator-signed, run on the home fortress:
   sanctuary federation enable  --fortress-url <url> [--idempotency-key <s>]
@@ -870,6 +1148,9 @@ export async function runFederationCommand(args: {
   if (!sub || sub === "--help" || sub === "-h" || sub === "help") {
     out.write(FEDERATION_HELP);
     return 0;
+  }
+  if (sub === "provision" || sub === "init-issuer") {
+    return runFederationProvision({ ...args, argv: args.argv.slice(1) });
   }
   if (sub === "join") {
     return runFederationJoin({ ...args, argv: args.argv.slice(1) });
