@@ -25,6 +25,7 @@ import {
   OperatorCloudProvisionClaimStore,
   createOperatorCloudJoinApprover,
 } from "../../src/mesh/lifecycle/operator-cloud-join-approver.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
 import {
   buildOperatorCloudProvisionBundle,
   openScopedSecret,
@@ -48,7 +49,10 @@ const NODE_ID = "operator-cloud-1";
  * a recorded Tier-1-approved claim, and a production operator-cloud approver
  * wired into an issuer FederationContext. Returns everything a cloud node needs.
  */
-function setup(opts?: { recordClaim?: boolean }) {
+async function setup(opts?: {
+  recordClaim?: boolean;
+  claimStore?: OperatorCloudProvisionClaimStore;
+}) {
   const materials = makeFederationMaterials();
   const proofKey = randomBytes(32);
   const deliveryKey = randomBytes(32);
@@ -86,9 +90,9 @@ function setup(opts?: { recordClaim?: boolean }) {
   });
 
   const nodePubkeyHash = computeNodePubkeyHash(toBase64url(assembled.nodePublicKey));
-  const claimStore = new OperatorCloudProvisionClaimStore();
+  const claimStore = opts?.claimStore ?? new OperatorCloudProvisionClaimStore();
   if (opts?.recordClaim ?? true) {
-    claimStore.record({
+    await claimStore.record({
       fortress_id: materials.fortressId,
       node_id: NODE_ID,
       node_pubkey_hash: nodePubkeyHash,
@@ -132,7 +136,7 @@ function setup(opts?: { recordClaim?: boolean }) {
 
 describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a + d)", () => {
   it("approves a join that matches the digest-and-pubkey-bound claim", async () => {
-    const { homeContext, assembled, materials } = setup();
+    const { homeContext, assembled, materials } = await setup();
     const outcome = await new JoinCeremony(homeContext).authorizeComplete(assembled.joinRequest);
     expect(outcome.approved).toBe(true);
     if (outcome.approved) {
@@ -148,13 +152,13 @@ describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a 
   });
 
   it("DENIES when there is NO matching approved provision claim", async () => {
-    const { homeContext, assembled } = setup({ recordClaim: false });
+    const { homeContext, assembled } = await setup({ recordClaim: false });
     const outcome = await new JoinCeremony(homeContext).authorizeComplete(assembled.joinRequest);
     expect(outcome.approved).toBe(false);
   });
 
   it("DENIES a substituted node pubkey consuming a leaked bundle (HIGH-1)", async () => {
-    const { homeContext, assembled } = setup();
+    const { homeContext, assembled } = await setup();
     // Attacker keeps the bundle's proof but swaps in their own keypair.
     const substituted = {
       ...assembled.joinRequest,
@@ -165,7 +169,7 @@ describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a 
   });
 
   it("DENIES a second consume of an already-consumed claim (single-use)", async () => {
-    const { homeContext, assembled } = setup();
+    const { homeContext, assembled } = await setup();
     const first = await new JoinCeremony(homeContext).authorizeComplete(assembled.joinRequest);
     expect(first.approved).toBe(true);
     const second = await new JoinCeremony(homeContext).authorizeComplete(assembled.joinRequest);
@@ -173,11 +177,11 @@ describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a 
   });
 
   it("DENIES an expired claim", async () => {
-    const { materials, token, built, claimStore, assembled, nodePubkeyHash, proofKey } = setup({
+    const { materials, token, built, claimStore, assembled, nodePubkeyHash, proofKey } = await setup({
       recordClaim: false,
     });
     // Record a claim already expired.
-    claimStore.record({
+    await claimStore.record({
       fortress_id: materials.fortressId,
       node_id: NODE_ID,
       node_pubkey_hash: nodePubkeyHash,
@@ -202,7 +206,7 @@ describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a 
   });
 
   it("DENIES when no approver is bound (Slice 1 invariant holds for operator-cloud joins)", async () => {
-    const { materials, assembled } = setup();
+    const { materials, assembled } = await setup();
     // Strip the approver entirely.
     const noApprover = { ...materials.context } as FederationContext & { approver?: unknown };
     delete noApprover.approver;
@@ -215,7 +219,7 @@ describe("operator-cloud join approver, anti-substitution (HIGH-1 / criterion a 
 
 describe("operator-cloud joined-node record, non-issuer context (criterion b)", () => {
   it("a joined cloud node yields a FederationNonIssuerOperatorCloudContext with no issuer authority", async () => {
-    const { homeContext, assembled, built, deliveryKey, materials } = setup();
+    const { homeContext, assembled, built, deliveryKey, materials } = await setup();
     const outcome = await new JoinCeremony(homeContext).authorizeComplete(assembled.joinRequest);
     expect(outcome.approved).toBe(true);
     if (!outcome.approved) return;
@@ -265,5 +269,43 @@ describe("operator-cloud joined-node record, non-issuer context (criterion b)", 
         intendedNodeMode: "local",
       }),
     ).toThrow();
+  });
+});
+
+describe("operator-cloud join approver — RESTART replay denied (durable, the debt-closer)", () => {
+  it("a consumed claim stays consumed across a daemon restart (DENIES the cloud-join replay)", async () => {
+    // Shared encrypted storage + custody master across two daemon "boots". Each
+    // boot builds its OWN durable claim store, mirroring how a production boot
+    // would wire it; the recorded + consumed claim must survive the restart.
+    const storage = new MemoryStorage();
+    const fakeMaster = new Uint8Array(32).fill(13);
+
+    // Boot 1: a durable claim store; setup records the claim into it. First join
+    // APPROVED, claim CONSUMED + persisted.
+    const store1 = OperatorCloudProvisionClaimStore.durableFromBoot(storage, fakeMaster);
+    const ctx1 = await setup({ claimStore: store1 });
+    const first = await new JoinCeremony(ctx1.homeContext).authorizeComplete(
+      ctx1.assembled.joinRequest,
+    );
+    expect(first.approved).toBe(true);
+
+    // Boot 2: a FRESH durable claim store over the SAME storage (the restart),
+    // wired to an approver that re-verifies the same bundle. Replaying the SAME
+    // join is DENIED because the consumed state was persisted. On `main`
+    // (in-memory only) the restart would FORGET the consumption and ALLOW.
+    const store2 = OperatorCloudProvisionClaimStore.durableFromBoot(storage, fakeMaster);
+    const approver2 = createOperatorCloudJoinApprover({
+      pinned_master_pubkey: ctx1.materials.context.pinnedMasterPubkey,
+      issuing_principal_cert: ctx1.materials.context.issuingPrincipalCert,
+      issuing_principal_private_key: ctx1.materials.context.getIssuingPrincipalPrivateKey(),
+      master_private_key: ctx1.materials.context.getMasterPrivateKey?.(),
+      claimStore: store2,
+      nodeJoinProofKey: ctx1.proofKey,
+    });
+    const ctx2: FederationContext = { ...ctx1.materials.context, approver: approver2 };
+    const replay = await new JoinCeremony(ctx2).authorizeComplete(
+      ctx1.assembled.joinRequest,
+    );
+    expect(replay.approved).toBe(false);
   });
 });

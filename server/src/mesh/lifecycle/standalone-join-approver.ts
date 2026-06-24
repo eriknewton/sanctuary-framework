@@ -29,6 +29,8 @@
  */
 
 import { fromBase64url } from "../../core/encoding.js";
+import type { StorageBackend } from "../../storage/interface.js";
+import { DurableSpentSetStore } from "./durable-spent-set-store.js";
 import { issueCertificateForApprovedJoin } from "./join-approver.js";
 import type {
   FortressMasterPublicKey,
@@ -36,8 +38,13 @@ import type {
 } from "../types.js";
 import type { JoinApprovalResult, JoinApprover, JoinRequest } from "./types.js";
 
+/** At-rest namespace + record key + HKDF label for the durable nonce set. */
+export const BOOTSTRAP_NONCE_STORE_NAMESPACE = "_federation";
+export const BOOTSTRAP_NONCE_STORE_KEY = "spent-bootstrap-nonces-v1";
+export const BOOTSTRAP_NONCE_STORE_HKDF_INFO = "federation-bootstrap-nonce-spent-set";
+
 /**
- * In-memory single-use store for spent bootstrap-token nonces, keyed on
+ * Single-use store for spent bootstrap-token nonces, keyed on
  * (fortress_id, node_id, nonce). `consume` is atomic single-shot: the FIRST call
  * for a (key) records it and returns true; any later call for the same key
  * returns false (the replay is denied). A nonce is only remembered until its
@@ -45,16 +52,50 @@ import type { JoinApprovalResult, JoinApprover, JoinRequest } from "./types.js";
  * enforced upstream, so the store only needs to remember a nonce for as long as
  * a valid token could still bear it).
  *
- * DURABLE-STORE DEBT (matches the OperatorCloudProvisionClaimStore note):
- * production should wire this to the encrypted state store so single-use survives
- * a daemon restart. In-memory is acceptable for this slice because a restart
- * drops the entire federation context anyway and bootstrap tokens expire in
- * BOOTSTRAP_TOKEN_TTL_MS (15 minutes); a restart mid-TTL would forget one spent
- * nonce and re-allow that single token until it expires. Low blast radius (same
- * node id + pubkey), but a genuine follow-up. See the final report.
+ * DURABILITY: when constructed with a {@link DurableSpentSetStore} backend
+ * (the production boot wiring always does), the spent set is loaded from the
+ * encrypted state store on first use and persisted on every consume, so
+ * single-use survives a daemon restart. The atomic gate stays the synchronous
+ * in-memory check-and-set (single-threaded event loop); the durable write is
+ * ordered so a token is NEVER allowed unless its spent record was durably
+ * committed: a newly-spent key is marked in memory, then persisted, and if the
+ * persist FAILS the in-memory mark is rolled back and the consume DENIES (fail
+ * closed, allow-without-durable-record is impossible). A corrupt durable record
+ * fails the load and every consume DENIES (cannot prove not-spent), never a
+ * silent reset.
+ *
+ * When constructed WITHOUT a backend (tests / non-persistent callers), it is a
+ * pure in-memory store with the same single-use semantics.
  */
 export class BootstrapNonceStore {
   private readonly spent = new Map<string, number>();
+  private readonly durable?: DurableSpentSetStore;
+  /** Lazy one-time load of the durable set; null until the first consume/init. */
+  private loadOnce: Promise<void> | null = null;
+
+  constructor(durable?: DurableSpentSetStore) {
+    this.durable = durable;
+  }
+
+  /**
+   * Build a durable-backed store from the boot context (encrypted state store +
+   * custody master). The production standalone boot uses this so single-use
+   * survives a restart.
+   */
+  static durableFromBoot(
+    storage: StorageBackend,
+    masterKey: Uint8Array,
+  ): BootstrapNonceStore {
+    return new BootstrapNonceStore(
+      new DurableSpentSetStore({
+        storage,
+        masterKey,
+        namespace: BOOTSTRAP_NONCE_STORE_NAMESPACE,
+        recordKey: BOOTSTRAP_NONCE_STORE_KEY,
+        hkdfLabel: BOOTSTRAP_NONCE_STORE_HKDF_INFO,
+      }),
+    );
+  }
 
   private key(fortressId: string, nodeId: string, nonce: string): string {
     return `${fortressId} ${nodeId} ${nonce}`;
@@ -68,21 +109,58 @@ export class BootstrapNonceStore {
   }
 
   /**
-   * Atomically consume the nonce. Returns true if this is the FIRST time the
-   * nonce is seen (records it as spent until `expiresAtMs`); returns false if it
-   * was already spent (a replay): the caller must DENY on false.
+   * Load the durable spent set into memory exactly once. THROWS (propagated to
+   * the caller, which fails closed) if the durable record is corrupt. A no-op
+   * for an in-memory-only store. Idempotent and safe to call from boot or lazily
+   * on the first consume.
    */
-  consume(
+  async init(nowMs = Date.now()): Promise<void> {
+    if (!this.durable) return;
+    if (this.loadOnce === null) {
+      const durable = this.durable;
+      this.loadOnce = durable.load(nowMs).then((loaded) => {
+        for (const [key, expiresAtMs] of loaded) this.spent.set(key, expiresAtMs);
+      });
+    }
+    await this.loadOnce;
+  }
+
+  /**
+   * Atomically consume the nonce. Returns true if this is the FIRST time the
+   * nonce is seen (records it as spent until `expiresAtMs` AND, when durable,
+   * persists the spent set before returning true); returns false if it was
+   * already spent (a replay) OR if the durable persist failed (fail closed). The
+   * caller must DENY on false. With a durable backend a corrupt record makes the
+   * load THROW, which propagates here so the caller fails closed.
+   */
+  async consume(
     fortressId: string,
     nodeId: string,
     nonce: string,
     expiresAtMs: number,
     nowMs = Date.now(),
-  ): boolean {
+  ): Promise<boolean> {
+    // Load the durable set once (throws on corruption -> caller fails closed).
+    await this.init(nowMs);
+
     this.prune(nowMs);
     const key = this.key(fortressId, nodeId, nonce);
+    // Synchronous atomic gate: a replay is rejected with no I/O.
     if (this.spent.has(key)) return false;
+    // Claim the slot in memory BEFORE the await so a concurrent re-entrant
+    // consume for the same key in the same tick is rejected above.
     this.spent.set(key, expiresAtMs);
+
+    if (this.durable) {
+      try {
+        await this.durable.persist(this.spent);
+      } catch {
+        // The spent record was NOT durably committed: roll back the in-memory
+        // mark and DENY. Never allow a token whose spent record did not persist.
+        this.spent.delete(key);
+        return false;
+      }
+    }
     return true;
   }
 
@@ -175,13 +253,20 @@ export function createStandaloneJoinApprover(
       if (!Number.isFinite(expiresAtMs)) {
         return { approved: false, denial_reason: "bootstrap token expiry is invalid" };
       }
-      const firstUse = params.nonceStore.consume(
-        token.fortress_id,
-        token.intended_node_id,
-        token.nonce,
-        expiresAtMs,
-        nowMs,
-      );
+      // The nonce store may fail the durable load (corrupt record) -> fail
+      // closed: a thrown load propagates as a denial, never a silent reset.
+      let firstUse: boolean;
+      try {
+        firstUse = await params.nonceStore.consume(
+          token.fortress_id,
+          token.intended_node_id,
+          token.nonce,
+          expiresAtMs,
+          nowMs,
+        );
+      } catch {
+        return { approved: false, denial_reason: "bootstrap token single-use store unavailable" };
+      }
       if (!firstUse) {
         return { approved: false, denial_reason: "bootstrap token already used" };
       }

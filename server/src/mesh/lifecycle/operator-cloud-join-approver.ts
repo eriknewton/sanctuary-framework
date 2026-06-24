@@ -19,10 +19,15 @@
  */
 
 import { fromBase64url } from "../../core/encoding.js";
+import type { StorageBackend } from "../../storage/interface.js";
 import {
   computeNodePubkeyHash,
   verifyOperatorCloudJoinProof,
 } from "../operator-cloud-provision.js";
+import {
+  DurableClaimSetStore,
+  type OperatorCloudProvisionClaim,
+} from "./durable-claim-set-store.js";
 import { issueCertificateForApprovedJoin } from "./join-approver.js";
 import type {
   FortressMasterPublicKey,
@@ -30,20 +35,13 @@ import type {
 } from "../types.js";
 import type { JoinApprovalResult, JoinApprover, JoinRequest } from "./types.js";
 
-/** A Tier-1-approved provision claim, recorded by the home node before delivery. */
-export interface OperatorCloudProvisionClaim {
-  fortress_id: string;
-  node_id: string;
-  node_mode: "operator_cloud";
-  node_pubkey_hash: string;
-  bootstrap_nonce: string;
-  manifest_digest: string;
-  scoped_secret_ciphertext_digest: string;
-  scope_digest: string;
-  bundle_digest: string;
-  expires_at: string;
-  consumed: boolean;
-}
+/** At-rest namespace + record key + HKDF label for the durable claim set. */
+export const OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE = "_federation";
+export const OPERATOR_CLOUD_CLAIM_STORE_KEY = "operator-cloud-provision-claims-v1";
+export const OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO =
+  "federation-operator-cloud-provision-claim-set";
+
+export type { OperatorCloudProvisionClaim };
 
 export interface RecordProvisionClaimParams {
   fortress_id: string;
@@ -58,19 +56,83 @@ export interface RecordProvisionClaimParams {
 }
 
 /**
- * In-memory pending-claim store. Production wires this to the encrypted state
- * store; the in-memory implementation is the Slice 2 mechanism + the test
- * substrate. A claim is single-use: `consume` flips `consumed` and never returns
- * it again.
+ * Single-use pending-claim store. A claim is single-use: `consume` flips
+ * `consumed` and never returns it again.
+ *
+ * DURABILITY: when constructed with a {@link DurableClaimSetStore} backend, the
+ * claim set is loaded from the encrypted state store on first use and persisted
+ * on every `record` / `consume`, so both an unconsumed claim AND a consumed
+ * claim's single-use state survive a daemon restart (a consumed claim stays
+ * consumed -> the cloud join is not replayable mid-TTL). The atomic gate is the
+ * synchronous in-memory check (single-threaded event loop); the durable write is
+ * ordered so a claim is NEVER consumed-as-approved unless its consumed state was
+ * durably committed: the in-memory `consumed` flag is set, then persisted, and if
+ * the persist FAILS the flag is rolled back and `consume` returns null (deny,
+ * allow-without-durable-record is impossible). A corrupt durable record fails the
+ * load and every consume DENIES (cannot prove unconsumed), never a silent reset.
+ *
+ * When constructed WITHOUT a backend (tests / non-persistent callers), it is a
+ * pure in-memory store with the same single-use semantics.
  */
 export class OperatorCloudProvisionClaimStore {
   private readonly claims = new Map<string, OperatorCloudProvisionClaim>();
+  private readonly durable?: DurableClaimSetStore;
+  /** Lazy one-time load of the durable set; null until the first record/consume. */
+  private loadOnce: Promise<void> | null = null;
+
+  constructor(durable?: DurableClaimSetStore) {
+    this.durable = durable;
+  }
+
+  /**
+   * Build a durable-backed store from the boot context (encrypted state store +
+   * custody master). Any production wiring that records / consumes operator-cloud
+   * provision claims uses this so single-use survives a restart.
+   */
+  static durableFromBoot(
+    storage: StorageBackend,
+    masterKey: Uint8Array,
+  ): OperatorCloudProvisionClaimStore {
+    return new OperatorCloudProvisionClaimStore(
+      new DurableClaimSetStore({
+        storage,
+        masterKey,
+        namespace: OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE,
+        recordKey: OPERATOR_CLOUD_CLAIM_STORE_KEY,
+        hkdfLabel: OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
+      }),
+    );
+  }
 
   private key(fortressId: string, nodeId: string, nonce: string): string {
     return `${fortressId} ${nodeId} ${nonce}`;
   }
 
-  record(params: RecordProvisionClaimParams): OperatorCloudProvisionClaim {
+  /**
+   * Load the durable claim set into memory exactly once. THROWS (propagated, so
+   * the caller fails closed) on a corrupt record. No-op for an in-memory store.
+   */
+  async init(nowMs = Date.now()): Promise<void> {
+    if (!this.durable) return;
+    if (this.loadOnce === null) {
+      const durable = this.durable;
+      this.loadOnce = durable.load(nowMs).then((loaded) => {
+        for (const [key, claim] of loaded) this.claims.set(key, claim);
+      });
+    }
+    await this.loadOnce;
+  }
+
+  /**
+   * Record a Tier-1-approved claim. When durable, persists the claim set before
+   * returning so a restart remembers it. THROWS if the durable persist fails (a
+   * claim that was not durably committed must not be silently treated as
+   * recorded).
+   */
+  async record(
+    params: RecordProvisionClaimParams,
+  ): Promise<OperatorCloudProvisionClaim> {
+    await this.init();
     const claim: OperatorCloudProvisionClaim = {
       fortress_id: params.fortress_id,
       node_id: params.node_id,
@@ -84,39 +146,64 @@ export class OperatorCloudProvisionClaimStore {
       expires_at: params.expires_at,
       consumed: false,
     };
-    this.claims.set(
-      this.key(params.fortress_id, params.node_id, params.bootstrap_nonce),
-      claim,
-    );
+    const key = this.key(params.fortress_id, params.node_id, params.bootstrap_nonce);
+    this.claims.set(key, claim);
+    if (this.durable) {
+      try {
+        await this.durable.persist(this.claims);
+      } catch (err) {
+        // The claim was not durably committed: roll back so we do not act on a
+        // recorded-but-not-persisted claim, and surface the failure.
+        this.claims.delete(key);
+        throw err;
+      }
+    }
     return claim;
   }
 
   /** Peek a claim without consuming it (status surfaces). */
-  peek(
+  async peek(
     fortressId: string,
     nodeId: string,
     nonce: string,
-  ): OperatorCloudProvisionClaim | null {
+  ): Promise<OperatorCloudProvisionClaim | null> {
+    await this.init();
     return this.claims.get(this.key(fortressId, nodeId, nonce)) ?? null;
   }
 
   /**
    * Atomically consume the matching claim if it is present, unconsumed, and
-   * unexpired. Returns the claim on success; null otherwise. The caller is
-   * responsible for verifying digest/pubkey bindings BEFORE acting on it, 
-   * `consume` only enforces single-use + expiry.
+   * unexpired. Returns the claim on success; null otherwise (absent / consumed /
+   * expired / durable-persist-failed). The caller verifies digest/pubkey bindings
+   * BEFORE acting on it; `consume` only enforces single-use + expiry + durable
+   * commit. When durable, the consumed flag is persisted before returning the
+   * claim; if the persist FAILS the flag is rolled back and consume returns null
+   * (fail closed). A corrupt durable record makes the load THROW (propagated so
+   * the caller fails closed).
    */
-  consume(
+  async consume(
     fortressId: string,
     nodeId: string,
     nonce: string,
     nowMs = Date.now(),
-  ): OperatorCloudProvisionClaim | null {
+  ): Promise<OperatorCloudProvisionClaim | null> {
+    await this.init(nowMs);
     const claim = this.claims.get(this.key(fortressId, nodeId, nonce));
     if (!claim) return null;
     if (claim.consumed) return null;
     if (Date.parse(claim.expires_at) < nowMs) return null;
+    // Claim the slot synchronously before the await: a concurrent re-entrant
+    // consume for the same claim in the same tick sees consumed === true above.
     claim.consumed = true;
+    if (this.durable) {
+      try {
+        await this.durable.persist(this.claims);
+      } catch {
+        // The consumed state was NOT durably committed: roll back and DENY.
+        claim.consumed = false;
+        return null;
+      }
+    }
     return claim;
   }
 }
@@ -160,12 +247,22 @@ export function createOperatorCloudJoinApprover(
       }
       const nowMs = params.nowMs?.() ?? Date.now();
       const token = request.bootstrap_token;
-      const claim = params.claimStore.consume(
-        token.fortress_id,
-        token.intended_node_id,
-        token.nonce,
-        nowMs,
-      );
+      // The claim store may fail the durable load (corrupt record) -> fail
+      // closed: a thrown load propagates as a denial, never a silent reset.
+      let claim: OperatorCloudProvisionClaim | null;
+      try {
+        claim = await params.claimStore.consume(
+          token.fortress_id,
+          token.intended_node_id,
+          token.nonce,
+          nowMs,
+        );
+      } catch {
+        return {
+          approved: false,
+          denial_reason: "operator-cloud provision-claim store unavailable",
+        };
+      }
       if (!claim) {
         return {
           approved: false,

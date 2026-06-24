@@ -138,6 +138,18 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
       context: "storage.write(namespace, key, bytes)",
       reason: "transparency emitter helper uses frozen internal namespaces",
     },
+    {
+      path: "server/src/mesh/lifecycle/durable-spent-set-store.ts",
+      context: "storage.write(",
+      reason:
+        "federation single-use NONCE replay-protection metadata (the spent set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+    },
+    {
+      path: "server/src/mesh/lifecycle/durable-claim-set-store.ts",
+      context: "storage.write(",
+      reason:
+        "operator-cloud provision-claim single-use replay-protection metadata (the claim set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+    },
   ];
   return allowed.some(
     (item) =>

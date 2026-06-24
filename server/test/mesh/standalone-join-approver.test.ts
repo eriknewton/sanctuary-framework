@@ -30,6 +30,7 @@ import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
 } from "../../src/mesh/lifecycle/standalone-join-approver.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
 import { issueBootstrapToken } from "../../src/mesh/lifecycle/bootstrap-token.js";
 import { verifyCertChain } from "../../src/mesh/trust-root.js";
 import { assembleJoinRequest } from "../../src/cli/federation.js";
@@ -130,13 +131,59 @@ describe("standalone join approver — REPLAY denied (criterion b, the headline)
     }
   });
 
-  it("at the approver level, consume() returns true once then false for the same nonce", () => {
+  it("at the approver level, consume() returns true once then false for the same nonce", async () => {
     const store = new BootstrapNonceStore();
     const expiresAtMs = Date.now() + 60_000;
-    expect(store.consume("f1", "n1", "nonce-1", expiresAtMs)).toBe(true);
-    expect(store.consume("f1", "n1", "nonce-1", expiresAtMs)).toBe(false);
+    expect(await store.consume("f1", "n1", "nonce-1", expiresAtMs)).toBe(true);
+    expect(await store.consume("f1", "n1", "nonce-1", expiresAtMs)).toBe(false);
     // A different nonce for the same node is independent.
-    expect(store.consume("f1", "n1", "nonce-2", expiresAtMs)).toBe(true);
+    expect(await store.consume("f1", "n1", "nonce-2", expiresAtMs)).toBe(true);
+  });
+});
+
+describe("standalone join approver — RESTART replay denied (durable, the debt-closer)", () => {
+  it("a DURABLE nonce store remembers a spent nonce across a daemon restart", async () => {
+    // One operator fortress, one assembled local-join request (one nonce). Two
+    // daemon "boots" share the SAME encrypted storage + custody master but build
+    // their OWN durable nonce store at boot, exactly like dashboard-standalone.
+    const { materials, assembled } = setup();
+    const storage = new MemoryStorage();
+    const fakeMaster = new Uint8Array(32).fill(11);
+
+    const issuerWith = (nonceStore: BootstrapNonceStore) => ({
+      ...materials.context,
+      approver: createStandaloneJoinApprover({
+        pinned_master_pubkey: materials.context.pinnedMasterPubkey,
+        issuing_principal_cert: materials.context.issuingPrincipalCert,
+        getIssuingPrincipalPrivateKey:
+          materials.context.getIssuingPrincipalPrivateKey,
+        getMasterPrivateKey: materials.context.getMasterPrivateKey,
+        nonceStore,
+      }),
+    });
+
+    // Boot 1: durable store over the shared storage. First join APPROVED.
+    const boot1 = issuerWith(
+      BootstrapNonceStore.durableFromBoot(storage, fakeMaster),
+    );
+    const first = await new JoinCeremony(boot1).authorizeComplete(
+      assembled.joinRequest,
+    );
+    expect(first.approved).toBe(true);
+
+    // Boot 2: a FRESH durable store over the SAME storage (the restart). Replaying
+    // the SAME bootstrap token is DENIED — the spent nonce was persisted. On
+    // `main` (in-memory only) this restart would FORGET the nonce and ALLOW.
+    const boot2 = issuerWith(
+      BootstrapNonceStore.durableFromBoot(storage, fakeMaster),
+    );
+    const replay = await new JoinCeremony(boot2).authorizeComplete(
+      assembled.joinRequest,
+    );
+    expect(replay.approved).toBe(false);
+    if (!replay.approved) {
+      expect(replay.denialReason).toMatch(/already used/i);
+    }
   });
 });
 
@@ -241,11 +288,11 @@ describe("standalone join approver — expired token denied (criterion f)", () =
     }
   });
 
-  it("the nonce store prunes and re-rejects an expired spent nonce", () => {
+  it("the nonce store prunes and re-rejects an expired spent nonce", async () => {
     const store = new BootstrapNonceStore();
     const past = Date.now() - 1000;
     // Consume with an already-past expiry, then verify it is not held as spent.
-    expect(store.consume("f1", "n1", "nonce-x", past)).toBe(true);
+    expect(await store.consume("f1", "n1", "nonce-x", past)).toBe(true);
     expect(store.isSpent("f1", "n1", "nonce-x")).toBe(false);
   });
 });

@@ -97,7 +97,7 @@ describe("sanctuary federation join, operator-cloud bundle path", () => {
     const mockRequest = (async (path: string, init: { body?: string }) => {
       expect(path).toBe("/v1/federation/authorize/complete");
       const join = JSON.parse(init.body as string);
-      claimStore.record({
+      await claimStore.record({
         fortress_id: materials.fortressId,
         node_id: NODE_ID,
         node_pubkey_hash: computeNodePubkeyHash(join.node_pubkey),
