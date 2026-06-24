@@ -19,6 +19,8 @@ export * from "./errors.js";
 export * from "./types.js";
 export * from "./trust-root.js";
 export * from "./federation-trust-root-store.js";
+export * from "./operator-cloud-provision.js";
+export * from "./operator-cloud-provision-service.js";
 export * from "./envelope.js";
 export * from "./audit-batch.js";
 export * from "./router.js";

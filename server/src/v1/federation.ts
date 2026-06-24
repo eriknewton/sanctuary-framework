@@ -255,28 +255,40 @@ export class JoinCeremony {
 
     // 4. HKDF salt proof: the requester must hold the master-derived transport
     //    key, not merely a stolen bootstrap token.
-    let proofOk: boolean;
-    try {
-      const issuer = this.issuerContext();
-      const transportKey = deriveNodeTransportKey({
-        fortress_master_secret: issuer.getFortressMasterSecret(),
-        node_id: request.bootstrap_token.intended_node_id,
-        node_mode: request.node_mode,
-      });
-      proofOk = verifyJoinHkdfSaltProof({
-        intended_node_id: request.bootstrap_token.intended_node_id,
-        node_mode: request.node_mode,
-        node_transport_key: transportKey,
-        proof: request.hkdf_salt_proof,
-      });
-    } catch (err) {
-      return { approved: false, denialReason: `hkdf proof error: ${reason(err)}` };
-    }
-    if (!proofOk) {
-      return {
-        approved: false,
-        denialReason: "hkdf_salt_proof failed — token holder lacks master-derived transport key",
-      };
+    //
+    //    Operator Cloud Slice 2: an `operator_cloud` join uses a DIFFERENT,
+    //    substitution-bound proof (`computeOperatorCloudJoinProof`: HMAC over
+    //    {nonce, node_pubkey, bundle_digest} under the node-scoped proof key),
+    //    which the production operator-cloud approver verifies against the
+    //    approved provision claim. The local-mode HKDF salt proof here HMACs
+    //    only {node_id, node_mode} and is replayable across keypairs, so it must
+    //    NOT be the gate for operator-cloud joins. We defer the operator-cloud
+    //    proof to the approver and keep the local-mode proof mandatory for the
+    //    local / sovereign_tee modes.
+    if (request.node_mode !== "operator_cloud") {
+      let proofOk: boolean;
+      try {
+        const issuer = this.issuerContext();
+        const transportKey = deriveNodeTransportKey({
+          fortress_master_secret: issuer.getFortressMasterSecret(),
+          node_id: request.bootstrap_token.intended_node_id,
+          node_mode: request.node_mode,
+        });
+        proofOk = verifyJoinHkdfSaltProof({
+          intended_node_id: request.bootstrap_token.intended_node_id,
+          node_mode: request.node_mode,
+          node_transport_key: transportKey,
+          proof: request.hkdf_salt_proof,
+        });
+      } catch (err) {
+        return { approved: false, denialReason: `hkdf proof error: ${reason(err)}` };
+      }
+      if (!proofOk) {
+        return {
+          approved: false,
+          denialReason: "hkdf_salt_proof failed, token holder lacks master-derived transport key",
+        };
+      }
     }
 
     // 5. node_pubkey must be a well-formed Ed25519 key.
