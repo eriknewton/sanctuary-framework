@@ -81,6 +81,7 @@ import {
   loadOrCreateLocalListenerSecret,
   DistressLocalSecretError,
 } from "./distress/local-secret.js";
+import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 
 export interface StandaloneDashboardOptions {
   passphrase?: string;
@@ -564,6 +565,31 @@ export async function startStandaloneDashboard(
     storage,
   });
   dashboard.setStandaloneMode(true);
+
+  // Federation Slice 1: production boot is LOAD-ONLY. A persisted trust root
+  // provisions /v1/federation/*; absence leaves federation honestly off.
+  const federationRoot = await provisionOrLoadFederationTrustRoot({
+    storage,
+    masterKey,
+    mint: false,
+    audit: async (event) => {
+      try {
+        await auditLog.append(
+          "l2",
+          event.operation,
+          "federation",
+          event.details,
+          event.result,
+        );
+      } catch {
+        // Federation remains fail-closed; dashboard boot should still report
+        // provisioned:false rather than crash or mint a replacement root.
+      }
+    },
+  });
+  if (federationRoot !== null) {
+    dashboard.setFederationContext(federationRoot.context);
+  }
 
   // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator
   // hub API at /api/hub/*. Legacy routes at / continue to serve. The
