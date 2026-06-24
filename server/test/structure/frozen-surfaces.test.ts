@@ -72,6 +72,9 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "application/did+json; charset=utf-8",
   "identity.sanctuaryprotocol.ai",
   "privacy-filter-tier-2",
+  // federation rotate-root rotation-certificate kind tag (Slice 3a; the joiner
+  // adopt side in 3b verifies this exact wire value):
+  "federation-root-rotation",
 
   // --- public TS export symbols (root index.ts surface) ---
   "L1Status",
@@ -126,6 +129,7 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "federation-joiner-trust-root",
   "federation-bootstrap-nonce-spent-set",
   "federation-operator-cloud-provision-claim-set",
+  "federation-rotate-root-journal-mac",
   "custody-envelope-mac",
   "custody-sentinel",
   "state-meta-mac",
@@ -170,6 +174,10 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "_query_anonymity_tier_b",
   "_query_anonymity_reverse_map",
   "_facade/hidden",
+  // federation rotate-root at-rest keys (Slice 3a; renaming orphans an
+  // in-progress rotation's staged record / journal):
+  "trust-root-v1-next",
+  "rotate-root-journal",
 
   // --- frozen versioned HTTP / served route paths ---
   "/v1/agents/protect",

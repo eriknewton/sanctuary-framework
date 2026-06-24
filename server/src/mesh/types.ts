@@ -131,6 +131,38 @@ export interface NodeIdentityCertificate {
 }
 
 /**
+ * Federation root-rotation certificate (rotate-root --renew, Slice 3a).
+ *
+ * The verifiable OLD -> NEW link emitted by the renewal path: the PREVIOUS
+ * fortress-master private key (K1) signs an attestation that K2 (the new master
+ * public key) is the successor under the SAME, stable fortress_id. A joiner that
+ * still pins K1 adopts K2 by verifying this cert against the key it currently
+ * pins (Slice 3b); the strictly-monotonic `rotation_serial` defeats a rollback
+ * or replay of an older rotation cert.
+ *
+ * FROZEN WIRE SURFACE. The signature is Ed25519 over
+ * canonicalize({kind, fortress_id, old_master_pubkey, new_master,
+ * rotation_serial, rotated_at}) by K1's private key (NOT the signature field).
+ * The cert is PUBLIC: it leaks nothing (an old-key signature over a public key).
+ */
+export interface FederationRootRotationCertificate {
+  /** Domain-separation tag; always this literal for Slice 3a renewal. */
+  kind: "federation-root-rotation";
+  /** The stable fortress identity that survives the rotation. */
+  fortress_id: string;
+  /** Base64url Ed25519 public key of the PREVIOUS master (K1) that SIGNS this. */
+  old_master_pubkey: string;
+  /** The NEW pinned master (K2) this cert attests, under the same fortress_id. */
+  new_master: FortressMasterPublicKey;
+  /** Strictly-monotonic rotation serial of this rotation (replay/rollback proof). */
+  rotation_serial: number;
+  /** ISO8601 timestamp of the rotation. */
+  rotated_at: string;
+  /** Base64url Ed25519 signature over the canonical body by the OLD master (K1). */
+  old_master_signature: string;
+}
+
+/**
  * Hybrid public-key pair carried by v2 certificates. Both key refs are signed
  * into the certificate body and must match the verifying signature bundle.
  */

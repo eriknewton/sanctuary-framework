@@ -83,6 +83,7 @@ import {
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
+import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
 import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
@@ -571,27 +572,49 @@ export async function startStandaloneDashboard(
   });
   dashboard.setStandaloneMode(true);
 
+  // Federation Slice 3a: a federation rotate-root journal means the signing
+  // master is mid-rotation. A half-rotated root must NEVER serve (fail closed):
+  // skip loading ANY federation context so /v1/federation reports unprovisioned
+  // until `sanctuary federation rotate-root --resume` completes the rotation.
+  // The daemon still boots; the LIVE record (the OLD, valid root) is untouched.
+  const federationRotating = await federationRotateRootInProgress(storage);
+  if (federationRotating) {
+    try {
+      await auditLog.append(
+        "l2",
+        "federation_trust_root_load",
+        "federation",
+        { reason: "rotate_root_journal_present", action: "federation_held_off" },
+        "failure",
+      );
+    } catch {
+      // Fail closed regardless of audit durability.
+    }
+  }
+
   // Federation Slice 1: production boot is LOAD-ONLY. A persisted trust root
   // provisions /v1/federation/*; absence leaves federation honestly off.
-  const federationRoot = await provisionOrLoadFederationTrustRoot({
-    storage,
-    masterKey,
-    mint: false,
-    audit: async (event) => {
-      try {
-        await auditLog.append(
-          "l2",
-          event.operation,
-          "federation",
-          event.details,
-          event.result,
-        );
-      } catch {
-        // Federation remains fail-closed; dashboard boot should still report
-        // provisioned:false rather than crash or mint a replacement root.
-      }
-    },
-  });
+  const federationRoot = federationRotating
+    ? null
+    : await provisionOrLoadFederationTrustRoot({
+        storage,
+        masterKey,
+        mint: false,
+        audit: async (event) => {
+          try {
+            await auditLog.append(
+              "l2",
+              event.operation,
+              "federation",
+              event.details,
+              event.result,
+            );
+          } catch {
+            // Federation remains fail-closed; dashboard boot should still report
+            // provisioned:false rather than crash or mint a replacement root.
+          }
+        },
+      });
   if (federationRoot !== null) {
     // The real operator-approval gate for a LOCAL / sovereign_tee join. Model:
     // token-as-approval: the operator's live Tier-1 decision already happened at
@@ -619,7 +642,7 @@ export async function startStandaloneDashboard(
         nonceStore,
       }),
     });
-  } else {
+  } else if (!federationRotating) {
     // Federation Slice 3a: the JOINER half. A second machine that ran a real
     // join persists a NON-ISSUER joiner trust root; production boot loads it
     // (never mints; a joiner has no master to mint from) into a non-issuer
@@ -628,6 +651,7 @@ export async function startStandaloneDashboard(
     // Issuer precedence: only attempted when no issuer root exists (Q3). A
     // malformed/tampered joiner record fails closed (load returns null) and
     // leaves federation honestly off; boot never crashes, never mints.
+    // (Also skipped while a rotate-root journal exists: fail closed until resume.)
     const joinerRoot = await loadFederationJoinerTrustRoot({
       storage,
       masterKey,

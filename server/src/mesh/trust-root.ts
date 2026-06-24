@@ -43,6 +43,7 @@ import {
   MeshReservedCapabilityBitError,
 } from "./errors.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   NodeIdentityCertificate,
   PrincipalCertificate,
@@ -50,6 +51,10 @@ import type {
 
 export const NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING =
   "sanctuary.v1.expiring-node-cert" as const;
+
+/** Domain-separation tag for the rotate-root renewal rotation certificate. */
+export const FEDERATION_ROOT_ROTATION_KIND =
+  "federation-root-rotation" as const;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Bootstrap
@@ -375,6 +380,135 @@ export function verifyCertChain(
  */
 export function v01VisibleCapabilities(cert: NodeIdentityCertificate): number {
   return cert.capabilities & V01_ALLOWED_CAPABILITY_MASK;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Root-rotation certificate (rotate-root --renew, Slice 3a)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * The exact canonical body the OLD master signs and a verifier reconstructs.
+ * Signature-bearing fields are excluded. Field set + ordering is the FROZEN wire
+ * surface for the cert (Slice 3b joiner-adopt verifies against this).
+ */
+function rotationCertSignedBody(
+  cert: Pick<
+    FederationRootRotationCertificate,
+    "kind" | "fortress_id" | "old_master_pubkey" | "new_master" | "rotation_serial" | "rotated_at"
+  >,
+) {
+  return {
+    kind: cert.kind,
+    fortress_id: cert.fortress_id,
+    old_master_pubkey: cert.old_master_pubkey,
+    new_master: {
+      public_key: cert.new_master.public_key,
+      fortress_id: cert.new_master.fortress_id,
+      created_at: cert.new_master.created_at,
+    },
+    rotation_serial: cert.rotation_serial,
+    rotated_at: cert.rotated_at,
+  };
+}
+
+/**
+ * Sign a federation root-rotation certificate with the OLD master private key.
+ *
+ * Renewal-path adoption artifact: K1 attests that K2 (`new_master`) succeeds it
+ * under the SAME stable fortress_id at a strictly-monotonic `rotation_serial`.
+ * The caller MUST zero `old_master_private_key` after return (constraint 6). The
+ * returned cert is PUBLIC (an old-key signature over a public key).
+ */
+export function signFederationRootRotationCertificate(params: {
+  fortress_id: string;
+  old_master_pubkey: string;
+  new_master: FortressMasterPublicKey;
+  old_master_private_key: Uint8Array;
+  rotation_serial: number;
+  rotated_at?: string;
+}): FederationRootRotationCertificate {
+  if (!Number.isInteger(params.rotation_serial) || params.rotation_serial < 1) {
+    throw new MeshChainError(
+      "rotation_serial must be a positive integer (a renewal always advances the serial)",
+    );
+  }
+  if (params.new_master.fortress_id !== params.fortress_id) {
+    throw new MeshChainError(
+      "rotation cert new_master.fortress_id must equal the stable fortress_id (renewal preserves identity)",
+    );
+  }
+  const body = rotationCertSignedBody({
+    kind: FEDERATION_ROOT_ROTATION_KIND,
+    fortress_id: params.fortress_id,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master: params.new_master,
+    rotation_serial: params.rotation_serial,
+    rotated_at: params.rotated_at ?? new Date().toISOString(),
+  });
+  const sig = ed25519.sign(canonicalizeToBytes(body), params.old_master_private_key);
+  return {
+    ...body,
+    old_master_signature: toBase64url(sig),
+  };
+}
+
+/**
+ * Verify a federation root-rotation certificate against the master a verifier
+ * CURRENTLY pins (the OLD master K1). Throws MeshChainError on any failure.
+ *
+ * Hard checks (Slice 3a / 3b safety):
+ *   - kind is the rotation domain tag (no shape confusion);
+ *   - the cert names the pinned (old) master as the signer and the SAME
+ *     fortress_id (fortress identity is preserved across renewal);
+ *   - the new master carries that same fortress_id;
+ *   - the signature verifies under the pinned OLD master public key;
+ *   - if `minSerial` is supplied (the serial the verifier has already adopted),
+ *     the cert's serial MUST strictly advance it (replay / rollback rejected).
+ */
+export function verifyFederationRootRotationCertificate(
+  cert: FederationRootRotationCertificate,
+  pinnedOldMaster: FortressMasterPublicKey,
+  opts: { minSerial?: number } = {},
+): void {
+  if (cert.kind !== FEDERATION_ROOT_ROTATION_KIND) {
+    throw new MeshChainError(
+      `rotation cert kind=${String(cert.kind)} is not ${FEDERATION_ROOT_ROTATION_KIND}`,
+    );
+  }
+  if (cert.fortress_id !== pinnedOldMaster.fortress_id) {
+    throw new MeshChainError(
+      `rotation cert fortress_id=${cert.fortress_id} does not match the pinned master fortress_id=${pinnedOldMaster.fortress_id} (fortress identity is preserved across renewal)`,
+    );
+  }
+  if (cert.old_master_pubkey !== pinnedOldMaster.public_key) {
+    throw new MeshChainError(
+      "rotation cert old_master_pubkey does not match the master this verifier currently pins",
+    );
+  }
+  if (cert.new_master.fortress_id !== pinnedOldMaster.fortress_id) {
+    throw new MeshChainError(
+      "rotation cert new_master.fortress_id does not match the stable fortress_id",
+    );
+  }
+  if (!Number.isInteger(cert.rotation_serial) || cert.rotation_serial < 1) {
+    throw new MeshChainError("rotation cert rotation_serial must be a positive integer");
+  }
+  if (opts.minSerial !== undefined && cert.rotation_serial <= opts.minSerial) {
+    throw new MeshChainError(
+      `rotation cert rotation_serial=${cert.rotation_serial} does not advance the adopted serial ${opts.minSerial} (stale / replayed rotation rejected)`,
+    );
+  }
+  const body = rotationCertSignedBody(cert);
+  const ok = ed25519.verify(
+    fromBase64url(cert.old_master_signature),
+    canonicalizeToBytes(body),
+    fromBase64url(pinnedOldMaster.public_key),
+  );
+  if (!ok) {
+    throw new MeshChainError(
+      "rotation cert signature does not verify under the pinned (old) fortress-master",
+    );
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
