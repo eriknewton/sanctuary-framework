@@ -34,6 +34,7 @@ import {
   sha256Hex,
   verifyCheckpointSignature,
 } from "../audit/chain.js";
+import type { PluginContribution } from "../substrate/attribution.js";
 
 export interface AuditEntry {
   timestamp: string;
@@ -42,6 +43,7 @@ export interface AuditEntry {
   identity_id: string;
   result: "success" | "failure";
   details?: Record<string, unknown>;
+  contributors?: PluginContribution[];
 }
 
 export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
@@ -971,6 +973,7 @@ export class AuditLog {
       identity_id: entry.identity_id,
       result: entry.result,
       details: entry.details,
+      ...(entry.contributors !== undefined ? { contributors: entry.contributors } : {}),
     };
   }
 
