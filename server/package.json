@@ -83,7 +83,7 @@
     "pg": "8.21.0",
     "pgvector": "0.3.0",
     "uint8arraylist": "2.4.9",
-    "uint8arrays": "5.1.1"
+    "uint8arrays": "6.1.1"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
