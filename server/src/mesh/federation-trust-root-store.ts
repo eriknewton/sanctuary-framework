@@ -136,7 +136,7 @@ interface PersistedHybridPrivateKeyMaterial {
 }
 
 /** Persisted (base64url) form of the optional hybrid signing material. */
-interface PersistedFederationHybridMasterMaterial {
+export interface PersistedFederationHybridMasterMaterial {
   pinned_master: FortressMasterPublicKeysV2Hybrid;
   master_private_keys: PersistedHybridPrivateKeyMaterial;
   issuing_principal_cert: PrincipalCertificateV2Hybrid;
@@ -560,7 +560,7 @@ function encodeHybridPrivateKeys(
   };
 }
 
-function encodeHybridMaterial(
+export function encodeHybridMaterial(
   hybrid: FederationHybridMasterMaterial,
 ): PersistedFederationHybridMasterMaterial {
   return {
@@ -662,7 +662,7 @@ function decodeHybridPrivateKeys(
   };
 }
 
-function decodeHybridMaterial(
+export function decodeHybridMaterial(
   value: Record<string, unknown>,
 ): FederationHybridMasterMaterial {
   return {
@@ -788,6 +788,51 @@ function validateRecord(record: FederationTrustRootRecord): void {
       throw new FederationTrustRootStoreError(
         "rotation_cert old_master_pubkey must differ from the new (current) master",
       );
+    }
+    // PQC Slice 3: a HYBRID rotation cert MUST carry the hybrid binding (and a
+    // classical one MUST NOT), and the binding's new hybrid master MUST be this
+    // record's own hybrid pinned master. A hybrid record whose rotation cert
+    // lacks the hybrid half would let a verifier adopt via the Ed25519 link only
+    // (a silent PQ-downgrade) -- reject it fail-closed.
+    if (record.hybrid !== undefined && cert.hybrid_rotation === undefined) {
+      throw new FederationTrustRootStoreError(
+        "hybrid record's rotation_cert is missing its hybrid_rotation binding (a hybrid rotation must carry the post-quantum old->new link; refusing a classical-only rotation cert on a hybrid root)",
+      );
+    }
+    if (record.hybrid === undefined && cert.hybrid_rotation !== undefined) {
+      throw new FederationTrustRootStoreError(
+        "classical record's rotation_cert carries a hybrid_rotation binding but the record has no hybrid block",
+      );
+    }
+    if (cert.hybrid_rotation !== undefined && record.hybrid !== undefined) {
+      const binding = cert.hybrid_rotation;
+      if (binding.new_hybrid_master.fortress_id !== record.fortress_id) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation new_hybrid_master fortress_id mismatch",
+        );
+      }
+      const recPub = record.hybrid.pinned_master.public_keys;
+      const newPub = binding.new_hybrid_master.public_keys;
+      if (
+        newPub.ed25519.public_key !== recPub.ed25519.public_key ||
+        newPub.ml_dsa_65.public_key !== recPub.ml_dsa_65.public_key ||
+        newPub.ed25519.key_ref !== recPub.ed25519.key_ref ||
+        newPub.ml_dsa_65.key_ref !== recPub.ml_dsa_65.key_ref
+      ) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation new_hybrid_master does not match the record's current hybrid pinned master",
+        );
+      }
+      if (
+        binding.old_hybrid_master.public_keys.ed25519.public_key ===
+          recPub.ed25519.public_key ||
+        binding.old_hybrid_master.public_keys.ml_dsa_65.public_key ===
+          recPub.ml_dsa_65.public_key
+      ) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation old_hybrid_master must differ from the new (current) hybrid master",
+        );
+      }
     }
   }
   // PQC Slice 3: structural integrity of the optional hybrid block. The async

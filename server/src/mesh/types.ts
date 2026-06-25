@@ -160,6 +160,41 @@ export interface FederationRootRotationCertificate {
   rotated_at: string;
   /** Base64url Ed25519 signature over the canonical body by the OLD master (K1). */
   old_master_signature: string;
+  /**
+   * PQC Slice 3 (hybrid rotate-root --renew): the post-quantum half of the
+   * old->new link for a HYBRID fortress. Present ONLY when the rotated fortress
+   * is hybrid; absent (undefined) on a classical rotation so a classical
+   * rotation cert stays byte-for-byte unchanged.
+   *
+   * When present, this binds the OLD hybrid master (both Ed25519 + ML-DSA-65
+   * components) to the NEW hybrid master (both components) and carries a HYBRID
+   * signature bundle (both-must-pass) produced by the OLD hybrid master's two
+   * private keys. A hybrid joiner MUST verify this bundle (both components) to
+   * adopt the new hybrid master; verifying only the classical `old_master_signature`
+   * (Ed25519) above is a silent post-quantum DOWNGRADE of the rotation link and
+   * is rejected fail-closed. The classical Ed25519 link above remains valid for a
+   * current-version (classical) joiner adopting the Ed25519 chain.
+   */
+  hybrid_rotation?: FederationRootRotationHybridBinding;
+}
+
+/**
+ * PQC Slice 3 hybrid binding for a root-rotation certificate (rotate-root
+ * --renew on a HYBRID fortress). The OLD hybrid master attests the NEW hybrid
+ * master with a both-must-pass hybrid signature bundle. PUBLIC (an old-key
+ * signature over public keys); leaks nothing.
+ */
+export interface FederationRootRotationHybridBinding {
+  /** The PREVIOUS hybrid master (K1) public keys that SIGN this binding. */
+  old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  /** The NEW hybrid master (K2) public keys this binding attests. */
+  new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  /**
+   * Hybrid signature bundle (Ed25519 + ML-DSA-65, in that fixed order) over the
+   * canonical hybrid-rotation body by the OLD hybrid master's two private keys.
+   * Both components must verify (`bundleMatchesSuitePolicy` + both-must-pass).
+   */
+  old_hybrid_master_signature_bundle: SignatureBundle;
 }
 
 /**
