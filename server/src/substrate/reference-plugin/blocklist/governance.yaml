@@ -1,0 +1,25 @@
+# Sanctuary plugin vendor contract declaration (governance.yaml).
+#
+# This is the ENTIRE declaration surface for the reference domain-blocklist plugin.
+# The host parses it under a restricted-YAML profile (no anchors/aliases/tags/merge
+# keys/duplicate keys) against a recursively-closed schema: any unknown key, at any
+# nesting depth, rejects the install. See Plugin_Host_Architecture_Design §3.1.
+#
+# The plugin binds the egress_decision hook only. It requests two Low-tier fields
+# (egress.host, egress.port) — never any Sensitive field, never raw state. Its
+# fail_mode is "deny": if this plugin crashes or times out, the host denies the
+# egress (the wall's default-deny stands). An enforcement hook may not declare a
+# fail-open fail_mode; "deny" is the strictest and is correct for a blocklist.
+plugin_id: ai.sanctuary.blocklist
+version: 1.0.0
+channel: stable
+entry: bin/blocklist.mjs
+hooks:
+  - hook_class: egress_decision
+    fields:
+      - egress.host
+      - egress.port
+    fail_mode: deny
+endpoints: []
+signal_keys:
+  - blocked_rule
