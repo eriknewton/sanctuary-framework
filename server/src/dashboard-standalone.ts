@@ -84,6 +84,7 @@ import {
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
+import { FederationSyncStateStore } from "./v1/federation-sync-state-store.js";
 import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
@@ -674,6 +675,23 @@ export async function startStandaloneDashboard(
       // No approver: a joiner is a non-issuer and cannot run the approval gate.
       dashboard.setFederationContext(joinerRoot.context);
     }
+  }
+
+  // Federation 3/3b P0: wire the DURABLE peer-sync security-state store and
+  // rehydrate it whenever federation is provisioned (issuer OR joiner). This
+  // makes the per-sender accepted high-water, the outbound high-water, and the
+  // folded revocation projection survive a daemon restart, so a captured
+  // envelope is rejected after restart and a revoked node stays revoked across
+  // reboot (closing the standing forgotten-revocation weakness). A
+  // present-but-corrupt record latches sync unavailable (fail closed) rather
+  // than booting on empty anti-replay memory; an absent record (fresh fortress)
+  // serves normally. Skipped while a rotate-root journal exists (federation is
+  // held off) and when federation never provisioned. The store mirrors the #741
+  // durable replay stores: AES-256-GCM under a custody-master purpose key.
+  if (!federationRotating && dashboard.isFederationProvisioned()) {
+    await dashboard.setFederationSyncStateStore(
+      new FederationSyncStateStore({ storage, masterKey }),
+    );
   }
 
   // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator

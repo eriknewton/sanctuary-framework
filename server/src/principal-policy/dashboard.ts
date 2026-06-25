@@ -124,6 +124,10 @@ import {
   startFederationNodeCertificateAutoRenewal,
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
+import {
+  FederationSyncStateStore,
+  type FederationSyncStateSnapshot,
+} from "../v1/federation-sync-state-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -434,6 +438,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private readonly _federationAcceptedHighWater = new Map<string, number>();
   private _federationOutboundHighWater = 0;
+  /**
+   * Federation 3/3b P0: DURABLE peer-sync security state. The store persists +
+   * rehydrates the per-sender accepted high-water, the outbound high-water, and
+   * the folded revocation projection (revoked-node set + highest eviction
+   * serial) so anti-replay and revocation memory survive a daemon restart.
+   * `null` when no storage/master key is wired (tests / minimal rigs run purely
+   * in memory with the same semantics).
+   */
+  private _federationSyncStateStore: FederationSyncStateStore | null = null;
+  /**
+   * FAIL-CLOSED latch (DUR-4 / CC-2). Set true when the durable sync-state
+   * record is PRESENT but could not be decrypted/parsed on boot (at-rest
+   * tamper/corruption). While true the sync paths must DENY rather than serve on
+   * empty anti-replay + empty revocation memory (never silently un-revoke or
+   * re-open the replay window). Cleared only by a clean (re)hydration.
+   */
+  private _federationSyncStateUnavailable = false;
+  /**
+   * RR-1 pre-wire (Federation 3/3b P0). The set of REVOKED fortress-master
+   * (root) pubkeys, base64url. Empty in P0 and populated only by rotate-root
+   * Slice 3c compromise recovery; wired feature-inert at all three chokepoints
+   * now. Persisting/wiring 3c's population is a 3c concern, not P0's.
+   */
+  private readonly _federationRevokedRoots = new Set<string>();
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -1538,6 +1566,117 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
+  /** True when federation materials are bound (issuer or joiner context). */
+  isFederationProvisioned(): boolean {
+    return this._federationContext !== null;
+  }
+
+  /**
+   * Federation 3/3b P0: bind the durable peer-sync security-state store and
+   * rehydrate it. Call from the boot path AFTER {@link setFederationContext}
+   * (the projection it loads supersedes the empty-log reprojection
+   * setFederationContext just ran). Tests / minimal rigs that never call this
+   * run purely in memory with the same fail-closed semantics.
+   *
+   * FAIL-CLOSED (DUR-4 / CC-2): a record that is PRESENT but
+   * undecryptable/unparseable (at-rest tamper/corruption) makes the load THROW.
+   * We catch it, latch {@link _federationSyncStateUnavailable} so the sync paths
+   * DENY (never serve on empty anti-replay + empty revocation memory), and
+   * return so the daemon still boots provisioned-but-not-serving rather than
+   * crashing or silently resetting. A clean load clears the latch and
+   * rehydrates all four fields; an absent record (fresh fortress) loads the
+   * empty/zero snapshot and serves normally.
+   */
+  async setFederationSyncStateStore(
+    store: FederationSyncStateStore | null,
+  ): Promise<void> {
+    this._federationSyncStateStore = store;
+    if (store === null) {
+      this._federationSyncStateUnavailable = false;
+      return;
+    }
+    await this.hydrateFederationSyncState();
+  }
+
+  /**
+   * Load the durable sync-state snapshot into the live in-memory fields.
+   * Internal to {@link setFederationSyncStateStore}; separated for testability.
+   */
+  private async hydrateFederationSyncState(): Promise<void> {
+    const store = this._federationSyncStateStore;
+    if (store === null) return;
+    let snapshot: FederationSyncStateSnapshot;
+    try {
+      snapshot = await store.load();
+    } catch {
+      // Present-but-corrupt -> fail closed. Do NOT touch the live fields (no
+      // half-applied state); latch unavailability so every sync path denies.
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    this._federationSyncStateUnavailable = false;
+    this._federationAcceptedHighWater.clear();
+    for (const [nodeId, highWater] of snapshot.acceptedHighWater) {
+      this._federationAcceptedHighWater.set(nodeId, highWater);
+    }
+    // Never regress the outbound counter below an already-issued value.
+    this._federationOutboundHighWater = Math.max(
+      this._federationOutboundHighWater,
+      snapshot.outboundHighWater,
+    );
+    // The durable revocation projection is the SOLE post-restart guarantor of
+    // who is revoked (CC-2). It supersedes the empty-log reprojection: union the
+    // durable revoked-set over the live one and lift the eviction-serial floor.
+    const mergedRevoked = new Set(this._federationState.revoked);
+    for (const nodeId of snapshot.revokedNodeIds) mergedRevoked.add(nodeId);
+    this._federationState = {
+      ...this._federationState,
+      revoked: mergedRevoked,
+      evictionMaxSerial: Math.max(
+        this._federationState.evictionMaxSerial,
+        snapshot.highestEvictionSerial,
+      ),
+    };
+  }
+
+  /** Snapshot the live federation security state for the durable store. */
+  private snapshotFederationSyncState(): FederationSyncStateSnapshot {
+    return {
+      acceptedHighWater: new Map(this._federationAcceptedHighWater),
+      outboundHighWater: this._federationOutboundHighWater,
+      revokedNodeIds: new Set(this._federationState.revoked),
+      highestEvictionSerial: this._federationState.evictionMaxSerial,
+    };
+  }
+
+  /**
+   * Persist the current federation security-state snapshot. A no-op (resolves)
+   * when no durable store is wired (in-memory rigs). THROWS on a store write
+   * failure so the caller can fail closed: a security-state advance MUST NOT be
+   * acknowledged unless it durably committed.
+   */
+  private async persistFederationSyncState(): Promise<void> {
+    const store = this._federationSyncStateStore;
+    if (store === null) return;
+    await store.persist(this.snapshotFederationSyncState());
+  }
+
+  /** RR-1 (Federation 3/3b P0): is this fortress-master (root) pubkey revoked? */
+  private isFederationRootRevoked(masterPubkeyB64u: string): boolean {
+    return this._federationRevokedRoots.has(masterPubkeyB64u);
+  }
+
+  /**
+   * Fail-closed guard (DUR-4): THROW when the durable sync-state record was
+   * present-but-corrupt on boot, so the sync paths that catch it deny rather
+   * than operate on empty anti-replay + empty revocation memory.
+   */
+  private assertFederationSyncStateAvailable(): void {
+    if (this._federationSyncStateUnavailable) {
+      throw new Error("federation_sync_state_unavailable");
+    }
+  }
+
   /**
    * Federation PR-A3: dependency bundle for the /v1/federation endpoints.
    * Reads live context + operator key each request. Audit writes route to the
@@ -1567,23 +1706,79 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
-      appendFederationEvents: (events, options) =>
-        this.appendFederationEvents(events, options),
+      appendFederationEvents: async (events, options) => {
+        // Fail closed: if the durable record was present-but-corrupt on boot,
+        // refuse to append on empty/untrusted revocation memory.
+        this.assertFederationSyncStateAvailable();
+        const before = this._federationState.evictionMaxSerial;
+        const result = this.appendFederationEvents(events, options);
+        // Persist ONLY when an operator-authority eviction advanced the durable
+        // revocation projection. On a persist failure THROW so the handler
+        // denies this sync (no false "accepted" acknowledgment), but DELIBERATELY
+        // do NOT un-apply the in-memory revocation: revocation is grow-only and
+        // "revoked in memory but not yet durable" is the FAIL-SAFE direction
+        // (un-revoking would be the dangerous one). The whole-snapshot persist is
+        // idempotent, so the next successful security-state write (the peer's
+        // retry, a later eviction, or any accepted high-water) carries this
+        // revocation to disk; the worst case is the SAME pre-existing
+        // forgotten-on-restart window this slice otherwise closes, never a
+        // silent un-revoke.
+        if (this._federationState.evictionMaxSerial > before) {
+          await this.persistFederationSyncState();
+        }
+        return result;
+      },
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
-      recordAcceptedHighWater: (senderNodeId, highWater, certificate) => {
+      recordAcceptedHighWater: async (senderNodeId, highWater, certificate) => {
+        // Fail closed on an unavailable durable record (corrupt-on-boot).
+        if (this._federationSyncStateUnavailable) return false;
         const prior = this._federationAcceptedHighWater.get(senderNodeId) ?? 0;
         // Defensive: only ever advance (the handler already gates rollback).
-        if (highWater > prior) {
+        const advanced = highWater > prior;
+        if (advanced) {
           this._federationAcceptedHighWater.set(senderNodeId, highWater);
         }
         this.upsertFederationNode(senderNodeId, {
           attestation_status: "verified",
           ...(certificate ? { node_mode: certificate.node_mode } : {}),
         });
+        // Persist the advance BEFORE acknowledging it. On a persist failure roll
+        // the high-water back and report false so the handler denies (the accept
+        // is not acknowledged with a high-water that a restart would forget).
+        if (advanced) {
+          try {
+            await this.persistFederationSyncState();
+          } catch {
+            this._federationAcceptedHighWater.set(senderNodeId, prior);
+            return false;
+          }
+        }
+        return true;
       },
-      nextOutboundHighWater: () => ++this._federationOutboundHighWater,
+      nextOutboundHighWater: async () => {
+        // Fail closed on an unavailable durable record (corrupt-on-boot).
+        this.assertFederationSyncStateAvailable();
+        const next = ++this._federationOutboundHighWater;
+        try {
+          // Persist the reserved counter BEFORE handing it out so a restart can
+          // never re-emit it. On failure roll back and THROW (caller omits the
+          // reciprocal slice rather than signing on an un-committed counter).
+          await this.persistFederationSyncState();
+        } catch (err) {
+          // Roll back ONLY if no concurrent caller advanced past us (decrement is
+          // monotonic-safe: if another reservation already bumped the counter, a
+          // blind `next - 1` would clobber it, so only undo our own increment).
+          if (this._federationOutboundHighWater === next) {
+            this._federationOutboundHighWater = next - 1;
+          }
+          throw err;
+        }
+        return next;
+      },
       isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      isRootRevoked: (masterPubkeyB64u) =>
+        this.isFederationRootRevoked(masterPubkeyB64u),
       renewLocalNodeCertificate: () => {
         this.renewLocalFederationNodeCertificate();
       },
