@@ -114,17 +114,15 @@ export function isFederationCeremonyPath(pathname: string): boolean {
  * the route over a plain network connection without minting a session against a
  * daemon it is not the operator of.
  *
- * Written extensibly (a small frozen set) because rotate-root Slice 3b will add
- * `/v1/federation/rotate/reissue-node-cert` to THIS class later, but that route
- * needs its own proof-of-possession auth model and is deliberately NOT added now.
+ * Today this class holds exactly one path, so it is a plain equality check
+ * (matching the sibling `isFederationCeremonyPath` convention). Rotate-root
+ * Slice 3b will add `/v1/federation/rotate/reissue-node-cert` to THIS class
+ * later — but that route needs its own proof-of-possession auth model and is
+ * deliberately NOT added now; when it lands, the equality becomes a `||` (or a
+ * frozen set) over the two members.
  */
-const FEDERATION_NODE_CERT_AUTH_PATHS: ReadonlySet<string> = new Set([
-  "/v1/federation/sync/peer",
-]);
-
-/** True for a path in the pre-session node-cert-authenticated auth class. */
 export function isFederationNodeCertAuthPath(pathname: string): boolean {
-  return FEDERATION_NODE_CERT_AUTH_PATHS.has(pathname);
+  return pathname === "/v1/federation/sync/peer";
 }
 
 // ── Fortress materials + ceremony ─────────────────────────────────────────

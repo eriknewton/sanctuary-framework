@@ -335,6 +335,57 @@ describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", () 
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
+  it("returns an over-ceiling 403 byte-identical (status + headers incl. cache-control: no-store + body) to a normal verify-failure 403", async () => {
+    // Regression guard for the P1 review fix: the concurrent-verify over-ceiling
+    // rejection MUST go through denyForbidden() so it carries Cache-Control:
+    // no-store like every other 403 on this route. A hand-rolled writeHead that
+    // omitted the header was wire-distinguishable -> a membership/load oracle.
+
+    // (a) A normal verify failure (foreign master) — the reference 403.
+    const foreign = makeMultiNodeFortress(["intruder"]);
+    const forged = signSyncEnvelope({
+      fortressId: foreign.fortressId,
+      senderNodeId: "intruder",
+      recipientNodeId: "linux-1",
+      syncHighWater: 1,
+      events: [makeEvent("intruder", 1, null)],
+      senderNodeCert: foreign.nodes["intruder"]!.nodeCert,
+      issuingPrincipalCert: foreign.principalCert,
+      nodePrivateKey: Uint8Array.from(foreign.nodes["intruder"]!.nodePrivateKey),
+    });
+    const verifyFailRes = await postPeerNoAuth(linux1.baseUrl, forged);
+    const verifyFailBody = await verifyFailRes.text();
+
+    // (b) Drive the in-flight counter to the ceiling so the very next peer-sync
+    // request takes the over-ceiling branch deterministically (no concurrency
+    // race). The branch returns synchronously before any envelope is parsed, so
+    // the envelope can be anything.
+    const internals = linux1.dashboard as unknown as { inFlightPeerVerify: number };
+    const saved = internals.inFlightPeerVerify;
+    internals.inFlightPeerVerify = 16; // MAX_CONCURRENT_PEER_VERIFY
+    let overCeilingRes: Response;
+    let overCeilingBody: string;
+    try {
+      overCeilingRes = await postPeerNoAuth(linux1.baseUrl, { any: "body" });
+      overCeilingBody = await overCeilingRes.text();
+    } finally {
+      internals.inFlightPeerVerify = saved;
+    }
+
+    // Status, body, and the security-relevant headers must all match exactly.
+    expect(overCeilingRes.status).toBe(verifyFailRes.status);
+    expect(overCeilingRes.status).toBe(403);
+    expect(overCeilingBody).toBe(verifyFailBody);
+    expect(overCeilingBody).toBe('{"error":"forbidden"}');
+    expect(overCeilingRes.headers.get("cache-control")).toBe("no-store");
+    expect(overCeilingRes.headers.get("cache-control")).toBe(
+      verifyFailRes.headers.get("cache-control"),
+    );
+    expect(overCeilingRes.headers.get("content-type")).toBe(
+      verifyFailRes.headers.get("content-type"),
+    );
+  });
+
   // ── Merge-bar 3: no membership oracle ───────────────────────────────
   it("returns an indistinguishable response for disabled, unprovisioned, and bad-envelope", async () => {
     // (a) federation disabled (provisioned-but-off).

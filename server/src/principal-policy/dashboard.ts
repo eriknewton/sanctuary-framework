@@ -63,6 +63,7 @@ import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
+import { denyForbidden } from "../v1/http.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
@@ -2809,10 +2810,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // SAME generic 403 a verify failure returns (no distinguishable error → no
       // membership/enabled-state oracle). The counter is released in a finally
       // after the handler resolves.
+      //
+      // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
+      // ceiling bound CPU spent on crypto verification, but do NOT bound a
+      // slow-loris socket-exhaustion attack: there is no listener read/idle
+      // timeout and no max-connection bound. `v1/http.ts` readJsonBody has no
+      // read timeout, and the server uses Node's default `requestTimeout`. The
+      // listener read/idle timeout + max-connection bound are deferred because
+      // they touch shared server-listener config (not just this route).
       if (limitClass === "federation_peer") {
         if (this.inFlightPeerVerify >= MAX_CONCURRENT_PEER_VERIFY) {
-          res.writeHead(403, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "forbidden" }));
+          // Byte-identical to every other 403 on this route (incl.
+          // Cache-Control: no-store) so the over-ceiling rejection is not a
+          // wire-distinguishable oracle.
+          denyForbidden(res);
           return;
         }
         this.inFlightPeerVerify++;

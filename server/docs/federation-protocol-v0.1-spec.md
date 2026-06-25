@@ -253,6 +253,8 @@ Two libp2p surfaces:
 > **Confidentiality is NOT provided by this route.** The signed envelope gives **integrity and authenticity, not confidentiality**. The default listener is plain HTTP, so the federation events and the node roster cross the wire **in cleartext**. The route does not terminate TLS. A pre-session `/sync/peer` deployment therefore **requires a confidential composed transport**: Tailscale, WireGuard, or a TLS-terminating reverse proxy in front of the listener. This is the 06-24 federation decision: the control plane (trust roots, custody, rotation, revocation, the signed log) is ours; the confidential transport is composed by the operator and is out of scope for this route.
 >
 > A dedicated rate-limit bucket fronts this route, with no loopback exemption (a tunneled peer can present as loopback), IPv6 /64 aggregation, and a global concurrent crypto-verify ceiling. Every rejection (federation off or unprovisioned, malformed or oversized body, envelope verification failure) collapses to a single generic `403` on the wire so a probing peer learns nothing about membership or enabled-state; the precise reason is recorded only in the audit log.
+>
+> **Known follow-up (deferred, Federation P1).** The rate-limit bucket and the concurrent-verify ceiling bound CPU spent on crypto verification, but they do NOT bound a slow-loris socket-exhaustion attack: there is currently no listener read/idle timeout and no max-connection bound (the body reader has no read timeout, and the server uses Node's default request timeout). Adding a listener read/idle timeout plus a max-connection bound is a known follow-up; it is deferred here because it touches shared server-listener configuration rather than this route alone.
 
 ### 4.2 Event envelope
 
