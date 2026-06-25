@@ -70,6 +70,8 @@ import {
   FEDERATION_TRUST_ROOT_NAMESPACE,
   FEDERATION_TRUST_ROOT_KEY,
   FEDERATION_TRUST_ROOT_HKDF_INFO,
+  FEDERATION_ISSUANCE_SUITE_HYBRID,
+  provisionOrLoadFederationTrustRoot,
 } from "../../src/mesh/federation-trust-root-store.js";
 import {
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
@@ -579,6 +581,49 @@ describe("master rotation — fail-closed coverage", () => {
       derivePurposeKey(est.masterKey, FEDERATION_TRUST_ROOT_HKDF_INFO)
     );
     expect(JSON.parse(bytesToString(plain))).toEqual(payload);
+  });
+
+  it("PQC Slice 3 merge-bar 6: a HYBRID federation trust root (ML-DSA secret in the same blob) survives custody rotation (re-wraps whole, both keys intact, no new label)", async () => {
+    // The hybrid ML-DSA-65 secret rides INSIDE the _federation/trust-root-v1 blob
+    // (no new HKDF label, no new store). The existing _federation recipe encrypts
+    // the NAMESPACE blob, not per-field, so a custody rotation re-wraps the whole
+    // record including the 4032-byte ML-DSA secret. This proves the secret loads
+    // back intact under the NEW master after a real rotation (no orphan/lockout).
+    const fortress = await buildFortress();
+    const minted = await provisionOrLoadFederationTrustRoot({
+      storage: fortress.storage,
+      masterKey: fortress.master,
+      mint: true,
+      nodeId: "home-mac",
+      issuanceSuite: FEDERATION_ISSUANCE_SUITE_HYBRID,
+    });
+    expect(minted?.record.hybrid).toBeDefined();
+    const beforeSecret = [
+      ...minted!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key,
+    ];
+
+    await rotateMaster(rotateOpts(fortress));
+
+    // Re-open under the rotated custody master and LOAD the record through the
+    // real primitive (validateRecord re-derives the ML-DSA public from the secret
+    // and re-runs the cert-chain coherence checks, so a stranded/garbled secret
+    // would throw here).
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const reloaded = await provisionOrLoadFederationTrustRoot({
+      storage: fortress.storage,
+      masterKey: est.masterKey,
+    });
+    expect(reloaded?.source).toBe("persisted");
+    expect(reloaded!.record.hybrid).toBeDefined();
+    expect([
+      ...reloaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key,
+    ]).toEqual(beforeSecret);
+    expect(
+      reloaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key.length,
+    ).toBe(4032);
   });
 
   it("rotates the federation JOINER trust-root record (_federation/joiner-trust-root-v1, anti-strand) — re-wraps under the new master, no orphan/lockout", async () => {

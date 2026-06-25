@@ -712,3 +712,113 @@ describe("rotate-root: provision -> rotate-root via the CLI dispatcher", () => {
     masterKey.fill(0);
   });
 });
+
+describe("rotate-root: refuses on a HYBRID root (PQC Slice 3, fail-closed; no silent downgrade)", () => {
+  /**
+   * Seed an issuer fortress provisioned with the HYBRID suite via the REAL
+   * provision CLI (--pqc-hybrid), so the at-rest record carries the
+   * Ed25519+ML-DSA-65 `hybrid` block. Returns the unlocked custody master key.
+   */
+  async function seedHybridIssuer(nodeId = "home-mac"): Promise<Uint8Array> {
+    const seeded = await seedCustodyAndOperator({ storage, passphrase: PASSPHRASE });
+    const masterKey = Uint8Array.from(seeded.masterKey);
+    seeded.masterKey.fill(0);
+
+    const provErr = capture();
+    const provCode = await runFederationProvision({
+      argv: ["--node-id", nodeId, "--pqc-hybrid", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: provErr.stream,
+    });
+    expect(provCode, `provision stderr: ${provErr.get()}`).toBe(0);
+    const live = await loadLive(masterKey);
+    expect(live.hybrid, "expected a hybrid issuer record").toBeDefined();
+    return masterKey;
+  }
+
+  it("--renew REFUSES (exit 3), names the hybrid limitation, leaves the live root UNCHANGED + no journal/staged record", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await storage.read(FEDERATION_TRUST_ROOT_NAMESPACE, "trust-root-v1");
+
+    const err = capture();
+    const code = await runFederationRotateRoot({
+      argv: ["--renew", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(3);
+    expect(err.get()).toMatch(/hybrid/i);
+    expect(err.get()).toMatch(/ML-DSA|not yet supported|refused/i);
+
+    // The hybrid live root is byte-for-byte unchanged (no downgrade).
+    const after = await storage.read(FEDERATION_TRUST_ROOT_NAMESPACE, "trust-root-v1");
+    expect(after).toEqual(before);
+    // The record still loads AS HYBRID.
+    const liveAfter = await loadLive(masterKey);
+    expect(liveAfter.hybrid).toBeDefined();
+    // No rotation artifacts left behind.
+    expect(await federationRotateRootInProgress(storage)).toBe(false);
+    expect(
+      await storage.exists(FEDERATION_TRUST_ROOT_NAMESPACE, FEDERATION_ROTATE_ROOT_STAGED_KEY),
+    ).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("--compromised REFUSES (exit 3) and does NOT downgrade the hybrid root", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await storage.read(FEDERATION_TRUST_ROOT_NAMESPACE, "trust-root-v1");
+
+    const err = capture();
+    const code = await runFederationRotateRoot({
+      argv: ["--compromised", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(3);
+    expect(err.get()).toMatch(/hybrid/i);
+
+    const after = await storage.read(FEDERATION_TRUST_ROOT_NAMESPACE, "trust-root-v1");
+    expect(after).toEqual(before);
+    const liveAfter = await loadLive(masterKey);
+    expect(liveAfter.hybrid).toBeDefined();
+    expect(await federationRotateRootInProgress(storage)).toBe(false);
+    expect(
+      await storage.exists(FEDERATION_TRUST_ROOT_NAMESPACE, FEDERATION_ROTATE_ROOT_STAGED_KEY),
+    ).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("the engine refuses a hybrid root directly: rotateFederationRootRenew throws FederationRotateRootError", async () => {
+    const masterKey = await seedHybridIssuer();
+    await expect(
+      rotateFederationRootRenew({ storage, masterKey }),
+    ).rejects.toThrow(FederationRotateRootError);
+    // Still hybrid (no mutation on the refusal path).
+    const live = await loadLive(masterKey);
+    expect(live.hybrid).toBeDefined();
+    masterKey.fill(0);
+  });
+
+  it("a CLASSICAL root still rotates fine (no regression from the hybrid guard)", async () => {
+    const { masterKey } = await seedIssuer();
+    const before = await loadLive(masterKey);
+    expect(before.hybrid).toBeUndefined();
+
+    const err = capture();
+    const code = await runFederationRotateRoot({
+      argv: ["--renew", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+    const after = await loadLive(masterKey);
+    expect(after.pinned_master_pubkey.public_key).not.toBe(
+      before.pinned_master_pubkey.public_key,
+    );
+    masterKey.fill(0);
+  });
+});
