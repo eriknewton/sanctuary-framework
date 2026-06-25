@@ -287,6 +287,21 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "recipient_mismatch" };
   }
 
+  // 1b. If THIS recipient is still pinning a revoked root anchor, deny before
+  //     looking at sender cert details. Hybrid compromise revocations can place
+  //     Ed25519 OR ML-DSA component public keys in the same revoked-root set; a
+  //     stale recipient pinning either old component should get the honest
+  //     root_revoked reason rather than a later cert-chain symptom.
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(input.pinnedMaster.public_key)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
+  }
+
   // 2. The sender_node_id MUST equal the id inside the presented certificate —
   //    no claiming to be one node while presenting another's cert.
   if (env.sender_node_id !== env.sender_node_cert.node_id) {
@@ -305,14 +320,8 @@ export function verifySyncEnvelope(input: {
   }
 
   // 3b. Revoked-ROOT check (RR-1; ACTIVE once rotate-root Slice 3c-1 populates the
-  //     set). The chain just proved it terminates at THIS pinned master, so the
-  //     primary master pubkey to test is the recipient's own pinned master: after
-  //     a compromise rotate the live pinned master is K2, so this never fires for
-  //     a healthy fortress; but a fortress that has NOT yet re-pinned still pins
-  //     the revoked K1, and this denies any sync against it. A throw is treated as
-  //     unevaluable -> deny. Omitting the hook skips the gate (back-compat).
-  //
-  //     ALSO reject a STRAGGLER cert whose chain root (the cert's own
+  //     set). The local pinned root was checked above before chain validation.
+  //     Here we ALSO reject a STRAGGLER cert whose chain root (the cert's own
   //     parent_chain.fortress_master_pubkey) is a revoked root, even though the
   //     chain verified against the recipient's pinned master. Normally these are
   //     the same value (the chain check above proved it), but checking the cert's
@@ -320,10 +329,7 @@ export function verifySyncEnvelope(input: {
   //     wherever it surfaces, independent of what the recipient currently pins.
   if (typeof input.isRootRevoked === "function") {
     try {
-      if (
-        input.isRootRevoked(input.pinnedMaster.public_key) ||
-        input.isRootRevoked(env.sender_node_cert.parent_chain.fortress_master_pubkey)
-      ) {
+      if (input.isRootRevoked(env.sender_node_cert.parent_chain.fortress_master_pubkey)) {
         return { ok: false, reason: "root_revoked" };
       }
     } catch {

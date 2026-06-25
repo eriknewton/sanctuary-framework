@@ -136,7 +136,7 @@ interface PersistedHybridPrivateKeyMaterial {
 }
 
 /** Persisted (base64url) form of the optional hybrid signing material. */
-interface PersistedFederationHybridMasterMaterial {
+export interface PersistedFederationHybridMasterMaterial {
   pinned_master: FortressMasterPublicKeysV2Hybrid;
   master_private_keys: PersistedHybridPrivateKeyMaterial;
   issuing_principal_cert: PrincipalCertificateV2Hybrid;
@@ -386,47 +386,59 @@ export async function mintHybridFederationMaterial(params: {
   nodeMode?: NodeMode;
   principalId?: string;
 }): Promise<FederationHybridMasterMaterial> {
-  // The hybrid master's fortress_id is generated independently by the helper; we
-  // re-bind it to the classical record's fortress_id so the hybrid and classical
-  // chains name the SAME fortress (a hybrid fortress is one identity, two suites).
-  const masterGen = generateFortressMasterV2Hybrid();
-  const pinnedMaster: FortressMasterPublicKeysV2Hybrid = {
-    ...masterGen.public,
-    fortress_id: params.fortressId,
-  };
-  const principalKeys = generateHybridCertificateKeypair({
-    owner_kind: "principal",
-    owner_id: params.principalId ?? "principal-root",
-  });
-  const nodeKeys = generateHybridCertificateKeypair({
-    owner_kind: "node",
-    owner_id: params.nodeId,
-  });
-  const issuingPrincipalCert = await issuePrincipalCertificateV2Hybrid({
-    principal_id: params.principalId ?? "principal-root",
-    principal_public_keys: principalKeys.public_keys,
-    role: "root",
-    master_public_keys: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-  });
-  const localNodeCert = await issueNodeIdentityCertificateV2Hybrid({
-    node_id: params.nodeId,
-    node_public_keys: nodeKeys.public_keys,
-    node_mode: params.nodeMode ?? "local",
-    capabilities: CAP_STANDARD_FORTRESS_NODE,
-    principal_certificate: issuingPrincipalCert,
-    principal_private_keys: principalKeys.private_keys,
-    master_public_keys: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-  });
-  return {
-    pinned_master: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-    issuing_principal_cert: issuingPrincipalCert,
-    issuing_principal_private_keys: principalKeys.private_keys,
-    local_node_cert: localNodeCert,
-    local_node_private_keys: nodeKeys.private_keys,
-  };
+  let masterGen: ReturnType<typeof generateFortressMasterV2Hybrid> | undefined;
+  let principalKeys:
+    | ReturnType<typeof generateHybridCertificateKeypair>
+    | undefined;
+  let nodeKeys: ReturnType<typeof generateHybridCertificateKeypair> | undefined;
+  try {
+    // The hybrid master's fortress_id is generated independently by the helper; we
+    // re-bind it to the classical record's fortress_id so the hybrid and classical
+    // chains name the SAME fortress (a hybrid fortress is one identity, two suites).
+    masterGen = generateFortressMasterV2Hybrid();
+    const pinnedMaster: FortressMasterPublicKeysV2Hybrid = {
+      ...masterGen.public,
+      fortress_id: params.fortressId,
+    };
+    principalKeys = generateHybridCertificateKeypair({
+      owner_kind: "principal",
+      owner_id: params.principalId ?? "principal-root",
+    });
+    nodeKeys = generateHybridCertificateKeypair({
+      owner_kind: "node",
+      owner_id: params.nodeId,
+    });
+    const issuingPrincipalCert = await issuePrincipalCertificateV2Hybrid({
+      principal_id: params.principalId ?? "principal-root",
+      principal_public_keys: principalKeys.public_keys,
+      role: "root",
+      master_public_keys: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+    });
+    const localNodeCert = await issueNodeIdentityCertificateV2Hybrid({
+      node_id: params.nodeId,
+      node_public_keys: nodeKeys.public_keys,
+      node_mode: params.nodeMode ?? "local",
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      principal_certificate: issuingPrincipalCert,
+      principal_private_keys: principalKeys.private_keys,
+      master_public_keys: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+    });
+    return {
+      pinned_master: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+      issuing_principal_cert: issuingPrincipalCert,
+      issuing_principal_private_keys: principalKeys.private_keys,
+      local_node_cert: localNodeCert,
+      local_node_private_keys: nodeKeys.private_keys,
+    };
+  } catch (err) {
+    if (masterGen) zeroHybridPrivateKeyMaterial(masterGen.private_keys);
+    if (principalKeys) zeroHybridPrivateKeyMaterial(principalKeys.private_keys);
+    if (nodeKeys) zeroHybridPrivateKeyMaterial(nodeKeys.private_keys);
+    throw err;
+  }
 }
 
 /**
@@ -560,7 +572,7 @@ function encodeHybridPrivateKeys(
   };
 }
 
-function encodeHybridMaterial(
+export function encodeHybridMaterial(
   hybrid: FederationHybridMasterMaterial,
 ): PersistedFederationHybridMasterMaterial {
   return {
@@ -642,55 +654,83 @@ function decodeHybridPrivateKeys(
   if (typeof ed.key_ref !== "string" || typeof ml.key_ref !== "string") {
     throw new FederationTrustRootStoreError(`${where} is missing a key_ref`);
   }
-  return {
-    ed25519: {
-      key_ref: ed.key_ref,
-      private_key: decodeKeyExact(
-        readString(ed, "private_key"),
-        ED25519_PUBLIC_KEY_BYTES,
-        `${where}.ed25519.private_key`,
-      ),
-    },
-    ml_dsa_65: {
-      key_ref: ml.key_ref,
-      secret_key: decodeKeyExact(
-        readString(ml, "secret_key"),
-        ML_DSA_65_SECRET_KEY_BYTES,
-        `${where}.ml_dsa_65.secret_key`,
-      ),
-    },
-  };
+  let ed25519PrivateKey: Uint8Array | undefined;
+  let mlDsa65SecretKey: Uint8Array | undefined;
+  try {
+    ed25519PrivateKey = decodeKeyExact(
+      readString(ed, "private_key"),
+      ED25519_PUBLIC_KEY_BYTES,
+      `${where}.ed25519.private_key`,
+    );
+    mlDsa65SecretKey = decodeKeyExact(
+      readString(ml, "secret_key"),
+      ML_DSA_65_SECRET_KEY_BYTES,
+      `${where}.ml_dsa_65.secret_key`,
+    );
+    return {
+      ed25519: {
+        key_ref: ed.key_ref,
+        private_key: ed25519PrivateKey,
+      },
+      ml_dsa_65: {
+        key_ref: ml.key_ref,
+        secret_key: mlDsa65SecretKey,
+      },
+    };
+  } catch (err) {
+    ed25519PrivateKey?.fill(0);
+    mlDsa65SecretKey?.fill(0);
+    throw err;
+  }
 }
 
-function decodeHybridMaterial(
+export function decodeHybridMaterial(
   value: Record<string, unknown>,
 ): FederationHybridMasterMaterial {
-  return {
-    pinned_master: readObject(
+  let masterPrivateKeys: HybridPrivateKeyMaterial | undefined;
+  let issuingPrincipalPrivateKeys: HybridPrivateKeyMaterial | undefined;
+  let localNodePrivateKeys: HybridPrivateKeyMaterial | undefined;
+  try {
+    const pinnedMaster = readObject(
       value,
       "pinned_master",
-    ) as unknown as FortressMasterPublicKeysV2Hybrid,
-    master_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as FortressMasterPublicKeysV2Hybrid;
+    masterPrivateKeys = decodeHybridPrivateKeys(
       value.master_private_keys,
       "hybrid.master_private_keys",
-    ),
-    issuing_principal_cert: readObject(
+    );
+    const issuingPrincipalCert = readObject(
       value,
       "issuing_principal_cert",
-    ) as unknown as PrincipalCertificateV2Hybrid,
-    issuing_principal_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as PrincipalCertificateV2Hybrid;
+    issuingPrincipalPrivateKeys = decodeHybridPrivateKeys(
       value.issuing_principal_private_keys,
       "hybrid.issuing_principal_private_keys",
-    ),
-    local_node_cert: readObject(
+    );
+    const localNodeCert = readObject(
       value,
       "local_node_cert",
-    ) as unknown as NodeIdentityCertificateV2Hybrid,
-    local_node_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as NodeIdentityCertificateV2Hybrid;
+    localNodePrivateKeys = decodeHybridPrivateKeys(
       value.local_node_private_keys,
       "hybrid.local_node_private_keys",
-    ),
-  };
+    );
+    return {
+      pinned_master: pinnedMaster,
+      master_private_keys: masterPrivateKeys,
+      issuing_principal_cert: issuingPrincipalCert,
+      issuing_principal_private_keys: issuingPrincipalPrivateKeys,
+      local_node_cert: localNodeCert,
+      local_node_private_keys: localNodePrivateKeys,
+    };
+  } catch (err) {
+    if (masterPrivateKeys) zeroHybridPrivateKeyMaterial(masterPrivateKeys);
+    if (issuingPrincipalPrivateKeys) {
+      zeroHybridPrivateKeyMaterial(issuingPrincipalPrivateKeys);
+    }
+    if (localNodePrivateKeys) zeroHybridPrivateKeyMaterial(localNodePrivateKeys);
+    throw err;
+  }
 }
 
 function validateRecord(record: FederationTrustRootRecord): void {
@@ -788,6 +828,51 @@ function validateRecord(record: FederationTrustRootRecord): void {
       throw new FederationTrustRootStoreError(
         "rotation_cert old_master_pubkey must differ from the new (current) master",
       );
+    }
+    // PQC Slice 3: a HYBRID rotation cert MUST carry the hybrid binding (and a
+    // classical one MUST NOT), and the binding's new hybrid master MUST be this
+    // record's own hybrid pinned master. A hybrid record whose rotation cert
+    // lacks the hybrid half would let a verifier adopt via the Ed25519 link only
+    // (a silent PQ-downgrade) -- reject it fail-closed.
+    if (record.hybrid !== undefined && cert.hybrid_rotation === undefined) {
+      throw new FederationTrustRootStoreError(
+        "hybrid record's rotation_cert is missing its hybrid_rotation binding (a hybrid rotation must carry the post-quantum old->new link; refusing a classical-only rotation cert on a hybrid root)",
+      );
+    }
+    if (record.hybrid === undefined && cert.hybrid_rotation !== undefined) {
+      throw new FederationTrustRootStoreError(
+        "classical record's rotation_cert carries a hybrid_rotation binding but the record has no hybrid block",
+      );
+    }
+    if (cert.hybrid_rotation !== undefined && record.hybrid !== undefined) {
+      const binding = cert.hybrid_rotation;
+      if (binding.new_hybrid_master.fortress_id !== record.fortress_id) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation new_hybrid_master fortress_id mismatch",
+        );
+      }
+      const recPub = record.hybrid.pinned_master.public_keys;
+      const newPub = binding.new_hybrid_master.public_keys;
+      if (
+        newPub.ed25519.public_key !== recPub.ed25519.public_key ||
+        newPub.ml_dsa_65.public_key !== recPub.ml_dsa_65.public_key ||
+        newPub.ed25519.key_ref !== recPub.ed25519.key_ref ||
+        newPub.ml_dsa_65.key_ref !== recPub.ml_dsa_65.key_ref
+      ) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation new_hybrid_master does not match the record's current hybrid pinned master",
+        );
+      }
+      if (
+        binding.old_hybrid_master.public_keys.ed25519.public_key ===
+          recPub.ed25519.public_key ||
+        binding.old_hybrid_master.public_keys.ml_dsa_65.public_key ===
+          recPub.ml_dsa_65.public_key
+      ) {
+        throw new FederationTrustRootStoreError(
+          "rotation_cert hybrid_rotation old_hybrid_master must differ from the new (current) hybrid master",
+        );
+      }
     }
   }
   // PQC Slice 3: structural integrity of the optional hybrid block. The async
@@ -1020,9 +1105,13 @@ export function zeroHybridMaterialSecrets(
     hybrid.issuing_principal_private_keys,
     hybrid.local_node_private_keys,
   ]) {
-    keys.ed25519.private_key.fill(0);
-    keys.ml_dsa_65.secret_key.fill(0);
+    zeroHybridPrivateKeyMaterial(keys);
   }
+}
+
+function zeroHybridPrivateKeyMaterial(keys: HybridPrivateKeyMaterial): void {
+  keys.ed25519.private_key.fill(0);
+  keys.ml_dsa_65.secret_key.fill(0);
 }
 
 async function auditTrustRoot(

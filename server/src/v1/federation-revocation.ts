@@ -21,8 +21,21 @@
  */
 
 import { ed25519 } from "@noble/curves/ed25519";
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
+import {
+  cryptoSuiteRegistry,
+  createHybridSuitePublicKeys,
+  ED25519_PUBLIC_KEY_BYTES,
+  HYBRID_SIGNATURE_SUITE_ID,
+  ML_DSA_65_PUBLIC_KEY_BYTES,
+  ML_DSA_65_SECRET_KEY_BYTES,
+  type SignatureBundle,
+  type SuiteSigner,
+} from "../core/crypto-suite-registry.js";
+import type { HybridPrivateKeyMaterial } from "../mesh/trust-root-hybrid.js";
+import type { HybridCertificatePublicKeys } from "../mesh/types.js";
 import {
   issueNodeIdentityCertificate,
   verifyPrincipalCertificate,
@@ -112,6 +125,38 @@ export interface FederationRootRevocationPayload {
   revocation_serial: number;
   operator_principal_id: string;
   operator_signature: string;
+  /**
+   * PQC Slice 3 (hybrid rotate-root --compromised): a HYBRID signature bundle
+   * (Ed25519 + ML-DSA-65, both-must-pass) over the same signed body, produced by
+   * the NEW K2 hybrid PRINCIPAL's two private keys. Present ONLY on a hybrid
+   * compromise revocation. This makes the revocation's authenticity itself
+   * post-quantum protected: a future quantum adversary cannot forge the
+   * revocation by breaking only the Ed25519 `operator_signature`. Absent on a
+   * classical revocation (byte-compatible).
+   */
+  operator_signature_bundle?: SignatureBundle;
+  /**
+   * PQC Slice 3 (hybrid rotate-root --compromised): the BOTH old hybrid master
+   * component public keys (Ed25519 + ML-DSA-65) being revoked. Present ONLY when
+   * the compromised fortress was hybrid; absent (undefined) on a classical
+   * revocation so a classical payload stays byte-for-byte unchanged. Binding both
+   * old components means any chain pinning EITHER the old Ed25519 OR the old
+   * ML-DSA component is rejectable from a single revocation event. This field is
+   * part of the signed body (the operator signature covers it), so it cannot be
+   * stripped without breaking the signature.
+   */
+  revoked_hybrid?: FederationRootRevocationHybridBinding;
+}
+
+/**
+ * The both-components binding of the revoked old HYBRID master (rotate-root
+ * --compromised on a hybrid fortress). Both base64url public keys + their key
+ * refs are recorded so the revoked-set enforcement can reject a chain pinning
+ * EITHER old component. PUBLIC.
+ */
+export interface FederationRootRevocationHybridBinding {
+  ed25519: { key_ref: string; public_key: string };
+  ml_dsa_65: { key_ref: string; public_key: string };
 }
 
 /**
@@ -671,6 +716,7 @@ export type FederationRootRevocationRejectionReason =
   | "principal_mismatch"
   | "principal_chain_invalid"
   | "operator_signature_invalid"
+  | "operator_signature_bundle_invalid"
   | "revocation_serial_replay"
   | "unsupported_event_version";
 
@@ -725,6 +771,158 @@ export function signFederationRootRevocationPayload(params: {
   };
 }
 
+/** Surface id for the hybrid root-revocation signature bundle. */
+export const ROOT_REVOCATION_HYBRID_SURFACE_ID =
+  "sanctuary.v1.federation-root-revocation.hybrid" as const;
+
+/**
+ * Sign a HYBRID root-revocation payload (rotate-root --compromised on a hybrid
+ * fortress). Produces BOTH:
+ *   - the classical `operator_signature` (Ed25519) over the canonical message,
+ *     signed by the NEW K2 hybrid principal's Ed25519 private key, so a
+ *     classical verifier path stays intact; and
+ *   - the `operator_signature_bundle` (Ed25519 + ML-DSA-65, both-must-pass) over
+ *     the same body via the new K2 hybrid principal's two private keys, so the
+ *     revocation's authenticity is post-quantum protected;
+ *   - the `revoked_hybrid` binding identifying BOTH old hybrid master components.
+ *
+ * Signed under K2 (the post-rotation hybrid principal), NEVER under K1: a thief
+ * holding the OLD root cannot forge a revocation the fortress would fold. The
+ * caller MUST zero `newHybridPrincipalPrivateKeys` after return (constraint 6).
+ */
+export async function signFederationRootRevocationPayloadHybrid(params: {
+  fortressId: string;
+  /** The old CLASSICAL Ed25519 master pubkey (base64url), still recorded. */
+  revokedMasterPubkey: string;
+  /** Both old HYBRID master component public keys being revoked. */
+  revokedHybrid: FederationRootRevocationHybridBinding;
+  effectiveAt: string;
+  revocationSerial: number;
+  operatorPrincipalId: string;
+  /**
+   * The NEW K2 CLASSICAL principal private key (Ed25519). Signs the classical
+   * `operator_signature` field so the existing classical verify path
+   * ({@link verifyFederationRootRevocationEvent}) accepts it against the
+   * fortress's classical issuing-principal cert. The caller MUST zero this.
+   */
+  newClassicalPrincipalPrivateKey: Uint8Array;
+  /** The NEW K2 hybrid principal's two private keys (Ed25519 + ML-DSA-65). */
+  newHybridPrincipalPrivateKeys: HybridPrivateKeyMaterial;
+}): Promise<FederationRootRevocationPayload> {
+  if (
+    params.newHybridPrincipalPrivateKeys.ed25519.private_key.length !==
+    ED25519_PUBLIC_KEY_BYTES
+  ) {
+    throw new Error("hybrid revocation Ed25519 private key must be 32 bytes");
+  }
+  if (
+    params.newHybridPrincipalPrivateKeys.ml_dsa_65.secret_key.length !==
+    ML_DSA_65_SECRET_KEY_BYTES
+  ) {
+    throw new Error("hybrid revocation ML-DSA-65 secret key must be 4032 bytes");
+  }
+  const body = {
+    event_version: FEDERATION_ROOT_REVOCATION_EVENT_VERSION,
+    fortress_id: params.fortressId,
+    revoked_master_pubkey: params.revokedMasterPubkey,
+    effective_at: params.effectiveAt,
+    revocation_serial: params.revocationSerial,
+    operator_principal_id: params.operatorPrincipalId,
+    revoked_hybrid: params.revokedHybrid,
+  };
+  const message = buildFederationRootRevocationMessage(body);
+  // Classical Ed25519 leg: the `operator_signature` field is the Ed25519
+  // signature over the canonical revocation MESSAGE (so the existing classical
+  // verify path, verifyFederationRootRevocationEvent, accepts it against the
+  // fortress's CLASSICAL issuing-principal cert), signed by the NEW K2 classical
+  // principal Ed25519 key.
+  const edSignature = ed25519.sign(
+    message,
+    params.newClassicalPrincipalPrivateKey,
+  );
+  // Hybrid bundle leg (both-must-pass): signs the descriptor-bound preimage the
+  // suite constructs (each component signs the bytes the registry hands it).
+  const signer: SuiteSigner = {
+    ed25519: {
+      key_ref: params.newHybridPrincipalPrivateKeys.ed25519.key_ref,
+      sign: (bytes) =>
+        ed25519.sign(bytes, params.newHybridPrincipalPrivateKeys.ed25519.private_key),
+    },
+    ml_dsa_65: {
+      key_ref: params.newHybridPrincipalPrivateKeys.ml_dsa_65.key_ref,
+      sign: (bytes) =>
+        ml_dsa65.sign(bytes, params.newHybridPrincipalPrivateKeys.ml_dsa_65.secret_key),
+    },
+  };
+  const bundle = await cryptoSuiteRegistry.signSurface(
+    {
+      surface_id: ROOT_REVOCATION_HYBRID_SURFACE_ID,
+      surface_version: FEDERATION_ROOT_REVOCATION_EVENT_VERSION,
+      signature_suite: HYBRID_SIGNATURE_SUITE_ID,
+      // The bundle's signed preimage wraps the raw revocation message as an
+      // opaque base64url payload; both bundle components cover these exact bytes.
+      payload: toBase64url(message),
+    },
+    signer,
+  );
+  return {
+    ...body,
+    operator_signature: toBase64url(edSignature),
+    operator_signature_bundle: bundle,
+  };
+}
+
+/**
+ * Verify the HYBRID leg of a hybrid root-revocation payload: BOTH the Ed25519
+ * and ML-DSA-65 components of `operator_signature_bundle` must verify under the
+ * NEW K2 hybrid principal public keys (both-must-pass). Returns true only when
+ * both pass; false on any defect. The classical `operator_signature` Ed25519
+ * leg is verified separately by {@link verifyFederationRootRevocationEvent}.
+ */
+export async function verifyFederationRootRevocationHybridBundle(
+  payload: FederationRootRevocationPayload,
+  newHybridPrincipalPublicKeys: HybridCertificatePublicKeys,
+): Promise<boolean> {
+  const bundle = payload.operator_signature_bundle;
+  if (!bundle) return false;
+  if (!payload.revoked_hybrid) return false;
+  const signedBody = {
+    event_version: payload.event_version,
+    fortress_id: payload.fortress_id,
+    revoked_master_pubkey: payload.revoked_master_pubkey,
+    effective_at: payload.effective_at,
+    revocation_serial: payload.revocation_serial,
+    operator_principal_id: payload.operator_principal_id,
+    revoked_hybrid: payload.revoked_hybrid,
+  };
+  const message = buildFederationRootRevocationMessage(signedBody);
+  let edPub: Uint8Array;
+  let mlPub: Uint8Array;
+  try {
+    edPub = fromBase64url(newHybridPrincipalPublicKeys.ed25519.public_key);
+    mlPub = fromBase64url(newHybridPrincipalPublicKeys.ml_dsa_65.public_key);
+  } catch {
+    return false;
+  }
+  if (edPub.length !== ED25519_PUBLIC_KEY_BYTES) return false;
+  if (mlPub.length !== ML_DSA_65_PUBLIC_KEY_BYTES) return false;
+  return cryptoSuiteRegistry.verifySurface(
+    {
+      surface_id: ROOT_REVOCATION_HYBRID_SURFACE_ID,
+      surface_version: FEDERATION_ROOT_REVOCATION_EVENT_VERSION,
+      signature_suite: HYBRID_SIGNATURE_SUITE_ID,
+      payload: toBase64url(message),
+    },
+    bundle,
+    createHybridSuitePublicKeys({
+      ed25519KeyRef: newHybridPrincipalPublicKeys.ed25519.key_ref,
+      ed25519PublicKey: edPub,
+      mlDsa65KeyRef: newHybridPrincipalPublicKeys.ml_dsa_65.key_ref,
+      mlDsa65PublicKey: mlPub,
+    }),
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // SCOPE (Slice 3c-1): the verify + fold functions below are the VERIFIER
 // SUBSTRATE and the test-proven downgrade-resistance invariants (sign-under-K2 /
@@ -745,13 +943,14 @@ export function signFederationRootRevocationPayload(params: {
  * fortress binding + principal binding + serial monotonicity + principal chain
  * + operator signature. A `false`/throw at the call site fails closed.
  */
-export function verifyFederationRootRevocationEvent(input: {
+export async function verifyFederationRootRevocationEvent(input: {
   event: FederationRevocationLogEvent;
   fortressId: string;
   pinnedMaster: FortressMasterPublicKey;
   operatorPrincipalCert: PrincipalCertificate;
+  operatorHybridPrincipalPublicKeys?: HybridCertificatePublicKeys;
   highestRevocationSerial: number;
-}): FederationRootRevocationVerification {
+}): Promise<FederationRootRevocationVerification> {
   const { event } = input;
   if (event.kind !== FEDERATION_ROOT_REVOCATION_EVENT_KIND) {
     return { ok: false, reason: "wrong_event_kind" };
@@ -800,6 +999,12 @@ export function verifyFederationRootRevocationEvent(input: {
     effective_at: payload.effective_at,
     revocation_serial: payload.revocation_serial,
     operator_principal_id: payload.operator_principal_id,
+    // Hybrid revocations sign over the revoked_hybrid binding too; include it
+    // (and only it) when present so the preimage matches what was signed. A
+    // classical payload omits it, leaving the body byte-for-byte unchanged.
+    ...(payload.revoked_hybrid !== undefined
+      ? { revoked_hybrid: payload.revoked_hybrid }
+      : {}),
   };
   const ok = verify(
     buildFederationRootRevocationMessage(signedBody),
@@ -807,6 +1012,18 @@ export function verifyFederationRootRevocationEvent(input: {
     fromBase64url(input.operatorPrincipalCert.principal_pubkey),
   );
   if (!ok) return { ok: false, reason: "operator_signature_invalid" };
+  if (payload.revoked_hybrid !== undefined) {
+    if (input.operatorHybridPrincipalPublicKeys === undefined) {
+      return { ok: false, reason: "operator_signature_bundle_invalid" };
+    }
+    const hybridOk = await verifyFederationRootRevocationHybridBundle(
+      payload,
+      input.operatorHybridPrincipalPublicKeys,
+    );
+    if (!hybridOk) {
+      return { ok: false, reason: "operator_signature_bundle_invalid" };
+    }
+  }
 
   return {
     ok: true,
@@ -822,22 +1039,32 @@ export function verifyFederationRootRevocationEvent(input: {
  * the security boundary. Adds the revoked root pubkey to the grow-only set and
  * lifts the serial floor.
  */
-export function foldFederationRootRevocationEvent(input: {
+export async function foldFederationRootRevocationEvent(input: {
   event: FederationRevocationLogEvent;
   projection: FederationRootRevocationProjection;
   fortressId: string;
   pinnedMaster: FortressMasterPublicKey;
   operatorPrincipalCert: PrincipalCertificate;
-}): FederationRootRevocationVerification {
-  const verification = verifyFederationRootRevocationEvent({
+  operatorHybridPrincipalPublicKeys?: HybridCertificatePublicKeys;
+}): Promise<FederationRootRevocationVerification> {
+  const verification = await verifyFederationRootRevocationEvent({
     event: input.event,
     fortressId: input.fortressId,
     pinnedMaster: input.pinnedMaster,
     operatorPrincipalCert: input.operatorPrincipalCert,
+    operatorHybridPrincipalPublicKeys: input.operatorHybridPrincipalPublicKeys,
     highestRevocationSerial: input.projection.highestRevocationSerial,
   });
   if (!verification.ok) return verification;
   input.projection.revokedRootPubkeys.add(verification.revokedMasterPubkey);
+  if (verification.payload.revoked_hybrid !== undefined) {
+    input.projection.revokedRootPubkeys.add(
+      verification.payload.revoked_hybrid.ed25519.public_key,
+    );
+    input.projection.revokedRootPubkeys.add(
+      verification.payload.revoked_hybrid.ml_dsa_65.public_key,
+    );
+  }
   input.projection.highestRevocationSerial = verification.revocationSerial;
   return verification;
 }
@@ -878,6 +1105,10 @@ export function foldAcceptedFederationRootRevocationEvent(input: {
   }
 
   input.projection.revokedRootPubkeys.add(payload.revoked_master_pubkey);
+  if (payload.revoked_hybrid !== undefined) {
+    input.projection.revokedRootPubkeys.add(payload.revoked_hybrid.ed25519.public_key);
+    input.projection.revokedRootPubkeys.add(payload.revoked_hybrid.ml_dsa_65.public_key);
+  }
   input.projection.highestRevocationSerial = payload.revocation_serial;
   return {
     ok: true,
@@ -924,6 +1155,12 @@ function parseRootRevocationPayload(
   if (typeof operatorSignature !== "string" || operatorSignature.length === 0) {
     return null;
   }
+  const revokedHybrid = parseRevokedHybridBinding(payload.revoked_hybrid);
+  if (revokedHybrid === "invalid") return null;
+  const signatureBundle = parseSignatureBundle(payload.operator_signature_bundle);
+  if (signatureBundle === "invalid") return null;
+  if (revokedHybrid !== undefined && signatureBundle === undefined) return null;
+  if (revokedHybrid === undefined && signatureBundle !== undefined) return null;
   return {
     event_version: eventVersion,
     fortress_id: fortressId,
@@ -932,6 +1169,81 @@ function parseRootRevocationPayload(
     revocation_serial: revocationSerial,
     operator_principal_id: operatorPrincipalId,
     operator_signature: operatorSignature,
+    ...(revokedHybrid !== undefined ? { revoked_hybrid: revokedHybrid } : {}),
+    ...(signatureBundle !== undefined ? { operator_signature_bundle: signatureBundle } : {}),
+  };
+}
+
+/**
+ * Parse the optional `revoked_hybrid` binding. Returns undefined when absent,
+ * "invalid" when present-but-malformed (so the whole payload is rejected; a
+ * tampered hybrid binding must never silently parse as a classical revocation),
+ * or the typed binding when well-formed.
+ */
+function parseRevokedHybridBinding(
+  value: unknown,
+): FederationRootRevocationHybridBinding | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null) return "invalid";
+  const v = value as Record<string, unknown>;
+  const ed = v.ed25519;
+  const ml = v.ml_dsa_65;
+  if (typeof ed !== "object" || ed === null) return "invalid";
+  if (typeof ml !== "object" || ml === null) return "invalid";
+  const edRec = ed as Record<string, unknown>;
+  const mlRec = ml as Record<string, unknown>;
+  if (
+    typeof edRec.key_ref !== "string" ||
+    edRec.key_ref.length === 0 ||
+    typeof edRec.public_key !== "string" ||
+    edRec.public_key.length === 0 ||
+    typeof mlRec.key_ref !== "string" ||
+    mlRec.key_ref.length === 0 ||
+    typeof mlRec.public_key !== "string" ||
+    mlRec.public_key.length === 0
+  ) {
+    return "invalid";
+  }
+  return {
+    ed25519: { key_ref: edRec.key_ref, public_key: edRec.public_key },
+    ml_dsa_65: { key_ref: mlRec.key_ref, public_key: mlRec.public_key },
+  };
+}
+
+function parseSignatureBundle(
+  value: unknown,
+): SignatureBundle | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null) return "invalid";
+  const bundle = value as Record<string, unknown>;
+  if (
+    bundle.bundle_version !== "sanctuary.signature-bundle.v1" ||
+    typeof bundle.signature_suite !== "string" ||
+    bundle.signature_suite.length === 0 ||
+    !Array.isArray(bundle.components)
+  ) {
+    return "invalid";
+  }
+  const components = bundle.components.map((component) => {
+    if (typeof component !== "object" || component === null) return "invalid";
+    const c = component as Record<string, unknown>;
+    if (
+      typeof c.alg !== "string" ||
+      c.alg.length === 0 ||
+      typeof c.key_ref !== "string" ||
+      c.key_ref.length === 0 ||
+      typeof c.sig !== "string" ||
+      c.sig.length === 0
+    ) {
+      return "invalid";
+    }
+    return { alg: c.alg, key_ref: c.key_ref, sig: c.sig };
+  });
+  if (components.some((component) => component === "invalid")) return "invalid";
+  return {
+    bundle_version: "sanctuary.signature-bundle.v1",
+    signature_suite: bundle.signature_suite,
+    components: components as SignatureBundle["components"],
   };
 }
 
