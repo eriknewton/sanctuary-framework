@@ -13,6 +13,7 @@ import {
   type PostureRouteDeps,
 } from "../../src/principal-policy/posture-routes.js";
 import type { DetectedHarness } from "../../src/principal-policy/posture.js";
+import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
 
 const FORTRESS = "fortress:test";
 
@@ -655,5 +656,69 @@ describe("posture recognition panel — impartiality contract", () => {
       `${basePresent}${POSTURE_API_PREFIX}/recognition`,
     );
     expect((await presentRes.json()).reputation_state).toBe("present");
+  });
+});
+
+describe("GET /api/posture/fleet — Fleet Console Slice 1 route", () => {
+  function fleetRosterFixture(): FleetRoster {
+    return {
+      available: true,
+      enabled: true,
+      fortress_id: FORTRESS,
+      node_id: "home-mac",
+      eviction_serial: 0,
+      nodes: [
+        {
+          node_id: "node-1",
+          label: null,
+          trust_state: "admitted",
+          trust_evaluable: true,
+          reach: "recent",
+          node_mode: "local",
+          provider_in_trust_boundary: false,
+          last_sync_received_at: "2026-06-24T11:59:00.000Z",
+          first_seen: "2026-06-24T11:00:00.000Z",
+          last_seen: "2026-06-24T11:59:00.000Z",
+        },
+      ],
+      summary: { total: 1, admitted: 1, revoked: 0, untrusted: 0 },
+    };
+  }
+
+  it("404s within the namespace when federation is not wired (no fleetRoster dep)", async () => {
+    // No `fleetRoster` supplied: the panel is ABSENT (additive), not broken.
+    const base = await serve(baseDeps(newLog(), []));
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/fleet`);
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { error: string; origin_machine: string };
+    expect(body.error).toBe("fleet_unavailable");
+    expect(body.origin_machine).toBe(FORTRESS);
+  });
+
+  it("serves the supplied roster verbatim (thin presenter, no re-derivation)", async () => {
+    const base = await serve({
+      ...baseDeps(newLog(), []),
+      fleetRoster: () => fleetRosterFixture(),
+    });
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/fleet`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as FleetRoster;
+    expect(body.available).toBe(true);
+    expect(body.nodes.map((n) => [n.node_id, n.trust_state])).toEqual([
+      ["node-1", "admitted"],
+    ]);
+    expect(body.summary).toEqual({ total: 1, admitted: 1, revoked: 0, untrusted: 0 });
+  });
+
+  it("503s when the audit log is locked (same fail-closed gate as the other panels)", async () => {
+    // The route is wrapped in runEagerReads on the audit log; a null log 503s
+    // before the roster builds, never an empty-green payload.
+    const base = await serve({
+      ...baseDeps(null, []),
+      fleetRoster: () => fleetRosterFixture(),
+    });
+    const res = await fetch(`${base}${POSTURE_API_PREFIX}/fleet`);
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe("posture_unavailable");
   });
 });

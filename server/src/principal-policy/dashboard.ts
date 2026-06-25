@@ -73,6 +73,7 @@ import {
   type PostureRouteDeps,
 } from "./posture-routes.js";
 import { renderPostureHomeHTML } from "./posture-home-html.js";
+import { buildFleetRoster } from "./fleet-roster.js";
 import {
   buildCastleWallPosture,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
@@ -1065,6 +1066,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       countBridgeCommitments: () => this.countBridgeCommitments(),
       gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+      // Fleet Console Slice 1: present the federation-backed fleet roster over
+      // the SAME live `V1FederationDeps` (and the SAME `isNodeRevoked`
+      // projection) the `/v1` federation endpoints use, so the panel's trust
+      // verdict is the federation layer's, never re-derived from a response
+      // shape. The eviction serial is fleet context only. Read-only: this builds
+      // a presentation object and drives no mutation, exposes no key material.
+      fleetRoster: () =>
+        buildFleetRoster(this.buildV1FederationDeps(), {
+          evictionSerial: this._federationState.evictionMaxSerial,
+        }),
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
