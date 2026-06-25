@@ -1099,6 +1099,13 @@ export async function createSanctuaryServer(options?: {
   });
   const unifiedInboxScheduler = new UnifiedInboxScheduler({
     bridge: unifiedInboxBridge,
+    // Feature-health observability raise path: on the operator-inbox cadence,
+    // recompute the feature-health panel from the integrity-judged audit read and
+    // raise the 3 ratified fault classes (deduped via the bridge). Additive +
+    // display-only; feeds NOTHING back into enforcement. The dashboard owns the
+    // raiser (it has the producer-key load + panel builder); a missing dashboard
+    // or locked log makes this a no-op.
+    onTick: () => dashboard?.evaluateFeatureFaults(),
   });
   unifiedInboxScheduler.start();
 

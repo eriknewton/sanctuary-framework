@@ -85,6 +85,8 @@ import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
 } from "./posture-stream.js";
+import { buildFeatureHealthPanel } from "./feature-health.js";
+import { FeatureFaultRaiser } from "./feature-fault-raise.js";
 import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
 import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
@@ -608,6 +610,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private unifiedInboxPrefsStore: UnifiedInboxPrefsStore | null = null;
   private unifiedInboxFortressId: string | null = null;
   private unifiedInboxIdentityId: string | null = null;
+  /**
+   * Feature-health fault-raise driver (observability Slice: OS-notification raise
+   * path). Built lazily when the unified-inbox bridge is wired, it recomputes the
+   * feature-health panel from the SAME integrity-judged audit read the posture
+   * surface uses and raises the 3 ratified fault classes to the inbox bridge,
+   * deduped + rate-limited. Display-only: it feeds NOTHING back into enforcement.
+   * Ticked on the unified-inbox scheduler's cadence via `evaluateFeatureFaults`.
+   */
+  private featureFaultRaiser: FeatureFaultRaiser | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -830,6 +841,68 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.unifiedInboxPrefsStore = opts.prefsStore ?? null;
     this.unifiedInboxFortressId = opts.fortressId ?? null;
     this.unifiedInboxIdentityId = opts.identityId ?? null;
+    // Wire the feature-health fault-raise driver onto the now-available inbox
+    // bridge (the notification sink). Built once; it holds the prior panel so the
+    // ON->OFF `feature_silently_off` transition can be computed across cycles.
+    this.featureFaultRaiser = opts.bridge
+      ? new FeatureFaultRaiser({
+          bridge: opts.bridge,
+          buildPanel: () => this.buildFeatureHealthPanelForRaise(),
+        })
+      : null;
+  }
+
+  /**
+   * Recompute the feature-health panel for the fault-raise driver, from the SAME
+   * integrity-judged eager audit read and the SAME producer-key load the posture
+   * `/api/posture/feature-health` route uses, so the raise can never diverge from
+   * the dashboard on what is green / fault. Includes the per-plugin rows so the
+   * `plugin_failure_surge` class can read its host-minted error-rate fault. Pure
+   * read: builds a presentation object, drives no mutation, exposes no key.
+   */
+  private async buildFeatureHealthPanelForRaise(): Promise<
+    Awaited<ReturnType<typeof buildFeatureHealthPanel>>
+  > {
+    if (this.auditLog === null) {
+      throw new Error("feature-health raise: audit log unavailable");
+    }
+    await this.ensureProducerKeyLoaded();
+    await this.ensureBrokerProducerKeyLoaded();
+    const load = this._producerKeyLoad;
+    const brokerLoad = this._brokerProducerKeyLoad;
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    const auditLog = this.auditLog;
+    return auditLog.runEagerReads(() =>
+      buildFeatureHealthPanel({
+        auditLog,
+        originMachine,
+        includePluginRows: true,
+        pinnedProducerKeyB64url:
+          load?.status === "present" ? load.keyB64url : null,
+        ...(load?.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+        brokerPinnedProducerKeyB64url:
+          brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+        ...(brokerLoad?.status === "unreadable"
+          ? { brokerProducerKeyExpectedButUnavailable: true }
+          : {}),
+      }),
+    );
+  }
+
+  /**
+   * One feature-health fault-raise evaluation cycle, ticked on the unified-inbox
+   * scheduler's cadence (`index.ts` passes this as the scheduler `onTick`). A
+   * no-op when the raiser is not wired (no inbox bridge / locked log). Never
+   * throws into the scheduler: the driver swallows a panel-build failure.
+   */
+  async evaluateFeatureFaults(): Promise<void> {
+    if (!this.featureFaultRaiser) return;
+    await this.featureFaultRaiser.evaluate();
   }
 
   /**
