@@ -83,6 +83,7 @@ import {
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
+import { provisionOrLoadOperatorCloudJoinedNode } from "./mesh/operator-cloud-joined-node-store.js";
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
 import { FederationSyncStateStore } from "./v1/federation-sync-state-store.js";
 import {
@@ -674,6 +675,45 @@ export async function startStandaloneDashboard(
     if (joinerRoot !== null) {
       // No approver: a joiner is a non-issuer and cannot run the approval gate.
       dashboard.setFederationContext(joinerRoot.context);
+    } else {
+      // Operator Cloud (Slice 3 boot-wire): the operator_cloud JOINED-NODE half.
+      // A cloud node that completed a real operator_cloud join persists a
+      // NON-ISSUER scoped-custody joined-node record; production boot loads it
+      // (never mints; a cloud node has no master to mint from) into a non-issuer
+      // operator_cloud context with NO approver. This provisions /v1/federation
+      // reads + /sync/peer (cert-chain verified) but structurally refuses
+      // issuance. Tried only when neither an issuer nor a local joiner root
+      // loaded. A malformed/tampered/cross-operator record fails closed (load
+      // returns null) and leaves federation honestly off; boot never crashes,
+      // never mints. Honest trust boundary (Option A): the provider is in this
+      // node's trust boundary until a TEE exists; the joined-node record carries
+      // that disclosure verbatim. (Also skipped while a rotate-root journal
+      // exists: fail closed until resume.)
+      const operatorCloudNode = await provisionOrLoadOperatorCloudJoinedNode({
+        storage,
+        masterKey,
+        audit: async (event) => {
+          try {
+            await auditLog.append(
+              "l2",
+              event.operation,
+              "federation",
+              event.details,
+              event.result,
+            );
+          } catch {
+            // Federation remains fail-closed; dashboard boot reports
+            // provisioned:false rather than crash or mint a replacement record.
+          }
+        },
+      });
+      if (operatorCloudNode !== null) {
+        // No approver: operator_cloud is structurally non-issuer and cannot run
+        // the approval gate. The generalized non-issuer guard inside
+        // setFederationContext re-asserts that this context carries no issuer
+        // authority.
+        dashboard.setFederationContext(operatorCloudNode.context);
+      }
     }
   }
 

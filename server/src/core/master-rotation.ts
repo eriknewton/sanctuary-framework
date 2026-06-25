@@ -367,6 +367,14 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       // strand it and rotateMaster would abort. MUST equal
       // FEDERATION_SYNC_STATE_STORE_HKDF_INFO (asserted in master-rotation.test).
       "federation-sync-state",
+      // Operator Cloud (Slice 3 boot-wire): the cloud node's at-rest joined-node
+      // record (non-issuer scoped-custody runtime state), persisted under
+      // _federation by the operator-cloud joined-node store. Same no-AAD
+      // derivePurposeKey blob, so the no-AAD candidate re-wraps it. Without this
+      // label a fortress that ever joined as an operator_cloud node would strand
+      // its joined-node record and rotateMaster would abort. MUST equal
+      // OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO (asserted in master-rotation.test).
+      "operator-cloud-joined-node",
     ],
   },
   _fortress_mode: {
