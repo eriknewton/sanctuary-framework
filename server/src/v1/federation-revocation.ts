@@ -674,17 +674,6 @@ export type FederationRootRevocationRejectionReason =
   | "revocation_serial_replay"
   | "unsupported_event_version";
 
-/** True when this event is the operator-authority root-revocation kind. */
-export function isFederationRootRevocationEvent(
-  event: FederationRevocationLogEvent,
-  fortressId: string,
-): boolean {
-  return (
-    event.origin_node_id === federationOperatorAuthorityOrigin(fortressId) &&
-    event.kind === FEDERATION_ROOT_REVOCATION_EVENT_KIND
-  );
-}
-
 export function buildFederationRootRevocationMessage(
   payload: Omit<FederationRootRevocationPayload, "operator_signature">,
 ): Uint8Array {
@@ -735,6 +724,19 @@ export function signFederationRootRevocationPayload(params: {
     operator_signature: toBase64url(signature),
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCOPE (Slice 3c-1): the verify + fold functions below are the VERIFIER
+// SUBSTRATE and the test-proven downgrade-resistance invariants (sign-under-K2 /
+// reject-under-K1, serial-monotonicity, principal-chain). They are NOT yet a
+// live production enforcement path: in 3c-1 no production code appends, syncs,
+// or folds a wire root-revocation event — enforcement runs entirely off the
+// durable revoked-root projection set + the `isRootRevoked` hook. The
+// wire-acceptance fold path (a peer/joiner adopting a remote root-revocation
+// event) is a LATER slice (3c-2 / 3d). Keep these: the downgrade-resistance
+// proof requires the sign+verify pair, and they are the design-specified Q6
+// substrate the later slice consumes.
+// ─────────────────────────────────────────────────────────────────────────
 
 /**
  * Verify a root-revocation event under the CURRENT principal cert (which chains

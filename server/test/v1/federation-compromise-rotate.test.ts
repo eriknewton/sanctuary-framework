@@ -364,6 +364,11 @@ describe("rotate-root --compromised: MERGE-BAR 7 (no half-rotation; resume compl
     // Resume forward -> clean K2 root + durable revocation persisted.
     const resumed = await resumeFederationRootCompromised({ storage, masterKey });
     expect(resumed.revoked_master_pubkey).toBe(oldPubkey);
+    // The resumed event is honest about its empty signature: the K2 key is at
+    // rest so the original signature cannot be reconstructed; enforcement is the
+    // durable projection (re-persisted above), and signature_note says so.
+    expect(resumed.root_revocation.operator_signature).toBe("");
+    expect(resumed.root_revocation.signature_note).toMatch(/durable revocation projection/);
     expect(await federationRotateRootInProgress(storage)).toBe(false);
     expect(
       await storage.exists(

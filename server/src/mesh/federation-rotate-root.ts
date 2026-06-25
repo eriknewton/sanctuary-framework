@@ -176,8 +176,13 @@ export interface RotateFederationRootCompromisedResult {
   new_pinned_master: FederationTrustRootRecord["pinned_master_pubkey"];
   /** The revoked old master (PUBLIC, K1) that is now permanently distrusted. */
   revoked_master_pubkey: string;
-  /** The signed, durably-persisted root-revocation event (PUBLIC; signed under K2). */
-  root_revocation: FederationRootRevocationPayload;
+  /**
+   * The signed, durably-persisted root-revocation event (PUBLIC; signed under
+   * K2). On a RESUMED run the original K2 signature is not reconstructable, so
+   * `operator_signature` is empty and `signature_note` explains why (the durable
+   * projection is the enforcement source of truth and has been re-persisted).
+   */
+  root_revocation: FederationRootRevocationPayload & { signature_note?: string };
   /** The strictly-monotonic revocation serial this compromise rotate installed. */
   revocation_serial: number;
 }
@@ -1087,9 +1092,12 @@ export async function resumeFederationRootCompromised(
         resumed: true,
       },
     });
-    // The signed revocation event from the original run is not reconstructable
-    // here (the K2 principal key is at rest, not the journal); the durable
-    // projection is the enforcement source of truth and is now re-persisted.
+    // DEBT: the signed revocation event from the original run is not
+    // reconstructable here (the K2 principal key is at rest, not in the journal);
+    // the durable projection is the enforcement source of truth and is now
+    // re-persisted. We therefore emit an empty `operator_signature` with an
+    // honest `signature_note` rather than a fabricated signature. A future slice
+    // could re-derive + re-sign on resume if the K2 principal key were unlocked.
     return {
       fortress_id: live.fortress_id,
       new_pinned_master: { ...live.pinned_master_pubkey },
@@ -1102,6 +1110,8 @@ export async function resumeFederationRootCompromised(
         revocation_serial: revocationSerial,
         operator_principal_id: live.issuing_principal_cert.principal_id,
         operator_signature: "",
+        signature_note:
+          "resumed run: enforcement is the durable revocation projection (already re-persisted); the original K2 signature is not reconstructable here",
       },
       revocation_serial: revocationSerial,
     };
