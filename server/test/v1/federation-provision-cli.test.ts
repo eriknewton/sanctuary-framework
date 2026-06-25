@@ -34,11 +34,17 @@ import { runFederationProvision } from "../../src/cli/federation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
-import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import {
+  bytesToString,
+  fromBase64url,
+  stringToBytes,
+  toBase64url,
+} from "../../src/core/encoding.js";
 import {
   FEDERATION_TRUST_ROOT_NAMESPACE,
   FEDERATION_TRUST_ROOT_KEY,
   provisionOrLoadFederationTrustRoot,
+  verifyHybridFederationChain,
 } from "../../src/mesh/federation-trust-root-store.js";
 import {
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
@@ -478,8 +484,8 @@ describe("federation provision -- no-secret-leak (constraint 6)", () => {
   });
 });
 
-describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () => {
-  it("merge-bar 5: default (no flag) is CLASSICAL and prints the operator-visible classical note", async () => {
+describe("federation provision -- PQC default-on (hybrid is the default; --classical opts out)", () => {
+  it("merge-bar 1 (default flip): a bare provision (no crypto flag) is HYBRID and prints the version-requirement note", async () => {
     await seedInitializedFortress();
     const out = capture();
     const err = capture();
@@ -491,8 +497,65 @@ describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () =
     });
     expect(code, `stderr: ${err.get()}`).toBe(0);
 
-    // No flag -> classical issuance; output declares the classical suite and NO
-    // hybrid pinned master is printed.
+    // PQC default-on: NO flag -> HYBRID issuance; output declares the hybrid suite
+    // and the hybrid pinned master is printed alongside the classical one.
+    const printed = JSON.parse(out.get()) as {
+      issuance_suite: string;
+      pinned_master: { public_key: string };
+      hybrid_pinned_master?: {
+        signature_suite: string;
+        public_keys: {
+          ed25519: { public_key: string };
+          ml_dsa_65: { public_key: string };
+        };
+      };
+    };
+    expect(printed.issuance_suite).toBe("ed25519+ml-dsa-v1");
+    expect(printed.pinned_master.public_key.length).toBeGreaterThan(0);
+    expect(printed.hybrid_pinned_master).toBeDefined();
+    expect(printed.hybrid_pinned_master!.signature_suite).toBe("ed25519+ml-dsa-v1");
+    expect(
+      printed.hybrid_pinned_master!.public_keys.ml_dsa_65.public_key.length,
+    ).toBeGreaterThan(0);
+
+    // The default note states the scope honestly (no overclaim) AND the
+    // version-requirement trade plainly; it is on stderr, not in the stdout JSON.
+    expect(err.get()).toMatch(/DEFAULT hybrid/);
+    expect(err.get()).toMatch(/does NOT make audit/);
+    expect(err.get()).toMatch(/hybrid-capable Sanctuary version/);
+    // Disclosure-at-decision-point: the default note warns the hybrid root is not
+    // yet rotatable / compromise-revocable in place (so the operator learns it
+    // BEFORE they are stuck), and names --classical as the in-place-rotation path.
+    expect(err.get()).toMatch(/cannot yet be rotated or compromise-revoked/);
+
+    // The persisted record is hybrid (carries the hybrid block + 4032-byte secret).
+    const { masterKey } = await establishMaster({
+      storage,
+      passphrase: PASSPHRASE,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
+    expect(loaded!.record.hybrid).toBeDefined();
+    expect(
+      loaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key.length,
+    ).toBe(4032);
+    masterKey.fill(0);
+  });
+
+  it("merge-bar 2 (opt-out): --classical mints a CLASSICAL root and prints the back-compat note", async () => {
+    await seedInitializedFortress();
+    const out = capture();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: ["--node-id", "home-mac", "--fortress", fortressPath, "--classical"],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+
+    // --classical -> classical issuance; output declares the classical suite and
+    // NO hybrid pinned master is printed (the unchanged old-default behavior).
     const printed = JSON.parse(out.get()) as {
       issuance_suite: string;
       hybrid_pinned_master?: unknown;
@@ -500,10 +563,9 @@ describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () =
     expect(printed.issuance_suite).toBe("ed25519-v1");
     expect(printed.hybrid_pinned_master).toBeUndefined();
 
-    // The operator-visible note (printed ONCE at classical provision) points at
-    // the opt-in; it is on stderr, not part of the machine-readable stdout JSON.
-    expect(err.get()).toMatch(/classical Ed25519/);
-    expect(err.get()).toMatch(/--pqc-hybrid/);
+    // The inverse note: classical opt-out, no post-quantum protection, max back-compat.
+    expect(err.get()).toMatch(/OPT-OUT classical/);
+    expect(err.get()).toMatch(/NO post-quantum protection/);
 
     // The persisted record is classical (no hybrid fields).
     const { masterKey } = await establishMaster({
@@ -516,7 +578,85 @@ describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () =
     masterKey.fill(0);
   });
 
-  it("merge-bar 5: --pqc-hybrid provisions hybrid, prints hybrid_pinned_master, persists the hybrid block", async () => {
+  it("merge-bar 2 (opt-out): --crypto-suite ed25519-v1 mints a CLASSICAL root (alias of --classical)", async () => {
+    await seedInitializedFortress();
+    const out = capture();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: [
+        "--node-id",
+        "home-mac",
+        "--fortress",
+        fortressPath,
+        "--crypto-suite",
+        "ed25519-v1",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+    const printed = JSON.parse(out.get()) as {
+      issuance_suite: string;
+      hybrid_pinned_master?: unknown;
+    };
+    expect(printed.issuance_suite).toBe("ed25519-v1");
+    expect(printed.hybrid_pinned_master).toBeUndefined();
+    expect(err.get()).toMatch(/OPT-OUT classical/);
+  });
+
+  it("merge-bar 4 (default chain verifies): the default hybrid root verifies both-must-pass AND its Ed25519 component verifies", async () => {
+    await seedInitializedFortress();
+    const code = await runFederationProvision({
+      argv: ["--node-id", "home-mac", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: capture().stream,
+    });
+    expect(code).toBe(0);
+
+    const { masterKey } = await establishMaster({
+      storage,
+      passphrase: PASSPHRASE,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
+    const hybrid = loaded!.record.hybrid!;
+    expect(hybrid).toBeDefined();
+    // both-must-pass over the persisted hybrid chain.
+    await expect(verifyHybridFederationChain(hybrid)).resolves.toBeUndefined();
+    // The Ed25519 component of the hybrid pinned master is a real 32-byte key, so
+    // the hybrid root still carries a verifiable Ed25519 chain for current peers.
+    expect(
+      fromBase64url(hybrid.pinned_master.public_keys.ed25519.public_key).length,
+    ).toBe(32);
+    masterKey.fill(0);
+  });
+
+  it("rejects --classical AND --pqc-hybrid together (exit 1, nothing minted)", async () => {
+    await seedInitializedFortress();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: [
+        "--node-id",
+        "home-mac",
+        "--fortress",
+        fortressPath,
+        "--classical",
+        "--pqc-hybrid",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code).toBe(1);
+    expect(err.get()).toMatch(/mutually/);
+    expect(
+      await storage.exists(FEDERATION_TRUST_ROOT_NAMESPACE, FEDERATION_TRUST_ROOT_KEY),
+    ).toBe(false);
+  });
+
+  it("--pqc-hybrid still provisions hybrid (now a no-op-but-accepted alias of the default)", async () => {
     await seedInitializedFortress();
     const out = capture();
     const err = capture();
@@ -540,8 +680,6 @@ describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () =
       };
     };
     expect(printed.issuance_suite).toBe("ed25519+ml-dsa-v1");
-    // The classical pinned_master is STILL printed (current-version peers verify
-    // the Ed25519 chain); the hybrid pinned master is added.
     expect(printed.pinned_master.public_key.length).toBeGreaterThan(0);
     expect(printed.hybrid_pinned_master).toBeDefined();
     expect(printed.hybrid_pinned_master!.signature_suite).toBe("ed25519+ml-dsa-v1");
@@ -549,11 +687,10 @@ describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () =
       printed.hybrid_pinned_master!.public_keys.ml_dsa_65.public_key.length,
     ).toBeGreaterThan(0);
 
-    // Honest scope note (no overclaim): says hybrid is opt-in + names the limit.
-    expect(err.get()).toMatch(/OPT-IN hybrid/);
+    // Same DEFAULT note (no overclaim) as the bare-provision path.
+    expect(err.get()).toMatch(/DEFAULT hybrid/);
     expect(err.get()).toMatch(/does NOT make audit/);
 
-    // The persisted record carries the hybrid block with the 4032-byte secret.
     const { masterKey } = await establishMaster({
       storage,
       passphrase: PASSPHRASE,
