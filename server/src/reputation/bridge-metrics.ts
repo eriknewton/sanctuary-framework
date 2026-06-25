@@ -106,6 +106,48 @@ export function validateBridgeAttestationMetrics(value: unknown):
     };
   }
 
+  const invalidRatios = keys.filter((key) => {
+    const metric = input[key] as number;
+    return key === "concession_magnitude" && (metric < 0 || metric > 1);
+  });
+  if (invalidRatios.length > 0) {
+    return {
+      ok: false,
+      error:
+        "Bridge attestation metrics rejected: concession_magnitude must be " +
+        "a ratio from 0 to 1; " +
+        `offending metric key(s): ${metricKeyList(invalidRatios)}.`,
+    };
+  }
+
+  const invalidDurations = keys.filter((key) => {
+    const metric = input[key] as number;
+    return key === "response_time_ms" && metric < 0;
+  });
+  if (invalidDurations.length > 0) {
+    return {
+      ok: false,
+      error:
+        "Bridge attestation metrics rejected: response_time_ms must be " +
+        "a non-negative finite number; " +
+        `offending metric key(s): ${metricKeyList(invalidDurations)}.`,
+    };
+  }
+
+  const invalidBooleanNumbers = keys.filter((key) => {
+    const metric = input[key] as number;
+    return key === "reasoning_provided" && metric !== 0 && metric !== 1;
+  });
+  if (invalidBooleanNumbers.length > 0) {
+    return {
+      ok: false,
+      error:
+        "Bridge attestation metrics rejected: reasoning_provided must be " +
+        "0 or 1; " +
+        `offending metric key(s): ${metricKeyList(invalidBooleanNumbers)}.`,
+    };
+  }
+
   const metrics: Record<string, number> = {};
   for (const key of keys) {
     metrics[key] = input[key] as number;

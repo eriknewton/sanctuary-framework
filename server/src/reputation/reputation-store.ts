@@ -817,6 +817,17 @@ export class ReputationStore {
       );
     }
 
+    const metricVerification = this.inspectBridgeAttestationMetrics(bundle);
+    if (metricVerification.invalid > 0) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle contains concordia-bridge attestations with " +
+          "invalid behavioral metrics: " +
+          metricVerification.errors.join(" "),
+        metricVerification.invalid,
+        0
+      );
+    }
+
     return {
       invalid,
       unverifiable,
@@ -825,6 +836,34 @@ export class ReputationStore {
       ),
       completeness_verification: completenessVerification,
     };
+  }
+
+  private inspectBridgeAttestationMetrics(
+    bundle: ReputationBundle
+  ): { invalid: number; errors: string[] } {
+    let invalid = 0;
+    const errors: string[] = [];
+
+    for (const attestation of bundle.attestations) {
+      if (!isConcordiaBridgeReputationContext(attestation.data.context)) {
+        continue;
+      }
+
+      try {
+        assertBridgeAttestationMetrics(attestation.data.metrics);
+      } catch (err) {
+        invalid++;
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Bridge attestation metrics rejected.";
+        errors.push(
+          `attestation ${attestation.attestation_id}: ${message}`
+        );
+      }
+    }
+
+    return { invalid, errors };
   }
 
   private verifyBundleCompleteness(

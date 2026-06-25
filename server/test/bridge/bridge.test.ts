@@ -696,6 +696,21 @@ describe("Concordia Bridge", () => {
           keys: ["response_time_ms"],
         },
         {
+          metrics: { response_time_ms: -1 },
+          message: /non-negative/i,
+          keys: ["response_time_ms"],
+        },
+        {
+          metrics: { concession_magnitude: 150 },
+          message: /0 to 1/i,
+          keys: ["concession_magnitude"],
+        },
+        {
+          metrics: { reasoning_provided: 123 },
+          message: /0 or 1/i,
+          keys: ["reasoning_provided"],
+        },
+        {
           metrics: { offers_made: 1.5 },
           message: /non-negative integers/i,
           keys: ["offers_made"],
