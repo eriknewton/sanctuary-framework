@@ -179,17 +179,15 @@ export async function handlePiiRewriteRoute(
         return true;
       }
       try {
-        const updated = await deps.store.patch(patch);
+        const { config: updated, consentJustRecorded } =
+          await deps.store.patch(patch);
         // Audit emission: consent first, then config-updated. The
-        // consent op fires only on the transition false -> true (i.e.
-        // when the patch supplied true AND the existing was false).
-        // `patch` stamps consented_at on that transition; we use that
-        // as the signal.
-        if (
-          patch.consented_to_trade_off === true &&
-          updated.consented_at !== undefined &&
-          updated.consented_at === updated.updated_at
-        ) {
+        // consent op fires only on the false -> true consent
+        // transition, signalled EXPLICITLY by the store (derived from
+        // state, not from comparing two independently-sampled
+        // timestamps). This is deterministic regardless of how the
+        // wall clock samples, closing the audit-completeness race.
+        if (consentJustRecorded) {
           void deps.auditLog.append(
             "l2",
             PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED,
