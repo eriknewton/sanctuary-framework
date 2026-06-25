@@ -199,6 +199,117 @@ describe("Xi-2 - applyRule pure function", () => {
   });
 });
 
+describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-depth)", () => {
+  // The forced-Tier-1 operations the loader's enforceForcedTiers pins. These
+  // are the non-relaxable subset (NOT the full DEFAULT_POLICY Tier-1 list):
+  // identity_sign, the policy-read tools, the policy-adjacent mutations,
+  // audit_export_siem, the compliance bundle, memory_delete, and the cloud
+  // ops. A mutation must not be able to downgrade any of these.
+  const FORCED_T1 = "identity_sign";
+  const FORCED_T1_CLOUD = "operator_cloud_provision";
+
+  it("make-or-break: a tier1_remove_operation for a forced-Tier-1 op leaves it in Tier 1", () => {
+    const base = clonePolicy();
+    expect(base.tier1_always_approve).toContain(FORCED_T1);
+    const after = applyRule(base, {
+      kind: "tier1_remove_operation",
+      operation: FORCED_T1,
+    });
+    // The structural remove is neutralized by enforceForcedTiers: the forced
+    // op is re-added. The downgrade does not take effect.
+    expect(after.tier1_always_approve).toContain(FORCED_T1);
+  });
+
+  it("make-or-break: a tier3_add_operation for a forced-Tier-1 op never lands in Tier 3", () => {
+    const after = applyRule(clonePolicy(), {
+      kind: "tier3_add_operation",
+      operation: FORCED_T1_CLOUD,
+    });
+    // The structural add to Tier 3 is pruned by enforceForcedTiers; the op
+    // stays Tier-1-only.
+    expect(after.tier3_always_allow).not.toContain(FORCED_T1_CLOUD);
+    expect(after.tier1_always_approve).toContain(FORCED_T1_CLOUD);
+  });
+
+  it("a legitimate mutation of a NON-forced op applies unchanged (no over-correction)", () => {
+    // state_export is NOT in the forced set, so a normal add/remove is honored.
+    const base = clonePolicy();
+    expect(base.tier1_always_approve).not.toContain("state_export");
+    const added = applyRule(base, {
+      kind: "tier1_add_operation",
+      operation: "state_export",
+    });
+    expect(added.tier1_always_approve).toContain("state_export");
+    const removed = applyRule(added, {
+      kind: "tier1_remove_operation",
+      operation: "state_export",
+    });
+    expect(removed.tier1_always_approve).not.toContain("state_export");
+
+    // A custom Tier-3 op is added and removed normally too.
+    const t3Added = applyRule(base, {
+      kind: "tier3_add_operation",
+      operation: "custom_reader_op",
+    });
+    expect(t3Added.tier3_always_allow).toContain("custom_reader_op");
+  });
+
+  it("even FORCING past the conflict gate, a tier1_remove draft cannot downgrade a forced op on the live policy", async () => {
+    // The conflict detector is the first-line defense: it flags this as a
+    // high-severity contradiction the operator must acknowledge + force. We
+    // deliberately force past it to prove the enforceForcedTiers backstop in
+    // applyRule still neutralizes the downgrade (defense-in-depth).
+    const rig = makeActivatorRig();
+    expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
+    const draft = buildCompiled({
+      kind: "tier1_remove_operation",
+      operation: FORCED_T1,
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+    const highIds = conflicts
+      .filter((c) => c.severity === "high")
+      .map((c) => c.conflict_id);
+    const outcome = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+      force_conflict_ids: highIds,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.updated_policy.tier1_always_approve).toContain(FORCED_T1);
+    }
+    // And the persisted live policy still gates it.
+    expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
+  });
+
+  it("even FORCING past the conflict gate, a tier3_add draft cannot smuggle a forced op into Tier 3", async () => {
+    const rig = makeActivatorRig();
+    const draft = buildCompiled({
+      kind: "tier3_add_operation",
+      operation: FORCED_T1_CLOUD,
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+    const highIds = conflicts
+      .filter((c) => c.severity === "high")
+      .map((c) => c.conflict_id);
+    const outcome = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+      force_conflict_ids: highIds,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.updated_policy.tier3_always_allow).not.toContain(
+        FORCED_T1_CLOUD,
+      );
+    }
+    expect(rig.livePolicy.current.tier3_always_allow).not.toContain(
+      FORCED_T1_CLOUD,
+    );
+    expect(rig.livePolicy.current.tier1_always_approve).toContain(
+      FORCED_T1_CLOUD,
+    );
+  });
+});
+
 describe("Xi-2 - inverseRule symmetry", () => {
   it("add <-> remove inverses across tier1 and tier3", () => {
     const r: CompiledPolicyRule = {
