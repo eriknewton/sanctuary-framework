@@ -86,7 +86,7 @@
 9	server/docs/federation-v0.1-hard-gate-walkthrough.md
 13	server/docs/keychain-schema.md
 15	server/docs/multi-tenancy.md
-14	server/docs/query-anonymity-tiers.md
+12	server/docs/query-anonymity-tiers.md
 8	server/docs/test-concurrency-discipline.md
 8	server/docs/test-port-discipline.md
 3	server/docs/transparency-checkpoints.md
