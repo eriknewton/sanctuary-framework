@@ -78,7 +78,7 @@ describe("castle-wall CLI verbs", () => {
     const { fortressPath, recoveryKey } = await makeFortress();
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const code = await runProvisionPin({
+    const code = await runProvisionPin([], {
       out,
       err,
       env: {
@@ -110,7 +110,7 @@ describe("castle-wall CLI verbs", () => {
 
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const code = await runProvisionPin({
+    const code = await runProvisionPin([], {
       out,
       err,
       env: {
@@ -125,6 +125,50 @@ describe("castle-wall CLI verbs", () => {
     expect(Buffer.compare(after, existing)).toBe(0);
     expect(out.text()).toContain(fingerprint(existing));
     expect(out.text()).toContain("Pinned key already provisioned");
+  });
+
+  it("provision-pin honors the --fortress flag over a stale SANCTUARY_STORAGE_PATH", async () => {
+    // Regression for the 2026-06-24 stock-CLI drill: provision-pin DROPPED its
+    // subcommand-level `--fortress` arg and read SANCTUARY_STORAGE_PATH only, so
+    // `castle-wall provision-pin --fortress <good>` loaded the custody envelope
+    // from a DIFFERENT (stale) fortress and failed with "custody envelope exists
+    // but has an unsupported shape or version" - while federation/identity verbs
+    // against the SAME --fortress path worked. The flag must win, like every
+    // other custody verb.
+    const { fortressPath, recoveryKey } = await makeFortress();
+
+    // A DIFFERENT directory pointed at by SANCTUARY_STORAGE_PATH that holds a
+    // malformed (unsupported v:2) custody envelope - the exact thing the reader
+    // refuses. provision-pin must NOT read this one.
+    const staleStoragePath = await mkdtemp(join(tmpdir(), "sanctuary-cw-stale-"));
+    tempDirs.push(staleStoragePath);
+    const staleStorage = new FilesystemStorage(join(staleStoragePath, "state"));
+    await staleStorage.write(
+      "_meta",
+      "custody-envelope",
+      stringToBytes(
+        JSON.stringify({ v: 2, install_mode: "interactive", wraps: [], mac: "x" }),
+      ),
+    );
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runProvisionPin(["--fortress", fortressPath], {
+      out,
+      err,
+      env: {
+        // Stale path that, if (wrongly) honored, throws "unsupported shape".
+        SANCTUARY_STORAGE_PATH: staleStoragePath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("unsupported shape");
+    // The pin must be written into the FLAG-named fortress, not the stale path.
+    const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+    expect(pub.length).toBe(32);
+    expect(out.text().trim()).toBe(fingerprint(pub));
   });
 
   it("status with pinned key", async () => {
@@ -846,7 +890,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     await seedBrokenChain(fortressPath, masterKey);
 
@@ -879,7 +923,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     await seedBrokenChain(fortressPath, masterKey);
 
@@ -919,7 +963,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     // No seedBrokenChain: the chain is clean.
 

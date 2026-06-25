@@ -993,7 +993,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "provision-pin") {
     const { runProvisionPin } = await import("./cli/castle-wall.js");
-    return runProvisionPin();
+    return runProvisionPin(args.slice(1));
   }
 
   if (command === "status") {
@@ -1084,6 +1084,8 @@ function printCastleWallHelp(): void {
 
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
+                     --fortress <path>  Target a specific fortress (defaults to
+                                        SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH).
     status           Show pinned-key fingerprint and sysext status.
     enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
                      Refuses without a reachable policy daemon; --force overrides.
