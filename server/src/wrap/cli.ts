@@ -769,7 +769,7 @@ export async function runWrap(
     // time (sysext refuses connection) rather than as a wrap-startup abort.
     // First-integration discipline: do no harm to the wrap critical path.
     try {
-      const pinResult = await runProvisionPin({
+      const pinResult = await runProvisionPin([], {
         out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
         err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
         env: {

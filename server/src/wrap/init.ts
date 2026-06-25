@@ -463,7 +463,7 @@ export async function runInit(
         `  Run \`sanctuary castle-wall provision-pin\` against this fortress when ready.\n`,
     );
   } else {
-    const pinResult = await provisionPin({
+    const pinResult = await provisionPin([], {
       out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
       env: {
         ...process.env,

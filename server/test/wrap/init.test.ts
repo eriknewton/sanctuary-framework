@@ -681,7 +681,7 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     await runInit(
       { fortress: fortressPath, noConfirm: true },
       {
-        provisionPin: async (ctx) => {
+        provisionPin: async (_argv, ctx) => {
           calls++;
           sawStoragePath = ctx?.env?.SANCTUARY_STORAGE_PATH;
           return 0;
