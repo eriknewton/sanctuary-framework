@@ -573,7 +573,9 @@ export async function runInit(
           ` or pass --no-identity to create a custody-only fortress and add an` +
           ` identity later with \`sanctuary identity create\`.\n`,
       );
-      throw new Error(`operator identity seed failed: ${message}`);
+      throw new Error(`operator identity seed failed: ${message}`, {
+        cause: err,
+      });
     }
   }
   // Castle Wall global-pin provisioning. By default init writes the
