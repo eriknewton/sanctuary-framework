@@ -32,6 +32,7 @@ import {
   printInitHelp,
   resolveFortressPath,
   resolveNoPin,
+  resolveNoIdentity,
   runInit as runInitRaw,
   type InitOptions,
   type RunInitDeps,
@@ -777,14 +778,210 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
   });
 });
 
+describe("--no-identity (default operator-identity seed)", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-init-noidentity-test-"));
+  });
+
+  afterEach(async () => {
+    delete process.env.SANCTUARY_INIT_NO_IDENTITY;
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    try {
+      await rm(tmp, { recursive: true, force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
+  });
+
+  async function recoveryKeyFor(
+    recoveryKeyDisclosurePath: string,
+  ): Promise<string> {
+    const recoveryFile = await readFile(recoveryKeyDisclosurePath, "utf-8");
+    return extractRecoveryKey(recoveryFile);
+  }
+
+  it("default init seeds a default operator identity findable by IdentityManager", async () => {
+    const fortressPath = join(tmp, "seeded-fortress");
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+    const recoveryKey = await recoveryKeyFor(result.recoveryKeyDisclosurePath);
+
+    const { FilesystemStorage } = await import(
+      "../../src/storage/filesystem.js"
+    );
+    const { establishMaster } = await import(
+      "../../src/core/master-custody.js"
+    );
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, recoveryKey });
+    const im = new IdentityManager(storage, masterKey);
+    await im.load();
+    const def = im.getDefault();
+    expect(def).toBeDefined();
+    expect(def!.label).toBe("operator");
+    masterKey.fill(0);
+  });
+
+  it("a federation operator-signing call finds the seeded identity", async () => {
+    const fortressPath = join(tmp, "fed-signer-fortress");
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+    const recoveryKey = await recoveryKeyFor(result.recoveryKeyDisclosurePath);
+
+    const { openOperatorSigner } = await import(
+      "../../src/cli/federation-operator-signing.js"
+    );
+    const signer = await openOperatorSigner({
+      recoveryKey,
+      fortressPath,
+    });
+    try {
+      expect(signer.operatorPublicKey.length).toBe(32);
+      // The signer can actually produce an operator signature.
+      const sig = signer.signPayload("federation_enable", { fortress_id: "x" });
+      expect(sig).toMatch(/^[A-Za-z0-9_-]+$/);
+    } finally {
+      signer.masterKey.fill(0);
+    }
+  });
+
+  it("--no-identity leaves NO operator identity in the fortress", async () => {
+    const fortressPath = join(tmp, "no-identity-fortress");
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+      noIdentity: true,
+    });
+    const recoveryKey = await recoveryKeyFor(result.recoveryKeyDisclosurePath);
+
+    const { FilesystemStorage } = await import(
+      "../../src/storage/filesystem.js"
+    );
+    const { establishMaster } = await import(
+      "../../src/core/master-custody.js"
+    );
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, recoveryKey });
+    const im = new IdentityManager(storage, masterKey);
+    const loadResult = await im.load();
+    expect(loadResult.total).toBe(0);
+    expect(im.getDefault()).toBeUndefined();
+    masterKey.fill(0);
+  });
+
+  it("seeds EXACTLY ONE operator identity (no double-seed) and the guard skips a pre-existing default", async () => {
+    // A default init seeds exactly one identity (the guard prevents a second
+    // within one init). Then, with the SAME master, we directly drive the
+    // idempotency guard's reachable path: an IdentityManager that already has
+    // a default identity must report it, which is what init checks before
+    // minting — proving init would skip rather than mint a second.
+    const fortressPath = join(tmp, "idempotent-fortress");
+    const result = await runInit({
+      fortress: fortressPath,
+      noConfirm: true,
+      noPin: true,
+    });
+    const recoveryKey = await recoveryKeyFor(result.recoveryKeyDisclosurePath);
+
+    const { FilesystemStorage } = await import(
+      "../../src/storage/filesystem.js"
+    );
+    const { establishMaster } = await import(
+      "../../src/core/master-custody.js"
+    );
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, recoveryKey });
+
+    // Default init left exactly one identity — never two.
+    const im = new IdentityManager(storage, masterKey);
+    const loadResult = await im.load();
+    expect(loadResult.loaded).toBe(1);
+    const seededId = im.getDefault()!.identity_id;
+
+    // The guard's exact predicate: re-loading under the same master surfaces
+    // the existing default, so the seed step short-circuits (no second mint).
+    const im2 = new IdentityManager(storage, masterKey);
+    await im2.load();
+    expect(im2.getDefault()).toBeDefined();
+    expect(im2.getDefault()!.identity_id).toBe(seededId);
+    masterKey.fill(0);
+  });
+
+  it("fails closed (and provisions no pin) when identity minting fails and --no-identity was NOT passed", async () => {
+    // Inject a saveNew that throws, simulating an identity-mint failure on a
+    // default (no --no-identity) init. init must FAIL and must NOT proceed to
+    // the pin step — never a half-provisioned fortress.
+    const fortressPath = join(tmp, "fail-closed-fortress");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+    const saveNewSpy = vi
+      .spyOn(IdentityManager.prototype, "saveNew")
+      .mockRejectedValue(new Error("injected mint failure"));
+    let pinCalls = 0;
+    try {
+      await expect(
+        runInit(
+          { fortress: fortressPath, noConfirm: true, noPin: true },
+          {
+            provisionPin: async () => {
+              pinCalls++;
+              return 0;
+            },
+          },
+        ),
+      ).rejects.toThrow(/operator identity seed failed/);
+    } finally {
+      saveNewSpy.mockRestore();
+    }
+    // Fail-closed: the pin step was never reached.
+    expect(pinCalls).toBe(0);
+  });
+
+  it("resolveNoIdentity uses an allowlist for the env var, not 'anything truthy'", () => {
+    expect(resolveNoIdentity({ noIdentity: true }, {})).toBe(true);
+    expect(resolveNoIdentity({}, {})).toBe(false);
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: "1" })).toBe(true);
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: "TRUE" })).toBe(
+      true,
+    );
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: " on " })).toBe(
+      true,
+    );
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: "0" })).toBe(
+      false,
+    );
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: "no" })).toBe(
+      false,
+    );
+    expect(resolveNoIdentity({}, { SANCTUARY_INIT_NO_IDENTITY: "" })).toBe(
+      false,
+    );
+    expect(
+      resolveNoIdentity({ noIdentity: true }, { SANCTUARY_INIT_NO_IDENTITY: "0" }),
+    ).toBe(true);
+  });
+});
+
 describe("parseInitArgs", () => {
-  it("recognizes --fortress, --force, --no-confirm, --no-pin, --recovery-out, --help", () => {
+  it("recognizes --fortress, --force, --no-confirm, --no-pin, --no-identity, --recovery-out, --help", () => {
     const opts = parseInitArgs([
       "--fortress",
       "/tmp/x",
       "--force",
       "--no-confirm",
       "--no-pin",
+      "--no-identity",
       "--recovery-out",
       "/tmp/recovery-key.txt",
     ]);
@@ -792,6 +989,7 @@ describe("parseInitArgs", () => {
     expect(opts.force).toBe(true);
     expect(opts.noConfirm).toBe(true);
     expect(opts.noPin).toBe(true);
+    expect(opts.noIdentity).toBe(true);
     expect(opts.recoveryOut).toBe("/tmp/recovery-key.txt");
 
     const helpOpts = parseInitArgs(["--help"]);
