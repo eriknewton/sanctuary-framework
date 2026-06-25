@@ -80,7 +80,7 @@ class CorruptReadStorage implements StorageBackend {
   }
 }
 
-describe("FederationSyncStateStore — durable peer-sync security state", () => {
+describe("FederationSyncStateStore - durable peer-sync security state", () => {
   it("round-trips the full snapshot through encrypt -> decrypt", async () => {
     const storage = new MemoryStorage();
     const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });

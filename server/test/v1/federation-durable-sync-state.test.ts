@@ -15,8 +15,8 @@
  * A "restart" is a NEW DashboardApprovalChannel over the SAME MemoryStorage +
  * master key, re-wired with the same FederationContext and a fresh
  * FederationSyncStateStore (exactly what the production boot path does). The
- * test drives the live `V1FederationDeps` seam — the same callbacks the HTTP
- * sync handlers call — so it exercises the real persistence + rehydration code.
+ * test drives the live `V1FederationDeps` seam (the same callbacks the HTTP
+ * sync handlers call) so it exercises the real persistence + rehydration code.
  *
  * Deterministic; in-memory storage; no sockets; keychain-free.
  */
@@ -132,7 +132,7 @@ beforeEach(() => {
   fortress = makeMultiNodeFortress(["mac-1", "linux-1"]);
 });
 
-describe("Federation 3/3b P0 — durable sync-state at the dashboard seam", () => {
+describe("Federation 3/3b P0 - durable sync-state at the dashboard seam", () => {
   it("MERGE-BAR 1: a captured envelope is REJECTED after a daemon restart", async () => {
     const storage = new MemoryStorage();
 
@@ -176,7 +176,7 @@ describe("Federation 3/3b P0 — durable sync-state at the dashboard seam", () =
     const boot1 = await buildRecipient(fortress, "linux-1", storage);
 
     // The operator (mac-1 is the issuer node here) signs a node_eviction of
-    // "linux-1"'s peer "mac-1"? No — evict a third id the recipient knows. We
+    // "linux-1"'s peer "mac-1"? No. Evict a third id the recipient knows. We
     // evict "rogue-node" via an operator-authority eviction event synced in.
     const fortressId = fortress.fortressId;
     const evictionPayload = signFederationNodeEvictionPayload({
