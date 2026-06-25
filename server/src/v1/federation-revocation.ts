@@ -695,7 +695,7 @@ export function buildFederationRootRevocationMessage(
 /**
  * Sign a root-revocation payload with the NEW (post-compromise) operator
  * principal private key, the one chaining to K2. The caller MUST zero the
- * private key after return (constraint 6). Signing under K2 — never K1 — is the
+ * private key after return (constraint 6). Signing under K2 (never K1) is the
  * structural downgrade-resistance guarantee: a thief holding K1 cannot forge a
  * revocation the fortress would fold.
  */
@@ -730,7 +730,7 @@ export function signFederationRootRevocationPayload(params: {
 // SUBSTRATE and the test-proven downgrade-resistance invariants (sign-under-K2 /
 // reject-under-K1, serial-monotonicity, principal-chain). They are NOT yet a
 // live production enforcement path: in 3c-1 no production code appends, syncs,
-// or folds a wire root-revocation event — enforcement runs entirely off the
+// or folds a wire root-revocation event; enforcement runs entirely off the
 // durable revoked-root projection set + the `isRootRevoked` hook. The
 // wire-acceptance fold path (a peer/joiner adopting a remote root-revocation
 // event) is a LATER slice (3c-2 / 3d). Keep these: the downgrade-resistance
