@@ -222,7 +222,12 @@ afterEach(async () => {
   await linux1.stop();
 });
 
-describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", () => {
+// retry:2 - this rig spins up a loopback HTTP dashboard for the /sync/peer
+// HTTP cases and races port/socket setup under full-suite CI load (the
+// "listen EADDRINUSE 127.0.0.1:<port>" flake), the same non-hermetic class the
+// sibling /v1 federation rigs carry. Logic is deterministic; the retry absorbs
+// the bind race.
+describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", { retry: 2 }, () => {
   // ── Path-class predicates (unit level) ──────────────────────────────
   it("classifies /sync/peer in the node-cert-auth class and NOT the post-session class", () => {
     expect(isFederationNodeCertAuthPath("/v1/federation/sync/peer")).toBe(true);
