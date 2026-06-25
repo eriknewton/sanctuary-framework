@@ -21,6 +21,11 @@ import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
+import {
+  BridgeAttestationMetricValidationError,
+  CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+  validateBridgeAttestationMetrics,
+} from "../reputation/bridge-metrics.js";
 
 import {
   createBridgeCommitment,
@@ -30,6 +35,16 @@ import type {
   ConcordiaOutcome,
   BridgeCommitment,
 } from "./types.js";
+
+/**
+ * HONEST LIMITATION: the behavioral-metric allowlist closes the structural
+ * raw-term FIELD leak for Concordia bridge attestations, so callers cannot add
+ * fields like `price` or `quantity`. It does not and cannot prove a caller has
+ * not semantically mislabeled a raw term under an allowed behavioral key such
+ * as `concession_magnitude`; consumers must not treat the key name as proof of
+ * semantic honesty.
+ */
+export { BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST } from "../reputation/bridge-metrics.js";
 
 // ─── Bridge Store ────────────────────────────────────────────────────────
 // Persists bridge commitments encrypted at rest for later verification
@@ -374,7 +389,13 @@ export function createBridgeTools(
           metrics: {
             type: "object",
             description:
-              "Optional metrics (e.g., rounds, response_time_ms, terms_complexity)",
+              "Optional BEHAVIORAL metrics only (allowlisted, fail-closed): " +
+              "rounds / negotiation_rounds (non-negative int), offers_made " +
+              "(non-negative int), concession_magnitude (ratio 0..1), " +
+              "response_time_ms (>= 0), reasoning_provided (0 or 1). Any other key, " +
+              "or a raw deal term (price/quantity/terms), is REJECTED and nothing is " +
+              "recorded (privacy invariant: attestations carry behavioral signals, " +
+              "never deal terms).",
           },
           identity_id: {
             type: "string",
@@ -390,8 +411,14 @@ export function createBridgeTools(
           | "partial"
           | "failed"
           | "disputed";
-        const metrics = (args.metrics as Record<string, number>) ?? {};
         const identityId = args.identity_id as string | undefined;
+        const validatedMetrics = validateBridgeAttestationMetrics(args.metrics);
+        if (!validatedMetrics.ok) {
+          return toolResult({
+            error: validatedMetrics.error,
+          });
+        }
+        const metrics = validatedMetrics.metrics;
 
         // Load the stored commitment and outcome
         const record = await bridgeStore.get(commitmentId);
@@ -470,7 +497,7 @@ export function createBridgeTools(
           interaction_id: outcome.session_id,
           participant_did: identity.did,
           counterparty_did: counterpartyDid,
-          context: "concordia-bridge",
+          context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
         });
         if (!dedup.scanComplete) {
           return toolResult({
@@ -512,20 +539,28 @@ export function createBridgeTools(
         };
 
         // Record the reputation attestation
-        const attestation = await reputationStore.record(
-          outcome.session_id, // interaction_id = concordia session
-          counterpartyDid,
-          {
-            type: "negotiation",
-            result: outcomeResult,
-            metrics: fullMetrics,
-          },
-          "concordia-bridge", // context
-          identity,
-          identityEncryptionKey,
-          undefined, // counterparty_attestation
-          tier
-        );
+        let attestation;
+        try {
+          attestation = await reputationStore.record(
+            outcome.session_id, // interaction_id = concordia session
+            counterpartyDid,
+            {
+              type: "negotiation",
+              result: outcomeResult,
+              metrics: fullMetrics,
+            },
+            CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+            identity,
+            identityEncryptionKey,
+            undefined, // counterparty_attestation
+            tier
+          );
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
 
         await auditLog.appendCritical({
           layer: "l4",

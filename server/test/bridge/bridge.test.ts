@@ -656,6 +656,179 @@ describe("Concordia Bridge", () => {
       expect((result.verification as Record<string, unknown>).valid).toBe(false);
     });
 
+    it("bridge_attest rejects raw-term metric keys and persists no attestation", async () => {
+      const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const result = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+        metrics: { price: 150 },
+      }));
+
+      expect(result.error).toMatch(/only behavioral metrics are allowed/i);
+      expect(result.error).toMatch(/price/);
+      expect(result.attestation_id).toBeUndefined();
+
+      const reputationStore = new ReputationStore(storage, masterKey);
+      const summary = await reputationStore.query({ context: "concordia-bridge" });
+      expect(summary.total_interactions).toBe(0);
+      expect(await storage.list("_reputation")).toHaveLength(0);
+    });
+
+    it("bridge_attest rejects invalid allowlisted metric values and persists no attestation", async () => {
+      const cases: Array<{
+        metrics: Record<string, unknown>;
+        message: RegExp;
+        keys: string[];
+      }> = [
+        {
+          metrics: { response_time_ms: "fast" },
+          message: /finite numbers/i,
+          keys: ["response_time_ms"],
+        },
+        {
+          metrics: { response_time_ms: -1 },
+          message: /non-negative/i,
+          keys: ["response_time_ms"],
+        },
+        {
+          metrics: { concession_magnitude: 150 },
+          message: /0 to 1/i,
+          keys: ["concession_magnitude"],
+        },
+        {
+          metrics: { reasoning_provided: 123 },
+          message: /0 or 1/i,
+          keys: ["reasoning_provided"],
+        },
+        {
+          metrics: { offers_made: 1.5 },
+          message: /non-negative integers/i,
+          keys: ["offers_made"],
+        },
+        {
+          metrics: { rounds: -1 },
+          message: /non-negative integers/i,
+          keys: ["rounds"],
+        },
+      ];
+
+      for (const scenario of cases) {
+        const { storage, masterKey, byName, signer, counterparty } =
+          await makeBridgeHarness();
+        const outcome = makeOutcome({
+          proposer_did: signer.publicIdentity.did,
+          acceptor_did: counterparty.publicIdentity.did,
+        });
+        const committed = parseToolResult(await byName("bridge_commit").handler({
+          ...outcome,
+          identity_id: signer.publicIdentity.identity_id,
+        }));
+
+        const result = parseToolResult(await byName("bridge_attest").handler({
+          bridge_commitment_id: committed.bridge_commitment_id,
+          outcome_result: "completed",
+          identity_id: signer.publicIdentity.identity_id,
+          metrics: scenario.metrics,
+        }));
+
+        expect(result.error).toMatch(scenario.message);
+        for (const key of scenario.keys) {
+          expect(result.error).toMatch(key);
+        }
+        expect(result.attestation_id).toBeUndefined();
+
+        const reputationStore = new ReputationStore(storage, masterKey);
+        const summary = await reputationStore.query({ context: "concordia-bridge" });
+        expect(summary.total_interactions).toBe(0);
+        expect(await storage.list("_reputation")).toHaveLength(0);
+      }
+    });
+
+    it("bridge_attest accepts allowlisted behavioral metrics and persists them", async () => {
+      const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const result = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+        metrics: {
+          rounds: 3,
+          response_time_ms: 450,
+          concession_magnitude: 0.25,
+          offers_made: 2,
+          reasoning_provided: 1,
+        },
+      }));
+
+      expect(result.error).toBeUndefined();
+      expect(result.attestation_id).toBeDefined();
+
+      const reputationStore = new ReputationStore(storage, masterKey);
+      const stored = await reputationStore.findExistingAttestation({
+        interaction_id: outcome.session_id,
+        participant_did: signer.publicIdentity.did,
+        counterparty_did: counterparty.publicIdentity.did,
+        context: "concordia-bridge",
+      });
+      expect(stored?.attestation.data.metrics).toEqual({
+        rounds: 3,
+        response_time_ms: 450,
+        concession_magnitude: 0.25,
+        offers_made: 2,
+        reasoning_provided: 1,
+        negotiation_rounds: outcome.rounds,
+      });
+
+      const summary = await reputationStore.query({ context: "concordia-bridge" });
+      expect(summary.total_interactions).toBe(1);
+      expect(summary.aggregate_metrics.response_time_ms.mean).toBe(450);
+      expect(summary.aggregate_metrics.negotiation_rounds.mean).toBe(outcome.rounds);
+    });
+
+    it("bridge_attest names every offending metric key in the rejection error", async () => {
+      const { byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const result = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+        metrics: {
+          price: 150,
+          quantity: 1000,
+        },
+      }));
+
+      expect(result.error).toMatch(/offending metric key/);
+      expect(result.error).toMatch(/price/);
+      expect(result.error).toMatch(/quantity/);
+    });
+
     // F1 make-or-break: idempotent bridge_attest (no reputation double-count)
     it("bridge_attest records reputation exactly once across repeated attests of the same commitment", async () => {
       const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
