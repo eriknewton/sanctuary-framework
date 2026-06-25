@@ -167,7 +167,9 @@ export interface FederationRootRotationCertificate {
    * rotation cert stays byte-for-byte unchanged.
    *
    * When present, this binds the OLD hybrid master (both Ed25519 + ML-DSA-65
-   * components) to the NEW hybrid master (both components) and carries a HYBRID
+   * components) to the NEW hybrid master (both components) AND to the full
+   * classical certificate body above (`old_master_pubkey`, `new_master`,
+   * `fortress_id`, `rotation_serial`, `rotated_at`). It carries a HYBRID
    * signature bundle (both-must-pass) produced by the OLD hybrid master's two
    * private keys. A hybrid joiner MUST verify this bundle (both components) to
    * adopt the new hybrid master; verifying only the classical `old_master_signature`

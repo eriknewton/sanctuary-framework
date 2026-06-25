@@ -306,7 +306,7 @@ describe("rotate-root --compromised: MERGE-BAR 6 (downgrade resistance)", () => 
       previous_hash: null,
       event_hash: "unused-by-verify",
     };
-    const verified = verifyFederationRootRevocationEvent({
+    const verified = await verifyFederationRootRevocationEvent({
       event,
       fortressId: revocation.fortress_id,
       pinnedMaster: k2Master,
@@ -318,7 +318,7 @@ describe("rotate-root --compromised: MERGE-BAR 6 (downgrade resistance)", () => 
     // The SAME event verified against the OLD master/principal is rejected
     // (principal chain invalid): a K1-rooted verifier cannot validate a
     // K2-signed revocation.
-    const underK1 = verifyFederationRootRevocationEvent({
+    const underK1 = await verifyFederationRootRevocationEvent({
       event,
       fortressId: revocation.fortress_id,
       pinnedMaster: k1Master,

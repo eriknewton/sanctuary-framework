@@ -205,6 +205,12 @@ interface FederationRotationJournalData {
    */
   old_hybrid_ed25519_pubkey?: string;
   old_hybrid_ml_dsa_pubkey?: string;
+  /**
+   * True when the live root being rotated was hybrid. Resume uses this durable bit
+   * to refuse a staged record that lacks a valid hybrid block instead of
+   * classically promoting over a hybrid root.
+   */
+  hybrid_expected?: boolean;
 }
 
 export interface FederationRotateRootAuditEvent {
@@ -439,6 +445,11 @@ function parseStagedRecord(json: string): FederationTrustRootRecord {
   // as hybrid; if a hybrid block is present it MUST decode (a malformed staged
   // hybrid throws, never silently drops to classical -- constraint 5).
   const value = JSON.parse(json) as Record<string, unknown>;
+  if (value.hybrid !== undefined && !isStagedObject(value.hybrid)) {
+    throw new FederationRotateRootResumeError(
+      "hybrid block in staged record is present but malformed; refusing to resume fail-closed",
+    );
+  }
   const decode32 = (b64: unknown, label: string): Uint8Array => {
     if (typeof b64 !== "string") {
       throw new FederationRotateRootResumeError(`${label} missing in staged record`);
@@ -585,6 +596,8 @@ async function mintRotatedRecord(
       });
       const hybridSigned = await signFederationRootRotationHybridBinding({
         fortress_id: live.fortress_id,
+        old_master_pubkey: live.pinned_master_pubkey.public_key,
+        new_master: newMasterPublic,
         rotation_serial: newRotationSerial,
         old_hybrid_master: live.hybrid.pinned_master,
         new_hybrid_master: newHybrid.pinned_master,
@@ -682,6 +695,12 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
   // captured, so every key derived from it must change.
   const newMasterSecret = randomBytes(32);
   let newHybrid: FederationHybridMasterMaterial | undefined;
+  let newHybridPrincipalPrivateKeys:
+    | {
+        ed25519: { key_ref: string; private_key: Uint8Array };
+        ml_dsa_65: { key_ref: string; secret_key: Uint8Array };
+      }
+    | undefined;
   try {
     const cascade = rekeyOnMasterRotation({
       new_master_secret: k2.private_key,
@@ -703,12 +722,6 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
     // under the stable fortress_id (NO rotation cert, downgrade-resistant). The
     // OLD hybrid master is revoked by the caller via a hybrid revocation signed
     // under the NEW hybrid principal.
-    let newHybridPrincipalPrivateKeys:
-      | {
-          ed25519: { key_ref: string; private_key: Uint8Array };
-          ml_dsa_65: { key_ref: string; secret_key: Uint8Array };
-        }
-      | undefined;
     if (live.hybrid !== undefined) {
       newHybrid = await mintHybridFederationMaterial({
         fortressId: live.fortress_id,
@@ -757,6 +770,10 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
     };
   } catch (err) {
     if (newHybrid) zeroHybridMaterialSecrets(newHybrid);
+    if (newHybridPrincipalPrivateKeys) {
+      newHybridPrincipalPrivateKeys.ed25519.private_key.fill(0);
+      newHybridPrincipalPrivateKeys.ml_dsa_65.secret_key.fill(0);
+    }
     throw err;
   } finally {
     k2.private_key.fill(0);
@@ -768,11 +785,12 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
 // ── Promote (atomic point of no return) ──────────────────────────────────
 
 /**
- * Promote the staged record to the live key, then delete the staged record and
- * the journal LAST. Idempotent: a re-run with the staged record already gone
- * just clears the journal. The live store's save() re-validates the full record
- * (cert chain + rotation-cert coherence) before the write, so a corrupt staged
- * record can never be promoted.
+ * Promote the staged record to the live key, then delete the staged record.
+ * Idempotent: a re-run with the staged record already gone leaves the live
+ * record as-is and lets the caller finish any remaining durable safety work
+ * before clearing the journal. The live store's save() re-validates the full
+ * record (cert chain + rotation-cert coherence) before the write, so a corrupt
+ * staged record can never be promoted.
  */
 async function promote(
   storage: StorageBackend,
@@ -794,6 +812,11 @@ async function promote(
   const liveStore = new FederationTrustRootStore(storage, masterKey);
   if (staged) {
     try {
+      if (journal.hybrid_expected === true && staged.hybrid === undefined) {
+        throw new FederationRotateRootResumeError(
+          "rotate-root journal expected a hybrid staged root, but the staged record has no valid hybrid block; refusing to promote fail-closed",
+        );
+      }
       // save() validates (cert chain + rotation-cert coherence) then writes.
       await liveStore.save(staged);
       failpoint("live-record-promoted");
@@ -807,8 +830,14 @@ async function promote(
     failpoint("staged-deleted");
   }
   // else: a prior resume already promoted + deleted the staged record; the live
-  // record is already K2. Just clear the journal.
+  // record is already K2. The caller still owns any remaining idempotent work
+  // (for compromise: durable revocation persistence) before it clears the journal.
+}
 
+async function clearRotationJournal(
+  storage: StorageBackend,
+  failpoint: (p: string) => void,
+): Promise<void> {
   await storage.delete(
     FEDERATION_TRUST_ROOT_NAMESPACE,
     FEDERATION_ROTATE_ROOT_JOURNAL_KEY,
@@ -870,25 +899,26 @@ export async function rotateFederationRootRenew(
       "this fortress is not a provisioned federation issuer (no _federation/trust-root-v1 to rotate); run `sanctuary federation provision` first",
     );
   }
-  if (!live.master_private_key) {
-    throw new FederationRotateRootError(
-      "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
-    );
-  }
-  // PQC Slice 3: a hybrid root rotates the HYBRID master in lockstep (constraint
-  // 5: never silently drop the ML-DSA block). A malformed hybrid block fails
-  // closed inside mintRotatedRecord (HybridRotateDowngradeError) BEFORE staging.
-
-  const oldSerial = typeof live.rotation_serial === "number" ? live.rotation_serial : 0;
-  const newSerial = oldSerial + 1;
-
-  log(
-    live.hybrid !== undefined
-      ? "Minting the new HYBRID federation signing master (K2, Ed25519+ML-DSA-65)..."
-      : "Minting the new federation signing master (K2)...",
-  );
-  const rotated = await mintRotatedRecord(live, newSerial);
+  let rotated: FederationTrustRootRecord | undefined;
   try {
+    if (!live.master_private_key) {
+      throw new FederationRotateRootError(
+        "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
+      );
+    }
+    // PQC Slice 3: a hybrid root rotates the HYBRID master in lockstep (constraint
+    // 5: never silently drop the ML-DSA block). A malformed hybrid block fails
+    // closed inside mintRotatedRecord (HybridRotateDowngradeError) BEFORE staging.
+
+    const oldSerial = typeof live.rotation_serial === "number" ? live.rotation_serial : 0;
+    const newSerial = oldSerial + 1;
+
+    log(
+      live.hybrid !== undefined
+        ? "Minting the new HYBRID federation signing master (K2, Ed25519+ML-DSA-65)..."
+        : "Minting the new federation signing master (K2)...",
+    );
+    rotated = await mintRotatedRecord(live, newSerial);
     const journal: FederationRotationJournalData = {
       v: 1,
       fortress_id: live.fortress_id,
@@ -899,6 +929,7 @@ export async function rotateFederationRootRenew(
       new_master_pubkey: rotated.pinned_master_pubkey.public_key,
       started_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      hybrid_expected: live.hybrid !== undefined,
     };
 
     // Stage the new record FIRST, then the journal. A crash after the staged
@@ -939,6 +970,7 @@ export async function rotateFederationRootRenew(
         resumed: false,
       },
     });
+    await clearRotationJournal(storage, failpoint);
     return result;
   } catch (err) {
     await emitAudit(opts.audit, {
@@ -952,7 +984,7 @@ export async function rotateFederationRootRenew(
     });
     throw err;
   } finally {
-    zeroRecordSecrets(rotated);
+    if (rotated) zeroRecordSecrets(rotated);
     zeroLiveSecrets(live);
   }
 }
@@ -1020,58 +1052,68 @@ export async function rotateFederationRootCompromised(
       "this fortress is not a provisioned federation issuer (no _federation/trust-root-v1 to rotate); run `sanctuary federation provision` first",
     );
   }
-  if (!live.master_private_key) {
-    throw new FederationRotateRootError(
-      "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
-    );
-  }
-  // PQC Slice 3: a hybrid root rotates the HYBRID master in lockstep. A malformed
-  // hybrid block fails closed inside mintCompromiseRotatedRecord BEFORE staging
-  // (constraint 5). Capture the OLD hybrid component public keys NOW (the live
-  // hybrid private material is zeroed once minting reads it).
   let oldRevokedHybrid: FederationRootRevocationHybridBinding | undefined;
-  if (live.hybrid !== undefined) {
-    assertHybridRecordWellFormedForRotation(live.hybrid);
-    const oldHybridPub = live.hybrid.pinned_master.public_keys;
-    oldRevokedHybrid = {
-      ed25519: {
-        key_ref: oldHybridPub.ed25519.key_ref,
-        public_key: oldHybridPub.ed25519.public_key,
-      },
-      ml_dsa_65: {
-        key_ref: oldHybridPub.ml_dsa_65.key_ref,
-        public_key: oldHybridPub.ml_dsa_65.public_key,
-      },
-    };
-  }
-
-  const oldMasterPubkey = live.pinned_master_pubkey.public_key;
-  // The compromise rotate advances a SEPARATE revocation_serial (parallel to the
-  // node eviction_serial), sourced from the durable sync-state floor so a re-run
-  // never replays an earlier serial.
-  const syncStateStore = new FederationSyncStateStore({ storage, masterKey });
-  let priorSnapshot: FederationSyncStateSnapshot;
+  let oldMasterPubkey = "";
+  let newRevocationSerial = 1;
+  let rotated: FederationTrustRootRecord | undefined;
+  let newPrincipalPrivateKey: Uint8Array | undefined;
+  let newHybridPrincipalPrivateKeys:
+    | {
+        ed25519: { key_ref: string; private_key: Uint8Array };
+        ml_dsa_65: { key_ref: string; secret_key: Uint8Array };
+      }
+    | undefined;
   try {
-    priorSnapshot = await syncStateStore.load();
-  } catch (err) {
-    // Present-but-corrupt durable state -> fail closed (do NOT rotate onto an
-    // unevaluable revocation floor that could replay an old serial).
-    throw new FederationRotateRootError(
-      `the durable federation sync-state is present but unreadable; restore _federation from backup before a compromise rotate (${err instanceof Error ? err.message : "load failed"})`,
+    if (!live.master_private_key) {
+      throw new FederationRotateRootError(
+        "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
+      );
+    }
+    // PQC Slice 3: a hybrid root rotates the HYBRID master in lockstep. A malformed
+    // hybrid block fails closed inside mintCompromiseRotatedRecord BEFORE staging
+    // (constraint 5). Capture the OLD hybrid component public keys NOW (the live
+    // hybrid private material is zeroed once minting reads it).
+    if (live.hybrid !== undefined) {
+      assertHybridRecordWellFormedForRotation(live.hybrid);
+      const oldHybridPub = live.hybrid.pinned_master.public_keys;
+      oldRevokedHybrid = {
+        ed25519: {
+          key_ref: oldHybridPub.ed25519.key_ref,
+          public_key: oldHybridPub.ed25519.public_key,
+        },
+        ml_dsa_65: {
+          key_ref: oldHybridPub.ml_dsa_65.key_ref,
+          public_key: oldHybridPub.ml_dsa_65.public_key,
+        },
+      };
+    }
+
+    oldMasterPubkey = live.pinned_master_pubkey.public_key;
+    // The compromise rotate advances a SEPARATE revocation_serial (parallel to the
+    // node eviction_serial), sourced from the durable sync-state floor so a re-run
+    // never replays an earlier serial.
+    const syncStateStore = new FederationSyncStateStore({ storage, masterKey });
+    let priorSnapshot: FederationSyncStateSnapshot;
+    try {
+      priorSnapshot = await syncStateStore.load();
+    } catch (err) {
+      // Present-but-corrupt durable state -> fail closed (do NOT rotate onto an
+      // unevaluable revocation floor that could replay an old serial).
+      throw new FederationRotateRootError(
+        `the durable federation sync-state is present but unreadable; restore _federation from backup before a compromise rotate (${err instanceof Error ? err.message : "load failed"})`,
+      );
+    }
+    newRevocationSerial = priorSnapshot.highestRevocationSerial + 1;
+
+    log(
+      live.hybrid !== undefined
+        ? "Minting the new HYBRID federation signing master (K2, Ed25519+ML-DSA-65) + fresh master_secret..."
+        : "Minting the new federation signing master (K2) + fresh master_secret...",
     );
-  }
-  const newRevocationSerial = priorSnapshot.highestRevocationSerial + 1;
-
-  log(
-    live.hybrid !== undefined
-      ? "Minting the new HYBRID federation signing master (K2, Ed25519+ML-DSA-65) + fresh master_secret..."
-      : "Minting the new federation signing master (K2) + fresh master_secret...",
-  );
-  const minted = await mintCompromiseRotatedRecord(live);
-  const rotated = minted.record;
-  const newPrincipalPrivateKey = minted.newPrincipalPrivateKey;
-  const newHybridPrincipalPrivateKeys = minted.newHybridPrincipalPrivateKeys;
-  try {
+    const minted = await mintCompromiseRotatedRecord(live);
+    rotated = minted.record;
+    newPrincipalPrivateKey = minted.newPrincipalPrivateKey;
+    newHybridPrincipalPrivateKeys = minted.newHybridPrincipalPrivateKeys;
     const journal: FederationRotationJournalData = {
       v: 1,
       fortress_id: live.fortress_id,
@@ -1088,6 +1130,7 @@ export async function rotateFederationRootCompromised(
       updated_at: new Date().toISOString(),
       compromise: true,
       revocation_serial: newRevocationSerial,
+      hybrid_expected: live.hybrid !== undefined,
       ...(oldRevokedHybrid !== undefined
         ? {
             old_hybrid_ed25519_pubkey: oldRevokedHybrid.ed25519.public_key,
@@ -1173,6 +1216,7 @@ export async function rotateFederationRootCompromised(
         hybrid: oldRevokedHybrid !== undefined,
       },
     });
+    await clearRotationJournal(storage, failpoint);
 
     return {
       fortress_id: rotated.fortress_id,
@@ -1196,12 +1240,12 @@ export async function rotateFederationRootCompromised(
     });
     throw err;
   } finally {
-    newPrincipalPrivateKey.fill(0);
+    newPrincipalPrivateKey?.fill(0);
     if (newHybridPrincipalPrivateKeys) {
       newHybridPrincipalPrivateKeys.ed25519.private_key.fill(0);
       newHybridPrincipalPrivateKeys.ml_dsa_65.secret_key.fill(0);
     }
-    zeroRecordSecrets(rotated);
+    if (rotated) zeroRecordSecrets(rotated);
     zeroLiveSecrets(live);
   }
 }
@@ -1245,12 +1289,12 @@ export async function resumeFederationRootRotation(
   // After promote the live record is K2. Load it (validated) for the result.
   const liveStore = new FederationTrustRootStore(storage, masterKey);
   const live = await liveStore.load();
-  if (live === null || !live.rotation_cert || typeof live.rotation_serial !== "number") {
-    throw new FederationRotateRootResumeError(
-      "rotate-root resumed but the promoted root is missing its rotation cert; restore _federation from backup",
-    );
-  }
   try {
+    if (live === null || !live.rotation_cert || typeof live.rotation_serial !== "number") {
+      throw new FederationRotateRootResumeError(
+        "rotate-root resumed but the promoted root is missing its rotation cert; restore _federation from backup",
+      );
+    }
     const result: RotateFederationRootResult = {
       fortress_id: live.fortress_id,
       new_pinned_master: { ...live.pinned_master_pubkey },
@@ -1275,9 +1319,10 @@ export async function resumeFederationRootRotation(
         resumed: true,
       },
     });
+    await clearRotationJournal(storage, failpoint);
     return result;
   } finally {
-    zeroLiveSecrets(live);
+    if (live) zeroLiveSecrets(live);
   }
 }
 
@@ -1330,43 +1375,43 @@ export async function resumeFederationRootCompromised(
   // After promote the live record is K2 (no rotation cert, by design).
   const liveStore = new FederationTrustRootStore(storage, masterKey);
   const live = await liveStore.load();
-  if (live === null) {
-    throw new FederationRotateRootResumeError(
-      "compromise rotate-root resumed but the promoted root failed to load; restore _federation from backup",
-    );
-  }
-
-  // Re-persist the durable root revocation (idempotent). The journal carries the
-  // revoked old master + serial so a crash between promote and the original
-  // persist is recoverable without re-minting.
-  const revocationSerial =
-    typeof journal.revocation_serial === "number" ? journal.revocation_serial : 1;
-  const syncStateStore = new FederationSyncStateStore({ storage, masterKey });
-  let snapshot: FederationSyncStateSnapshot;
   try {
-    snapshot = await syncStateStore.load();
-  } catch (err) {
-    throw new FederationRotateRootResumeError(
-      `the durable federation sync-state is present but unreadable; restore _federation from backup before resuming the compromise rotate (${err instanceof Error ? err.message : "load failed"})`,
-    );
-  }
-  snapshot.revokedRootPubkeys.add(journal.old_master_pubkey);
-  // PQC Slice 3: re-add BOTH old hybrid component pubkeys from the journal so a
-  // resumed hybrid compromise still denies any chain pinning either old component.
-  if (typeof journal.old_hybrid_ed25519_pubkey === "string") {
-    snapshot.revokedRootPubkeys.add(journal.old_hybrid_ed25519_pubkey);
-  }
-  if (typeof journal.old_hybrid_ml_dsa_pubkey === "string") {
-    snapshot.revokedRootPubkeys.add(journal.old_hybrid_ml_dsa_pubkey);
-  }
-  snapshot.highestRevocationSerial = Math.max(
-    snapshot.highestRevocationSerial,
-    revocationSerial,
-  );
-  await syncStateStore.persist(snapshot);
-  failpoint("root-revocation-persisted");
+    if (live === null) {
+      throw new FederationRotateRootResumeError(
+        "compromise rotate-root resumed but the promoted root failed to load; restore _federation from backup",
+      );
+    }
 
-  try {
+    // Re-persist the durable root revocation (idempotent). The journal carries the
+    // revoked old master + serial so a crash between promote and the original
+    // persist is recoverable without re-minting.
+    const revocationSerial =
+      typeof journal.revocation_serial === "number" ? journal.revocation_serial : 1;
+    const syncStateStore = new FederationSyncStateStore({ storage, masterKey });
+    let snapshot: FederationSyncStateSnapshot;
+    try {
+      snapshot = await syncStateStore.load();
+    } catch (err) {
+      throw new FederationRotateRootResumeError(
+        `the durable federation sync-state is present but unreadable; restore _federation from backup before resuming the compromise rotate (${err instanceof Error ? err.message : "load failed"})`,
+      );
+    }
+    snapshot.revokedRootPubkeys.add(journal.old_master_pubkey);
+    // PQC Slice 3: re-add BOTH old hybrid component pubkeys from the journal so a
+    // resumed hybrid compromise still denies any chain pinning either old component.
+    if (typeof journal.old_hybrid_ed25519_pubkey === "string") {
+      snapshot.revokedRootPubkeys.add(journal.old_hybrid_ed25519_pubkey);
+    }
+    if (typeof journal.old_hybrid_ml_dsa_pubkey === "string") {
+      snapshot.revokedRootPubkeys.add(journal.old_hybrid_ml_dsa_pubkey);
+    }
+    snapshot.highestRevocationSerial = Math.max(
+      snapshot.highestRevocationSerial,
+      revocationSerial,
+    );
+    await syncStateStore.persist(snapshot);
+    failpoint("root-revocation-persisted");
+
     await emitAudit(opts.audit, {
       operation: "federation_root_compromise_revoked",
       result: "success",
@@ -1379,6 +1424,7 @@ export async function resumeFederationRootCompromised(
         resumed: true,
       },
     });
+    await clearRotationJournal(storage, failpoint);
     // DEBT: the signed revocation event from the original run is not
     // reconstructable here (the K2 principal key is at rest, not in the journal);
     // the durable projection is the enforcement source of truth and is now
@@ -1421,7 +1467,7 @@ export async function resumeFederationRootCompromised(
         : {}),
     };
   } finally {
-    zeroLiveSecrets(live);
+    if (live) zeroLiveSecrets(live);
   }
 }
 

@@ -402,31 +402,38 @@ export async function mintHybridFederationMaterial(params: {
     owner_kind: "node",
     owner_id: params.nodeId,
   });
-  const issuingPrincipalCert = await issuePrincipalCertificateV2Hybrid({
-    principal_id: params.principalId ?? "principal-root",
-    principal_public_keys: principalKeys.public_keys,
-    role: "root",
-    master_public_keys: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-  });
-  const localNodeCert = await issueNodeIdentityCertificateV2Hybrid({
-    node_id: params.nodeId,
-    node_public_keys: nodeKeys.public_keys,
-    node_mode: params.nodeMode ?? "local",
-    capabilities: CAP_STANDARD_FORTRESS_NODE,
-    principal_certificate: issuingPrincipalCert,
-    principal_private_keys: principalKeys.private_keys,
-    master_public_keys: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-  });
-  return {
-    pinned_master: pinnedMaster,
-    master_private_keys: masterGen.private_keys,
-    issuing_principal_cert: issuingPrincipalCert,
-    issuing_principal_private_keys: principalKeys.private_keys,
-    local_node_cert: localNodeCert,
-    local_node_private_keys: nodeKeys.private_keys,
-  };
+  try {
+    const issuingPrincipalCert = await issuePrincipalCertificateV2Hybrid({
+      principal_id: params.principalId ?? "principal-root",
+      principal_public_keys: principalKeys.public_keys,
+      role: "root",
+      master_public_keys: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+    });
+    const localNodeCert = await issueNodeIdentityCertificateV2Hybrid({
+      node_id: params.nodeId,
+      node_public_keys: nodeKeys.public_keys,
+      node_mode: params.nodeMode ?? "local",
+      capabilities: CAP_STANDARD_FORTRESS_NODE,
+      principal_certificate: issuingPrincipalCert,
+      principal_private_keys: principalKeys.private_keys,
+      master_public_keys: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+    });
+    return {
+      pinned_master: pinnedMaster,
+      master_private_keys: masterGen.private_keys,
+      issuing_principal_cert: issuingPrincipalCert,
+      issuing_principal_private_keys: principalKeys.private_keys,
+      local_node_cert: localNodeCert,
+      local_node_private_keys: nodeKeys.private_keys,
+    };
+  } catch (err) {
+    zeroHybridPrivateKeyMaterial(masterGen.private_keys);
+    zeroHybridPrivateKeyMaterial(principalKeys.private_keys);
+    zeroHybridPrivateKeyMaterial(nodeKeys.private_keys);
+    throw err;
+  }
 }
 
 /**
@@ -1065,9 +1072,13 @@ export function zeroHybridMaterialSecrets(
     hybrid.issuing_principal_private_keys,
     hybrid.local_node_private_keys,
   ]) {
-    keys.ed25519.private_key.fill(0);
-    keys.ml_dsa_65.secret_key.fill(0);
+    zeroHybridPrivateKeyMaterial(keys);
   }
+}
+
+function zeroHybridPrivateKeyMaterial(keys: HybridPrivateKeyMaterial): void {
+  keys.ed25519.private_key.fill(0);
+  keys.ml_dsa_65.secret_key.fill(0);
 }
 
 async function auditTrustRoot(

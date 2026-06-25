@@ -716,6 +716,7 @@ export type FederationRootRevocationRejectionReason =
   | "principal_mismatch"
   | "principal_chain_invalid"
   | "operator_signature_invalid"
+  | "operator_signature_bundle_invalid"
   | "revocation_serial_replay"
   | "unsupported_event_version";
 
@@ -942,13 +943,14 @@ export async function verifyFederationRootRevocationHybridBundle(
  * fortress binding + principal binding + serial monotonicity + principal chain
  * + operator signature. A `false`/throw at the call site fails closed.
  */
-export function verifyFederationRootRevocationEvent(input: {
+export async function verifyFederationRootRevocationEvent(input: {
   event: FederationRevocationLogEvent;
   fortressId: string;
   pinnedMaster: FortressMasterPublicKey;
   operatorPrincipalCert: PrincipalCertificate;
+  operatorHybridPrincipalPublicKeys?: HybridCertificatePublicKeys;
   highestRevocationSerial: number;
-}): FederationRootRevocationVerification {
+}): Promise<FederationRootRevocationVerification> {
   const { event } = input;
   if (event.kind !== FEDERATION_ROOT_REVOCATION_EVENT_KIND) {
     return { ok: false, reason: "wrong_event_kind" };
@@ -1010,6 +1012,18 @@ export function verifyFederationRootRevocationEvent(input: {
     fromBase64url(input.operatorPrincipalCert.principal_pubkey),
   );
   if (!ok) return { ok: false, reason: "operator_signature_invalid" };
+  if (payload.revoked_hybrid !== undefined) {
+    if (input.operatorHybridPrincipalPublicKeys === undefined) {
+      return { ok: false, reason: "operator_signature_bundle_invalid" };
+    }
+    const hybridOk = await verifyFederationRootRevocationHybridBundle(
+      payload,
+      input.operatorHybridPrincipalPublicKeys,
+    );
+    if (!hybridOk) {
+      return { ok: false, reason: "operator_signature_bundle_invalid" };
+    }
+  }
 
   return {
     ok: true,
@@ -1025,22 +1039,32 @@ export function verifyFederationRootRevocationEvent(input: {
  * the security boundary. Adds the revoked root pubkey to the grow-only set and
  * lifts the serial floor.
  */
-export function foldFederationRootRevocationEvent(input: {
+export async function foldFederationRootRevocationEvent(input: {
   event: FederationRevocationLogEvent;
   projection: FederationRootRevocationProjection;
   fortressId: string;
   pinnedMaster: FortressMasterPublicKey;
   operatorPrincipalCert: PrincipalCertificate;
-}): FederationRootRevocationVerification {
-  const verification = verifyFederationRootRevocationEvent({
+  operatorHybridPrincipalPublicKeys?: HybridCertificatePublicKeys;
+}): Promise<FederationRootRevocationVerification> {
+  const verification = await verifyFederationRootRevocationEvent({
     event: input.event,
     fortressId: input.fortressId,
     pinnedMaster: input.pinnedMaster,
     operatorPrincipalCert: input.operatorPrincipalCert,
+    operatorHybridPrincipalPublicKeys: input.operatorHybridPrincipalPublicKeys,
     highestRevocationSerial: input.projection.highestRevocationSerial,
   });
   if (!verification.ok) return verification;
   input.projection.revokedRootPubkeys.add(verification.revokedMasterPubkey);
+  if (verification.payload.revoked_hybrid !== undefined) {
+    input.projection.revokedRootPubkeys.add(
+      verification.payload.revoked_hybrid.ed25519.public_key,
+    );
+    input.projection.revokedRootPubkeys.add(
+      verification.payload.revoked_hybrid.ml_dsa_65.public_key,
+    );
+  }
   input.projection.highestRevocationSerial = verification.revocationSerial;
   return verification;
 }
@@ -1081,6 +1105,10 @@ export function foldAcceptedFederationRootRevocationEvent(input: {
   }
 
   input.projection.revokedRootPubkeys.add(payload.revoked_master_pubkey);
+  if (payload.revoked_hybrid !== undefined) {
+    input.projection.revokedRootPubkeys.add(payload.revoked_hybrid.ed25519.public_key);
+    input.projection.revokedRootPubkeys.add(payload.revoked_hybrid.ml_dsa_65.public_key);
+  }
   input.projection.highestRevocationSerial = payload.revocation_serial;
   return {
     ok: true,
@@ -1129,6 +1157,10 @@ function parseRootRevocationPayload(
   }
   const revokedHybrid = parseRevokedHybridBinding(payload.revoked_hybrid);
   if (revokedHybrid === "invalid") return null;
+  const signatureBundle = parseSignatureBundle(payload.operator_signature_bundle);
+  if (signatureBundle === "invalid") return null;
+  if (revokedHybrid !== undefined && signatureBundle === undefined) return null;
+  if (revokedHybrid === undefined && signatureBundle !== undefined) return null;
   return {
     event_version: eventVersion,
     fortress_id: fortressId,
@@ -1138,9 +1170,7 @@ function parseRootRevocationPayload(
     operator_principal_id: operatorPrincipalId,
     operator_signature: operatorSignature,
     ...(revokedHybrid !== undefined ? { revoked_hybrid: revokedHybrid } : {}),
-    ...(isSignatureBundle(payload.operator_signature_bundle)
-      ? { operator_signature_bundle: payload.operator_signature_bundle }
-      : {}),
+    ...(signatureBundle !== undefined ? { operator_signature_bundle: signatureBundle } : {}),
   };
 }
 
@@ -1180,12 +1210,41 @@ function parseRevokedHybridBinding(
   };
 }
 
-function isSignatureBundle(value: unknown): value is SignatureBundle {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Array.isArray((value as { components?: unknown }).components)
-  );
+function parseSignatureBundle(
+  value: unknown,
+): SignatureBundle | undefined | "invalid" {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null) return "invalid";
+  const bundle = value as Record<string, unknown>;
+  if (
+    bundle.bundle_version !== "sanctuary.signature-bundle.v1" ||
+    typeof bundle.signature_suite !== "string" ||
+    bundle.signature_suite.length === 0 ||
+    !Array.isArray(bundle.components)
+  ) {
+    return "invalid";
+  }
+  const components = bundle.components.map((component) => {
+    if (typeof component !== "object" || component === null) return "invalid";
+    const c = component as Record<string, unknown>;
+    if (
+      typeof c.alg !== "string" ||
+      c.alg.length === 0 ||
+      typeof c.key_ref !== "string" ||
+      c.key_ref.length === 0 ||
+      typeof c.sig !== "string" ||
+      c.sig.length === 0
+    ) {
+      return "invalid";
+    }
+    return { alg: c.alg, key_ref: c.key_ref, sig: c.sig };
+  });
+  if (components.some((component) => component === "invalid")) return "invalid";
+  return {
+    bundle_version: "sanctuary.signature-bundle.v1",
+    signature_suite: bundle.signature_suite,
+    components: components as SignatureBundle["components"],
+  };
 }
 
 function parseNodeEvictionPayload(
