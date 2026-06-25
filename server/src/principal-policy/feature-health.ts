@@ -345,6 +345,21 @@ export type FeatureHealthBasis =
   // non-green `unknown`.
   | "intentionally_stopped"
   | "no_activity_event_driven"
+  // Observability (event-floor slice): an event-driven feature WITH an OPT-IN,
+  // operator-declared expectation floor whose activity in the window met or
+  // exceeded the floor. Reads `active`/green - the operator expected events and
+  // got them. Distinct from `activity_in_window` only so the UI can say "met your
+  // declared floor" honestly; a feature with NO floor never reaches this basis.
+  | "floor_met"
+  // Observability (event-floor slice): an event-driven feature WITH an OPT-IN,
+  // operator-declared expectation floor whose activity in the window fell BELOW
+  // the floor. Reads `unconfirmed`/yellow - "you declared you expect this and it
+  // is quieter than that." NOT `fault`/red: we do not KNOW it is broken, only
+  // that it is below the operator's own stated expectation. A feature with NO
+  // declared floor NEVER reaches this basis (quiet stays `no_activity_event_driven`),
+  // and nothing here is auto-derived - the floor is operator-declared, never a
+  // trailing-median auto-threshold (the design's named false-alarm trap).
+  | "below_expected_floor"
   | "integrity_tainted"
   // The freshness-window scan could not be proven complete (it returned a full
   // page, so an older fault inside the window may have been dropped). We cannot
@@ -352,6 +367,38 @@ export type FeatureHealthBasis =
   // green on this basis - it fails closed to `unknown`. See codex MEDIUM
   // 2026-06-13.
   | "freshness_scan_incomplete";
+
+/**
+ * An OPT-IN, operator-declared "expected minimum volume" for an event-driven
+ * feature: the operator (or an enterprise policy) asserts "feature X is expected
+ * to fire at least `minInvocations` times over the digest window." This is
+ * OPERATOR-DECLARED CONFIGURATION, never an auto-derived threshold: the value is
+ * set by a human in the registry/config artifact, so a false alarm is the
+ * operator's own declared expectation, not the system inventing one (design
+ * §2.3). Auto-baselining a floor from a trailing median is OUT OF SCOPE and
+ * forbidden - that is the classic false-alarm generator the design names.
+ *
+ * A floor is purely additive: a feature WITHOUT one keeps its conservative
+ * default (quiet = a non-green `unconfirmed` chip, NEVER red). With a floor, a
+ * below-floor window reads `unconfirmed`/yellow ("you expected this and it is
+ * quiet"), and a met-floor window reads `active`/green. The floor only ever
+ * sharpens the green/quiet split for a feature the operator explicitly opted in;
+ * it never manufactures a red, never couples to enforcement, and never raises an
+ * OS notification (that path is the 3 fault classes only - design §4.3).
+ *
+ * Only meaningful for `event_driven` features. Self-reporting features prove
+ * liveness from their own evidence + heartbeat, so a floor is ignored for them
+ * (and rejected at registry validation - see `assertExpectationFloorsWellFormed`).
+ */
+export interface FeatureExpectationFloor {
+  /**
+   * The minimum invocation count the operator declares they expect over the
+   * digest window. Must be a positive integer (a floor of 0 is vacuous - it can
+   * never be unmet - and is rejected at validation so a meaningless config can
+   * never silently disable the signal).
+   */
+  readonly minInvocations: number;
+}
 
 /**
  * A feature's matcher + liveness declaration. This is configuration, not
@@ -444,6 +491,15 @@ export interface FeatureRegistryEntry {
    */
   noHeartbeatFaultWhenProducerKeyPresent?: boolean;
   /**
+   * OPT-IN operator-declared expectation floor (event-driven features only). When
+   * present, a below-floor window reads `unconfirmed`/yellow and a met-floor
+   * window reads `active`/green; absent, the feature keeps its conservative
+   * quiet-is-`unconfirmed` default. NEVER auto-derived (no trailing-median
+   * auto-threshold ever populates this; the median is descriptive-only). Ignored
+   * for `self_reporting` features and rejected for them at registry validation.
+   */
+  expectationFloor?: FeatureExpectationFloor;
+  /**
    * Whether broken-zero is even detectable for this feature. Surfaced verbatim
    * so the UI never implies "confirmed working" for a feature it cannot
    * independently confirm. Self-reporting → true; event-driven → false.
@@ -474,6 +530,22 @@ export interface FeatureHealthRow {
    * them). The UI uses this to phrase the `unconfirmed` chip honestly.
    */
   broken_zero_detectable: boolean;
+  /**
+   * The OPT-IN operator-declared minimum invocation count for this feature over
+   * the window, or null when the operator declared no floor. OPERATOR-DECLARED,
+   * never auto-derived. When non-null and `invocation_count` is below it, the row
+   * reads `unconfirmed`/`below_expected_floor`; when met, `active`/`floor_met`.
+   */
+  expectation_floor: number | null;
+  /**
+   * DESCRIPTIVE-ONLY context: the trailing-median invocation volume for this
+   * feature over recent windows, surfaced so an operator can SEE typical volume
+   * when deciding whether to declare a floor. It is NEVER an auto-threshold and
+   * NEVER drives `status` or `basis` (auto-baselining is the design's named
+   * false-alarm trap, §2.3, and is forbidden). Null when no trailing context is
+   * available. The reader computes nothing from it; it is pure display data.
+   */
+  trailing_window_volume: number | null;
   /** True when the backing audit read was integrity-clean. */
   audit_integrity_ok: boolean;
   /** Freshness window (ms) used to judge "recent" for self-reporting features. */
@@ -667,6 +739,44 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
 // feature-health tests) requires.
 assertPluginMatcherDisjoint(SLICE1_FEATURE_REGISTRY);
 
+/**
+ * Validate every declared expectation floor at registry-load (same discipline as
+ * the mutual-exclusion check): a floor is OPT-IN config for event-driven features
+ * only, and `minInvocations` must be a positive integer. Throws at import time on
+ * a malformed declaration so a meaningless or misplaced floor can never silently
+ * mis-color a row:
+ *
+ *  - A floor on a `self_reporting` feature is rejected: those prove liveness from
+ *    their own evidence/heartbeat, so a volume floor would be a second, weaker
+ *    color model for them (and is ignored by the evaluator regardless).
+ *  - A non-integer / non-positive `minInvocations` is rejected: a floor of 0 is
+ *    vacuous (can never be unmet) and a fractional/negative floor is nonsense, so
+ *    accepting one would be a silently-dead config.
+ */
+export function assertExpectationFloorsWellFormed(
+  registry: ReadonlyArray<FeatureRegistryEntry>,
+): void {
+  for (const feature of registry) {
+    const floor = feature.expectationFloor;
+    if (floor === undefined) continue;
+    if (feature.liveness !== "event_driven") {
+      throw new Error(
+        `feature-health: expectationFloor declared on non-event_driven feature "${feature.id}" (floors are opt-in for event-driven features only)`,
+      );
+    }
+    if (
+      !Number.isInteger(floor.minInvocations) ||
+      floor.minInvocations <= 0
+    ) {
+      throw new Error(
+        `feature-health: expectationFloor.minInvocations for "${feature.id}" must be a positive integer, got ${String(floor.minInvocations)}`,
+      );
+    }
+  }
+}
+
+assertExpectationFloorsWellFormed(SLICE1_FEATURE_REGISTRY);
+
 export interface BuildFeatureHealthInput {
   auditLog: AuditLog;
   originMachine: string;
@@ -755,6 +865,13 @@ export function evaluateFeatureHealth(args: {
   producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
+  /**
+   * DESCRIPTIVE-ONLY trailing-median invocation volume for this feature, surfaced
+   * verbatim on the row for operator context. It NEVER influences `status` or
+   * `basis` (no-auto-baselining invariant): the evaluator only echoes it into
+   * `trailing_window_volume`. Null when no trailing context is available.
+   */
+  trailingWindowVolume?: number | null;
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
@@ -1192,7 +1309,29 @@ export function evaluateFeatureHealth(args: {
     // undetectable for these features (the config-vs-activity cross-check is
     // vacuous - configured-ON + zero activity is indistinguishable from
     // healthy-quiet).
-    if (invocationCount > 0) {
+    //
+    // OPT-IN expectation floor (additive, operator-declared): when the operator
+    // has declared a floor for THIS feature, it sharpens the green/quiet split:
+    //   - count >= floor → `active`/`floor_met` (you expected events and got them).
+    //   - count <  floor → `unconfirmed`/`below_expected_floor` (you expected this
+    //     and it is quieter than that). NOT `fault`/red: below-floor is the
+    //     operator's stated expectation, not proof the feature is broken.
+    // A feature with NO declared floor keeps the conservative default EXACTLY:
+    // any activity is green, zero is `unconfirmed`/`no_activity_event_driven`,
+    // and silence NEVER fires. The floor is operator-declared, never auto-derived
+    // - the trailing-median context is descriptive-only and never reaches here.
+    const floor = feature.expectationFloor;
+    if (floor !== undefined) {
+      if (invocationCount >= floor.minInvocations) {
+        status = "active";
+        basis = "floor_met";
+      } else {
+        // Below the operator's declared floor (including a fully-quiet window):
+        // an honest "expected-but-quiet" yellow, never red, never green.
+        status = "unconfirmed";
+        basis = "below_expected_floor";
+      }
+    } else if (invocationCount > 0) {
       status = "active";
       basis = "activity_in_window";
     } else {
@@ -1214,6 +1353,13 @@ export function evaluateFeatureHealth(args: {
         ? new Date(latestInvocationMs).toISOString()
         : null,
     broken_zero_detectable: feature.brokenZeroDetectable,
+    expectation_floor: feature.expectationFloor?.minInvocations ?? null,
+    // DESCRIPTIVE-ONLY: surfaced verbatim from the injected context (the panel
+    // builder's trailing-median read), never computed into a status here. This
+    // is the strict no-auto-baselining boundary: the median is shown as context,
+    // and the assignment below is the ONLY place it touches the row - it cannot
+    // reach `status`/`basis` because those were already decided above without it.
+    trailing_window_volume: args.trailingWindowVolume ?? null,
     audit_integrity_ok: integrityOk,
     freshness_window_ms: freshnessWindowMs,
   };
@@ -1291,6 +1437,51 @@ export interface FeatureHealthPanel {
      */
     broker_daemon_silent_death_detectable: boolean;
   };
+}
+
+/**
+ * DESCRIPTIVE-ONLY trailing-window volume for one event-driven feature: the
+ * MEDIAN of the feature's invocation counts across evenly-divided sub-buckets of
+ * the digest window, folded from the SAME in-window entries the panel already
+ * read (no second query, no second store). This is operator CONTEXT for the
+ * "should I declare a floor, and at what level?" decision - it is NEVER an
+ * auto-threshold and is never passed into the status decision (auto-baselining is
+ * the design's named false-alarm trap, §2.3, and is forbidden). Only computed for
+ * event-driven features (self-reporting features prove liveness directly), and
+ * only surfaced as `trailing_window_volume`. Returns null when there is nothing
+ * to summarize.
+ */
+function descriptiveTrailingVolume(
+  feature: FeatureRegistryEntry,
+  inWindowEntries: ReadonlyArray<AuditEntry>,
+  now: number,
+  windowMs: number,
+): number | null {
+  if (feature.liveness !== "event_driven") return null;
+  const BUCKETS = 4;
+  const bucketMs = windowMs / BUCKETS;
+  if (!(bucketMs > 0)) return null;
+  const counts = new Array<number>(BUCKETS).fill(0);
+  const windowFloor = now - windowMs;
+  let sawAny = false;
+  for (const entry of inWindowEntries) {
+    if (entry.layer !== feature.layer) continue;
+    if (!feature.invocationOps.has(entry.operation)) continue;
+    const ts = Date.parse(entry.timestamp);
+    if (Number.isNaN(ts) || ts < windowFloor || ts > now) continue;
+    sawAny = true;
+    let idx = Math.floor((ts - windowFloor) / bucketMs);
+    if (idx < 0) idx = 0;
+    if (idx >= BUCKETS) idx = BUCKETS - 1;
+    counts[idx] += 1;
+  }
+  if (!sawAny) return null;
+  const sorted = [...counts].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  // Even count → average the two middle buckets (a descriptive median).
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
 }
 
 /**
@@ -1410,6 +1601,15 @@ export async function buildFeatureHealthPanel(
     const featureProducerKeyUnavailable = isBrokerDaemon
       ? input.brokerProducerKeyExpectedButUnavailable === true
       : false;
+    // Descriptive-only trailing volume (no-auto-baselining boundary): computed
+    // from the SAME in-window read and passed in as pure context. It is echoed
+    // onto the row and NEVER influences the status decision.
+    const trailingWindowVolume = descriptiveTrailingVolume(
+      feature,
+      inWindow,
+      now,
+      windowMs,
+    );
     return evaluateFeatureHealth({
       feature,
       entries: inWindow,
@@ -1420,6 +1620,7 @@ export async function buildFeatureHealthPanel(
       freshnessWindowMs,
       integrityOk,
       pinnedProducerKeyB64url: featurePinnedProducerKey,
+      trailingWindowVolume,
       ...(featureProducerKeyUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),

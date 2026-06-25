@@ -525,6 +525,10 @@ export function renderPostureHomeHTML(): string {
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
           : "No activity in the window.";
+      case "floor_met":
+        return "Activity met the minimum volume you declared for this feature.";
+      case "below_expected_floor":
+        return "Below the minimum volume you declared for this feature. This is your stated expectation being quiet, not a detected fault.";
       case "integrity_tainted":
         return "Audit integrity finding present; status cannot be trusted.";
       case "freshness_scan_incomplete":
