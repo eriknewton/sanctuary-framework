@@ -42,6 +42,26 @@ export const FEDERATION_SYNC_WIRE_VERSION =
 export const V1_FEDERATION_NODE_EVICTION_DOMAIN =
   "sanctuary.v1.federation-node-eviction";
 
+/**
+ * Operator-authority ROOT-REVOCATION event (rotate-root --compromised, Slice
+ * 3c-1). Distinct from `node_eviction`: a `node_eviction` revokes ONE node's
+ * cert; a `federation_root_revocation` revokes the WHOLE old fortress-master
+ * (root) K1 after a compromise rotate to K2. It is the durable, replay-proofed
+ * record that the old root must never again be trusted as a chain anchor.
+ *
+ * DOWNGRADE-RESISTANCE INVARIANT: this event is signed by the NEW principal
+ * under K2 (the post-rotation root), NEVER by K1. An attacker who stole K1
+ * cannot forge a revocation that the fortress would fold (the verify step pins
+ * the CURRENT principal/K2). And there is no old-(K1)-signed adoption artifact
+ * anywhere in the compromise flow: re-pin is out of band (Slice 3c-2).
+ */
+export const FEDERATION_ROOT_REVOCATION_EVENT_KIND =
+  "federation_root_revocation" as const;
+export const FEDERATION_ROOT_REVOCATION_EVENT_VERSION =
+  "sanctuary.v1.federation-root-revocation" as const;
+export const V1_FEDERATION_ROOT_REVOCATION_DOMAIN =
+  "sanctuary.v1.federation-root-revocation";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const DEFAULT_FEDERATION_NODE_CERT_LIFETIME_MS = 365 * DAY_MS;
@@ -74,6 +94,34 @@ export interface FederationRevocationLogEvent {
 export interface FederationNodeRevocationProjection {
   revokedNodeIds: Set<string>;
   highestEvictionSerial: number;
+}
+
+/**
+ * The signed body of a root-revocation event. Mirrors the node-eviction payload
+ * shape: an operator-authority record carrying the revoked material + a strictly
+ * monotonic serial, signed by the operator principal. The signed master here is
+ * the OLD (now-revoked) root K1; the SIGNATURE is by the NEW principal under K2.
+ */
+export interface FederationRootRevocationPayload {
+  event_version: typeof FEDERATION_ROOT_REVOCATION_EVENT_VERSION;
+  fortress_id: string;
+  /** Base64url Ed25519 public key of the REVOKED old fortress-master (K1). */
+  revoked_master_pubkey: string;
+  effective_at: string;
+  /** Strictly-monotonic per-fortress revocation serial (replay/rollback proof). */
+  revocation_serial: number;
+  operator_principal_id: string;
+  operator_signature: string;
+}
+
+/**
+ * The folded root-revocation projection: a grow-only set of revoked root
+ * (fortress-master) pubkeys + the highest accepted revocation serial. Parallel
+ * to {@link FederationNodeRevocationProjection} for nodes.
+ */
+export interface FederationRootRevocationProjection {
+  revokedRootPubkeys: Set<string>;
+  highestRevocationSerial: number;
 }
 
 export interface FederationAcceptanceEvent {
@@ -599,6 +647,291 @@ export function foldAcceptedFederationNodeEvictionEvent(input: {
     nodeId: payload.node_id,
     evictionSerial: payload.eviction_serial,
     payload,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Root revocation (rotate-root --compromised, Slice 3c-1)
+// ═══════════════════════════════════════════════════════════════════════
+
+export type FederationRootRevocationVerification =
+  | {
+      ok: true;
+      revokedMasterPubkey: string;
+      revocationSerial: number;
+      payload: FederationRootRevocationPayload;
+    }
+  | { ok: false; reason: FederationRootRevocationRejectionReason };
+
+export type FederationRootRevocationRejectionReason =
+  | "wrong_event_kind"
+  | "wrong_authority_origin"
+  | "malformed_payload"
+  | "fortress_mismatch"
+  | "principal_mismatch"
+  | "principal_chain_invalid"
+  | "operator_signature_invalid"
+  | "revocation_serial_replay"
+  | "unsupported_event_version";
+
+export function buildFederationRootRevocationMessage(
+  payload: Omit<FederationRootRevocationPayload, "operator_signature">,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts = [
+    encoder.encode(V1_FEDERATION_ROOT_REVOCATION_DOMAIN),
+    lengthPrefixed(encoder.encode(canonicalJson(payload))),
+  ];
+  const total = parts.reduce((n, part) => n + part.length, 0);
+  const message = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    message.set(part, offset);
+    offset += part.length;
+  }
+  return message;
+}
+
+/**
+ * Sign a root-revocation payload with the NEW (post-compromise) operator
+ * principal private key, the one chaining to K2. The caller MUST zero the
+ * private key after return (constraint 6). Signing under K2 (never K1) is the
+ * structural downgrade-resistance guarantee: a thief holding K1 cannot forge a
+ * revocation the fortress would fold.
+ */
+export function signFederationRootRevocationPayload(params: {
+  fortressId: string;
+  revokedMasterPubkey: string;
+  effectiveAt: string;
+  revocationSerial: number;
+  operatorPrincipalId: string;
+  operatorPrincipalPrivateKey: Uint8Array;
+}): FederationRootRevocationPayload {
+  const body = {
+    event_version: FEDERATION_ROOT_REVOCATION_EVENT_VERSION,
+    fortress_id: params.fortressId,
+    revoked_master_pubkey: params.revokedMasterPubkey,
+    effective_at: params.effectiveAt,
+    revocation_serial: params.revocationSerial,
+    operator_principal_id: params.operatorPrincipalId,
+  };
+  const signature = ed25519.sign(
+    buildFederationRootRevocationMessage(body),
+    params.operatorPrincipalPrivateKey,
+  );
+  return {
+    ...body,
+    operator_signature: toBase64url(signature),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SCOPE (Slice 3c-1): the verify + fold functions below are the VERIFIER
+// SUBSTRATE and the test-proven downgrade-resistance invariants (sign-under-K2 /
+// reject-under-K1, serial-monotonicity, principal-chain). They are NOT yet a
+// live production enforcement path: in 3c-1 no production code appends, syncs,
+// or folds a wire root-revocation event; enforcement runs entirely off the
+// durable revoked-root projection set + the `isRootRevoked` hook. The
+// wire-acceptance fold path (a peer/joiner adopting a remote root-revocation
+// event) is a LATER slice (3c-2 / 3d). Keep these: the downgrade-resistance
+// proof requires the sign+verify pair, and they are the design-specified Q6
+// substrate the later slice consumes.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Verify a root-revocation event under the CURRENT principal cert (which chains
+ * to K2, the post-rotation root). Mirrors {@link
+ * verifyFederationNodeEvictionEvent}: kind + authority origin + payload shape +
+ * fortress binding + principal binding + serial monotonicity + principal chain
+ * + operator signature. A `false`/throw at the call site fails closed.
+ */
+export function verifyFederationRootRevocationEvent(input: {
+  event: FederationRevocationLogEvent;
+  fortressId: string;
+  pinnedMaster: FortressMasterPublicKey;
+  operatorPrincipalCert: PrincipalCertificate;
+  highestRevocationSerial: number;
+}): FederationRootRevocationVerification {
+  const { event } = input;
+  if (event.kind !== FEDERATION_ROOT_REVOCATION_EVENT_KIND) {
+    return { ok: false, reason: "wrong_event_kind" };
+  }
+  if (
+    event.origin_node_id !== federationOperatorAuthorityOrigin(input.fortressId)
+  ) {
+    return { ok: false, reason: "wrong_authority_origin" };
+  }
+  if (event.payload.event_version !== FEDERATION_ROOT_REVOCATION_EVENT_VERSION) {
+    return { ok: false, reason: "unsupported_event_version" };
+  }
+  const payload = parseRootRevocationPayload(event.payload);
+  if (payload === null) return { ok: false, reason: "malformed_payload" };
+  if (payload.fortress_id !== input.fortressId) {
+    return { ok: false, reason: "fortress_mismatch" };
+  }
+  if (
+    payload.operator_principal_id !== input.operatorPrincipalCert.principal_id
+  ) {
+    return { ok: false, reason: "principal_mismatch" };
+  }
+  if (payload.revocation_serial <= input.highestRevocationSerial) {
+    return { ok: false, reason: "revocation_serial_replay" };
+  }
+
+  try {
+    verifyPrincipalCertificate(input.operatorPrincipalCert, input.pinnedMaster);
+  } catch {
+    return { ok: false, reason: "principal_chain_invalid" };
+  }
+
+  let signature: Uint8Array;
+  try {
+    signature = fromBase64url(payload.operator_signature);
+  } catch {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
+  if (signature.length !== 64) {
+    return { ok: false, reason: "operator_signature_invalid" };
+  }
+  const signedBody = {
+    event_version: payload.event_version,
+    fortress_id: payload.fortress_id,
+    revoked_master_pubkey: payload.revoked_master_pubkey,
+    effective_at: payload.effective_at,
+    revocation_serial: payload.revocation_serial,
+    operator_principal_id: payload.operator_principal_id,
+  };
+  const ok = verify(
+    buildFederationRootRevocationMessage(signedBody),
+    signature,
+    fromBase64url(input.operatorPrincipalCert.principal_pubkey),
+  );
+  if (!ok) return { ok: false, reason: "operator_signature_invalid" };
+
+  return {
+    ok: true,
+    revokedMasterPubkey: payload.revoked_master_pubkey,
+    revocationSerial: payload.revocation_serial,
+    payload,
+  };
+}
+
+/**
+ * Verify-then-fold a root-revocation event under the current principal/K2. Used
+ * on the ACCEPTANCE path (a NEW event arriving), where the operator signature is
+ * the security boundary. Adds the revoked root pubkey to the grow-only set and
+ * lifts the serial floor.
+ */
+export function foldFederationRootRevocationEvent(input: {
+  event: FederationRevocationLogEvent;
+  projection: FederationRootRevocationProjection;
+  fortressId: string;
+  pinnedMaster: FortressMasterPublicKey;
+  operatorPrincipalCert: PrincipalCertificate;
+}): FederationRootRevocationVerification {
+  const verification = verifyFederationRootRevocationEvent({
+    event: input.event,
+    fortressId: input.fortressId,
+    pinnedMaster: input.pinnedMaster,
+    operatorPrincipalCert: input.operatorPrincipalCert,
+    highestRevocationSerial: input.projection.highestRevocationSerial,
+  });
+  if (!verification.ok) return verification;
+  input.projection.revokedRootPubkeys.add(verification.revokedMasterPubkey);
+  input.projection.highestRevocationSerial = verification.revocationSerial;
+  return verification;
+}
+
+/**
+ * Replay an already-accepted durable root-revocation into the in-memory
+ * projection. As with {@link foldAcceptedFederationNodeEvictionEvent}, the
+ * acceptance-time verification was the security boundary; reprojection after a
+ * legitimate principal rotation must NOT re-verify the old signature under the
+ * current principal (a rotation would otherwise un-revoke). This validates the
+ * stable wire shape + fortress binding + authority origin + serial monotonicity,
+ * but deliberately does not re-check the signature.
+ */
+export function foldAcceptedFederationRootRevocationEvent(input: {
+  event: FederationRevocationLogEvent;
+  projection: FederationRootRevocationProjection;
+  fortressId: string;
+}): FederationRootRevocationVerification {
+  const { event } = input;
+  if (event.kind !== FEDERATION_ROOT_REVOCATION_EVENT_KIND) {
+    return { ok: false, reason: "wrong_event_kind" };
+  }
+  if (
+    event.origin_node_id !== federationOperatorAuthorityOrigin(input.fortressId)
+  ) {
+    return { ok: false, reason: "wrong_authority_origin" };
+  }
+  if (event.payload.event_version !== FEDERATION_ROOT_REVOCATION_EVENT_VERSION) {
+    return { ok: false, reason: "unsupported_event_version" };
+  }
+  const payload = parseRootRevocationPayload(event.payload);
+  if (payload === null) return { ok: false, reason: "malformed_payload" };
+  if (payload.fortress_id !== input.fortressId) {
+    return { ok: false, reason: "fortress_mismatch" };
+  }
+  if (payload.revocation_serial <= input.projection.highestRevocationSerial) {
+    return { ok: false, reason: "revocation_serial_replay" };
+  }
+
+  input.projection.revokedRootPubkeys.add(payload.revoked_master_pubkey);
+  input.projection.highestRevocationSerial = payload.revocation_serial;
+  return {
+    ok: true,
+    revokedMasterPubkey: payload.revoked_master_pubkey,
+    revocationSerial: payload.revocation_serial,
+    payload,
+  };
+}
+
+function parseRootRevocationPayload(
+  payload: Record<string, unknown>,
+): FederationRootRevocationPayload | null {
+  const eventVersion = payload.event_version;
+  const fortressId = payload.fortress_id;
+  const revokedMasterPubkey = payload.revoked_master_pubkey;
+  const effectiveAt = payload.effective_at;
+  const revocationSerial = payload.revocation_serial;
+  const operatorPrincipalId = payload.operator_principal_id;
+  const operatorSignature = payload.operator_signature;
+  if (eventVersion !== FEDERATION_ROOT_REVOCATION_EVENT_VERSION) return null;
+  if (typeof fortressId !== "string" || fortressId.length === 0) return null;
+  if (
+    typeof revokedMasterPubkey !== "string" ||
+    revokedMasterPubkey.length === 0
+  ) {
+    return null;
+  }
+  if (typeof effectiveAt !== "string" || Number.isNaN(Date.parse(effectiveAt))) {
+    return null;
+  }
+  if (
+    typeof revocationSerial !== "number" ||
+    !Number.isSafeInteger(revocationSerial) ||
+    revocationSerial < 1
+  ) {
+    return null;
+  }
+  if (
+    typeof operatorPrincipalId !== "string" ||
+    operatorPrincipalId.length === 0
+  ) {
+    return null;
+  }
+  if (typeof operatorSignature !== "string" || operatorSignature.length === 0) {
+    return null;
+  }
+  return {
+    event_version: eventVersion,
+    fortress_id: fortressId,
+    revoked_master_pubkey: revokedMasterPubkey,
+    effective_at: effectiveAt,
+    revocation_serial: revocationSerial,
+    operator_principal_id: operatorPrincipalId,
+    operator_signature: operatorSignature,
   };
 }
 

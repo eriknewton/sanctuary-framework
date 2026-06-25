@@ -229,6 +229,8 @@ describe("Federation 3/3b P0 - durable sync-state at the dashboard seam", () => 
       outboundHighWater: 0,
       revokedNodeIds: new Set(),
       highestEvictionSerial: 0,
+      revokedRootPubkeys: new Set(),
+      highestRevocationSerial: 0,
     });
     const raw = await storage.read("_federation", "sync-state-v1");
     const obj = JSON.parse(new TextDecoder().decode(raw!)) as { ct: string };

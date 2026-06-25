@@ -43,6 +43,8 @@ function sampleSnapshot(): FederationSyncStateSnapshot {
     outboundHighWater: 5,
     revokedNodeIds: new Set(["evil-node", "stale-node"]),
     highestEvictionSerial: 3,
+    revokedRootPubkeys: new Set(["revoked-root-k1"]),
+    highestRevocationSerial: 1,
   };
 }
 
