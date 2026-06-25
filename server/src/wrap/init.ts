@@ -485,9 +485,10 @@ export async function runInit(
   // independently-orphanable secret, nothing written to disk in plaintext.
   // --no-identity (or SANCTUARY_INIT_NO_IDENTITY) skips it. Reuses the
   // existing createIdentity + IdentityManager.saveNew primitives; no new
-  // crypto. Idempotent: if a default identity already exists (e.g. a --force
-  // re-init over a prior fortress, or a prior MCP session), init skips
-  // rather than minting a second or clobbering it.
+  // crypto. A defensive guard (below) skips minting if a default identity is
+  // already visible under the current master; note a normal --force re-init
+  // derives a NEW master, so the prior identity is invisible (not skipped) and
+  // a fresh "operator" identity is minted under the new custody.
   const skipIdentity = resolveNoIdentity(options);
   if (skipIdentity) {
     await auditLog.appendCritical({
@@ -503,47 +504,60 @@ export async function runInit(
   } else {
     try {
       const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-      const identityManager = new IdentityManager(storage, masterKey);
-      // Load any pre-existing identities so the idempotency guard sees them
-      // (and saveNew's conflict check has the current set). A fresh init has
-      // none; a --force re-init over a prior fortress may.
-      await identityManager.load();
-      const existing = identityManager.getDefault();
-      if (existing) {
-        await auditLog.appendCritical({
-          layer: "l2",
-          operation: "operator_identity_seed_skipped",
-          identity_id: fortressId,
-          result: "success",
-          details: {
-            source: "sanctuary-init",
-            reason: "default-operator-identity-already-exists",
-            existing_identity_id: existing.identity_id,
-          },
-        });
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `\n  Sanctuary init: a default operator identity already exists` +
-            ` (${existing.identity_id}); leaving it unchanged.\n`,
-        );
-      } else {
-        const { storedIdentity } = createIdentity(
-          "operator",
-          identityEncKey,
-          passphrase ? "passphrase" : "recovery-key",
-        );
-        await identityManager.saveNew(storedIdentity);
-        await auditLog.appendCritical({
-          layer: "l2",
-          operation: "operator_identity_seeded",
-          identity_id: fortressId,
-          result: "success",
-          details: {
-            source: "sanctuary-init",
-            seeded_identity_id: storedIdentity.identity_id,
-            label: "operator",
-          },
-        });
+      try {
+        const identityManager = new IdentityManager(storage, masterKey);
+        await identityManager.load();
+        const existing = identityManager.getDefault();
+        if (existing) {
+          // Defensive: skip minting if a default operator identity is already
+          // visible under the CURRENT master. Not reachable via a normal
+          // `runInit` (a fresh init has an empty fortress, and a --force
+          // re-init derives a brand-new random master under which the prior
+          // `_identities` blobs cannot decrypt, so getDefault() returns
+          // undefined), but this guards any future path that seeds under an
+          // already-established master.
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seed_skipped",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              reason: "default-operator-identity-already-exists",
+              existing_identity_id: existing.identity_id,
+            },
+          });
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `\n  Sanctuary init: a default operator identity already exists` +
+              ` (${existing.identity_id}); leaving it unchanged.\n`,
+          );
+        } else {
+          const { storedIdentity } = createIdentity(
+            "operator",
+            identityEncKey,
+            passphrase ? "passphrase" : "recovery-key",
+          );
+          await identityManager.saveNew(storedIdentity);
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seeded",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              seeded_identity_id: storedIdentity.identity_id,
+              label: "operator",
+            },
+          });
+        }
+      } finally {
+        // Zero the symmetric key that wraps the new private key as soon as it
+        // has done its job (success, the skip path, or error), mirroring how
+        // the raw private key is zeroed inside createIdentity. masterKey
+        // itself is zeroed on the error path below and on the success path
+        // after pin provisioning.
+        identityEncKey.fill(0);
       }
     } catch (err) {
       // Fail-closed (AGENTS.md #5): never leave a half-provisioned fortress

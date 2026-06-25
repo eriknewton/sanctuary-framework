@@ -880,12 +880,16 @@ describe("--no-identity (default operator-identity seed)", () => {
     masterKey.fill(0);
   });
 
-  it("seeds EXACTLY ONE operator identity (no double-seed) and the guard skips a pre-existing default", async () => {
-    // A default init seeds exactly one identity (the guard prevents a second
-    // within one init). Then, with the SAME master, we directly drive the
-    // idempotency guard's reachable path: an IdentityManager that already has
-    // a default identity must report it, which is what init checks before
-    // minting — proving init would skip rather than mint a second.
+  it("seeds EXACTLY ONE operator identity (no double-seed) and the guard's predicate holds under a reused master", async () => {
+    // A default init seeds exactly one identity (never two). We then assert
+    // the idempotency guard's PREDICATE directly: under the SAME master, an
+    // IdentityManager that already has a default identity reports it via
+    // getDefault() — the exact check init runs before minting. Note this is
+    // NOT reachable through a normal runInit (a fresh init has an empty
+    // fortress and a --force re-init derives a new random master under which
+    // the prior identity is invisible, not skipped); the guard is defensive
+    // for any future caller that seeds under an already-established master,
+    // and this asserts that predicate without exercising it via init itself.
     const fortressPath = join(tmp, "idempotent-fortress");
     const result = await runInit({
       fortress: fortressPath,
@@ -911,7 +915,9 @@ describe("--no-identity (default operator-identity seed)", () => {
     const seededId = im.getDefault()!.identity_id;
 
     // The guard's exact predicate: re-loading under the same master surfaces
-    // the existing default, so the seed step short-circuits (no second mint).
+    // the existing default via getDefault(). When that predicate is true the
+    // seed step short-circuits (no second mint); here we assert the predicate
+    // itself, not init's branch selection.
     const im2 = new IdentityManager(storage, masterKey);
     await im2.load();
     expect(im2.getDefault()).toBeDefined();

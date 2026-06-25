@@ -327,12 +327,21 @@ async function cmdCreate(
       // no separate orphanable secret). The custody floor is enforced
       // inside save() for every new identity.
       const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-      const { storedIdentity } = createIdentity(
-        label,
-        identityEncKey,
-        passphrase ? "passphrase" : "recovery-key",
-      );
-      await identityManager.saveNew(storedIdentity);
+      let storedIdentity;
+      try {
+        ({ storedIdentity } = createIdentity(
+          label,
+          identityEncKey,
+          passphrase ? "passphrase" : "recovery-key",
+        ));
+        await identityManager.saveNew(storedIdentity);
+      } finally {
+        // Zero the symmetric key that wraps the new private key as soon as
+        // it has done its job (success or error), mirroring how the raw
+        // private key is zeroed inside createIdentity. masterKey itself is
+        // zeroed by the outer finally below.
+        identityEncKey.fill(0);
+      }
 
       const isPrimary =
         identityManager.getPrimaryIdentityId() === storedIdentity.identity_id;
