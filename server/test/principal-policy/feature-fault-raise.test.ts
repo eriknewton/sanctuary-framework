@@ -40,6 +40,7 @@ import {
   type UnifiedInboxEntry,
 } from "../../src/principal-policy/unified-inbox-bridge.js";
 import {
+  SLICE1_FEATURE_REGISTRY,
   type FeatureHealthPanel,
   type FeatureHealthRow,
   type FeatureHealthStatus,
@@ -520,5 +521,15 @@ describe("feature-fault raise path - the 3 fault classes only", () => {
     const raiser = new FeatureFaultRaiser({ bridge, buildPanel });
     await expect(raiser.evaluate()).resolves.toEqual([]);
     expect(ingests).toHaveLength(0);
+  });
+
+  // ── Registry-id-drift guard: CASTLE_WALL_FEATURE_ID must match the registry ──
+  it("CASTLE_WALL_FEATURE_ID still matches an id in SLICE1_FEATURE_REGISTRY (no fail-silent rename)", () => {
+    // CASTLE_WALL_FEATURE_ID is a string-literal mirror of the Castle Wall entry's
+    // `id` in SLICE1_FEATURE_REGISTRY. If that id is ever renamed, isCastleWallFault
+    // would silently stop matching and WALL-FAULT alerts would go dark on the
+    // highest-severity class. This test fails loudly on such a rename instead.
+    const ids = SLICE1_FEATURE_REGISTRY.map((entry) => entry.id);
+    expect(ids).toContain(CASTLE_WALL_FEATURE_ID);
   });
 });

@@ -1105,6 +1105,12 @@ export async function createSanctuaryServer(options?: {
     // display-only; feeds NOTHING back into enforcement. The dashboard owns the
     // raiser (it has the producer-key load + panel builder); a missing dashboard
     // or locked log makes this a no-op.
+    //
+    // ALERT LATENCY (operator-facing honesty): the raise rides this existing
+    // ~60s UnifiedInboxScheduler tick, so a feature fault can take up to one
+    // scheduler cycle (best-effort ~60s, not instant) to surface as a
+    // notification. This path adds NO faster heartbeat/poll; it deliberately
+    // reuses the inbox cadence to inherit the integrity-judged audit read.
     onTick: () => dashboard?.evaluateFeatureFaults(),
   });
   unifiedInboxScheduler.start();

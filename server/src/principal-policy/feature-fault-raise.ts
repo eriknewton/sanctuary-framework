@@ -63,7 +63,18 @@ import {
 import type { PluginHealthRow } from "./plugin-feature-health.js";
 import type { UnifiedInboxBridge, UnifiedInboxEntry } from "./unified-inbox-bridge.js";
 
-/** The native registry id of the Castle Wall row (the only self-reporting wall). */
+/**
+ * The native registry id of the Castle Wall row (the only self-reporting wall).
+ *
+ * SYNC WARNING: this MUST stay in sync with the `id` of the Castle Wall entry in
+ * `SLICE1_FEATURE_REGISTRY` (`feature-health.ts`). It is a string literal mirror,
+ * not a shared reference, so a rename of that registry id would silently break
+ * `isCastleWallFault` matching and mute WALL-FAULT alerts (a fail-silent on the
+ * highest-severity class). A registry-id-drift test in
+ * `test/principal-policy/feature-fault-raise.test.ts` asserts the registry still
+ * contains a feature with this exact id, so a future rename fails the test
+ * instead of silently going dark.
+ */
 export const CASTLE_WALL_FEATURE_ID = "castle_wall_egress";
 
 /**
@@ -292,22 +303,6 @@ export function raiseFeatureFaults(
 }
 
 /**
- * Convenience: derive + raise in one call, for the evaluation cycle. Pure
- * derivation is exposed separately (`deriveFeatureFaults`) so the invariant
- * tests assert the derivation without touching a bridge.
- */
-export function evaluateAndRaiseFeatureFaults(params: {
-  bridge: UnifiedInboxBridge;
-  current: FeatureHealthPanel;
-  prev?: FeatureHealthPanel;
-}): UnifiedInboxEntry[] {
-  return raiseFeatureFaults(
-    params.bridge,
-    deriveFeatureFaults(params.current, params.prev),
-  );
-}
-
-/**
  * Server-side raise driver, wired into the existing posture/daemon evaluation
  * cadence (it does NOT own a timer; the caller ticks it). It holds the prior
  * feature-health panel so the `feature_silently_off` ON->OFF transition can be
@@ -318,6 +313,12 @@ export function evaluateAndRaiseFeatureFaults(params: {
  *
  * It is intentionally additive and display-only: it reads feature-health, raises
  * notifications via the inbox bridge, and feeds NOTHING back into enforcement.
+ *
+ * Alert latency (operator-facing honesty): this raiser owns no timer; it is
+ * ticked by the existing UnifiedInboxScheduler (~60s cadence). A fault therefore
+ * surfaces as a notification on a best-effort ~60s cycle, not instantly. This is
+ * deliberate: it inherits the integrity-judged audit read and adds no cheaper
+ * heartbeat/poll path.
  */
 export class FeatureFaultRaiser {
   private prev: FeatureHealthPanel | undefined;
