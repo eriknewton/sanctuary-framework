@@ -82,7 +82,12 @@ describe("Principal Dashboard", () => {
       dashboard = new DashboardApprovalChannel({
         port,
         host: "127.0.0.1",
-        timeout_seconds: 2, // Short timeout for tests
+        // Generous timeout: the human-decision tests (approve/deny/concurrent)
+        // must never race the production auto-deny timer under a >2s event-loop
+        // stall during full-suite CI load. The genuine timeout-behavior test
+        // ("auto-denies on timeout when auto_deny is true") builds its OWN
+        // short-timeout dashboard so this value does not affect it.
+        timeout_seconds: 30,
         auto_deny: true,
       });
       await dashboard.start();
@@ -212,6 +217,7 @@ describe("Principal Dashboard", () => {
 
       const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
       const pending = await listRes.json();
+      expect(pending).toHaveLength(1);
 
       const denyRes = await fetch(
         `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
@@ -233,12 +239,33 @@ describe("Principal Dashboard", () => {
     });
 
     it("auto-denies on timeout when auto_deny is true", async () => {
-      const request = makeRequest();
-      const response = await dashboard.requestApproval(request);
-      // With 2-second timeout, this should auto-deny
-      expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("timeout");
-      expect(dashboard.pendingCount).toBe(0);
+      // The top-level dashboard runs a generous 30s timeout so the
+      // human-decision tests never race the auto-deny under load. This test
+      // genuinely needs a SHORT timeout to observe the auto-deny within the
+      // 5000ms budget, so it builds its own short-timeout dashboard (mirroring
+      // the SEC-002 rig below) and tears it down in a finally.
+      let timeoutDashboard: DashboardApprovalChannel | undefined;
+      let timeoutPort: number;
+      await bindWithRetry(async () => {
+        timeoutPort = randomTestPort();
+        timeoutDashboard = new DashboardApprovalChannel({
+          port: timeoutPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+        });
+        await timeoutDashboard.start();
+      });
+      try {
+        const request = makeRequest();
+        const response = await timeoutDashboard!.requestApproval(request);
+        // With 2-second timeout, this should auto-deny
+        expect(response.decision).toBe("deny");
+        expect(response.decided_by).toBe("timeout");
+        expect(timeoutDashboard!.pendingCount).toBe(0);
+      } finally {
+        await timeoutDashboard?.stop();
+      }
     }, 5000);
 
     it("handles multiple concurrent pending requests", async () => {
