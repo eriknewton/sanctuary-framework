@@ -485,6 +485,45 @@ export class ReputationStore {
   }
 
   /**
+   * Find a single existing attestation matching an interaction identity tuple,
+   * or null if none exists. Used for idempotency / replay-resistance at the
+   * recording boundary (e.g. the bridge's attest path) so a party cannot
+   * inflate reputation tallies by re-recording the same interaction N times.
+   *
+   * Matches on the full identifying tuple: the interaction id, the participant
+   * (signer) DID, the counterparty DID, and the context. Distinct parties, or
+   * the same party in a different context or interaction, are NOT deduped.
+   * Returns the FIRST match by stable attestation_id ordering for determinism.
+   */
+  async findExistingAttestation(criteria: {
+    interaction_id: string;
+    participant_did: string;
+    counterparty_did: string;
+    context: string;
+  }): Promise<StoredAttestation | null> {
+    let match: StoredAttestation | null = null;
+    for await (const page of this.loadAllPaginated(100)) {
+      for (const stored of page) {
+        const d = stored.attestation.data;
+        if (
+          d.interaction_id === criteria.interaction_id &&
+          d.participant_did === criteria.participant_did &&
+          d.counterparty_did === criteria.counterparty_did &&
+          d.context === criteria.context
+        ) {
+          if (
+            match === null ||
+            stored.attestation.attestation_id < match.attestation.attestation_id
+          ) {
+            match = stored;
+          }
+        }
+      }
+    }
+    return match;
+  }
+
+  /**
    * Query reputation data with filtering.
    * Returns aggregates only — not raw interaction data.
    */

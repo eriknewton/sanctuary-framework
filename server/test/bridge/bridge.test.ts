@@ -20,6 +20,7 @@ import { hash } from "../../src/core/hashing.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createBridgeTools } from "../../src/bridge/tools.js";
+import { ReputationStore } from "../../src/reputation/reputation-store.js";
 import {
   createBridgeCommitment,
   verifyBridgeCommitment,
@@ -652,6 +653,131 @@ describe("Concordia Bridge", () => {
 
       expect(result.error).toMatch(/failed verification/);
       expect((result.verification as Record<string, unknown>).valid).toBe(false);
+    });
+
+    // F1 make-or-break: idempotent bridge_attest (no reputation double-count)
+    it("bridge_attest records reputation exactly once across repeated attests of the same commitment", async () => {
+      const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      const commitmentId = committed.bridge_commitment_id as string;
+
+      const reputationStore = new ReputationStore(storage, masterKey);
+
+      const first = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: commitmentId,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      expect(first.already_attested).toBe(false);
+      expect(first.attestation_id).toBeDefined();
+
+      const afterFirst = await reputationStore.query({ context: "concordia-bridge" });
+      expect(afterFirst.total_interactions).toBe(1);
+
+      const second = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: commitmentId,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      // Second call returns the EXISTING attestation idempotently, signals it,
+      // and does NOT record a second.
+      expect(second.already_attested).toBe(true);
+      expect(second.attestation_id).toBe(first.attestation_id);
+
+      const afterSecond = await reputationStore.query({ context: "concordia-bridge" });
+      expect(afterSecond.total_interactions).toBe(1);
+    });
+
+    it("bridge_attest still records a DIFFERENT commitment (no over-dedup)", async () => {
+      const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcomeA = makeOutcome({
+        session_id: "concordia-session-A",
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const outcomeB = makeOutcome({
+        session_id: "concordia-session-B",
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+      const committedA = parseToolResult(await byName("bridge_commit").handler({
+        ...outcomeA,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      const committedB = parseToolResult(await byName("bridge_commit").handler({
+        ...outcomeB,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      const attestA = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committedA.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      const attestB = parseToolResult(await byName("bridge_attest").handler({
+        bridge_commitment_id: committedB.bridge_commitment_id,
+        outcome_result: "completed",
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+
+      expect(attestA.already_attested).toBe(false);
+      expect(attestB.already_attested).toBe(false);
+      expect(attestB.attestation_id).not.toBe(attestA.attestation_id);
+
+      const reputationStore = new ReputationStore(storage, masterKey);
+      const summary = await reputationStore.query({ context: "concordia-bridge" });
+      expect(summary.total_interactions).toBe(2);
+    });
+
+    // F2 make-or-break: terms_hash recomputed at commit, mismatch rejected
+    it("bridge_commit rejects a terms_hash that does not match the canonical terms", async () => {
+      const { storage, byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+        terms_hash: toBase64url(hash(stringToBytes("not-the-real-hash"))),
+      });
+
+      await expect(
+        byName("bridge_commit").handler({
+          ...outcome,
+          identity_id: signer.publicIdentity.identity_id,
+        })
+      ).rejects.toThrow(/terms_hash/);
+
+      // Nothing was persisted or signed: the bridge store has no commitment.
+      const entries = await storage.list("_bridge");
+      expect(entries.length).toBe(0);
+    });
+
+    it("bridge_commit accepts a matching terms_hash and signs only a true hash", async () => {
+      const { byName, signer, counterparty } = await makeBridgeHarness();
+      const outcome = makeOutcome({
+        proposer_did: signer.publicIdentity.did,
+        acceptor_did: counterparty.publicIdentity.did,
+      });
+
+      const committed = parseToolResult(await byName("bridge_commit").handler({
+        ...outcome,
+        identity_id: signer.publicIdentity.identity_id,
+      }));
+      expect(committed.bridge_commitment_id).toBeDefined();
+
+      // The committed outcome verifies, and the recompute-at-commit matches the
+      // recompute verifyBridgeCommitment performs (terms_hash_match true).
+      const verified = parseToolResult(await byName("bridge_verify").handler({
+        bridge_commitment_id: committed.bridge_commitment_id,
+        outcome,
+      }));
+      expect(verified.valid).toBe(true);
+      expect((verified.checks as Record<string, unknown>).terms_hash_match).toBe(true);
     });
   });
 

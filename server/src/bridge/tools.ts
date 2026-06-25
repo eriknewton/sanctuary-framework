@@ -436,6 +436,38 @@ export function createBridgeTools(
             ? outcome.acceptor_did
             : outcome.proposer_did;
 
+        // Idempotency / replay-resistance: a party can call bridge_attest
+        // repeatedly on the same valid commitment. Each call would otherwise
+        // mint a fresh attestation reusing interaction_id = session_id, and the
+        // reputation aggregator counts attestations with no de-dup, so one real
+        // negotiation would inflate the tallies N-fold (a self-serving
+        // reputation-inflation primitive on the score-integrity invariant).
+        // Detect an attestation this same party has ALREADY recorded for this
+        // session in the bridge context and return it idempotently rather than
+        // recording a second. The counterparty attesting the same session, a
+        // different context, or a different session still records normally.
+        const existingAttestation = await reputationStore.findExistingAttestation({
+          interaction_id: outcome.session_id,
+          participant_did: identity.did,
+          counterparty_did: counterpartyDid,
+          context: "concordia-bridge",
+        });
+        if (existingAttestation) {
+          return toolResult({
+            attestation_id: existingAttestation.attestation.attestation_id,
+            bridge_commitment_id: commitmentId,
+            session_id: outcome.session_id,
+            counterparty_did: counterpartyDid,
+            outcome_result: existingAttestation.attestation.data.outcome_result,
+            sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
+            attested_at: existingAttestation.recorded_at,
+            already_attested: true,
+            note:
+              "This negotiation was already attested by this identity; returning " +
+              "the existing attestation. Reputation was not recorded a second time.",
+          });
+        }
+
         // Resolve sovereignty tier from handshake results
         // Check if the counterparty has a known Sanctuary identity
         const hasSanctuaryIdentity = identityManager.list().some(
@@ -490,6 +522,7 @@ export function createBridgeTools(
           outcome_result: outcomeResult,
           sovereignty_tier: tier,
           attested_at: attestation.recorded_at,
+          already_attested: false,
           note: `Negotiation recorded as reputation attestation. ` +
             `Counterparty sovereignty tier: ${tier} (weight: ${weight}).`,
         });
