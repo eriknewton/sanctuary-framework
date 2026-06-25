@@ -116,3 +116,21 @@ export {
   parseConfinementReport,
   validateConfinementReport,
 } from "./supervisor.js";
+
+export {
+  REFERENCE_BLOCKLIST_PLUGIN_ID,
+  REFERENCE_BLOCKLIST_SIGNER_ID,
+  REFERENCE_BLOCKLIST_KEY_ID,
+  REFERENCE_BLOCKLIST_ENTRY,
+  REFERENCE_SIGNER_PUBKEY_FILENAME,
+  type LoadedReferenceBundle,
+  type SpawnedPlugin,
+  referenceBlocklistBundleDir,
+  enumerateBundle,
+  buildReferenceDescriptor,
+  signDescriptor,
+  loadReferenceBlocklistBundle,
+  readBundledSigner,
+  loadBundledReferenceBlocklist,
+  spawnReferencePlugin,
+} from "./reference-plugin/index.js";

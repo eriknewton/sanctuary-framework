@@ -25,6 +25,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "init",
   "intelligence",
   "nodes",
+  "plugin",
   "policy",
   "protect",
   "reset-passphrase",

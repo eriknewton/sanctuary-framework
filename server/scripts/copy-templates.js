@@ -32,3 +32,22 @@ for (const name of TEMPLATE_DIRS) {
   cpSync(src, dest, { recursive: true });
   console.log(`copy-templates: ${name} -> dist/templates/${name}`);
 }
+
+// Plugin-host reference plugins (slice S5): the first-party bundled plugins ship
+// their binary + governance.yaml + rules as non-TS assets. tsup bundles the host
+// loader into dist/index.js (flat), so the bundle dirs are copied to
+// dist/reference-plugin/<name>/, which referenceBlocklistBundleDir() resolves.
+const srcRefPlugins = join(__dirname, "..", "src", "substrate", "reference-plugin");
+const distRefPlugins = join(__dirname, "..", "dist", "reference-plugin");
+const REFERENCE_PLUGIN_BUNDLES = ["blocklist"];
+mkdirSync(distRefPlugins, { recursive: true });
+for (const name of REFERENCE_PLUGIN_BUNDLES) {
+  const src = join(srcRefPlugins, name);
+  if (!existsSync(src)) {
+    console.warn(`copy-templates: skipping reference plugin ${name} (not found at ${src})`);
+    continue;
+  }
+  const dest = join(distRefPlugins, name);
+  cpSync(src, dest, { recursive: true });
+  console.log(`copy-templates: reference-plugin ${name} -> dist/reference-plugin/${name}`);
+}

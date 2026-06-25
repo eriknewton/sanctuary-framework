@@ -1,0 +1,13 @@
+# Sanctuary reference blocklist plugin — egress denylist.
+# One domain per line. '#' starts a comment; blank lines are ignored.
+# A request host is DENIED if it equals a listed domain or is a subdomain of one.
+#
+# These are illustrative known-bad / exfiltration-shaped domains for the reference
+# plugin and its drill. A real Pi-hole/NextDNS-shape vendor ships its own curated
+# list; the contract is identical.
+evil.example.com
+exfil.test
+malware-c2.example
+data-exfil.example.net
+phishing.example.org
+tracker.bad-ads.example
