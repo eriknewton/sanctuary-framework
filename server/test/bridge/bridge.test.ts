@@ -684,6 +684,61 @@ describe("Concordia Bridge", () => {
       expect(await storage.list("_reputation")).toHaveLength(0);
     });
 
+    it("bridge_attest rejects invalid allowlisted metric values and persists no attestation", async () => {
+      const cases: Array<{
+        metrics: Record<string, unknown>;
+        message: RegExp;
+        keys: string[];
+      }> = [
+        {
+          metrics: { response_time_ms: "fast" },
+          message: /finite numbers/i,
+          keys: ["response_time_ms"],
+        },
+        {
+          metrics: { offers_made: 1.5 },
+          message: /non-negative integers/i,
+          keys: ["offers_made"],
+        },
+        {
+          metrics: { rounds: -1 },
+          message: /non-negative integers/i,
+          keys: ["rounds"],
+        },
+      ];
+
+      for (const scenario of cases) {
+        const { storage, masterKey, byName, signer, counterparty } =
+          await makeBridgeHarness();
+        const outcome = makeOutcome({
+          proposer_did: signer.publicIdentity.did,
+          acceptor_did: counterparty.publicIdentity.did,
+        });
+        const committed = parseToolResult(await byName("bridge_commit").handler({
+          ...outcome,
+          identity_id: signer.publicIdentity.identity_id,
+        }));
+
+        const result = parseToolResult(await byName("bridge_attest").handler({
+          bridge_commitment_id: committed.bridge_commitment_id,
+          outcome_result: "completed",
+          identity_id: signer.publicIdentity.identity_id,
+          metrics: scenario.metrics,
+        }));
+
+        expect(result.error).toMatch(scenario.message);
+        for (const key of scenario.keys) {
+          expect(result.error).toMatch(key);
+        }
+        expect(result.attestation_id).toBeUndefined();
+
+        const reputationStore = new ReputationStore(storage, masterKey);
+        const summary = await reputationStore.query({ context: "concordia-bridge" });
+        expect(summary.total_interactions).toBe(0);
+        expect(await storage.list("_reputation")).toHaveLength(0);
+      }
+    });
+
     it("bridge_attest accepts allowlisted behavioral metrics and persists them", async () => {
       const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
       const outcome = makeOutcome({

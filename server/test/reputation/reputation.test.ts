@@ -47,6 +47,10 @@ function setupIdentity(masterKey: Uint8Array) {
   return { identity: storedIdentity, encryptionKey };
 }
 
+function parseToolResult(result: { content: Array<{ text: string }> }): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
 function publicKeysFor(identity: ReturnType<typeof setupIdentity>["identity"]) {
   const publicKeys = new Map<string, Uint8Array>();
   publicKeys.set(identity.did, fromBase64url(identity.public_key));
@@ -120,6 +124,62 @@ describe("L4 Reputation Store", () => {
   });
 
   describe("record + query", () => {
+    it("rejects Concordia-bridge raw-term metrics at the record boundary and reputation_record writes nothing", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await expect(
+        store.record(
+          "bridge-direct-bypass",
+          "did:key:counterparty",
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: { price: 150 },
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/price/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const recordTool = tools.find((tool) => tool.name === "reputation_record");
+      expect(recordTool).toBeDefined();
+
+      const result = parseToolResult(
+        await recordTool!.handler({
+          interaction_id: "bridge-tool-bypass",
+          counterparty_did: "did:key:counterparty",
+          context: "concordia-bridge",
+          outcome: {
+            type: "negotiation",
+            result: "completed",
+            metrics: { price: 150 },
+          },
+        })
+      );
+
+      expect(result.error).toMatch(/only behavioral metrics are allowed/i);
+      expect(result.error).toMatch(/price/);
+      expect(result.attestation_id).toBeUndefined();
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+      await expect(store.query({ context: "concordia-bridge" })).resolves.toMatchObject({
+        total_interactions: 0,
+      });
+    });
+
     it("records an attestation and queries it back", async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();

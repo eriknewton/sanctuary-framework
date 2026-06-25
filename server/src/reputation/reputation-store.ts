@@ -29,6 +29,10 @@ import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type { SovereigntyTier } from "./tiers.js";
 import { hashToString } from "../core/hashing.js";
+import {
+  assertBridgeAttestationMetrics,
+  isConcordiaBridgeReputationContext,
+} from "./bridge-metrics.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -435,6 +439,9 @@ export class ReputationStore {
   ): Promise<StoredAttestation> {
     const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
+    const metrics = isConcordiaBridgeReputationContext(context)
+      ? assertBridgeAttestationMetrics(outcome.metrics)
+      : outcome.metrics ?? {};
 
     // Build the attestation data
     const attestationData: Attestation["data"] = {
@@ -443,7 +450,7 @@ export class ReputationStore {
       counterparty_did: counterpartyDid,
       outcome_type: outcome.type,
       outcome_result: outcome.result,
-      metrics: outcome.metrics ?? {},
+      metrics,
       context,
       timestamp: now,
       sovereignty_tier: sovereigntyTier,

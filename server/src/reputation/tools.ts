@@ -12,6 +12,7 @@ import {
   ReputationStore,
   type InteractionOutcome,
 } from "./reputation-store.js";
+import { BridgeAttestationMetricValidationError } from "./bridge-metrics.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
@@ -161,16 +162,24 @@ export function createReputationTools(
         );
         const tierMeta = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
 
-        const stored = await reputationStore.record(
-          args.interaction_id as string,
-          counterpartyDid,
-          outcome,
-          context,
-          identity,
-          identityEncryptionKey,
-          args.counterparty_attestation as string | undefined,
-          tierMeta.sovereignty_tier
-        );
+        let stored;
+        try {
+          stored = await reputationStore.record(
+            args.interaction_id as string,
+            counterpartyDid,
+            outcome,
+            context,
+            identity,
+            identityEncryptionKey,
+            args.counterparty_attestation as string | undefined,
+            tierMeta.sovereignty_tier
+          );
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
 
         await auditLog.appendCritical({
           layer: "l4",
