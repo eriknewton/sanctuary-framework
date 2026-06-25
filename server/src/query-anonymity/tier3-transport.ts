@@ -336,7 +336,7 @@ export function createTunneledFetch(
       );
     }
 
-    let tunnel: TunnelFetch | null = null;
+    let tunnel: TunnelFetch | null;
     try {
       tunnel = await config.dialer.dial(destination);
     } catch (err) {
@@ -586,7 +586,7 @@ interface TwoHopResult {
  * Step 2: over that tunnel, send `CONNECT destination:port` to the egress.
  * Step 3: TLS-handshake to the destination over the doubly-tunneled byte
  *         stream (so the provider sees a normal TLS client, terminating at
- *         the operator end-to-end — the egress cannot read content).
+ *         the operator end-to-end, so the egress cannot read content).
  */
 async function dialTwoHopConnect(
   relay: ConnectHopEndpoint,
