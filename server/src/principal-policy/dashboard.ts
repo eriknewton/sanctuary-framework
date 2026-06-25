@@ -526,6 +526,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * now. Persisting/wiring 3c's population is a 3c concern, not P0's.
    */
   private readonly _federationRevokedRoots = new Set<string>();
+  /**
+   * Slice 3c-1: the highest accepted root-revocation serial, the replay floor
+   * carried alongside {@link _federationRevokedRoots}. Loaded from the durable
+   * sync-state projection on boot and preserved in {@link
+   * snapshotFederationSyncState} so a re-persist never regresses it. The daemon
+   * does not itself MINT root revocations (the rotate-root CLI does, persisting
+   * directly into the durable store); the daemon only enforces the loaded set.
+   */
+  private _federationHighestRevocationSerial = 0;
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -1701,6 +1710,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         snapshot.highestEvictionSerial,
       ),
     };
+    // Slice 3c-1: rehydrate the durable revoked-ROOT projection so a compromise
+    // rotate's revocation of the old root SURVIVES a restart. This is the
+    // standing-weakness fix for roots: union the durable set over the live one
+    // (grow-only) and lift the revocation-serial floor. _federationRevokedRoots
+    // is the set every enforcement chokepoint (sync, /sync/peer, join) reads.
+    for (const pubkey of snapshot.revokedRootPubkeys) {
+      this._federationRevokedRoots.add(pubkey);
+    }
+    this._federationHighestRevocationSerial = Math.max(
+      this._federationHighestRevocationSerial,
+      snapshot.highestRevocationSerial,
+    );
   }
 
   /** Snapshot the live federation security state for the durable store. */
@@ -1710,6 +1731,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       outboundHighWater: this._federationOutboundHighWater,
       revokedNodeIds: new Set(this._federationState.revoked),
       highestEvictionSerial: this._federationState.evictionMaxSerial,
+      // Preserve the durable revoked-ROOT projection across re-persists so a
+      // high-water/eviction write by the daemon never drops a revoked root the
+      // rotate-root CLI committed (Slice 3c-1).
+      revokedRootPubkeys: new Set(this._federationRevokedRoots),
+      highestRevocationSerial: this._federationHighestRevocationSerial,
     };
   }
 

@@ -81,6 +81,16 @@ export interface FederationSyncStateSnapshot {
   revokedNodeIds: Set<string>;
   /** Highest accepted operator-authority eviction serial (replay floor). */
   highestEvictionSerial: number;
+  /**
+   * Folded ROOT-revocation projection (Slice 3c-1): the grow-only set of
+   * revoked fortress-master (root) pubkeys, base64url. Persisted in the SAME
+   * record/blob as the node revocations (no new at-rest HKDF label) so a
+   * compromise rotate's revocation of the old root K1 survives a daemon restart
+   * exactly like a node eviction does.
+   */
+  revokedRootPubkeys: Set<string>;
+  /** Highest accepted operator-authority revocation serial (replay floor). */
+  highestRevocationSerial: number;
 }
 
 interface PersistedSyncState {
@@ -94,6 +104,17 @@ interface PersistedSyncState {
   revoked_node_ids: string[];
   /** Highest accepted eviction serial. */
   highest_eviction_serial: number;
+  /**
+   * Folded revoked-root pubkeys (Slice 3c-1). Optional on read for
+   * forward/backward field-compatibility within v1: a pre-3c-1 record (written
+   * before this field existed) decodes to the empty set; a fresh write always
+   * includes it. Adding a field to an existing v1 blob is additive — the AEAD
+   * tag still authenticates the whole record, so a tampered/truncated blob still
+   * fails closed.
+   */
+  revoked_root_pubkeys?: string[];
+  /** Highest accepted revocation serial (optional for the same back-compat reason). */
+  highest_revocation_serial?: number;
 }
 
 export class FederationSyncStateStoreError extends Error {
@@ -110,6 +131,8 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     outboundHighWater: 0,
     revokedNodeIds: new Set(),
     highestEvictionSerial: 0,
+    revokedRootPubkeys: new Set(),
+    highestRevocationSerial: 0,
   };
 }
 
@@ -199,6 +222,8 @@ export class FederationSyncStateStore {
       outbound_high_water: snapshot.outboundHighWater,
       revoked_node_ids: [...snapshot.revokedNodeIds],
       highest_eviction_serial: snapshot.highestEvictionSerial,
+      revoked_root_pubkeys: [...snapshot.revokedRootPubkeys],
+      highest_revocation_serial: snapshot.highestRevocationSerial,
     };
     const serialized = stringToBytes(JSON.stringify(persisted));
     try {
@@ -222,6 +247,8 @@ function cloneSnapshot(
     outboundHighWater: snapshot.outboundHighWater,
     revokedNodeIds: new Set(snapshot.revokedNodeIds),
     highestEvictionSerial: snapshot.highestEvictionSerial,
+    revokedRootPubkeys: new Set(snapshot.revokedRootPubkeys),
+    highestRevocationSerial: snapshot.highestRevocationSerial,
   };
 }
 
@@ -246,12 +273,25 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     obj.highest_eviction_serial,
     "highest_eviction_serial",
   );
+  // Slice 3c-1 fields are OPTIONAL on read (a pre-3c-1 v1 record omits them);
+  // absent -> empty/zero (NOT a corruption). PRESENT-but-malformed THROWS (the
+  // same fail-closed-on-corrupt contract: never accept a half-decoded blob).
+  const revokedRootPubkeys = decodeRevokedRootPubkeys(obj.revoked_root_pubkeys);
+  const highestRevocationSerial =
+    obj.highest_revocation_serial === undefined
+      ? 0
+      : decodeNonNegativeInt(
+          obj.highest_revocation_serial,
+          "highest_revocation_serial",
+        );
 
   return {
     acceptedHighWater,
     outboundHighWater,
     revokedNodeIds,
     highestEvictionSerial,
+    revokedRootPubkeys,
+    highestRevocationSerial,
   };
 }
 
@@ -296,6 +336,22 @@ function decodeRevokedNodeIds(value: unknown): Set<string> {
       throw new FederationSyncStateStoreError("revoked node id is invalid");
     }
     out.add(nodeId);
+  }
+  return out;
+}
+
+function decodeRevokedRootPubkeys(value: unknown): Set<string> {
+  // Absent (pre-3c-1 record) -> empty, the legitimate back-compat default.
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("revoked_root_pubkeys is not an array");
+  }
+  const out = new Set<string>();
+  for (const pubkey of value) {
+    if (typeof pubkey !== "string" || pubkey.length === 0) {
+      throw new FederationSyncStateStoreError("revoked root pubkey is invalid");
+    }
+    out.add(pubkey);
   }
   return out;
 }

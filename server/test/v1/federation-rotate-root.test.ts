@@ -603,7 +603,7 @@ describe("rotate-root: refuse-if-not-provisioned + fail-closed custody", () => {
     masterKey.fill(0);
   });
 
-  it("usage errors: no mode -> exit 1; --compromise -> exit 1 (not implemented this slice)", async () => {
+  it("usage errors: no mode -> exit 1; --renew + --compromised together -> exit 1 (mutually exclusive)", async () => {
     const { masterKey } = await seedIssuer();
     masterKey.fill(0);
 
@@ -616,18 +616,20 @@ describe("rotate-root: refuse-if-not-provisioned + fail-closed custody", () => {
         err: noMode.stream,
       }),
     ).toBe(1);
-    expect(noMode.get()).toMatch(/--renew|--resume/);
+    expect(noMode.get()).toMatch(/--renew|--resume|--compromised/);
 
-    const compromise = capture();
+    // --renew and --compromised are mutually exclusive intents -> usage error
+    // (returns before any custody unlock, so the fortress is untouched).
+    const conflicting = capture();
     expect(
       await runFederationRotateRoot({
-        argv: ["--compromise", "--fortress", fortressPath],
+        argv: ["--renew", "--compromised", "--fortress", fortressPath],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
         out: capture().stream,
-        err: compromise.stream,
+        err: conflicting.stream,
       }),
     ).toBe(1);
-    expect(compromise.get()).toMatch(/not implemented in this slice|Slice 3c/i);
+    expect(conflicting.get()).toMatch(/mutually exclusive/i);
   });
 });
 

@@ -304,14 +304,26 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "cert_chain_invalid" };
   }
 
-  // 3b. Revoked-ROOT check (RR-1, feature-inert in P0). The chain just proved it
-  //     terminates at THIS pinned master, so the master pubkey to test is the
-  //     recipient's own pinned master. A revoked root (rotate-root Slice 3c
-  //     compromise recovery) denies; a throw is treated as unevaluable -> deny.
-  //     Omitting the hook skips the gate (back-compat; the set is empty in P0).
+  // 3b. Revoked-ROOT check (RR-1; ACTIVE once rotate-root Slice 3c-1 populates the
+  //     set). The chain just proved it terminates at THIS pinned master, so the
+  //     primary master pubkey to test is the recipient's own pinned master: after
+  //     a compromise rotate the live pinned master is K2, so this never fires for
+  //     a healthy fortress; but a fortress that has NOT yet re-pinned still pins
+  //     the revoked K1, and this denies any sync against it. A throw is treated as
+  //     unevaluable -> deny. Omitting the hook skips the gate (back-compat).
+  //
+  //     ALSO reject a STRAGGLER cert whose chain root (the cert's own
+  //     parent_chain.fortress_master_pubkey) is a revoked root, even though the
+  //     chain verified against the recipient's pinned master. Normally these are
+  //     the same value (the chain check above proved it), but checking the cert's
+  //     declared root explicitly is defense-in-depth: a K1-rooted cert is rejected
+  //     wherever it surfaces, independent of what the recipient currently pins.
   if (typeof input.isRootRevoked === "function") {
     try {
-      if (input.isRootRevoked(input.pinnedMaster.public_key)) {
+      if (
+        input.isRootRevoked(input.pinnedMaster.public_key) ||
+        input.isRootRevoked(env.sender_node_cert.parent_chain.fortress_master_pubkey)
+      ) {
         return { ok: false, reason: "root_revoked" };
       }
     } catch {

@@ -48,8 +48,11 @@ import {
 } from "../mesh/federation-trust-root-store.js";
 import {
   rotateFederationRootRenew,
+  rotateFederationRootCompromised,
   resumeFederationRootRotation,
+  resumeFederationRootCompromised,
   federationRotateRootInProgress,
+  federationRotateRootJournalIsCompromise,
   FederationRotateRootError,
   FederationRotateRootResumeError,
   type FederationRotateRootAuditEvent,
@@ -1144,21 +1147,19 @@ export async function runFederationRotateRoot(args: {
   const openSigner = args.openSigner ?? openOperatorSigner;
   const flags = parseRotateRootFlags(args.argv, env);
 
-  // Slice 3a is RENEWAL only. The compromise path (mint + revoke old root + no
-  // old-key-signed adoption artifact) is Slice 3c; reject it explicitly so an
-  // operator never believes a compromise was handled when it was not.
-  if (flags.compromise) {
+  // --renew and --compromised are mutually exclusive intents.
+  if (flags.compromise && flags.renew) {
     err.write(
-      "sanctuary federation rotate-root: --compromise is not implemented in this slice " +
-        "(it is Slice 3c: revoke the old root + out-of-band re-pin only). Use --renew for a " +
-        "planned re-key while the old key is still trusted.\n",
+      "sanctuary federation rotate-root: --renew and --compromised are mutually exclusive; " +
+        "pick one (--renew = planned re-key, old key stays trusted; --compromised = revoke the " +
+        "old root + rotate the master_secret, old key permanently distrusted)\n",
     );
     return 1;
   }
-  if (!flags.renew && !flags.resume) {
+  if (!flags.renew && !flags.compromise && !flags.resume) {
     err.write(
-      "sanctuary federation rotate-root: specify --renew (planned re-key) or --resume " +
-        "(complete a crashed rotation)\n",
+      "sanctuary federation rotate-root: specify --renew (planned re-key), --compromised " +
+        "(revoke a compromised root), or --resume (complete a crashed rotation)\n",
     );
     return 1;
   }
@@ -1207,14 +1208,63 @@ export async function runFederationRotateRoot(args: {
 
   try {
     const resuming = flags.resume && (await federationRotateRootInProgress(signer.storage));
-    // --resume with no journal but --renew also set -> fall through to a fresh
-    // renewal. --resume alone with no journal -> nothing to do, refuse clearly.
-    if (flags.resume && !resuming && !flags.renew) {
+    // --resume with no journal but a fresh-rotate intent also set -> fall through
+    // to a fresh rotation. --resume alone with no journal -> nothing to resume.
+    if (flags.resume && !resuming && !flags.renew && !flags.compromise) {
       err.write(
         "sanctuary federation rotate-root: no federation rotate-root is in progress on this " +
           "fortress (no journal); nothing to resume\n",
       );
       return 3;
+    }
+
+    // Whether the in-progress journal (if any) is a compromise rotate decides
+    // which resume to run, regardless of which flag the operator passed.
+    const journalIsCompromise =
+      resuming &&
+      (await federationRotateRootJournalIsCompromise(
+        signer.storage,
+        signer.masterKey,
+      ));
+    const compromisePath = resuming ? journalIsCompromise : flags.compromise;
+
+    if (compromisePath) {
+      const result = resuming
+        ? await resumeFederationRootCompromised({
+            storage: signer.storage,
+            masterKey: signer.masterKey,
+            audit,
+            log: (line) => err.write(`${line}\n`),
+          })
+        : await rotateFederationRootCompromised({
+            storage: signer.storage,
+            masterKey: signer.masterKey,
+            audit,
+            log: (line) => err.write(`${line}\n`),
+          });
+
+      // Print ONLY safe public material. There is DELIBERATELY no rotation cert
+      // for a compromise rotate (downgrade resistance); adoption is out-of-band
+      // re-pin of the new pinned_master (Slice 3c-2). NEVER a private key /
+      // master_secret.
+      out.write(
+        `${JSON.stringify(
+          {
+            rotated: true,
+            compromised: true,
+            resumed: resuming,
+            fortress_id: result.fortress_id,
+            revoked_master_pubkey: result.revoked_master_pubkey,
+            revocation_serial: result.revocation_serial,
+            pinned_master: { ...result.new_pinned_master },
+            root_revocation: { ...result.root_revocation },
+            adoption: "out-of-band re-pin of pinned_master (no rotation cert is issued for a compromise)",
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 0;
     }
 
     const result = resuming
@@ -1294,6 +1344,7 @@ Provision (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
 Rotate-root (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
   sanctuary federation rotate-root --renew \\
     [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+  sanctuary federation rotate-root --compromised ...
   sanctuary federation rotate-root --resume ...
 
   rotate-root  ROTATE this fortress's federation SIGNING MASTER (the Ed25519
@@ -1303,11 +1354,22 @@ Rotate-root (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress
                with the OLD key (the old->new link a joiner adopts), and
                atomically promotes the new root (journaled; --resume completes a
                crashed rotation). The fortress always boots to a valid root.
+
+               --compromised handles a STOLEN root key: it mints a new keypair
+               (stable fortress_id) AND a fresh master_secret (so every derived
+               transport/audit key changes), revokes the OLD root permanently via
+               a durable, restart-surviving root-revocation signed by the NEW key,
+               and issues NO old-key-signed rotation cert (a thief holding the old
+               key could forge one). Adoption is an OUT-OF-BAND re-pin of the new
+               pinned_master only. After a --compromised rotate, any cert chaining
+               to the old root is rejected (sync + join), even one that would
+               otherwise verify.
+
                Custody-gated (SANCTUARY_PASSPHRASE / --passphrase /
                SANCTUARY_RECOVERY_KEY; never prompts the keychain). Refuses if not
                provisioned, or while a custody rotation is in progress. Prints the
-               NEW pinned_master + the rotation cert (both PUBLIC) to redistribute
-               out of band. --compromise (revoke the old root) is a later slice.
+               NEW pinned_master (PUBLIC) to redistribute out of band, plus the
+               rotation cert (--renew) or the root revocation (--compromised).
 
 Operator (issuer) verbs -- operator-signed, run on the home fortress:
   sanctuary federation enable  --fortress-url <url> [--idempotency-key <s>]
