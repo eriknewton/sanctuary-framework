@@ -32,6 +32,7 @@ import {
   keychainServiceFor,
   isOsKeyringLocation,
   OS_KEYRING_LOCATION_LINUX,
+  PassphraseKeyringUnreachableError,
   type ExecResult,
 } from "../src/wrap/passphrase.js";
 import { SilentCustodyRefusedError } from "../src/core/master-custody.js";
@@ -304,7 +305,13 @@ describe("Linux Secret Service keychain backend", () => {
     expect(raw.toString("utf-8")).not.toContain("user-held-linux-value");
   });
 
-  it("F3: refuses silent generation when the D-Bus session bus is unavailable", async () => {
+  it("fails closed (no clobber) when the D-Bus session bus is unavailable and no fallback exists", async () => {
+    // Finding 1 (2026-06-25): a down D-Bus session bus means the Secret Service
+    // is UNREACHABLE (the item may exist; we cannot say), not genuinely absent.
+    // With no fallback custody to recover from, Sanctuary must NOT generate a
+    // new passphrase and overwrite the (possibly present) keyring entry. It now
+    // fails closed with the actionable PassphraseKeyringUnreachableError
+    // ("unlock the keyring and retry") rather than SilentCustodyRefusedError.
     const h = makeSecretServiceMock();
     h.mode.storeFailure = "dbus-unavailable";
     h.mode.lookupFailure = "dbus-unavailable";
@@ -315,7 +322,13 @@ describe("Linux Secret Service keychain backend", () => {
         platformOverride: "linux",
         exec: h.exec,
       })
-    ).rejects.toThrow(SilentCustodyRefusedError);
+    ).rejects.toBeInstanceOf(PassphraseKeyringUnreachableError);
+
+    // Make-or-break: no `secret-tool store` (the clobber) was ever attempted.
+    const storeCalls = h.calls.filter(
+      (c) => c.cmd === "secret-tool" && c.args[0] === "store"
+    );
+    expect(storeCalls.length).toBe(0);
   });
 
   it("F3: refuses silent generation when the keyring unlock prompt is cancelled", async () => {

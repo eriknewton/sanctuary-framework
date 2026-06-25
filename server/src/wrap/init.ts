@@ -566,12 +566,27 @@ export async function runInit(
       const message = err instanceof Error ? err.message : String(err);
       await auditLog.flush();
       masterKey.fill(0);
+      // Honesty (Finding 2, 2026-06-25): the custody envelope and the recovery
+      // key just shown are already written and INTACT at this point; only the
+      // operator-identity seed failed. The old message said "Re-run init", but
+      // a plain `init` re-run REFUSES (the fortress dir is now non-empty) and a
+      // `--force` re-init mints a brand-new random master, ORPHANING the
+      // recovery key the operator was just told to save. Give the two
+      // remediations that actually work and do not contradict the
+      // non-empty/--force guards.
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `\n  Sanctuary init: failed to seed the default operator identity:` +
-          ` ${message}\n  The fortress was NOT fully provisioned. Re-run init,` +
-          ` or pass --no-identity to create a custody-only fortress and add an` +
-          ` identity later with \`sanctuary identity create\`.\n`,
+          ` ${message}\n` +
+          `  The fortress custody was provisioned and the recovery key shown above` +
+          ` is valid, but it has NO operator identity yet. To finish, do ONE of:\n` +
+          `    - add the identity to this existing fortress (custody is intact):\n` +
+          `        sanctuary identity create --fortress ${fortressPath}\n` +
+          `    - OR start over with a fresh master (this DISCARDS the recovery key` +
+          ` shown above; a new one will be minted):\n` +
+          `        sanctuary init --force --fortress ${fortressPath}\n` +
+          `  A plain \`sanctuary init\` re-run will refuse: this fortress directory` +
+          ` is no longer empty.\n`,
       );
       throw new Error(`operator identity seed failed: ${message}`, {
         cause: err,

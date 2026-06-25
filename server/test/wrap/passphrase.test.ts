@@ -72,6 +72,19 @@ function makeExec(): {
       stored.set(key, m[1].replace(/\\(.)/g, "$1"));
       return { stdout: "", stderr: "", code: 0 };
     }
+    // Linux Secret Service: this mock models a host with NO usable Secret
+    // Service (the original intent of these tests — the keyring write fails, so
+    // generation fails closed and user-supplied values persist to the encrypted
+    // fallback file). A `lookup` is a clean MISS: exit 1 with EMPTY stderr,
+    // which the three-state keyring classifier reads as not-found (NOT a
+    // locked/unreachable keyring), so callers fall through correctly. A `store`
+    // FAILS (no keyring to write to), exercising the fallback-file path.
+    if (cmd === "secret-tool" && args[0] === "lookup") {
+      return { stdout: "", stderr: "", code: 1 };
+    }
+    if (cmd === "secret-tool" && args[0] === "store") {
+      return { stdout: "", stderr: "no secret service", code: 1 };
+    }
     return { stdout: "", stderr: "unknown", code: 1 };
   };
 
