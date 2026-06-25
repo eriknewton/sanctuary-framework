@@ -591,7 +591,7 @@ const SUBCATEGORIES: NistSubcategory[] = [
     summary:
       "The functioning and behaviour of the AI system is monitored in " +
       "deployment (production monitoring).",
-    coverage: "covered",
+    coverage: "partial",
     evidence_emitter: [
       "monitor_audit_log",
       "audit_export_siem",
@@ -603,14 +603,17 @@ const SUBCATEGORIES: NistSubcategory[] = [
       "encrypted audit log (monitor_audit_log), exportable in CEF/OCSF " +
       "to a SIEM (audit_export_siem); monitor_health reports live state-" +
       "integrity and subsystem status; principal_baseline_view exposes " +
-      "the behavioural anomaly baseline. Production monitoring of the " +
-      "Sanctuary-mediated behaviour is machine-verifiable.",
+      "the behavioural anomaly baseline. This is structured monitoring " +
+      "of Sanctuary-mediated tool activity and Sanctuary health, not full-" +
+      "fidelity production monitoring of the model or all AI-system " +
+      "components.",
     review_notes:
-      "Covered, scoped to behaviour MEDIATED BY Sanctuary tool calls " +
-      "(the gate sees every tool call; it does not see the model's " +
-      "internal reasoning). This scope note matters: covered for the " +
-      "deployment-monitoring mechanism, not a claim to observe model " +
-      "cognition.",
+      "Partial. Sanctuary monitors Sanctuary-mediated tool calls, " +
+      "runtime health, and baseline drift with redacted, agent-scoped " +
+      "evidence. NIST MEASURE 2.4 is broader production monitoring of " +
+      "the AI system's functionality, behaviour, and components; " +
+      "Sanctuary does not observe model internals or provide full-" +
+      "fidelity system telemetry.",
   },
   {
     id: "MEASURE 2.6",
@@ -641,7 +644,7 @@ const SUBCATEGORIES: NistSubcategory[] = [
       "AI system security and resilience (e.g. against adversarial " +
       "attacks, data poisoning, exfiltration) are evaluated and " +
       "documented.",
-    coverage: "covered",
+    coverage: "partial",
     evidence_emitter: [
       "sovereignty_audit",
       "shr_generate",
@@ -658,16 +661,17 @@ const SUBCATEGORIES: NistSubcategory[] = [
       "data exfiltration to third parties (context_gate_enforcer_status); " +
       "and a runtime prompt-injection detector whose hits land as " +
       "injection_detected:* audit entries (monitor_audit_log). This is " +
-      "the same control set the EU pack marks 'full' at Annex IV §2(h) " +
-      "and Art. 15(5).",
+      "runtime Sanctuary-layer security/resilience evidence; it does " +
+      "not evaluate training-time data poisoning, model poisoning, or " +
+      "the model's own robustness.",
     review_notes:
-      "Covered. This is Sanctuary's strongest mapping and the EU<->NIST " +
-      "overlap is exact (same tools as the EU 'full' cybersecurity rows). " +
-      "Honesty caveat carried over from the EU pack: TRAINING-time data/" +
-      "model poisoning is NOT covered (runtime only); the injection " +
-      "detector's config is not itself queryable, only its audit hits. " +
-      "Covered is correct for the runtime security/resilience evaluation " +
-      "mechanism.",
+      "Partial. The cited controls are real for runtime sovereignty, " +
+      "exfiltration resistance, approval-gate resilience, and prompt-" +
+      "injection audit evidence. NIST MEASURE 2.7 is broader: it also " +
+      "names adversarial robustness, data poisoning, model poisoning, " +
+      "and documentation of those evaluations. Sanctuary does not cover " +
+      "the data/model-poisoning scope, and the injection detector's " +
+      "configuration is not itself queryable, only its audit hits.",
   },
   {
     id: "MEASURE 2.8",
@@ -676,7 +680,7 @@ const SUBCATEGORIES: NistSubcategory[] = [
     summary:
       "Risks associated with transparency and accountability are " +
       "examined and documented (provenance, model cards, lineage).",
-    coverage: "covered",
+    coverage: "partial",
     evidence_emitter: [
       "shr_generate",
       "monitor_audit_log",
@@ -692,16 +696,16 @@ const SUBCATEGORIES: NistSubcategory[] = [
       "cryptographic identity provenance and rotation chain " +
       "(identity_list); and cryptographic verification of Concordia " +
       "bridge attestations (bridge_verify). Together these provide " +
-      "machine-verifiable provenance and accountability for agent " +
-      "actions.",
+      "machine-verifiable action provenance, identity lineage, bridge " +
+      "verification, and audit evidence. They do not examine or document " +
+      "model transparency/accountability risks across the full AI system.",
     review_notes:
-      "UNSURE, flagged. I marked this covered because the provenance/" +
-      "accountability MECHANISM (signed reports + cryptographic audit " +
-      "trail + identity lineage) is fully shipped and verifiable. " +
-      "BUT MEASURE 2.8 also reaches model lineage / model cards, which " +
-      "Sanctuary does NOT produce. A reviewer focused on model-card " +
-      "lineage may downgrade to partial. Covered is for the action-" +
-      "provenance reading; I am flagging the scope explicitly.",
+      "Partial. Sanctuary provides action provenance, cryptographic " +
+      "identity lineage, Concordia bridge verification, signed health " +
+      "reports, and audit/export evidence. NIST MEASURE 2.8 also reaches " +
+      "transparency and accountability risk examination across the AI " +
+      "system, including model cards and model lineage, which Sanctuary " +
+      "does not produce.",
   },
   {
     id: "MEASURE 2.9",
@@ -1081,10 +1085,11 @@ export const NIST_CROSSWALK_V1: NistCrosswalk = {
     "SHARED CONTROL CATALOG. Every evidence_emitter here is an MCP tool " +
       "name also used by the EU AI Act coverage matrix. The two packs " +
       "share one control catalog so a reviewer sees the EU AI Act <-> " +
-      "NIST AI RMF overlap directly. The strongest overlap is the " +
-      "runtime security/resilience and audit/provenance controls " +
+      "NIST AI RMF overlap directly. The strongest control overlap is " +
+      "the runtime security/resilience and audit/provenance evidence " +
       "(MEASURE 2.7 / 2.8 here; Annex IV §2(h) / Art. 12 / Art. 15(5) " +
-      "in the EU pack).",
+      "in the EU pack), while the NIST rows remain partial where they " +
+      "reach model/data-poisoning, model-card, or model-lineage scope.",
     "HONESTY OVER COVERAGE. 'covered' is used only where a real shipped " +
       "mechanism is independently verifiable by running the named " +
       "tool(s). 'gap' marks technical subcategories (e.g. model " +

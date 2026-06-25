@@ -61,6 +61,10 @@ describe("NIST AI RMF crosswalk, data integrity", () => {
 
   it("coverage counts add up to the total", () => {
     const s = coverageStats(NIST_CROSSWALK_V1);
+    expect(s.covered).toBe(0);
+    expect(s.partial).toBe(27);
+    expect(s.not_applicable).toBe(25);
+    expect(s.gap).toBe(3);
     expect(s.covered + s.partial + s.not_applicable + s.gap).toBe(s.total);
     expect(s.total).toBe(NIST_CROSSWALK_V1.subcategories.length);
   });
@@ -110,9 +114,10 @@ describe("NIST AI RMF crosswalk, shared control catalog", () => {
   it("the strong EU<->NIST security overlap is present (MEASURE 2.7)", () => {
     const m27 = NIST_CROSSWALK_V1.subcategories.find((s) => s.id === "MEASURE 2.7");
     expect(m27).toBeDefined();
-    expect(m27!.coverage).toBe("covered");
-    // sovereignty_audit + principal_policy_view are the EU "full"
-    // cybersecurity-row controls; they must appear here too.
+    expect(m27!.coverage).toBe("partial");
+    // sovereignty_audit + principal_policy_view are real runtime
+    // cybersecurity controls; the broader NIST poisoning/model scope
+    // keeps this row partial.
     expect(m27!.evidence_emitter).toContain("sovereignty_audit");
     expect(m27!.evidence_emitter).toContain("principal_policy_view");
   });
@@ -148,7 +153,7 @@ describe("NIST AI RMF crosswalk, rendered output", () => {
     expect(governLine).toContain("not-applicable (organizational)");
   });
 
-  it("renders control tool names in backticks for covered rows", () => {
+  it("renders control tool names in backticks for evidence rows", () => {
     expect(md).toContain("`sovereignty_audit`");
     expect(md).toContain("`monitor_audit_log`");
   });
