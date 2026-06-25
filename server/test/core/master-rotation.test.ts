@@ -86,6 +86,11 @@ import {
   OPERATOR_CLOUD_CLAIM_STORE_KEY,
   OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
 } from "../../src/mesh/lifecycle/operator-cloud-join-approver.js";
+import {
+  FEDERATION_SYNC_STATE_STORE_NAMESPACE,
+  FEDERATION_SYNC_STATE_STORE_KEY,
+  FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+} from "../../src/v1/federation-sync-state-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -703,13 +708,13 @@ describe("master rotation — fail-closed coverage", () => {
     ).toEqual(joinerPayload);
   });
 
-  it("rotates ALL FOUR _federation records (trust-root, joiner, spent-nonce set, provision-claim set) without strand", async () => {
-    // Anti-strand for the durable single-use replay stores: the spent-nonce set
-    // and the operator-cloud provision-claim set persist blobs into _federation
-    // under NEW HKDF labels. Without those labels in the _federation recipe's
+  it("rotates ALL FIVE _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state) without strand", async () => {
+    // Anti-strand for the durable single-use replay stores AND the Federation
+    // 3/3b P0 durable sync-state store: each persists a blob into _federation
+    // under a NEW HKDF label. Without those labels in the _federation recipe's
     // infos, convertPurposeNamespace throws RotationPreflightError and rotateMaster
-    // is DENIED on any fortress that ever consumed a federation nonce/claim. This
-    // proves the grown infos list re-wraps all four under the new master.
+    // is DENIED on any fortress that ever consumed a federation nonce/claim OR
+    // persisted sync-state. This proves the grown infos list re-wraps all five.
     //
     // The store labels MUST equal the recipe strings; assert that explicitly so a
     // typo in either place is caught here, not only at a real operator's rotation.
@@ -717,8 +722,10 @@ describe("master rotation — fail-closed coverage", () => {
     expect(OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO).toBe(
       "federation-operator-cloud-provision-claim-set"
     );
+    expect(FEDERATION_SYNC_STATE_STORE_HKDF_INFO).toBe("federation-sync-state");
     expect(BOOTSTRAP_NONCE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
     expect(OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(FEDERATION_SYNC_STATE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
 
     const fortress = await buildFortress();
     const records: Array<{ key: string; info: string; payload: unknown }> = [
@@ -741,6 +748,17 @@ describe("master rotation — fail-closed coverage", () => {
         key: OPERATOR_CLOUD_CLAIM_STORE_KEY,
         info: OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
         payload: { v: 1, entries: [{ key: "f n nonce", claim: { consumed: true } }] },
+      },
+      {
+        key: FEDERATION_SYNC_STATE_STORE_KEY,
+        info: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+        payload: {
+          v: 1,
+          accepted_high_water: [["linux-1", 7]],
+          outbound_high_water: 3,
+          revoked_node_ids: ["evil-node"],
+          highest_eviction_serial: 2,
+        },
       },
     ];
     // All four live in the same _federation namespace (no-AAD, purpose-keyed).

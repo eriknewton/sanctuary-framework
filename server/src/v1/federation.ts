@@ -472,27 +472,59 @@ export interface V1FederationDeps {
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
   listFederationEvents(since?: FederationSyncCursor): FederationEvent[];
-  /** Validate and append remote sync events. */
+  /**
+   * Validate and append remote sync events. ASYNC because a folded
+   * operator-authority `node_eviction` advances the DURABLE revocation
+   * projection (Federation 3/3b P0): the append commits the in-memory fold,
+   * then persists the security-state snapshot. THROWS if that persist fails so
+   * the caller fails closed (a revocation that did not durably commit must not
+   * be acknowledged as accepted). When no eviction was folded the persist is a
+   * no-op and the call cannot throw on durability grounds.
+   */
   appendFederationEvents(
     events: FederationEvent[],
     options?: FederationAppendOptions,
-  ): FederationAppendResult;
+  ): Promise<FederationAppendResult>;
   /**
    * Highest peer-sync high-water already accepted from `senderNodeId`, or null
    * if none. Gates whole-envelope rollback on the cross-node `/sync/peer` path
    * (PR-A5). Per-sender; advances only on a successful accept.
    */
   acceptedHighWaterFor(senderNodeId: string): number | null;
-  /** Record a newly-accepted peer-sync high-water for `senderNodeId`. */
+  /**
+   * Record a newly-accepted peer-sync high-water for `senderNodeId`. ASYNC +
+   * fail-closed (Federation 3/3b P0): the in-memory advance is committed, then
+   * the DURABLE sync-state snapshot is persisted. Resolves `true` only when the
+   * advance is durably committed; resolves `false` (the in-memory advance rolled
+   * back) when the persist failed, so the caller MUST deny rather than
+   * acknowledge an accept whose anti-replay high-water did not reach disk.
+   */
   recordAcceptedHighWater(
     senderNodeId: string,
     highWater: number,
     certificate?: NodeIdentityCertificate,
-  ): void;
-  /** Monotonic outbound high-water this daemon stamps on reciprocal envelopes. */
-  nextOutboundHighWater(): number;
+  ): Promise<boolean>;
+  /**
+   * Monotonic outbound high-water this daemon stamps on reciprocal envelopes.
+   * ASYNC + fail-closed (Federation 3/3b P0): the advanced counter is persisted
+   * before it is handed out so a restart cannot re-emit an already-used outbound
+   * high-water. Resolves the new value on success; THROWS if the persist failed
+   * so the caller does not sign a reciprocal envelope on an un-committed counter.
+   */
+  nextOutboundHighWater(): Promise<number>;
   /** Grow-only revocation projection. Throws/false distinction is security-significant. */
   isNodeRevoked(nodeId: string): boolean;
+  /**
+   * RR-1 pre-wire (Federation 3/3b P0): reject any certificate chaining to a
+   * REVOKED fortress-master (root) pubkey. Feature-inert in P0 (the revoked-root
+   * set is always empty until rotate-root Slice 3c POPULATES it on compromise
+   * recovery) but wired at all three chokepoints now so 3c need only fill the
+   * set, never re-thread the call sites. Fail-closed contract identical to {@link
+   * isNodeRevoked}: a throw or absence is treated as "cannot evaluate -> deny".
+   * `masterPubkeyB64u` is the base64url fortress-master public key the presented
+   * chain terminates at.
+   */
+  isRootRevoked(masterPubkeyB64u: string): boolean;
   /** Best-effort local cert auto-renewal tick before this daemon presents its cert. */
   renewLocalNodeCertificate(): void;
   /** Structured aggregate disclosure for status surfaces. */
@@ -854,7 +886,8 @@ async function handleSync(
     return;
   }
 
-  if (!deps.isEnabled() || deps.getContext() === null) {
+  const syncCtx = deps.getContext();
+  if (!deps.isEnabled() || syncCtx === null) {
     await deps.audit({
       operation,
       result: "failure",
@@ -865,10 +898,41 @@ async function handleSync(
     return;
   }
 
-  const append = deps.appendFederationEvents(parsedEvents, {
-    senderNodeId: node_id,
-    wireVersion: wire_version,
-  });
+  // RR-1 pre-wire (feature-inert until rotate-root Slice 3c). Reject a sync
+  // against a fortress whose own pinned master (root) has been revoked. The set
+  // is empty in P0, so this never fires today; wired here so 3c need only fill
+  // the set. A throw is treated as unevaluable -> deny.
+  if (rootRevokedFailClosed(deps, syncCtx.pinnedMasterPubkey.public_key)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "root_revoked" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents(parsedEvents, {
+      senderNodeId: node_id,
+      wireVersion: wire_version,
+    });
+  } catch {
+    // A folded revocation could not be durably persisted (Federation 3/3b P0
+    // fail-closed): deny rather than acknowledge an accept whose revocation
+    // state did not reach disk. The in-memory revocation stays applied
+    // (grow-only fail-safe); the peer's retry re-persists the whole snapshot.
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
   let senderRevoked: boolean;
   try {
     senderRevoked = deps.isNodeRevoked(node_id);
@@ -964,6 +1028,8 @@ async function handlePeerSync(
     recipientNodeId: ctx.nodeId,
     acceptedHighWaterFor: (senderNodeId) => deps.acceptedHighWaterFor(senderNodeId),
     isNodeRevoked: (senderNodeId) => deps.isNodeRevoked(senderNodeId),
+    // RR-1 pre-wire (feature-inert until rotate-root Slice 3c populates the set).
+    isRootRevoked: (masterPubkeyB64u) => deps.isRootRevoked(masterPubkeyB64u),
   });
   if (!verification.ok) {
     await deps.audit({
@@ -988,10 +1054,26 @@ async function handlePeerSync(
   //     to a huge value with a content-free envelope and self-DoS every future
   //     legitimate sync (codex PR-A5 r2 MEDIUM). High-water is a property of
   //     committed work, never of an empty signed envelope.
-  const append = deps.appendFederationEvents(verification.events, {
-    senderNodeId: verification.senderNodeId,
-    wireVersion: verification.wireVersion,
-  });
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents(verification.events, {
+      senderNodeId: verification.senderNodeId,
+      wireVersion: verification.wireVersion,
+    });
+  } catch {
+    // A folded revocation could not be durably persisted (Federation 3/3b P0
+    // fail-closed): deny rather than acknowledge an accept whose revocation
+    // state did not reach disk. The in-memory revocation stays applied
+    // (grow-only fail-safe); the peer's retry re-persists the whole snapshot.
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: verification.senderNodeId,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
 
   let senderRevokedAfterAcceptance: boolean;
   try {
@@ -1008,11 +1090,27 @@ async function handlePeerSync(
   }
 
   if (append.rejected.length === 0 && append.accepted.length > 0) {
-    deps.recordAcceptedHighWater(
+    const highWaterPersisted = await deps.recordAcceptedHighWater(
       verification.senderNodeId,
       verification.syncHighWater,
       verification.senderNodeCert,
     );
+    if (!highWaterPersisted) {
+      // The anti-replay high-water advance did not durably commit (Federation
+      // 3/3b P0 fail-closed): deny rather than let the peer believe its slice
+      // was accepted with a high-water that a restart would forget (which would
+      // re-open the very replay window this slice closes). The events appended
+      // above are still hash-chained + deduped on the next attempt, so a retry
+      // is safe; an un-acknowledged accept is the correct fail-closed posture.
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: verification.senderNodeId,
+        details: { reason: "durable_state_persist_failed" },
+      });
+      denyForbidden(res);
+      return;
+    }
   }
 
   // The reciprocal envelope is signed by THIS node and therefore may only carry
@@ -1026,9 +1124,24 @@ async function handlePeerSync(
     : deps
         .listFederationEvents(verification.cursor ?? undefined)
         .filter((event) => event.origin_node_id === ctx.nodeId);
-  const responseEnvelope = senderRevokedAfterAcceptance
-    ? null
-    : buildReciprocalEnvelope(deps, ctx, verification.senderNodeId, outbound);
+  let responseEnvelope: FederationSyncEnvelope | null;
+  try {
+    responseEnvelope = senderRevokedAfterAcceptance
+      ? null
+      : await buildReciprocalEnvelope(
+          deps,
+          ctx,
+          verification.senderNodeId,
+          outbound,
+        );
+  } catch {
+    // The outbound high-water advance could not be durably persisted
+    // (Federation 3/3b P0 fail-closed). The inbound slice was already accepted
+    // and its high-water persisted above, so do NOT fail the whole exchange:
+    // simply omit the reciprocal envelope. The peer re-requests on its next
+    // sync; a missing reciprocal slice is a benign degrade, never a replay risk.
+    responseEnvelope = null;
+  }
 
   await deps.audit({
     operation,
@@ -1065,22 +1178,33 @@ async function handlePeerSync(
  * private key) rather than forging an attribution. The caller must not emit
  * bare events as a fallback. The node private key is transient and never logged.
  */
-function buildReciprocalEnvelope(
+async function buildReciprocalEnvelope(
   deps: V1FederationDeps,
   ctx: FederationContext,
   recipientNodeId: string,
   outbound: FederationEvent[],
-): FederationSyncEnvelope | null {
+): Promise<FederationSyncEnvelope | null> {
   deps.renewLocalNodeCertificate();
   const nodeCert = ctx.localNodeCert;
   const nodePrivateKey = ctx.getLocalNodePrivateKey?.();
   if (!nodeCert || !nodePrivateKey) return null;
+  // Reserve + DURABLY persist the next outbound high-water BEFORE signing, so a
+  // restart can never re-emit an already-used counter. A persist failure throws
+  // out of nextOutboundHighWater; the caller treats that as "no reciprocal
+  // slice" (benign degrade), never as a counter it already handed out.
+  let syncHighWater: number;
+  try {
+    syncHighWater = await deps.nextOutboundHighWater();
+  } catch (err) {
+    nodePrivateKey.fill(0);
+    throw err;
+  }
   try {
     return signSyncEnvelope({
       fortressId: ctx.fortressId,
       senderNodeId: ctx.nodeId,
       recipientNodeId,
-      syncHighWater: deps.nextOutboundHighWater(),
+      syncHighWater,
       events: outbound,
       senderNodeCert: nodeCert,
       issuingPrincipalCert: ctx.issuingPrincipalCert,
@@ -1098,6 +1222,25 @@ function peerSenderNodeId(body: unknown): string {
     if (typeof id === "string" && id.length > 0) return id;
   }
   return "unknown";
+}
+
+/**
+ * RR-1 fail-closed evaluation of the revoked-ROOT predicate (Federation 3/3b
+ * P0). Returns true (-> the caller denies) when the fortress master is revoked
+ * OR when the predicate throws (revocation state unevaluable). Feature-inert in
+ * P0 because the revoked-root set is empty until rotate-root Slice 3c populates
+ * it; centralizing the throw-is-deny rule here keeps every chokepoint identical.
+ */
+function rootRevokedFailClosed(
+  deps: V1FederationDeps,
+  masterPubkeyB64u: string,
+): boolean {
+  if (typeof deps.isRootRevoked !== "function") return true;
+  try {
+    return deps.isRootRevoked(masterPubkeyB64u);
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -1130,6 +1273,22 @@ export async function handleFederationCeremony(
       details: {
         reason: !deps.isEnabled() || ctx === null ? "federation_unavailable" : "malformed_request",
       },
+    });
+    denyUnauthorized(res);
+    return true;
+  }
+
+  // RR-1 pre-wire (feature-inert until rotate-root Slice 3c). A join against a
+  // fortress whose own pinned master (root) has been revoked must fail closed,
+  // so a compromised root cannot keep admitting new nodes. Empty set in P0 (this
+  // never fires today); wired so 3c only fills the set. Throw -> deny. Collapses
+  // to the SAME uniform 401 as every other ceremony denial (no oracle).
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: request.bootstrap_token.intended_node_id,
+      details: { reason: "root_revoked" },
     });
     denyUnauthorized(res);
     return true;

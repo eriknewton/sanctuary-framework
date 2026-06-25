@@ -229,6 +229,7 @@ export type SyncEnvelopeDenialReason =
   | "cert_node_id_mismatch"
   | "cert_chain_invalid"
   | "node_revoked"
+  | "root_revoked"
   | "revocation_state_unavailable"
   | "envelope_signature_invalid"
   | "event_hash_invalid"
@@ -246,6 +247,16 @@ export type SyncEnvelopeDenialReason =
  * is this fortress node's own id. `acceptedHighWaterFor(senderNodeId)` returns
  * the highest high-water this recipient has already accepted from that sender
  * (or null if never), which gates rollback.
+ *
+ * `isRootRevoked` (RR-1, Federation 3/3b P0) is the OPTIONAL revoked-root
+ * predicate: it answers whether the fortress-master pubkey the chain terminates
+ * at has been revoked (rotate-root Slice 3c compromise recovery). It is
+ * feature-inert in P0 (the set is empty until 3c populates it) but wired here
+ * now. When supplied it is checked AFTER the chain verifies (the chain proves
+ * the terminal master IS this pinned master) and BEFORE the node-revocation
+ * check; a `true` answer or a throw denies. When omitted, no root-revocation
+ * gate runs (back-compatible for callers, and the loopback `/sync` path, that
+ * have not wired it).
  */
 export function verifySyncEnvelope(input: {
   envelope: unknown;
@@ -253,6 +264,7 @@ export function verifySyncEnvelope(input: {
   recipientNodeId: string;
   acceptedHighWaterFor(senderNodeId: string): number | null;
   isNodeRevoked(senderNodeId: string): boolean;
+  isRootRevoked?(masterPubkeyB64u: string): boolean;
 }): SyncEnvelopeVerification {
   if (typeof input.envelope !== "object" || input.envelope === null) {
     return { ok: false, reason: "malformed_envelope" };
@@ -290,6 +302,21 @@ export function verifySyncEnvelope(input: {
     verifyCertChain(env.sender_node_cert, env.issuing_principal_cert, input.pinnedMaster);
   } catch {
     return { ok: false, reason: "cert_chain_invalid" };
+  }
+
+  // 3b. Revoked-ROOT check (RR-1, feature-inert in P0). The chain just proved it
+  //     terminates at THIS pinned master, so the master pubkey to test is the
+  //     recipient's own pinned master. A revoked root (rotate-root Slice 3c
+  //     compromise recovery) denies; a throw is treated as unevaluable -> deny.
+  //     Omitting the hook skips the gate (back-compat; the set is empty in P0).
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(input.pinnedMaster.public_key)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
   }
 
   // 4. Revocation projection check. This hook is supplied by the /v1 dashboard
