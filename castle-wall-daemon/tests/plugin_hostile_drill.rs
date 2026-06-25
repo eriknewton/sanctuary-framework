@@ -5,28 +5,23 @@
 //! drill:
 //!
 //!   1. raw socket          — socket(AF_INET, SOCK_RAW/STREAM): must be EPERM. The
-//!                            plugin-v1 seccomp profile allows only AF_UNIX, so a
-//!                            plugin cannot open ANY internet socket. This is also
-//!                            the prerequisite for probe 3, so denying it denies
-//!                            outbound network at the syscall layer.
+//!      plugin-v1 seccomp profile allows only AF_UNIX, so a plugin cannot open ANY
+//!      internet socket. This is also the prerequisite for probe 3, so denying it
+//!      denies outbound network at the syscall layer.
 //!   2. ptrace              — ptrace(PTRACE_TRACEME): must be EPERM. A plugin must
-//!                            not attach to / inspect another process.
+//!      not attach to / inspect another process.
 //!   3. daemon-port connect — connect() to a loopback daemon port. Because probe 1
-//!                            denies AF_INET socket creation, the plugin cannot even
-//!                            construct the fd to connect with: the connect is
-//!                            unreachable. The drill asserts the socket() denial that
-//!                            makes the connect impossible.
+//!      denies AF_INET socket creation, the plugin cannot even construct the fd to
+//!      connect with: the connect is unreachable. The drill asserts the socket()
+//!      denial that makes the connect impossible.
 //!   4. host-file read      — reading a host path outside the bundle. Under seccomp
-//!                            ALONE the open/read syscalls are not blocked (file
-//!                            confinement is the launcher's pivot_root job, proven by
-//!                            plugin_launcher_failclosed.rs). This drill ALSO proves
-//!                            the filesystem half directly: in a child that enters an
-//!                            unprivileged user+mount namespace and pivots into an
-//!                            empty rootfs, a host path (/etc/shadow) is ENOENT —
-//!                            absent, not merely permission-denied. When unprivileged
-//!                            userns is unavailable in the CI sandbox, the probe is
-//!                            recorded as `launcher_covered` (the seccomp layer still
-//!                            ran), never silently skipped.
+//!      ALONE the open/read syscalls are not blocked (file confinement is the
+//!      launcher's pivot_root job, proven by plugin_launcher_failclosed.rs). This
+//!      drill ALSO proves the filesystem half directly: in a child that enters an
+//!      unprivileged user+mount namespace and pivots into an empty rootfs, a host
+//!      path (/etc/shadow) is ENOENT — absent, not merely permission-denied. When
+//!      unprivileged userns is unavailable in the CI sandbox, the probe is recorded
+//!      as `launcher_covered` (the seccomp layer still ran), never silently skipped.
 //!
 //! Repeated N>=3 (drill-acceptance rule). Evidence (one JSON line per run + a
 //! summary) is printed to stdout so the run can be captured; the runbook + banked
