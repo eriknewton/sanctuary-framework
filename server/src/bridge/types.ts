@@ -143,7 +143,13 @@ export interface BridgeAttestationRequest {
   /** Negotiation outcome for reputation scoring */
   outcome_result: "completed" | "partial" | "failed" | "disputed";
 
-  /** Optional metrics (e.g., rounds, response_time_ms, terms_complexity) */
+  /**
+   * Optional BEHAVIORAL metrics only, enforced by a fail-closed allowlist for
+   * bridge-context attestations: rounds / negotiation_rounds, offers_made
+   * (non-negative ints), concession_magnitude (0..1), response_time_ms (>= 0),
+   * reasoning_provided (0 or 1). Any other key, or a raw deal term, is rejected
+   * (invariant #8: behavioral signals only, never deal terms).
+   */
   metrics?: Record<string, number>;
 
   /** Identity to sign the attestation (uses default if omitted) */
