@@ -478,6 +478,157 @@ describe("federation provision -- no-secret-leak (constraint 6)", () => {
   });
 });
 
+describe("federation provision -- PQC Slice 3 opt-in hybrid (default OFF)", () => {
+  it("merge-bar 5: default (no flag) is CLASSICAL and prints the operator-visible classical note", async () => {
+    await seedInitializedFortress();
+    const out = capture();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: ["--node-id", "home-mac", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+
+    // No flag -> classical issuance; output declares the classical suite and NO
+    // hybrid pinned master is printed.
+    const printed = JSON.parse(out.get()) as {
+      issuance_suite: string;
+      hybrid_pinned_master?: unknown;
+    };
+    expect(printed.issuance_suite).toBe("ed25519-v1");
+    expect(printed.hybrid_pinned_master).toBeUndefined();
+
+    // The operator-visible note (printed ONCE at classical provision) points at
+    // the opt-in; it is on stderr, not part of the machine-readable stdout JSON.
+    expect(err.get()).toMatch(/classical Ed25519/);
+    expect(err.get()).toMatch(/--pqc-hybrid/);
+
+    // The persisted record is classical (no hybrid fields).
+    const { masterKey } = await establishMaster({
+      storage,
+      passphrase: PASSPHRASE,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
+    expect(loaded!.record.hybrid).toBeUndefined();
+    masterKey.fill(0);
+  });
+
+  it("merge-bar 5: --pqc-hybrid provisions hybrid, prints hybrid_pinned_master, persists the hybrid block", async () => {
+    await seedInitializedFortress();
+    const out = capture();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: ["--node-id", "home-mac", "--fortress", fortressPath, "--pqc-hybrid"],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+
+    const printed = JSON.parse(out.get()) as {
+      issuance_suite: string;
+      pinned_master: { public_key: string };
+      hybrid_pinned_master?: {
+        signature_suite: string;
+        public_keys: {
+          ed25519: { public_key: string };
+          ml_dsa_65: { public_key: string };
+        };
+      };
+    };
+    expect(printed.issuance_suite).toBe("ed25519+ml-dsa-v1");
+    // The classical pinned_master is STILL printed (current-version peers verify
+    // the Ed25519 chain); the hybrid pinned master is added.
+    expect(printed.pinned_master.public_key.length).toBeGreaterThan(0);
+    expect(printed.hybrid_pinned_master).toBeDefined();
+    expect(printed.hybrid_pinned_master!.signature_suite).toBe("ed25519+ml-dsa-v1");
+    expect(
+      printed.hybrid_pinned_master!.public_keys.ml_dsa_65.public_key.length,
+    ).toBeGreaterThan(0);
+
+    // Honest scope note (no overclaim): says hybrid is opt-in + names the limit.
+    expect(err.get()).toMatch(/OPT-IN hybrid/);
+    expect(err.get()).toMatch(/does NOT make audit/);
+
+    // The persisted record carries the hybrid block with the 4032-byte secret.
+    const { masterKey } = await establishMaster({
+      storage,
+      passphrase: PASSPHRASE,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
+    expect(loaded!.record.hybrid).toBeDefined();
+    expect(
+      loaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key.length,
+    ).toBe(4032);
+    masterKey.fill(0);
+  });
+
+  it("merge-bar 4 (CLI no-leak): a hybrid provision leaks NO ML-DSA secret to stdout or the audit entry", async () => {
+    const seeded = await seedCustodyAndOperator({ storage, passphrase: PASSPHRASE });
+    const masterKey = Uint8Array.from(seeded.masterKey);
+    seeded.masterKey.fill(0);
+
+    const out = capture();
+    const code = await runFederationProvision({
+      argv: ["--node-id", "home-mac", "--fortress", fortressPath, "--pqc-hybrid"],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: capture().stream,
+    });
+    expect(code).toBe(0);
+
+    const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
+    const hybrid = loaded!.record.hybrid!;
+    const secrets = [
+      toBase64url(hybrid.master_private_keys.ml_dsa_65.secret_key),
+      toBase64url(hybrid.master_private_keys.ed25519.private_key),
+      toBase64url(hybrid.issuing_principal_private_keys.ml_dsa_65.secret_key),
+      toBase64url(hybrid.local_node_private_keys.ml_dsa_65.secret_key),
+    ];
+    const stdout = out.get();
+    for (const secret of secrets) expect(stdout).not.toContain(secret);
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const { entries } = await auditLog.query({
+      operation_type: "federation_trust_root_mint",
+      limit: 100,
+    });
+    const auditJson = JSON.stringify(entries);
+    for (const secret of secrets) expect(auditJson).not.toContain(secret);
+    // The suite is recorded for attribution (PUBLIC metadata, no secret).
+    expect(auditJson).toContain("ed25519+ml-dsa-v1");
+    masterKey.fill(0);
+  });
+
+  it("rejects an unknown --crypto-suite (exit 1)", async () => {
+    await seedInitializedFortress();
+    const err = capture();
+    const code = await runFederationProvision({
+      argv: [
+        "--node-id",
+        "home-mac",
+        "--fortress",
+        fortressPath,
+        "--crypto-suite",
+        "rsa-9999",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code).toBe(1);
+    expect(err.get()).toMatch(/--crypto-suite/);
+    // Nothing was minted.
+    expect(
+      await storage.exists(FEDERATION_TRUST_ROOT_NAMESPACE, FEDERATION_TRUST_ROOT_KEY),
+    ).toBe(false);
+  });
+});
+
 describe("federation provision -- defensive race (record appears between probe and mint)", () => {
   it("refuses (exit 3) if a record raced in: source:persisted is treated as a refusal", async () => {
     // Drive the verb with an injected signer whose storage already has a valid

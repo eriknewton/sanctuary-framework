@@ -44,6 +44,8 @@ import {
   provisionOrLoadFederationTrustRoot,
   FEDERATION_TRUST_ROOT_NAMESPACE,
   FEDERATION_TRUST_ROOT_KEY,
+  FEDERATION_ISSUANCE_SUITE_CLASSICAL,
+  FEDERATION_ISSUANCE_SUITE_HYBRID,
   type FederationTrustRootAuditEvent,
 } from "../mesh/federation-trust-root-store.js";
 import {
@@ -840,6 +842,10 @@ interface ProvisionFlags {
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
+  /** PQC Slice 3: opt into hybrid Ed25519+ML-DSA-65 issuance (default OFF). */
+  pqcHybrid: boolean;
+  /** True when --crypto-suite was given a value this verb does not understand. */
+  cryptoSuiteInvalid: boolean;
 }
 
 function parseProvisionFlags(
@@ -850,11 +856,23 @@ function parseProvisionFlags(
     const i = argv.indexOf(name);
     return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
   };
+  // Two equivalent opt-ins: the boolean --pqc-hybrid, or the explicit
+  // --crypto-suite ed25519+ml-dsa-v1. Either selects hybrid; absence (or the
+  // explicit ed25519-v1) keeps the unchanged classical default.
+  const cryptoSuite = flag("--crypto-suite");
+  const suiteSelectsHybrid =
+    cryptoSuite === FEDERATION_ISSUANCE_SUITE_HYBRID;
+  const cryptoSuiteInvalid =
+    cryptoSuite !== undefined &&
+    cryptoSuite !== FEDERATION_ISSUANCE_SUITE_HYBRID &&
+    cryptoSuite !== FEDERATION_ISSUANCE_SUITE_CLASSICAL;
   return {
     nodeId: flag("--node-id"),
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
     fortressPath: flag("--fortress"),
+    pqcHybrid: argv.includes("--pqc-hybrid") || suiteSelectsHybrid,
+    cryptoSuiteInvalid,
   };
 }
 
@@ -913,6 +931,14 @@ export async function runFederationProvision(args: {
 
   if (!flags.nodeId) {
     err.write("sanctuary federation provision: --node-id <id> is required\n");
+    return 1;
+  }
+  if (flags.cryptoSuiteInvalid) {
+    err.write(
+      "sanctuary federation provision: --crypto-suite must be ed25519-v1 " +
+        "(classical, default) or ed25519+ml-dsa-v1 (opt-in hybrid; same as " +
+        "--pqc-hybrid)\n",
+    );
     return 1;
   }
 
@@ -1025,6 +1051,9 @@ export async function runFederationProvision(args: {
         nodeId: flags.nodeId,
         nodeMode: "local",
         principalId: "principal-root",
+        issuanceSuite: flags.pqcHybrid
+          ? FEDERATION_ISSUANCE_SUITE_HYBRID
+          : FEDERATION_ISSUANCE_SUITE_CLASSICAL,
         audit,
       });
     } catch (cause) {
@@ -1054,18 +1083,51 @@ export async function runFederationProvision(args: {
     // FortressMasterPublicKey (public_key, fortress_id, created_at -- all PUBLIC),
     // the out-of-band trust anchor a joiner pins via `--pinned-master`. NEVER
     // print the master secret / private keys (they stay owned by the primitive).
+    //
+    // PQC Slice 3: a hybrid-provisioned fortress ALSO prints its hybrid pinned
+    // master (PUBLIC: Ed25519 + ML-DSA-65 public keys), the out-of-band anchor a
+    // hybrid-capable joiner pins. The classical pinned_master stays so a
+    // current-version peer can still verify the Ed25519 chain. NEVER the ML-DSA
+    // secret / hybrid private keys.
+    const isHybrid = provisioned.context.isHybrid === true;
     out.write(
       `${JSON.stringify(
         {
           provisioned: true,
           fortress_id: provisioned.record.pinned_master_pubkey.fortress_id,
           node_id: provisioned.record.node_id,
+          issuance_suite: isHybrid
+            ? FEDERATION_ISSUANCE_SUITE_HYBRID
+            : FEDERATION_ISSUANCE_SUITE_CLASSICAL,
           pinned_master: { ...provisioned.record.pinned_master_pubkey },
+          ...(isHybrid && provisioned.context.hybridPinnedMaster
+            ? { hybrid_pinned_master: provisioned.context.hybridPinnedMaster }
+            : {}),
         },
         null,
         2,
       )}\n`,
     );
+    if (isHybrid) {
+      // One honest, non-naggy note: scope of the hybrid choice (no overclaim).
+      err.write(
+        "sanctuary federation provision: provisioned with the OPT-IN hybrid " +
+          "Ed25519+ML-DSA-65 federation signing master. This makes only the " +
+          "federation trust-root cert chain post-quantum-capable; it does NOT " +
+          "make audit, transparency, reputation, custody at-rest, or transport " +
+          "post-quantum. All peers must be hybrid-capable to verify this root.\n",
+      );
+    } else {
+      // Operator-visible warning (design Slice 3): printed ONCE, at classical
+      // provision time only (NOT on every command). Honest + non-naggy.
+      err.write(
+        "sanctuary federation provision: this fortress uses classical Ed25519 " +
+          "federation signing. For post-quantum resistance of the federation " +
+          "trust root, provision with --pqc-hybrid (or --crypto-suite " +
+          "ed25519+ml-dsa-v1). Note: all peers must be hybrid-capable to verify " +
+          "a hybrid root, so this is opt-in and not the default.\n",
+      );
+    }
     return 0;
   } finally {
     // Keep the audit durable before this short-lived CLI exits, on EVERY path
@@ -1326,7 +1388,7 @@ export async function runFederationRotateRoot(args: {
 const FEDERATION_HELP = `sanctuary federation -- cross-machine federation (Wave 1)
 
 Provision (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
-  sanctuary federation provision --node-id <id> \\
+  sanctuary federation provision --node-id <id> [--pqc-hybrid] \\
     [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
   (alias: sanctuary federation init-issuer ...)
 
@@ -1340,6 +1402,14 @@ Provision (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
               would orphan the whole mesh. There is no --force and no rotation
               yet. Prints the pinned_master (the PUBLIC trust anchor) to hand to
               joiners for their --pinned-master.
+
+              --pqc-hybrid (default OFF; alias --crypto-suite ed25519+ml-dsa-v1)
+              additionally provisions an Ed25519+ML-DSA-65 HYBRID federation
+              signing master and prints its hybrid_pinned_master. This makes ONLY
+              the federation trust-root cert chain post-quantum-capable; it does
+              NOT make audit, transparency, reputation, custody at-rest, or
+              transport post-quantum. A hybrid root requires hybrid-capable peers
+              to verify, so it is opt-in and NOT the default.
 
 Rotate-root (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
   sanctuary federation rotate-root --renew \\
