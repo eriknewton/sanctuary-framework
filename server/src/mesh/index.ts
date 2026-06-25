@@ -20,6 +20,7 @@ export * from "./types.js";
 export * from "./trust-root.js";
 export * from "./federation-trust-root-store.js";
 export * from "./federation-joiner-trust-root-store.js";
+export * from "./operator-cloud-joined-node-store.js";
 export * from "./operator-cloud-provision.js";
 export * from "./operator-cloud-provision-service.js";
 export * from "./envelope.js";
