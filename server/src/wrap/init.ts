@@ -43,6 +43,9 @@ import {
   type KeychainCustodyOptions,
 } from "./keychain-custody.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { createIdentity } from "../core/identity.js";
+import { IdentityManager } from "../cognitive/tools.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   discloseRecoveryKey,
@@ -95,6 +98,16 @@ export interface InitOptions {
    * non-interactive harnesses. Default behavior (no flag) is unchanged.
    */
   noPin?: boolean;
+  /**
+   * Skip seeding the default operator identity. Default init mints a single
+   * Ed25519 operator identity (the one every Tier-1 operator-signed surface,
+   * federation, did:web, exit, needs) under the fortress's existing custody,
+   * so a stock `init` fortress can drive federation admin verbs with no extra
+   * step. With this flag set, init mints NO identity (the "custody-only,
+   * bring-your-own-identity-later" path); run `sanctuary identity create`
+   * later when ready. Mirrors --no-pin. Default behavior (no flag) is to seed.
+   */
+  noIdentity?: boolean;
 }
 
 /**
@@ -124,6 +137,34 @@ export function resolveNoPin(
     return false;
   }
   return NO_PIN_ENV_OPT_IN.has(raw.trim().toLowerCase());
+}
+
+/**
+ * Explicit opt-in values for SANCTUARY_INIT_NO_IDENTITY. Skipping the default
+ * operator-identity seed leaves a fortress that cannot drive any Tier-1
+ * operator-signed surface, so the env var is an allowlist (NOT "anything
+ * truthy"): only these exact values opt out. Mirrors NO_PIN_ENV_OPT_IN.
+ */
+const NO_IDENTITY_ENV_OPT_IN = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Resolve whether the default operator-identity seed should be skipped.
+ * Precedence: the --no-identity CLI flag wins; otherwise
+ * SANCTUARY_INIT_NO_IDENTITY opts out only when set to an explicit
+ * allowlisted value (1/true/yes/on, case-insensitive). Default is to seed.
+ */
+export function resolveNoIdentity(
+  options: { noIdentity?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (options.noIdentity) {
+    return true;
+  }
+  const raw = env.SANCTUARY_INIT_NO_IDENTITY;
+  if (raw === undefined) {
+    return false;
+  }
+  return NO_IDENTITY_ENV_OPT_IN.has(raw.trim().toLowerCase());
 }
 
 export interface InitResult {
@@ -433,6 +474,110 @@ export async function runInit(
       },
     });
   }
+
+  // Default operator identity seed. Every Tier-1 operator-signed surface
+  // (federation admin verbs, did:web, exit) needs a default operator
+  // identity, and a fortress with none is a half-provisioned state. By
+  // default init mints ONE Ed25519 operator identity under the fortress's
+  // EXISTING custody: the private key is encrypted with the master-derived
+  // "identity-encryption" purpose key (the same key sign() decrypts under),
+  // so the existing master-key recovery/escrow path recovers it too: no new
+  // independently-orphanable secret, nothing written to disk in plaintext.
+  // --no-identity (or SANCTUARY_INIT_NO_IDENTITY) skips it. Reuses the
+  // existing createIdentity + IdentityManager.saveNew primitives; no new
+  // crypto. A defensive guard (below) skips minting if a default identity is
+  // already visible under the current master; note a normal --force re-init
+  // derives a NEW master, so the prior identity is invisible (not skipped) and
+  // a fresh "operator" identity is minted under the new custody.
+  const skipIdentity = resolveNoIdentity(options);
+  if (skipIdentity) {
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation: "operator_identity_seed_skipped",
+      identity_id: fortressId,
+      result: "success",
+      details: {
+        source: "sanctuary-init",
+        reason: options.noIdentity ? "--no-identity" : "SANCTUARY_INIT_NO_IDENTITY",
+      },
+    });
+  } else {
+    try {
+      const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+      try {
+        const identityManager = new IdentityManager(storage, masterKey);
+        await identityManager.load();
+        const existing = identityManager.getDefault();
+        if (existing) {
+          // Defensive: skip minting if a default operator identity is already
+          // visible under the CURRENT master. Not reachable via a normal
+          // `runInit` (a fresh init has an empty fortress, and a --force
+          // re-init derives a brand-new random master under which the prior
+          // `_identities` blobs cannot decrypt, so getDefault() returns
+          // undefined), but this guards any future path that seeds under an
+          // already-established master.
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seed_skipped",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              reason: "default-operator-identity-already-exists",
+              existing_identity_id: existing.identity_id,
+            },
+          });
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `\n  Sanctuary init: a default operator identity already exists` +
+              ` (${existing.identity_id}); leaving it unchanged.\n`,
+          );
+        } else {
+          const { storedIdentity } = createIdentity(
+            "operator",
+            identityEncKey,
+            passphrase ? "passphrase" : "recovery-key",
+          );
+          await identityManager.saveNew(storedIdentity);
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seeded",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              seeded_identity_id: storedIdentity.identity_id,
+              label: "operator",
+            },
+          });
+        }
+      } finally {
+        // Zero the symmetric key that wraps the new private key as soon as it
+        // has done its job (success, the skip path, or error), mirroring how
+        // the raw private key is zeroed inside createIdentity. masterKey
+        // itself is zeroed on the error path below and on the success path
+        // after pin provisioning.
+        identityEncKey.fill(0);
+      }
+    } catch (err) {
+      // Fail-closed (AGENTS.md #5): never leave a half-provisioned fortress
+      // with custody but no operator identity when the operator did not opt
+      // out. --no-identity is the only supported way to skip the seed.
+      const message = err instanceof Error ? err.message : String(err);
+      await auditLog.flush();
+      masterKey.fill(0);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Sanctuary init: failed to seed the default operator identity:` +
+          ` ${message}\n  The fortress was NOT fully provisioned. Re-run init,` +
+          ` or pass --no-identity to create a custody-only fortress and add an` +
+          ` identity later with \`sanctuary identity create\`.\n`,
+      );
+      throw new Error(`operator identity seed failed: ${message}`, {
+        cause: err,
+      });
+    }
+  }
   // Castle Wall global-pin provisioning. By default init writes the
   // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
   // skips it so a test/isolated fortress never silently touches the
@@ -502,6 +647,9 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-pin":
         opts.noPin = true;
         break;
+      case "--no-identity":
+        opts.noIdentity = true;
+        break;
       case "--recovery-out":
         opts.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
         i++;
@@ -556,6 +704,13 @@ Options:
                        \`sanctuary castle-wall provision-pin\` when ready.
                        Also settable via SANCTUARY_INIT_NO_PIN=1 for
                        non-interactive harnesses.
+  --no-identity        Do NOT seed the default operator identity. Default
+                       init mints one Ed25519 operator identity under the
+                       fortress's existing custody so federation admin verbs
+                       work from a stock init; use this for a custody-only
+                       fortress and add an identity later with
+                       \`sanctuary identity create\`. Also settable via
+                       SANCTUARY_INIT_NO_IDENTITY=1.
   --help, -h           Show this help.
 
 What init does:
@@ -574,7 +729,12 @@ What init does:
   5. With --no-confirm: records an explicit, audited headless install
      (custody_headless_install in the audit log) instead of the
      re-entry verification.
-  6. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
+  6. Seeds the default operator identity (a single Ed25519 key encrypted
+     under the fortress's existing custody) unless --no-identity (or
+     SANCTUARY_INIT_NO_IDENTITY) is set. This is the identity every Tier-1
+     operator-signed surface (federation admin verbs, did:web, exit) signs
+     with. Idempotent: an existing default identity is left unchanged.
+  7. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
      anchor) unless --no-pin (or SANCTUARY_INIT_NO_PIN) is set, in which
      case it records an audited castle_pin_provision_skipped entry and
      prints a reminder to provision the pin explicitly when ready.
