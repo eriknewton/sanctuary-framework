@@ -386,23 +386,28 @@ export async function mintHybridFederationMaterial(params: {
   nodeMode?: NodeMode;
   principalId?: string;
 }): Promise<FederationHybridMasterMaterial> {
-  // The hybrid master's fortress_id is generated independently by the helper; we
-  // re-bind it to the classical record's fortress_id so the hybrid and classical
-  // chains name the SAME fortress (a hybrid fortress is one identity, two suites).
-  const masterGen = generateFortressMasterV2Hybrid();
-  const pinnedMaster: FortressMasterPublicKeysV2Hybrid = {
-    ...masterGen.public,
-    fortress_id: params.fortressId,
-  };
-  const principalKeys = generateHybridCertificateKeypair({
-    owner_kind: "principal",
-    owner_id: params.principalId ?? "principal-root",
-  });
-  const nodeKeys = generateHybridCertificateKeypair({
-    owner_kind: "node",
-    owner_id: params.nodeId,
-  });
+  let masterGen: ReturnType<typeof generateFortressMasterV2Hybrid> | undefined;
+  let principalKeys:
+    | ReturnType<typeof generateHybridCertificateKeypair>
+    | undefined;
+  let nodeKeys: ReturnType<typeof generateHybridCertificateKeypair> | undefined;
   try {
+    // The hybrid master's fortress_id is generated independently by the helper; we
+    // re-bind it to the classical record's fortress_id so the hybrid and classical
+    // chains name the SAME fortress (a hybrid fortress is one identity, two suites).
+    masterGen = generateFortressMasterV2Hybrid();
+    const pinnedMaster: FortressMasterPublicKeysV2Hybrid = {
+      ...masterGen.public,
+      fortress_id: params.fortressId,
+    };
+    principalKeys = generateHybridCertificateKeypair({
+      owner_kind: "principal",
+      owner_id: params.principalId ?? "principal-root",
+    });
+    nodeKeys = generateHybridCertificateKeypair({
+      owner_kind: "node",
+      owner_id: params.nodeId,
+    });
     const issuingPrincipalCert = await issuePrincipalCertificateV2Hybrid({
       principal_id: params.principalId ?? "principal-root",
       principal_public_keys: principalKeys.public_keys,
@@ -429,9 +434,9 @@ export async function mintHybridFederationMaterial(params: {
       local_node_private_keys: nodeKeys.private_keys,
     };
   } catch (err) {
-    zeroHybridPrivateKeyMaterial(masterGen.private_keys);
-    zeroHybridPrivateKeyMaterial(principalKeys.private_keys);
-    zeroHybridPrivateKeyMaterial(nodeKeys.private_keys);
+    if (masterGen) zeroHybridPrivateKeyMaterial(masterGen.private_keys);
+    if (principalKeys) zeroHybridPrivateKeyMaterial(principalKeys.private_keys);
+    if (nodeKeys) zeroHybridPrivateKeyMaterial(nodeKeys.private_keys);
     throw err;
   }
 }
@@ -649,55 +654,83 @@ function decodeHybridPrivateKeys(
   if (typeof ed.key_ref !== "string" || typeof ml.key_ref !== "string") {
     throw new FederationTrustRootStoreError(`${where} is missing a key_ref`);
   }
-  return {
-    ed25519: {
-      key_ref: ed.key_ref,
-      private_key: decodeKeyExact(
-        readString(ed, "private_key"),
-        ED25519_PUBLIC_KEY_BYTES,
-        `${where}.ed25519.private_key`,
-      ),
-    },
-    ml_dsa_65: {
-      key_ref: ml.key_ref,
-      secret_key: decodeKeyExact(
-        readString(ml, "secret_key"),
-        ML_DSA_65_SECRET_KEY_BYTES,
-        `${where}.ml_dsa_65.secret_key`,
-      ),
-    },
-  };
+  let ed25519PrivateKey: Uint8Array | undefined;
+  let mlDsa65SecretKey: Uint8Array | undefined;
+  try {
+    ed25519PrivateKey = decodeKeyExact(
+      readString(ed, "private_key"),
+      ED25519_PUBLIC_KEY_BYTES,
+      `${where}.ed25519.private_key`,
+    );
+    mlDsa65SecretKey = decodeKeyExact(
+      readString(ml, "secret_key"),
+      ML_DSA_65_SECRET_KEY_BYTES,
+      `${where}.ml_dsa_65.secret_key`,
+    );
+    return {
+      ed25519: {
+        key_ref: ed.key_ref,
+        private_key: ed25519PrivateKey,
+      },
+      ml_dsa_65: {
+        key_ref: ml.key_ref,
+        secret_key: mlDsa65SecretKey,
+      },
+    };
+  } catch (err) {
+    ed25519PrivateKey?.fill(0);
+    mlDsa65SecretKey?.fill(0);
+    throw err;
+  }
 }
 
 export function decodeHybridMaterial(
   value: Record<string, unknown>,
 ): FederationHybridMasterMaterial {
-  return {
-    pinned_master: readObject(
+  let masterPrivateKeys: HybridPrivateKeyMaterial | undefined;
+  let issuingPrincipalPrivateKeys: HybridPrivateKeyMaterial | undefined;
+  let localNodePrivateKeys: HybridPrivateKeyMaterial | undefined;
+  try {
+    const pinnedMaster = readObject(
       value,
       "pinned_master",
-    ) as unknown as FortressMasterPublicKeysV2Hybrid,
-    master_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as FortressMasterPublicKeysV2Hybrid;
+    masterPrivateKeys = decodeHybridPrivateKeys(
       value.master_private_keys,
       "hybrid.master_private_keys",
-    ),
-    issuing_principal_cert: readObject(
+    );
+    const issuingPrincipalCert = readObject(
       value,
       "issuing_principal_cert",
-    ) as unknown as PrincipalCertificateV2Hybrid,
-    issuing_principal_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as PrincipalCertificateV2Hybrid;
+    issuingPrincipalPrivateKeys = decodeHybridPrivateKeys(
       value.issuing_principal_private_keys,
       "hybrid.issuing_principal_private_keys",
-    ),
-    local_node_cert: readObject(
+    );
+    const localNodeCert = readObject(
       value,
       "local_node_cert",
-    ) as unknown as NodeIdentityCertificateV2Hybrid,
-    local_node_private_keys: decodeHybridPrivateKeys(
+    ) as unknown as NodeIdentityCertificateV2Hybrid;
+    localNodePrivateKeys = decodeHybridPrivateKeys(
       value.local_node_private_keys,
       "hybrid.local_node_private_keys",
-    ),
-  };
+    );
+    return {
+      pinned_master: pinnedMaster,
+      master_private_keys: masterPrivateKeys,
+      issuing_principal_cert: issuingPrincipalCert,
+      issuing_principal_private_keys: issuingPrincipalPrivateKeys,
+      local_node_cert: localNodeCert,
+      local_node_private_keys: localNodePrivateKeys,
+    };
+  } catch (err) {
+    if (masterPrivateKeys) zeroHybridPrivateKeyMaterial(masterPrivateKeys);
+    if (issuingPrincipalPrivateKeys) {
+      zeroHybridPrivateKeyMaterial(issuingPrincipalPrivateKeys);
+    }
+    if (localNodePrivateKeys) zeroHybridPrivateKeyMaterial(localNodePrivateKeys);
+    throw err;
+  }
 }
 
 function validateRecord(record: FederationTrustRootRecord): void {

@@ -450,48 +450,56 @@ function parseStagedRecord(json: string): FederationTrustRootRecord {
       "hybrid block in staged record is present but malformed; refusing to resume fail-closed",
     );
   }
+  const decodedSecrets: Uint8Array[] = [];
   const decode32 = (b64: unknown, label: string): Uint8Array => {
     if (typeof b64 !== "string") {
       throw new FederationRotateRootResumeError(`${label} missing in staged record`);
     }
     const bytes = fromBase64url(b64);
     if (bytes.length !== 32) {
+      bytes.fill(0);
       throw new FederationRotateRootResumeError(`${label} must be 32 bytes`);
     }
+    decodedSecrets.push(bytes);
     return bytes;
   };
-  const record: FederationTrustRootRecord = {
-    fortress_id: String(value.fortress_id),
-    node_id: String(value.node_id),
-    pinned_master_pubkey:
-      value.pinned_master_pubkey as FederationTrustRootRecord["pinned_master_pubkey"],
-    master_secret: decode32(value.master_secret, "master_secret"),
-    ...(typeof value.master_private_key === "string"
-      ? { master_private_key: decode32(value.master_private_key, "master_private_key") }
-      : {}),
-    issuing_principal_cert:
-      value.issuing_principal_cert as FederationTrustRootRecord["issuing_principal_cert"],
-    issuing_principal_private_key: decode32(
-      value.issuing_principal_private_key,
-      "issuing_principal_private_key",
-    ),
-    local_node_cert:
-      value.local_node_cert as FederationTrustRootRecord["local_node_cert"],
-    local_node_private_key: decode32(
-      value.local_node_private_key,
-      "local_node_private_key",
-    ),
-    ...(typeof value.rotation_serial === "number"
-      ? { rotation_serial: value.rotation_serial }
-      : {}),
-    ...(value.rotation_cert
-      ? { rotation_cert: value.rotation_cert as FederationRootRotationCertificate }
-      : {}),
-    ...(isStagedObject(value.hybrid)
-      ? { hybrid: decodeHybridMaterial(value.hybrid) }
-      : {}),
-  };
-  return record;
+  try {
+    const record: FederationTrustRootRecord = {
+      fortress_id: String(value.fortress_id),
+      node_id: String(value.node_id),
+      pinned_master_pubkey:
+        value.pinned_master_pubkey as FederationTrustRootRecord["pinned_master_pubkey"],
+      master_secret: decode32(value.master_secret, "master_secret"),
+      ...(typeof value.master_private_key === "string"
+        ? { master_private_key: decode32(value.master_private_key, "master_private_key") }
+        : {}),
+      issuing_principal_cert:
+        value.issuing_principal_cert as FederationTrustRootRecord["issuing_principal_cert"],
+      issuing_principal_private_key: decode32(
+        value.issuing_principal_private_key,
+        "issuing_principal_private_key",
+      ),
+      local_node_cert:
+        value.local_node_cert as FederationTrustRootRecord["local_node_cert"],
+      local_node_private_key: decode32(
+        value.local_node_private_key,
+        "local_node_private_key",
+      ),
+      ...(typeof value.rotation_serial === "number"
+        ? { rotation_serial: value.rotation_serial }
+        : {}),
+      ...(value.rotation_cert
+        ? { rotation_cert: value.rotation_cert as FederationRootRotationCertificate }
+        : {}),
+      ...(isStagedObject(value.hybrid)
+        ? { hybrid: decodeHybridMaterial(value.hybrid) }
+        : {}),
+    };
+    return record;
+  } catch (err) {
+    for (const secret of decodedSecrets) secret.fill(0);
+    throw err;
+  }
 }
 
 function zeroRecordSecrets(record: FederationTrustRootRecord): void {
@@ -537,19 +545,21 @@ async function mintRotatedRecord(
   if (live.hybrid !== undefined) {
     assertHybridRecordWellFormedForRotation(live.hybrid);
   }
-  const k2 = generateFortressMaster();
-  // Keep the stable fortress_id; only the keypair rotates.
-  const newMasterPublic = {
-    public_key: k2.public.public_key,
-    fortress_id: live.fortress_id,
-    created_at: k2.public.created_at,
-  };
-  const newPrincipal = generateKeypair();
   // One rotated_at shared by the classical cert and the hybrid binding so a
   // hybrid cert's two halves attest the same instant.
   const rotatedAt = new Date().toISOString();
+  let k2: ReturnType<typeof generateFortressMaster> | undefined;
+  let newPrincipal: ReturnType<typeof generateKeypair> | undefined;
   let newHybrid: FederationHybridMasterMaterial | undefined;
   try {
+    k2 = generateFortressMaster();
+    // Keep the stable fortress_id; only the keypair rotates.
+    const newMasterPublic = {
+      public_key: k2.public.public_key,
+      fortress_id: live.fortress_id,
+      created_at: k2.public.created_at,
+    };
+    newPrincipal = generateKeypair();
     // Re-issue the principal cert + the local node cert under K2. The cascade
     // also derives transport/audit subkeys (off the Ed25519 key it is handed),
     // but we DISCARD those: renewal keeps master_secret stable, and the record
@@ -630,8 +640,8 @@ async function mintRotatedRecord(
     if (newHybrid) zeroHybridMaterialSecrets(newHybrid);
     throw err;
   } finally {
-    k2.private_key.fill(0);
-    newPrincipal.privateKey.fill(0);
+    k2?.private_key.fill(0);
+    newPrincipal?.privateKey.fill(0);
   }
 }
 
@@ -682,26 +692,29 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
   if (live.hybrid !== undefined) {
     assertHybridRecordWellFormedForRotation(live.hybrid);
   }
-  const k2 = generateFortressMaster();
-  // Keep the stable fortress_id; only the keypair (and, on compromise, the
-  // symmetric secret) rotate.
-  const newMasterPublic = {
-    public_key: k2.public.public_key,
-    fortress_id: live.fortress_id,
-    created_at: k2.public.created_at,
-  };
-  const newPrincipal = generateKeypair();
-  // Fresh symmetric master_secret (compromise-only). The OLD secret is assumed
-  // captured, so every key derived from it must change.
-  const newMasterSecret = randomBytes(32);
+  let k2: ReturnType<typeof generateFortressMaster> | undefined;
+  let newPrincipal: ReturnType<typeof generateKeypair> | undefined;
+  let newMasterSecret: Uint8Array | undefined;
   let newHybrid: FederationHybridMasterMaterial | undefined;
   let newHybridPrincipalPrivateKeys:
     | {
         ed25519: { key_ref: string; private_key: Uint8Array };
         ml_dsa_65: { key_ref: string; secret_key: Uint8Array };
-      }
+    }
     | undefined;
   try {
+    k2 = generateFortressMaster();
+    // Keep the stable fortress_id; only the keypair (and, on compromise, the
+    // symmetric secret) rotate.
+    const newMasterPublic = {
+      public_key: k2.public.public_key,
+      fortress_id: live.fortress_id,
+      created_at: k2.public.created_at,
+    };
+    newPrincipal = generateKeypair();
+    // Fresh symmetric master_secret (compromise-only). The OLD secret is assumed
+    // captured, so every key derived from it must change.
+    newMasterSecret = randomBytes(32);
     const cascade = rekeyOnMasterRotation({
       new_master_secret: k2.private_key,
       new_master_public: newMasterPublic,
@@ -776,9 +789,9 @@ async function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): Pro
     }
     throw err;
   } finally {
-    k2.private_key.fill(0);
-    newPrincipal.privateKey.fill(0);
-    newMasterSecret.fill(0);
+    k2?.private_key.fill(0);
+    newPrincipal?.privateKey.fill(0);
+    newMasterSecret?.fill(0);
   }
 }
 
@@ -1429,7 +1442,9 @@ export async function resumeFederationRootCompromised(
     // reconstructable here (the K2 principal key is at rest, not in the journal);
     // the durable projection is the enforcement source of truth and is now
     // re-persisted. We therefore emit an empty `operator_signature` with an
-    // honest `signature_note` rather than a fabricated signature. A future slice
+    // honest `signature_note` rather than a fabricated signature. Hybrid key refs
+    // are intentionally empty in this non-authoritative echo; mixing old public
+    // keys with live K2 refs would mislead audit/export consumers. A future slice
     // could re-derive + re-sign on resume if the K2 principal key were unlocked.
     return {
       fortress_id: live.fortress_id,
@@ -1448,18 +1463,18 @@ export async function resumeFederationRootCompromised(
           ? {
               revoked_hybrid: {
                 ed25519: {
-                  key_ref: live.hybrid?.pinned_master.public_keys.ed25519.key_ref ?? "",
+                  key_ref: "",
                   public_key: journal.old_hybrid_ed25519_pubkey,
                 },
                 ml_dsa_65: {
-                  key_ref: live.hybrid?.pinned_master.public_keys.ml_dsa_65.key_ref ?? "",
+                  key_ref: "",
                   public_key: journal.old_hybrid_ml_dsa_pubkey,
                 },
               },
             }
           : {}),
         signature_note:
-          "resumed run: enforcement is the durable revocation projection (already re-persisted); the original K2 signature is not reconstructable here",
+          "resumed run: non-authoritative echo only; operator_signature is intentionally empty and hybrid key_refs are intentionally empty because the original K2 signature bundle is not reconstructable here; enforcement is the durable revocation projection (already re-persisted)",
       },
       revocation_serial: revocationSerial,
       ...(live.hybrid

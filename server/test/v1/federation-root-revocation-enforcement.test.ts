@@ -478,4 +478,83 @@ describe("Federation 3c-1 - root-revocation event invariants", () => {
       zeroHybridMaterialSecrets(hybrid);
     }
   });
+
+  it("hybrid fold enforces root_revoked when a sync envelope pins either old hybrid component", async () => {
+    const fed = makeMultiNodeFortress(["mac-1", "linux-1"]);
+    const ctx = fed.nodes["mac-1"].context;
+    const principalPriv = ctx.getIssuingPrincipalPrivateKey();
+    const hybrid = await mintHybridFederationMaterial({
+      fortressId: fed.fortressId,
+      nodeId: "mac-1",
+      principalId: fed.principalCert.principal_id,
+    });
+    try {
+      const revokedHybrid = {
+        ed25519: {
+          key_ref: hybrid.pinned_master.public_keys.ed25519.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ed25519.public_key,
+        },
+        ml_dsa_65: {
+          key_ref: hybrid.pinned_master.public_keys.ml_dsa_65.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ml_dsa_65.public_key,
+        },
+      };
+      const payload = await signFederationRootRevocationPayloadHybrid({
+        fortressId: fed.fortressId,
+        revokedMasterPubkey: "old-root-k1",
+        revokedHybrid,
+        effectiveAt: new Date().toISOString(),
+        revocationSerial: 5,
+        operatorPrincipalId: fed.principalCert.principal_id,
+        newClassicalPrincipalPrivateKey: principalPriv,
+        newHybridPrincipalPrivateKeys: hybrid.issuing_principal_private_keys,
+      });
+      const event: FederationRevocationLogEvent = {
+        event_id: `${federationOperatorAuthorityOrigin(fed.fortressId)}:5`,
+        origin_node_id: federationOperatorAuthorityOrigin(fed.fortressId),
+        sequence: 5,
+        occurred_at: new Date().toISOString(),
+        kind: "federation_root_revocation",
+        payload: { ...payload },
+        previous_hash: null,
+        event_hash: "unused",
+      };
+      const projection: FederationRootRevocationProjection = {
+        revokedRootPubkeys: new Set(),
+        highestRevocationSerial: 0,
+      };
+      const fold = await foldFederationRootRevocationEvent({
+        event,
+        projection,
+        fortressId: fed.fortressId,
+        pinnedMaster: fed.pinnedMaster,
+        operatorPrincipalCert: fed.principalCert,
+        operatorHybridPrincipalPublicKeys:
+          hybrid.issuing_principal_cert.principal_public_keys,
+      });
+      expect(fold.ok).toBe(true);
+
+      const envelope = captureEnvelope(fed, "mac-1", "linux-1", 7);
+      const verifyWithPinnedRoot = (publicKey: string) =>
+        verifySyncEnvelope({
+          envelope,
+          pinnedMaster: { ...fed.pinnedMaster, public_key: publicKey },
+          recipientNodeId: "linux-1",
+          acceptedHighWaterFor: () => null,
+          isNodeRevoked: () => false,
+          isRootRevoked: (pubkey) => projection.revokedRootPubkeys.has(pubkey),
+        });
+
+      const ed25519Pinned = verifyWithPinnedRoot(revokedHybrid.ed25519.public_key);
+      expect(ed25519Pinned.ok).toBe(false);
+      if (!ed25519Pinned.ok) expect(ed25519Pinned.reason).toBe("root_revoked");
+
+      const mlDsaPinned = verifyWithPinnedRoot(revokedHybrid.ml_dsa_65.public_key);
+      expect(mlDsaPinned.ok).toBe(false);
+      if (!mlDsaPinned.ok) expect(mlDsaPinned.reason).toBe("root_revoked");
+    } finally {
+      principalPriv.fill(0);
+      zeroHybridMaterialSecrets(hybrid);
+    }
+  });
 });

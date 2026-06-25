@@ -1191,6 +1191,16 @@ describe("rotate-root --compromised on a HYBRID root (PQC Slice 3): revokes both
 
     const result = await resumeFederationRootCompromised({ storage, masterKey });
     expect(result.revoked_master_pubkey).toBe(before.pinned_master_pubkey.public_key);
+    expect(result.root_revocation.operator_signature).toBe("");
+    expect(result.root_revocation.signature_note).toMatch(/non-authoritative echo/);
+    expect(result.root_revocation.revoked_hybrid?.ed25519).toEqual({
+      key_ref: "",
+      public_key: oldEd,
+    });
+    expect(result.root_revocation.revoked_hybrid?.ml_dsa_65).toEqual({
+      key_ref: "",
+      public_key: oldMl,
+    });
     const after = await loadLive(masterKey);
     expect(after.hybrid).toBeDefined();
 
@@ -1228,7 +1238,17 @@ describe("rotate-root --compromised on a HYBRID root (PQC Slice 3): revokes both
     expect(midSnapshot.revokedRootPubkeys.has(oldEd)).toBe(false);
     expect(midSnapshot.revokedRootPubkeys.has(oldMl)).toBe(false);
 
-    await resumeFederationRootCompromised({ storage, masterKey });
+    const resumed = await resumeFederationRootCompromised({ storage, masterKey });
+    expect(resumed.root_revocation.operator_signature).toBe("");
+    expect(resumed.root_revocation.signature_note).toMatch(/non-authoritative echo/);
+    expect(resumed.root_revocation.revoked_hybrid?.ed25519).toEqual({
+      key_ref: "",
+      public_key: oldEd,
+    });
+    expect(resumed.root_revocation.revoked_hybrid?.ml_dsa_65).toEqual({
+      key_ref: "",
+      public_key: oldMl,
+    });
     const snapshot = await syncStore.load();
     expect(snapshot.revokedRootPubkeys.has(oldClassical)).toBe(true);
     expect(snapshot.revokedRootPubkeys.has(oldEd)).toBe(true);
