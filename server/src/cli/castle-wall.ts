@@ -429,12 +429,24 @@ export async function runAuditFindings(
 }
 
 export async function runProvisionPin(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, exactly like every
+  // other castle-wall custody verb (re-pin, daemon, audit-*) and like the
+  // federation/identity/transparency verbs. Before this, provision-pin
+  // silently DROPPED its `--fortress` arg and read SANCTUARY_STORAGE_PATH
+  // only, so `castle-wall provision-pin --fortress <good>` loaded the custody
+  // envelope from a DIFFERENT (default/stale) fortress than the one named -
+  // surfacing as "custody envelope exists but has an unsupported shape or
+  // version" while federation/identity verbs against the SAME --fortress path
+  // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
+  // resolveStoragePath(env) when no flag is given, preserving prior behavior.
+  const { fortress } = parseCastleWallArgs(argv);
+  const storagePath = resolveFortressArg(fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
 
