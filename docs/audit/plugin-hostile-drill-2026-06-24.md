@@ -1,7 +1,7 @@
-# Plugin-host hostile-plugin drill (slice S5) — 2026-06-24
+# Plugin-host hostile-plugin drill (slice S5), 2026-06-24
 
-Pre-declared acceptance drill for the Linux plugin host. A **hostile plugin** — one
-that actively tries to break out of its jail and break the vendor contract — must be
+Pre-declared acceptance drill for the Linux plugin host. A **hostile plugin** (one
+that actively tries to break out of its jail and break the vendor contract) must be
 fully contained. This drill banks the evidence (drill-acceptance rule: N>=3 each).
 
 The drill has two halves, because plugin confinement is enforced at two layers:
@@ -56,7 +56,7 @@ Both drills print one JSON evidence line per run plus a summary line.
 ## Banked evidence (this run)
 
 Build host: macOS (the contract drill is platform-independent; the kernel drill runs
-in Linux CI — consistent with the thesis-gate rule that Linux-confinement claims trace
+in Linux CI, consistent with the thesis-gate rule that Linux-confinement claims trace
 to Linux evidence, the kernel half is CI-verified, not locally captured on this run).
 
 Contract drill, N=3, all 9 attack modes contained to egress DENY every run:

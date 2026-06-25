@@ -54,10 +54,10 @@ function sha256Hex(bytes) {
  *  for the only input that matters. */
 function assertCanonicalizable(value, where) {
   if (value === undefined) {
-    throw new Error(`sign-reference-plugin: undefined value at ${where} — descriptor must be value-narrow`);
+    throw new Error(`sign-reference-plugin: undefined value at ${where}; descriptor must be value-narrow`);
   }
   if (typeof value === "number" && !Number.isFinite(value)) {
-    throw new Error(`sign-reference-plugin: non-finite number at ${where} — descriptor must be value-narrow`);
+    throw new Error(`sign-reference-plugin: non-finite number at ${where}; descriptor must be value-narrow`);
   }
   if (Array.isArray(value)) {
     value.forEach((v, i) => assertCanonicalizable(v, `${where}[${i}]`));

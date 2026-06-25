@@ -93,7 +93,7 @@ export function referenceBlocklistBundleDir(): string {
 
 /**
  * Enumerate a bundle directory into the (files, nonRegular, signatureFileCount)
- * shape the verifier consumes. Rejects nothing here — the verifier is the gate;
+ * shape the verifier consumes. Rejects nothing here; the verifier is the gate;
  * this only reports what is on disk, including non-regular entries so the verifier
  * can fail closed on them.
  */
@@ -258,7 +258,7 @@ export async function loadReferenceBlocklistBundle(opts: {
 
 /**
  * Read the committed first-party signer public key from the bundle. This is the key
- * the host verifies the bundled reference plugin against — it ships with the bundle as
+ * the host verifies the bundled reference plugin against; it ships with the bundle as
  * part of the signed release (trust = release integrity), NOT an independent host-policy
  * pin and NOT a third-party signer-registry entry (that path is F1-gated).
  */

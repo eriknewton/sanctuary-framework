@@ -30,7 +30,7 @@ import {
   type LoadedReferenceBundle,
 } from "../substrate/reference-plugin/index.js";
 
-const PLUGIN_HELP = `sanctuary plugin — bundled plugin inspection (read-only + liveness)
+const PLUGIN_HELP = `sanctuary plugin - bundled plugin inspection (read-only + liveness)
 
 Usage:
   sanctuary plugin list              list bundled plugins and their declared hooks
@@ -167,7 +167,7 @@ async function runTest(out: Writable, err: Writable, id?: string): Promise<numbe
           probe_host: host,
           verdict: verdict.decision,
           rationale: verdict.rationale,
-          note: "liveness only — this proves the plugin answers the contract, not detection quality",
+          note: "liveness only: this proves the plugin answers the contract, not detection quality",
         },
         null,
         2,
