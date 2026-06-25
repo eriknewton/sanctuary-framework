@@ -102,6 +102,11 @@ import {
   BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
   BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
 } from "../broker-mcp/liveness-constants.js";
+import {
+  assertPluginMatcherDisjoint,
+  buildPluginHealthRows,
+  type PluginHealthRow,
+} from "./plugin-feature-health.js";
 
 /**
  * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
@@ -653,6 +658,15 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
     },
   ]);
 
+// Load-time mutual-exclusion check (per-plugin invariant 4): the per-plugin
+// matcher keys on the `(l1, egress_decision)` op, which carries the host-stamped
+// `contributors` array. Assert NO native registry row claims that op on that
+// layer, so a contribution entry can never be double-counted as both a plugin
+// row and a native row. Throws at import time on a collision, exactly as the
+// native registry's own mutual-exclusion discipline (validated in the
+// feature-health tests) requires.
+assertPluginMatcherDisjoint(SLICE1_FEATURE_REGISTRY);
+
 export interface BuildFeatureHealthInput {
   auditLog: AuditLog;
   originMachine: string;
@@ -685,6 +699,16 @@ export interface BuildFeatureHealthInput {
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
+  /**
+   * When true, the panel additionally folds the window's per-plugin attribution
+   * (the `contributors` on `egress_decision` entries) into one read-only
+   * `plugin_rows` entry per attributed plugin, reusing the SAME integrity-judged
+   * read this builder already performs (no second query, no second store). The
+   * plugin rows are a pure observability projection: they NEVER influence the
+   * native rows or any enforcement path. Defaults to off so existing callers see
+   * an empty `plugin_rows` array.
+   */
+  includePluginRows?: boolean;
 }
 
 /**
@@ -1201,6 +1225,14 @@ export interface FeatureHealthPanel {
   window_end: string;
   /** One row per registry feature, in registry order. */
   rows: FeatureHealthRow[];
+  /**
+   * One read-only row per third-party plugin that weighed in on a hook decision
+   * in the window (empty unless `includePluginRows` was set). A pure
+   * observability projection over the per-plugin attribution the host already
+   * records; it composes with `rows` but NEVER influences them or any
+   * enforcement path. See `plugin-feature-health.ts`.
+   */
+  plugin_rows: PluginHealthRow[];
   /** True when the backing audit read was integrity-clean. */
   audit_integrity_ok: boolean;
   /**
@@ -1398,11 +1430,28 @@ export async function buildFeatureHealthPanel(
   });
   const detectionEvidenceComplete = freshnessComplete && lifecycleHistoryComplete;
 
+  // Per-plugin observability projection (read-only). Folded from the SAME
+  // integrity-judged digest read this builder already performed - no second
+  // query, no second store. The plugin rows are an observability sink ONLY:
+  // they do not (and structurally cannot) feed back into the native rows above
+  // or into any enforcement decision. Off by default so existing callers are
+  // byte-for-byte unchanged except for an empty `plugin_rows` array.
+  const pluginRows: PluginHealthRow[] =
+    input.includePluginRows === true
+      ? buildPluginHealthRows({
+          entries: inWindow,
+          originMachine: input.originMachine,
+          integrityOk,
+          now,
+        })
+      : [];
+
   return {
     origin_machine: input.originMachine,
     window_start: windowStart,
     window_end: windowEnd,
     rows,
+    plugin_rows: pluginRows,
     audit_integrity_ok: integrityOk,
     disclosure: {
       broken_zero_undetectable_for_event_driven: true,

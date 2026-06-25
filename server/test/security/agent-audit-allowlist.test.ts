@@ -908,6 +908,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "principal-policy/dashboard.ts",
     "principal-policy/approval-aggregator.ts",
     "principal-policy/feature-health.ts",
+    // per-plugin attribution health rows: a read-only observability projection
+    // over egress_decision contributors, folded into the operator posture
+    // /feature-health surface behind the SAME checkAuth gate; never agent-facing.
+    "principal-policy/plugin-feature-health.ts",
     "principal-policy/posture.ts",
     "principal-policy/unified-inbox-producers.ts",
     // operator CLI
