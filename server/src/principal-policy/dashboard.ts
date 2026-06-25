@@ -63,6 +63,7 @@ import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
+import { denyForbidden } from "../v1/http.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
@@ -230,11 +231,67 @@ const MAX_SESSIONS = 1000;
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1-minute window
 const RATE_LIMIT_GENERAL = 120;       // max general API requests per window
 const RATE_LIMIT_DECISIONS = 20;      // max approve/deny decisions per window
+// Federation P1: dedicated bucket for the pre-session, node-cert-authenticated
+// `/v1/federation/sync/peer` route. Each request triggers one cryptographic
+// envelope verification, so the budget is tighter than the general bucket and
+// (unlike the dashboard buckets) does NOT exempt loopback: a remote peer can
+// arrive via a loopback-presenting transport (a tunnel), so a loopback exemption
+// would let such a peer flood the verify path unthrottled, and the exemption is
+// itself a probing asymmetry. See checkRateLimit's `exemptLoopback` flag.
+const RATE_LIMIT_FEDERATION_PEER = 60; // max peer-sync attempts per window per /64
 const MAX_RATE_LIMIT_ENTRIES = 10_000; // cap the tracking map to prevent memory exhaustion
+// Federation P1 DoS hardening: a global ceiling on concurrent in-flight
+// crypto-verify (envelope verification) on the unauthenticated peer-sync route,
+// so an unauthenticated flood cannot exhaust CPU faster than the per-/64 rate
+// limit alone would bound it. Over-ceiling requests get the SAME generic
+// rejection as a verify failure (no distinguishable error → no oracle).
+const MAX_CONCURRENT_PEER_VERIFY = 16;
+
+type RateLimitClass = "general" | "decisions" | "federation_peer";
 
 interface RateLimitEntry {
-  general: number[];   // timestamps of general requests
-  decisions: number[]; // timestamps of decision requests
+  general: number[];        // timestamps of general requests
+  decisions: number[];      // timestamps of decision requests
+  federation_peer: number[]; // timestamps of federation peer-sync requests
+}
+
+/**
+ * Federation P1 DoS hardening: return the /64 prefix key for an IPv6 address, or
+ * null when the input is not an IPv6 literal (IPv4 / "unknown" / already a mapped
+ * IPv4 normalized upstream). A /64 is the smallest IPv6 block a host is normally
+ * delegated, so an attacker rotating source addresses within their /64 must share
+ * one rate-limit bucket. We take the first four hextets after expanding any single
+ * `::` zero-run. Keyed as `"<h0>:<h1>:<h2>:<h3>::/64"` so it can never collide
+ * with a verbatim address key. Conservative: any parse ambiguity returns null so
+ * the caller falls back to the exact-address key (fail safe; never wider than the
+ * input intended).
+ */
+export function ipv6Slash64Prefix(addr: string): string | null {
+  // Reject anything without a colon (IPv4 / "unknown") and zone ids / ports.
+  if (!addr.includes(":")) return null;
+  if (addr.includes("%") || addr.includes("/")) return null;
+  // An IPv4-mapped form (::ffff:1.2.3.4) is an IPv4 address; do not /64 it.
+  if (addr.includes(".")) return null;
+  const doubleColonCount = (addr.match(/::/g) ?? []).length;
+  if (doubleColonCount > 1) return null; // malformed: more than one "::"
+  let hextets: string[];
+  if (doubleColonCount === 1) {
+    const [head, tail] = addr.split("::");
+    const headParts = head ? head.split(":") : [];
+    const tailParts = tail ? tail.split(":") : [];
+    const missing = 8 - headParts.length - tailParts.length;
+    if (missing < 0) return null;
+    hextets = [...headParts, ...Array<string>(missing).fill("0"), ...tailParts];
+  } else {
+    hextets = addr.split(":");
+  }
+  if (hextets.length !== 8) return null;
+  // Each hextet must be 1-4 hex digits.
+  for (const h of hextets) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(h)) return null;
+  }
+  const prefix = hextets.slice(0, 4).map((h) => h.toLowerCase()).join(":");
+  return `${prefix}::/64`;
 }
 
 /**
@@ -339,6 +396,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
   /** Rate limiting: per-IP request tracking */
   private rateLimits: Map<string, RateLimitEntry> = new Map();
+  /**
+   * Federation P1 DoS hardening: count of in-flight crypto-verify on the
+   * unauthenticated `/v1/federation/sync/peer` route. Bounded by
+   * MAX_CONCURRENT_PEER_VERIFY so an unauthenticated flood cannot exhaust CPU on
+   * envelope verification faster than the per-/64 rate limit alone would bound.
+   */
+  private inFlightPeerVerify = 0;
   /** Whether the dashboard is running in standalone mode (no MCP server) */
   private _standaloneMode = false;
   /**
@@ -2512,6 +2576,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Federation P1 DoS hardening: derive the rate-limit MAP KEY for an address.
+   * For the federation peer class we aggregate IPv6 addresses to their /64
+   * prefix, so an attacker who rotates source addresses within a single /64
+   * (the smallest routable IPv6 allocation, trivially obtained) shares ONE
+   * bucket instead of getting a fresh budget per address. IPv4 and non-IPv6
+   * literals are keyed verbatim (no /64 concept). The dashboard/browser classes
+   * keep per-exact-address keying (a NAT'd office should not share a browser
+   * bucket).
+   */
+  private rateLimitKey(addr: string, aggregateIpv6: boolean): string {
+    if (!aggregateIpv6) return addr;
+    return ipv6Slash64Prefix(addr) ?? addr;
+  }
+
+  /**
    * v1.3.0 (XXXXX): loopback addresses are exempt from rate limiting.
    * The operator's local browser, autonomous tooling, and drill-via-curl
    * flows should never be locked out of their own dashboard.
@@ -2521,41 +2600,81 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Per-class rate-limit policy. The dashboard/browser classes exempt loopback
+   * (operator-local requests must never 429) and key per exact address. The
+   * federation peer class does NEITHER: it must throttle loopback (a tunneled
+   * remote peer can present as loopback) and aggregates IPv6 to /64 (DoS
+   * hardening). Centralized so the policy difference is in one place.
+   */
+  private rateLimitPolicy(type: RateLimitClass): {
+    limit: number;
+    exemptLoopback: boolean;
+    aggregateIpv6: boolean;
+  } {
+    switch (type) {
+      case "decisions":
+        return { limit: RATE_LIMIT_DECISIONS, exemptLoopback: true, aggregateIpv6: false };
+      case "federation_peer":
+        return {
+          limit: RATE_LIMIT_FEDERATION_PEER,
+          exemptLoopback: false,
+          aggregateIpv6: true,
+        };
+      case "general":
+      default:
+        return { limit: RATE_LIMIT_GENERAL, exemptLoopback: true, aggregateIpv6: false };
+    }
+  }
+
+  /**
    * Check rate limit for a request. Returns true if allowed, false if rate-limited.
    * When rate-limited, sends a 429 response.
    *
-   * v1.3.0 (XXXXX): loopback addresses bypass rate limiting entirely.
+   * v1.3.0 (XXXXX): the dashboard/browser classes ("general"/"decisions") exempt
+   * loopback (operator-local requests: browser polling, autonomous tooling,
+   * drill-via-curl) must never 429. Federation P1: the "federation_peer" class
+   * does NOT exempt loopback and aggregates IPv6 to /64 (see rateLimitPolicy).
+   *
+   * NO-ORACLE (Federation P1 §2/§3): the 429 fires identically for every caller
+   * regardless of federation membership/enabled-state. It runs BEFORE any
+   * federation-state check, so it leaks only "you are being throttled". The body
+   * carries NO federation-state detail and the Retry-After is derived purely from
+   * the FIXED window bucket (oldest timestamp + window), never from any internal
+   * federation state, so it is not a timing oracle.
    */
   private checkRateLimit(
     req: IncomingMessage,
     res: ServerResponse,
-    type: "general" | "decisions"
+    type: RateLimitClass
   ): boolean {
+    const { limit, exemptLoopback, aggregateIpv6 } = this.rateLimitPolicy(type);
     const addr = this.getRemoteAddr(req);
 
-    // v1.3.0 (XXXXX): loopback is always allowed. Operator-local requests
-    // (browser polling, autonomous tooling, drill-via-curl) must never 429.
-    if (this.isLoopbackAddr(addr)) return true;
+    // Loopback exemption is per-class: dashboard/browser classes keep it; the
+    // federation peer class drops it (a tunneled remote peer can present as
+    // loopback, and the exemption is itself a probing asymmetry).
+    if (exemptLoopback && this.isLoopbackAddr(addr)) return true;
 
+    const key = this.rateLimitKey(addr, aggregateIpv6);
     const now = Date.now();
     const windowStart = now - RATE_LIMIT_WINDOW_MS;
 
-    // Get or create entry for this address
-    let entry = this.rateLimits.get(addr);
+    // Get or create entry for this key
+    let entry = this.rateLimits.get(key);
     if (!entry) {
       // Cap the tracking map to prevent memory exhaustion
       if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
         this.pruneRateLimits(now);
       }
-      entry = { general: [], decisions: [] };
-      this.rateLimits.set(addr, entry);
+      entry = { general: [], decisions: [], federation_peer: [] };
+      this.rateLimits.set(key, entry);
     }
 
     // Prune old timestamps from the window
     entry.general = entry.general.filter(t => t > windowStart);
     entry.decisions = entry.decisions.filter(t => t > windowStart);
+    entry.federation_peer = entry.federation_peer.filter(t => t > windowStart);
 
-    const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
     const timestamps = entry[type];
 
     if (timestamps.length >= limit) {
@@ -2583,7 +2702,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     for (const [addr, entry] of this.rateLimits) {
       const hasRecent =
         entry.general.some(t => t > windowStart) ||
-        entry.decisions.some(t => t > windowStart);
+        entry.decisions.some(t => t > windowStart) ||
+        entry.federation_peer.some(t => t > windowStart);
       if (!hasRecent) {
         this.rateLimits.delete(addr);
       }
@@ -2672,13 +2792,66 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // Ceremony endpoints get the stricter decision-class rate limit
       // (auth brute-force guard); reads get the general limit. The federation
       // join-submission ceremony is an auth surface too (bootstrap-token
-      // brute-force guard), so it shares the decisions budget.
-      const limitClass =
-        url.pathname.startsWith("/v1/session/") ||
-        url.pathname.startsWith("/v1/federation/authorize/")
-          ? "decisions"
-          : "general";
+      // brute-force guard), so it shares the decisions budget. Federation P1: the
+      // pre-session, node-cert-authenticated peer-sync route gets its OWN
+      // dedicated bucket (no loopback exemption, IPv6 /64 aggregation, tighter
+      // budget, global concurrent-verify ceiling) because it is reachable with no
+      // session and each request triggers a crypto verification.
+      const limitClass: RateLimitClass =
+        url.pathname === "/v1/federation/sync/peer"
+          ? "federation_peer"
+          : url.pathname.startsWith("/v1/session/") ||
+              url.pathname.startsWith("/v1/federation/authorize/")
+            ? "decisions"
+            : "general";
       if (!this.checkRateLimit(req, res, limitClass)) return;
+      // Federation P1 DoS hardening: bound concurrent in-flight crypto-verify on
+      // the unauthenticated peer-sync route. Over the ceiling, reject with the
+      // SAME generic 403 a verify failure returns (no distinguishable error → no
+      // membership/enabled-state oracle). The counter is released in a finally
+      // after the handler resolves.
+      //
+      // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
+      // ceiling bound CPU spent on crypto verification, but do NOT bound a
+      // slow-loris socket-exhaustion attack: there is no listener read/idle
+      // timeout and no max-connection bound. `v1/http.ts` readJsonBody has no
+      // read timeout, and the server uses Node's default `requestTimeout`. The
+      // listener read/idle timeout + max-connection bound are deferred because
+      // they touch shared server-listener config (not just this route).
+      if (limitClass === "federation_peer") {
+        if (this.inFlightPeerVerify >= MAX_CONCURRENT_PEER_VERIFY) {
+          // Byte-identical to every other 403 on this route (incl.
+          // Cache-Control: no-store) so the over-ceiling rejection is not a
+          // wire-distinguishable oracle.
+          denyForbidden(res);
+          return;
+        }
+        this.inFlightPeerVerify++;
+        handleV1Request(
+          {
+            sessions: this.v1Sessions,
+            isLoopbackRequest: (r) => this.isLoopbackRequest(r),
+            buildFullStatus: () => this.buildV1FullStatus(),
+            version: PKG_VERSION,
+            agents: this.buildV1AgentsDeps(),
+            federation: this.buildV1FederationDeps(),
+          },
+          req,
+          res,
+          url,
+          method,
+        )
+          .catch(() => {
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Internal server error" }));
+            }
+          })
+          .finally(() => {
+            this.inFlightPeerVerify--;
+          });
+        return;
+      }
       handleV1Request(
         {
           sessions: this.v1Sessions,
