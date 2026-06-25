@@ -1149,7 +1149,10 @@ export async function runFederationProvision(args: {
           "federation must run a hybrid-capable Sanctuary version to verify this " +
           "root. If you need to federate with an older (classical-only) peer, " +
           "re-provision a fresh fortress with --classical (or --crypto-suite " +
-          "ed25519-v1).\n",
+          "ed25519-v1). NOTE: a hybrid root cannot yet be rotated or " +
+          "compromise-revoked in place -- rotate-root refuses on hybrid roots " +
+          "(hybrid rotation is a planned follow-up). If you need in-place " +
+          "rotation or compromise-recovery today, provision with --classical.\n",
       );
     } else {
       // Inverse note on the --classical opt-out: maximal back-compat, but NO
@@ -1444,8 +1447,11 @@ Provision (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress:
               ONLY the federation trust-root cert chain post-quantum-capable; it
               does NOT make audit, transparency, reputation, custody at-rest, or
               transport post-quantum. TRADE: every joining machine must run a
-              hybrid-capable Sanctuary version to verify a hybrid root. Pass
-              --pqc-hybrid (or --crypto-suite ed25519+ml-dsa-v1) to name the
+              hybrid-capable Sanctuary version to verify a hybrid root, AND a
+              hybrid root cannot yet be rotated or compromise-revoked in place
+              (rotate-root refuses on hybrid; hybrid rotation is a planned
+              follow-up -- pass --classical if you need in-place rotation today).
+              Pass --pqc-hybrid (or --crypto-suite ed25519+ml-dsa-v1) to name the
               default explicitly.
 
               --classical (alias --crypto-suite ed25519-v1) opts OUT to a legacy
@@ -1484,9 +1490,10 @@ Rotate-root (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress
                NEW pinned_master (PUBLIC) to redistribute out of band, plus the
                rotation cert (--renew) or the root revocation (--compromised).
 
-               NOTE: a fortress provisioned with --pqc-hybrid is NOT yet
-               rotatable; rotate-root REFUSES on a hybrid root (rotating now would
-               silently drop the ML-DSA key). Hybrid rotation is a planned
+               NOTE: a hybrid root (now the DEFAULT for a fresh provision) is NOT
+               yet rotatable; rotate-root REFUSES on a hybrid root (rotating now
+               would silently drop the ML-DSA key). Provision with --classical if
+               you need in-place rotation today. Hybrid rotation is a planned
                follow-up.
 
 Operator (issuer) verbs -- operator-signed, run on the home fortress:

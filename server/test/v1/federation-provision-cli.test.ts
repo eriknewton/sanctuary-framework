@@ -523,6 +523,10 @@ describe("federation provision -- PQC default-on (hybrid is the default; --class
     expect(err.get()).toMatch(/DEFAULT hybrid/);
     expect(err.get()).toMatch(/does NOT make audit/);
     expect(err.get()).toMatch(/hybrid-capable Sanctuary version/);
+    // Disclosure-at-decision-point: the default note warns the hybrid root is not
+    // yet rotatable / compromise-revocable in place (so the operator learns it
+    // BEFORE they are stuck), and names --classical as the in-place-rotation path.
+    expect(err.get()).toMatch(/cannot yet be rotated or compromise-revoked/);
 
     // The persisted record is hybrid (carries the hybrid block + 4032-byte secret).
     const { masterKey } = await establishMaster({
