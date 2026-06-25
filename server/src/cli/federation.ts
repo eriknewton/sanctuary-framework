@@ -1441,6 +1441,11 @@ Rotate-root (issuer) verb -- custody-unlocked, runs LOCALLY on the home fortress
                NEW pinned_master (PUBLIC) to redistribute out of band, plus the
                rotation cert (--renew) or the root revocation (--compromised).
 
+               NOTE: a fortress provisioned with --pqc-hybrid is NOT yet
+               rotatable; rotate-root REFUSES on a hybrid root (rotating now would
+               silently drop the ML-DSA key). Hybrid rotation is a planned
+               follow-up.
+
 Operator (issuer) verbs -- operator-signed, run on the home fortress:
   sanctuary federation enable  --fortress-url <url> [--idempotency-key <s>]
   sanctuary federation disable --fortress-url <url> [--idempotency-key <s>]

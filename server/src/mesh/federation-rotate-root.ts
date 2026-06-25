@@ -98,6 +98,55 @@ export const FEDERATION_ROTATE_ROOT_JOURNAL_MAC_PURPOSE =
 
 const JOURNAL_MAC_DOMAIN = "sanctuary.federation-rotate-root-journal.v1\n";
 
+/**
+ * PQC Slice 3 fail-closed guard (constraint 5: never silently degrade).
+ *
+ * The rotate-root flows rebuild the trust-root record field-by-field (see the
+ * DROP markers in `encodeRecordForStaging` / `mintRotatedRecord` /
+ * `mintCompromiseRotatedRecord`) and do NOT carry the optional `hybrid`
+ * (Ed25519+ML-DSA-65) block. A hybrid-provisioned fortress that rotated would
+ * therefore be SILENTLY downgraded to a classical-only root, dropping its
+ * post-quantum protection with no warning. Full hybrid rotation is a deferred
+ * Slice 3 follow-up; until it lands, rotate-root REFUSES on a hybrid live (or
+ * staged) record, fail-closed, BEFORE minting or journaling anything.
+ */
+const HYBRID_ROTATE_ROOT_UNSUPPORTED_MESSAGE =
+  "this fortress has a hybrid (Ed25519+ML-DSA) federation root. Hybrid " +
+  "signing-master rotation is not yet supported (deferred Slice 3 follow-up); " +
+  "rotating now would silently drop the ML-DSA key, so it is refused. Track: " +
+  "PQC hybrid rotate-root follow-up.";
+
+function assertNotHybridForRotation(record: FederationTrustRootRecord): void {
+  if (record.hybrid !== undefined) {
+    throw new FederationRotateRootError(HYBRID_ROTATE_ROOT_UNSUPPORTED_MESSAGE);
+  }
+}
+
+/**
+ * Resume-path guard: if the LIVE federation root is still hybrid, the staged
+ * record (always classical: `encodeRecordForStaging` drops `hybrid`) must NOT
+ * be promoted over it (that is the same silent hybrid->classical downgrade the
+ * rotate paths refuse upstream). Refuses fail-closed before promote; the live
+ * hybrid root stays bootable. Loads + zeroes the live secrets so the check
+ * leaves no key material in memory.
+ */
+async function assertLiveNotHybridBeforeResume(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+): Promise<void> {
+  const liveStore = new FederationTrustRootStore(storage, masterKey);
+  const live = await liveStore.load();
+  if (live === null) return;
+  const isHybrid = live.hybrid !== undefined;
+  if (live.master_private_key) live.master_private_key.fill(0);
+  live.master_secret.fill(0);
+  live.issuing_principal_private_key.fill(0);
+  live.local_node_private_key.fill(0);
+  if (isHybrid) {
+    throw new FederationRotateRootResumeError(HYBRID_ROTATE_ROOT_UNSUPPORTED_MESSAGE);
+  }
+}
+
 export class FederationRotateRootError extends Error {
   constructor(message: string) {
     super(message);
@@ -321,6 +370,11 @@ class StagedRecordStore {
 }
 
 function encodeRecordForStaging(record: FederationTrustRootRecord): unknown {
+  // DEBT (PQC Slice 3 follow-up): hybrid rotate-root unsupported; refused
+  // fail-closed upstream (rotateFederationRootRenew / rotateFederationRootCompromised
+  // / the resume guard) to avoid a silent hybrid->classical downgrade. The
+  // optional `hybrid` block is intentionally NOT carried here; once hybrid
+  // rotation lands, mint + encode + parse must round-trip it together.
   return {
     fortress_id: record.fortress_id,
     node_id: record.node_id,
@@ -346,6 +400,9 @@ function encodeRecordForStaging(record: FederationTrustRootRecord): unknown {
 function parseStagedRecord(json: string): FederationTrustRootRecord {
   // Structural decode only; the promote step's liveStore.save() runs the full
   // cert-chain + rotation-cert validation before the record can serve.
+  // DEBT (PQC Slice 3 follow-up): see encodeRecordForStaging; the `hybrid` block
+  // is intentionally not decoded here because rotate-root refuses on a hybrid
+  // root fail-closed upstream (no hybrid staged record is ever written).
   const value = JSON.parse(json) as Record<string, unknown>;
   const decode32 = (b64: unknown, label: string): Uint8Array => {
     if (typeof b64 !== "string") {
@@ -452,6 +509,12 @@ function mintRotatedRecord(
       rotation_serial: newRotationSerial,
     });
 
+    // DEBT (PQC Slice 3 follow-up): this rebuild intentionally does NOT carry
+    // `live.hybrid` (the Ed25519+ML-DSA block). rotateFederationRootRenew refuses
+    // on a hybrid live root fail-closed BEFORE reaching here, so the dropped
+    // field can never cause a silent hybrid->classical downgrade. Hybrid
+    // rotation (re-mint the ML-DSA master + re-issue the hybrid certs) is a
+    // deferred slice; when it lands, carry the hybrid block here.
     return {
       fortress_id: live.fortress_id,
       node_id: live.node_id,
@@ -536,6 +599,11 @@ function mintCompromiseRotatedRecord(live: FederationTrustRootRecord): {
       throw new FederationRotateRootError("cascade did not re-issue the local node cert");
     }
 
+    // DEBT (PQC Slice 3 follow-up): like mintRotatedRecord, this rebuild does NOT
+    // carry `live.hybrid`. rotateFederationRootCompromised refuses on a hybrid
+    // live root fail-closed BEFORE reaching here, so no silent
+    // hybrid->classical downgrade can occur; hybrid compromise rotation is a
+    // deferred slice.
     const record: FederationTrustRootRecord = {
       fortress_id: live.fortress_id,
       node_id: live.node_id,
@@ -671,6 +739,16 @@ export async function rotateFederationRootRenew(
     throw new FederationRotateRootError(
       "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
     );
+  }
+  // PQC Slice 3: refuse a hybrid root before minting (a renewal would silently
+  // drop the ML-DSA block; constraint 5, fail-closed). Zero the loaded secrets
+  // first so the early refusal does not leave key material in memory.
+  if (live.hybrid !== undefined) {
+    if (live.master_private_key) live.master_private_key.fill(0);
+    live.master_secret.fill(0);
+    live.issuing_principal_private_key.fill(0);
+    live.local_node_private_key.fill(0);
+    assertNotHybridForRotation(live);
   }
 
   const oldSerial = typeof live.rotation_serial === "number" ? live.rotation_serial : 0;
@@ -813,6 +891,16 @@ export async function rotateFederationRootCompromised(
     throw new FederationRotateRootError(
       "this fortress holds a NON-ISSUER (joiner) federation root; only an issuer can rotate-root",
     );
+  }
+  // PQC Slice 3: refuse a hybrid root before minting (a compromise rotate would
+  // silently drop the ML-DSA block; constraint 5, fail-closed). Zero the loaded
+  // secrets first so the early refusal does not leave key material in memory.
+  if (live.hybrid !== undefined) {
+    if (live.master_private_key) live.master_private_key.fill(0);
+    live.master_secret.fill(0);
+    live.issuing_principal_private_key.fill(0);
+    live.local_node_private_key.fill(0);
+    assertNotHybridForRotation(live);
   }
 
   const oldMasterPubkey = live.pinned_master_pubkey.public_key;
@@ -963,6 +1051,9 @@ export async function resumeFederationRootRotation(
       "this fortress has a COMPROMISE rotate-root in progress; resume it with `sanctuary federation rotate-root --compromised --resume`",
     );
   }
+  // PQC Slice 3: never promote a classical staged record over a still-hybrid
+  // live root (fail-closed; constraint 5).
+  await assertLiveNotHybridBeforeResume(storage, masterKey);
 
   log("Resuming: promoting the staged federation root...");
   await promote(storage, masterKey, journal, failpoint);
@@ -1044,6 +1135,9 @@ export async function resumeFederationRootCompromised(
       "the in-progress rotate-root is a RENEWAL, not a compromise; resume it with `sanctuary federation rotate-root --renew --resume`",
     );
   }
+  // PQC Slice 3: never promote a classical staged record over a still-hybrid
+  // live root (fail-closed; constraint 5).
+  await assertLiveNotHybridBeforeResume(storage, masterKey);
 
   log("Resuming: promoting the staged federation root (K2)...");
   await promote(storage, masterKey, journal, failpoint);
