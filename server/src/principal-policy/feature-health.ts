@@ -102,6 +102,11 @@ import {
   BROKER_DAEMON_AUDIT_PROVENANCE_KEY,
   BROKER_DAEMON_AUDIT_PROVENANCE_VALUE,
 } from "../broker-mcp/liveness-constants.js";
+import {
+  assertPluginMatcherDisjoint,
+  buildPluginHealthRows,
+  type PluginHealthRow,
+} from "./plugin-feature-health.js";
 
 /**
  * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
@@ -653,6 +658,15 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
     },
   ]);
 
+// Load-time mutual-exclusion check (per-plugin invariant 4): the per-plugin
+// matcher keys on the `(l1, egress_decision)` op, which carries the host-stamped
+// `contributors` array. Assert NO native registry row claims that op on that
+// layer, so a contribution entry can never be double-counted as both a plugin
+// row and a native row. Throws at import time on a collision, exactly as the
+// native registry's own mutual-exclusion discipline (validated in the
+// feature-health tests) requires.
+assertPluginMatcherDisjoint(SLICE1_FEATURE_REGISTRY);
+
 export interface BuildFeatureHealthInput {
   auditLog: AuditLog;
   originMachine: string;
@@ -685,6 +699,16 @@ export interface BuildFeatureHealthInput {
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
+  /**
+   * When true, the panel additionally folds the window's per-plugin attribution
+   * (the `contributors` on `egress_decision` entries) into one read-only
+   * `plugin_rows` entry per attributed plugin, reusing the SAME integrity-judged
+   * read this builder already performs (no second query, no second store). The
+   * plugin rows are a pure observability projection: they NEVER influence the
+   * native rows or any enforcement path. Defaults to off so existing callers see
+   * an empty `plugin_rows` array.
+   */
+  includePluginRows?: boolean;
 }
 
 /**
@@ -1201,6 +1225,14 @@ export interface FeatureHealthPanel {
   window_end: string;
   /** One row per registry feature, in registry order. */
   rows: FeatureHealthRow[];
+  /**
+   * One read-only row per third-party plugin that weighed in on a hook decision
+   * in the window (empty unless `includePluginRows` was set). A pure
+   * observability projection over the per-plugin attribution the host already
+   * records; it composes with `rows` but NEVER influences them or any
+   * enforcement path. See `plugin-feature-health.ts`.
+   */
+  plugin_rows: PluginHealthRow[];
   /** True when the backing audit read was integrity-clean. */
   audit_integrity_ok: boolean;
   /**
@@ -1398,11 +1430,28 @@ export async function buildFeatureHealthPanel(
   });
   const detectionEvidenceComplete = freshnessComplete && lifecycleHistoryComplete;
 
+  // Per-plugin observability projection (read-only). Folded from the SAME
+  // integrity-judged digest read this builder already performed - no second
+  // query, no second store. The plugin rows are an observability sink ONLY:
+  // they do not (and structurally cannot) feed back into the native rows above
+  // or into any enforcement decision. Off by default so existing callers are
+  // byte-for-byte unchanged except for an empty `plugin_rows` array.
+  const pluginRows: PluginHealthRow[] =
+    input.includePluginRows === true
+      ? buildPluginHealthRows({
+          entries: inWindow,
+          originMachine: input.originMachine,
+          integrityOk,
+          now,
+        })
+      : [];
+
   return {
     origin_machine: input.originMachine,
     window_start: windowStart,
     window_end: windowEnd,
     rows,
+    plugin_rows: pluginRows,
     audit_integrity_ok: integrityOk,
     disclosure: {
       broken_zero_undetectable_for_event_driven: true,
@@ -1444,11 +1493,15 @@ export async function buildFeatureHealthPanel(
  *                              evaluation, then `unconfirmed`/`unknown` in a
  *                              later one (an ON→OFF state transition). State
  *                              comparison is the caller's; this enum names it.
- *   (c) plugin_failure_surge - DEFERRED behind #508 S4. No emission path exists
- *                              yet (`substrate/verdict.ts` is contract-only),
- *                              so this rule is wired but DORMANT: it can never
- *                              fire until a `plugin_error` producer lands. Do
- *                              NOT fabricate a producer to make it fire.
+ *   (c) plugin_failure_surge - The emission path now EXISTS (S4, #728:
+ *                              `castle-wall/egress-proxy.ts:appendPluginAuditIfConfigured`
+ *                              stamps `plugin_error`-class contributions onto
+ *                              the `egress_decision` L1 audit entry, the same
+ *                              data the per-plugin rows read). This rule stays
+ *                              DORMANT not because the data is absent but
+ *                              because the NOTIFICATION raise/dedup path is not
+ *                              built yet (a later slice). Do NOT fire on it
+ *                              until that path lands.
  */
 export type FeatureFaultClass =
   | "castle_wall_fault"
@@ -1460,10 +1513,11 @@ export interface FeatureFaultClassRule {
   /** Human-facing description (the notification body source). */
   description: string;
   /**
-   * Whether a producer exists for this class today. `plugin_failure_surge` is
-   * dormant until #508 S4 lands an emission path; the route layer MUST skip any
-   * rule whose `dormant` flag is true so a dormant rule can never fire on
-   * fabricated data.
+   * Whether this class is wired to fire today. `plugin_failure_surge` now HAS a
+   * producer (S4 #728 emits `plugin_error`-class contributions onto the
+   * `egress_decision` audit entry), but stays dormant because its notification
+   * raise/dedup path is not built yet (a later slice). The route layer MUST skip
+   * any rule whose `dormant` flag is true so a not-yet-wired rule can never fire.
    */
   dormant: boolean;
 }
@@ -1486,8 +1540,10 @@ export const FEATURE_FAULT_CLASS_RULES: ReadonlyArray<FeatureFaultClassRule> =
       class: "plugin_failure_surge",
       description:
         "A security plugin's failure rate crossed into sustained failure.",
-      // DORMANT: no plugin_error emission path exists until #508 S4. Wired so
-      // the rule shape is reviewable now; the route layer must not fire it.
+      // DORMANT: the plugin_error emission path now exists (S4 #728), but the
+      // notification raise/dedup path is not built yet (a later slice), so the
+      // route layer must not fire it. Dormancy is the missing raise path, not
+      // missing data.
       dormant: true,
     },
   ]);
