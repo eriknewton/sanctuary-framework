@@ -64,6 +64,7 @@ import {
   persistUserProvidedPassphrase,
   isOsKeyringLocation,
   PassphraseUnreadableError,
+  PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import {
@@ -300,6 +301,52 @@ function resolveSanctuaryCommand(options: WrapOptions): {
   };
 }
 
+/**
+ * Validate a `--dev-dist <path>` before it is written into the harness config
+ * (Finding 4, 2026-06-25). The dogfood path registers `node <path>` as the
+ * `sanctuary` MCP command; a typo'd or non-existent path produces a wrap that
+ * "verifies" (the JSON check only requires a non-empty command string) but
+ * whose harness entry silently fails at MCP spawn time, with no wrap-time
+ * signal. Fail loudly at wrap time instead: the file must exist and end in
+ * `.js`. Throws {@link DevDistInvalidError} with an actionable message.
+ */
+export class DevDistInvalidError extends Error {
+  readonly devDist: string;
+  constructor(devDist: string, reason: string) {
+    super(
+      `--dev-dist path is invalid: ${reason}\n` +
+        `  path: ${devDist}\n` +
+        `  --dev-dist must point at a built Sanctuary entrypoint .js file ` +
+        `(e.g. dist/index.js). It is registered as 'node <path>' for the ` +
+        `sanctuary MCP entry; a missing path would fail silently at spawn time.`
+    );
+    this.name = "DevDistInvalidError";
+    this.devDist = devDist;
+  }
+}
+
+export async function validateDevDist(devDist: string): Promise<void> {
+  const resolved = resolvePath(devDist);
+  if (!resolved.endsWith(".js")) {
+    throw new DevDistInvalidError(devDist, "path does not end in '.js'");
+  }
+  try {
+    await access(resolved);
+  } catch {
+    throw new DevDistInvalidError(devDist, "no such file");
+  }
+  // Reject a directory masquerading as the entrypoint.
+  try {
+    const st = await lstat(resolved);
+    if (!st.isFile()) {
+      throw new DevDistInvalidError(devDist, "path is not a regular file");
+    }
+  } catch (err) {
+    if (err instanceof DevDistInvalidError) throw err;
+    throw new DevDistInvalidError(devDist, "could not stat the path");
+  }
+}
+
 /** Operator-facing one-liner for what the YAML injection did / would do. */
 function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
   const preserved =
@@ -458,6 +505,23 @@ export async function runWrap(
   if (options.unwrap) {
     await unwrap(options.dryRun === true);
     return;
+  }
+
+  // Finding 4 (2026-06-25): validate --dev-dist BEFORE anything is previewed or
+  // written. The dry-run reporter previews the exact 'node <path>' harness
+  // entry this would write, so a typo'd path must fail the dry run too, not
+  // just the real wrap. Fail loudly here rather than at deferred MCP spawn time.
+  if (options.devDist !== undefined) {
+    try {
+      await validateDevDist(options.devDist);
+    } catch (err) {
+      if (err instanceof DevDistInvalidError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
   }
 
   // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
@@ -701,6 +765,16 @@ export async function runWrap(
         );
       }
     } catch (err) {
+      if (err instanceof PassphraseKeyringUnreachableError) {
+        // Locked / unreachable OS keyring (error 36 / no D-Bus): fail closed
+        // with the actionable unlock message. Sanctuary did NOT regenerate or
+        // overwrite the stored passphrase, so retrying after unlocking the
+        // keyring recovers cleanly.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Keyring Locked`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
       if (err instanceof PassphraseUnreadableError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`\n  Sanctuary: Passphrase Unreadable`);
@@ -1700,8 +1774,13 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const heroPrefix = info.castleWallArmed === true
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
+  // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
+  // wrap, not "Full". "Full" is a superlative reserved for observed/verified
+  // state (as Castle Wall and Sentinels already are); printing "Charter Full /
+  // Heralds Full" unconditionally (even under --no-dashboard, even when nothing
+  // was exercised) was the same overclaim the load-bearing-layer fix removed.
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
@@ -1783,7 +1862,7 @@ export function formatWrapSuccessNoDashboard(
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;

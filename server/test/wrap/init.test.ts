@@ -954,6 +954,48 @@ describe("--no-identity (default operator-identity seed)", () => {
     expect(pinCalls).toBe(0);
   });
 
+  it("the seed-failure remediation message is honest: identity create OR --force, never the broken 'Re-run init'", async () => {
+    // Finding 2 (2026-06-25): the old message said "Re-run init", but a plain
+    // `init` re-run REFUSES the now-non-empty fortress and `--force` mints a NEW
+    // master that orphans the recovery key just shown. The corrected message
+    // must point at the two remediations that actually work and must NOT print
+    // the broken literal.
+    const fortressPath = join(tmp, "honest-message-fortress");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+    const saveNewSpy = vi
+      .spyOn(IdentityManager.prototype, "saveNew")
+      .mockRejectedValue(new Error("injected mint failure"));
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    let consoleOutput = "";
+    try {
+      await expect(
+        runInit(
+          { fortress: fortressPath, noConfirm: true, noPin: true },
+          { provisionPin: async () => 0 },
+        ),
+      ).rejects.toThrow(/operator identity seed failed/);
+      consoleOutput = consoleSpy.mock.calls
+        .map((c) => c.join(" "))
+        .join("\n");
+    } finally {
+      consoleSpy.mockRestore();
+      saveNewSpy.mockRestore();
+    }
+    // The accurate remediations, both naming the existing fortress path.
+    expect(consoleOutput).toContain(
+      `sanctuary identity create --fortress ${fortressPath}`,
+    );
+    expect(consoleOutput).toContain(
+      `sanctuary init --force --fortress ${fortressPath}`,
+    );
+    // It tells the operator custody is intact and warns --force discards the key.
+    expect(consoleOutput).toContain("recovery key shown above");
+    // The broken instruction is GONE.
+    expect(consoleOutput).not.toMatch(/Re-run init/);
+  });
+
   it("resolveNoIdentity uses an allowlist for the env var, not 'anything truthy'", () => {
     expect(resolveNoIdentity({ noIdentity: true }, {})).toBe(true);
     expect(resolveNoIdentity({}, {})).toBe(false);
