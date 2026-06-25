@@ -1066,8 +1066,8 @@ export async function rotateFederationRootCompromised(
     );
   }
   let oldRevokedHybrid: FederationRootRevocationHybridBinding | undefined;
-  let oldMasterPubkey = "";
-  let newRevocationSerial = 1;
+  let oldMasterPubkey: string;
+  let newRevocationSerial: number;
   let rotated: FederationTrustRootRecord | undefined;
   let newPrincipalPrivateKey: Uint8Array | undefined;
   let newHybridPrincipalPrivateKeys:
