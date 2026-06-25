@@ -485,6 +485,118 @@ export class ReputationStore {
   }
 
   /**
+   * Find a single existing attestation matching an interaction identity tuple.
+   * Used for idempotency / replay-resistance at the recording boundary (e.g.
+   * the bridge's attest path) so a party cannot RE-ATTEST the SAME negotiation:
+   * matching on the full identifying tuple (interaction id == Concordia
+   * session_id, participant/signer DID, counterparty DID, and context) collapses
+   * repeated bridge_attest calls on one session into a single recorded
+   * attestation. Distinct parties, or the same party in a different context or
+   * interaction, are NOT deduped. Returns the FIRST match by stable
+   * attestation_id ordering for determinism.
+   *
+   * SCOPE (do not overclaim): this closes the same-negotiation / same-session
+   * replay only. It does NOT prevent a party from minting MULTIPLE distinct
+   * commitments for one real negotiation, because the interaction_id is the
+   * caller-supplied Concordia session_id and the bridge does not verify a
+   * session_receipt anchor here. So choosing a fresh session_id per call still
+   * lets one real negotiation self-inflate the tallies N-fold. That broader
+   * self-inflation is NOT closed by this dedup and is a known scoring-engine /
+   * collusion concern (the bridge cannot prove a Concordia session is unique or
+   * real without a verified session_receipt). See findExistingAttestationForDedup
+   * for the fail-closed variant the bridge actually calls.
+   */
+  async findExistingAttestation(criteria: {
+    interaction_id: string;
+    participant_did: string;
+    counterparty_did: string;
+    context: string;
+  }): Promise<StoredAttestation | null> {
+    const result = await this.findExistingAttestationForDedup(criteria);
+    return result.match;
+  }
+
+  /**
+   * Fail-closed dedup scan for the attest boundary.
+   *
+   * Unlike loadAllPaginated / query / loadAll (which deliberately SKIP a
+   * storage.list error or a corrupted entry so aggregate reads degrade
+   * gracefully), the dedup path must fail CLOSED: if a pre-existing matching
+   * attestation happens to be the entry that cannot be listed/read/decrypted,
+   * a silent skip would let the caller record a SECOND attestation under a
+   * transient error (a double-count). So this scan reports `scanComplete:false`
+   * whenever the namespace listing throws OR any per-entry load/decrypt fails,
+   * and the caller (bridge_attest) must DENY the attest rather than risk a
+   * duplicate.
+   *
+   * Returns `{ match, scanComplete }`:
+   * - `match`: the first matching attestation by stable id ordering, or null.
+   * - `scanComplete`: false if the scan could not reliably confirm uniqueness
+   *   (a list error, or any entry that failed to load/decrypt during the scan).
+   *
+   * Scoped to dedup ONLY; other callers keep skip-corrupted aggregate reads.
+   */
+  async findExistingAttestationForDedup(criteria: {
+    interaction_id: string;
+    participant_did: string;
+    counterparty_did: string;
+    context: string;
+  }): Promise<{ match: StoredAttestation | null; scanComplete: boolean }> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_reputation");
+    } catch {
+      // Cannot enumerate the namespace, so cannot confirm uniqueness: fail closed.
+      return { match: null, scanComplete: false };
+    }
+
+    let match: StoredAttestation | null = null;
+    let scanComplete = true;
+
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_reputation", meta.key);
+      } catch {
+        // A read error on an entry we needed to inspect: cannot confirm the
+        // pre-existing attestation is not THIS entry. Fail closed.
+        scanComplete = false;
+        continue;
+      }
+      if (!raw) continue;
+
+      let stored: StoredAttestation;
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        stored = JSON.parse(bytesToString(decrypted));
+      } catch {
+        // A corrupted / undecryptable entry might BE the pre-existing match;
+        // we cannot rule it out, so the scan is incomplete. Fail closed.
+        scanComplete = false;
+        continue;
+      }
+
+      const d = stored.attestation.data;
+      if (
+        d.interaction_id === criteria.interaction_id &&
+        d.participant_did === criteria.participant_did &&
+        d.counterparty_did === criteria.counterparty_did &&
+        d.context === criteria.context
+      ) {
+        if (
+          match === null ||
+          stored.attestation.attestation_id < match.attestation.attestation_id
+        ) {
+          match = stored;
+        }
+      }
+    }
+
+    return { match, scanComplete };
+  }
+
+  /**
    * Query reputation data with filtering.
    * Returns aggregates only — not raw interaction data.
    */

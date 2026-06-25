@@ -436,6 +436,67 @@ export function createBridgeTools(
             ? outcome.acceptor_did
             : outcome.proposer_did;
 
+        // Idempotency for the SAME-NEGOTIATION replay: a party can call
+        // bridge_attest repeatedly on the same valid commitment. Each call would
+        // otherwise mint a fresh attestation reusing interaction_id =
+        // session_id, and the reputation aggregator counts attestations with no
+        // de-dup, so re-attesting one session would inflate the tallies N-fold.
+        // Detect an attestation this same party has ALREADY recorded for this
+        // session in the bridge context and return it idempotently rather than
+        // recording a second. The counterparty attesting the same session, a
+        // different context, or a different session still records normally.
+        //
+        // SCOPE (do not overclaim): this closes RE-ATTESTATION of the SAME
+        // negotiation (same session_id tuple) only. It does NOT prevent a party
+        // from minting MULTIPLE DISTINCT commitments for one real negotiation:
+        // the session_id is caller-supplied and the session_receipt is not
+        // verified here, so a fresh session_id per call still self-inflates the
+        // tally. That broader self-inflation is NOT closed by this fix and is a
+        // known scoring-engine / collusion concern (the bridge cannot verify a
+        // Concordia session is unique or real without a verified session_receipt
+        // anchor).
+        //
+        // DEBT (bridge self-inflation): verify the Concordia session_receipt (or
+        // another negotiation-unique anchor) so one real negotiation cannot be
+        // re-committed under many session_ids. That is a trust-boundary decision
+        // for Erik (draft-then-approve), not resolved by this dedup.
+        //
+        // Fail CLOSED on the dedup scan: if uniqueness cannot be confirmed
+        // (a storage.list error, or any entry that failed to load/decrypt during
+        // the scan), deny the attest rather than risk recording a duplicate
+        // under a transient error. The aggregate read paths intentionally skip
+        // corrupted entries; this dedup path does not.
+        const dedup = await reputationStore.findExistingAttestationForDedup({
+          interaction_id: outcome.session_id,
+          participant_did: identity.did,
+          counterparty_did: counterpartyDid,
+          context: "concordia-bridge",
+        });
+        if (!dedup.scanComplete) {
+          return toolResult({
+            error:
+              "Cannot confirm this negotiation was not already attested " +
+              "(reputation store could not be fully read); the attestation was " +
+              "not recorded. Retry once the store is readable.",
+          });
+        }
+        const existingAttestation = dedup.match;
+        if (existingAttestation) {
+          return toolResult({
+            attestation_id: existingAttestation.attestation.attestation_id,
+            bridge_commitment_id: commitmentId,
+            session_id: outcome.session_id,
+            counterparty_did: counterpartyDid,
+            outcome_result: existingAttestation.attestation.data.outcome_result,
+            sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
+            attested_at: existingAttestation.recorded_at,
+            already_attested: true,
+            note:
+              "This negotiation was already attested by this identity; returning " +
+              "the existing attestation. Reputation was not recorded a second time.",
+          });
+        }
+
         // Resolve sovereignty tier from handshake results
         // Check if the counterparty has a known Sanctuary identity
         const hasSanctuaryIdentity = identityManager.list().some(
@@ -490,6 +551,7 @@ export function createBridgeTools(
           outcome_result: outcomeResult,
           sovereignty_tier: tier,
           attested_at: attestation.recorded_at,
+          already_attested: false,
           note: `Negotiation recorded as reputation attestation. ` +
             `Counterparty sovereignty tier: ${tier} (weight: ${weight}).`,
         });
