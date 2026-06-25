@@ -180,6 +180,13 @@ function isSilentlyOff(
   if (prev === undefined) return false;
   if (!prev.audit_integrity_ok || !current.audit_integrity_ok) return false;
   if (prev.status !== "active") return false;
+  // An OPT-IN expectation-floor breach is a DASHBOARD-ONLY "expected-but-quiet"
+  // signal, NEVER an OS notification (event-floor slice invariant 5: the §4.3
+  // raise path is the 3 fault classes only). A feature that met its floor one
+  // cycle and dipped below it the next reads `unconfirmed`/`below_expected_floor`;
+  // that is the operator's own declared expectation being unmet, not a
+  // silent-disable fault, so it must NOT raise. Exclude it explicitly.
+  if (current.basis === "below_expected_floor") return false;
   // A self-reporting fault is its OWN class (castle_wall_fault); silent-off is
   // the "went quiet without a fault event" case, so we exclude `fault` here.
   return current.status === "unconfirmed" || current.status === "unknown";

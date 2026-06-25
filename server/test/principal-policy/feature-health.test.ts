@@ -5,6 +5,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import {
   buildFeatureHealthPanel,
   evaluateFeatureHealth,
+  assertExpectationFloorsWellFormed,
   SLICE1_FEATURE_REGISTRY,
   FEATURE_FAULT_CLASS_RULES,
   CASTLE_WALL_LIVE_ADJUDICATION_OPERATIONS,
@@ -636,5 +637,309 @@ describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the alwa
     const hs = row(panel, "header_strip");
     expect(hs.status).toBe("unknown");
     expect(hs.basis).toBe("integrity_tainted");
+  });
+});
+
+describe("feature-health - opt-in operator-declared expectation floors (event-driven)", () => {
+  // The event-driven feature under test: the secret broker, which counts
+  // `broker_token_issued` / `broker_token_denied`. We declare an OPT-IN floor
+  // on it via a custom (injected) registry to model an operator/enterprise
+  // policy opting THIS feature into a minimum-volume expectation.
+  const FLOORED_BROKER: FeatureRegistryEntry = {
+    id: "secret_broker",
+    label: "Secret broker (selective disclosure)",
+    layer: "l3",
+    liveness: "event_driven",
+    invocationOps: Object.freeze(
+      new Set<string>(["broker_token_issued", "broker_token_denied"]),
+    ),
+    // The operator declares: I expect at least 3 broker decisions this window.
+    expectationFloor: { minInvocations: 3 },
+    brokenZeroDetectable: false,
+  };
+
+  // The SAME feature WITHOUT a floor (the conservative default), to prove the
+  // no-regression invariant.
+  const UNFLOORED_BROKER: FeatureRegistryEntry = {
+    id: "secret_broker",
+    label: "Secret broker (selective disclosure)",
+    layer: "l3",
+    liveness: "event_driven",
+    invocationOps: Object.freeze(
+      new Set<string>(["broker_token_issued", "broker_token_denied"]),
+    ),
+    brokenZeroDetectable: false,
+  };
+
+  async function appendBroker(
+    log: AuditLog,
+    n: number,
+    now: number,
+  ): Promise<void> {
+    for (let i = 0; i < n; i += 1) {
+      await log.appendCritical({
+        layer: "l3",
+        operation: "broker_token_issued",
+        identity_id: FORTRESS,
+        result: "success",
+        details: {},
+        timestamp: new Date(now - (i + 1) * 60_000).toISOString(),
+      });
+    }
+  }
+
+  // (1) WITH a declared floor + below-floor activity → unconfirmed/yellow (NOT
+  // red, NOT green).
+  it("below a declared floor reads unconfirmed/yellow, never fault or active", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendBroker(log, 1, now); // 1 < floor of 3
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [FLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    expect(broker.status).toBe("unconfirmed");
+    expect(broker.basis).toBe("below_expected_floor");
+    expect(broker.status).not.toBe("fault");
+    expect(broker.status).not.toBe("active");
+    expect(broker.invocation_count).toBe(1);
+    expect(broker.expectation_floor).toBe(3);
+  });
+
+  // (2) The same feature MEETING its floor reads green.
+  it("meeting a declared floor reads active/green (floor_met)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendBroker(log, 3, now); // exactly meets floor of 3
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [FLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    expect(broker.status).toBe("active");
+    expect(broker.basis).toBe("floor_met");
+    expect(broker.invocation_count).toBe(3);
+    expect(broker.expectation_floor).toBe(3);
+  });
+
+  // (3) WITHOUT a declared floor + zero activity → green-neutral as before (the
+  // conservative default; NO regression, silence never fires).
+  it("no declared floor + zero activity keeps the conservative default (unconfirmed/no_activity, never red)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [UNFLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    expect(broker.status).toBe("unconfirmed");
+    expect(broker.basis).toBe("no_activity_event_driven");
+    expect(broker.status).not.toBe("fault");
+    expect(broker.expectation_floor).toBeNull();
+  });
+
+  it("no declared floor + activity is active/activity_in_window exactly as before (no regression)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendBroker(log, 1, now);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [UNFLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    expect(broker.status).toBe("active");
+    expect(broker.basis).toBe("activity_in_window");
+    expect(broker.expectation_floor).toBeNull();
+  });
+
+  // (4) Integrity → unknown overrides a would-be below-floor yellow.
+  it("an integrity finding forces unknown, overriding a below-floor yellow", () => {
+    const now = Date.now();
+    const belowFloorEntry: AuditEntry = {
+      timestamp: new Date(now - 60_000).toISOString(),
+      layer: "l3",
+      operation: "broker_token_issued",
+      identity_id: FORTRESS,
+      result: "success",
+      details: {},
+    };
+    const r = evaluateFeatureHealth({
+      feature: FLOORED_BROKER,
+      entries: [belowFloorEntry], // 1 < floor of 3 → would be below_expected_floor
+      originMachine: FORTRESS,
+      now,
+      freshnessWindowMs: 10 * 60 * 1000,
+      integrityOk: false, // tainted read wins
+    });
+    expect(r.status).toBe("unknown");
+    expect(r.basis).toBe("integrity_tainted");
+    expect(r.basis).not.toBe("below_expected_floor");
+  });
+
+  // (5) No auto-baselining: with NO operator-declared floor, no trailing-median
+  // or computed threshold ever changes a status. The trailing volume is
+  // descriptive-only.
+  it("no auto-baselining: trailing volume is descriptive-only and never drives status without a declared floor", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // A busy then quiet history: plenty of activity, so a trailing median exists,
+    // but the UNFLOORED feature must still NOT manufacture a below-typical alarm.
+    await appendBroker(log, 5, now);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [UNFLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    // Activity present → active/activity_in_window. A trailing median may be
+    // surfaced for context, but it NEVER becomes an auto-threshold.
+    expect(broker.status).toBe("active");
+    expect(broker.basis).toBe("activity_in_window");
+    expect(broker.expectation_floor).toBeNull();
+    // Descriptive-only context may be present but never a status driver.
+    expect(broker.basis).not.toBe("below_expected_floor");
+    expect(broker.basis).not.toBe("floor_met");
+  });
+
+  it("the descriptive trailing_window_volume never appears as a basis or floor (no-auto-baselining boundary)", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendBroker(log, 4, now);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [UNFLOORED_BROKER],
+    });
+    const broker = row(panel, "secret_broker");
+    // trailing_window_volume is surfaced (a number) but the feature has NO floor,
+    // so it cannot have driven status: expectation_floor stays null and the basis
+    // is the plain activity basis.
+    expect(broker.expectation_floor).toBeNull();
+    expect(typeof broker.trailing_window_volume === "number" || broker.trailing_window_volume === null).toBe(true);
+    expect(broker.basis).toBe("activity_in_window");
+  });
+
+  // (6) The floor config is operator-declared (round-trips through the registry
+  // config artifact) and is opt-in per feature.
+  it("the floor round-trips through the registry config artifact and is opt-in per feature", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendBroker(log, 2, now); // below floor of 3
+    // Two features on the same panel: one floored, one not. ONLY the floored one
+    // changes behavior; the unfloored one is untouched.
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+      registry: [
+        FLOORED_BROKER,
+        {
+          id: "approval_gates",
+          label: "Human-approval gates",
+          layer: "l2",
+          liveness: "event_driven",
+          invocationOps: Object.freeze(
+            new Set<string>(["cross_harness_approval_resolved"]),
+          ),
+          brokenZeroDetectable: false,
+        } as FeatureRegistryEntry,
+      ],
+    });
+    const broker = row(panel, "secret_broker");
+    const approval = row(panel, "approval_gates");
+    // The floored feature carries its declared floor and reads below-floor.
+    expect(broker.expectation_floor).toBe(3);
+    expect(broker.basis).toBe("below_expected_floor");
+    // The unfloored feature is opt-OUT by default: null floor, conservative quiet.
+    expect(approval.expectation_floor).toBeNull();
+    expect(approval.basis).toBe("no_activity_event_driven");
+  });
+
+  it("the shipped Slice-1 registry declares NO floors (conservative default for every shipped feature)", () => {
+    // The headline honesty: opt-in means the shipped product behaves exactly as
+    // before. NO shipped feature carries a floor, so none changes its dashboard
+    // behavior until an operator declares one.
+    for (const f of SLICE1_FEATURE_REGISTRY) {
+      expect(f.expectationFloor).toBeUndefined();
+    }
+  });
+
+  it("registry validation rejects a floor on a self-reporting feature", () => {
+    expect(() =>
+      assertExpectationFloorsWellFormed([
+        {
+          id: "bad_self",
+          label: "Bad self-reporting with floor",
+          layer: "l1",
+          liveness: "self_reporting",
+          invocationOps: new Set(["op_invoke"]),
+          expectationFloor: { minInvocations: 1 },
+          brokenZeroDetectable: true,
+        },
+      ]),
+    ).toThrow(/non-event_driven/);
+  });
+
+  it("registry validation rejects a non-positive / non-integer floor", () => {
+    for (const bad of [0, -1, 1.5]) {
+      expect(() =>
+        assertExpectationFloorsWellFormed([
+          {
+            id: "bad_floor",
+            label: "Bad floor value",
+            layer: "l3",
+            liveness: "event_driven",
+            invocationOps: new Set(["op_invoke"]),
+            expectationFloor: { minInvocations: bad },
+            brokenZeroDetectable: false,
+          },
+        ]),
+      ).toThrow(/positive integer/);
+    }
+  });
+
+  it("a below-floor dip does NOT enter the OS-notification raise path (invariant 5)", async () => {
+    // A feature that met its floor one cycle and dipped below it the next reads
+    // unconfirmed/below_expected_floor. That transition must NOT be reported as a
+    // `feature_silently_off` fault (the §4.3 raise path is the 3 fault classes
+    // only). We assert directly against the raise-deriving logic.
+    const { deriveFeatureFaults } = await import(
+      "../../src/principal-policy/feature-fault-raise.js"
+    );
+    const now = Date.now();
+    const { log: logPrev } = newAuditLog();
+    await appendBroker(logPrev, 3, now); // meets floor
+    const prevPanel = await buildFeatureHealthPanel({
+      auditLog: logPrev,
+      originMachine: FORTRESS,
+      now,
+      registry: [FLOORED_BROKER],
+    });
+    const { log: logCur } = newAuditLog();
+    await appendBroker(logCur, 1, now); // dips below floor
+    const curPanel = await buildFeatureHealthPanel({
+      auditLog: logCur,
+      originMachine: FORTRESS,
+      now,
+      registry: [FLOORED_BROKER],
+    });
+    expect(row(prevPanel, "secret_broker").status).toBe("active");
+    expect(row(curPanel, "secret_broker").basis).toBe("below_expected_floor");
+    const faults = deriveFeatureFaults(curPanel, prevPanel);
+    // No silent-off (or any) fault should be raised for an opt-in floor breach.
+    expect(
+      faults.some((f) => f.feature_id === "secret_broker"),
+    ).toBe(false);
   });
 });
