@@ -688,14 +688,21 @@ describe("rotate-root: provision -> rotate-root via the CLI dispatcher", () => {
     const masterKey = Uint8Array.from(seeded.masterKey);
     seeded.masterKey.fill(0);
 
+    // PQC default-on: a bare provision now mints a HYBRID root, and rotate-root
+    // REFUSES on hybrid roots (hybrid signing-master rotation is a deferred
+    // follow-up). This test exercises the provision -> rotate-root path through
+    // the dispatcher, so it must provision the CLASSICAL root that rotate-root
+    // can actually rotate (--classical opts out of the new hybrid default). The
+    // hybrid-root rotate REFUSAL is covered by its own tests above.
     const provCode = await runFederationProvision({
-      argv: ["--node-id", "home-mac", "--fortress", fortressPath],
+      argv: ["--node-id", "home-mac", "--classical", "--fortress", fortressPath],
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: capture().stream,
       err: capture().stream,
     });
     expect(provCode).toBe(0);
     const before = await loadLive(masterKey);
+    expect(before.hybrid, "the dispatcher rotate path needs a classical root").toBeUndefined();
 
     const out = capture();
     const err = capture();
