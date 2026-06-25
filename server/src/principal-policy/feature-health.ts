@@ -1493,15 +1493,16 @@ export async function buildFeatureHealthPanel(
  *                              evaluation, then `unconfirmed`/`unknown` in a
  *                              later one (an ON→OFF state transition). State
  *                              comparison is the caller's; this enum names it.
- *   (c) plugin_failure_surge - The emission path now EXISTS (S4, #728:
+ *   (c) plugin_failure_surge - The emission path EXISTS (S4, #728:
  *                              `castle-wall/egress-proxy.ts:appendPluginAuditIfConfigured`
  *                              stamps `plugin_error`-class contributions onto
  *                              the `egress_decision` L1 audit entry, the same
- *                              data the per-plugin rows read). This rule stays
- *                              DORMANT not because the data is absent but
- *                              because the NOTIFICATION raise/dedup path is not
- *                              built yet (a later slice). Do NOT fire on it
- *                              until that path lands.
+ *                              data the per-plugin rows read). This rule is now
+ *                              LIVE: the per-plugin health rows (#753) surface
+ *                              the host-minted error rate as `fault` /
+ *                              `plugin_error_rate`, and the raise/dedup path
+ *                              (`feature-fault-raise.ts`) turns that into ONE
+ *                              deduped notification per plugin per window.
  */
 export type FeatureFaultClass =
   | "castle_wall_fault"
@@ -1513,11 +1514,11 @@ export interface FeatureFaultClassRule {
   /** Human-facing description (the notification body source). */
   description: string;
   /**
-   * Whether this class is wired to fire today. `plugin_failure_surge` now HAS a
-   * producer (S4 #728 emits `plugin_error`-class contributions onto the
-   * `egress_decision` audit entry), but stays dormant because its notification
-   * raise/dedup path is not built yet (a later slice). The route layer MUST skip
-   * any rule whose `dormant` flag is true so a not-yet-wired rule can never fire.
+   * Whether this class is wired to fire today. All three classes are LIVE: their
+   * producers exist and the raise/dedup path (`feature-fault-raise.ts`) is built.
+   * `dormant` remains a structural guard: the raise layer MUST skip any rule
+   * whose `dormant` flag is true, so a future not-yet-wired class added here can
+   * never fire until it is deliberately flipped live per-rule.
    */
   dormant: boolean;
 }
@@ -1540,10 +1541,11 @@ export const FEATURE_FAULT_CLASS_RULES: ReadonlyArray<FeatureFaultClassRule> =
       class: "plugin_failure_surge",
       description:
         "A security plugin's failure rate crossed into sustained failure.",
-      // DORMANT: the plugin_error emission path now exists (S4 #728), but the
-      // notification raise/dedup path is not built yet (a later slice), so the
-      // route layer must not fire it. Dormancy is the missing raise path, not
-      // missing data.
-      dormant: true,
+      // LIVE: the plugin_error emission path exists (S4 #728), the per-plugin
+      // health rows read it (#753), and the notification raise/dedup path is now
+      // built (`feature-fault-raise.ts`). A plugin row that crosses the
+      // host-minted error-rate threshold reads `fault`/`plugin_error_rate`, which
+      // the raise layer turns into ONE deduped notification per plugin per window.
+      dormant: false,
     },
   ]);

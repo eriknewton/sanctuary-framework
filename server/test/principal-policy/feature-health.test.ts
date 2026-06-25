@@ -106,15 +106,26 @@ describe("feature-health registry — integrity invariants", () => {
     expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has("policy_loaded")).toBe(false);
   });
 
-  it("the plugin_failure_surge fault class is DORMANT (no #508 S4 producer yet)", () => {
+  it("the plugin_failure_surge fault class is now LIVE (producer #728/#753 + raise path built)", () => {
     const plugin = FEATURE_FAULT_CLASS_RULES.find(
       (r) => r.class === "plugin_failure_surge",
     );
-    expect(plugin?.dormant).toBe(true);
-    // The other two classes have producers and are live.
+    // Un-dormanted: its plugin_error producer exists (#728), the per-plugin rows
+    // read it (#753), and the notification raise/dedup path is built
+    // (feature-fault-raise.ts). Only this rule was flipped.
+    expect(plugin?.dormant).toBe(false);
+    // All three ratified classes are live; no other class exists to stay dormant.
     expect(
       FEATURE_FAULT_CLASS_RULES.filter((r) => !r.dormant).map((r) => r.class),
-    ).toEqual(["castle_wall_fault", "feature_silently_off"]);
+    ).toEqual([
+      "castle_wall_fault",
+      "feature_silently_off",
+      "plugin_failure_surge",
+    ]);
+    // `dormant` remains a structural guard for any future class added here.
+    expect(FEATURE_FAULT_CLASS_RULES.every((r) => r.dormant === false)).toBe(
+      true,
+    );
   });
 });
 

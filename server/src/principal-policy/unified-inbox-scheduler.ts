@@ -25,6 +25,14 @@ export class UnifiedInboxScheduler {
       bridge: UnifiedInboxBridge;
       intervalMs?: number;
       now?: () => Date;
+      /**
+       * Optional additional work to run on each tick, on the SAME operator-inbox
+       * cadence. The feature-health observability layer wires its fault-raise
+       * evaluation here (see `feature-fault-raise.ts:FeatureFaultRaiser`), so the
+       * raise rides the existing operator-attention lifecycle instead of owning a
+       * second timer. A rejected/throwing hook never breaks the snooze tick.
+       */
+      onTick?: () => void | Promise<void>;
     },
   ) {}
 
@@ -49,8 +57,17 @@ export class UnifiedInboxScheduler {
   }
 
   tick(): number {
-    return this.opts.bridge.resurfaceDueSnoozes(
+    const resurfaced = this.opts.bridge.resurfaceDueSnoozes(
       this.opts.now?.() ?? new Date(),
     );
+    if (this.opts.onTick) {
+      try {
+        const result = this.opts.onTick();
+        if (result instanceof Promise) result.catch(() => {});
+      } catch {
+        // Additional-work hook must never break the snooze tick.
+      }
+    }
+    return resurfaced;
   }
 }
