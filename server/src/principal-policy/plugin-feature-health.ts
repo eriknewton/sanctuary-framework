@@ -63,12 +63,11 @@
  * in this slice, and the panel says so plainly.
  */
 
-import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
 import type {
   PluginContribution,
   PluginContributionVerdict,
 } from "../substrate/attribution.js";
-import { DEFAULT_DIGEST_WINDOW_MS } from "./posture.js";
 
 /**
  * The native feature-health status color model, re-declared here as the SAME
@@ -499,111 +498,4 @@ export function assertPluginMatcherDisjoint(
       );
     }
   }
-}
-
-export interface BuildPluginHealthPanelInput {
-  auditLog: AuditLog;
-  originMachine: string;
-  now?: number;
-  /** Window over which contributions are counted. Defaults to the digest window. */
-  windowMs?: number;
-  errorMinContributions?: number;
-  errorFaultRate?: number;
-}
-
-/**
- * Honest panel-level disclosure for the per-plugin rows: broken-zero (a
- * silently-removed plugin) is undetectable, because no per-plugin liveness
- * heartbeat reaches the audit chain.
- */
-export interface PluginHealthPanel {
-  origin_machine: string;
-  window_start: string;
-  window_end: string;
-  rows: PluginHealthRow[];
-  audit_integrity_ok: boolean;
-  disclosure: {
-    /**
-     * Always true: a plugin that is silently removed/disabled emits no
-     * contributions, which is indistinguishable from a plugin that was simply
-     * quiet. The config-vs-activity cross-check is vacuous for plugins in this
-     * slice (there is no per-plugin liveness audit op). The UI must not imply
-     * "confirmed working" for a quiet plugin row.
-     */
-    broken_zero_undetectable_for_plugins: true;
-  };
-}
-
-/**
- * Build the per-plugin health panel as a pure read-only projection over the
- * audit chain. ONE window-sized query for `egress_decision` entries, judged for
- * integrity once (a tainted read forces every row to `unknown`), then folded.
- * Mirrors the native panel's cost profile and fail-closed posture; adds NO new
- * storage and NO new audit op.
- */
-export async function buildPluginHealthPanel(
-  input: BuildPluginHealthPanelInput,
-): Promise<PluginHealthPanel> {
-  const now = input.now ?? Date.now();
-  const windowMs = input.windowMs ?? DEFAULT_DIGEST_WINDOW_MS;
-  const windowStart = new Date(now - windowMs).toISOString();
-  const windowEnd = new Date(now).toISOString();
-  const AUDIT_PAGE_LIMIT = 10_000;
-
-  let entries: AuditEntry[];
-  let integrityOk: boolean;
-  try {
-    // Operator surface read: bounded-cost via the eager-maintained verified view
-    // (the same chokepoint discipline the native posture builders follow), so the
-    // standalone panel never triggers a full-chain re-verify per call. Honesty is
-    // unchanged: a detected integrity finding still forces every row to `unknown`.
-    const result = await input.auditLog.runEagerReads(() =>
-      input.auditLog.query({
-        since: windowStart,
-        layer: PLUGIN_CONTRIBUTION_AUDIT_LAYER,
-        operation_type: PLUGIN_CONTRIBUTION_AUDIT_OPERATION,
-        limit: AUDIT_PAGE_LIMIT,
-      }),
-    );
-    entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
-  } catch {
-    // A failed/tainted read must NOT render any plugin row green. Fail closed:
-    // an empty set with integrityOk=false makes every row `unknown` (and there
-    // are no rows to show, which is honest: we could not read the evidence).
-    entries = [];
-    integrityOk = false;
-  }
-
-  // Upper-bound the window: the query only filters `since`, so drop any entry
-  // stamped past `now` (an unparseable timestamp is kept; the chain owns
-  // malformed-entry detection).
-  const inWindow = entries.filter((e) => {
-    const ts = Date.parse(e.timestamp);
-    return Number.isNaN(ts) || ts <= now;
-  });
-
-  const rows = buildPluginHealthRows({
-    entries: inWindow,
-    originMachine: input.originMachine,
-    integrityOk,
-    now,
-    ...(input.errorMinContributions !== undefined
-      ? { errorMinContributions: input.errorMinContributions }
-      : {}),
-    ...(input.errorFaultRate !== undefined
-      ? { errorFaultRate: input.errorFaultRate }
-      : {}),
-  });
-
-  return {
-    origin_machine: input.originMachine,
-    window_start: windowStart,
-    window_end: windowEnd,
-    rows,
-    audit_integrity_ok: integrityOk,
-    disclosure: {
-      broken_zero_undetectable_for_plugins: true,
-    },
-  };
 }

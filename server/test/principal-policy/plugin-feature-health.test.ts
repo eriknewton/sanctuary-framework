@@ -6,7 +6,6 @@ import type { AuditEntry } from "../../src/operational/audit-log.js";
 import type { PluginContribution } from "../../src/substrate/attribution.js";
 import {
   assertPluginMatcherDisjoint,
-  buildPluginHealthPanel,
   buildPluginHealthRows,
   evaluatePluginHealthStatus,
   pluginRowId,
@@ -68,6 +67,41 @@ function rowFor(rows: PluginHealthRow[], pluginId: string): PluginHealthRow {
   return r;
 }
 
+const DIGEST_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Read the window's `egress_decision` entries from a real audit log and fold
+ * them through the LIVE row builder, mirroring exactly what the wired
+ * `buildFeatureHealthPanel` does internally (window query, upper-bound filter,
+ * integrity verdict, fold). This exercises the production row path end to end
+ * over a real audit chain, without the deleted standalone panel engine.
+ */
+async function readPluginRows(
+  log: AuditLog,
+  now: number,
+): Promise<PluginHealthRow[]> {
+  const windowStart = new Date(now - DIGEST_WINDOW_MS).toISOString();
+  const result = await log.runEagerReads(() =>
+    log.query({
+      since: windowStart,
+      layer: PLUGIN_CONTRIBUTION_AUDIT_LAYER,
+      operation_type: PLUGIN_CONTRIBUTION_AUDIT_OPERATION,
+      limit: 10_000,
+    }),
+  );
+  const integrityOk = result.integrity_findings.length === 0;
+  const inWindow = result.entries.filter((e) => {
+    const ts = Date.parse(e.timestamp);
+    return Number.isNaN(ts) || ts <= now;
+  });
+  return buildPluginHealthRows({
+    entries: inWindow,
+    originMachine: FORTRESS,
+    integrityOk,
+    now,
+  });
+}
+
 describe("per-plugin feature-health: invocations", () => {
   // Merge-bar test 1: a plugin with N attributed contributions earns a row with
   // invocations==N over the fixture window.
@@ -77,12 +111,8 @@ describe("per-plugin feature-health: invocations", () => {
     await appendDecision(log, [contribution("acme", "escalate")], NOW - 3000);
     await appendDecision(log, [contribution("acme", "deny")], NOW - 2000);
 
-    const panel = await buildPluginHealthPanel({
-      auditLog: log,
-      originMachine: FORTRESS,
-      now: NOW,
-    });
-    const row = rowFor(panel.rows, "acme");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "acme");
     expect(row.invocation_count).toBe(3);
     expect(row.tally.total).toBe(3);
     expect(row.status).toBe("active");
@@ -95,12 +125,8 @@ describe("per-plugin feature-health: invocations", () => {
     // 48h ago, outside the default 24h digest window.
     await appendDecision(log, [contribution("acme", "deny")], NOW - 48 * 3600_000);
     await appendDecision(log, [contribution("acme", "deny")], NOW - 1000);
-    const panel = await buildPluginHealthPanel({
-      auditLog: log,
-      originMachine: FORTRESS,
-      now: NOW,
-    });
-    expect(rowFor(panel.rows, "acme").invocation_count).toBe(1);
+    const rows = await readPluginRows(log, NOW);
+    expect(rowFor(rows, "acme").invocation_count).toBe(1);
   });
 });
 
@@ -140,12 +166,8 @@ describe("per-plugin feature-health: display-only / tainted attribution (invaria
       ],
       NOW - 1000,
     );
-    const panel = await buildPluginHealthPanel({
-      auditLog: log,
-      originMachine: FORTRESS,
-      now: NOW,
-    });
-    const row = rowFor(panel.rows, "acme");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "acme");
     // Status is `active` purely because there was one contribution; the
     // attribution is echoed inert in last_contribution, never consulted.
     expect(row.status).toBe("active");
@@ -162,8 +184,8 @@ describe("per-plugin feature-health: display-only / tainted attribution (invaria
     // documents/locks that the only attribution surface is the render echo.
     const log = newAuditLog();
     await appendDecision(log, [contribution("acme", "observe", { confidence: 0.4 })], NOW - 1000);
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    const row = rowFor(panel.rows, "acme");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "acme");
     const keys = Object.keys(row);
     // No key on the row is an enforcement decision; the only attribution-bearing
     // key is the display echo.
@@ -250,8 +272,8 @@ describe("per-plugin feature-health: plugin_error -> fault, not green-quiet (inv
     await appendDecision(log, [contribution("flaky", "unhealthy_skipped")], NOW - 3000);
     await appendDecision(log, [contribution("flaky", "fail_mode_applied")], NOW - 2000);
     await appendDecision(log, [contribution("flaky", "timeout")], NOW - 1000);
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    const row = rowFor(panel.rows, "flaky");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "flaky");
     expect(row.tally.plugin_errors).toBe(5);
     expect(row.status).toBe("fault");
   });
@@ -279,8 +301,8 @@ describe("per-plugin feature-health: inbox vs deny distinction (invariant 5 / de
     await appendDecision(log, [contribution("acme", "deny")], NOW - 3000);
     await appendDecision(log, [contribution("acme", "observe")], NOW - 2000);
     await appendDecision(log, [contribution("acme", "no_objection")], NOW - 1000);
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    const row = rowFor(panel.rows, "acme");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "acme");
     expect(row.tally.escalations_to_inbox).toBe(2);
     expect(row.tally.enforced_denies).toBe(1);
     expect(row.tally.observed).toBe(2); // observe + no_objection
@@ -300,9 +322,9 @@ describe("per-plugin feature-health: matcher mutual-exclusion (invariant 4)", ()
       [contribution("alpha", "deny"), contribution("beta", "escalate")],
       NOW - 1000,
     );
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    const alpha = rowFor(panel.rows, "alpha");
-    const beta = rowFor(panel.rows, "beta");
+    const rows = await readPluginRows(log, NOW);
+    const alpha = rowFor(rows, "alpha");
+    const beta = rowFor(rows, "beta");
     expect(alpha.tally.enforced_denies).toBe(1);
     expect(alpha.tally.escalations_to_inbox).toBe(0);
     expect(beta.tally.escalations_to_inbox).toBe(1);
@@ -354,16 +376,25 @@ describe("per-plugin feature-health: quiet plugin is green-neutral, not red (inv
 
   it("an empty window produces no plugin rows and an honest broken-zero disclosure", async () => {
     const log = newAuditLog();
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    expect(panel.rows).toHaveLength(0);
-    expect(panel.disclosure.broken_zero_undetectable_for_plugins).toBe(true);
+    const rows = await readPluginRows(log, NOW);
+    expect(rows).toHaveLength(0);
+    // The honest broken-zero disclosure rides the WIRED panel surface
+    // (`broken_zero_undetectable_for_event_driven`), so assert it there.
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+      includePluginRows: true,
+    });
+    expect(panel.plugin_rows).toHaveLength(0);
+    expect(panel.disclosure.broken_zero_undetectable_for_event_driven).toBe(true);
   });
 
   it("liveness class is always event_driven and broken_zero_detectable is false", async () => {
     const log = newAuditLog();
     await appendDecision(log, [contribution("acme", "observe")], NOW - 1000);
-    const panel = await buildPluginHealthPanel({ auditLog: log, originMachine: FORTRESS, now: NOW });
-    const row = rowFor(panel.rows, "acme");
+    const rows = await readPluginRows(log, NOW);
+    const row = rowFor(rows, "acme");
     expect(row.liveness).toBe("event_driven");
     expect(row.broken_zero_detectable).toBe(false);
   });
