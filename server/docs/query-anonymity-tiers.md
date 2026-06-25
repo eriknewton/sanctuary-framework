@@ -121,11 +121,85 @@ The Rho-1 module structure is forward-compatible with Tier B:
 `rewriteContentPii` at the request-body layer, wired through the
 same selector hook. No Tier B knobs in `principal-policy.yaml` yet.
 
-## Tier C — mix network / ZK (research, out of v1.x)
+## Tier 3a: network-path anonymity (two-hop egress proxy), Slice 1
 
-Route substrate calls through a mix network (Tor-like onion routing)
-or use zero-knowledge proofs for the query content. Paper-grade
-research. Not v1.x ship.
+Tiers A and B clean the *bytes of the request* (headers and content).
+They do not touch the **transport** beneath: the wrapped fetch still opens
+a direct TLS connection from the operator host to the provider, so the
+operator's IP and the operator-to-provider path linkage still leak. Tier 3a
+hides the network path itself.
+
+**Mechanism (this slice).** A two-hop egress proxy (HTTP CONNECT over TLS;
+MASQUE later). The client opens a tunnel to a **relay** (hop 1) and asks it
+to connect onward to an **egress** (hop 2), which makes the actual TLS
+connection to the provider. The relay sees the operator's IP but only an
+opaque tunnel (not the destination); the egress sees the destination but
+connects from its own IP, not the operator's. No single hop sees both. This
+is the architecture Apple iCloud Private Relay uses for its traffic. It
+reaches providers that have not opted in (unlike OHTTP), since a CONNECT
+tunnel reaches any HTTPS destination.
+
+**What Slice 1 delivers, Property 1 only.** *IP-decoupling and path-linkage
+removal.* The provider no longer sees the operator's source IP; a path /
+network observer cannot link operator to destination. Delivered at any relay
+size N. **Approved external wording:** "removes the operator's IP and path
+linkage as deanonymizing side channels."
+
+**What Slice 1 does NOT claim.**
+- **Property 2 (unlinkability / anonymity-set).** Hiding *which* operator
+  sent a query requires a live crowd. A relay with a handful of users is "a
+  crowd of N," not anonymity. This slice surfaces no anonymity-set claim;
+  live-set instrumentation is a later slice and any future claim is gated on
+  it. **Forbidden wording:** "full anonymity," "anonymous queries," or any
+  phrasing implying a crowd we do not have.
+- **Credential decoupling.** The API key is in the Tier A
+  `REQUIRED_HEADERS` allowlist and is never stripped; against the provider
+  specifically, IP-hiding is necessary but not sufficient because the key
+  already keys a per-operator profile. The unconditional win is against the
+  path / network observer, not the provider. Key rotation / pooled keys are
+  a LATER slice with a billing/quota tradeoff.
+- **GPA resistance.** No low-latency two-hop system defeats a global passive
+  adversary who watches both ends. That is the Tier-3b mixnet's job.
+
+**Trust model (non-collusion).** Security rests on relay ≠ egress being
+operated by non-colluding parties. If they collude, the operator IP and the
+destination reunite and the protection collapses. The **default posture is
+operator-run / federated** (the hops sit inside, or are chosen by, the
+operator), which keeps Sanctuary off the critical path and preserves the
+non-domination thesis. Sanctuary-hosted and third-party / Tor postures are
+**labeled opt-ins**, never a Sanctuary-embedded default.
+
+**Fail-closed.** When armed and the anonymous path cannot be established, the
+query is **denied** (a `Tier3FailClosedError`); it is never silently
+fulfilled over a direct deanonymizing connection. A direct fallback exists
+only via an explicit operator opt-in (`onTunnelFailure: "fallback-direct"`),
+which is audited as a deanonymizing event.
+
+**Castle Wall stays whole (AC-1).** The Tier 3 transport is composed
+*beneath* the Tier A anonymized fetch:
+`createAnonymizedFetch(createTunneledFetch(baseFetch, cfg), audit)`. Because
+the substrate clients hold only the wrapped fetch, the tunnel is reachable
+only through that single channel and opens no unwrapped outbound socket, so
+Castle Wall's egress filter still binds the sole outbound channel and the
+`query_anonymity_headers_stripped` audit still fires on every call. A
+regression test asserts there is no unwrapped socket (AC-1), that the
+provider observes the egress IP (AC-2), and that token-by-token streaming
+survives the tunnel (AC-4).
+
+**Status:** opt-in, **disarmed by default** (zero behavioral / latency change
+for operators who have not enabled it). The reference operator-run dialer is
+an in-process two-hop CONNECT chain on Node core sockets; production
+federated / hosted dialers implement the same `TunnelDialer` interface.
+
+## Tier 3b: mix network / ZK (research, out of v1.x)
+
+Route substrate calls through a mix network (Tor-like onion routing, e.g.
+Nym/Loopix with cover traffic) for global-passive-adversary resistance, with
+source-side traffic shaping to close the still-open packet-timing leak.
+Higher latency / bandwidth cost; an opt-in high-assurance mode, not an
+interactive default. Zero-knowledge / Privacy-Pass anonymous credentials
+enter only as the relay-authorization scheme, never as the network-path
+mechanism. Paper-grade for now; not v1.x ship.
 
 ## Operator quickstart
 
@@ -149,11 +223,20 @@ sanctuary secrets audit --operation query_anonymity_headers_stripped
 ## Cross-references
 
 - `server/src/query-anonymity/header-strip.ts` — Tier A module.
+- `server/src/query-anonymity/tier3-transport.ts`: Tier 3a network-path
+  transport (two-hop egress proxy, Slice 1) + reference loopback CONNECT
+  dialer.
 - `server/src/query-anonymity/query-anonymity-routes.ts` — dashboard
   backend route.
 - `server/src/intelligence/selector.ts` — substrate selector
-  integration point (Rho-1 wrap in the constructor).
-- `server/test/query-anonymity/header-strip.test.ts` — regression
+  integration point (Rho-1 strip wrap + Tier 3a tunnel composed beneath
+  it, in the constructor).
+- `server/test/query-anonymity/header-strip.test.ts`: Tier A regression
   suite + zero-PII ship gate.
+- `server/test/query-anonymity/tier3-transport.test.ts`: Tier 3a
+  regression suite (AC-1 sole-egress / AC-2 IP-decoupling / AC-4 streaming,
+  fail-closed, end-to-end through the selector).
+- `Review/Sanctuary/Query_Anon_Tier3_Design_Revised_2026-06-13.md`:
+  ratified Tier 3 design (source of truth).
 - `server/docs/test-concurrency-discipline.md` — sibling test
   discipline doc.
