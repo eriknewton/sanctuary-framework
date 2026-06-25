@@ -7,7 +7,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
-import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
+import {
+  DashboardApprovalChannel,
+  ipv6Slash64Prefix,
+} from "../../src/principal-policy/dashboard.js";
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -1025,6 +1028,41 @@ describe("Principal Dashboard", () => {
         results.push(res.status);
       }
       expect(results).not.toContain(429);
+    });
+
+    // Federation P1 DoS hardening: the federation peer rate-limit bucket keys
+    // IPv6 to its /64 prefix so an attacker rotating addresses within one /64
+    // shares one bucket. The helper is pure; test it directly.
+    describe("ipv6Slash64Prefix (Federation P1 /64 aggregation)", () => {
+      it("aggregates distinct addresses in the same /64 to the same key", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234:0:0:0:1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:1234:ffff:ffff:ffff:ffff");
+        expect(a).toBe("2001:db8:abcd:1234::/64");
+        expect(a).toBe(b);
+      });
+
+      it("keeps addresses in DIFFERENT /64s on distinct keys", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234::1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:9999::1");
+        expect(a).not.toBe(b);
+      });
+
+      it("expands a single `::` zero-run before taking the prefix", () => {
+        // ::1 -> 0:0:0:0:0:0:0:1 -> first four hextets all zero.
+        expect(ipv6Slash64Prefix("::1")).toBe("0:0:0:0::/64");
+        // fe80::1 -> fe80:0:0:0:...
+        expect(ipv6Slash64Prefix("fe80::1")).toBe("fe80:0:0:0::/64");
+      });
+
+      it("returns null for IPv4, mapped-IPv4, and malformed inputs (caller keys verbatim)", () => {
+        expect(ipv6Slash64Prefix("127.0.0.1")).toBeNull();
+        expect(ipv6Slash64Prefix("203.0.113.7")).toBeNull();
+        expect(ipv6Slash64Prefix("::ffff:1.2.3.4")).toBeNull(); // mapped IPv4
+        expect(ipv6Slash64Prefix("unknown")).toBeNull();
+        expect(ipv6Slash64Prefix("2001:db8::1::2")).toBeNull(); // two "::"
+        expect(ipv6Slash64Prefix("fe80::1%eth0")).toBeNull(); // zone id
+        expect(ipv6Slash64Prefix("gggg::1")).toBeNull(); // non-hex
+      });
     });
   });
 

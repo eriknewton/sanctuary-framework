@@ -92,7 +92,6 @@ export function isFederationPath(pathname: string): boolean {
     pathname === "/v1/federation/status" ||
     pathname === "/v1/federation/authorize/init" ||
     pathname === "/v1/federation/sync" ||
-    pathname === "/v1/federation/sync/peer" ||
     pathname === "/v1/nodes"
   );
 }
@@ -100,6 +99,32 @@ export function isFederationPath(pathname: string): boolean {
 /** The pre-session (bootstrap-token-authenticated) join-submission path. */
 export function isFederationCeremonyPath(pathname: string): boolean {
   return pathname === "/v1/federation/authorize/complete";
+}
+
+/**
+ * Federation P1 pre-session "node-cert-authenticated" auth class. A path in this
+ * class is reached BEFORE the /v1 session gate (router.ts dispatch, alongside the
+ * BOOTSTRAP_TOKEN ceremony class): the caller carries NO `Authorization` header
+ * and NO shared operator login. The ONLY trust decision is the cryptographic
+ * sync-envelope verification inside the handler (the node certificate must chain
+ * to THIS fortress's pinned master). The pre-session session-token gate that used
+ * to front `/sync/peer` only gated NETWORK ACCESS, never data trust, so removing
+ * it changes nothing about the trust boundary (CLAUDE.md constraint 4 is still
+ * enforced cryptographically); it only lets a remote operator's machine reach
+ * the route over a plain network connection without minting a session against a
+ * daemon it is not the operator of.
+ *
+ * Written extensibly (a small frozen set) because rotate-root Slice 3b will add
+ * `/v1/federation/rotate/reissue-node-cert` to THIS class later, but that route
+ * needs its own proof-of-possession auth model and is deliberately NOT added now.
+ */
+const FEDERATION_NODE_CERT_AUTH_PATHS: ReadonlySet<string> = new Set([
+  "/v1/federation/sync/peer",
+]);
+
+/** True for a path in the pre-session node-cert-authenticated auth class. */
+export function isFederationNodeCertAuthPath(pathname: string): boolean {
+  return FEDERATION_NODE_CERT_AUTH_PATHS.has(pathname);
 }
 
 // ── Fortress materials + ceremony ─────────────────────────────────────────
@@ -625,13 +650,47 @@ export async function handleFederationRequest(
     await handleSync(deps, req, res, claims);
     return true;
   }
-  if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
-    await handlePeerSync(deps, req, res, claims);
-    return true;
-  }
+  // NOTE: /v1/federation/sync/peer is NO LONGER reachable here (Federation P1).
+  // It moved to the pre-session node-cert-authenticated class
+  // (isFederationNodeCertAuthPath, dispatched in router.ts before the session
+  // gate). If an authenticated caller reaches THIS dispatcher with that path, it
+  // falls through to the 404 below: the cert-auth dispatch already handled the
+  // pre-session case, and a session-bearing caller gets no special treatment.
   // Wrong method on an owned path: not found to an authenticated caller.
   writeJson(res, 404, { error: "not found" });
   return true;
+}
+
+/**
+ * Federation P1 pre-session node-cert-authenticated entry. Reached by the router
+ * BEFORE the /v1 session gate (like the BOOTSTRAP_TOKEN ceremony), so the caller
+ * holds NO session token. Only POST `/v1/federation/sync/peer` is in this class
+ * today; a non-POST or any other path falls through (returns false) so the router
+ * routes it to the session gate exactly like a non-POST ceremony request; it
+ * must NEVER fall through to legacy `/api` routing, and an unhandled in-class path
+ * fails closed at the router (it never reaches a handler that could fall open).
+ *
+ * The session that previously fronted this route was only a network-access gate;
+ * the sole trust decision is `handlePeerSync`'s cryptographic envelope
+ * verification, unchanged.
+ */
+export async function handleFederationNodeCertAuth(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+): Promise<boolean> {
+  if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
+    await handlePeerSync(deps, req, res);
+    return true;
+  }
+  // In-class-but-unhandled route fails closed: a future node-cert-auth path
+  // (e.g. rotate/reissue-node-cert in Slice 3b) that is added to the class set
+  // but not yet given a branch here must NOT fall open. Return false; the router
+  // sends it to the session gate (generic 401 unauth / 404 to an authed caller),
+  // never to legacy routing.
+  return false;
 }
 
 function handleNodes(deps: V1FederationDeps, res: ServerResponse): void {
@@ -968,21 +1027,41 @@ async function handleSync(
 }
 
 /**
- * Cross-MACHINE peer sync (PR-A5 — the federation marquee). Unlike `/sync`,
- * which authorizes the request with THIS fortress's own operator signature
- * (correct only when the caller is the same operator process — the A4
- * "loopback position-only" path), `/sync/peer` accepts a sync from ANOTHER of
- * the operator's machines. The session token still gates network access, but
- * trust in the EVENTS comes from the {@link FederationSyncEnvelope}: the peer
- * presents its node identity certificate, which the recipient verifies chains
- * to its OWN pinned fortress-master (`verifySyncEnvelope` → `verifyCertChain`).
+ * Cross-MACHINE peer sync (PR-A5 marquee; relaxed to pre-session in Federation
+ * P1). Unlike `/sync`, which authorizes the request with THIS fortress's own
+ * operator signature (correct only when the caller is the same operator process,
+ * the A4 "loopback position-only" path), `/sync/peer` accepts a sync from
+ * ANOTHER of the operator's machines. There is NO session and NO operator login
+ * on this route (Federation P1: it moved to the pre-session node-cert-auth
+ * class); trust in the EVENTS comes SOLELY from the {@link
+ * FederationSyncEnvelope}: the peer presents its node identity certificate, which
+ * the recipient verifies chains to its OWN pinned fortress-master
+ * (`verifySyncEnvelope` → `verifyCertChain`). That single cryptographic
+ * verification is the only trust decision.
  *
  * This is the "no implicit trust across the boundary" rule (CLAUDE.md
  * constraint 4) realized for the cross-machine case: a node whose certificate
- * does NOT chain to this fortress's master — a different operator — is rejected
- * with the generic 403 even with a valid session. The hash-chained log defeats
- * per-event tampering/replay; the envelope high-water defeats whole-envelope
- * rollback. No private key crosses the wire (constraint 6).
+ * does NOT chain to this fortress's master (a different operator) is rejected
+ * with the generic 403. The hash-chained log defeats per-event tampering/replay;
+ * the envelope high-water defeats whole-envelope rollback. No private key crosses
+ * the wire (constraint 6).
+ *
+ * NO MEMBERSHIP ORACLE (Federation P1 §2): a pre-session caller must learn
+ * nothing about whether federation is enabled, whether it is provisioned, or
+ * WHICH check failed. Every rejection (federation off/unprovisioned, malformed
+ * or over-cap body, envelope verification failure) collapses to the SAME generic
+ * 403 on the wire. The audit log records the precise reason; the response never
+ * does. (Previously this route returned 503 when federation was disabled, which,
+ * now that there is no session in front, would have been an enabled-state
+ * oracle for an unauthenticated probe.)
+ *
+ * CONFIDENTIALITY HONESTY (Federation P1 §5, CC-1): the signed envelope provides
+ * INTEGRITY + AUTHENTICITY, NOT confidentiality. The default listener is plain
+ * HTTP; over it the events and the node roster cross the wire in cleartext. A
+ * pre-session `/sync/peer` deployment therefore REQUIRES a confidential composed
+ * transport (Tailscale / WireGuard / a TLS-terminating front); the route does
+ * NOT terminate TLS itself (out of scope; transport is composed per the 06-24
+ * federation decision).
  *
  * On accept, the recipient appends the verified slice, records the new
  * per-sender high-water, and answers with its OWN outbound slice wrapped in a
@@ -994,14 +1073,16 @@ async function handlePeerSync(
   deps: V1FederationDeps,
   req: IncomingMessage,
   res: ServerResponse,
-  _claims: V1SessionClaims,
 ): Promise<void> {
   const operation = "v1_federation_sync_peer";
   const ctx = deps.getContext();
 
   // Federation must be enabled and provisioned (we need the pinned master to
-  // verify the peer's chain). Honest authenticated 503 — the session already
-  // proved /v1 access, so this is not an auth oracle.
+  // verify the peer's chain). NO-ORACLE (P1 §2): there is no session in front of
+  // this route now, so a distinguishable 503 would tell an unauthenticated probe
+  // that this fortress is NOT a provisioned federation member. Collapse it to the
+  // SAME generic 403 every other denial returns; the audit entry keeps the
+  // precise reason.
   if (!deps.isEnabled() || ctx === null) {
     await deps.audit({
       operation,
@@ -1009,13 +1090,24 @@ async function handlePeerSync(
       identityId: "peer",
       details: { reason: "federation_disabled" },
     });
-    writeJson(res, 503, { error: "unavailable" });
+    denyForbidden(res);
     return;
   }
 
+  // NO-ORACLE (P1 §2): a malformed or over-cap body also collapses to the same
+  // generic 403. The body cap still rejects oversized peer traffic cheaply (over
+  // V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES -> readJsonBody returns undefined
+  // before JSON.parse), but the WIRE response is identical to a verify failure so
+  // a probe cannot distinguish "too big / not JSON" from "bad envelope".
   const body = await readJsonBody(req, V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES);
   if (typeof body !== "object" || body === null) {
-    writeJson(res, 400, { error: "bad request" });
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: peerSenderNodeId(body),
+      details: { reason: "malformed_or_oversized_body" },
+    });
+    denyForbidden(res);
     return;
   }
 
