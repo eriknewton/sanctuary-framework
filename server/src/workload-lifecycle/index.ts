@@ -83,3 +83,8 @@ export {
   sealHostAttestation,
   type HostAttestationSealContext,
 } from "./host-attestation-seal.js";
+
+export {
+  recordWrappedHarnessRegistration,
+  type RecordWrappedHarnessRegistrationParams,
+} from "./wrap-registration.js";
