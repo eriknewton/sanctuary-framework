@@ -1,7 +1,7 @@
 /**
  * Federation Slice 3b -- operator-signed admin CLI verb tests.
  *
- * Covers `sanctuary federation enable / disable / authorize` and
+ * Covers `sanctuary federation enable / disable / authorize / revoke` and
  * `join --persist`. The verbs are thin clients of the existing
  * `/v1/federation/*` endpoints: each opens the local fortress headless
  * (keychain-safe, no modal), resolves the DEFAULT operator identity, and
@@ -27,6 +27,7 @@ import {
   runFederationAuthorize,
   runFederationEnableDisable,
   runFederationJoin,
+  runFederationRevoke,
 } from "../../src/cli/federation.js";
 import { verifyOperatorSignature } from "../../src/v1/operator-signed.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -260,6 +261,86 @@ describe("federation authorize -- operator-signed bootstrap token", () => {
       request: async () => ({ bootstrap_token: { intended_node_id: "joiner-linux" } }),
     });
     expect(code).toBe(0);
+  });
+});
+
+describe("federation revoke -- operator-signed node eviction", () => {
+  it("fails closed (exit 3) without an operator credential", async () => {
+    const err = capture();
+    const code = await runFederationRevoke({
+      argv: [
+        "--fortress-url",
+        "http://127.0.0.1:9",
+        "--fortress",
+        fortressPath,
+        "--node-id",
+        "joiner-linux",
+      ],
+      env: {},
+      out: capture().stream,
+      err: err.stream,
+      request: async () => {
+        throw new Error("request should not be reached without an operator identity");
+      },
+    });
+    expect(code).toBe(3);
+    expect(err.get()).toMatch(/unlocked operator identity|SANCTUARY_PASSPHRASE/);
+  });
+
+  it("signs revoke with the operator key and prints the eviction event summary", async () => {
+    let captured: { action: string; body: Record<string, unknown> } | null = null;
+    const out = capture();
+    const code = await runFederationRevoke({
+      argv: [
+        "--fortress-url",
+        "http://127.0.0.1:9",
+        "--fortress",
+        fortressPath,
+        "--node-id",
+        "joiner-linux",
+        "--reason",
+        "operator_removed",
+        "--idempotency-key",
+        "idem-revoke-1",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: capture().stream,
+      openSession: stubOpenSession,
+      request: async (path, init, ctx) => {
+        captured = {
+          action: path,
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+        };
+        expect(ctx?.authToken).toBe(STUB_SESSION_TOKEN);
+        return {
+          revoked: true,
+          node_id: "joiner-linux",
+          event_id: "operator:fortress:1",
+          eviction_serial: 1,
+        };
+      },
+    });
+    expect(code).toBe(0);
+    const { action, body } = captured!;
+    expect(action).toBe("/v1/federation/revoke");
+    const ok = verifyOperatorSignature({
+      action,
+      payload: {
+        node_id: body.node_id,
+        reason: body.reason,
+        idempotency_key: body.idempotency_key,
+      },
+      signature: body.operator_signature as string,
+      operatorPublicKey: issuer.operator.publicKey,
+    });
+    expect(ok).toBe(true);
+    expect(JSON.parse(out.get())).toEqual({
+      revoked: true,
+      node_id: "joiner-linux",
+      event_id: "operator:fortress:1",
+      eviction_serial: 1,
+    });
   });
 });
 
