@@ -37,7 +37,7 @@ import {
   runFederationCommand,
 } from "../../src/cli/federation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, AuditPersistenceError } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import {
   bytesToString,
@@ -433,5 +433,49 @@ describe("federation reveal-master-secret -- audit (e)", () => {
     expect(failure).toBeDefined();
     expect(JSON.stringify(failure)).toContain("not_provisioned");
     masterKey.fill(0);
+  });
+});
+
+describe("federation reveal-master-secret -- audit-before-disclose fail-closed (Fix 1)", () => {
+  it("aborts (exit 3) and writes NOTHING to stdout when the durable success audit cannot persist", async () => {
+    // A fully provisioned issuer: custody + operator + trust root all present, so
+    // the verb reaches the success path and would otherwise reveal the secret.
+    const issuer = await seedFederationIssuerFortress({
+      storage,
+      passphrase: PASSPHRASE,
+      nodeId: "home-mac",
+    });
+    const secretB64 = toBase64url(issuer.masterSecret);
+    issuer.masterKey.fill(0);
+
+    // Inject an AuditLog whose DURABLE appendCritical() rejects, simulating a
+    // disk-full / permission / torn-write persistence failure on the disclosure
+    // event. Everything else stays a real AuditLog.
+    class FailingCriticalAuditLog extends AuditLog {
+      override async appendCritical(): Promise<void> {
+        throw new AuditPersistenceError(
+          "simulated durable-append failure",
+          "disk_full",
+        );
+      }
+    }
+
+    const out = capture();
+    const err = capture();
+    const code = await runFederationRevealMasterSecret({
+      argv: ["--yes", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+      makeAuditLog: (storageArg, masterKey) =>
+        new FailingCriticalAuditLog(storageArg, masterKey),
+    });
+
+    // Fail-closed: exit 3, and the master secret NEVER reached stdout.
+    expect(code, `stderr: ${err.get()}`).toBe(3);
+    expect(out.get()).toBe("");
+    expect(out.get()).not.toContain(secretB64);
+    // The operator is told WHY (the disclosure audit could not be persisted).
+    expect(err.get()).toMatch(/durably record|disclosure audit|refusing/);
   });
 });

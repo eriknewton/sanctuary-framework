@@ -1573,19 +1573,28 @@ function parseRevealMasterSecretFlags(
  *     uses (passphrase / recovery-key only; NEVER a keychain modal in headless).
  *     No credential / wrong passphrase / no default operator identity -> exit 3,
  *     fail-closed, never a weaker path.
- *   - REQUIRES a provisioned ISSUER record carrying the master secret. A joiner
- *     record holds NO master secret (`master_private_key` is the issuer-only
- *     field, but `master_secret` is present on a joined node too -- see below).
- *     If no trust root exists, or it cannot be decrypted, it fails closed
- *     (exit 3) WITHOUT revealing anything.
- *   - AUDITED. A Tier-1 master-secret disclosure is recorded under the resolving
- *     operator's PUBLIC key (`federation_master_secret_reveal`). Audit-write
- *     failures never mask the verb's outcome (best-effort flush), mirroring
- *     provision/rotate-root.
+ *   - ISSUER-ONLY in practice. Only a fortress that ran `provision` holds the
+ *     `_federation/trust-root-v1` record carrying `master_secret`. A pure joiner
+ *     persists to `_federation/joiner-trust-root-v1`, whose schema forbids the
+ *     field, so this verb's `load()` returns null on a joiner and the verb fails
+ *     closed (exit 3) revealing nothing. If no trust root exists, or the issuer
+ *     record cannot be decrypted, it likewise fails closed WITHOUT revealing
+ *     anything.
+ *   - AUDITED (DURABLY, BEFORE DISCLOSURE). A Tier-1 master-secret disclosure is
+ *     recorded under the resolving operator's PUBLIC key
+ *     (`federation_master_secret_reveal`) via the DURABLE `appendCritical()` path
+ *     (read-after-write verified), the same barrier the disclosure broker / export
+ *     paths use. On the success path the durable audit is committed BEFORE the
+ *     secret is written to stdout: if the audit cannot be persisted the verb
+ *     aborts fail-closed (exit 3) with NOTHING on stdout, so a master secret never
+ *     reaches stdout un-audited. The failure-reason events are durable too.
  *   - ZEROIZED. The base64url string and the decrypted secret Buffer are zeroed
- *     after writing (constraint 6 discipline). NOTE: a base64url string is an
- *     immutable JS primitive that cannot be wiped in place; the secret BYTES are
- *     zeroed, and the disclosure is already on stdout by design.
+ *     after writing (constraint 6 discipline), AS ARE the record's other private-
+ *     key fields -- including, on a hybrid-suite issuer, every hybrid private key
+ *     (master / issuing-principal / local-node Ed25519 + ML-DSA-65 secret bytes).
+ *     NOTE: a base64url string is an immutable JS primitive that cannot be wiped
+ *     in place; the secret BYTES are zeroed, and the disclosure is already on
+ *     stdout by design.
  *
  * Exit codes:
  *   0 revealed · 1 usage (missing --yes) · 3 refused (fail-closed custody / not
@@ -1598,11 +1607,20 @@ export async function runFederationRevealMasterSecret(args: {
   err?: Writable;
   /** Test seam: keychain-safe custody-unlock (defaults to the real impl). */
   openSigner?: typeof openOperatorSigner;
+  /**
+   * Test seam: construct the audit log (defaults to the real `AuditLog`). Lets a
+   * test inject a log whose durable `appendCritical()` rejects, to prove the
+   * success path aborts fail-closed with NOTHING on stdout when the disclosure
+   * audit cannot be persisted.
+   */
+  makeAuditLog?: (storage: OperatorSigner["storage"], masterKey: Uint8Array) => AuditLog;
 }): Promise<number> {
   const env = args.env ?? process.env;
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
   const openSigner = args.openSigner ?? openOperatorSigner;
+  const makeAuditLog =
+    args.makeAuditLog ?? ((storage, masterKey) => new AuditLog(storage, masterKey));
   const flags = parseRevealMasterSecretFlags(args.argv, env);
 
   // Confirm gate FIRST: refuse a sensitive disclosure that was not explicitly
@@ -1644,23 +1662,25 @@ export async function runFederationRevealMasterSecret(args: {
   }
 
   const operatorPubkeyB64 = toBase64url(signer.operatorPublicKey);
-  const auditLog = new AuditLog(signer.storage, signer.masterKey);
+  const auditLog = makeAuditLog(signer.storage, signer.masterKey);
+  // DURABLE disclosure audit. This is custody-core: a master-secret disclosure
+  // (and the failure reasons that gate it) MUST land durably, so we use the same
+  // `appendCritical()` read-after-write barrier the disclosure broker / export
+  // paths use. We AWAIT it and let a persist failure REJECT loudly -- a reveal
+  // that cannot be audited must NOT proceed (constraint 5: never silently degrade
+  // to a less-secure behavior). The operator signer is already resolved here, so
+  // a signing identity exists for the critical append.
   const audit = async (result: "success" | "failure", reason?: string): Promise<void> => {
-    try {
-      await auditLog.append(
-        "l2",
-        "federation_master_secret_reveal",
-        "federation",
-        {
-          operator_pubkey: operatorPubkeyB64,
-          ...(reason !== undefined ? { reason } : {}),
-        },
-        result,
-      );
-    } catch {
-      // Federation stays fail-closed; an audit-write failure never masks the
-      // verb's reveal/refusal outcome.
-    }
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation: "federation_master_secret_reveal",
+      identity_id: "federation",
+      result,
+      details: {
+        operator_pubkey: operatorPubkeyB64,
+        ...(reason !== undefined ? { reason } : {}),
+      },
+    });
   };
 
   let record: Awaited<ReturnType<FederationTrustRootStore["load"]>> = null;
@@ -1697,22 +1717,38 @@ export async function runFederationRevealMasterSecret(args: {
     }
 
     // The 32-byte symmetric master secret -- the SAME value a joiner feeds to
-    // `join --master-secret`. (A joined node also carries master_secret, so this
-    // verb works on any provisioned/joined fortress; only the issuer should ever
-    // need to re-export it for new joiners.)
+    // `join --master-secret`. Only an ISSUER (ran `provision`) holds this
+    // `_federation/trust-root-v1` record; a pure joiner persists to
+    // `_federation/joiner-trust-root-v1` (no `master_secret`), so `load()`
+    // returned null above and we never reach here on a joiner.
     secretBytes = Uint8Array.from(record.master_secret);
     let secretB64 = toBase64url(secretBytes);
     try {
-      // Print to stdout (the intended output; pipe to the joiner's --master-secret).
+      // AUDIT-BEFORE-DISCLOSE: commit the durable success audit FIRST. If it
+      // cannot be persisted, `appendCritical()` rejects, we fall through to the
+      // catch below, abort fail-closed (exit 3), and NOTHING is written to
+      // stdout. The master secret never reaches stdout un-audited.
+      await audit("success");
+      // Only now -- with the disclosure durably audited -- print to stdout (the
+      // intended output; pipe to the joiner's --master-secret).
       out.write(`${secretB64}\n`);
+      return 0;
+    } catch (cause) {
+      // The durable success audit could not be persisted. Refuse the disclosure
+      // (constraint 5: never silently degrade). Nothing was written to stdout.
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      err.write(
+        `sanctuary federation reveal-master-secret: could not durably record the ` +
+          `Tier-1 disclosure audit event (${detail}); refusing to reveal the master ` +
+          `secret. Nothing was written.\n`,
+      );
+      return 3;
     } finally {
       // Constraint 6 discipline: drop our reference. A JS string is immutable and
       // cannot be wiped in place, but the secret BYTES are zeroed in the outer
-      // finally; the value is already on stdout by design.
+      // finally; the value is already on stdout by design (on the success path).
       secretB64 = "";
     }
-    await audit("success");
-    return 0;
   } finally {
     // Zeroize the secret bytes we copied out of the record (constraint 6).
     secretBytes?.fill(0);
@@ -1722,10 +1758,25 @@ export async function runFederationRevealMasterSecret(args: {
     record?.master_private_key?.fill(0);
     record?.issuing_principal_private_key.fill(0);
     record?.local_node_private_key.fill(0);
+    // On a HYBRID-suite issuer, `record.hybrid` carries LIVE Ed25519 + ML-DSA-65
+    // private keys (master, issuing-principal, local-node) decrypted transiently
+    // by load(). The classical four fields above do NOT cover them, so zero every
+    // hybrid private-key Uint8Array too (constraint 6). Optional chaining makes
+    // this a safe no-op on a classical record where `hybrid` is absent.
+    record?.hybrid?.master_private_keys?.ed25519?.private_key?.fill(0);
+    record?.hybrid?.master_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+    record?.hybrid?.issuing_principal_private_keys?.ed25519?.private_key?.fill(0);
+    record?.hybrid?.issuing_principal_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+    record?.hybrid?.local_node_private_keys?.ed25519?.private_key?.fill(0);
+    record?.hybrid?.local_node_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+    // Durability already rode on `appendCritical()` above (read-after-write
+    // verified before that promise resolved); this flush is a belt-and-suspenders
+    // drain of anything else queued and never changes the verb's exit code.
     try {
       await auditLog.flush();
     } catch {
-      // Audit durability is best-effort; never change the verb's exit code.
+      // Drain is best-effort here; the critical disclosure audit was already
+      // durably committed before any secret reached stdout.
     }
     // Constraint 6: the custody master never persists past this call.
     signer.masterKey.fill(0);
@@ -1822,7 +1873,10 @@ Reveal-master-secret (issuer) verb -- custody-unlocked, runs LOCALLY on the home
                         unlocked default operator identity: SANCTUARY_PASSPHRASE /
                         --passphrase / SANCTUARY_RECOVERY_KEY; never prompts the
                         keychain), fails closed if no credential or no provisioned
-                        trust root, and records a Tier-1 disclosure audit event.
+                        trust root, and DURABLY records a Tier-1 disclosure audit
+                        event BEFORE the secret is printed -- if that audit cannot
+                        be persisted the reveal aborts (exit 3) with nothing on
+                        stdout, so a master secret never reaches stdout un-audited.
                         Redirect the output to a secure channel; never paste it
                         where it can be logged.
 
