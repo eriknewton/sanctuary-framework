@@ -33,14 +33,20 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHash } from "node:crypto";
-import { fromBase64url } from "../core/encoding.js";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { fromBase64url, toBase64url } from "../core/encoding.js";
+import { verify } from "../core/identity.js";
 import {
   issueBootstrapToken,
   verifyBootstrapToken,
   verifyJoinHkdfSaltProof,
 } from "../mesh/lifecycle/bootstrap-token.js";
-import { deriveNodeTransportKey } from "../mesh/trust-root.js";
+import {
+  deriveNodeTransportKey,
+  issueNodeIdentityCertificate,
+  verifyCertChain,
+  verifyFederationRootRotationCertificate,
+} from "../mesh/trust-root.js";
 import type { NodeMode } from "../mesh/constants.js";
 import {
   NODE_TRUST_BOUNDARY_VERSION,
@@ -49,6 +55,7 @@ import {
   type NodeTrustBoundary,
 } from "../mesh/node-posture.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   PrincipalCertificate,
   NodeIdentityCertificate,
@@ -68,6 +75,7 @@ import {
 } from "./federation-sync-envelope.js";
 import {
   FEDERATION_SYNC_WIRE_VERSION,
+  normalizeFederationNodeCertificateRenewalConfig,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
 
@@ -83,6 +91,12 @@ const NODE_MODES: readonly NodeMode[] = [
  * JSON parsing to keep malformed peer traffic cheap to reject.
  */
 export const V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES = 96 * 1024;
+export const V1_FEDERATION_REISSUE_NODE_CERT_MAX_BODY_BYTES = 96 * 1024;
+
+export const FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION =
+  "sanctuary.v1.federation-reissue-node-cert";
+export const FEDERATION_REISSUE_NODE_CERT_PROOF_DOMAIN =
+  "sanctuary.v1.federation-reissue-node-cert-proof";
 
 /** A path owned by the federation handler (post-session class). */
 export function isFederationPath(pathname: string): boolean {
@@ -114,15 +128,15 @@ export function isFederationCeremonyPath(pathname: string): boolean {
  * the route over a plain network connection without minting a session against a
  * daemon it is not the operator of.
  *
- * Today this class holds exactly one path, so it is a plain equality check
- * (matching the sibling `isFederationCeremonyPath` convention). Rotate-root
- * Slice 3b will add `/v1/federation/rotate/reissue-node-cert` to THIS class
- * later — but that route needs its own proof-of-possession auth model and is
- * deliberately NOT added now; when it lands, the equality becomes a `||` (or a
- * frozen set) over the two members.
+ * This class contains only routes whose handler performs its own cryptographic
+ * proof before trusting the caller: peer-sync envelopes and node-cert reissue
+ * proof-of-possession challenges.
  */
 export function isFederationNodeCertAuthPath(pathname: string): boolean {
-  return pathname === "/v1/federation/sync/peer";
+  return (
+    pathname === "/v1/federation/sync/peer" ||
+    pathname === "/v1/federation/rotate/reissue-node-cert"
+  );
 }
 
 // ── Fortress materials + ceremony ─────────────────────────────────────────
@@ -550,6 +564,14 @@ export interface V1FederationDeps {
   isRootRevoked(masterPubkeyB64u: string): boolean;
   /** Best-effort local cert auto-renewal tick before this daemon presents its cert. */
   renewLocalNodeCertificate(): void;
+  /** Issue a server challenge for pre-session node-cert reissue POP. */
+  issueReissueChallenge(
+    params: FederationReissueChallengeParams,
+  ): FederationReissueChallenge | Promise<FederationReissueChallenge>;
+  /** Consume exactly one reissue challenge before issuance; false is fail-closed. */
+  consumeReissueChallenge(
+    params: FederationConsumeReissueChallengeParams,
+  ): Promise<boolean>;
   /** Structured aggregate disclosure for status surfaces. */
   federationPosture(): FederationPostureSummary;
 }
@@ -610,6 +632,23 @@ export interface FederationAppendOptions {
   wireVersion?: unknown;
 }
 
+export interface FederationReissueChallenge {
+  challenge_id: string;
+  challenge: string;
+  expires_at: string;
+}
+
+export interface FederationReissueChallengeParams {
+  fortressId: string;
+  nodeId: string;
+}
+
+export interface FederationConsumeReissueChallengeParams
+  extends FederationReissueChallengeParams {
+  challengeId: string;
+  challenge: string;
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /**
@@ -662,11 +701,11 @@ export async function handleFederationRequest(
 /**
  * Federation P1 pre-session node-cert-authenticated entry. Reached by the router
  * BEFORE the /v1 session gate (like the BOOTSTRAP_TOKEN ceremony), so the caller
- * holds NO session token. Only POST `/v1/federation/sync/peer` is in this class
- * today; a non-POST or any other path falls through (returns false) so the router
- * routes it to the session gate exactly like a non-POST ceremony request; it
- * must NEVER fall through to legacy `/api` routing, and an unhandled in-class path
- * fails closed at the router (it never reaches a handler that could fall open).
+ * holds NO session token. Only POSTs in this class are handled here; a non-POST
+ * or any other path falls through (returns false) so the router routes it to the
+ * session gate exactly like a non-POST ceremony request; it must NEVER fall
+ * through to legacy `/api` routing, and an unhandled in-class path fails closed
+ * at the router (it never reaches a handler that could fall open).
  *
  * The session that previously fronted this route was only a network-access gate;
  * the sole trust decision is `handlePeerSync`'s cryptographic envelope
@@ -681,6 +720,13 @@ export async function handleFederationNodeCertAuth(
 ): Promise<boolean> {
   if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
     await handlePeerSync(deps, req, res);
+    return true;
+  }
+  if (
+    method === "POST" &&
+    url.pathname === "/v1/federation/rotate/reissue-node-cert"
+  ) {
+    await handleReissueNodeCert(deps, req, res);
     return true;
   }
   // In-class-but-unhandled route fails closed: a future node-cert-auth path
@@ -1022,6 +1068,424 @@ async function handleSync(
     ...(senderRevoked ? {} : { events: outbound }),
     nodes: deps.listNodes(),
   });
+}
+
+interface ReissueNodeCertCompleteRequest {
+  node_id: string;
+  challenge_id: string;
+  challenge: string;
+  current_node_cert: NodeIdentityCertificate;
+  current_issuing_principal_cert: PrincipalCertificate;
+  rotation_cert: FederationRootRotationCertificate;
+  node_signature: string;
+}
+
+class ReissueNodeCertFailure extends Error {
+  constructor(readonly auditReason: string) {
+    super(auditReason);
+  }
+}
+
+async function handleReissueNodeCert(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const body = await readJsonBody(req, V1_FEDERATION_REISSUE_NODE_CERT_MAX_BODY_BYTES);
+  if (!isRecord(body)) {
+    await auditReissueFailure(
+      deps,
+      "v1_federation_reissue_node_cert",
+      reissueRequestNodeId(body),
+      "malformed_or_oversized_body",
+    );
+    denyForbidden(res);
+    return;
+  }
+
+  if (body.action === "challenge") {
+    await handleReissueNodeCertChallenge(deps, body, res);
+    return;
+  }
+  if (body.action === "complete") {
+    await handleReissueNodeCertComplete(deps, body, res);
+    return;
+  }
+
+  await auditReissueFailure(
+    deps,
+    "v1_federation_reissue_node_cert",
+    reissueRequestNodeId(body),
+    "malformed_request",
+  );
+  denyForbidden(res);
+}
+
+async function handleReissueNodeCertChallenge(
+  deps: V1FederationDeps,
+  body: Record<string, unknown>,
+  res: ServerResponse,
+): Promise<void> {
+  const operation = "v1_federation_reissue_node_cert_challenge";
+  const nodeId = typeof body.node_id === "string" && body.node_id.length > 0
+    ? body.node_id
+    : null;
+  const ctx = deps.getContext();
+  const unavailable = !deps.isEnabled() || ctx === null;
+  if (nodeId === null) {
+    await auditReissueFailure(deps, operation, "peer", "malformed_request");
+    denyForbidden(res);
+    return;
+  }
+  if (unavailable || !federationContextHasIssuerAuthority(ctx)) {
+    await auditReissueFailure(
+      deps,
+      operation,
+      nodeId,
+      unavailable ? "federation_disabled" : "issuer_authority_unavailable",
+    );
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await auditReissueFailure(deps, operation, nodeId, "root_revoked");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  let revoked: boolean;
+  try {
+    revoked = deps.isNodeRevoked(nodeId);
+  } catch {
+    await auditReissueFailure(deps, operation, nodeId, "revocation_state_unavailable");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+  if (revoked) {
+    await auditReissueFailure(deps, operation, nodeId, "node_revoked");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  let issued: FederationReissueChallenge;
+  try {
+    issued = await deps.issueReissueChallenge({
+      fortressId: ctx.fortressId,
+      nodeId,
+    });
+  } catch {
+    await auditReissueFailure(deps, operation, nodeId, "challenge_store_unavailable");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: nodeId,
+    details: { challenge_id: issued.challenge_id, expires_at: issued.expires_at },
+  });
+  writeReissueChallenge(res, issued);
+}
+
+function writeReissueChallenge(
+  res: ServerResponse,
+  challenge: FederationReissueChallenge,
+): void {
+  writeJson(res, 200, {
+    request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    ...challenge,
+  });
+}
+
+function dummyReissueChallenge(): FederationReissueChallenge {
+  return {
+    challenge_id: randomUUID(),
+    challenge: toBase64url(randomBytes(32)),
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+}
+
+async function handleReissueNodeCertComplete(
+  deps: V1FederationDeps,
+  body: Record<string, unknown>,
+  res: ServerResponse,
+): Promise<void> {
+  const operation = "v1_federation_reissue_node_cert";
+  const request = parseReissueNodeCertComplete(body);
+  const ctx = deps.getContext();
+  const unavailable = !deps.isEnabled() || ctx === null;
+  if (request === null || unavailable || !federationContextHasIssuerAuthority(ctx)) {
+    await auditReissueFailure(deps, operation, reissueRequestNodeId(body), unavailable
+      ? "federation_disabled"
+      : request === null
+        ? "malformed_request"
+        : "issuer_authority_unavailable");
+    denyForbidden(res);
+    return;
+  }
+
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await auditReissueFailure(deps, operation, request.node_id, "root_revoked");
+    denyForbidden(res);
+    return;
+  }
+
+  let consumed: boolean;
+  try {
+    consumed = await deps.consumeReissueChallenge({
+      fortressId: ctx.fortressId,
+      nodeId: request.node_id,
+      challengeId: request.challenge_id,
+      challenge: request.challenge,
+    });
+  } catch {
+    consumed = false;
+  }
+  if (!consumed) {
+    await auditReissueFailure(deps, operation, request.node_id, "challenge_invalid");
+    denyForbidden(res);
+    return;
+  }
+
+  let certificate: NodeIdentityCertificate;
+  try {
+    certificate = reissueNodeCertificate(deps, ctx, request);
+  } catch (err) {
+    await auditReissueFailure(
+      deps,
+      operation,
+      request.node_id,
+      err instanceof ReissueNodeCertFailure
+        ? err.auditReason
+        : "certificate_issue_failed",
+    );
+    denyForbidden(res);
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: request.node_id,
+    details: {
+      node_id: request.node_id,
+      rotation_serial: request.rotation_cert.rotation_serial,
+      expires_at: certificate.expires_at ?? null,
+    },
+  });
+  writeJson(res, 200, {
+    reissued: true,
+    request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    node_id: request.node_id,
+    certificate,
+    issuing_principal_cert: ctx.issuingPrincipalCert,
+    pinned_master: ctx.pinnedMasterPubkey,
+  });
+}
+
+function reissueNodeCertificate(
+  deps: V1FederationDeps,
+  ctx: FederationIssuerContext,
+  request: ReissueNodeCertCompleteRequest,
+): NodeIdentityCertificate {
+  const rotationCert = request.rotation_cert;
+  if (!isRecord(rotationCert) || rotationCert.hybrid_rotation !== undefined) {
+    throw new ReissueNodeCertFailure("hybrid_reissue_unsupported");
+  }
+  if (
+    typeof rotationCert.fortress_id !== "string" ||
+    typeof rotationCert.old_master_pubkey !== "string"
+  ) {
+    throw new ReissueNodeCertFailure("rotation_cert_invalid");
+  }
+  const oldPinnedMaster: FortressMasterPublicKey = {
+    public_key: rotationCert.old_master_pubkey,
+    fortress_id: rotationCert.fortress_id,
+    created_at: rotationCert.rotated_at,
+  };
+
+  if (rotationCert.fortress_id !== ctx.fortressId) {
+    throw new ReissueNodeCertFailure("rotation_cert_invalid");
+  }
+  if (rootRevokedFailClosed(deps, rotationCert.old_master_pubkey)) {
+    throw new ReissueNodeCertFailure("old_root_revoked");
+  }
+  try {
+    verifyFederationRootRotationCertificate(rotationCert, oldPinnedMaster);
+  } catch {
+    throw new ReissueNodeCertFailure("rotation_cert_invalid");
+  }
+  if (!samePinnedMaster(rotationCert.new_master, ctx.pinnedMasterPubkey)) {
+    throw new ReissueNodeCertFailure("rotation_cert_not_current_root");
+  }
+
+  const nodeCert = request.current_node_cert;
+  const principalCert = request.current_issuing_principal_cert;
+  if (nodeCert.node_id !== request.node_id || nodeCert.fortress_id !== ctx.fortressId) {
+    throw new ReissueNodeCertFailure("old_cert_chain_invalid");
+  }
+  try {
+    verifyCertChain(nodeCert, principalCert, oldPinnedMaster);
+  } catch {
+    throw new ReissueNodeCertFailure("old_cert_chain_invalid");
+  }
+
+  let revoked: boolean;
+  try {
+    revoked = deps.isNodeRevoked(request.node_id);
+  } catch {
+    throw new ReissueNodeCertFailure("revocation_state_unavailable");
+  }
+  if (revoked) throw new ReissueNodeCertFailure("node_revoked");
+
+  let nodePubkey: Uint8Array;
+  let signature: Uint8Array;
+  try {
+    nodePubkey = fromBase64url(nodeCert.node_pubkey);
+    signature = fromBase64url(request.node_signature);
+  } catch {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+  if (nodePubkey.length !== 32 || signature.length !== 64) {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+  const proofMessage = buildFederationReissueNodeCertProofMessage({
+    fortressId: ctx.fortressId,
+    nodeId: request.node_id,
+    challengeId: request.challenge_id,
+    challenge: request.challenge,
+    currentNodeCert: nodeCert,
+    currentIssuingPrincipalCert: principalCert,
+    rotationCert,
+  });
+  if (!verify(proofMessage, signature, nodePubkey)) {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+
+  const renewal = normalizeFederationNodeCertificateRenewalConfig(
+    ctx.nodeCertificateRenewal,
+  );
+  const expiresAt = new Date(renewal.now() + renewal.certLifetimeMs).toISOString();
+  try {
+    return issueNodeIdentityCertificate({
+      node_id: request.node_id,
+      node_pubkey: nodePubkey,
+      node_mode: nodeCert.node_mode,
+      fortress_id: ctx.fortressId,
+      capabilities: nodeCert.capabilities,
+      parent_chain: {
+        fortress_master_pubkey: ctx.pinnedMasterPubkey.public_key,
+        principal_id: ctx.issuingPrincipalCert.principal_id,
+        principal_pubkey: ctx.issuingPrincipalCert.principal_pubkey,
+      },
+      principal_private_key: ctx.getIssuingPrincipalPrivateKey(),
+      master_private_key: ctx.getMasterPrivateKey?.(),
+      expires_at: expiresAt,
+      ...(typeof nodeCert.tee_attestation_hash === "string"
+        ? { tee_attestation_hash: nodeCert.tee_attestation_hash }
+        : {}),
+    });
+  } catch {
+    throw new ReissueNodeCertFailure("certificate_issue_failed");
+  }
+}
+
+export function buildFederationReissueNodeCertProofMessage(params: {
+  fortressId: string;
+  nodeId: string;
+  challengeId: string;
+  challenge: string;
+  currentNodeCert: NodeIdentityCertificate;
+  currentIssuingPrincipalCert: PrincipalCertificate;
+  rotationCert: FederationRootRotationCertificate;
+}): Uint8Array {
+  return new TextEncoder().encode(
+    canonicalJson({
+      domain: FEDERATION_REISSUE_NODE_CERT_PROOF_DOMAIN,
+      request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+      fortress_id: params.fortressId,
+      node_id: params.nodeId,
+      challenge_id: params.challengeId,
+      challenge: params.challenge,
+      current_node_cert_sha256: sha256Canonical(params.currentNodeCert),
+      current_issuing_principal_cert_sha256: sha256Canonical(
+        params.currentIssuingPrincipalCert,
+      ),
+      rotation_cert_sha256: sha256Canonical(params.rotationCert),
+    }),
+  );
+}
+
+function sha256Canonical(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("base64url");
+}
+
+function parseReissueNodeCertComplete(
+  body: Record<string, unknown>,
+): ReissueNodeCertCompleteRequest | null {
+  if (
+    typeof body.node_id !== "string" ||
+    body.node_id.length === 0 ||
+    typeof body.challenge_id !== "string" ||
+    body.challenge_id.length === 0 ||
+    typeof body.challenge !== "string" ||
+    body.challenge.length === 0 ||
+    typeof body.node_signature !== "string" ||
+    body.node_signature.length === 0 ||
+    !isRecord(body.current_node_cert) ||
+    !isRecord(body.current_issuing_principal_cert) ||
+    !isRecord(body.rotation_cert)
+  ) {
+    return null;
+  }
+  return {
+    node_id: body.node_id,
+    challenge_id: body.challenge_id,
+    challenge: body.challenge,
+    current_node_cert: body.current_node_cert as unknown as NodeIdentityCertificate,
+    current_issuing_principal_cert:
+      body.current_issuing_principal_cert as unknown as PrincipalCertificate,
+    rotation_cert: body.rotation_cert as unknown as FederationRootRotationCertificate,
+    node_signature: body.node_signature,
+  };
+}
+
+function samePinnedMaster(
+  a: FortressMasterPublicKey,
+  b: FortressMasterPublicKey,
+): boolean {
+  return (
+    a.public_key === b.public_key &&
+    a.fortress_id === b.fortress_id &&
+    a.created_at === b.created_at
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function auditReissueFailure(
+  deps: V1FederationDeps,
+  operation: string,
+  identityId: string,
+  reasonCode: string,
+): Promise<void> {
+  await deps.audit({
+    operation,
+    result: "failure",
+    identityId,
+    details: { reason: reasonCode },
+  });
+}
+
+function reissueRequestNodeId(body: unknown): string {
+  if (isRecord(body) && typeof body.node_id === "string" && body.node_id.length > 0) {
+    return body.node_id;
+  }
+  return "peer";
 }
 
 /**

@@ -375,6 +375,13 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       // its joined-node record and rotateMaster would abort. MUST equal
       // OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO (asserted in master-rotation.test).
       "operator-cloud-joined-node",
+      // Durable server-issued challenge spent-set for the pre-session
+      // federation node-cert reissue endpoint (Slice 3c-2). Same no-AAD
+      // derivePurposeKey blob; without this label a fortress that accepted a
+      // reissue proof would strand the replay set on custody master rotation.
+      // MUST equal FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO (asserted in
+      // master-rotation.test).
+      "federation-reissue-node-cert-challenge-set",
     ],
   },
   _fortress_mode: {

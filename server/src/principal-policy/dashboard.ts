@@ -131,6 +131,7 @@ import {
   FederationSyncStateStore,
   type FederationSyncStateSnapshot,
 } from "../v1/federation-sync-state-store.js";
+import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -513,6 +514,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * in memory with the same semantics).
    */
   private _federationSyncStateStore: FederationSyncStateStore | null = null;
+  private _federationReissueChallengeStore = new FederationReissueChallengeStore();
+  private _federationReissueChallengeStoreUnavailable = false;
   /**
    * FAIL-CLOSED latch (DUR-4 / CC-2). Set true when the durable sync-state
    * record is PRESENT but could not be decrypted/parsed on boot (at-rest
@@ -1745,6 +1748,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Federation 3c-2: bind the durable server-issued challenge spent-set for the
+   * pre-session node-cert reissue endpoint. Minimal rigs default to an in-memory
+   * store; production boot replaces it with a durable store so accepted proofs
+   * cannot be replayed after restart. A present-but-corrupt record latches the
+   * endpoint unavailable (fail closed) without preventing dashboard boot.
+   */
+  async setFederationReissueChallengeStore(
+    store: FederationReissueChallengeStore | null,
+  ): Promise<void> {
+    this._federationReissueChallengeStore = store ?? new FederationReissueChallengeStore();
+    this._federationReissueChallengeStoreUnavailable = false;
+    if (store === null) return;
+    try {
+      await store.init();
+    } catch {
+      this._federationReissueChallengeStoreUnavailable = true;
+    }
+  }
+
+  /**
    * Load the durable sync-state snapshot into the live in-memory fields.
    * Internal to {@link setFederationSyncStateStore}; separated for testability.
    */
@@ -1944,6 +1967,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.isFederationRootRevoked(masterPubkeyB64u),
       renewLocalNodeCertificate: () => {
         this.renewLocalFederationNodeCertificate();
+      },
+      issueReissueChallenge: async (params) => {
+        if (this._federationReissueChallengeStoreUnavailable) {
+          throw new Error("federation_reissue_challenge_store_unavailable");
+        }
+        return this._federationReissueChallengeStore.issue(params);
+      },
+      consumeReissueChallenge: async (params) => {
+        if (this._federationReissueChallengeStoreUnavailable) return false;
+        return this._federationReissueChallengeStore.consume(params);
       },
       federationPosture: () => this.buildFederationPostureSummary(),
       audit: async ({ operation, result, identityId, details }) => {

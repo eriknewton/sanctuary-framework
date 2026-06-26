@@ -229,10 +229,16 @@ afterEach(async () => {
 // the bind race.
 describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", { retry: 2 }, () => {
   // ── Path-class predicates (unit level) ──────────────────────────────
-  it("classifies /sync/peer in the node-cert-auth class and NOT the post-session class", () => {
+  it("classifies node-cert-auth routes and keeps them out of the post-session class", () => {
     expect(isFederationNodeCertAuthPath("/v1/federation/sync/peer")).toBe(true);
+    expect(
+      isFederationNodeCertAuthPath("/v1/federation/rotate/reissue-node-cert"),
+    ).toBe(true);
     // It is no longer a post-session federation path (moved out of isFederationPath).
     expect(isFederationPath("/v1/federation/sync/peer")).toBe(false);
+    expect(isFederationPath("/v1/federation/rotate/reissue-node-cert")).toBe(
+      false,
+    );
     // The post-session routes are untouched.
     for (const p of [
       "/v1/federation/enable",
@@ -249,10 +255,6 @@ describe("Federation P1 — pre-session node-cert-authenticated /sync/peer", { r
     expect(isFederationNodeCertAuthPath("/v1/federation/authorize/complete")).toBe(
       false,
     );
-    // A would-be future in-class route (3b) is NOT in the class yet.
-    expect(
-      isFederationNodeCertAuthPath("/v1/federation/rotate/reissue-node-cert"),
-    ).toBe(false);
   });
 
   // ── Merge-bar 1: positive end-to-end (no Authorization header) ──────
