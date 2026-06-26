@@ -31,7 +31,10 @@ import {
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
   readCustodyEnvelope,
+  verifyEnvelopeMac,
   CustodyUnlockError,
+  CustodyRotationInProgressError,
+  ROTATION_JOURNAL_KEY,
   type CustodyEnvelope,
   type EstablishMasterResult,
 } from "../core/master-custody.js";
@@ -274,4 +277,113 @@ export async function establishWrapCustody(
 
   await auditLog.flush();
   return { masterKey, envelope, mintedRecoveryKey, origin };
+}
+
+/** Thrown when a supervised launch's injected master does not unlock this fortress. */
+export class SupervisedCustodyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SupervisedCustodyError";
+  }
+}
+
+export interface SupervisedWrapCustodyOptions {
+  storagePath: string;
+  /**
+   * The raw 32-byte fortress master the supervisor handed over the one-shot fd
+   * (the dashboard's already-unlocked in-memory master — Tier A). This buffer
+   * is OWNED by the caller (`runWrap`), which zeroes it on teardown; this
+   * function MUST NOT zero or retain a reference to it beyond the returned
+   * `masterKey` (which IS the same buffer, threaded forward intentionally).
+   */
+  master: Uint8Array;
+}
+
+/**
+ * Establish wrap custody from a SUPERVISOR-supplied raw master (Phase S1 Tier A
+ * live mile). The supervisor process already unlocked the fortress and holds
+ * the master in memory; it hands a copy to this child over a one-shot fd
+ * (never env/argv). The child must NOT re-derive a master from a passphrase
+ * (there is none in supervised mode) and must NOT mint a new one — it must
+ * adopt the supervisor's master AS the fortress master, but only after proving
+ * it actually unlocks THIS fortress.
+ *
+ * Fail-closed gates (never silently degrade — constraint #5):
+ *   1. A master rotation in flight ⇒ refuse (defense in depth; the supervisor's
+ *      rotation guard already refused, but the child re-checks at the on-disk
+ *      truth so a rotation journaled after the socket request still refuses).
+ *   2. NO custody envelope on disk ⇒ refuse. A supervised launch is only ever
+ *      issued against a fortress the dashboard already unlocked, which by
+ *      construction has an established envelope. A legacy/fresh fortress (no
+ *      envelope) must never be "established" from an ambient master — that
+ *      would mint custody over existing data with no recovery wrap. The
+ *      operator runs an interactive `sanctuary wrap` once to establish custody
+ *      before it can be supervised.
+ *   3. The supplied master must MAC-verify against the envelope
+ *      (`verifyEnvelopeMac`). A wrong/garbage master throws
+ *      `CustodyEnvelopeIntegrityError`; we surface it as a fail-closed refusal.
+ *      This is the supervised analogue of the passphrase-unlock check: we never
+ *      run the enforcement chain on a master that does not own this fortress.
+ *
+ * On success the returned `masterKey` IS the supplied buffer (threaded forward
+ * so `runWrap` can zero exactly one buffer on teardown). No new credential is
+ * introduced and nothing extra is written to disk — identical custody posture
+ * to the dashboard's own in-memory hold (Tier A, design §3).
+ */
+export async function establishSupervisedWrapCustody(
+  opts: SupervisedWrapCustodyOptions
+): Promise<WrapCustodyResult> {
+  const storage = new FilesystemStorage(join(opts.storagePath, "state"));
+
+  // Gate 1: rotation in flight ⇒ refuse (the master may be split old/new).
+  if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+    throw new CustodyRotationInProgressError();
+  }
+
+  // Gate 2: a supervised launch requires an already-established envelope.
+  const envelope = await readCustodyEnvelope(storage);
+  if (!envelope) {
+    throw new SupervisedCustodyError(
+      "supervised launch requires an established custody envelope; " +
+        "run an interactive `sanctuary wrap` once to establish custody before supervising"
+    );
+  }
+
+  // Gate 3: prove the supervisor's master actually unlocks THIS fortress. A
+  // wrong master throws CustodyEnvelopeIntegrityError; treat any verify failure
+  // as a fail-closed refusal (never run on a master that does not own the
+  // fortress). The MAC also authenticates the envelope's install_mode/verified
+  // flags before anyone trusts them (H2).
+  try {
+    verifyEnvelopeMac(envelope, opts.master);
+  } catch (err) {
+    throw new SupervisedCustodyError(
+      `supervisor master does not unlock this fortress (${
+        err instanceof Error ? err.message : String(err)
+      })`
+    );
+  }
+
+  // Adopt the supervisor's master as the fortress master. Origin "envelope":
+  // identical to a passphrase unlock of an existing envelope: no migration, no
+  // mint, no new wrap, no recovery-key disclosure. We DO record an audit event
+  // so the supervised custody adoption is visible in the same log the dashboard
+  // and CLI read.
+  const masterKey = opts.master;
+  const auditLog = new AuditLog(storage, masterKey);
+  const fortressId = fortressIdFromStoragePath(opts.storagePath);
+  await auditLog.appendCritical({
+    layer: "l2",
+    operation: "custody_supervised_unlock",
+    identity_id: fortressId,
+    result: "success",
+    details: {
+      install_mode: envelope.install_mode,
+      wrap_types: envelope.wraps.map((w) => w.type),
+      source: "sanctuary-wrap-supervised",
+    },
+  });
+  await auditLog.flush();
+
+  return { masterKey, envelope, mintedRecoveryKey: false, origin: "envelope" };
 }

@@ -100,41 +100,52 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "protect" || args[0] === "wrap") {
-    // Phase S1 supervisor handoff (codex R3-H1): when launched BY the
-    // split-process supervisor, the transient master key arrives on an
-    // inherited one-shot fd (never env/argv). Consume + close it at the
-    // earliest point so it cannot linger for a same-uid `/proc/<pid>/fd` race,
-    // and FAIL CLOSED in supervisor mode: never silently fall through to the
-    // passphrase/keychain path. Threading the raw master into wrap custody
-    // (`establishWrapCustody`) is the drill-gated last mile (S1 acceptance is
-    // Erik-present on the signing host); until that lands, supervisor mode
-    // refuses rather than running an unintended custody path.
+    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
+    const opts = parseWrapArgs(args.slice(1));
+
+    // Phase S1 supervisor handoff (codex R3-H1) — LIVE wrap-launch mile.
+    // When launched BY the split-process supervisor, the fortress master
+    // arrives on an inherited one-shot fd (never env/argv). Read + close it at
+    // the earliest point so it cannot linger for a same-uid `/proc/<pid>/fd`
+    // race, then thread the RAW master into `runWrap` so it establishes custody
+    // directly (verified against the on-disk envelope, fail-closed) and runs
+    // the full enforcement chain. FAIL CLOSED in supervisor mode: a handoff
+    // failure NEVER falls through to the passphrase/keychain path — that would
+    // boot the agent on a credential the operator did not intend for this
+    // launch. The raw master is OWNED by runWrap, which zeroes it on teardown
+    // (custody invariant: teardown zeroes the key).
     if (process.env[SUPERVISOR_KEY_FD_ENV] !== undefined) {
       const { readSupervisorTransientKey } = await import("./supervisor/spawn-launcher.js");
-      let transientKey: Uint8Array | null = null;
+      let supervisedMaster: Uint8Array | null = null;
       try {
-        transientKey = readSupervisorTransientKey();
+        supervisedMaster = readSupervisorTransientKey();
       } catch (err) {
         // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
         console.error(`\n  Sanctuary wrap: supervisor key handoff failed`);
         console.error(`  ${(err as Error).message}\n`);
         process.exit(2);
       }
-      // Drain succeeded: zero our copy immediately (the master-unlock wiring is
-      // the drill last mile; we do NOT proceed on a half-wired custody path).
-      if (transientKey) transientKey.fill(0);
-      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-      console.error(
-        `\n  Sanctuary wrap: supervised launch detected (${SUPERVISOR_KEY_FD_ENV}).` +
-          `\n  Transient-key custody establishment is the Erik-present S1 acceptance` +
-          `\n  drill's last mile and is not yet wired into wrap custody. Refusing to` +
-          `\n  boot on a fallback credential path. (Build: split-process supervisor,` +
-          `\n  socket auth, idempotency, and rotation guards are complete + tested.)\n`,
-      );
-      process.exit(2);
+      // The fd env var was present, so supervisor mode is indicated; a null
+      // return here would only happen if the env var were absent (handled
+      // above by readSupervisorTransientKey). Defend anyway: no master ⇒
+      // refuse, never fall through to the credential path (#5).
+      if (!supervisedMaster) {
+        // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+        console.error(
+          `\n  Sanctuary wrap: supervised launch indicated but no master was delivered.` +
+            `\n  Refusing to boot on a fallback credential path.\n`,
+        );
+        process.exit(2);
+      }
+      // Supervised launch never auto-opens a browser (headless by construction);
+      // force it off regardless of any inherited flag. The dashboard server
+      // still binds and keeps the process supervised; the operator reaches it
+      // from the dashboard that issued the protect.
+      opts.noOpen = true;
+      await runWrap(opts, { supervisedMaster });
+      return;
     }
-    const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
-    const opts = parseWrapArgs(args.slice(1));
+
     await runWrap(opts);
     return;
   }

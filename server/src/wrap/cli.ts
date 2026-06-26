@@ -106,6 +106,7 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { CustodyUnlockError } from "../core/master-custody.js";
 import {
   establishWrapCustody,
+  establishSupervisedWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
 import {
@@ -2270,6 +2271,17 @@ export interface RunWrapDeps {
   checkPinResolvability?: (
     version: string,
   ) => Promise<PinnedVersionResolvability>;
+  /**
+   * Phase S1 supervised live mile: the raw 32-byte fortress master the
+   * split-process supervisor handed this child over a one-shot fd (never
+   * env/argv). When present, `runWrap` establishes custody DIRECTLY from this
+   * master (verified against the on-disk envelope, fail-closed) instead of
+   * resolving/deriving from a passphrase, and zeroes the buffer on teardown.
+   * Production is set ONLY by the supervised-launch dispatch in `cli.ts`; tests
+   * inject it to exercise the live-mile lifecycle without a real supervisor.
+   * Leaving it undefined is the ordinary interactive/keychain wrap path.
+   */
+  supervisedMaster?: Uint8Array;
 }
 
 /**
@@ -2576,6 +2588,15 @@ export async function runWrap(
     process.exit(2);
   }
 
+  // Phase S1 supervised live mile: when the split-process supervisor handed us
+  // the fortress master over a one-shot fd (never env/argv), custody is
+  // established DIRECTLY from that master (verified against the on-disk
+  // envelope below): there is no passphrase in supervised mode, so the whole
+  // passphrase-resolution / persistence / provision-pin-subprocess path is
+  // skipped. The master buffer is OWNED here and zeroed on teardown.
+  const supervisedMaster = deps.supervisedMaster;
+  const supervised = supervisedMaster !== undefined;
+
   // Resolve or generate passphrase.
   //
   // Invariant: the resolved passphrase never reaches argv or the rewritten
@@ -2591,7 +2612,13 @@ export async function runWrap(
   // only; never persisted to disk beyond the existing keychain write
   // and never injected into the rewritten harness env.
   let passphraseValue: string | undefined;
-  if (options.passphrase) {
+  if (supervised) {
+    // No passphrase in supervised mode: the supervisor's in-memory master IS
+    // the credential. Mark the location/source honestly for the success banner;
+    // these are display strings only and never used to re-derive a master.
+    passphraseLocation = "supervisor (in-memory master, fd handoff)";
+    passphraseSource = "supervisor";
+  } else if (options.passphrase) {
     try {
       const persist =
         deps.persistPassphrase ??
@@ -2669,7 +2696,7 @@ export async function runWrap(
   const isFallbackGenerated = passphraseSource === "generated" && usingFallback;
   const isFallbackUserProvided =
     passphraseSource === "fallback-file" && usingFallback;
-  if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
+  if (!supervised && (isFallbackGenerated || (options.passphrase && isFallbackUserProvided))) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
@@ -2693,7 +2720,28 @@ export async function runWrap(
   // verification; non-interactive runs are recorded as an audited headless
   // install. Fail closed on a credential that does not unlock (#5).
   let wrapCustody: WrapCustodyResult | undefined;
-  if (passphraseValue !== undefined) {
+  if (supervised) {
+    // Phase S1 live mile: establish custody from the supervisor's raw master,
+    // verified against the on-disk envelope. Fail CLOSED on any verify failure,
+    // a missing envelope, or a rotation in flight — never run the enforcement
+    // chain on a master that does not own this fortress (#5). The supplied
+    // buffer is threaded forward as wrapCustody.masterKey and zeroed on
+    // teardown below.
+    try {
+      wrapCustody = await establishSupervisedWrapCustody({
+        storagePath,
+        master: supervisedMaster as Uint8Array,
+      });
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`\n  Sanctuary wrap: Supervised Custody Establishment Failed`);
+      console.error(`  ${err instanceof Error ? err.message : String(err)}\n`);
+      // Zero the injected master before exiting: a refused supervised launch
+      // must leave no master bytes resident (honest fail-closed residency #7).
+      (supervisedMaster as Uint8Array).fill(0);
+      process.exit(2);
+    }
+  } else if (passphraseValue !== undefined) {
     try {
       wrapCustody = await establishWrapCustody({
         storagePath,
@@ -2711,7 +2759,36 @@ export async function runWrap(
     }
   }
 
-  if (passphraseValue !== undefined) {
+  // Unified custody-ready predicate. Pre-supervised, every downstream binding
+  // gated on "the master is established" used `passphraseValue !== undefined &&
+  // wrapCustody !== undefined`. Supervised mode has no passphrase but DOES have
+  // an established master, so the bindings must fire on this predicate instead.
+  // A zero-byte master is treated as not-ready (defensive: the supervisor never
+  // hands a zero key, but a future caller bug must not arm on dead bytes).
+  const custodyReady =
+    wrapCustody !== undefined &&
+    (supervised
+      ? wrapCustody.masterKey.length > 0 && wrapCustody.masterKey.some((b) => b !== 0)
+      : passphraseValue !== undefined);
+
+  // Teardown zeroing for the supervised master (custody invariant: teardown
+  // zeroes the key, no residency after teardown — A1 hermetic leg). The same
+  // buffer is wrapCustody.masterKey; zero it once on every exit path.
+  if (supervised && wrapCustody !== undefined) {
+    const masterToZero = wrapCustody.masterKey;
+    const zeroSupervisedMaster = (): void => {
+      try {
+        masterToZero.fill(0);
+      } catch {
+        /* best-effort: a detached buffer is already unusable */
+      }
+    };
+    process.once("SIGINT", zeroSupervisedMaster);
+    process.once("SIGTERM", zeroSupervisedMaster);
+    process.once("exit", zeroSupervisedMaster);
+  }
+
+  if (!supervised && passphraseValue !== undefined) {
     // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
     // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
     // time (sysext refuses connection) rather than as a wrap-startup abort.
@@ -3464,7 +3541,7 @@ export async function runWrap(
     // dashboard startup path. Derive the master key and create a default
     // identity so CLI surfaces (exit export, identity show) work
     // immediately after wrap without launching the dashboard first.
-    if (passphraseValue !== undefined && wrapCustody !== undefined) {
+    if (custodyReady && wrapCustody !== undefined) {
       try {
         const ndStorage = new FilesystemStorage(`${storagePath}/state`);
         // Unified custody: the master was established (or migrated) above;
@@ -3645,7 +3722,7 @@ export async function runWrap(
   // Best-effort: a derivation failure does not fail wrap (operators still
   // get a working v1.0 dashboard at /). The v1.1 surface is reachable
   // via `sanctuary dashboard` if this wiring path errors.
-  if (passphraseValue !== undefined && wrapCustody !== undefined) {
+  if (custodyReady && wrapCustody !== undefined) {
     try {
       const v11Storage = new FilesystemStorage(`${storagePath}/state`);
       // Unified custody: reuse the master established above (envelope-backed)

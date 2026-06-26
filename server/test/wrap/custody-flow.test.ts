@@ -13,10 +13,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 
-import { establishWrapCustody } from "../../src/wrap/custody-flow.js";
+import {
+  establishWrapCustody,
+  establishSupervisedWrapCustody,
+  SupervisedCustodyError,
+} from "../../src/wrap/custody-flow.js";
 import {
   establishMaster,
   readCustodyEnvelope,
+  CustodyRotationInProgressError,
+  ROTATION_JOURNAL_KEY,
 } from "../../src/core/master-custody.js";
 import {
   verifyRecoveryKeyReentry,
@@ -168,6 +174,87 @@ describe("establishWrapCustody", () => {
         interactive: false,
       })
     ).rejects.toThrow(/does not unlock/);
+  });
+});
+
+describe("establishSupervisedWrapCustody (Phase S1 live mile)", () => {
+  let fortress: string;
+
+  beforeEach(async () => {
+    fortress = await mkdtemp(join(tmpdir(), "sanctuary-superd-custody-"));
+  });
+
+  afterEach(async () => {
+    await rm(fortress, { recursive: true, force: true });
+  });
+
+  /** Establish an envelope fortress the way the dashboard would have, returning the master. */
+  async function seedEnvelopeFortress(): Promise<Uint8Array> {
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "operator-passphrase",
+      interactive: false,
+    });
+    // Return a COPY: establishSupervisedWrapCustody adopts the buffer it is
+    // handed as the fortress master, mirroring the over-fd handoff.
+    return Uint8Array.from(result.masterKey);
+  }
+
+  it("adopts the supervisor's master when it verifies against the on-disk envelope (origin=envelope)", async () => {
+    const master = await seedEnvelopeFortress();
+    const result = await establishSupervisedWrapCustody({
+      storagePath: fortress,
+      master,
+    });
+    expect(result.origin).toBe("envelope");
+    expect(result.mintedRecoveryKey).toBe(false);
+    // The returned masterKey IS the supplied buffer (threaded forward so
+    // runWrap zeroes exactly one buffer on teardown).
+    expect(result.masterKey).toBe(master);
+    // No new credential / recovery key disclosed.
+    expect(result.envelope).not.toBeNull();
+
+    // The supervised unlock is audited (visible in the same log the dashboard reads).
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const auditLog = new AuditLog(storage, master);
+    const { entries } = await auditLog.query({ layer: "l2", limit: 50 });
+    expect(entries.map((e) => e.operation)).toContain(
+      "custody_supervised_unlock"
+    );
+  });
+
+  it("FAILS CLOSED when the supervisor master does not unlock this fortress (wrong key)", async () => {
+    await seedEnvelopeFortress();
+    // A random 32-byte key that is NOT this fortress's master.
+    const wrongMaster = new Uint8Array(32).fill(7);
+    await expect(
+      establishSupervisedWrapCustody({ storagePath: fortress, master: wrongMaster })
+    ).rejects.toBeInstanceOf(SupervisedCustodyError);
+    await expect(
+      establishSupervisedWrapCustody({ storagePath: fortress, master: new Uint8Array(32).fill(7) })
+    ).rejects.toThrow(/does not unlock this fortress/);
+  });
+
+  it("FAILS CLOSED when there is no custody envelope (fresh/legacy fortress)", async () => {
+    // No envelope established — a supervised launch must refuse rather than
+    // mint custody over (possibly existing) data from an ambient master.
+    const master = new Uint8Array(32).fill(3);
+    await expect(
+      establishSupervisedWrapCustody({ storagePath: fortress, master })
+    ).rejects.toBeInstanceOf(SupervisedCustodyError);
+    await expect(
+      establishSupervisedWrapCustody({ storagePath: fortress, master: new Uint8Array(32).fill(3) })
+    ).rejects.toThrow(/requires an established custody envelope/);
+  });
+
+  it("FAILS CLOSED when a master rotation is in flight (refuses to launch under a split master)", async () => {
+    const master = await seedEnvelopeFortress();
+    // Journal a rotation: while present, the master may be split old/new.
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    await storage.write("_meta", ROTATION_JOURNAL_KEY, stringToBytes("{}"));
+    await expect(
+      establishSupervisedWrapCustody({ storagePath: fortress, master })
+    ).rejects.toBeInstanceOf(CustodyRotationInProgressError);
   });
 });
 
