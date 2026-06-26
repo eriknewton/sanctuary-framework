@@ -1,5 +1,5 @@
 /**
- * Phase S1 — Default {@link AgentLauncher}: spawns `sanctuary wrap`.
+ * Phase S1 - Default {@link AgentLauncher}: spawns `sanctuary wrap`.
  *
  * The supervisor's production launcher. It starts the same enforcement chain
  * `sanctuary wrap` builds today (config rewrite + IPC enforcement daemon +
@@ -14,11 +14,11 @@
  * written once and closed immediately. The child reads its single fd, scrubs
  * the buffer, and closes.
  *
- * Residency, stated honestly (do NOT over-claim — codex S1): this launcher does
+ * Residency, stated honestly (do NOT over-claim, codex S1): this launcher does
  * NOT zero key material after spawn. The base64url copy it writes to the pipe
  * is an immutable JS string that cannot be wiped (it lingers until GC), and the
  * raw `spec.transientKey` is RETAINED by the supervisor for the agent lifetime
- * (Tier A crash-restart re-launches from the same spec) — the supervisor zeroes
+ * (Tier A crash-restart re-launches from the same spec). The supervisor zeroes
  * that raw key only on a failed/refused launch or on unprotect/shutdown, not
  * "after spawn." See supervisor.ts for the exact zeroing points.
  *
@@ -28,7 +28,7 @@
  * `sanctuary wrap` already.
  *
  * NOTE: the actual `sanctuary wrap` end-to-end launch is exercised by the
- * Tier-A Protect acceptance drill (N>=3, Erik-present, on the signing host) —
+ * Tier-A Protect acceptance drill (N>=3, Erik-present, on the signing host):
  * headless arming is broken on Tahoe, so a real launch cannot be asserted in
  * CI. The automated tests cover the spawn CONTRACT (fd key handoff, key never
  * in env/argv, exit wiring) against a stub binary, not a live wrap.
@@ -85,11 +85,11 @@ export class SpawnAgentLauncher implements AgentLauncher {
     while (stdio.length <= fd) stdio.push("pipe");
     stdio[fd] = "pipe";
 
-    // Child env (honest — codex S1): the child INHERITS the supervisor's
+    // Child env (honest, codex S1): the child INHERITS the supervisor's
     // process env (it spreads `process.env`) because `sanctuary wrap` needs the
     // normal environment (PATH, HOME, locale, etc.) to run; this is NOT a
     // "minimal env." What matters for custody is the invariant that holds: the
-    // transient KEY never goes in env or argv (codex R2-H2) — only the fd NUMBER
+    // transient KEY never goes in env or argv (codex R2-H2); only the fd NUMBER
     // is advertised here so the wrap child knows where to read the key from. The
     // key bytes travel ONLY over the inherited one-shot fd pipe.
     //
@@ -114,19 +114,19 @@ export class SpawnAgentLauncher implements AgentLauncher {
     );
 
     // Codex S1 R4-H1: spawn FAILURE (ENOENT on a bad node/cli path, EACCES,
-    // fork limits) is delivered ASYNCHRONOUSLY via an `error` event — NOT a
+    // fork limits) is delivered ASYNCHRONOUSLY via an `error` event, NOT a
     // throw from `spawn()`. Returning a SpawnedChild synchronously would (a)
     // leave the child `error` event unhandled (an EventEmitter `error` with no
     // listener THROWS and can crash the supervisor), and (b) let the Supervisor
     // mark the entry `running` and RETAIN the transient key for a process that
     // never started. So await the spawn outcome here: resolve only once the
     // child confirms `spawn`, reject on `error` (or a pre-spawn `exit`). On
-    // rejection `guardedLaunch`/`runProtect` zero the key and drop the entry —
+    // rejection `guardedLaunch`/`runProtect` zero the key and drop the entry:
     // honest fail-closed residency (claim #7), no key left resident on a failed
     // launch. The key is written to the pipe only AFTER spawn confirms, so a
     // failed spawn never even marshals the key onto a dead pipe.
     // Exit latch armed at spawn-confirmation (codex S1 R6-H1 + R11): the
-    // supervised child can exit at ANY point after `spawn` — including in the
+    // supervised child can exit at ANY point after `spawn`, including in the
     // gap between spawn-confirmation and `new SpawnedChild(...)` below (very live
     // today: supervised `wrap` reads its key and exits 2 almost immediately).
     // A `once("exit")` installed only in the SpawnedChild constructor would MISS
@@ -183,7 +183,7 @@ export class SpawnAgentLauncher implements AgentLauncher {
     // supervisor.ts).
     //
     // Codex S1 R9: a MISSING/non-writable key pipe means the child can never
-    // receive its key and cannot establish custody — treat it as a launch
+    // receive its key and cannot establish custody; treat it as a launch
     // FAILURE here (kill the child + reject) rather than returning a SpawnedChild
     // the supervisor would mark `running` (retaining the key for a child that
     // can't use it). Rejecting routes through runProtect's catch → key zeroed +
@@ -200,7 +200,7 @@ export class SpawnAgentLauncher implements AgentLauncher {
     // Codex S1 R10: AWAIT the key-pipe write to completion and REJECT on an
     // async stream error (EPIPE/ECONNRESET if the child closed its read fd
     // before the key landed). Fire-and-forget `write()`/`end()` would let a
-    // failed key delivery resolve as a successful launch — the child never got
+    // failed key delivery resolve as a successful launch; the child never got
     // its key but the supervisor marks `running` and retains it. Awaiting
     // `finish` vs `error` makes a post-spawn handoff failure a launch FAILURE
     // (→ kill child + throw → runProtect catch zeroes the key + drops the
@@ -232,12 +232,11 @@ export class SpawnAgentLauncher implements AgentLauncher {
       } catch {
         /* best-effort */
       }
-      throw new Error(
-        `supervised child key handoff failed on fd ${fd}: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`supervised child key handoff failed on fd ${fd}: ${detail}`, { cause: err });
     }
     // After a successful handoff a LATE pipe error (child gone) must not become
-    // an unhandled error event — the child's exit drives teardown from here.
+    // an unhandled error event; the child's exit drives teardown from here.
     writable.on("error", () => {});
 
     return new SpawnedChild(child, this.opts.stopGraceMs, exitState);
@@ -264,7 +263,7 @@ export class SpawnedChild implements LaunchedChild {
   /**
    * Pre-armed exit latch (codex S1 R6-H1 + R11). The supervisor registers its
    * exit callback AFTER `launch()` resolves, and a child can exit at ANY point
-   * after `spawn` — including in the gap BEFORE this wrapper is even constructed
+   * after `spawn`, including in the gap BEFORE this wrapper is even constructed
    * (very live today: supervised `wrap` reads its key and exits 2 almost
    * immediately). So the latch is armed by `launch()` AT spawn-confirmation and
    * passed in here as `state`; if the exit already landed before construction,
@@ -328,12 +327,12 @@ export class SupervisorKeyHandoffError extends Error {
 /**
  * Child-side reader (codex R2-H2, R3-M1): read the transient key from the
  * inherited one-shot pipe the supervisor wrote, then return the raw bytes. The
- * `sanctuary wrap` host calls this when `SANCTUARY_SUPERVISOR_KEY_FD` is set —
+ * `sanctuary wrap` host calls this when `SANCTUARY_SUPERVISOR_KEY_FD` is set:
  * the key NEVER arrives via env or argv, only this fd.
  *
  * FAIL-CLOSED (R3-M1): returns null ONLY when the env var is absent (the wrap
  * was launched interactively, not by the supervisor). When the env var IS
- * present, supervisor mode is indicated and the handoff MUST succeed — any
+ * present, supervisor mode is indicated and the handoff MUST succeed; any
  * malformed fd, read failure, or malformed key THROWS {@link
  * SupervisorKeyHandoffError} rather than silently falling back to the
  * passphrase/keychain path (which would leave the key unread in the pipe for a
@@ -367,7 +366,7 @@ export function readSupervisorTransientKey(env: NodeJS.ProcessEnv = process.env)
     try {
       closeSync(fd);
     } catch {
-      /* already closed by the reader / EOF — fine */
+      /* already closed by the reader / EOF; fine */
     }
   }
   if (b64.length === 0) {
@@ -384,7 +383,7 @@ export function readSupervisorTransientKey(env: NodeJS.ProcessEnv = process.env)
   if (key.length === 0 || toBase64url(key) !== b64) {
     // Codex S1 R8: a malformed-but-decodable body already materialized real key
     // bytes; zero them before throwing so a rejected handoff leaves none
-    // resident (honest custody — same hygiene as the request-handler path).
+    // resident (honest custody, same hygiene as the request-handler path).
     key.fill(0);
     throw new SupervisorKeyHandoffError("supervisor key failed strict base64url round-trip");
   }
