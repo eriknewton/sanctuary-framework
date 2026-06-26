@@ -359,18 +359,23 @@ describe("runInit", () => {
     ).rejects.toThrow();
   });
 
-  it("--recovery-out writes the recovery key to an external durable path", async () => {
+  it("--recovery-out writes the recovery key to an external durable path without touching Keychain", async () => {
     const fortressPath = join(tmp, "external-recovery-fortress");
     const recoveryOut = join(tmp, "durable", "recovery-key.txt");
-    const result = await runInit({
-      fortress: fortressPath,
-      recoveryOut,
-      noConfirm: true,
-      noPin: true,
-    });
+    const keychain = makeRecoveryKeychainMock({ writeFails: true });
+    const { result } = await runInitWithRecoveryKeychain(
+      {
+        fortress: fortressPath,
+        recoveryOut,
+        noConfirm: true,
+        noPin: true,
+      },
+      keychain,
+    );
 
     expect(result.fortressPath).toBe(fortressPath);
     expect(result.recoveryKeyDisclosurePath).toBe(recoveryOut);
+    expect(keychain.calls).toHaveLength(0);
     const recoveryFile = await readFile(recoveryOut, "utf-8");
     expect(recoveryFile).toContain("Recovery key:");
     expect(recoveryFile).toContain(
@@ -383,18 +388,23 @@ describe("runInit", () => {
     ).rejects.toThrow();
   });
 
-  it("SANCTUARY_RECOVERY_OUT writes to an external durable path when the flag is absent", async () => {
+  it("SANCTUARY_RECOVERY_OUT writes to an external durable path without touching Keychain when the flag is absent", async () => {
     const fortressPath = join(tmp, "env-recovery-fortress");
     const recoveryOut = join(tmp, "env-durable", "recovery-key.txt");
     process.env.SANCTUARY_RECOVERY_OUT = recoveryOut;
+    const keychain = makeRecoveryKeychainMock({ writeFails: true });
 
-    const result = await runInit({
-      fortress: fortressPath,
-      noConfirm: true,
-      noPin: true,
-    });
+    const { result } = await runInitWithRecoveryKeychain(
+      {
+        fortress: fortressPath,
+        noConfirm: true,
+        noPin: true,
+      },
+      keychain,
+    );
 
     expect(result.recoveryKeyDisclosurePath).toBe(recoveryOut);
+    expect(keychain.calls).toHaveLength(0);
     const recoveryFile = await readFile(recoveryOut, "utf-8");
     expect(recoveryFile).toContain("Recovery key:");
     await expect(
