@@ -149,7 +149,32 @@
         },
         "metrics": {
           "type": "object",
-          "description": "Optional BEHAVIORAL metrics only (allowlisted, fail-closed): rounds / negotiation_rounds (non-negative int), offers_made (non-negative int), concession_magnitude (ratio 0..1), response_time_ms (>= 0), reasoning_provided (0 or 1). Any other key, or a raw deal term (price/quantity/terms), is REJECTED and nothing is recorded (privacy invariant: attestations carry behavioral signals, never deal terms)."
+          "additionalProperties": false,
+          "description": "Optional self-declared bridge behavioral inputs. Sanctuary does not independently verify these declarations; it bounds and buckets them before storage under metric_policy \"concordia-bridge-behavioral-v1\". Raw deal terms, raw magnitudes, legacy exact metric names, and unknown keys are rejected.",
+          "properties": {
+            "declared_offers_made": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "description": "Self-declared offer count, integer 1..64. Stored only as declared_offers_made_bucket, not the exact count."
+            },
+            "declared_concession": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Self-declared concession ratio from 0 to 1. Stored only as declared_concession_bucket (0..10), not the exact ratio."
+            },
+            "declared_reasoning_provided": {
+              "type": "boolean",
+              "description": "Self-declared whether reasoning was provided. Stored as declared_reasoning_provided 0 or 1."
+            },
+            "declared_response_time_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3600000,
+              "description": "Self-declared response latency in milliseconds, integer 0..3600000. Stored only as declared_response_time_bucket, not exact milliseconds."
+            }
+          }
         },
         "identity_id": {
           "type": "string",
