@@ -5,6 +5,7 @@
  *   POST /v1/federation/disable            SESSION + OPERATOR_SIGNED, Tier 1
  *   GET  /v1/federation/status             SESSION
  *   POST /v1/federation/authorize/init     SESSION + OPERATOR_SIGNED, Tier 1
+ *   POST /v1/federation/revoke             SESSION + OPERATOR_SIGNED, Tier 1
  *   POST /v1/federation/authorize/complete BOOTSTRAP_TOKEN (pre-session class)
  *
  * The join ceremony is operator-authorized in two crypto-verified steps and
@@ -67,7 +68,10 @@ import {
   type FederationSyncEnvelope,
 } from "./federation-sync-envelope.js";
 import {
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
   FEDERATION_SYNC_WIRE_VERSION,
+  federationOperatorAuthorityOrigin,
+  signFederationNodeEvictionPayload,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
 
@@ -91,6 +95,7 @@ export function isFederationPath(pathname: string): boolean {
     pathname === "/v1/federation/disable" ||
     pathname === "/v1/federation/status" ||
     pathname === "/v1/federation/authorize/init" ||
+    pathname === "/v1/federation/revoke" ||
     pathname === "/v1/federation/sync" ||
     pathname === "/v1/nodes"
   );
@@ -644,6 +649,10 @@ export async function handleFederationRequest(
     await handleAuthorizeInit(deps, req, res, claims);
     return true;
   }
+  if (method === "POST" && url.pathname === "/v1/federation/revoke") {
+    await handleRevoke(deps, req, res, claims);
+    return true;
+  }
   if (method === "POST" && url.pathname === "/v1/federation/sync") {
     await handleSync(deps, req, res, claims);
     return true;
@@ -876,6 +885,147 @@ async function handleAuthorizeInit(
     details: { intended_node_mode, nonce: token.nonce },
   });
   writeJson(res, 200, { bootstrap_token: token });
+}
+
+async function handleRevoke(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+): Promise<void> {
+  const action = "/v1/federation/revoke";
+  const operation = "v1_federation_revoke";
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const { node_id, reason: rawReason, idempotency_key, operator_signature } = body as {
+    node_id?: unknown;
+    reason?: unknown;
+    idempotency_key?: unknown;
+    operator_signature?: unknown;
+  };
+  if (typeof node_id !== "string" || node_id.length === 0) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const revocationReason =
+    typeof rawReason === "string" && rawReason.length > 0
+      ? rawReason
+      : "operator_revoked";
+  const signedPayload: Record<string, unknown> = {
+    node_id,
+    reason: revocationReason,
+  };
+  if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+
+  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "operator_signature_invalid" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  const ctx = deps.getContext();
+  if (ctx === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "federation_not_provisioned" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+  if (!federationContextHasIssuerAuthority(ctx)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "issuer_authority_unavailable" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  const originNodeId = federationOperatorAuthorityOrigin(ctx.fortressId);
+  const prior = deps.listFederationEvents({ node_id: originNodeId });
+  const previous = prior.length > 0 ? prior[prior.length - 1] : null;
+  const evictionSerial = nextEvictionSerial(prior);
+  const effectiveAt = new Date().toISOString();
+  const payload = signFederationNodeEvictionPayload({
+    fortressId: ctx.fortressId,
+    nodeId: node_id,
+    reason: revocationReason,
+    effectiveAt,
+    evictionSerial,
+    operatorPrincipalId: ctx.issuingPrincipalCert.principal_id,
+    operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
+  });
+  const eventWithoutHash = {
+    event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
+    origin_node_id: originNodeId,
+    sequence: (previous?.sequence ?? 0) + 1,
+    occurred_at: effectiveAt,
+    kind: FEDERATION_NODE_EVICTION_EVENT_KIND,
+    payload: payload as unknown as Record<string, unknown>,
+    previous_hash: previous?.event_hash ?? null,
+  };
+  const event: FederationEvent = {
+    ...eventWithoutHash,
+    event_hash: federationEventHash(eventWithoutHash),
+  };
+
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents([event], {
+      senderNodeId: originNodeId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+    });
+  } catch {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
+  if (append.accepted.length !== 1 || append.rejected.length !== 0) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: append.rejected[0]?.reason ?? "append_rejected" },
+    });
+    writeJson(res, 409, {
+      error: "conflict",
+      rejected: append.rejected,
+    });
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: node_id,
+    details: {
+      event_id: event.event_id,
+      eviction_serial: evictionSerial,
+    },
+  });
+  writeJson(res, 200, {
+    revoked: true,
+    node_id,
+    event_id: event.event_id,
+    eviction_serial: evictionSerial,
+  });
 }
 
 async function handleSync(
@@ -1485,6 +1635,18 @@ function parseFederationEvents(events: unknown[]): FederationEvent[] | null {
     });
   }
   return out;
+}
+
+function nextEvictionSerial(events: FederationEvent[]): number {
+  let max = 0;
+  for (const event of events) {
+    if (event.kind !== FEDERATION_NODE_EVICTION_EVENT_KIND) continue;
+    const serial = event.payload.eviction_serial;
+    if (typeof serial === "number" && Number.isSafeInteger(serial) && serial > max) {
+      max = serial;
+    }
+  }
+  return max + 1;
 }
 
 function parseSyncCursor(cursor: unknown): FederationSyncCursor | null {

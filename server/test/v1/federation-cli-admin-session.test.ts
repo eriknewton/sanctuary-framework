@@ -33,6 +33,7 @@ import { join } from "node:path";
 import {
   runFederationAuthorize,
   runFederationEnableDisable,
+  runFederationRevoke,
 } from "../../src/cli/federation.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import {
@@ -139,6 +140,49 @@ describe("federation admin verbs open their own /v1 session (drill 401 gap)", ()
       bootstrap_token: { intended_node_id: string };
     };
     expect(printed.bootstrap_token.intended_node_id).toBe("joiner-linux");
+  });
+
+  it("revoke emits an eviction event against a REAL dashboard with NO --auth-token", async () => {
+    const enableCode = await runFederationEnableDisable({
+      enable: true,
+      argv: ["--fortress-url", rig.baseUrl, "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: capture().stream,
+    });
+    expect(enableCode).toBe(0);
+
+    const out = capture();
+    const err = capture();
+    const code = await runFederationRevoke({
+      argv: [
+        "--fortress-url",
+        rig.baseUrl,
+        "--fortress",
+        fortressPath,
+        "--node-id",
+        "joiner-linux",
+        "--reason",
+        "operator_removed",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+    const printed = JSON.parse(out.get()) as {
+      revoked: boolean;
+      node_id: string;
+      event_id: string;
+      eviction_serial: number;
+    };
+    expect(printed).toEqual({
+      revoked: true,
+      node_id: "joiner-linux",
+      event_id: expect.any(String),
+      eviction_serial: 1,
+    });
+    expect(materials.context.isNodeRevoked("joiner-linux")).toBe(true);
   });
 });
 
