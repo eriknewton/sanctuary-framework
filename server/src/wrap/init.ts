@@ -312,11 +312,13 @@ export async function runInit(
   ];
   recoveryKeyBytes.fill(0);
 
-  await storeRecoveryKeyInKeychain(
-    fortressPath,
-    recoveryKey,
-    deps.recoveryKeychain
-  );
+  if (!recoveryKeyOutputPath) {
+    await storeRecoveryKeyInKeychain(
+      fortressPath,
+      recoveryKey,
+      deps.recoveryKeychain
+    );
+  }
 
   // Second factor. Interactive installs MUST enroll one (the two-factor
   // floor refuses trust-bearing writes — including the Castle pin below —

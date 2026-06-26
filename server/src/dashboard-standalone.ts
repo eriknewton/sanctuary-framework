@@ -86,6 +86,7 @@ import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-ro
 import { provisionOrLoadOperatorCloudJoinedNode } from "./mesh/operator-cloud-joined-node-store.js";
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
 import { FederationSyncStateStore } from "./v1/federation-sync-state-store.js";
+import { FederationReissueChallengeStore } from "./v1/federation-reissue-challenge-store.js";
 import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
@@ -731,6 +732,9 @@ export async function startStandaloneDashboard(
   if (!federationRotating && dashboard.isFederationProvisioned()) {
     await dashboard.setFederationSyncStateStore(
       new FederationSyncStateStore({ storage, masterKey }),
+    );
+    await dashboard.setFederationReissueChallengeStore(
+      FederationReissueChallengeStore.durableFromBoot(storage, masterKey),
     );
   }
 

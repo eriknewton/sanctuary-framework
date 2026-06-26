@@ -557,6 +557,7 @@ interface AdminFlags {
   nodeId?: string;
   nodeMode: NodeMode;
   nodeModeValid: boolean;
+  reason?: string;
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
@@ -578,6 +579,7 @@ function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
     nodeId: flag("--node-id"),
     nodeMode: rawMode as NodeMode,
     nodeModeValid,
+    reason: flag("--reason"),
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
     fortressPath: flag("--fortress"),
@@ -693,6 +695,10 @@ function mapAdminRequestError(
       err.write(
         `sanctuary federation ${verb}: this endpoint is not available on the fortress\n`,
       );
+      return 3;
+    }
+    if (cause.kind === "http") {
+      err.write(`sanctuary federation ${verb}: ${cause.message}\n`);
       return 3;
     }
     err.write(`sanctuary federation ${verb}: fortress unreachable at ${fortressUrl}\n`);
@@ -832,6 +838,94 @@ export async function runFederationAuthorize(args: {
     return 0;
   } catch (cause) {
     return mapAdminRequestError("authorize", cause, flags.fortressUrl, err);
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+/**
+ * `sanctuary federation revoke`. Operator-signed Tier-1 verb that emits a
+ * durable operator-authority node-eviction event on the home fortress via
+ * `/v1/federation/revoke`. The server signs the append-only event with issuer
+ * authority and folds it through the same revocation chokepoint used by sync.
+ */
+export async function runFederationRevoke(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+  /** Test seam: the /v1 session-open ceremony (defaults to the real client). */
+  openSession?: typeof openV1Session;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const request = args.request ?? dashboardRequest;
+  const openSession = args.openSession ?? openV1Session;
+  const action = "/v1/federation/revoke";
+  const flags = parseAdminFlags(args.argv, env);
+
+  if (!flags.fortressUrl) {
+    err.write(
+      "sanctuary federation revoke: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n",
+    );
+    return 1;
+  }
+  if (!flags.nodeId) {
+    err.write("sanctuary federation revoke: --node-id <id> is required\n");
+    return 1;
+  }
+
+  const signer = await openAdminSigner("revoke", flags, err);
+  if (typeof signer === "number") return signer;
+  try {
+    const sessionToken = await resolveAdminSessionToken("revoke", flags, signer, err, openSession);
+    if (typeof sessionToken === "number") return sessionToken;
+    const signedPayload: Record<string, unknown> = {
+      node_id: flags.nodeId,
+      reason: flags.reason ?? "operator_revoked",
+    };
+    if (flags.idempotencyKey !== undefined) {
+      signedPayload.idempotency_key = flags.idempotencyKey;
+    }
+    const operatorSignature = signer.signPayload(action, signedPayload);
+    const body = { ...signedPayload, operator_signature: operatorSignature };
+
+    const response = (await request(
+      action,
+      { method: "POST", body: JSON.stringify(body) },
+      adminRequestContext(flags, sessionToken),
+    )) as {
+      revoked?: unknown;
+      node_id?: unknown;
+      event_id?: unknown;
+      eviction_serial?: unknown;
+    };
+    if (
+      response.revoked !== true ||
+      response.node_id !== flags.nodeId ||
+      typeof response.event_id !== "string" ||
+      typeof response.eviction_serial !== "number"
+    ) {
+      err.write("sanctuary federation revoke: fortress returned no eviction event summary\n");
+      return 3;
+    }
+    out.write(
+      `${JSON.stringify(
+        {
+          revoked: true,
+          node_id: response.node_id,
+          event_id: response.event_id,
+          eviction_serial: response.eviction_serial,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  } catch (cause) {
+    return mapAdminRequestError("revoke", cause, flags.fortressUrl, err);
   } finally {
     signer.masterKey.fill(0);
   }
@@ -1501,6 +1595,10 @@ Operator (issuer) verbs -- operator-signed, run on the home fortress:
   sanctuary federation disable --fortress-url <url> [--idempotency-key <s>]
   sanctuary federation authorize [init] --fortress-url <url> --node-id <id> \\
     [--node-mode local|operator_cloud|sovereign_tee]
+  sanctuary federation admit --fortress-url <url> --node-id <id> \\
+    [--node-mode local|operator_cloud|sovereign_tee]
+  sanctuary federation revoke --fortress-url <url> --node-id <id> \\
+    [--reason <reason>] [--idempotency-key <s>]
 
   enable / disable   Turn federation on/off for this fortress. Operator-signed
                      Tier-1: needs an unlocked default operator identity
@@ -1511,6 +1609,15 @@ Operator (issuer) verbs -- operator-signed, run on the home fortress:
                      join (POST /v1/federation/authorize/init). Prints the
                      bootstrap token JSON to hand to the joiner's
                      'federation join --bootstrap-token'. Operator-signed Tier-1.
+
+  admit              Alias for authorize/init. Use when working from the fleet
+                     admit/revoke mental model; it prints the same bootstrap
+                     token JSON.
+
+  revoke             Emit a durable operator-authority node eviction event
+                     (POST /v1/federation/revoke). The fortress folds the event
+                     into its revoked-node projection before acknowledging it,
+                     so future joins/sync for that node fail closed.
 
 Joiner verb -- runs on the joining node:
   Local / sovereign_tee node:
@@ -1572,8 +1679,11 @@ export async function runFederationCommand(args: {
       argv: args.argv.slice(1),
     });
   }
-  if (sub === "authorize") {
+  if (sub === "authorize" || sub === "admit") {
     return runFederationAuthorize({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "revoke") {
+    return runFederationRevoke({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
     `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,
