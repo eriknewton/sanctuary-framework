@@ -144,13 +144,17 @@ export interface BridgeAttestationRequest {
   outcome_result: "completed" | "partial" | "failed" | "disputed";
 
   /**
-   * Optional BEHAVIORAL metrics only, enforced by a fail-closed allowlist for
-   * bridge-context attestations: rounds / negotiation_rounds, offers_made
-   * (non-negative ints), concession_magnitude (0..1), response_time_ms (>= 0),
-   * reasoning_provided (0 or 1). Any other key, or a raw deal term, is rejected
-   * (invariant #8: behavioral signals only, never deal terms).
+   * Optional self-declared behavioral inputs. bridge_attest stores only the
+   * derived negotiation_round_bucket plus bounded declared_* buckets under
+   * metric_policy "concordia-bridge-behavioral-v1". Legacy exact metric names
+   * and raw deal-term-like keys are rejected on new bridge attestations.
    */
-  metrics?: Record<string, number>;
+  metrics?: {
+    declared_offers_made?: number;
+    declared_concession?: number;
+    declared_reasoning_provided?: boolean;
+    declared_response_time_ms?: number;
+  };
 
   /** Identity to sign the attestation (uses default if omitted) */
   identity_id?: string;
@@ -169,6 +173,9 @@ export interface BridgeAttestationResult {
 
   /** Sovereignty tier applied to the attestation */
   sovereignty_tier: SovereigntyTier;
+
+  /** Privacy-rated metric policy applied to stored bridge metric buckets */
+  metric_policy?: "concordia-bridge-behavioral-v1";
 
   /** ISO 8601 timestamp */
   attested_at: string;

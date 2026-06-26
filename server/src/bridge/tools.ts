@@ -22,9 +22,10 @@ import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
 import {
+  BRIDGE_METRIC_POLICY,
   BridgeAttestationMetricValidationError,
   CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
-  validateBridgeAttestationMetrics,
+  buildBridgeAttestationMetrics,
 } from "../reputation/bridge-metrics.js";
 
 import {
@@ -36,15 +37,10 @@ import type {
   BridgeCommitment,
 } from "./types.js";
 
-/**
- * HONEST LIMITATION: the behavioral-metric allowlist closes the structural
- * raw-term FIELD leak for Concordia bridge attestations, so callers cannot add
- * fields like `price` or `quantity`. It does not and cannot prove a caller has
- * not semantically mislabeled a raw term under an allowed behavioral key such
- * as `concession_magnitude`; consumers must not treat the key name as proof of
- * semantic honesty.
- */
-export { BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST } from "../reputation/bridge-metrics.js";
+export {
+  BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST,
+  BRIDGE_POLICY_METRIC_ALLOWLIST,
+} from "../reputation/bridge-metrics.js";
 
 // ─── Bridge Store ────────────────────────────────────────────────────────
 // Persists bridge commitments encrypted at rest for later verification
@@ -388,14 +384,46 @@ export function createBridgeTools(
           },
           metrics: {
             type: "object",
+            additionalProperties: false,
             description:
-              "Optional BEHAVIORAL metrics only (allowlisted, fail-closed): " +
-              "rounds / negotiation_rounds (non-negative int), offers_made " +
-              "(non-negative int), concession_magnitude (ratio 0..1), " +
-              "response_time_ms (>= 0), reasoning_provided (0 or 1). Any other key, " +
-              "or a raw deal term (price/quantity/terms), is REJECTED and nothing is " +
-              "recorded (privacy invariant: attestations carry behavioral signals, " +
-              "never deal terms).",
+              "Optional self-declared bridge behavioral inputs. Sanctuary " +
+              "does not independently verify these declarations; it bounds " +
+              "and buckets them before storage under metric_policy " +
+              `"${BRIDGE_METRIC_POLICY}". Raw deal terms, raw magnitudes, ` +
+              "legacy exact metric names, and unknown keys are rejected.",
+            properties: {
+              declared_offers_made: {
+                type: "integer",
+                minimum: 1,
+                maximum: 64,
+                description:
+                  "Self-declared offer count, integer 1..64. Stored only as " +
+                  "declared_offers_made_bucket, not the exact count.",
+              },
+              declared_concession: {
+                type: "number",
+                minimum: 0,
+                maximum: 1,
+                description:
+                  "Self-declared concession ratio from 0 to 1. Stored only " +
+                  "as declared_concession_bucket (0..10), not the exact ratio.",
+              },
+              declared_reasoning_provided: {
+                type: "boolean",
+                description:
+                  "Self-declared whether reasoning was provided. Stored as " +
+                  "declared_reasoning_provided 0 or 1.",
+              },
+              declared_response_time_ms: {
+                type: "integer",
+                minimum: 0,
+                maximum: 3600000,
+                description:
+                  "Self-declared response latency in milliseconds, integer " +
+                  "0..3600000. Stored only as declared_response_time_bucket, " +
+                  "not exact milliseconds.",
+              },
+            },
           },
           identity_id: {
             type: "string",
@@ -412,13 +440,6 @@ export function createBridgeTools(
           | "failed"
           | "disputed";
         const identityId = args.identity_id as string | undefined;
-        const validatedMetrics = validateBridgeAttestationMetrics(args.metrics);
-        if (!validatedMetrics.ok) {
-          return toolResult({
-            error: validatedMetrics.error,
-          });
-        }
-        const metrics = validatedMetrics.metrics;
 
         // Load the stored commitment and outcome
         const record = await bridgeStore.get(commitmentId);
@@ -455,6 +476,16 @@ export function createBridgeTools(
               `Bridge commitment "${commitmentId}" failed verification and cannot be attested.`,
             verification,
           });
+        }
+
+        let builtMetrics;
+        try {
+          builtMetrics = buildBridgeAttestationMetrics(outcome, args.metrics);
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
         }
 
         // Determine counterparty DID
@@ -516,6 +547,7 @@ export function createBridgeTools(
             counterparty_did: counterpartyDid,
             outcome_result: existingAttestation.attestation.data.outcome_result,
             sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
+            metric_policy: existingAttestation.attestation.data.metric_policy,
             attested_at: existingAttestation.recorded_at,
             already_attested: true,
             note:
@@ -532,12 +564,6 @@ export function createBridgeTools(
         const tierMeta: TierMetadata = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
         const tier = tierMeta.sovereignty_tier;
 
-        // Include bridge-specific metrics alongside user-provided ones
-        const fullMetrics = {
-          ...metrics,
-          negotiation_rounds: outcome.rounds,
-        };
-
         // Record the reputation attestation
         let attestation;
         try {
@@ -547,7 +573,8 @@ export function createBridgeTools(
             {
               type: "negotiation",
               result: outcomeResult,
-              metrics: fullMetrics,
+              metrics: builtMetrics.metrics,
+              metric_policy: builtMetrics.policy,
             },
             CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
             identity,
@@ -585,6 +612,7 @@ export function createBridgeTools(
           counterparty_did: counterpartyDid,
           outcome_result: outcomeResult,
           sovereignty_tier: tier,
+          metric_policy: attestation.attestation.data.metric_policy,
           attested_at: attestation.recorded_at,
           already_attested: false,
           note: `Negotiation recorded as reputation attestation. ` +

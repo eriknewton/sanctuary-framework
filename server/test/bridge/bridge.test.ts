@@ -23,6 +23,12 @@ import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createBridgeTools } from "../../src/bridge/tools.js";
 import { ReputationStore } from "../../src/reputation/reputation-store.js";
 import {
+  BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST,
+  BRIDGE_METRIC_POLICY,
+  BRIDGE_POLICY_METRIC_ALLOWLIST,
+  buildBridgeAttestationMetrics,
+} from "../../src/reputation/bridge-metrics.js";
+import {
   createBridgeCommitment,
   verifyBridgeCommitment,
   canonicalize,
@@ -339,6 +345,142 @@ describe("Concordia Bridge", () => {
       for (const { input, expected } of vectors) {
         expect(ss(input)).toBe(expected);
       }
+    });
+  });
+
+  describe("buildBridgeAttestationMetrics()", () => {
+    it("keeps bridge_attest caller inputs separate from stored policy bucket metrics", () => {
+      expect(BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST).toEqual([
+        "declared_offers_made",
+        "declared_concession",
+        "declared_reasoning_provided",
+        "declared_response_time_ms",
+      ]);
+      expect(BRIDGE_POLICY_METRIC_ALLOWLIST).toEqual([
+        "negotiation_round_bucket",
+        "declared_offers_made_bucket",
+        "declared_concession_bucket",
+        "declared_reasoning_provided",
+        "declared_response_time_bucket",
+      ]);
+    });
+
+    it("derives negotiation_round_bucket from verified outcome rounds", () => {
+      const cases: Array<[number, number]> = [
+        [1, 0],
+        [2, 1],
+        [3, 1],
+        [4, 2],
+        [7, 2],
+        [8, 3],
+        [15, 3],
+        [16, 4],
+        [31, 4],
+        [32, 5],
+        [64, 5],
+      ];
+
+      for (const [rounds, expectedBucket] of cases) {
+        const built = buildBridgeAttestationMetrics(
+          makeOutcome({ rounds }),
+          undefined
+        );
+        expect(built).toEqual({
+          policy: BRIDGE_METRIC_POLICY,
+          metrics: { negotiation_round_bucket: expectedBucket },
+        });
+      }
+    });
+
+    it("rejects legacy exact metric names on the bridge_attest path", () => {
+      for (const key of [
+        "rounds",
+        "negotiation_rounds",
+        "offers_made",
+        "concession_magnitude",
+        "response_time_ms",
+        "terms_complexity",
+      ]) {
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), { [key]: 1 })
+        ).toThrow(new RegExp(key));
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), { [key]: 1 })
+        ).toThrow(/legacy exact metric names/i);
+      }
+    });
+
+    it("rejects raw-term-like metric keys", () => {
+      for (const key of ["price", "quantity", "terms"]) {
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), { [key]: 150 })
+        ).toThrow(new RegExp(key));
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), { [key]: 150 })
+        ).toThrow(/raw deal-term-like/i);
+      }
+    });
+
+    it("rejects non-finite values, unsafe integers, negative zero, strings, arrays, and objects", () => {
+      const cases: Array<Record<string, unknown>> = [
+        { declared_offers_made: NaN },
+        { declared_response_time_ms: Infinity },
+        { declared_offers_made: Number.MAX_SAFE_INTEGER + 1 },
+        { declared_concession: -0 },
+        { declared_response_time_ms: "450" },
+        { declared_concession: [0.5] },
+        { declared_concession: { ratio: 0.5 } },
+      ];
+
+      for (const metrics of cases) {
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), metrics)
+        ).toThrow(/Bridge attestation metrics rejected/);
+      }
+    });
+
+    it("rejects out-of-domain declared values and outcome rounds", () => {
+      for (const rounds of [0, 65, 1.5]) {
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome({ rounds }), undefined)
+        ).toThrow(/outcome\.rounds/);
+      }
+
+      const cases: Array<Record<string, unknown>> = [
+        { declared_offers_made: 0 },
+        { declared_offers_made: 65 },
+        { declared_concession: -0.1 },
+        { declared_concession: 1.1 },
+        { declared_reasoning_provided: 1 },
+        { declared_response_time_ms: -1 },
+        { declared_response_time_ms: 3_600_001 },
+      ];
+
+      for (const metrics of cases) {
+        expect(() =>
+          buildBridgeAttestationMetrics(makeOutcome(), metrics)
+        ).toThrow(/Bridge attestation metrics rejected/);
+      }
+    });
+
+    it("quantizes valid declared values deterministically", () => {
+      const built = buildBridgeAttestationMetrics(makeOutcome({ rounds: 9 }), {
+        declared_offers_made: 4,
+        declared_concession: 0.25,
+        declared_reasoning_provided: true,
+        declared_response_time_ms: 45_000,
+      });
+
+      expect(built).toEqual({
+        policy: BRIDGE_METRIC_POLICY,
+        metrics: {
+          negotiation_round_bucket: 3,
+          declared_offers_made_bucket: 2,
+          declared_concession_bucket: 3,
+          declared_reasoning_provided: 1,
+          declared_response_time_bucket: 3,
+        },
+      });
     });
   });
 
@@ -674,7 +816,7 @@ describe("Concordia Bridge", () => {
         metrics: { price: 150 },
       }));
 
-      expect(result.error).toMatch(/only behavioral metrics are allowed/i);
+      expect(result.error).toMatch(/raw deal-term-like/i);
       expect(result.error).toMatch(/price/);
       expect(result.attestation_id).toBeUndefined();
 
@@ -684,40 +826,35 @@ describe("Concordia Bridge", () => {
       expect(await storage.list("_reputation")).toHaveLength(0);
     });
 
-    it("bridge_attest rejects invalid allowlisted metric values and persists no attestation", async () => {
+    it("bridge_attest rejects legacy exact metric values and persists no attestation", async () => {
       const cases: Array<{
         metrics: Record<string, unknown>;
         message: RegExp;
         keys: string[];
       }> = [
         {
-          metrics: { response_time_ms: "fast" },
-          message: /finite numbers/i,
+          metrics: { response_time_ms: 450 },
+          message: /legacy exact metric names/i,
           keys: ["response_time_ms"],
         },
         {
-          metrics: { response_time_ms: -1 },
-          message: /non-negative/i,
-          keys: ["response_time_ms"],
-        },
-        {
-          metrics: { concession_magnitude: 150 },
-          message: /0 to 1/i,
-          keys: ["concession_magnitude"],
-        },
-        {
-          metrics: { reasoning_provided: 123 },
-          message: /0 or 1/i,
-          keys: ["reasoning_provided"],
-        },
-        {
-          metrics: { offers_made: 1.5 },
-          message: /non-negative integers/i,
+          metrics: { offers_made: 2 },
+          message: /legacy exact metric names/i,
           keys: ["offers_made"],
         },
         {
-          metrics: { rounds: -1 },
-          message: /non-negative integers/i,
+          metrics: { concession_magnitude: 0.25 },
+          message: /legacy exact metric names/i,
+          keys: ["concession_magnitude"],
+        },
+        {
+          metrics: { negotiation_rounds: 3 },
+          message: /legacy exact metric names/i,
+          keys: ["negotiation_rounds"],
+        },
+        {
+          metrics: { rounds: 3 },
+          message: /legacy exact metric names/i,
           keys: ["rounds"],
         },
       ];
@@ -754,11 +891,82 @@ describe("Concordia Bridge", () => {
       }
     });
 
-    it("bridge_attest accepts allowlisted behavioral metrics and persists them", async () => {
+    it("bridge_attest rejects invalid declared metric inputs and persists no attestation", async () => {
+      const cases: Array<{
+        metrics: Record<string, unknown>;
+        message: RegExp;
+        keys: string[];
+      }> = [
+        {
+          metrics: { declared_response_time_ms: "fast" },
+          message: /finite numbers|integer/i,
+          keys: ["declared_response_time_ms"],
+        },
+        {
+          metrics: { declared_response_time_ms: -1 },
+          message: /0 to 3600000/i,
+          keys: ["declared_response_time_ms"],
+        },
+        {
+          metrics: { declared_concession: 150 },
+          message: /0 to 1/i,
+          keys: ["declared_concession"],
+        },
+        {
+          metrics: { declared_reasoning_provided: 1 },
+          message: /boolean/i,
+          keys: ["declared_reasoning_provided"],
+        },
+        {
+          metrics: { declared_offers_made: 1.5 },
+          message: /integer from 1 to 64/i,
+          keys: ["declared_offers_made"],
+        },
+        {
+          metrics: { negotiation_round_bucket: 0 },
+          message: /only declared bridge metric inputs|offending metric key/i,
+          keys: ["negotiation_round_bucket"],
+        },
+      ];
+
+      for (const scenario of cases) {
+        const { storage, masterKey, byName, signer, counterparty } =
+          await makeBridgeHarness();
+        const outcome = makeOutcome({
+          proposer_did: signer.publicIdentity.did,
+          acceptor_did: counterparty.publicIdentity.did,
+        });
+        const committed = parseToolResult(await byName("bridge_commit").handler({
+          ...outcome,
+          identity_id: signer.publicIdentity.identity_id,
+        }));
+
+        const result = parseToolResult(await byName("bridge_attest").handler({
+          bridge_commitment_id: committed.bridge_commitment_id,
+          outcome_result: "completed",
+          identity_id: signer.publicIdentity.identity_id,
+          metrics: scenario.metrics,
+        }));
+
+        expect(result.error).toMatch(scenario.message);
+        for (const key of scenario.keys) {
+          expect(result.error).toMatch(key);
+        }
+        expect(result.attestation_id).toBeUndefined();
+
+        const reputationStore = new ReputationStore(storage, masterKey);
+        const summary = await reputationStore.query({ context: "concordia-bridge" });
+        expect(summary.total_interactions).toBe(0);
+        expect(await storage.list("_reputation")).toHaveLength(0);
+      }
+    });
+
+    it("bridge_attest stores only approved bucket metrics and a signed metric policy", async () => {
       const { storage, masterKey, byName, signer, counterparty } = await makeBridgeHarness();
       const outcome = makeOutcome({
         proposer_did: signer.publicIdentity.did,
         acceptor_did: counterparty.publicIdentity.did,
+        rounds: 9,
       });
       const committed = parseToolResult(await byName("bridge_commit").handler({
         ...outcome,
@@ -770,16 +978,16 @@ describe("Concordia Bridge", () => {
         outcome_result: "completed",
         identity_id: signer.publicIdentity.identity_id,
         metrics: {
-          rounds: 3,
-          response_time_ms: 450,
-          concession_magnitude: 0.25,
-          offers_made: 2,
-          reasoning_provided: 1,
+          declared_response_time_ms: 45_000,
+          declared_concession: 0.25,
+          declared_offers_made: 4,
+          declared_reasoning_provided: true,
         },
       }));
 
       expect(result.error).toBeUndefined();
       expect(result.attestation_id).toBeDefined();
+      expect(result.metric_policy).toBe(BRIDGE_METRIC_POLICY);
 
       const reputationStore = new ReputationStore(storage, masterKey);
       const stored = await reputationStore.findExistingAttestation({
@@ -788,19 +996,26 @@ describe("Concordia Bridge", () => {
         counterparty_did: counterparty.publicIdentity.did,
         context: "concordia-bridge",
       });
+      expect(stored?.attestation.data.metric_policy).toBe(BRIDGE_METRIC_POLICY);
       expect(stored?.attestation.data.metrics).toEqual({
-        rounds: 3,
-        response_time_ms: 450,
-        concession_magnitude: 0.25,
-        offers_made: 2,
-        reasoning_provided: 1,
-        negotiation_rounds: outcome.rounds,
+        negotiation_round_bucket: 3,
+        declared_response_time_bucket: 3,
+        declared_concession_bucket: 3,
+        declared_offers_made_bucket: 2,
+        declared_reasoning_provided: 1,
       });
+      expect(Object.keys(stored?.attestation.data.metrics ?? {}).sort()).toEqual([
+        "declared_concession_bucket",
+        "declared_offers_made_bucket",
+        "declared_reasoning_provided",
+        "declared_response_time_bucket",
+        "negotiation_round_bucket",
+      ]);
 
       const summary = await reputationStore.query({ context: "concordia-bridge" });
       expect(summary.total_interactions).toBe(1);
-      expect(summary.aggregate_metrics.response_time_ms.mean).toBe(450);
-      expect(summary.aggregate_metrics.negotiation_rounds.mean).toBe(outcome.rounds);
+      expect(summary.aggregate_metrics.declared_response_time_bucket.mean).toBe(3);
+      expect(summary.aggregate_metrics.negotiation_round_bucket.mean).toBe(3);
     });
 
     it("bridge_attest names every offending metric key in the rejection error", async () => {
@@ -824,7 +1039,7 @@ describe("Concordia Bridge", () => {
         },
       }));
 
-      expect(result.error).toMatch(/offending metric key/);
+      expect(result.error).toMatch(/raw deal-term-like|offending metric key/);
       expect(result.error).toMatch(/price/);
       expect(result.error).toMatch(/quantity/);
     });
