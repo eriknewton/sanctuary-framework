@@ -289,6 +289,48 @@ describe("castle-wall CLI verbs", () => {
       expect(calls).toEqual([[hostAppPath, "--headless", "status"]]);
     });
 
+    it("labels the dead-man lease as a broadcast distinct from live filter state", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-lease.json"),
+        JSON.stringify(
+          {
+            armed: false,
+            ttl_seconds: null,
+            heartbeat_interval_seconds: 5,
+            updated_at: "2026-06-26T08:00:00.000Z",
+            source: "castle-wall-cli",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Content filter: enabled");
+      expect(out.text()).toContain(
+        "Dead-man lease broadcast: disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
+      );
+      expect(out.text()).not.toContain("Dead-man lease: disarmed");
+    });
+
     it("reports the filter disabled (sysext installed but not filtering)", async () => {
       const { fortressPath, hostAppPath } = await makeDarwinFixture();
       const out = new CaptureStream();

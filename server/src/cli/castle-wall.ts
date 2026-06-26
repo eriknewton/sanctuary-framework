@@ -210,6 +210,21 @@ interface LeaseStatusFile {
   source: "castle-wall-cli";
 }
 
+type ContentFilterStatusForLease = "enabled" | "disabled" | "unknown" | null;
+
+function formatDeadManLeaseStatus(
+  lease: LeaseStatusFile,
+  contentFilterState: ContentFilterStatusForLease,
+): string {
+  const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
+  const filter =
+    contentFilterState === null ? "" : `; content-filter=${contentFilterState}`;
+  return (
+    `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}` +
+    `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
+  );
+}
+
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
 export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "2";
@@ -1043,14 +1058,7 @@ export async function runStatus(
   }
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
-  const lease = await readLeaseStatus(storagePath);
-  if (lease) {
-    const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
-    write(
-      out,
-      `Dead-man lease: ${lease.armed ? "armed" : "disarmed"}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`,
-    );
-  }
+  let contentFilterState: ContentFilterStatusForLease = null;
 
   // Sysext "[activated enabled]" only means installed, not filtering. When the
   // host-app binary is present, corroborate the live NE filter state through
@@ -1067,6 +1075,7 @@ export async function runStatus(
         report?.ok &&
         (report.state === "enabled" || report.state === "disabled")
       ) {
+        contentFilterState = report.state;
         write(out, `Content filter: ${report.state}\n`);
         if (report.build?.git_sha && report.build?.headless_contract_version) {
           write(
@@ -1087,9 +1096,11 @@ export async function runStatus(
             : undefined) ??
           (result.stderr.trim() ||
             `host app exited with code ${result.exitCode}`);
+        contentFilterState = "unknown";
         write(out, `Content filter: unknown (${reason})\n`);
       }
     } catch (error) {
+      contentFilterState = "unknown";
       write(
         out,
         `Content filter: unknown (${
@@ -1097,6 +1108,10 @@ export async function runStatus(
         })\n`,
       );
     }
+  }
+  const lease = await readLeaseStatus(storagePath);
+  if (lease) {
+    write(out, formatDeadManLeaseStatus(lease, contentFilterState));
   }
   return 0;
 }
