@@ -392,12 +392,18 @@ function buildProducerSignedEnvelope(
   eventType: "egress_allowed" | "egress_blocked"
 ): CriticalEventEnvelope {
   const producer = normalizeProducerSignature(notification.producer);
+  const destination = {
+    host: notification.destination.host,
+    ip: notification.destination.ip,
+    port: notification.destination.port,
+    protocol: notification.destination.protocol,
+  };
   const event = buildAuditEvent({
     timestamp: notification.recorded_at,
     fortress_id: notification.agent.id,
     event_type: eventType,
     agent: notification.agent,
-    destination: notification.destination,
+    destination,
     decision: null,
     rule_id: notification.matched_rule_id ?? null,
     details: producer

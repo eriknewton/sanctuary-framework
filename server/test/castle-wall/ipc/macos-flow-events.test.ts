@@ -20,6 +20,8 @@
  *   - register/unregister keep the subscriber count consistent.
  */
 
+import { createHash } from "node:crypto";
+
 import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 
@@ -243,6 +245,38 @@ function signedMacOSProducerFor(
   };
 }
 
+function macOSProducerEventHashFor(
+  notification: FlowDecisionRecordedNotification,
+  eventType: "egress_allowed" | "egress_blocked",
+  opts?: { seq?: number; priorSha256Hex?: string | null }
+): string {
+  const seq = opts?.seq ?? 0;
+  const canonical = canonicalize({
+    schema_version: 1,
+    layer: "l1",
+    timestamp: notification.recorded_at,
+    fortress_id: notification.agent.id,
+    event_type: eventType,
+    agent: {
+      id: notification.agent.id,
+      template: notification.agent.template,
+    },
+    destination: {
+      host: notification.destination.host,
+      ip: notification.destination.ip,
+      port: notification.destination.port,
+      protocol: notification.destination.protocol,
+    },
+    decision: null,
+    rule_id: notification.matched_rule_id ?? null,
+    details: {
+      seq,
+      prior_sha256_hex: opts?.priorSha256Hex ?? null,
+    },
+  });
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
 describe("MacOSFlowEventConsumer : manifest subscribe + broadcast", () => {
   it("emits an immediate manifest_updated snapshot on subscribe", async () => {
     const { consumer } = buildConsumer({ rules: [SAMPLE_RULE], signature: "sigA" });
@@ -431,6 +465,72 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
       CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     );
     expect(consumer.getStats().decisionsRecorded).toBe(1);
+    expect(consumer.getStats().decisionsRejected).toBe(0);
+  });
+
+  it("accepts consecutive producer-signed macOS verdicts when the prior hash matches the Swift producer chain", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const capturedAtUnixMs = 1_760_000_000_000;
+    const { consumer, auditSinkBundle } = buildConsumer({
+      pinnedProducerKeyB64url: publicKeyB64url,
+      now: () => capturedAtUnixMs + 1000,
+    });
+    const first: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00.000Z",
+    };
+    first.producer = signedMacOSProducerFor(first, privateKey, {
+      capturedAtUnixMs,
+      seq: 0,
+      priorSha256Hex: null,
+    });
+    const priorSha256Hex = macOSProducerEventHashFor(first, "egress_allowed", {
+      seq: 0,
+      priorSha256Hex: null,
+    });
+    const second: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "drop",
+      destination: {
+        host: "blocked.example",
+        ip: "203.0.113.9",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-blocked",
+      recorded_at: "2026-05-11T12:00:01.000Z",
+    };
+    second.producer = signedMacOSProducerFor(second, privateKey, {
+      capturedAtUnixMs: capturedAtUnixMs + 1000,
+      seq: 1,
+      priorSha256Hex,
+    });
+
+    await consumer.handleFlowDecisionRecorded(first);
+    await consumer.handleFlowDecisionRecorded(second);
+
+    expect(
+      auditSinkBundle.entries.filter((entry) =>
+        entry.operation === "egress_allowed" ||
+        entry.operation === "egress_blocked"
+      ),
+    ).toHaveLength(2);
+    expect(consumer.getStats().decisionsRecorded).toBe(2);
     expect(consumer.getStats().decisionsRejected).toBe(0);
   });
 
