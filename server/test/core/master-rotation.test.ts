@@ -98,6 +98,11 @@ import {
   OPERATOR_CLOUD_JOINED_NODE_KEY,
   OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO,
 } from "../../src/mesh/operator-cloud-joined-node-store.js";
+import {
+  FEDERATION_REISSUE_CHALLENGE_STORE_NAMESPACE,
+  FEDERATION_REISSUE_CHALLENGE_STORE_KEY,
+  FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
+} from "../../src/v1/federation-reissue-challenge-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -758,14 +763,15 @@ describe("master rotation — fail-closed coverage", () => {
     ).toEqual(joinerPayload);
   });
 
-  it("rotates ALL SIX _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state, operator-cloud joined-node) without strand", async () => {
+  it("rotates ALL SEVEN _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state, operator-cloud joined-node, reissue challenge set) without strand", async () => {
     // Anti-strand for the durable single-use replay stores, the Federation 3/3b
     // P0 durable sync-state store, AND the Operator Cloud Slice 3 joined-node
     // store: each persists a blob into _federation under a NEW HKDF label.
     // Without those labels in the _federation recipe's infos, convertPurposeNamespace
     // throws RotationPreflightError and rotateMaster is DENIED on any fortress that
     // ever consumed a federation nonce/claim, persisted sync-state, OR joined as an
-    // operator_cloud node. This proves the grown infos list re-wraps all six.
+    // operator_cloud node, OR accepted a node-cert reissue challenge. This proves
+    // the grown infos list re-wraps all seven.
     //
     // The store labels MUST equal the recipe strings; assert that explicitly so a
     // typo in either place is caught here, not only at a real operator's rotation.
@@ -775,10 +781,16 @@ describe("master rotation — fail-closed coverage", () => {
     );
     expect(FEDERATION_SYNC_STATE_STORE_HKDF_INFO).toBe("federation-sync-state");
     expect(OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO).toBe("operator-cloud-joined-node");
+    expect(FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO).toBe(
+      "federation-reissue-node-cert-challenge-set"
+    );
     expect(BOOTSTRAP_NONCE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
     expect(OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
     expect(FEDERATION_SYNC_STATE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
     expect(OPERATOR_CLOUD_JOINED_NODE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(FEDERATION_REISSUE_CHALLENGE_STORE_NAMESPACE).toBe(
+      FEDERATION_TRUST_ROOT_NAMESPACE
+    );
 
     const fortress = await buildFortress();
     const records: Array<{ key: string; info: string; payload: unknown }> = [
@@ -818,8 +830,21 @@ describe("master rotation — fail-closed coverage", () => {
         info: OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO,
         payload: { record_version: "operator-cloud-joined-node-v1", marker: "oc-joined-node" },
       },
+      {
+        key: FEDERATION_REISSUE_CHALLENGE_STORE_KEY,
+        info: FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
+        payload: {
+          v: 1,
+          entries: [
+            {
+              key: "fortress node-1 reissue-node-cert challenge-1",
+              expires_at_ms: Date.now() + 60_000,
+            },
+          ],
+        },
+      },
     ];
-    // All six live in the same _federation namespace (no-AAD, purpose-keyed).
+    // All seven live in the same _federation namespace (no-AAD, purpose-keyed).
     for (const r of records) {
       await fortress.storage.write(
         FEDERATION_TRUST_ROOT_NAMESPACE,
@@ -842,7 +867,7 @@ describe("master rotation — fail-closed coverage", () => {
       passphrase: PASSPHRASE,
     });
 
-    // Every one of the four decrypts + reads back under the NEW master.
+    // Every one decrypts + reads back under the NEW master.
     for (const r of records) {
       const raw = JSON.parse(
         bytesToString(
