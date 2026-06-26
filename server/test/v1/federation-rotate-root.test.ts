@@ -246,6 +246,19 @@ describe("rotate-root --renew: the renewal re-key (P1)", () => {
     // The context's pinned master is K2; the issuing principal cert chains to it.
     expect(ctx.pinnedMasterPubkey.public_key).toBe(after.pinned_master_pubkey.public_key);
     verifyPrincipalCertificate(ctx.issuingPrincipalCert, ctx.pinnedMasterPubkey);
+    // Slice 3c-2: the context surfaces the fortress's OWN adopted rotation
+    // lineage (the trusted anchor the pre-session reissue endpoint pins the
+    // predecessor master from, never the request). Sourced from the durable
+    // record, not the wire.
+    expect(ctx.recordedRotationSerial).toBe(after.rotation_serial);
+    expect(ctx.recordedRotationCert?.old_master_pubkey).toBe(
+      after.rotation_cert?.old_master_pubkey,
+    );
+    expect(ctx.recordedRotationCert?.new_master.public_key).toBe(
+      after.pinned_master_pubkey.public_key,
+    );
+    // A classical fortress is NOT hybrid, so the reissue endpoint stays open.
+    expect(ctx.isHybrid).toBe(false);
     masterKey.fill(0);
   });
 

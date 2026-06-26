@@ -37,6 +37,8 @@ import { OPERATOR, openDurableSession, startRig, type TestRig } from "./rig.js";
 interface ReissueMaterials {
   fortressId: string;
   k2Public: FortressMasterPublicKey;
+  /** Genuine predecessor (K1) private key, for forging higher-serial lineage in tests. */
+  k1PrivateKey: Uint8Array;
   context: FederationIssuerContext;
   nodeId: string;
   currentNodeCert: NodeIdentityCertificate;
@@ -197,7 +199,156 @@ describe("/v1/federation/rotate/reissue-node-cert", { retry: 2 }, () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
+
+  // HOLE 1: a forged predecessor master cannot mint a real current-root cert.
+  // The attacker controls M_attacker, crafts a rotation cert claiming M_attacker
+  // is the "old" master rotating into the REAL current root, self-signs a node
+  // chain under M_attacker, and holds the node key for the PoP. The server must
+  // pin the predecessor from its OWN recorded lineage and reject this cert
+  // because it is not byte-identical to the one the fortress adopted.
+  it("rejects a forged-old-master rotation cert (attacker's own keypair as old_master)", async () => {
+    await enableFederation();
+    const forged = makeForgedOldMasterMaterials(materials);
+    const challenge = await issueChallenge();
+
+    const res = await completeReissue(forged.signedBody(challenge));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+  });
+
+  // HOLE 1 (replay/rollback): a genuine-lineage rotation cert with a rolled-back
+  // serial is rejected. Here the fortress has adopted serial 2, but the submitted
+  // cert (and the recorded one in this rig) carry serial 1: the submitted cert is
+  // not byte-identical to the recorded serial-2 cert, so it is rejected.
+  it("rejects a genuine-lineage rotation cert with a rolled-back / replayed serial", async () => {
+    // Re-pin the context's recorded lineage to a serial-2 cert (as if the
+    // fortress rotated twice), while the client still presents the serial-1 cert.
+    const advanced = makeAdvancedSerialMaterials(materials);
+    rig.dashboard.setFederationContext(advanced.context);
+    await enableFederation();
+    const challenge = await issueChallenge();
+
+    // Client submits the OLD serial-1 cert; server adopted serial 2.
+    const res = await completeReissue(signedCompleteBody(challenge, materials.rotationCert));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+  });
+
+  // HOLE 2: on a hybrid (PQC) fortress the reissue endpoint refuses entirely, so
+  // a classical-only rotation cert can never silently downgrade the post-quantum
+  // root. The submitted cert here is the genuine recorded one; the deny comes
+  // purely from the fortress being hybrid.
+  it("fails closed on a hybrid fortress even for a genuine classical rotation cert", async () => {
+    rig.dashboard.setFederationContext({ ...materials.context, isHybrid: true });
+    await enableFederation();
+    const challenge = await issueChallenge();
+
+    const res = await completeReissue(signedCompleteBody(challenge));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+  });
 });
+
+/**
+ * Build a self-consistent attacker chain: a rotation cert claiming the attacker's
+ * OWN master rotated into the REAL current root, plus an old node-cert chain that
+ * verifies under the attacker's master, plus the node key for the PoP. Every
+ * signature is internally valid; the ONLY thing wrong is that the "old" master is
+ * the attacker's, not the fortress's recorded predecessor.
+ */
+function makeForgedOldMasterMaterials(genuine: ReissueMaterials): {
+  signedBody: (challenge: { challenge_id: string; challenge: string }) => Record<string, unknown>;
+} {
+  const attackerMaster = generateFortressMaster();
+  const fortressId = genuine.fortressId;
+
+  const attackerPrincipalPrivate = randomBytes(32);
+  const attackerPrincipalPublic = ed25519.getPublicKey(attackerPrincipalPrivate);
+  const attackerPrincipalCert = issuePrincipalCertificate({
+    principal_id: "principal-attacker",
+    principal_pubkey: attackerPrincipalPublic,
+    role: "root",
+    fortress_id: fortressId,
+    master_private_key: attackerMaster.private_key,
+  });
+
+  const { publicKey: nodePublicKey, privateKey: nodePrivateKey } = generateNodeKeypair();
+  const forgedNodeCert = issueNodeIdentityCertificate({
+    node_id: genuine.nodeId,
+    node_pubkey: nodePublicKey,
+    node_mode: "local",
+    fortress_id: fortressId,
+    capabilities: CAP_STANDARD_FORTRESS_NODE,
+    parent_chain: {
+      fortress_master_pubkey: attackerMaster.public.public_key,
+      principal_id: attackerPrincipalCert.principal_id,
+      principal_pubkey: attackerPrincipalCert.principal_pubkey,
+    },
+    principal_private_key: attackerPrincipalPrivate,
+    master_private_key: attackerMaster.private_key,
+  });
+
+  // The forged rotation cert: attacker's master "rotates" into the REAL current
+  // root (k2Public is public), signed by the attacker's master.
+  const forgedRotationCert = signFederationRootRotationCertificate({
+    fortress_id: fortressId,
+    old_master_pubkey: attackerMaster.public.public_key,
+    new_master: genuine.k2Public,
+    old_master_private_key: attackerMaster.private_key,
+    rotation_serial: 1,
+    rotated_at: "2026-06-26T00:00:00.000Z",
+  });
+
+  return {
+    signedBody: (challenge) => {
+      const message = buildFederationReissueNodeCertProofMessage({
+        fortressId,
+        nodeId: genuine.nodeId,
+        challengeId: challenge.challenge_id,
+        challenge: challenge.challenge,
+        currentNodeCert: forgedNodeCert,
+        currentIssuingPrincipalCert: attackerPrincipalCert,
+        rotationCert: forgedRotationCert,
+      });
+      return {
+        action: "complete",
+        node_id: genuine.nodeId,
+        challenge_id: challenge.challenge_id,
+        challenge: challenge.challenge,
+        current_node_cert: forgedNodeCert,
+        current_issuing_principal_cert: attackerPrincipalCert,
+        rotation_cert: forgedRotationCert,
+        node_signature: toBase64url(ed25519.sign(message, nodePrivateKey)),
+      };
+    },
+  };
+}
+
+/**
+ * A context whose RECORDED lineage is at serial 2 (a genuine, internally-valid
+ * serial-2 rotation cert from the same K1->K2 link), used to prove that a client
+ * presenting the older serial-1 cert is rejected (it is not byte-identical to the
+ * adopted serial-2 cert).
+ */
+function makeAdvancedSerialMaterials(genuine: ReissueMaterials): {
+  context: FederationIssuerContext;
+} {
+  const serial2Cert = signFederationRootRotationCertificate({
+    fortress_id: genuine.fortressId,
+    old_master_pubkey: genuine.rotationCert.old_master_pubkey,
+    new_master: genuine.k2Public,
+    old_master_private_key: genuine.k1PrivateKey,
+    rotation_serial: 2,
+    rotated_at: "2026-06-27T00:00:00.000Z",
+  });
+  return {
+    context: {
+      ...genuine.context,
+      recordedRotationCert: serial2Cert,
+      recordedRotationSerial: 2,
+    },
+  };
+}
 
 function makeReissueMaterials(): ReissueMaterials {
   const k1 = generateFortressMaster();
@@ -265,6 +416,11 @@ function makeReissueMaterials(): ReissueMaterials {
     getFortressMasterSecret: () => masterSecret,
     getMasterPrivateKey: () => k2.private_key,
     isNodeRevoked: () => false,
+    // The fortress's OWN adopted rotation lineage (as the durable trust-root
+    // record would surface it). The reissue endpoint pins the predecessor master
+    // from THIS, not from the request body.
+    recordedRotationCert: rotationCert,
+    recordedRotationSerial: 1,
     approver: createAutoApproveJoinApprover({
       pinned_master_pubkey: k2Public,
       issuing_principal_cert: newPrincipalCert,
@@ -276,6 +432,7 @@ function makeReissueMaterials(): ReissueMaterials {
   return {
     fortressId,
     k2Public,
+    k1PrivateKey: k1.private_key,
     context,
     nodeId,
     currentNodeCert,

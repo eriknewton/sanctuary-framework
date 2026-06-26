@@ -367,6 +367,15 @@ export function federationContextFromTrustRootRecord(
     hybridPinnedMaster: record.hybrid
       ? structuredClone(record.hybrid.pinned_master)
       : undefined,
+    // Slice 3c-2 (node-cert reissue): the fortress's OWN adopted rotation
+    // lineage, the trusted anchor the pre-session reissue endpoint pins the
+    // predecessor master from (NEVER the request). Public + safe at rest. Absent
+    // on a never-rotated root, in which case the reissue-with-rotation path fails
+    // closed rather than trust an attacker-supplied "old" master.
+    recordedRotationCert: record.rotation_cert
+      ? structuredClone(record.rotation_cert)
+      : undefined,
+    recordedRotationSerial: record.rotation_serial,
   };
 }
 

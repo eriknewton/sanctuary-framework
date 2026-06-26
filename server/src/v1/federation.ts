@@ -189,6 +189,38 @@ export interface FederationIssuerContext extends FederationBaseContext {
    * test-only auto-approve helper; production must inject a real gate.
    */
   approver: JoinApprover;
+  /**
+   * The rotation certificate this fortress ITSELF adopted at its last
+   * `rotate-root --renew` (sourced from the durable trust-root record, NOT from
+   * any request). It attests the predecessor master -> the current pinned master
+   * under the stable fortress_id. Absent on a freshly-provisioned root that has
+   * never rotated.
+   *
+   * SECURITY (3c-2 node-cert reissue): the pre-session reissue endpoint pins the
+   * predecessor master from THIS field, never from the attacker-controlled
+   * request body. A reissue-with-rotation must present a `rotation_cert` that is
+   * byte-identical (canonical-JSON equal) to this recorded one, so an attacker
+   * cannot substitute a self-minted master as the "old" root and have the server
+   * mint a real current-root-chained cert for an arbitrary node. If this field is
+   * absent (the fortress never rotated) the reissue-with-rotation path fails
+   * closed.
+   */
+  recordedRotationCert?: FederationRootRotationCertificate;
+  /**
+   * The rotation serial this fortress has adopted (the serial of
+   * {@link recordedRotationCert}), from the durable trust-root record. Used as
+   * the `minSerial` floor so even a genuine-lineage rotation cert with a
+   * rolled-back / replayed serial is rejected. Absent on a never-rotated root.
+   */
+  recordedRotationSerial?: number;
+  /**
+   * True when this fortress was provisioned with the Ed25519+ML-DSA-65 hybrid
+   * (PQC) suite. Sourced from the durable trust-root record. The 3c-2 reissue
+   * endpoint refuses entirely on a hybrid fortress (hybrid reissue is out of
+   * scope for this slice) so a classical-only rotation cert can never silently
+   * downgrade the post-quantum root.
+   */
+  isHybrid?: boolean;
 }
 
 /**
@@ -1291,33 +1323,71 @@ function reissueNodeCertificate(
   request: ReissueNodeCertCompleteRequest,
 ): NodeIdentityCertificate {
   const rotationCert = request.rotation_cert;
+
+  // HOLE 2 (PQC downgrade): fail closed on a hybrid fortress. Hybrid reissue is
+  // out of scope for Slice 3c-2; accepting a classical-only rotation cert on a
+  // hybrid (Ed25519+ML-DSA-65) fortress would silently downgrade the
+  // post-quantum root (the classical `samePinnedMaster` compares only the
+  // Ed25519 half). Refuse the endpoint entirely rather than verify half the
+  // binding. Matches the fail-closed contract on
+  // `FederationRootRotationCertificate.hybrid_rotation` (mesh/types.ts).
+  if (ctx.isHybrid === true) {
+    throw new ReissueNodeCertFailure("hybrid_reissue_unsupported");
+  }
+  // Defense in depth: a classical issuer must never process a cert that even
+  // CARRIES a hybrid binding (it cannot verify the ML-DSA-65 half).
   if (!isRecord(rotationCert) || rotationCert.hybrid_rotation !== undefined) {
     throw new ReissueNodeCertFailure("hybrid_reissue_unsupported");
   }
+
+  // HOLE 1 (forged old master): pin the predecessor master from THIS fortress's
+  // OWN durable rotation lineage, NEVER from the request. The endpoint is
+  // pre-session / unauthenticated, so the only safe anchor for the "old" master
+  // is the rotation cert the fortress itself adopted at its last
+  // `rotate-root --renew` (carried in the trust-root record -> ctx). If the
+  // fortress never rotated, there is no predecessor to chain an old K1 cert to:
+  // the reissue-with-rotation path fails closed.
+  const recordedRotationCert = ctx.recordedRotationCert;
   if (
-    typeof rotationCert.fortress_id !== "string" ||
-    typeof rotationCert.old_master_pubkey !== "string"
+    recordedRotationCert === undefined ||
+    ctx.recordedRotationSerial === undefined
   ) {
+    throw new ReissueNodeCertFailure("no_recorded_rotation_lineage");
+  }
+  // The submitted rotation cert must be byte-identical (canonical-JSON equal) to
+  // the one the fortress persisted. This is the strongest tie: an attacker
+  // cannot swap in a self-minted predecessor master, replay a stale serial, or
+  // alter the rotated_at / signature, because anything but the exact recorded
+  // cert is rejected here.
+  if (canonicalJson(rotationCert) !== canonicalJson(recordedRotationCert)) {
+    throw new ReissueNodeCertFailure("rotation_cert_not_recorded_lineage");
+  }
+  if (recordedRotationCert.fortress_id !== ctx.fortressId) {
     throw new ReissueNodeCertFailure("rotation_cert_invalid");
   }
+  // Predecessor master pinned from the RECORDED cert. created_at is not consumed
+  // by the verifiers (they key only on public_key + fortress_id); we carry the
+  // recorded rotated_at for shape completeness.
   const oldPinnedMaster: FortressMasterPublicKey = {
-    public_key: rotationCert.old_master_pubkey,
-    fortress_id: rotationCert.fortress_id,
-    created_at: rotationCert.rotated_at,
+    public_key: recordedRotationCert.old_master_pubkey,
+    fortress_id: recordedRotationCert.fortress_id,
+    created_at: recordedRotationCert.rotated_at,
   };
 
-  if (rotationCert.fortress_id !== ctx.fortressId) {
-    throw new ReissueNodeCertFailure("rotation_cert_invalid");
-  }
-  if (rootRevokedFailClosed(deps, rotationCert.old_master_pubkey)) {
+  if (rootRevokedFailClosed(deps, recordedRotationCert.old_master_pubkey)) {
     throw new ReissueNodeCertFailure("old_root_revoked");
   }
   try {
-    verifyFederationRootRotationCertificate(rotationCert, oldPinnedMaster);
+    // minSerial = adopted serial - 1 so the recorded serial itself is accepted
+    // while any serial <= the predecessor is rejected (rollback/replay proof,
+    // even within genuine lineage).
+    verifyFederationRootRotationCertificate(recordedRotationCert, oldPinnedMaster, {
+      minSerial: ctx.recordedRotationSerial - 1,
+    });
   } catch {
     throw new ReissueNodeCertFailure("rotation_cert_invalid");
   }
-  if (!samePinnedMaster(rotationCert.new_master, ctx.pinnedMasterPubkey)) {
+  if (!samePinnedMaster(recordedRotationCert.new_master, ctx.pinnedMasterPubkey)) {
     throw new ReissueNodeCertFailure("rotation_cert_not_current_root");
   }
 
