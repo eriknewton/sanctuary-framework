@@ -26,6 +26,7 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
+import { resolveProducerPubKeyPath } from "./producer-signature.js";
 import {
   isCustodyFsError,
   readFileCustody,
@@ -50,6 +51,8 @@ const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+const CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH =
+  `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/castle-audit-producer.pub`;
 
 /**
  * Signing handle used by the daemon. B2: the production default routes both
@@ -175,6 +178,13 @@ export interface MacOSCastleWallDaemonInput {
    */
   globalPinnedPublicKeyPath?: string;
   /**
+   * Root-helper-published macOS audit-producer public key. When present, the
+   * daemon pins the macOS flow-event consumer to it and copies it to the
+   * existing fortress producer-key reader path. Missing means the honest macOS
+   * channel-authenticated floor remains in effect.
+   */
+  auditProducerPublicKeyPath?: string;
+  /**
    * Provider-side dead-man lease. Undefined/null means durable arming
    * (--no-ttl); a positive number means the extension fails open after that
    * many seconds unless renewed by the authenticated daemon channel.
@@ -257,6 +267,15 @@ export async function startMacOSCastleWallDaemon(
 
   const signer = input.signer ?? (await loadSigningKey(input));
   await writeSystemPinnedPublicKey(signer);
+  const auditProducerKey = await loadMacOSAuditProducerPublicKey(
+    input.auditProducerPublicKeyPath ?? CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH,
+  );
+  if (auditProducerKey !== null) {
+    await publishFortressAuditProducerPublicKey(
+      input.fortressPath,
+      auditProducerKey.bytes,
+    );
+  }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   const operatorBaseline = await resolveOperatorBaseline(
@@ -307,6 +326,7 @@ export async function startMacOSCastleWallDaemon(
     },
     auditSink: input.auditLog,
     defaultApprovalTimeoutSeconds: 30,
+    pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
@@ -818,6 +838,47 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
       `[castle-wall] warning: unable to write shared pinned public key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+async function loadMacOSAuditProducerPublicKey(
+  path: string,
+): Promise<{ bytes: Uint8Array; keyB64url: string } | null> {
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(
+      await readFileCustody(path, { verifyPathIdentity: true }),
+    );
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      return null;
+    }
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is unreadable: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
+  }
+  if (bytes.length !== 32) {
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is ${bytes.length} bytes (expected 32).`,
+    );
+  }
+  return { bytes, keyB64url: toBase64url(bytes) };
+}
+
+async function publishFortressAuditProducerPublicKey(
+  fortressPath: string,
+  publicKey: Uint8Array,
+): Promise<void> {
+  await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
+    mode: 0o644,
+    createParent: true,
+  });
 }
 
 /**

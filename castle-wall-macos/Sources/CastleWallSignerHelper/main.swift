@@ -81,6 +81,17 @@ final class SignerListenerDelegate: NSObject, NSXPCListenerDelegate {
 // MARK: - Bring-up
 
 let service = SignerService(audit: auditLine)
+let auditProducerService = SignerService(
+    keyStore: SignerKeyStore(
+        directory: SignerConstants.protectedDirectory,
+        filename: SignerConstants.auditProducerPrivateKeyFilename
+    ),
+    pinStore: PinStore(
+        directory: SignerConstants.protectedDirectory,
+        filename: SignerConstants.auditProducerPublicKeyFilename
+    ),
+    audit: auditLine
+)
 
 // A2/B2 custody bring-up: ensure the protected directory exists ROOT-OWNED and
 // not group/other-writable BEFORE any key/pin I/O (F-A2-1). If an operator-owned
@@ -115,10 +126,21 @@ service.publicKey { pub, err in
         auditLine("signer_startup_warning", ["error": err ?? "unknown"])
     }
 }
+auditProducerService.installPin { pub, err in
+    if let pub {
+        auditLine("audit_producer_ready", ["pubkey_present": "true", "pubkey_bytes": String(pub.count)])
+    } else {
+        auditLine("audit_producer_startup_warning", ["error": err ?? "unknown"])
+    }
+}
 
 let delegate = SignerListenerDelegate(
     service: service,
     requirement: CodeRequirement.signerClientRequirement()
+)
+let auditProducerDelegate = SignerListenerDelegate(
+    service: auditProducerService,
+    requirement: CodeRequirement.castleWallExtensionRequirement()
 )
 
 let listener = NSXPCListener(machServiceName: SignerConstants.machServiceName)
@@ -126,6 +148,16 @@ listener.delegate = delegate
 listener.resume()
 
 auditLine("signer_listening", ["mach_service": SignerConstants.machServiceName])
+
+let auditProducerListener = NSXPCListener(
+    machServiceName: SignerConstants.auditProducerMachServiceName
+)
+auditProducerListener.delegate = auditProducerDelegate
+auditProducerListener.resume()
+
+auditLine("audit_producer_listening", [
+    "mach_service": SignerConstants.auditProducerMachServiceName,
+])
 
 // LaunchDaemon: park the main thread on the run loop. launchd owns our lifecycle
 // and will respawn us if we exit (KeepAlive); we never return.
