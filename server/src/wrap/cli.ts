@@ -85,6 +85,7 @@ import {
 import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
+import { recordWrappedHarnessRegistration } from "../workload-lifecycle/index.js";
 import {
   formatFortressPathWritableError,
   preflightFortressPathWritable,
@@ -1202,6 +1203,10 @@ export async function runWrap(
   // config is already rewritten and operational; a missing dashboard
   // record is a UX degradation, not a security one). The error is
   // surfaced on stderr so operators can re-run later if needed.
+  const localAgentRecord = buildLocalAgentRecord({
+    storagePath,
+    platform: agentConfig.platform,
+  });
   try {
     // The host tenant registry must live under the *resolved* storage root,
     // not the hardcoded ~/.sanctuary default. When SANCTUARY_STORAGE_PATH is
@@ -1223,13 +1228,7 @@ export async function runWrap(
   }
 
   try {
-    upsertPersistedLocalAgent(
-      storagePath,
-      buildLocalAgentRecord({
-        storagePath,
-        platform: agentConfig.platform,
-      }),
-    );
+    upsertPersistedLocalAgent(storagePath, localAgentRecord);
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -1301,6 +1300,11 @@ export async function runWrap(
         // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        await bestEffortRecordWrapWorkloadRegistration({
+          auditLog: ndAuditLog,
+          storagePath,
+          record: localAgentRecord,
+        });
         // Best-effort: daemon failure does not block identity bootstrap.
         // See parallel block below (line ~939) for full rationale.
         try {
@@ -1421,6 +1425,11 @@ export async function runWrap(
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      await bestEffortRecordWrapWorkloadRegistration({
+        auditLog: wrapAuditLog,
+        storagePath,
+        record: localAgentRecord,
+      });
 
       // HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): resolve the
       // pinned producer key over the SAME canonical storage path the wrap-auto
@@ -2269,6 +2278,36 @@ function buildLocalAgentRecord(input: {
       can_change_template: true,
     },
   };
+}
+
+async function recordWrapWorkloadRegistration(input: {
+  auditLog: AuditLog;
+  storagePath: string;
+  record: LocalAgentRecord;
+}): Promise<void> {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  await recordWrappedHarnessRegistration({
+    auditLog: input.auditLog,
+    fortressId,
+    agentId: input.record.agent_id,
+  });
+}
+
+async function bestEffortRecordWrapWorkloadRegistration(input: {
+  auditLog: AuditLog;
+  storagePath: string;
+  record: LocalAgentRecord;
+}): Promise<void> {
+  try {
+    await recordWrapWorkloadRegistration(input);
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: workload-lifecycle registration not recorded ` +
+        `(${(err as Error).message}). ` +
+        `Wrap is otherwise complete; re-run \`sanctuary wrap\` to retry after fixing the audit log.`,
+    );
+  }
 }
 
 function countUpstreamTools(servers: UpstreamServer[]): number {
