@@ -24,6 +24,8 @@
     <dict>
         <key>ai.sanctuaryprotocol.macos.castle-wall.signer</key>
         <true/>
+        <key>ai.sanctuaryprotocol.macos.castle-wall.audit-producer</key>
+        <true/>
     </dict>
     <key>RunAtLoad</key>
     <true/>
