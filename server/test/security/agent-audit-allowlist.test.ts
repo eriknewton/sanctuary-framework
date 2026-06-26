@@ -1184,6 +1184,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         "operator CLI castle-wall audit dump: one-shot full read per invocation; wants a single full re-verify.",
     },
     {
+      module: "cli/castle-wall.ts",
+      fn: "runAuditVerify",
+      kind: "operator-batch",
+      reason:
+        "operator CLI castle-wall audit-verify (Slice M reader leg): one-shot full read per invocation that re-verifies every enforcement entry's producer signature; a single full re-verify across all entries IS the desired tamper-evidence behavior, never a warm/eager hot-path view.",
+    },
+    {
       module: "exit/bundle.ts",
       fn: "exportAuditReceipts",
       kind: "operator-batch",

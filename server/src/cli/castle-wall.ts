@@ -42,6 +42,14 @@ import {
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import {
+  resolveProducerPubKeyPath,
+  loadPinnedProducerKeyB64url,
+} from "../castle-wall/runtime/producer-signature.js";
+import {
+  reverifyEntryProducerSignature,
+  type EntryReverifyBasis,
+} from "../principal-policy/producer-reverify.js";
+import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
 } from "./castle-wall-boot.js";
@@ -132,6 +140,23 @@ export interface CastleWallCommandContext {
   safeModeDaemonStart?: (
     input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
   ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
+   * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
+   * key-resolution + producer-key threading can be exercised without a real
+   * socket/helper). Defaults to {@link startMacOSCastleWallDaemon}.
+   */
+  fullDaemonStart?: (
+    input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
+  ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Override the macOS audit-producer public-key path threaded into the daemon
+   * (Slice M). Tests point it at a temp key; an operator may set it via
+   * `SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY` for a non-default helper layout.
+   * When unset the daemon uses its built-in
+   * `/Library/Application Support/Sanctuary/castle-audit-producer.pub` default.
+   */
+  auditProducerPublicKeyPath?: string;
 }
 
 export interface CastleWallParsedArgs {
@@ -153,6 +178,14 @@ export interface CastleWallParsedArgs {
    * error instead of silently falling back to the raw dump.
    */
   ruleMissingValue?: boolean;
+  /** audit-verify: emit machine-readable JSON instead of the human summary. */
+  json?: boolean;
+  /**
+   * audit-verify: explicit override for the pinned audit-producer public-key
+   * file. Tests point this at a temp key; production resolves it from the
+   * fortress publish path. Never accepted from an untrusted source.
+   */
+  producerPubKey?: string;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -1297,17 +1330,41 @@ export async function runDaemon(
       ? undefined
       : await resolveSignerClientPath(env, platform, ctx);
 
-    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    // Slice M: resolve the macOS audit-producer public-key path the daemon
+    // pins flow verdicts against. ctx (tests) → env override → daemon default
+    // (`/Library/Application Support/Sanctuary/castle-audit-producer.pub`). When
+    // a key IS published there, the daemon loads it and engages per-producer
+    // re-verification; when it is absent, the daemon stays on the honest
+    // channel-authenticated floor (never overclaims).
+    const auditProducerKeyPath =
+      ctx.auditProducerPublicKeyPath ??
+      env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY;
+
+    const startFullDaemon =
+      ctx.fullDaemonStart ??
+      (async (input) => {
+        const { startMacOSCastleWallDaemon } = await import(
+          "../castle-wall/runtime/index.js"
+        );
+        return startMacOSCastleWallDaemon(input);
+      });
     try {
-      daemon = await startMacOSCastleWallDaemon({
+      daemon = await startFullDaemon({
         fortressPath: storagePath,
         fortressId: fortressIdFromStoragePath(storagePath),
         masterKey: derived.key,
         auditLog,
+        // FULL operator daemon: come up in FULL mode (NOT safe-mode-from-boot-
+        // token). This is the console-login enforcement path that holds the
+        // fortress key + reaches the audit-producer signing service.
+        daemonMode: "full",
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
         ...(resolvedSignerClient
           ? { signerClientPath: resolvedSignerClient }
+          : {}),
+        ...(auditProducerKeyPath
+          ? { auditProducerPublicKeyPath: auditProducerKeyPath }
           : {}),
       });
     } catch (error) {
@@ -1626,6 +1683,16 @@ export async function runSafeModeDaemon(
       ...(ctx.globalPinnedPublicKeyPath
         ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
         : {}),
+      // Slice M: a safe-mode boot daemon also loads the helper-published
+      // audit-producer key (the helper provisions it at boot independent of
+      // login), so producer-signed verdicts are re-verified even before login.
+      ...(ctx.auditProducerPublicKeyPath ?? env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY
+        ? {
+            auditProducerPublicKeyPath:
+              ctx.auditProducerPublicKeyPath ??
+              env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY,
+          }
+        : {}),
     });
   } catch (error) {
     write(err, `Safe-mode daemon failed to start: ${(error as Error).message}\n`);
@@ -1879,6 +1946,219 @@ export async function runAuditDump(
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+/** The per-basis tally `audit-verify` reports. */
+interface AuditVerifyTally {
+  verified: number;
+  rejected: number;
+  channel: number;
+}
+
+/** Map a re-verification basis into the tally bucket it contributes to. */
+function tallyBucketForBasis(basis: EntryReverifyBasis): keyof AuditVerifyTally {
+  switch (basis) {
+    case "producer_signed_verified":
+      return "verified";
+    case "producer_signed_rejected":
+      return "rejected";
+    case "channel_authenticated":
+      return "channel";
+  }
+}
+
+/**
+ * Resolve the pinned audit-producer public key for `audit-verify`, in
+ * base64url-no-pad, or `null` when no key is published.
+ *
+ * Path resolution (single source of truth - never invents a weaker basis):
+ *   1. an explicit `--producer-pub-key <path>` override (tests / non-default
+ *      layouts), else
+ *   2. the fortress publish path `resolveProducerPubKeyPath(fortressPath)` =
+ *      `<fortress>/policy/egress/audit-producer.pub`, which is exactly where the
+ *      macOS/Linux daemon republishes the key the audit CONSUMER pinned, so the
+ *      reader can never diverge onto a different key than the one writes were
+ *      gated against.
+ *
+ * A MISSING key file (ENOENT) is the honest no-key floor: the reader returns
+ * `null` and reports every entry on the channel basis - it never fabricates a
+ * verified result it cannot check. A PRESENT-but-bad key (wrong length, EACCES)
+ * is a fault, not "absent": it throws so the verb fails honestly rather than
+ * silently dropping to the channel basis (the Slice P fail-closed contract).
+ */
+async function resolveAuditVerifyProducerKey(
+  fortressPath: string,
+  explicitPath: string | undefined,
+): Promise<string | null> {
+  const pubKeyPath = explicitPath ?? resolveProducerPubKeyPath(fortressPath);
+  try {
+    return await loadPinnedProducerKeyB64url(pubKeyPath);
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      // No producer key published: the honest channel-authenticated floor.
+      // Not a failure - macOS pre-Slice-M / pre-provision Linux lives here.
+      return null;
+    }
+    // A key file exists but is unreadable / malformed. A key is EXPECTED here,
+    // so do NOT pretend it is absent and drop to the channel basis.
+    throw error;
+  }
+}
+
+/**
+ * `audit-verify` - the read-side tamper-evidence reader for Castle Wall
+ * enforcement evidence (Slice R / Slice M reader leg).
+ *
+ * Unlike `audit-dump` (which surfaces the RECORDED attribution, including a
+ * forgeable `cw_source` marker, and makes NO authenticity claim), this verb
+ * CRYPTOGRAPHICALLY RE-VERIFIES each entry's persisted producer signature
+ * against the daemon's pinned producer public key. A forger that stamped the
+ * `producer_signed` basis + marker but could not mint a signature over the
+ * pinned key is REJECTED here; only a signature that re-verifies counts as
+ * per-producer-authenticated.
+ *
+ * It reuses `reverifyEntryProducerSignature()` - the exact same fail-closed
+ * gate the posture/feature-health readers run - so the CLI cannot diverge from
+ * the live posture surface.
+ *
+ * Honest no-key floor: when no producer key is published (macOS pre-Slice-M,
+ * pre-provision Linux), the verb reports every enforcement entry on the
+ * `channel_authenticated` basis and explicitly states it could NOT re-verify
+ * per-producer signatures. It never fakes a verified count.
+ *
+ * Exit codes:
+ *   0 - read + classification succeeded (this is a DIAGNOSTIC; a present
+ *       `rejected` count does NOT change the exit code, so a tamper finding is
+ *       reported, not swallowed by a non-zero exit a script might ignore).
+ *   1 - could not read the audit log / load an expected-but-broken key.
+ */
+export async function runAuditVerify(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const sinceIso = parsed.since
+    ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
+    : undefined;
+
+  try {
+    const pinnedProducerKeyB64url = await resolveAuditVerifyProducerKey(
+      fortressPath,
+      parsed.producerPubKey,
+    );
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const auditLog = new AuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const query = await auditLog.query({
+      ...(sinceIso ? { since: sinceIso } : {}),
+      layer: "l1",
+      limit: 100_000,
+    });
+    // Only enforcement-evidence operations carry producer signatures; an
+    // operator_decision / policy_loaded / heartbeat entry is never expected to
+    // be producer-signed, so re-verifying them would inflate the channel count
+    // with entries that were never enforcement evidence. Scope to the two flow
+    // verdict operations the consumer signs.
+    const evidenceEntries = query.entries.filter(
+      (entry) =>
+        entry.operation === "egress_allowed" ||
+        entry.operation === "egress_blocked",
+    );
+
+    const tally: AuditVerifyTally = { verified: 0, rejected: 0, channel: 0 };
+    const rejectedSamples: Array<{
+      timestamp: string;
+      operation: string;
+    }> = [];
+    for (const entry of evidenceEntries) {
+      const result = reverifyEntryProducerSignature(
+        entry.details ?? {},
+        pinnedProducerKeyB64url,
+      );
+      tally[tallyBucketForBasis(result.basis)] += 1;
+      if (result.basis === "producer_signed_rejected" && rejectedSamples.length < 20) {
+        rejectedSamples.push({
+          timestamp: entry.timestamp,
+          operation: entry.operation,
+        });
+      }
+    }
+
+    if (parsed.json) {
+      write(
+        out,
+        JSON.stringify({
+          fortress: fortressPath,
+          producer_key_present: pinnedProducerKeyB64url !== null,
+          // The honest basis label for this run: with no pinned key we could
+          // only channel-authenticate; with a key we re-verified per-producer.
+          reader_basis:
+            pinnedProducerKeyB64url !== null
+              ? "per_producer_reverified"
+              : "channel_authenticated_only",
+          enforcement_entries: evidenceEntries.length,
+          verified: tally.verified,
+          rejected: tally.rejected,
+          channel_authenticated: tally.channel,
+          rejected_samples: rejectedSamples,
+        }) + "\n",
+      );
+      return 0;
+    }
+
+    write(out, `Castle Wall audit-verify (fortress ${fortressPath})\n`);
+    if (pinnedProducerKeyB64url === null) {
+      write(
+        out,
+        "Producer key: NONE published. Cannot re-verify per-producer signatures.\n" +
+          "  Reporting on the channel-authenticated basis only (the honest macOS\n" +
+          "  pre-Slice-M / pre-provision Linux floor). A green here is NOT a\n" +
+          "  per-producer-authenticated claim.\n",
+      );
+    } else {
+      write(
+        out,
+        "Producer key: published. Re-verifying each enforcement entry's producer\n" +
+          "  signature against the pinned key (the forgeable cw_source marker is NOT\n" +
+          "  trusted; the cryptographic signature is the authority).\n",
+      );
+    }
+    write(out, `Enforcement entries examined: ${evidenceEntries.length}\n`);
+    write(out, `  producer_signed_verified : ${tally.verified}\n`);
+    write(out, `  producer_signed_rejected : ${tally.rejected}\n`);
+    write(out, `  channel_authenticated    : ${tally.channel}\n`);
+    if (tally.rejected > 0) {
+      write(
+        err,
+        `WARNING: ${tally.rejected} enforcement entr${
+          tally.rejected === 1 ? "y" : "ies"
+        } CLAIMED producer_signed but FAILED re-verification against the pinned key.\n` +
+          "  This is a forgery / tamper signal: an entry stamped the producer-signed\n" +
+          "  basis but carries no valid signature over the pinned producer key.\n",
+      );
+      for (const sample of rejectedSamples) {
+        write(err, `    rejected: ${sample.timestamp} ${sample.operation}\n`);
+      }
+    }
+    return 0;
+  } catch (error) {
+    write(
+      err,
+      `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     return 1;
   }
 }
@@ -2875,6 +3155,12 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.acceptBrokenChain = true;
     } else if (arg === "--by-rule") {
       parsed.byRule = true;
+    } else if (arg === "--json") {
+      parsed.json = true;
+    } else if (arg.startsWith("--producer-pub-key=")) {
+      parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
+    } else if (arg === "--producer-pub-key") {
+      parsed.producerPubKey = argv[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
