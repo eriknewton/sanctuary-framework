@@ -290,6 +290,152 @@ describe("buildFleetRoster — reach is liveness telemetry, separate from trust"
   });
 });
 
+describe("buildFleetRoster — fleet sync-health rollup (A1, liveness not trust)", () => {
+  const recentIso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
+
+  it("rolls up reachable/stale/never counts from the per-node reach axis", () => {
+    const recent = recentIso(60_000);
+    const old = recentIso(FLEET_REACH_FRESHNESS_WINDOW_MS + 60_000);
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("a", { last_sync: { received_at: recent, sent_at: recent, last_sequence: 1 } }),
+          nodeView("b", { last_sync: { received_at: recent, sent_at: recent, last_sequence: 1 } }),
+          nodeView("c", { last_sync: { received_at: old, sent_at: old, last_sequence: 1 } }),
+          nodeView("d", { last_sync: { received_at: null, sent_at: null, last_sequence: 0 } }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW },
+    );
+    expect(roster.sync_health.reachable).toBe(2);
+    expect(roster.sync_health.stale).toBe(1);
+    expect(roster.sync_health.never).toBe(1);
+    expect(roster.sync_health.freshness_window_ms).toBe(
+      FLEET_REACH_FRESHNESS_WINDOW_MS,
+    );
+    // The rollup is consistent with the per-node reach axis it summarizes.
+    const reachCounts = roster.nodes.reduce(
+      (acc, n) => {
+        acc[n.reach] += 1;
+        return acc;
+      },
+      { recent: 0, stale: 0, never: 0 } as Record<string, number>,
+    );
+    expect(roster.sync_health.reachable).toBe(reachCounts.recent);
+    expect(roster.sync_health.stale).toBe(reachCounts.stale);
+    expect(roster.sync_health.never).toBe(reachCounts.never);
+  });
+
+  it("reports the oldest last-sync as the staleness frontier, ignoring never-synced nodes", () => {
+    const newer = recentIso(60_000);
+    const older = recentIso(5 * 60_000);
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("new", { last_sync: { received_at: newer, sent_at: newer, last_sequence: 2 } }),
+          nodeView("old", { last_sync: { received_at: older, sent_at: older, last_sequence: 1 } }),
+          nodeView("never", { last_sync: { received_at: null, sent_at: null, last_sequence: 0 } }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW },
+    );
+    // The earliest real sync wins; the never-synced node does not become the frontier.
+    expect(roster.sync_health.oldest_last_sync).toBe(older);
+  });
+
+  it("reports a null frontier when no node has ever synced", () => {
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("a", { last_sync: { received_at: null, sent_at: null, last_sequence: 0 } }),
+          nodeView("b", { last_sync: { received_at: null, sent_at: null, last_sequence: 0 } }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW },
+    );
+    expect(roster.sync_health.never).toBe(2);
+    expect(roster.sync_health.oldest_last_sync).toBeNull();
+  });
+
+  it("counts a reachable-but-revoked node as in-touch WITHOUT laundering its trust", () => {
+    const recent = recentIso(60_000);
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("revoked-recent", {
+            last_sync: { received_at: recent, sent_at: recent, last_sequence: 9 },
+          }),
+        ],
+        isNodeRevoked: () => true,
+      }),
+      { now: () => NOW },
+    );
+    // Reach and trust are SEPARATE axes: in-touch for liveness, still revoked for trust.
+    expect(roster.sync_health.reachable).toBe(1);
+    expect(roster.summary.revoked).toBe(1);
+    expect(roster.summary.admitted).toBe(0);
+    expect(roster.nodes[0]!.trust_state).toBe("revoked");
+  });
+
+  it("treats a malformed last-sync timestamp as never (frontier never picks it up)", () => {
+    const good = recentIso(60_000);
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("good", { last_sync: { received_at: good, sent_at: good, last_sequence: 1 } }),
+          nodeView("bad", {
+            last_sync: { received_at: "not-a-date", sent_at: null, last_sequence: 0 },
+          }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW },
+    );
+    // The malformed node classifies as never (same parse guard as classifyReach)
+    // and never becomes the oldest real sync.
+    expect(roster.sync_health.never).toBe(1);
+    expect(roster.sync_health.reachable).toBe(1);
+    expect(roster.sync_health.oldest_last_sync).toBe(good);
+  });
+
+  it("emits honest zeros for an unprovisioned (absent) fleet", () => {
+    const roster = buildFleetRoster(
+      deps({ context: null, nodes: [], isNodeRevoked: () => false }),
+      { now: () => NOW },
+    );
+    expect(roster.available).toBe(false);
+    expect(roster.sync_health).toEqual({
+      reachable: 0,
+      stale: 0,
+      never: 0,
+      oldest_last_sync: null,
+      freshness_window_ms: FLEET_REACH_FRESHNESS_WINDOW_MS,
+    });
+  });
+});
+
+describe("buildFleetRoster — signed-policy-distribution status (A2, honest absence)", () => {
+  it("reports policy distribution as not-yet-available (never a fabricated distributed state)", () => {
+    const roster = buildFleetRoster(
+      deps({ nodes: [nodeView("node-1")], isNodeRevoked: () => false }),
+      { now: () => NOW },
+    );
+    // The rail is unbuilt: the console states honest absence, never green.
+    expect(roster.policy_distribution).toEqual({ available: false });
+  });
+
+  it("reports honest absence on an unprovisioned fortress too", () => {
+    const roster = buildFleetRoster(
+      deps({ context: null, nodes: [], isNodeRevoked: () => false }),
+      { now: () => NOW },
+    );
+    expect(roster.policy_distribution).toEqual({ available: false });
+  });
+});
+
 describe("buildFleetRoster — no key material on the roster shape", () => {
   it("emits only public identifiers and posture metadata", () => {
     const roster = buildFleetRoster(
