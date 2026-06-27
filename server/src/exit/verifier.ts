@@ -557,6 +557,24 @@ export async function verifyExitBundle(
     unsupportedArtifacts.push(
       "audit_receipts: individual audit entries are not signed in the legacy L2 audit log; verifier pins them by signed manifest hash"
     );
+    // Surface the export-cap truncation marker so the operator is told the
+    // carried receipts are an incomplete (most-recent) slice, not the full
+    // population that `total` reports.
+    const auditJson = auditArtifact.json as {
+      truncated?: unknown;
+      omitted_count?: unknown;
+    };
+    if (auditJson.truncated === true) {
+      const omitted =
+        typeof auditJson.omitted_count === "number"
+          ? auditJson.omitted_count
+          : undefined;
+      warnings.push(
+        omitted !== undefined
+          ? `audit receipts are truncated: the oldest ${omitted} entries were omitted by the export cap`
+          : "audit receipts are truncated: the oldest entries were omitted by the export cap"
+      );
+    }
   }
 
   const reputationArtifact = await loadExitArtifact(root, manifest, "reputation_bundle");

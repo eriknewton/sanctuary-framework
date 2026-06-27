@@ -109,6 +109,48 @@ const FORCED_TIER1_OPERATIONS = [
 ] as const;
 
 /**
+ * Apply the forced-Tier invariants to a fully-formed PrincipalPolicy and
+ * return a normalized copy. This is the SINGLE source of the force-add /
+ * prune logic, factored out of validatePolicy so BOTH enforcement points
+ * uphold it byte-identically:
+ *
+ *   - the policy LOADER (validatePolicy, at load/merge time), and
+ *   - the policy MUTATION path (EnglishPolicyActivator.applyRule, when an
+ *     activated English-policy draft rewrites the live policy).
+ *
+ * Without this on the mutation path, an activated draft could drop a
+ * forced-Tier-1 op out of Tier 1 (a tier1_remove_operation) or smuggle one
+ * into Tier 3 (a tier3_add_operation) — a silent enforcement downgrade
+ * (Hard Constraint #5: never silently degrade; #7: policy integrity).
+ *
+ * Behavior, applied to the policy AS GIVEN (does NOT re-merge defaults):
+ *   - force-ADD every FORCED_TIER1_OPERATIONS entry into tier1_always_approve
+ *     (appended in declaration order after existing entries; deduplicated), and
+ *   - PRUNE every FORCED_TIER1_OPERATIONS entry out of tier3_always_allow, and
+ *   - ensure every FORCED_TIER3_OPERATIONS entry is present in
+ *     tier3_always_allow (the guaranteed distress lane).
+ *
+ * Ordering is preserved so validatePolicy's load-path output is unchanged:
+ * existing tier1 entries first, then forced ops; existing tier3 entries
+ * first, then any missing forced-tier3 ops, with forced-tier1 ops filtered
+ * out. Idempotent: enforceForcedTiers(enforceForcedTiers(p)) === one pass.
+ */
+export function enforceForcedTiers(policy: PrincipalPolicy): PrincipalPolicy {
+  const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
+  const mergedTier1 = [
+    ...new Set([...policy.tier1_always_approve, ...FORCED_TIER1_OPERATIONS]),
+  ];
+  const mergedTier3 = [
+    ...new Set([...policy.tier3_always_allow, ...FORCED_TIER3_OPERATIONS]),
+  ].filter((op) => !forcedTier1.has(op));
+  return {
+    ...policy,
+    tier1_always_approve: mergedTier1,
+    tier3_always_allow: mergedTier3,
+  };
+}
+
+/**
  * HABEAS PORT (agent-side sovereignty, ratified 2026-06-12): operations that
  * MUST always be allowed (Tier 3, audit-only) and may NEVER be gated behind
  * Tier 1 approval. The distress channel is the agent's guaranteed lane to
@@ -397,32 +439,23 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
 
   // Merge tier3: user's list + any new defaults added in later versions.
   // This ensures upgrades automatically include new read-only tools
-  // without requiring operators to manually edit their policy file.
+  // without requiring operators to manually edit their policy file. The
+  // forced-Tier invariants (force-add to Tier 1, prune from Tier 3, ensure
+  // forced-Tier-3) are applied by enforceForcedTiers below — the SINGLE
+  // source shared with the policy-mutation path so both can never drift.
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
-  const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
-  const mergedTier3 = [
-    ...new Set([
-      ...userTier3,
-      ...DEFAULT_POLICY.tier3_always_allow,
-      ...FORCED_TIER3_OPERATIONS,
-    ]),
-  ].filter((op) => !forcedTier1.has(op));
-
-  const mergedTier1 = [
-    ...new Set([
-      ...rawTier1,
-      ...FORCED_TIER1_OPERATIONS,
-    ]),
+  const mergedTier3Pre = [
+    ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
   ];
 
-  return {
+  return enforceForcedTiers({
     version: (raw.version as number) ?? 1,
-    tier1_always_approve: mergedTier1,
+    tier1_always_approve: rawTier1,
     tier2_anomaly: {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
-    tier3_always_allow: mergedTier3,
+    tier3_always_allow: mergedTier3Pre,
     approval_channel: (() => {
       const merged = {
         ...DEFAULT_CHANNEL,
@@ -434,7 +467,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       return merged;
     })(),
     approval_redirect: parseApprovalRedirect(raw.approval_redirect),
-  };
+  });
 }
 
 /**

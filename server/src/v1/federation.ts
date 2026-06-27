@@ -5,6 +5,7 @@
  *   POST /v1/federation/disable            SESSION + OPERATOR_SIGNED, Tier 1
  *   GET  /v1/federation/status             SESSION
  *   POST /v1/federation/authorize/init     SESSION + OPERATOR_SIGNED, Tier 1
+ *   POST /v1/federation/revoke             SESSION + OPERATOR_SIGNED, Tier 1
  *   POST /v1/federation/authorize/complete BOOTSTRAP_TOKEN (pre-session class)
  *
  * The join ceremony is operator-authorized in two crypto-verified steps and
@@ -33,14 +34,20 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHash } from "node:crypto";
-import { fromBase64url } from "../core/encoding.js";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { fromBase64url, toBase64url } from "../core/encoding.js";
+import { verify } from "../core/identity.js";
 import {
   issueBootstrapToken,
   verifyBootstrapToken,
   verifyJoinHkdfSaltProof,
 } from "../mesh/lifecycle/bootstrap-token.js";
-import { deriveNodeTransportKey } from "../mesh/trust-root.js";
+import {
+  deriveNodeTransportKey,
+  issueNodeIdentityCertificate,
+  verifyCertChain,
+  verifyFederationRootRotationCertificate,
+} from "../mesh/trust-root.js";
 import type { NodeMode } from "../mesh/constants.js";
 import {
   NODE_TRUST_BOUNDARY_VERSION,
@@ -49,6 +56,7 @@ import {
   type NodeTrustBoundary,
 } from "../mesh/node-posture.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   PrincipalCertificate,
   NodeIdentityCertificate,
@@ -67,7 +75,11 @@ import {
   type FederationSyncEnvelope,
 } from "./federation-sync-envelope.js";
 import {
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
   FEDERATION_SYNC_WIRE_VERSION,
+  normalizeFederationNodeCertificateRenewalConfig,
+  federationOperatorAuthorityOrigin,
+  signFederationNodeEvictionPayload,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
 
@@ -83,6 +95,12 @@ const NODE_MODES: readonly NodeMode[] = [
  * JSON parsing to keep malformed peer traffic cheap to reject.
  */
 export const V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES = 96 * 1024;
+export const V1_FEDERATION_REISSUE_NODE_CERT_MAX_BODY_BYTES = 96 * 1024;
+
+export const FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION =
+  "sanctuary.v1.federation-reissue-node-cert";
+export const FEDERATION_REISSUE_NODE_CERT_PROOF_DOMAIN =
+  "sanctuary.v1.federation-reissue-node-cert-proof";
 
 /** A path owned by the federation handler (post-session class). */
 export function isFederationPath(pathname: string): boolean {
@@ -91,8 +109,8 @@ export function isFederationPath(pathname: string): boolean {
     pathname === "/v1/federation/disable" ||
     pathname === "/v1/federation/status" ||
     pathname === "/v1/federation/authorize/init" ||
+    pathname === "/v1/federation/revoke" ||
     pathname === "/v1/federation/sync" ||
-    pathname === "/v1/federation/sync/peer" ||
     pathname === "/v1/nodes"
   );
 }
@@ -100,6 +118,30 @@ export function isFederationPath(pathname: string): boolean {
 /** The pre-session (bootstrap-token-authenticated) join-submission path. */
 export function isFederationCeremonyPath(pathname: string): boolean {
   return pathname === "/v1/federation/authorize/complete";
+}
+
+/**
+ * Federation P1 pre-session "node-cert-authenticated" auth class. A path in this
+ * class is reached BEFORE the /v1 session gate (router.ts dispatch, alongside the
+ * BOOTSTRAP_TOKEN ceremony class): the caller carries NO `Authorization` header
+ * and NO shared operator login. The ONLY trust decision is the cryptographic
+ * sync-envelope verification inside the handler (the node certificate must chain
+ * to THIS fortress's pinned master). The pre-session session-token gate that used
+ * to front `/sync/peer` only gated NETWORK ACCESS, never data trust, so removing
+ * it changes nothing about the trust boundary (CLAUDE.md constraint 4 is still
+ * enforced cryptographically); it only lets a remote operator's machine reach
+ * the route over a plain network connection without minting a session against a
+ * daemon it is not the operator of.
+ *
+ * This class contains only routes whose handler performs its own cryptographic
+ * proof before trusting the caller: peer-sync envelopes and node-cert reissue
+ * proof-of-possession challenges.
+ */
+export function isFederationNodeCertAuthPath(pathname: string): boolean {
+  return (
+    pathname === "/v1/federation/sync/peer" ||
+    pathname === "/v1/federation/rotate/reissue-node-cert"
+  );
 }
 
 // ── Fortress materials + ceremony ─────────────────────────────────────────
@@ -152,6 +194,38 @@ export interface FederationIssuerContext extends FederationBaseContext {
    * test-only auto-approve helper; production must inject a real gate.
    */
   approver: JoinApprover;
+  /**
+   * The rotation certificate this fortress ITSELF adopted at its last
+   * `rotate-root --renew` (sourced from the durable trust-root record, NOT from
+   * any request). It attests the predecessor master -> the current pinned master
+   * under the stable fortress_id. Absent on a freshly-provisioned root that has
+   * never rotated.
+   *
+   * SECURITY (3c-2 node-cert reissue): the pre-session reissue endpoint pins the
+   * predecessor master from THIS field, never from the attacker-controlled
+   * request body. A reissue-with-rotation must present a `rotation_cert` that is
+   * byte-identical (canonical-JSON equal) to this recorded one, so an attacker
+   * cannot substitute a self-minted master as the "old" root and have the server
+   * mint a real current-root-chained cert for an arbitrary node. If this field is
+   * absent (the fortress never rotated) the reissue-with-rotation path fails
+   * closed.
+   */
+  recordedRotationCert?: FederationRootRotationCertificate;
+  /**
+   * The rotation serial this fortress has adopted (the serial of
+   * {@link recordedRotationCert}), from the durable trust-root record. Used as
+   * the `minSerial` floor so even a genuine-lineage rotation cert with a
+   * rolled-back / replayed serial is rejected. Absent on a never-rotated root.
+   */
+  recordedRotationSerial?: number;
+  /**
+   * True when this fortress was provisioned with the Ed25519+ML-DSA-65 hybrid
+   * (PQC) suite. Sourced from the durable trust-root record. The 3c-2 reissue
+   * endpoint refuses entirely on a hybrid fortress (hybrid reissue is out of
+   * scope for this slice) so a classical-only rotation cert can never silently
+   * downgrade the post-quantum root.
+   */
+  isHybrid?: boolean;
 }
 
 /**
@@ -472,29 +546,69 @@ export interface V1FederationDeps {
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
   listFederationEvents(since?: FederationSyncCursor): FederationEvent[];
-  /** Validate and append remote sync events. */
+  /**
+   * Validate and append remote sync events. ASYNC because a folded
+   * operator-authority `node_eviction` advances the DURABLE revocation
+   * projection (Federation 3/3b P0): the append commits the in-memory fold,
+   * then persists the security-state snapshot. THROWS if that persist fails so
+   * the caller fails closed (a revocation that did not durably commit must not
+   * be acknowledged as accepted). When no eviction was folded the persist is a
+   * no-op and the call cannot throw on durability grounds.
+   */
   appendFederationEvents(
     events: FederationEvent[],
     options?: FederationAppendOptions,
-  ): FederationAppendResult;
+  ): Promise<FederationAppendResult>;
   /**
    * Highest peer-sync high-water already accepted from `senderNodeId`, or null
    * if none. Gates whole-envelope rollback on the cross-node `/sync/peer` path
    * (PR-A5). Per-sender; advances only on a successful accept.
    */
   acceptedHighWaterFor(senderNodeId: string): number | null;
-  /** Record a newly-accepted peer-sync high-water for `senderNodeId`. */
+  /**
+   * Record a newly-accepted peer-sync high-water for `senderNodeId`. ASYNC +
+   * fail-closed (Federation 3/3b P0): the in-memory advance is committed, then
+   * the DURABLE sync-state snapshot is persisted. Resolves `true` only when the
+   * advance is durably committed; resolves `false` (the in-memory advance rolled
+   * back) when the persist failed, so the caller MUST deny rather than
+   * acknowledge an accept whose anti-replay high-water did not reach disk.
+   */
   recordAcceptedHighWater(
     senderNodeId: string,
     highWater: number,
     certificate?: NodeIdentityCertificate,
-  ): void;
-  /** Monotonic outbound high-water this daemon stamps on reciprocal envelopes. */
-  nextOutboundHighWater(): number;
+  ): Promise<boolean>;
+  /**
+   * Monotonic outbound high-water this daemon stamps on reciprocal envelopes.
+   * ASYNC + fail-closed (Federation 3/3b P0): the advanced counter is persisted
+   * before it is handed out so a restart cannot re-emit an already-used outbound
+   * high-water. Resolves the new value on success; THROWS if the persist failed
+   * so the caller does not sign a reciprocal envelope on an un-committed counter.
+   */
+  nextOutboundHighWater(): Promise<number>;
   /** Grow-only revocation projection. Throws/false distinction is security-significant. */
   isNodeRevoked(nodeId: string): boolean;
+  /**
+   * RR-1 pre-wire (Federation 3/3b P0): reject any certificate chaining to a
+   * REVOKED fortress-master (root) pubkey. Feature-inert in P0 (the revoked-root
+   * set is always empty until rotate-root Slice 3c POPULATES it on compromise
+   * recovery) but wired at all three chokepoints now so 3c need only fill the
+   * set, never re-thread the call sites. Fail-closed contract identical to {@link
+   * isNodeRevoked}: a throw or absence is treated as "cannot evaluate -> deny".
+   * `masterPubkeyB64u` is the base64url fortress-master public key the presented
+   * chain terminates at.
+   */
+  isRootRevoked(masterPubkeyB64u: string): boolean;
   /** Best-effort local cert auto-renewal tick before this daemon presents its cert. */
   renewLocalNodeCertificate(): void;
+  /** Issue a server challenge for pre-session node-cert reissue POP. */
+  issueReissueChallenge(
+    params: FederationReissueChallengeParams,
+  ): FederationReissueChallenge | Promise<FederationReissueChallenge>;
+  /** Consume exactly one reissue challenge before issuance; false is fail-closed. */
+  consumeReissueChallenge(
+    params: FederationConsumeReissueChallengeParams,
+  ): Promise<boolean>;
   /** Structured aggregate disclosure for status surfaces. */
   federationPosture(): FederationPostureSummary;
 }
@@ -555,6 +669,23 @@ export interface FederationAppendOptions {
   wireVersion?: unknown;
 }
 
+export interface FederationReissueChallenge {
+  challenge_id: string;
+  challenge: string;
+  expires_at: string;
+}
+
+export interface FederationReissueChallengeParams {
+  fortressId: string;
+  nodeId: string;
+}
+
+export interface FederationConsumeReissueChallengeParams
+  extends FederationReissueChallengeParams {
+  challengeId: string;
+  challenge: string;
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /**
@@ -589,17 +720,62 @@ export async function handleFederationRequest(
     await handleAuthorizeInit(deps, req, res, claims);
     return true;
   }
+  if (method === "POST" && url.pathname === "/v1/federation/revoke") {
+    await handleRevoke(deps, req, res, claims);
+    return true;
+  }
   if (method === "POST" && url.pathname === "/v1/federation/sync") {
     await handleSync(deps, req, res, claims);
     return true;
   }
-  if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
-    await handlePeerSync(deps, req, res, claims);
-    return true;
-  }
+  // NOTE: /v1/federation/sync/peer is NO LONGER reachable here (Federation P1).
+  // It moved to the pre-session node-cert-authenticated class
+  // (isFederationNodeCertAuthPath, dispatched in router.ts before the session
+  // gate). If an authenticated caller reaches THIS dispatcher with that path, it
+  // falls through to the 404 below: the cert-auth dispatch already handled the
+  // pre-session case, and a session-bearing caller gets no special treatment.
   // Wrong method on an owned path: not found to an authenticated caller.
   writeJson(res, 404, { error: "not found" });
   return true;
+}
+
+/**
+ * Federation P1 pre-session node-cert-authenticated entry. Reached by the router
+ * BEFORE the /v1 session gate (like the BOOTSTRAP_TOKEN ceremony), so the caller
+ * holds NO session token. Only POSTs in this class are handled here; a non-POST
+ * or any other path falls through (returns false) so the router routes it to the
+ * session gate exactly like a non-POST ceremony request; it must NEVER fall
+ * through to legacy `/api` routing, and an unhandled in-class path fails closed
+ * at the router (it never reaches a handler that could fall open).
+ *
+ * The session that previously fronted this route was only a network-access gate;
+ * the sole trust decision is `handlePeerSync`'s cryptographic envelope
+ * verification, unchanged.
+ */
+export async function handleFederationNodeCertAuth(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+): Promise<boolean> {
+  if (method === "POST" && url.pathname === "/v1/federation/sync/peer") {
+    await handlePeerSync(deps, req, res);
+    return true;
+  }
+  if (
+    method === "POST" &&
+    url.pathname === "/v1/federation/rotate/reissue-node-cert"
+  ) {
+    await handleReissueNodeCert(deps, req, res);
+    return true;
+  }
+  // In-class-but-unhandled route fails closed: a future node-cert-auth path
+  // (e.g. rotate/reissue-node-cert in Slice 3b) that is added to the class set
+  // but not yet given a branch here must NOT fall open. Return false; the router
+  // sends it to the session gate (generic 401 unauth / 404 to an authed caller),
+  // never to legacy routing.
+  return false;
 }
 
 function handleNodes(deps: V1FederationDeps, res: ServerResponse): void {
@@ -789,6 +965,147 @@ async function handleAuthorizeInit(
   writeJson(res, 200, { bootstrap_token: token });
 }
 
+async function handleRevoke(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+  _claims: V1SessionClaims,
+): Promise<void> {
+  const action = "/v1/federation/revoke";
+  const operation = "v1_federation_revoke";
+  const body = await readJsonBody(req);
+  if (typeof body !== "object" || body === null) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const { node_id, reason: rawReason, idempotency_key, operator_signature } = body as {
+    node_id?: unknown;
+    reason?: unknown;
+    idempotency_key?: unknown;
+    operator_signature?: unknown;
+  };
+  if (typeof node_id !== "string" || node_id.length === 0) {
+    writeJson(res, 400, { error: "bad request" });
+    return;
+  }
+  const revocationReason =
+    typeof rawReason === "string" && rawReason.length > 0
+      ? rawReason
+      : "operator_revoked";
+  const signedPayload: Record<string, unknown> = {
+    node_id,
+    reason: revocationReason,
+  };
+  if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
+
+  if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "operator_signature_invalid" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  const ctx = deps.getContext();
+  if (ctx === null) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "federation_not_provisioned" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+  if (!federationContextHasIssuerAuthority(ctx)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "issuer_authority_unavailable" },
+    });
+    writeJson(res, 503, { error: "unavailable" });
+    return;
+  }
+
+  const originNodeId = federationOperatorAuthorityOrigin(ctx.fortressId);
+  const prior = deps.listFederationEvents({ node_id: originNodeId });
+  const previous = prior.length > 0 ? prior[prior.length - 1] : null;
+  const evictionSerial = nextEvictionSerial(prior);
+  const effectiveAt = new Date().toISOString();
+  const payload = signFederationNodeEvictionPayload({
+    fortressId: ctx.fortressId,
+    nodeId: node_id,
+    reason: revocationReason,
+    effectiveAt,
+    evictionSerial,
+    operatorPrincipalId: ctx.issuingPrincipalCert.principal_id,
+    operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
+  });
+  const eventWithoutHash = {
+    event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
+    origin_node_id: originNodeId,
+    sequence: (previous?.sequence ?? 0) + 1,
+    occurred_at: effectiveAt,
+    kind: FEDERATION_NODE_EVICTION_EVENT_KIND,
+    payload: payload as unknown as Record<string, unknown>,
+    previous_hash: previous?.event_hash ?? null,
+  };
+  const event: FederationEvent = {
+    ...eventWithoutHash,
+    event_hash: federationEventHash(eventWithoutHash),
+  };
+
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents([event], {
+      senderNodeId: originNodeId,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+    });
+  } catch {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
+  if (append.accepted.length !== 1 || append.rejected.length !== 0) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: append.rejected[0]?.reason ?? "append_rejected" },
+    });
+    writeJson(res, 409, {
+      error: "conflict",
+      rejected: append.rejected,
+    });
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: node_id,
+    details: {
+      event_id: event.event_id,
+      eviction_serial: evictionSerial,
+    },
+  });
+  writeJson(res, 200, {
+    revoked: true,
+    node_id,
+    event_id: event.event_id,
+    eviction_serial: evictionSerial,
+  });
+}
+
 async function handleSync(
   deps: V1FederationDeps,
   req: IncomingMessage,
@@ -854,7 +1171,8 @@ async function handleSync(
     return;
   }
 
-  if (!deps.isEnabled() || deps.getContext() === null) {
+  const syncCtx = deps.getContext();
+  if (!deps.isEnabled() || syncCtx === null) {
     await deps.audit({
       operation,
       result: "failure",
@@ -865,10 +1183,41 @@ async function handleSync(
     return;
   }
 
-  const append = deps.appendFederationEvents(parsedEvents, {
-    senderNodeId: node_id,
-    wireVersion: wire_version,
-  });
+  // RR-1 pre-wire (feature-inert until rotate-root Slice 3c). Reject a sync
+  // against a fortress whose own pinned master (root) has been revoked. The set
+  // is empty in P0, so this never fires today; wired here so 3c need only fill
+  // the set. A throw is treated as unevaluable -> deny.
+  if (rootRevokedFailClosed(deps, syncCtx.pinnedMasterPubkey.public_key)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "root_revoked" },
+    });
+    denyForbidden(res);
+    return;
+  }
+
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents(parsedEvents, {
+      senderNodeId: node_id,
+      wireVersion: wire_version,
+    });
+  } catch {
+    // A folded revocation could not be durably persisted (Federation 3/3b P0
+    // fail-closed): deny rather than acknowledge an accept whose revocation
+    // state did not reach disk. The in-memory revocation stays applied
+    // (grow-only fail-safe); the peer's retry re-persists the whole snapshot.
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: node_id,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
   let senderRevoked: boolean;
   try {
     senderRevoked = deps.isNodeRevoked(node_id);
@@ -903,22 +1252,498 @@ async function handleSync(
   });
 }
 
+interface ReissueNodeCertCompleteRequest {
+  node_id: string;
+  challenge_id: string;
+  challenge: string;
+  current_node_cert: NodeIdentityCertificate;
+  current_issuing_principal_cert: PrincipalCertificate;
+  rotation_cert: FederationRootRotationCertificate;
+  node_signature: string;
+}
+
+class ReissueNodeCertFailure extends Error {
+  constructor(readonly auditReason: string) {
+    super(auditReason);
+  }
+}
+
+async function handleReissueNodeCert(
+  deps: V1FederationDeps,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const body = await readJsonBody(req, V1_FEDERATION_REISSUE_NODE_CERT_MAX_BODY_BYTES);
+  if (!isRecord(body)) {
+    await auditReissueFailure(
+      deps,
+      "v1_federation_reissue_node_cert",
+      reissueRequestNodeId(body),
+      "malformed_or_oversized_body",
+    );
+    denyForbidden(res);
+    return;
+  }
+
+  if (body.action === "challenge") {
+    await handleReissueNodeCertChallenge(deps, body, res);
+    return;
+  }
+  if (body.action === "complete") {
+    await handleReissueNodeCertComplete(deps, body, res);
+    return;
+  }
+
+  await auditReissueFailure(
+    deps,
+    "v1_federation_reissue_node_cert",
+    reissueRequestNodeId(body),
+    "malformed_request",
+  );
+  denyForbidden(res);
+}
+
+async function handleReissueNodeCertChallenge(
+  deps: V1FederationDeps,
+  body: Record<string, unknown>,
+  res: ServerResponse,
+): Promise<void> {
+  const operation = "v1_federation_reissue_node_cert_challenge";
+  const nodeId = typeof body.node_id === "string" && body.node_id.length > 0
+    ? body.node_id
+    : null;
+  const ctx = deps.getContext();
+  const unavailable = !deps.isEnabled() || ctx === null;
+  if (nodeId === null) {
+    await auditReissueFailure(deps, operation, "peer", "malformed_request");
+    denyForbidden(res);
+    return;
+  }
+  if (unavailable || !federationContextHasIssuerAuthority(ctx)) {
+    await auditReissueFailure(
+      deps,
+      operation,
+      nodeId,
+      unavailable ? "federation_disabled" : "issuer_authority_unavailable",
+    );
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await auditReissueFailure(deps, operation, nodeId, "root_revoked");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  let revoked: boolean;
+  try {
+    revoked = deps.isNodeRevoked(nodeId);
+  } catch {
+    await auditReissueFailure(deps, operation, nodeId, "revocation_state_unavailable");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+  if (revoked) {
+    await auditReissueFailure(deps, operation, nodeId, "node_revoked");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  let issued: FederationReissueChallenge;
+  try {
+    issued = await deps.issueReissueChallenge({
+      fortressId: ctx.fortressId,
+      nodeId,
+    });
+  } catch {
+    await auditReissueFailure(deps, operation, nodeId, "challenge_store_unavailable");
+    writeReissueChallenge(res, dummyReissueChallenge());
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: nodeId,
+    details: { challenge_id: issued.challenge_id, expires_at: issued.expires_at },
+  });
+  writeReissueChallenge(res, issued);
+}
+
+function writeReissueChallenge(
+  res: ServerResponse,
+  challenge: FederationReissueChallenge,
+): void {
+  writeJson(res, 200, {
+    request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    ...challenge,
+  });
+}
+
+function dummyReissueChallenge(): FederationReissueChallenge {
+  return {
+    challenge_id: randomUUID(),
+    challenge: toBase64url(randomBytes(32)),
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+}
+
+async function handleReissueNodeCertComplete(
+  deps: V1FederationDeps,
+  body: Record<string, unknown>,
+  res: ServerResponse,
+): Promise<void> {
+  const operation = "v1_federation_reissue_node_cert";
+  const request = parseReissueNodeCertComplete(body);
+  const ctx = deps.getContext();
+  const unavailable = !deps.isEnabled() || ctx === null;
+  if (request === null || unavailable || !federationContextHasIssuerAuthority(ctx)) {
+    await auditReissueFailure(deps, operation, reissueRequestNodeId(body), unavailable
+      ? "federation_disabled"
+      : request === null
+        ? "malformed_request"
+        : "issuer_authority_unavailable");
+    denyForbidden(res);
+    return;
+  }
+
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await auditReissueFailure(deps, operation, request.node_id, "root_revoked");
+    denyForbidden(res);
+    return;
+  }
+
+  let consumed: boolean;
+  try {
+    consumed = await deps.consumeReissueChallenge({
+      fortressId: ctx.fortressId,
+      nodeId: request.node_id,
+      challengeId: request.challenge_id,
+      challenge: request.challenge,
+    });
+  } catch {
+    consumed = false;
+  }
+  if (!consumed) {
+    await auditReissueFailure(deps, operation, request.node_id, "challenge_invalid");
+    denyForbidden(res);
+    return;
+  }
+
+  let certificate: NodeIdentityCertificate;
+  try {
+    certificate = reissueNodeCertificate(deps, ctx, request);
+  } catch (err) {
+    await auditReissueFailure(
+      deps,
+      operation,
+      request.node_id,
+      err instanceof ReissueNodeCertFailure
+        ? err.auditReason
+        : "certificate_issue_failed",
+    );
+    denyForbidden(res);
+    return;
+  }
+
+  await deps.audit({
+    operation,
+    result: "success",
+    identityId: request.node_id,
+    details: {
+      node_id: request.node_id,
+      rotation_serial: request.rotation_cert.rotation_serial,
+      expires_at: certificate.expires_at ?? null,
+    },
+  });
+  writeJson(res, 200, {
+    reissued: true,
+    request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+    node_id: request.node_id,
+    certificate,
+    issuing_principal_cert: ctx.issuingPrincipalCert,
+    pinned_master: ctx.pinnedMasterPubkey,
+  });
+}
+
+function reissueNodeCertificate(
+  deps: V1FederationDeps,
+  ctx: FederationIssuerContext,
+  request: ReissueNodeCertCompleteRequest,
+): NodeIdentityCertificate {
+  const rotationCert = request.rotation_cert;
+
+  // HOLE 2 (PQC downgrade): fail closed on a hybrid fortress. Hybrid reissue is
+  // out of scope for Slice 3c-2; accepting a classical-only rotation cert on a
+  // hybrid (Ed25519+ML-DSA-65) fortress would silently downgrade the
+  // post-quantum root (the classical `samePinnedMaster` compares only the
+  // Ed25519 half). Refuse the endpoint entirely rather than verify half the
+  // binding. Matches the fail-closed contract on
+  // `FederationRootRotationCertificate.hybrid_rotation` (mesh/types.ts).
+  if (ctx.isHybrid === true) {
+    throw new ReissueNodeCertFailure("hybrid_reissue_unsupported");
+  }
+  // Defense in depth: a classical issuer must never process a cert that even
+  // CARRIES a hybrid binding (it cannot verify the ML-DSA-65 half).
+  if (!isRecord(rotationCert) || rotationCert.hybrid_rotation !== undefined) {
+    throw new ReissueNodeCertFailure("hybrid_reissue_unsupported");
+  }
+
+  // HOLE 1 (forged old master): pin the predecessor master from THIS fortress's
+  // OWN durable rotation lineage, NEVER from the request. The endpoint is
+  // pre-session / unauthenticated, so the only safe anchor for the "old" master
+  // is the rotation cert the fortress itself adopted at its last
+  // `rotate-root --renew` (carried in the trust-root record -> ctx). If the
+  // fortress never rotated, there is no predecessor to chain an old K1 cert to:
+  // the reissue-with-rotation path fails closed.
+  const recordedRotationCert = ctx.recordedRotationCert;
+  if (
+    recordedRotationCert === undefined ||
+    ctx.recordedRotationSerial === undefined
+  ) {
+    throw new ReissueNodeCertFailure("no_recorded_rotation_lineage");
+  }
+  // The submitted rotation cert must be byte-identical (canonical-JSON equal) to
+  // the one the fortress persisted. This is the strongest tie: an attacker
+  // cannot swap in a self-minted predecessor master, replay a stale serial, or
+  // alter the rotated_at / signature, because anything but the exact recorded
+  // cert is rejected here.
+  if (canonicalJson(rotationCert) !== canonicalJson(recordedRotationCert)) {
+    throw new ReissueNodeCertFailure("rotation_cert_not_recorded_lineage");
+  }
+  if (recordedRotationCert.fortress_id !== ctx.fortressId) {
+    throw new ReissueNodeCertFailure("rotation_cert_invalid");
+  }
+  // Predecessor master pinned from the RECORDED cert. created_at is not consumed
+  // by the verifiers (they key only on public_key + fortress_id); we carry the
+  // recorded rotated_at for shape completeness.
+  const oldPinnedMaster: FortressMasterPublicKey = {
+    public_key: recordedRotationCert.old_master_pubkey,
+    fortress_id: recordedRotationCert.fortress_id,
+    created_at: recordedRotationCert.rotated_at,
+  };
+
+  if (rootRevokedFailClosed(deps, recordedRotationCert.old_master_pubkey)) {
+    throw new ReissueNodeCertFailure("old_root_revoked");
+  }
+  try {
+    // minSerial = adopted serial - 1 so the recorded serial itself is accepted
+    // while any serial <= the predecessor is rejected (rollback/replay proof,
+    // even within genuine lineage).
+    verifyFederationRootRotationCertificate(recordedRotationCert, oldPinnedMaster, {
+      minSerial: ctx.recordedRotationSerial - 1,
+    });
+  } catch {
+    throw new ReissueNodeCertFailure("rotation_cert_invalid");
+  }
+  if (!samePinnedMaster(recordedRotationCert.new_master, ctx.pinnedMasterPubkey)) {
+    throw new ReissueNodeCertFailure("rotation_cert_not_current_root");
+  }
+
+  const nodeCert = request.current_node_cert;
+  const principalCert = request.current_issuing_principal_cert;
+  if (nodeCert.node_id !== request.node_id || nodeCert.fortress_id !== ctx.fortressId) {
+    throw new ReissueNodeCertFailure("old_cert_chain_invalid");
+  }
+  try {
+    verifyCertChain(nodeCert, principalCert, oldPinnedMaster);
+  } catch {
+    throw new ReissueNodeCertFailure("old_cert_chain_invalid");
+  }
+
+  let revoked: boolean;
+  try {
+    revoked = deps.isNodeRevoked(request.node_id);
+  } catch {
+    throw new ReissueNodeCertFailure("revocation_state_unavailable");
+  }
+  if (revoked) throw new ReissueNodeCertFailure("node_revoked");
+
+  let nodePubkey: Uint8Array;
+  let signature: Uint8Array;
+  try {
+    nodePubkey = fromBase64url(nodeCert.node_pubkey);
+    signature = fromBase64url(request.node_signature);
+  } catch {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+  if (nodePubkey.length !== 32 || signature.length !== 64) {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+  const proofMessage = buildFederationReissueNodeCertProofMessage({
+    fortressId: ctx.fortressId,
+    nodeId: request.node_id,
+    challengeId: request.challenge_id,
+    challenge: request.challenge,
+    currentNodeCert: nodeCert,
+    currentIssuingPrincipalCert: principalCert,
+    rotationCert,
+  });
+  if (!verify(proofMessage, signature, nodePubkey)) {
+    throw new ReissueNodeCertFailure("proof_invalid");
+  }
+
+  const renewal = normalizeFederationNodeCertificateRenewalConfig(
+    ctx.nodeCertificateRenewal,
+  );
+  const expiresAt = new Date(renewal.now() + renewal.certLifetimeMs).toISOString();
+  try {
+    return issueNodeIdentityCertificate({
+      node_id: request.node_id,
+      node_pubkey: nodePubkey,
+      node_mode: nodeCert.node_mode,
+      fortress_id: ctx.fortressId,
+      capabilities: nodeCert.capabilities,
+      parent_chain: {
+        fortress_master_pubkey: ctx.pinnedMasterPubkey.public_key,
+        principal_id: ctx.issuingPrincipalCert.principal_id,
+        principal_pubkey: ctx.issuingPrincipalCert.principal_pubkey,
+      },
+      principal_private_key: ctx.getIssuingPrincipalPrivateKey(),
+      master_private_key: ctx.getMasterPrivateKey?.(),
+      expires_at: expiresAt,
+      ...(typeof nodeCert.tee_attestation_hash === "string"
+        ? { tee_attestation_hash: nodeCert.tee_attestation_hash }
+        : {}),
+    });
+  } catch {
+    throw new ReissueNodeCertFailure("certificate_issue_failed");
+  }
+}
+
+export function buildFederationReissueNodeCertProofMessage(params: {
+  fortressId: string;
+  nodeId: string;
+  challengeId: string;
+  challenge: string;
+  currentNodeCert: NodeIdentityCertificate;
+  currentIssuingPrincipalCert: PrincipalCertificate;
+  rotationCert: FederationRootRotationCertificate;
+}): Uint8Array {
+  return new TextEncoder().encode(
+    canonicalJson({
+      domain: FEDERATION_REISSUE_NODE_CERT_PROOF_DOMAIN,
+      request_version: FEDERATION_REISSUE_NODE_CERT_REQUEST_VERSION,
+      fortress_id: params.fortressId,
+      node_id: params.nodeId,
+      challenge_id: params.challengeId,
+      challenge: params.challenge,
+      current_node_cert_sha256: sha256Canonical(params.currentNodeCert),
+      current_issuing_principal_cert_sha256: sha256Canonical(
+        params.currentIssuingPrincipalCert,
+      ),
+      rotation_cert_sha256: sha256Canonical(params.rotationCert),
+    }),
+  );
+}
+
+function sha256Canonical(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("base64url");
+}
+
+function parseReissueNodeCertComplete(
+  body: Record<string, unknown>,
+): ReissueNodeCertCompleteRequest | null {
+  if (
+    typeof body.node_id !== "string" ||
+    body.node_id.length === 0 ||
+    typeof body.challenge_id !== "string" ||
+    body.challenge_id.length === 0 ||
+    typeof body.challenge !== "string" ||
+    body.challenge.length === 0 ||
+    typeof body.node_signature !== "string" ||
+    body.node_signature.length === 0 ||
+    !isRecord(body.current_node_cert) ||
+    !isRecord(body.current_issuing_principal_cert) ||
+    !isRecord(body.rotation_cert)
+  ) {
+    return null;
+  }
+  return {
+    node_id: body.node_id,
+    challenge_id: body.challenge_id,
+    challenge: body.challenge,
+    current_node_cert: body.current_node_cert as unknown as NodeIdentityCertificate,
+    current_issuing_principal_cert:
+      body.current_issuing_principal_cert as unknown as PrincipalCertificate,
+    rotation_cert: body.rotation_cert as unknown as FederationRootRotationCertificate,
+    node_signature: body.node_signature,
+  };
+}
+
+function samePinnedMaster(
+  a: FortressMasterPublicKey,
+  b: FortressMasterPublicKey,
+): boolean {
+  return (
+    a.public_key === b.public_key &&
+    a.fortress_id === b.fortress_id &&
+    a.created_at === b.created_at
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function auditReissueFailure(
+  deps: V1FederationDeps,
+  operation: string,
+  identityId: string,
+  reasonCode: string,
+): Promise<void> {
+  await deps.audit({
+    operation,
+    result: "failure",
+    identityId,
+    details: { reason: reasonCode },
+  });
+}
+
+function reissueRequestNodeId(body: unknown): string {
+  if (isRecord(body) && typeof body.node_id === "string" && body.node_id.length > 0) {
+    return body.node_id;
+  }
+  return "peer";
+}
+
 /**
- * Cross-MACHINE peer sync (PR-A5 — the federation marquee). Unlike `/sync`,
- * which authorizes the request with THIS fortress's own operator signature
- * (correct only when the caller is the same operator process — the A4
- * "loopback position-only" path), `/sync/peer` accepts a sync from ANOTHER of
- * the operator's machines. The session token still gates network access, but
- * trust in the EVENTS comes from the {@link FederationSyncEnvelope}: the peer
- * presents its node identity certificate, which the recipient verifies chains
- * to its OWN pinned fortress-master (`verifySyncEnvelope` → `verifyCertChain`).
+ * Cross-MACHINE peer sync (PR-A5 marquee; relaxed to pre-session in Federation
+ * P1). Unlike `/sync`, which authorizes the request with THIS fortress's own
+ * operator signature (correct only when the caller is the same operator process,
+ * the A4 "loopback position-only" path), `/sync/peer` accepts a sync from
+ * ANOTHER of the operator's machines. There is NO session and NO operator login
+ * on this route (Federation P1: it moved to the pre-session node-cert-auth
+ * class); trust in the EVENTS comes SOLELY from the {@link
+ * FederationSyncEnvelope}: the peer presents its node identity certificate, which
+ * the recipient verifies chains to its OWN pinned fortress-master
+ * (`verifySyncEnvelope` → `verifyCertChain`). That single cryptographic
+ * verification is the only trust decision.
  *
  * This is the "no implicit trust across the boundary" rule (CLAUDE.md
  * constraint 4) realized for the cross-machine case: a node whose certificate
- * does NOT chain to this fortress's master — a different operator — is rejected
- * with the generic 403 even with a valid session. The hash-chained log defeats
- * per-event tampering/replay; the envelope high-water defeats whole-envelope
- * rollback. No private key crosses the wire (constraint 6).
+ * does NOT chain to this fortress's master (a different operator) is rejected
+ * with the generic 403. The hash-chained log defeats per-event tampering/replay;
+ * the envelope high-water defeats whole-envelope rollback. No private key crosses
+ * the wire (constraint 6).
+ *
+ * NO MEMBERSHIP ORACLE (Federation P1 §2): a pre-session caller must learn
+ * nothing about whether federation is enabled, whether it is provisioned, or
+ * WHICH check failed. Every rejection (federation off/unprovisioned, malformed
+ * or over-cap body, envelope verification failure) collapses to the SAME generic
+ * 403 on the wire. The audit log records the precise reason; the response never
+ * does. (Previously this route returned 503 when federation was disabled, which,
+ * now that there is no session in front, would have been an enabled-state
+ * oracle for an unauthenticated probe.)
+ *
+ * CONFIDENTIALITY HONESTY (Federation P1 §5, CC-1): the signed envelope provides
+ * INTEGRITY + AUTHENTICITY, NOT confidentiality. The default listener is plain
+ * HTTP; over it the events and the node roster cross the wire in cleartext. A
+ * pre-session `/sync/peer` deployment therefore REQUIRES a confidential composed
+ * transport (Tailscale / WireGuard / a TLS-terminating front); the route does
+ * NOT terminate TLS itself (out of scope; transport is composed per the 06-24
+ * federation decision).
  *
  * On accept, the recipient appends the verified slice, records the new
  * per-sender high-water, and answers with its OWN outbound slice wrapped in a
@@ -930,14 +1755,16 @@ async function handlePeerSync(
   deps: V1FederationDeps,
   req: IncomingMessage,
   res: ServerResponse,
-  _claims: V1SessionClaims,
 ): Promise<void> {
   const operation = "v1_federation_sync_peer";
   const ctx = deps.getContext();
 
   // Federation must be enabled and provisioned (we need the pinned master to
-  // verify the peer's chain). Honest authenticated 503 — the session already
-  // proved /v1 access, so this is not an auth oracle.
+  // verify the peer's chain). NO-ORACLE (P1 §2): there is no session in front of
+  // this route now, so a distinguishable 503 would tell an unauthenticated probe
+  // that this fortress is NOT a provisioned federation member. Collapse it to the
+  // SAME generic 403 every other denial returns; the audit entry keeps the
+  // precise reason.
   if (!deps.isEnabled() || ctx === null) {
     await deps.audit({
       operation,
@@ -945,13 +1772,24 @@ async function handlePeerSync(
       identityId: "peer",
       details: { reason: "federation_disabled" },
     });
-    writeJson(res, 503, { error: "unavailable" });
+    denyForbidden(res);
     return;
   }
 
+  // NO-ORACLE (P1 §2): a malformed or over-cap body also collapses to the same
+  // generic 403. The body cap still rejects oversized peer traffic cheaply (over
+  // V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES -> readJsonBody returns undefined
+  // before JSON.parse), but the WIRE response is identical to a verify failure so
+  // a probe cannot distinguish "too big / not JSON" from "bad envelope".
   const body = await readJsonBody(req, V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES);
   if (typeof body !== "object" || body === null) {
-    writeJson(res, 400, { error: "bad request" });
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: peerSenderNodeId(body),
+      details: { reason: "malformed_or_oversized_body" },
+    });
+    denyForbidden(res);
     return;
   }
 
@@ -964,6 +1802,8 @@ async function handlePeerSync(
     recipientNodeId: ctx.nodeId,
     acceptedHighWaterFor: (senderNodeId) => deps.acceptedHighWaterFor(senderNodeId),
     isNodeRevoked: (senderNodeId) => deps.isNodeRevoked(senderNodeId),
+    // RR-1 pre-wire (feature-inert until rotate-root Slice 3c populates the set).
+    isRootRevoked: (masterPubkeyB64u) => deps.isRootRevoked(masterPubkeyB64u),
   });
   if (!verification.ok) {
     await deps.audit({
@@ -988,10 +1828,26 @@ async function handlePeerSync(
   //     to a huge value with a content-free envelope and self-DoS every future
   //     legitimate sync (codex PR-A5 r2 MEDIUM). High-water is a property of
   //     committed work, never of an empty signed envelope.
-  const append = deps.appendFederationEvents(verification.events, {
-    senderNodeId: verification.senderNodeId,
-    wireVersion: verification.wireVersion,
-  });
+  let append: FederationAppendResult;
+  try {
+    append = await deps.appendFederationEvents(verification.events, {
+      senderNodeId: verification.senderNodeId,
+      wireVersion: verification.wireVersion,
+    });
+  } catch {
+    // A folded revocation could not be durably persisted (Federation 3/3b P0
+    // fail-closed): deny rather than acknowledge an accept whose revocation
+    // state did not reach disk. The in-memory revocation stays applied
+    // (grow-only fail-safe); the peer's retry re-persists the whole snapshot.
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: verification.senderNodeId,
+      details: { reason: "durable_state_persist_failed" },
+    });
+    denyForbidden(res);
+    return;
+  }
 
   let senderRevokedAfterAcceptance: boolean;
   try {
@@ -1008,11 +1864,27 @@ async function handlePeerSync(
   }
 
   if (append.rejected.length === 0 && append.accepted.length > 0) {
-    deps.recordAcceptedHighWater(
+    const highWaterPersisted = await deps.recordAcceptedHighWater(
       verification.senderNodeId,
       verification.syncHighWater,
       verification.senderNodeCert,
     );
+    if (!highWaterPersisted) {
+      // The anti-replay high-water advance did not durably commit (Federation
+      // 3/3b P0 fail-closed): deny rather than let the peer believe its slice
+      // was accepted with a high-water that a restart would forget (which would
+      // re-open the very replay window this slice closes). The events appended
+      // above are still hash-chained + deduped on the next attempt, so a retry
+      // is safe; an un-acknowledged accept is the correct fail-closed posture.
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: verification.senderNodeId,
+        details: { reason: "durable_state_persist_failed" },
+      });
+      denyForbidden(res);
+      return;
+    }
   }
 
   // The reciprocal envelope is signed by THIS node and therefore may only carry
@@ -1026,9 +1898,24 @@ async function handlePeerSync(
     : deps
         .listFederationEvents(verification.cursor ?? undefined)
         .filter((event) => event.origin_node_id === ctx.nodeId);
-  const responseEnvelope = senderRevokedAfterAcceptance
-    ? null
-    : buildReciprocalEnvelope(deps, ctx, verification.senderNodeId, outbound);
+  let responseEnvelope: FederationSyncEnvelope | null;
+  try {
+    responseEnvelope = senderRevokedAfterAcceptance
+      ? null
+      : await buildReciprocalEnvelope(
+          deps,
+          ctx,
+          verification.senderNodeId,
+          outbound,
+        );
+  } catch {
+    // The outbound high-water advance could not be durably persisted
+    // (Federation 3/3b P0 fail-closed). The inbound slice was already accepted
+    // and its high-water persisted above, so do NOT fail the whole exchange:
+    // simply omit the reciprocal envelope. The peer re-requests on its next
+    // sync; a missing reciprocal slice is a benign degrade, never a replay risk.
+    responseEnvelope = null;
+  }
 
   await deps.audit({
     operation,
@@ -1065,22 +1952,33 @@ async function handlePeerSync(
  * private key) rather than forging an attribution. The caller must not emit
  * bare events as a fallback. The node private key is transient and never logged.
  */
-function buildReciprocalEnvelope(
+async function buildReciprocalEnvelope(
   deps: V1FederationDeps,
   ctx: FederationContext,
   recipientNodeId: string,
   outbound: FederationEvent[],
-): FederationSyncEnvelope | null {
+): Promise<FederationSyncEnvelope | null> {
   deps.renewLocalNodeCertificate();
   const nodeCert = ctx.localNodeCert;
   const nodePrivateKey = ctx.getLocalNodePrivateKey?.();
   if (!nodeCert || !nodePrivateKey) return null;
+  // Reserve + DURABLY persist the next outbound high-water BEFORE signing, so a
+  // restart can never re-emit an already-used counter. A persist failure throws
+  // out of nextOutboundHighWater; the caller treats that as "no reciprocal
+  // slice" (benign degrade), never as a counter it already handed out.
+  let syncHighWater: number;
+  try {
+    syncHighWater = await deps.nextOutboundHighWater();
+  } catch (err) {
+    nodePrivateKey.fill(0);
+    throw err;
+  }
   try {
     return signSyncEnvelope({
       fortressId: ctx.fortressId,
       senderNodeId: ctx.nodeId,
       recipientNodeId,
-      syncHighWater: deps.nextOutboundHighWater(),
+      syncHighWater,
       events: outbound,
       senderNodeCert: nodeCert,
       issuingPrincipalCert: ctx.issuingPrincipalCert,
@@ -1098,6 +1996,25 @@ function peerSenderNodeId(body: unknown): string {
     if (typeof id === "string" && id.length > 0) return id;
   }
   return "unknown";
+}
+
+/**
+ * RR-1 fail-closed evaluation of the revoked-ROOT predicate (Federation 3/3b
+ * P0). Returns true (-> the caller denies) when the fortress master is revoked
+ * OR when the predicate throws (revocation state unevaluable). Feature-inert in
+ * P0 because the revoked-root set is empty until rotate-root Slice 3c populates
+ * it; centralizing the throw-is-deny rule here keeps every chokepoint identical.
+ */
+function rootRevokedFailClosed(
+  deps: V1FederationDeps,
+  masterPubkeyB64u: string,
+): boolean {
+  if (typeof deps.isRootRevoked !== "function") return true;
+  try {
+    return deps.isRootRevoked(masterPubkeyB64u);
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -1130,6 +2047,22 @@ export async function handleFederationCeremony(
       details: {
         reason: !deps.isEnabled() || ctx === null ? "federation_unavailable" : "malformed_request",
       },
+    });
+    denyUnauthorized(res);
+    return true;
+  }
+
+  // RR-1 pre-wire (feature-inert until rotate-root Slice 3c). A join against a
+  // fortress whose own pinned master (root) has been revoked must fail closed,
+  // so a compromised root cannot keep admitting new nodes. Empty set in P0 (this
+  // never fires today); wired so 3c only fills the set. Throw -> deny. Collapses
+  // to the SAME uniform 401 as every other ceremony denial (no oracle).
+  if (rootRevokedFailClosed(deps, ctx.pinnedMasterPubkey.public_key)) {
+    await deps.audit({
+      operation,
+      result: "failure",
+      identityId: request.bootstrap_token.intended_node_id,
+      details: { reason: "root_revoked" },
     });
     denyUnauthorized(res);
     return true;
@@ -1236,6 +2169,18 @@ function parseFederationEvents(events: unknown[]): FederationEvent[] | null {
     });
   }
   return out;
+}
+
+function nextEvictionSerial(events: FederationEvent[]): number {
+  let max = 0;
+  for (const event of events) {
+    if (event.kind !== FEDERATION_NODE_EVICTION_EVENT_KIND) continue;
+    const serial = event.payload.eviction_serial;
+    if (typeof serial === "number" && Number.isSafeInteger(serial) && serial > max) {
+      max = serial;
+    }
+  }
+  return max + 1;
 }
 
 function parseSyncCursor(cursor: unknown): FederationSyncCursor | null {

@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AgentDetector
+import CastleWallIPC
 
 /// The native macOS app is a FRAME around the one Sanctuary posture board, not
 /// a parallel product (Dashboard one-surface spec §1, Delta Review Part C
@@ -15,7 +16,7 @@ import AgentDetector
 /// handful of actions that are inherently platform-native and cannot live on a
 /// web page: installing the system extension, enabling the network filter,
 /// approving the privileged helper, and launching the protect / unprotect
-/// process for an agent. We never reimplement the posture board in SwiftUI —
+/// process for an agent. We never reimplement the posture board in SwiftUI -
 /// that would fork the never-fake-green honesty model (see PostureWebView).
 ///
 /// This replaces the old two-tab (Agents / Activity) UI: both of those views
@@ -30,6 +31,27 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @AppStorage("hasCompletedFirstRun") private var hasCompletedFirstRun = false
+
+    /// Manual disarm latch: set by the Disarm button, cleared by the Arm
+    /// button. Persisted so a manual disarm survives an app relaunch -
+    /// auto-arm must never silently undo the operator's explicit decision.
+    @AppStorage("operatorDisarmed") private var operatorDisarmed = false
+
+    /// Arm gate input: true only when active-config discovery resolves to a
+    /// daemon that proves possession of the pinned fortress key via the IPC
+    /// handshake. This supports the current operator daemon's legacy discovery
+    /// writer without trusting the legacy file itself; a forged /tmp path cannot
+    /// sign the challenge.
+    @State private var daemonUpWithPolicy = false
+    @State private var daemonProbeGeneration = 0
+    @State private var didSubmitLaunchActivationRefresh = false
+
+    /// Periodic status tick: keeps the Arm gate + helper status live while the
+    /// app sits open, so "start the daemon, watch the Arm button light up" works
+    /// without bouncing the app. Both probes are cheap (one
+    /// short authenticated IPC probe, one SMAppService status read).
+    private let statusTick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
     @State private var protectingAgent: String?
     @State private var showRestartWarning: AgentRecord?
     @State private var errorMessage: String?
@@ -79,6 +101,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 720, minHeight: 560)
         .task {
+            refreshProtectionInputs()
+            refreshActivatedSystemExtensionIfNeeded()
+            evaluateAutoArm()
             await agentDetector.scan()
             await serverBridge.checkServerHealth()
             await serverBridge.refreshWallArmState()
@@ -92,22 +117,46 @@ struct ContentView: View {
             }
         }
         .onChange(of: scenePhase) { newPhase in
-            // Re-read helper status + arm state when the app reactivates so the
-            // badge and approval banner reflect reality the moment the operator
-            // returns from System Settings.
+            // Re-read helper + daemon status AND the evidence-gated arm/server
+            // state when the app reactivates: the approval banner clears the
+            // moment the operator flips the System Settings toggle and returns,
+            // auto-arm is re-evaluated on the same path instead of only at the
+            // first onAppear, and the evidence-gated badge
+            // tracks the server posture the embedded board reads. Note
+            // `refreshProtectionInputs()` already re-reads the helper status, so
+            // it covers main's prior `signerHelperManager.refreshStatus()`.
             if newPhase == .active {
-                signerHelperManager.refreshStatus()
+                refreshProtectionInputs()
+                refreshActivatedSystemExtensionIfNeeded()
+                evaluateAutoArm()
                 Task {
                     await serverBridge.checkServerHealth()
                     await serverBridge.refreshWallArmState()
                 }
             }
         }
+        .onReceive(statusTick) { _ in
+            refreshProtectionInputs()
+            evaluateAutoArm()
+        }
+        .onChange(of: signerHelperManager.helperState) { newState in
+            // The moment the operator approves the helper (state flips to
+            // .enabled), re-evaluate arming - no relaunch required.
+            if newState == .enabled {
+                refreshActivatedSystemExtensionIfNeeded()
+                refreshProtectionInputs()
+                evaluateAutoArm()
+            }
+        }
         .onChange(of: systemExtensionManager.extensionState) { newState in
-            if newState == .activated,
-               filterConfigurationManager.filterState != .enabled,
-               filterConfigurationManager.filterState != .enabling {
-                filterConfigurationManager.enableFilter()
+            // Final arming step once sysext activation lands. Re-checked
+            // against the full fail-closed gate: the helper/daemon state may
+            // have changed while activation was in flight, and an operator
+            // disarm during that window must win.
+            if newState == .activated {
+                Task {
+                    await enableFilterAfterActivationIfAllowed()
+                }
             }
         }
         .alert("Restart Required", isPresented: .init(
@@ -139,7 +188,7 @@ struct ContentView: View {
         // `errorMessage` while `serverDownView` (not the web view) is rendered;
         // keeping the toast outside the `.reachable` branch is what makes that
         // error visible instead of silently lost. Posture truth never renders
-        // here — the toast carries only Mac-control action feedback.
+        // here - the toast carries only Mac-control action feedback.
         ZStack(alignment: .bottom) {
             // Three honest surface states (Slice 1a design §3.1), read from
             // `serverBridge.surfaceState` (derived in `postureSurfaceState`):
@@ -375,31 +424,275 @@ struct ContentView: View {
     // MARK: - Header (native strip: badge + Mac-only controls)
 
     private var headerBar: some View {
-        HStack(spacing: 12) {
-            Text("Sanctuary")
-                .font(.title2)
-                .fontWeight(.semibold)
+        // The header carries BOTH the local Arm/Disarm action control and the
+        // evidence-gated posture badge. The control row is an
+        // HStack; the blocked-arm reason stacks UNDER it in a VStack so a
+        // refused arm is never silent. Posture TRUTH = `armBadge` (server-side
+        // evidence-gated, the SOLE green source); the local Arm/Disarm control
+        // and `sysextStatusBadge` are local-action / install-config surfaces and
+        // never produce the green posture badge.
+        VStack(spacing: 4) {
+            HStack(spacing: 12) {
+                Text("Sanctuary")
+                    .font(.title2)
+                    .fontWeight(.semibold)
 
-            Spacer()
+                Spacer()
 
-            // Mac-only control: protect/unprotect launch. This is the native
-            // action surface for `sanctuary wrap`; the posture *truth* about
-            // which agents are protected lives on the embedded board.
-            if serverBridge.sanctuaryPath != nil && hasCompletedFirstRun {
-                agentControlsButton
+                // Mac-only control: protect/unprotect launch. This is the native
+                // action surface for `sanctuary wrap`; the posture *truth* about
+                // which agents are protected lives on the embedded board.
+                if serverBridge.sanctuaryPath != nil && hasCompletedFirstRun {
+                    agentControlsButton
+                }
+
+                // Manual Arm/Disarm action control + local install/config sysext
+                // badge. These drive the local action only; they are NOT the
+                // posture-truth badge.
+                protectionControl
+
+                sysextStatusBadge
+
+                // Evidence-gated posture badge (main): the SOLE source of
+                // "armed = green", read from the same server posture the
+                // embedded board polls. Never green from local state.
+                armBadge
             }
 
-            armBadge
+            // A blocked Arm must never be silent: name the missing precondition
+            // right under the control.
+            if !isArmed, let reason = armBlockedReason {
+                HStack {
+                    Spacer()
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    // MARK: - Arm / Disarm
+
+    /// Armed = the content filter is on (or coming up). The sysext being
+    /// activated alone is not armed - only the filter actually intercepts
+    /// flows.
+    private var isArmed: Bool {
+        filterConfigurationManager.filterState == .enabled ||
+            filterConfigurationManager.filterState == .enabling
+    }
+
+    private var canArm: Bool {
+        ProtectionGate.canArm(
+            helperReady: signerHelperManager.isReady,
+            daemonUpWithPolicy: daemonUpWithPolicy
+        )
+    }
+
+    private var armBlockedReason: String? {
+        ProtectionGate.armBlockedReason(
+            helperReady: signerHelperManager.isReady,
+            daemonUpWithPolicy: daemonUpWithPolicy
+        )
+    }
+
+    /// The manual control: Disarm whenever armed OR while a disarm attempt is
+    /// pending/unverified (ALWAYS enabled - the operator can stand the wall
+    /// down unconditionally, and a failed disarm must keep the retry on
+    /// screen), Arm otherwise (enabled only when the fail-closed gate passes).
+    @ViewBuilder
+    private var protectionControl: some View {
+        if ProtectionGate.disarmControlVisible(
+            isArmed: isArmed,
+            disarmPending: filterConfigurationManager.disarmPending
+        ) {
+            Button("Disarm") {
+                disarmProtection()
+            }
+            .disabled(!ProtectionGate.canDisarm())
+            .help(
+                filterConfigurationManager.disarmPending && !isArmed
+                    ? "The last disarm was not verified complete - retry until the filter is confirmed off."
+                    : "Turn the Castle Wall off. Always available."
+            )
+        } else {
+            Button("Arm") {
+                armProtection()
+            }
+            .disabled(!canArm)
+            .help(armBlockedReason ?? "Turn the Castle Wall on.")
+        }
+    }
+
+    /// Refresh the inputs the arm gate + banners read: helper status and
+    /// authenticated daemon readiness (active-config discovery + authenticated
+    /// IPC handshake). Called on scene activation and the status tick.
+    private func refreshProtectionInputs() {
+        signerHelperManager.refreshStatus()
+        refreshDaemonArmingReadiness(reevaluateAutoArm: true)
+    }
+
+    /// Re-submit activation once on launch / helper approval so a newer bundled
+    /// sysext replaces an older running one. This must not depend on the filter
+    /// being disabled: a fresh launch can start at `.unknown` while the filter is
+    /// already enabled from a previous app session.
+    private func refreshActivatedSystemExtensionIfNeeded() {
+        guard !didSubmitLaunchActivationRefresh,
+              signerHelperManager.isReady else {
+            return
+        }
+        switch systemExtensionManager.extensionState {
+        case .unknown, .activated:
+            didSubmitLaunchActivationRefresh = true
+            systemExtensionManager.activate()
+        default:
+            break
+        }
+    }
+
+    private func refreshDaemonArmingReadiness(reevaluateAutoArm: Bool = false) {
+        daemonProbeGeneration += 1
+        let generation = daemonProbeGeneration
+        daemonUpWithPolicy = false
+        Task {
+            let ready = await DaemonArmingProbe.authenticatedDaemonPresent()
+            await MainActor.run {
+                guard daemonProbeGeneration == generation else { return }
+                daemonUpWithPolicy = ready
+                if ready && reevaluateAutoArm {
+                    evaluateAutoArm()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func recheckDaemonArmingReadinessNow() async -> Bool {
+        daemonProbeGeneration += 1
+        let generation = daemonProbeGeneration
+        daemonUpWithPolicy = false
+        let ready = await DaemonArmingProbe.authenticatedDaemonPresent()
+        guard daemonProbeGeneration == generation else {
+            return false
+        }
+        daemonUpWithPolicy = ready
+        return ready
+    }
+
+    /// Auto-arm, re-evaluated on every refresh path - not a one-shot.
+    /// Only acts from a settled "filter off" state so transient states
+    /// (.loading at startup, .enabling mid-arm) and sticky ones
+    /// (.needsUserApproval, .error - which need the operator) never loop.
+    private func evaluateAutoArm() {
+        guard filterConfigurationManager.filterState == .disabled else { return }
+        // Auto-arm only drives from clean sysext states. In-flight, error,
+        // needs-approval, and reboot-gated states are operator territory - a
+        // 5s re-submit loop into a persistent error would churn forever.
+        switch systemExtensionManager.extensionState {
+        case .unknown, .deactivated, .activated:
+            break
+        default:
+            return
+        }
+        guard ProtectionGate.shouldAutoArm(
+            canArm: canArm,
+            alreadyArmed: isArmed,
+            operatorDisarmed: operatorDisarmed
+        ) else { return }
+        armProtection()
+    }
+
+    /// Arm the wall. Fail-closed: re-probe the daemon at gesture time with the
+    /// authenticated daemon-readiness check and bail (never partially arm) if
+    /// the gate no longer passes. Also refuses to arm while a disarm attempt is
+    /// pending/unverified - the filter's true state is unknown then, and the
+    /// operator's standing order is "down".
+    private func armProtection() {
+        Task {
+            await armProtectionAfterProbe()
+        }
+    }
+
+    @MainActor
+    private func armProtectionAfterProbe() async {
+        guard !filterConfigurationManager.disarmPending else { return }
+        guard await recheckDaemonArmingReadinessNow() else { return }
+        guard canArm else { return }
+
+        operatorDisarmed = false
+
+        switch systemExtensionManager.extensionState {
+        case .activated:
+            // Re-submit the activation request so a newer bundled extension
+            // version replaces a running older one. macOS calls
+            // actionForReplacingExtension (-> .replace) only on a version diff
+            // and completes silently when unchanged; when activation completes,
+            // the extension-state observer re-probes before enabling the filter.
+            systemExtensionManager.activate()
+        case .activating, .deactivating, .activatedRequiresReboot, .needsUserApproval:
+            // In-flight, reboot-gated, or parked on the System Settings sysext
+            // approval: nothing sensible to re-submit now. The
+            // onChange(extensionState) hook finishes arming when activation
+            // lands.
+            break
+        case .unknown, .deactivated, .error:
+            // .error reachable only via the manual Arm button (auto-arm skips
+            // it) - an explicit operator retry.
+            systemExtensionManager.activate()
+        }
+    }
+
+    @MainActor
+    private func enableFilterAfterActivationIfAllowed() async {
+        guard filterConfigurationManager.filterState != .enabled,
+              filterConfigurationManager.filterState != .enabling,
+              !operatorDisarmed else {
+            return
+        }
+        guard await recheckDaemonArmingReadinessNow() else { return }
+        guard canArm else { return }
+        filterConfigurationManager.enableFilter()
+    }
+
+    /// Disarm the wall. Unconditional, and sticky: sets the operator-disarm
+    /// latch so auto-arm does not immediately re-arm.
+    private func disarmProtection() {
+        operatorDisarmed = true
+        filterConfigurationManager.disableFilter()
+    }
+
+    // MARK: - Badges (posture truth + local install/config)
+
+    /// Local install/config status pill: surfaces the LOCAL sysext / filter /
+    /// signer-helper state so the operator can see what still needs approval or
+    /// activation. This is install/config context
+    /// ONLY - it is explicitly NOT a protection determination and can NEVER show
+    /// green for "armed". The single evidence-gated green source is `armBadge`
+    /// below. Reuses the same `configHintColor`/`configHintLabel` derivation the
+    /// posture badge uses for its (non-green) fallback, so the two never drift.
+    private var sysextStatusBadge: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(configHintColor)
+                .frame(width: 8, height: 8)
+            Text(configHintLabel)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(configHintColor.opacity(0.1))
+        .cornerRadius(12)
+        .help("Local install/config state (helper, system extension, filter). Not a protection guarantee - the armed/protected truth is the badge to the right.")
     }
 
     /// The protection badge. Piece B: its GREEN now comes solely from the
     /// evidence-gated arm state (`/api/posture/castle-wall`), NOT from local
     /// sysext/filter/signer state. The local install/config state is surfaced
     /// only as secondary, clearly-labeled "install/config" context when the wall
-    /// is not evidenced-armed — it can never produce green on its own. This kills
+    /// is not evidenced-armed - it can never produce green on its own. This kills
     /// the second, audit-blind source of "is it armed" truth (Delta Review
     /// line 132): the native badge and the embedded board read the SAME source.
     private var armBadge: some View {
@@ -419,7 +712,7 @@ struct ContentView: View {
     }
 
     /// Green ONLY when the server reports evidence-gated `armed`. Everything
-    /// else is amber/red/gray — never green from local config alone.
+    /// else is amber/red/gray - never green from local config alone.
     private var armColor: Color {
         switch serverBridge.wallArmState {
         case .armed:
@@ -445,7 +738,7 @@ struct ContentView: View {
             return "Not Installed"
         case .unknown, .none:
             // Honest: we cannot confirm enforcement. Show the install/config
-            // state as the reason, labeled as config — not as "protected."
+            // state as the reason, labeled as config - not as "protected."
             return configHintLabel
         }
     }
@@ -457,7 +750,7 @@ struct ContentView: View {
             // board (posture-home-html.ts renderWall): only claim a producer
             // signature when the server reports `producer_signed`. On the macOS
             // channel-authenticated floor (no pinned producer key on this reader)
-            // we must NOT say "signed" — the two surfaces read the same source and
+            // we must NOT say "signed" - the two surfaces read the same source and
             // must agree (Piece B; H3 second-source honesty).
             switch serverBridge.producerAuthenticity {
             case .producerSigned:
@@ -485,7 +778,10 @@ struct ContentView: View {
         if case .error = signerHelperManager.helperState { return .red }
         if case .error = systemExtensionManager.extensionState { return .red }
         if case .error = filterConfigurationManager.filterState { return .red }
-        if signerHelperManager.helperState == .requiresApproval { return .yellow }
+        if signerHelperManager.helperState == .requiresApproval ||
+            signerHelperManager.helperState == .registering {
+            return .yellow
+        }
         if systemExtensionManager.extensionState == .needsUserApproval ||
             filterConfigurationManager.filterState == .needsUserApproval {
             return .yellow
@@ -498,11 +794,14 @@ struct ContentView: View {
         return .gray
     }
 
-    /// Secondary install/config label. Never says "protected" — that word is
+    /// Secondary install/config label. Never says "protected" - that word is
     /// reserved for the evidence-gated `.armed` state above.
     private var configHintLabel: String {
         if signerHelperManager.helperState == .requiresApproval {
             return "Needs Helper Approval"
+        }
+        if signerHelperManager.helperState == .registering {
+            return "Registering Helper…"
         }
         if case let .error(msg) = signerHelperManager.helperState {
             return "Helper Error: \(msg)"
@@ -527,7 +826,7 @@ struct ContentView: View {
             return "Activating..."
         }
         // Nothing is installed locally (fresh / uninstalled Mac): say so. We are
-        // NOT "checking enforcement" — there is nothing installed to check. This
+        // NOT "checking enforcement" - there is nothing installed to check. This
         // is honest copy for the cold/uninstalled case; "Checking enforcement..."
         // is reserved for when something IS installed but evidence isn't in yet.
         if configHintIsNotInstalled {
@@ -690,6 +989,18 @@ struct ContentView: View {
     @ViewBuilder
     private var helperStatusBanner: some View {
         switch signerHelperManager.helperState {
+        case .registering:
+            // Post-register settle window. Visible so the operator sees
+            // registration in progress.
+            helperBanner(
+                icon: "hourglass",
+                tint: .blue,
+                title: "Registering Sanctuary background helper…",
+                detail: "Waiting for macOS to accept the helper registration (a few seconds).",
+                actionLabel: "Open Settings"
+            ) {
+                signerHelperManager.openApprovalSettings()
+            }
         case .requiresApproval:
             helperBanner(
                 icon: "exclamationmark.shield.fill",
@@ -700,13 +1011,34 @@ struct ContentView: View {
             ) {
                 signerHelperManager.openApprovalSettings()
             }
+        case .notRegistered, .notFound:
+            // Post-register fallthrough. If a register attempt was made and BTM
+            // still reports nothing, give the operator an explicit path (retry
+            // + the settings pane) instead of nothing.
+            if signerHelperManager.hasAttemptedRegister {
+                helperBanner(
+                    icon: "exclamationmark.shield.fill",
+                    tint: .yellow,
+                    title: "Background helper not registered",
+                    detail: "macOS did not accept the helper registration yet. Retry, then enable Sanctuary-CastleWall under Allow in the Background.",
+                    actionLabel: "Retry",
+                    secondaryActionLabel: "Open Settings",
+                    secondaryAction: { signerHelperManager.openApprovalSettings() }
+                ) {
+                    signerHelperManager.register()
+                }
+            } else {
+                EmptyView()
+            }
         case let .error(msg):
             helperBanner(
                 icon: "xmark.octagon.fill",
                 tint: .red,
                 title: "Background helper error",
                 detail: msg,
-                actionLabel: "Retry"
+                actionLabel: "Retry",
+                secondaryActionLabel: "Open Settings",
+                secondaryAction: { signerHelperManager.openApprovalSettings() }
             ) {
                 signerHelperManager.register()
             }
@@ -721,6 +1053,8 @@ struct ContentView: View {
         title: String,
         detail: String,
         actionLabel: String,
+        secondaryActionLabel: String? = nil,
+        secondaryAction: (() -> Void)? = nil,
         action: @escaping () -> Void
     ) -> some View {
         HStack(spacing: 12) {
@@ -736,6 +1070,10 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
+            if let secondaryActionLabel, let secondaryAction {
+                Button(secondaryActionLabel, action: secondaryAction)
+                    .font(.subheadline)
+            }
             Button(actionLabel, action: action)
                 .font(.subheadline)
         }

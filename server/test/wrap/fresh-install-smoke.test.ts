@@ -310,6 +310,7 @@ describe("fresh-install onboarding smoke", () => {
     expect(v11BindingsSet).toBe(true);
     expect(loopbackAutoAuth).toBe(true);
     expect(castleWallMocks.runProvisionPin).toHaveBeenCalledWith(
+      [],
       expect.objectContaining({
         env: expect.objectContaining({
           SANCTUARY_STORAGE_PATH: fortressPath,

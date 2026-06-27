@@ -83,7 +83,10 @@ import {
 } from "./distress/local-secret.js";
 import { provisionOrLoadFederationTrustRoot } from "./mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "./mesh/federation-joiner-trust-root-store.js";
+import { provisionOrLoadOperatorCloudJoinedNode } from "./mesh/operator-cloud-joined-node-store.js";
 import { federationRotateRootInProgress } from "./mesh/federation-rotate-root.js";
+import { FederationSyncStateStore } from "./v1/federation-sync-state-store.js";
+import { FederationReissueChallengeStore } from "./v1/federation-reissue-challenge-store.js";
 import {
   BootstrapNonceStore,
   createStandaloneJoinApprover,
@@ -673,7 +676,66 @@ export async function startStandaloneDashboard(
     if (joinerRoot !== null) {
       // No approver: a joiner is a non-issuer and cannot run the approval gate.
       dashboard.setFederationContext(joinerRoot.context);
+    } else {
+      // Operator Cloud (Slice 3 boot-wire): the operator_cloud JOINED-NODE half.
+      // A cloud node that completed a real operator_cloud join persists a
+      // NON-ISSUER scoped-custody joined-node record; production boot loads it
+      // (never mints; a cloud node has no master to mint from) into a non-issuer
+      // operator_cloud context with NO approver. This provisions /v1/federation
+      // reads + /sync/peer (cert-chain verified) but structurally refuses
+      // issuance. Tried only when neither an issuer nor a local joiner root
+      // loaded. A malformed/tampered/cross-operator record fails closed (load
+      // returns null) and leaves federation honestly off; boot never crashes,
+      // never mints. Honest trust boundary (Option A): the provider is in this
+      // node's trust boundary until a TEE exists; the joined-node record carries
+      // that disclosure verbatim. (Also skipped while a rotate-root journal
+      // exists: fail closed until resume.)
+      const operatorCloudNode = await provisionOrLoadOperatorCloudJoinedNode({
+        storage,
+        masterKey,
+        audit: async (event) => {
+          try {
+            await auditLog.append(
+              "l2",
+              event.operation,
+              "federation",
+              event.details,
+              event.result,
+            );
+          } catch {
+            // Federation remains fail-closed; dashboard boot reports
+            // provisioned:false rather than crash or mint a replacement record.
+          }
+        },
+      });
+      if (operatorCloudNode !== null) {
+        // No approver: operator_cloud is structurally non-issuer and cannot run
+        // the approval gate. The generalized non-issuer guard inside
+        // setFederationContext re-asserts that this context carries no issuer
+        // authority.
+        dashboard.setFederationContext(operatorCloudNode.context);
+      }
     }
+  }
+
+  // Federation 3/3b P0: wire the DURABLE peer-sync security-state store and
+  // rehydrate it whenever federation is provisioned (issuer OR joiner). This
+  // makes the per-sender accepted high-water, the outbound high-water, and the
+  // folded revocation projection survive a daemon restart, so a captured
+  // envelope is rejected after restart and a revoked node stays revoked across
+  // reboot (closing the standing forgotten-revocation weakness). A
+  // present-but-corrupt record latches sync unavailable (fail closed) rather
+  // than booting on empty anti-replay memory; an absent record (fresh fortress)
+  // serves normally. Skipped while a rotate-root journal exists (federation is
+  // held off) and when federation never provisioned. The store mirrors the #741
+  // durable replay stores: AES-256-GCM under a custody-master purpose key.
+  if (!federationRotating && dashboard.isFederationProvisioned()) {
+    await dashboard.setFederationSyncStateStore(
+      new FederationSyncStateStore({ storage, masterKey }),
+    );
+    await dashboard.setFederationReissueChallengeStore(
+      FederationReissueChallengeStore.durableFromBoot(storage, masterKey),
+    );
   }
 
   // v1.1.1 hotfix: light up the v1.1 dashboard at /v1.1 plus the operator

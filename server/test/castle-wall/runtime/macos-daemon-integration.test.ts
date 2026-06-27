@@ -68,7 +68,7 @@ describe("Castle Wall macOS daemon integration", () => {
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
-    const pinResult = await runProvisionPin({
+    const pinResult = await runProvisionPin([], {
       out: silent,
       err: silent,
       env: {

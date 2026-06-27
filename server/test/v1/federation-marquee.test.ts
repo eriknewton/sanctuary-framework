@@ -715,7 +715,12 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
     expect(recognized2.has("agent-1")).toBe(true);
   });
 
-  it("requires a /v1 session for /sync/peer (no anonymous network access)", async () => {
+  it("accepts /sync/peer with NO Authorization header (Federation P1 pre-session node-cert auth)", async () => {
+    // Federation P1: the session that used to front this route was only a
+    // network-access gate; trust comes solely from the envelope's cert chain. A
+    // well-formed envelope from a real fortress member now syncs with NO
+    // `Authorization` header at all, the capability today's marquee could not do
+    // without a session/tunnel.
     const mac = fortress.nodes["mac-1"];
     const envelope = signSyncEnvelope({
       fortressId: fortress.fortressId,
@@ -732,7 +737,10 @@ describe("PR-A5 cross-machine federation marquee", { retry: 2 }, () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(envelope),
     });
-    expect(res.status).toBe(401);
+    // NOT 401 (no session required); the verified slice is accepted.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { accepted: string[] };
+    expect(body.accepted).toContain("mac-1:1");
   });
 });
 

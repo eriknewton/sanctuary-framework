@@ -17,6 +17,7 @@ import {
   createHybridSuitePublicKeys,
   cryptoSuiteRegistry,
   type CanonicalJsonValue,
+  type SignatureBundle,
   type SuitePublicKeys,
   type SuiteSigner,
 } from "../core/crypto-suite-registry.js";
@@ -48,6 +49,11 @@ export const TRUST_ROOT_PRINCIPAL_CERT_SURFACE_ID =
   "sanctuary.mesh.trust-root.principal-certificate" as const;
 export const TRUST_ROOT_NODE_CERT_SURFACE_ID =
   "sanctuary.mesh.trust-root.node-identity-certificate" as const;
+export const TRUST_ROOT_ROOT_ROTATION_SURFACE_ID =
+  "sanctuary.mesh.trust-root.root-rotation-certificate" as const;
+/** Surface version for the hybrid root-rotation binding (rotate-root --renew). */
+export const ROOT_ROTATION_HYBRID_BINDING_VERSION =
+  "sanctuary.root-rotation.v2.hybrid-ed25519-ml-dsa-65" as const;
 
 export const MAX_HYBRID_SIGNATURE_BUNDLE_JSON_BYTES = 6 * 1024;
 export const MAX_HYBRID_PRINCIPAL_CERT_JSON_BYTES = 14 * 1024;
@@ -499,6 +505,285 @@ export async function verifyCertChainWithPolicy(
     pinnedMasterPubkey as FortressMasterPublicKey,
     nowMs
   );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Hybrid root-rotation binding (rotate-root --renew on a HYBRID fortress)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * The exact canonical body the OLD hybrid master signs (both components) and a
+ * verifier reconstructs for a hybrid root-rotation binding. Binds the full
+ * classical rotation body (stable fortress_id, old_master_pubkey, new_master,
+ * strictly-monotonic rotation_serial, rotated_at) and BOTH the old and new
+ * hybrid master public-key sets (both Ed25519 + ML-DSA-65 components).
+ * Signature-bearing fields are excluded. FROZEN wire surface.
+ */
+function hybridRotationBindingBody(params: {
+  readonly fortress_id: string;
+  readonly old_master_pubkey: string;
+  readonly new_master: FortressMasterPublicKey;
+  readonly rotation_serial: number;
+  readonly rotated_at: string;
+  readonly old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  readonly new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+}): CanonicalJsonValue {
+  return {
+    kind: ROOT_ROTATION_HYBRID_BINDING_VERSION,
+    fortress_id: params.fortress_id,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master: {
+      public_key: params.new_master.public_key,
+      fortress_id: params.new_master.fortress_id,
+      created_at: params.new_master.created_at,
+    },
+    rotation_serial: params.rotation_serial,
+    rotated_at: params.rotated_at,
+    old_hybrid_master: params.old_hybrid_master as unknown as CanonicalJsonValue,
+    new_hybrid_master: params.new_hybrid_master as unknown as CanonicalJsonValue,
+  };
+}
+
+function hybridRotationDescriptor(body: CanonicalJsonValue) {
+  return {
+    surface_id: TRUST_ROOT_ROOT_ROTATION_SURFACE_ID,
+    surface_version: ROOT_ROTATION_HYBRID_BINDING_VERSION,
+    signature_suite: HYBRID_SIGNATURE_SUITE_ID,
+    payload: body,
+  };
+}
+
+/**
+ * Sign the hybrid half of a root-rotation certificate with the OLD hybrid
+ * master's two private keys (Ed25519 + ML-DSA-65). Produces a both-must-pass
+ * hybrid signature bundle binding the OLD hybrid master to the NEW hybrid master
+ * AND binding the outer classical K1->K2 rotation body. The caller MUST zero the
+ * old master private material after return (constraint 6). The returned binding
+ * is PUBLIC (an old-key signature over public keys).
+ */
+export async function signFederationRootRotationHybridBinding(params: {
+  readonly fortress_id: string;
+  readonly old_master_pubkey: string;
+  readonly new_master: FortressMasterPublicKey;
+  readonly rotation_serial: number;
+  readonly old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  readonly new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  readonly old_hybrid_master_private_keys: HybridPrivateKeyMaterial;
+  readonly rotated_at?: string;
+}): Promise<{
+  hybrid_rotation: {
+    old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+    new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+    old_hybrid_master_signature_bundle: SignatureBundle;
+  };
+  rotated_at: string;
+}> {
+  if (!Number.isInteger(params.rotation_serial) || params.rotation_serial < 1) {
+    throw new MeshChainError(
+      "hybrid rotation_serial must be a positive integer (a renewal always advances the serial)"
+    );
+  }
+  if (params.old_hybrid_master.fortress_id !== params.fortress_id) {
+    throw new MeshChainError(
+      "hybrid rotation old_hybrid_master.fortress_id must equal the stable fortress_id"
+    );
+  }
+  if (params.old_master_pubkey.length === 0) {
+    throw new MeshChainError("hybrid rotation old_master_pubkey must be present");
+  }
+  if (params.new_master.fortress_id !== params.fortress_id) {
+    throw new MeshChainError(
+      "hybrid rotation new_master.fortress_id must equal the stable fortress_id"
+    );
+  }
+  if (params.new_master.public_key.length === 0) {
+    throw new MeshChainError("hybrid rotation new_master.public_key must be present");
+  }
+  if (params.new_hybrid_master.fortress_id !== params.fortress_id) {
+    throw new MeshChainError(
+      "hybrid rotation new_hybrid_master.fortress_id must equal the stable fortress_id (renewal preserves identity)"
+    );
+  }
+  assertHybridPublicKeys(
+    "old_hybrid_master",
+    params.old_hybrid_master.public_keys
+  );
+  assertHybridPublicKeys(
+    "new_hybrid_master",
+    params.new_hybrid_master.public_keys
+  );
+  assertHybridPrivateKeyRefs(
+    params.old_hybrid_master_private_keys,
+    params.old_hybrid_master.public_keys
+  );
+  const rotatedAt = params.rotated_at ?? new Date().toISOString();
+  const body = hybridRotationBindingBody({
+    fortress_id: params.fortress_id,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master: params.new_master,
+    rotation_serial: params.rotation_serial,
+    rotated_at: rotatedAt,
+    old_hybrid_master: params.old_hybrid_master,
+    new_hybrid_master: params.new_hybrid_master,
+  });
+  const bundle = await cryptoSuiteRegistry.signSurface(
+    hybridRotationDescriptor(body),
+    hybridSignerFromPrivateKeys(params.old_hybrid_master_private_keys)
+  );
+  return {
+    hybrid_rotation: {
+      old_hybrid_master: params.old_hybrid_master,
+      new_hybrid_master: params.new_hybrid_master,
+      old_hybrid_master_signature_bundle: bundle,
+    },
+    rotated_at: rotatedAt,
+  };
+}
+
+/**
+ * Verify the hybrid half of a root-rotation certificate against the master the
+ * verifier CURRENTLY pins (the OLD hybrid master, both components). BOTH-MUST-PASS:
+ * the hybrid bundle's Ed25519 AND ML-DSA-65 components must both verify under the
+ * pinned old hybrid master, or the binding is rejected. This is the fail-closed
+ * gate against a silent PQ-downgrade of the rotation link. Throws MeshChainError
+ * on any failure.
+ *
+ *   - the binding names the pinned OLD hybrid master (both key refs) and the
+ *     SAME fortress_id;
+ *   - the new hybrid master carries that same fortress_id;
+ *   - if `minSerial` is supplied, the serial MUST strictly advance it;
+ *   - the bundle verifies (both components) under the pinned old hybrid master.
+ */
+export async function verifyFederationRootRotationHybridBinding(
+  binding: {
+    old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+    new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+    old_hybrid_master_signature_bundle: SignatureBundle;
+  },
+  pinnedOldHybridMaster: FortressMasterPublicKeysV2Hybrid,
+  opts: {
+    fortress_id?: string;
+    old_master_pubkey?: string;
+    new_master?: FortressMasterPublicKey;
+    rotation_serial?: number;
+    rotated_at?: string;
+    minSerial?: number;
+  } = {}
+): Promise<void> {
+  assertV2HybridFortressMaster(pinnedOldHybridMaster);
+  assertV2HybridFortressMaster(binding.old_hybrid_master);
+  assertV2HybridFortressMaster(binding.new_hybrid_master);
+  assertHybridPublicKeys(
+    "binding.old_hybrid_master",
+    binding.old_hybrid_master.public_keys
+  );
+  assertHybridPublicKeys(
+    "binding.new_hybrid_master",
+    binding.new_hybrid_master.public_keys
+  );
+  assertHybridPublicKeys(
+    "pinned old hybrid master",
+    pinnedOldHybridMaster.public_keys
+  );
+  assertSignatureBundleSize(
+    "hybrid rotation signature bundle",
+    binding.old_hybrid_master_signature_bundle
+  );
+
+  // The binding's declared old hybrid master MUST be the master this verifier
+  // currently pins (both key refs + both public keys), and the same fortress_id.
+  if (
+    binding.old_hybrid_master.fortress_id !== pinnedOldHybridMaster.fortress_id ||
+    binding.old_hybrid_master.public_keys.ed25519.key_ref !==
+      pinnedOldHybridMaster.public_keys.ed25519.key_ref ||
+    binding.old_hybrid_master.public_keys.ed25519.public_key !==
+      pinnedOldHybridMaster.public_keys.ed25519.public_key ||
+    binding.old_hybrid_master.public_keys.ml_dsa_65.key_ref !==
+      pinnedOldHybridMaster.public_keys.ml_dsa_65.key_ref ||
+    binding.old_hybrid_master.public_keys.ml_dsa_65.public_key !==
+      pinnedOldHybridMaster.public_keys.ml_dsa_65.public_key
+  ) {
+    throw new MeshChainError(
+      "hybrid rotation binding old_hybrid_master does not match the hybrid master this verifier currently pins"
+    );
+  }
+  if (
+    opts.fortress_id !== undefined &&
+    binding.new_hybrid_master.fortress_id !== opts.fortress_id
+  ) {
+    throw new MeshChainError(
+      "hybrid rotation binding new_hybrid_master.fortress_id does not match the stable fortress_id"
+    );
+  }
+  if (
+    binding.new_hybrid_master.fortress_id !== pinnedOldHybridMaster.fortress_id
+  ) {
+    throw new MeshChainError(
+      "hybrid rotation binding new_hybrid_master.fortress_id does not match the stable fortress_id"
+    );
+  }
+  if (opts.rotation_serial !== undefined) {
+    if (!Number.isInteger(opts.rotation_serial) || opts.rotation_serial < 1) {
+      throw new MeshChainError(
+        "hybrid rotation rotation_serial must be a positive integer"
+      );
+    }
+    if (opts.minSerial !== undefined && opts.rotation_serial <= opts.minSerial) {
+      throw new MeshChainError(
+        `hybrid rotation rotation_serial=${opts.rotation_serial} does not advance the adopted serial ${opts.minSerial} (stale / replayed rotation rejected)`
+      );
+    }
+  }
+
+  if (opts.old_master_pubkey !== undefined && opts.old_master_pubkey.length === 0) {
+    throw new MeshChainError("hybrid rotation old_master_pubkey must be present");
+  }
+  if (opts.new_master !== undefined) {
+    if (opts.new_master.public_key.length === 0) {
+      throw new MeshChainError("hybrid rotation new_master.public_key must be present");
+    }
+    if (
+      opts.fortress_id !== undefined &&
+      opts.new_master.fortress_id !== opts.fortress_id
+    ) {
+      throw new MeshChainError(
+        "hybrid rotation new_master.fortress_id does not match the stable fortress_id"
+      );
+    }
+  }
+
+  // Reconstruct the body exactly: the caller supplies the classical rotation
+  // cert fields so the hybrid signed preimage is bound to the outer Ed25519 link.
+  if (
+    opts.fortress_id === undefined ||
+    opts.old_master_pubkey === undefined ||
+    opts.new_master === undefined ||
+    opts.rotation_serial === undefined ||
+    opts.rotated_at === undefined
+  ) {
+    throw new MeshChainError(
+      "hybrid rotation verify requires the full classical rotation body to reconstruct the signed body"
+    );
+  }
+  const body = hybridRotationBindingBody({
+    fortress_id: opts.fortress_id,
+    old_master_pubkey: opts.old_master_pubkey,
+    new_master: opts.new_master,
+    rotation_serial: opts.rotation_serial,
+    rotated_at: opts.rotated_at,
+    old_hybrid_master: binding.old_hybrid_master,
+    new_hybrid_master: binding.new_hybrid_master,
+  });
+  const ok = await cryptoSuiteRegistry.verifySurface(
+    hybridRotationDescriptor(body),
+    binding.old_hybrid_master_signature_bundle,
+    hybridPublicKeysFromCertificate(pinnedOldHybridMaster.public_keys)
+  );
+  if (!ok) {
+    throw new MeshChainError(
+      "hybrid rotation binding signature does not verify (both-must-pass) under the pinned old hybrid master"
+    );
+  }
 }
 
 function hybridKeyRefs(
