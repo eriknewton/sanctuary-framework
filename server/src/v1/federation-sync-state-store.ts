@@ -52,6 +52,7 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { bytesToString, stringToBytes } from "../core/encoding.js";
@@ -70,6 +71,15 @@ export const FEDERATION_SYNC_STATE_STORE_NAMESPACE = "_federation";
 export const FEDERATION_SYNC_STATE_STORE_KEY = "sync-state-v1";
 export const FEDERATION_SYNC_STATE_STORE_HKDF_INFO =
   "federation-sync-state" as const;
+
+/**
+ * Lockfile name (in the `_federation` namespace directory) for the cross-process
+ * advisory lock that serializes the read-modify-write in {@link
+ * FederationSyncStateStore.writeNow}. Not encrypted/at-rest state, just a
+ * transient coordination file (PID + acquired_at), removed once the write
+ * completes. The leading dot keeps it out of normal record enumeration.
+ */
+export const FEDERATION_SYNC_STATE_LOCK_FILE = ".sync-state.lock";
 
 /** The derived security state this store persists and rehydrates. */
 export interface FederationSyncStateSnapshot {
@@ -203,10 +213,41 @@ export class FederationSyncStateStore {
   }
 
   /**
-   * Persist the whole snapshot (the caller's live state is the source of truth).
-   * THROWS on any encrypt/write failure so the caller can fail closed: a write
-   * whose persist throws MUST deny rather than act on state that was not durably
-   * committed.
+   * Persist the snapshot, serialized cross-process and MONOTONICALLY MERGED over
+   * whatever is already at rest.
+   *
+   * [LOST-UPDATE close, cross-process] The caller's live state is NOT a complete
+   * source of truth: another process (the `rotate-root --compromised` CLI) writes
+   * the SAME blob out-of-band, and the daemon's in-memory state never learns of
+   * that write. A blind whole-blob overwrite by the daemon (a high-water advance
+   * built purely from stale in-memory fields) would CLOBBER a root revocation the
+   * CLI committed, silently un-revoking a compromised root after the next restart.
+   *
+   * Two layers close the window, each covering what the other cannot:
+   *
+   *   1. A CROSS-PROCESS advisory lock ({@link withCrossProcessLock}) spans the
+   *      WHOLE read-modify-write in {@link writeNow}, so the merge-read and the
+   *      write are atomic with respect to ANOTHER process's read-modify-write.
+   *      This closes the genuine write-OVERLAP race (two processes both reading
+   *      before either writes); the lock is bounded + breaks provably-stale holders
+   *      so it cannot deadlock, and FAILS CLOSED (throws) on sustained contention.
+   *   2. A strictly MONOTONIC merge: writeNow RE-READS the at-rest blob and UNIONs
+   *      the grow-only security fields (revoked node ids, revoked root pubkeys) +
+   *      takes `Math.max` of the monotonic floors (eviction serial, revocation
+   *      serial, every per-peer high-water, the outbound high-water) before
+   *      encrypting. This keeps single-process and non-filesystem rigs (where the
+   *      lock degrades to a direct call) correct, and converges any residual
+   *      interleaving to the union.
+   *
+   * Together: on filesystem backends no committed revocation/floor can be lost
+   * regardless of interleaving (the lock serializes the read-modify-write across
+   * processes); on single-process rigs the monotonic merge alone suffices.
+   *
+   * THROWS on any lock/read/encrypt/write failure so the caller can fail closed:
+   * a write whose persist throws MUST deny rather than act on state that was not
+   * durably committed. A present-but-corrupt at-rest blob makes the merge-read
+   * THROW (never silently reset-to-empty-then-overwrite), preserving the
+   * fail-closed contract for the read leg too.
    */
   async persist(snapshot: FederationSyncStateSnapshot): Promise<void> {
     const copy = cloneSnapshot(snapshot);
@@ -216,26 +257,46 @@ export class FederationSyncStateStore {
   }
 
   private async writeNow(snapshot: FederationSyncStateSnapshot): Promise<void> {
-    const persisted: PersistedSyncState = {
-      v: 1,
-      accepted_high_water: [...snapshot.acceptedHighWater],
-      outbound_high_water: snapshot.outboundHighWater,
-      revoked_node_ids: [...snapshot.revokedNodeIds],
-      highest_eviction_serial: snapshot.highestEvictionSerial,
-      revoked_root_pubkeys: [...snapshot.revokedRootPubkeys],
-      highest_revocation_serial: snapshot.highestRevocationSerial,
-    };
-    const serialized = stringToBytes(JSON.stringify(persisted));
-    try {
-      const encrypted = encrypt(serialized, this.encryptionKey);
-      await this.storage.write(
-        this.namespace,
-        this.recordKey,
-        stringToBytes(JSON.stringify(encrypted)),
-      );
-    } finally {
-      serialized.fill(0);
-    }
+    // Hold a cross-process lock across the ENTIRE read-modify-write so another
+    // process's read-modify-write cannot interleave between our load and our
+    // write (the write-OVERLAP lost-update). On non-filesystem backends the lock
+    // degrades to a direct call (single process; the monotonic merge suffices).
+    // The in-process writeChain already serializes this process's own writers, so
+    // we never block on a lock this process holds (the lock is not reentrant).
+    await withCrossProcessLock(
+      this.storage,
+      this.namespace,
+      FEDERATION_SYNC_STATE_LOCK_FILE,
+      async () => {
+        // Re-read the at-rest blob and fold this snapshot OVER it monotonically,
+        // so a concurrent cross-process writer's committed revocations/floors
+        // survive this write. `load` returns empty on a fresh fortress and THROWS
+        // on a corrupt record (fail closed); either way we never overwrite
+        // committed state with a stale subset.
+        const onDisk = await this.load();
+        const merged = mergeSyncStateMonotonic(onDisk, snapshot);
+        const persisted: PersistedSyncState = {
+          v: 1,
+          accepted_high_water: [...merged.acceptedHighWater],
+          outbound_high_water: merged.outboundHighWater,
+          revoked_node_ids: [...merged.revokedNodeIds],
+          highest_eviction_serial: merged.highestEvictionSerial,
+          revoked_root_pubkeys: [...merged.revokedRootPubkeys],
+          highest_revocation_serial: merged.highestRevocationSerial,
+        };
+        const serialized = stringToBytes(JSON.stringify(persisted));
+        try {
+          const encrypted = encrypt(serialized, this.encryptionKey);
+          await this.storage.write(
+            this.namespace,
+            this.recordKey,
+            stringToBytes(JSON.stringify(encrypted)),
+          );
+        } finally {
+          serialized.fill(0);
+        }
+      },
+    );
   }
 }
 
@@ -249,6 +310,61 @@ function cloneSnapshot(
     highestEvictionSerial: snapshot.highestEvictionSerial,
     revokedRootPubkeys: new Set(snapshot.revokedRootPubkeys),
     highestRevocationSerial: snapshot.highestRevocationSerial,
+  };
+}
+
+/**
+ * Fold `next` OVER `base` with strictly MONOTONIC, grow-only semantics for every
+ * security field, producing the snapshot to persist. This is the lost-update
+ * close: `base` is the freshly-loaded at-rest state (which may include a
+ * cross-process writer's committed revocations the live caller never saw) and
+ * `next` is the caller's live snapshot. The result:
+ *
+ *   - revoked node ids / revoked root pubkeys: UNION (never drops either side's
+ *     revocations),
+ *   - eviction serial / revocation serial: `Math.max` (a replay floor never
+ *     lowers),
+ *   - per-peer accepted high-water: `Math.max` per sender, union of senders (an
+ *     anti-replay high-water never regresses, and a sender known to only one side
+ *     is kept),
+ *   - outbound high-water: `Math.max` (the reciprocal counter never re-emits).
+ *
+ * Because every field can only grow, this merge can never lower a floor or drop a
+ * revocation it has already read: folding a stale `next` over a fresher `base`
+ * keeps the fresher value. It is the SECOND of the two lost-update layers; the
+ * cross-process lock in {@link FederationSyncStateStore.writeNow} provides the
+ * atomicity that guarantees `base` is the latest committed state (closing the
+ * write-OVERLAP window), and this monotonic fold then makes the combine safe and
+ * keeps single-process / non-filesystem rigs (lock-free) correct. This does NOT
+ * change the trust model or the revocation semantics; it only makes the persist
+ * incapable of LOSING a committed revocation/floor.
+ */
+function mergeSyncStateMonotonic(
+  base: FederationSyncStateSnapshot,
+  next: FederationSyncStateSnapshot,
+): FederationSyncStateSnapshot {
+  const acceptedHighWater = new Map(base.acceptedHighWater);
+  for (const [senderNodeId, highWater] of next.acceptedHighWater) {
+    const prior = acceptedHighWater.get(senderNodeId) ?? 0;
+    acceptedHighWater.set(senderNodeId, Math.max(prior, highWater));
+  }
+  const revokedNodeIds = new Set(base.revokedNodeIds);
+  for (const nodeId of next.revokedNodeIds) revokedNodeIds.add(nodeId);
+  const revokedRootPubkeys = new Set(base.revokedRootPubkeys);
+  for (const pubkey of next.revokedRootPubkeys) revokedRootPubkeys.add(pubkey);
+  return {
+    acceptedHighWater,
+    outboundHighWater: Math.max(base.outboundHighWater, next.outboundHighWater),
+    revokedNodeIds,
+    highestEvictionSerial: Math.max(
+      base.highestEvictionSerial,
+      next.highestEvictionSerial,
+    ),
+    revokedRootPubkeys,
+    highestRevocationSerial: Math.max(
+      base.highestRevocationSerial,
+      next.highestRevocationSerial,
+    ),
   };
 }
 
