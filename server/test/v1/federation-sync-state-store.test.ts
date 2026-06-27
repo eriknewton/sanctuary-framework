@@ -15,9 +15,13 @@
  * dirs.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type {
   StorageBackend,
   StorageEntryMeta,
@@ -221,5 +225,284 @@ describe("FederationSyncStateStore - durable peer-sync security state", () => {
     });
 
     await expect(store.persist(sampleSnapshot())).rejects.toThrow();
+  });
+});
+
+describe("FederationSyncStateStore - cross-process lost-update close (monotonic merge)", () => {
+  /**
+   * The race this fix closes: the `rotate-root --compromised` CLI loads fresh,
+   * folds the compromised root into `revokedRootPubkeys` + lifts
+   * `highestRevocationSerial`, and persists to the single blob. The LIVE daemon's
+   * in-memory state never learns of that write, so the daemon's next persist (a
+   * high-water advance built from its STALE in-memory snapshot) would, with a
+   * blind whole-blob overwrite, CLOBBER the revoked root + the new serial. On the
+   * next restart the clobbered blob hydrates -> a cert chaining to the compromised
+   * root is accepted again.
+   *
+   * Each `FederationSyncStateStore` instance over the SAME storage stands in for a
+   * distinct process (CLI vs daemon); the daemon instance's snapshot is built from
+   * state that predates the CLI write (it never saw it). With the read-modify-write
+   * merge in `writeNow`, the daemon's overwrite UNIONs the at-rest revocation back
+   * in instead of dropping it.
+   */
+  it("daemon high-water overwrite after a CLI root-revocation does NOT un-revoke the root", async () => {
+    const storage = new MemoryStorage();
+    const compromisedRoot = "compromised-root-K1";
+
+    // --- t0: daemon boots, snapshots its in-memory state (no revoked root yet).
+    // Capture it NOW; this is what a later daemon persist would write blindly.
+    const daemonStore = new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    });
+    const daemonStaleSnapshot: FederationSyncStateSnapshot = {
+      acceptedHighWater: new Map([["peer-a", 3]]),
+      outboundHighWater: 2,
+      revokedNodeIds: new Set(),
+      highestEvictionSerial: 0,
+      revokedRootPubkeys: new Set(), // <- never learned of the CLI revocation
+      highestRevocationSerial: 0,
+    };
+
+    // --- t1: the CLI (a SEPARATE process) loads fresh, revokes the root, persists.
+    const cliStore = new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    });
+    const cliSnapshot = await cliStore.load();
+    cliSnapshot.revokedRootPubkeys.add(compromisedRoot);
+    cliSnapshot.highestRevocationSerial = Math.max(
+      cliSnapshot.highestRevocationSerial,
+      9,
+    );
+    await cliStore.persist(cliSnapshot);
+
+    // --- t2: the daemon persists a high-water advance from its STALE snapshot.
+    // Pre-fix this whole-blob overwrite drops the revoked root + the serial floor.
+    const advanced: FederationSyncStateSnapshot = {
+      ...daemonStaleSnapshot,
+      acceptedHighWater: new Map([["peer-a", 4]]), // an advance
+    };
+    await daemonStore.persist(advanced);
+
+    // --- t3: a fresh restart hydrates the on-disk blob.
+    const afterRestart = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    // The compromised root MUST still be revoked, and the serial floor preserved.
+    expect(afterRestart.revokedRootPubkeys.has(compromisedRoot)).toBe(true);
+    expect(afterRestart.highestRevocationSerial).toBe(9);
+    // The daemon's legitimate high-water advance is ALSO preserved (monotonic max).
+    expect(afterRestart.acceptedHighWater.get("peer-a")).toBe(4);
+    expect(afterRestart.outboundHighWater).toBe(2);
+  });
+
+  it("merge is strictly monotonic: a stale daemon write never lowers a serial or drops a revoked node", async () => {
+    const storage = new MemoryStorage();
+
+    // Seed the blob with a high floor + revocations (as if a prior CLI/eviction wrote it).
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist({
+      acceptedHighWater: new Map([["peer-a", 10]]),
+      outboundHighWater: 7,
+      revokedNodeIds: new Set(["evicted-1"]),
+      highestEvictionSerial: 5,
+      revokedRootPubkeys: new Set(["root-old"]),
+      highestRevocationSerial: 4,
+    });
+
+    // A daemon persists a STALE snapshot with LOWER floors + missing revocations.
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist({
+      acceptedHighWater: new Map([["peer-a", 2], ["peer-b", 1]]),
+      outboundHighWater: 1,
+      revokedNodeIds: new Set(),
+      highestEvictionSerial: 1,
+      revokedRootPubkeys: new Set(),
+      highestRevocationSerial: 1,
+    });
+
+    const loaded = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    // Floors are MAX (never lowered); the new sender is added; revocations survive.
+    expect(loaded.acceptedHighWater.get("peer-a")).toBe(10);
+    expect(loaded.acceptedHighWater.get("peer-b")).toBe(1);
+    expect(loaded.outboundHighWater).toBe(7);
+    expect(loaded.highestEvictionSerial).toBe(5);
+    expect(loaded.highestRevocationSerial).toBe(4);
+    expect(loaded.revokedNodeIds.has("evicted-1")).toBe(true);
+    expect(loaded.revokedRootPubkeys.has("root-old")).toBe(true);
+  });
+
+  it("union grows both directions: each writer's distinct revocation survives the other's overwrite", async () => {
+    const storage = new MemoryStorage();
+
+    // Writer 1 commits root-A.
+    const s1 = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+    s1.revokedRootPubkeys.add("root-A");
+    s1.highestRevocationSerial = 3;
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist(s1);
+
+    // Writer 2 started from the EMPTY pre-A state and commits root-B (it never saw A).
+    const s2: FederationSyncStateSnapshot = {
+      acceptedHighWater: new Map(),
+      outboundHighWater: 0,
+      revokedNodeIds: new Set(),
+      highestEvictionSerial: 0,
+      revokedRootPubkeys: new Set(["root-B"]),
+      highestRevocationSerial: 6,
+    };
+    await new FederationSyncStateStore({ storage, masterKey: masterKey() }).persist(s2);
+
+    const loaded = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    expect(loaded.revokedRootPubkeys.has("root-A")).toBe(true);
+    expect(loaded.revokedRootPubkeys.has("root-B")).toBe(true);
+    expect(loaded.highestRevocationSerial).toBe(6);
+  });
+});
+
+/**
+ * The write-OVERLAP race (the residual the cross-process lock closes). The
+ * sequential-completion case above is closed by the read-modify-write alone: the
+ * second writer's persist starts AFTER the first's persist resolved, so its
+ * merge-read sees the committed revocation. This block proves the genuine OVERLAP
+ * case: two SEPARATE processes (separate store instances over the SAME on-disk
+ * storage) BOTH begin their read-modify-write before either has written. Without
+ * a lock spanning the whole read-modify-write, the daemon's read would precede the
+ * CLI's write, so its later overwrite would drop the CLI-committed revocation. The
+ * cross-process file lock in `writeNow` serializes the two read-modify-writes, so
+ * the second one reads the first's committed state and unions it.
+ *
+ * Uses a REAL FilesystemStorage over a temp dir so the lock engages (it degrades
+ * to a no-op on non-filesystem backends, which have no cross-process surface). An
+ * injected per-instance write delay forces the two persists to be in-flight at the
+ * same wall-clock window; the lock makes their critical sections non-overlapping
+ * anyway.
+ */
+describe("FederationSyncStateStore - write-OVERLAP close (cross-process lock)", () => {
+  let fortressPath: string;
+
+  beforeEach(async () => {
+    fortressPath = await mkdtemp(join(tmpdir(), "fed-sync-overlap-"));
+  });
+
+  afterEach(async () => {
+    await rm(fortressPath, { recursive: true, force: true });
+  });
+
+  /**
+   * A FilesystemStorage whose `write` is artificially slowed so two concurrent
+   * persists are genuinely in-flight together. The lock must still serialize their
+   * read-modify-writes (the loser blocks on the lockfile, then reads the winner's
+   * committed state). Records the order of `read`/`write` calls so the test can
+   * assert the critical sections did NOT interleave.
+   */
+  class SlowWriteFilesystemStorage extends FilesystemStorage {
+    public readonly ops: string[] = [];
+    constructor(
+      basePath: string,
+      private readonly writeDelayMs: number,
+    ) {
+      super(basePath);
+    }
+    override async read(
+      namespace: string,
+      key: string,
+    ): Promise<Uint8Array | null> {
+      if (key === "sync-state-v1") this.ops.push(`read:${namespace}/${key}`);
+      return super.read(namespace, key);
+    }
+    override async write(
+      namespace: string,
+      key: string,
+      data: Uint8Array,
+    ): Promise<void> {
+      if (key === "sync-state-v1") {
+        await new Promise((r) => setTimeout(r, this.writeDelayMs));
+        this.ops.push(`write:${namespace}/${key}`);
+      }
+      return super.write(namespace, key, data);
+    }
+  }
+
+  it("two overlapping cross-process writers BOTH persist; the revoked root SURVIVES and the floor holds", async () => {
+    const storage = new SlowWriteFilesystemStorage(
+      join(fortressPath, "state"),
+      40,
+    );
+    const compromisedRoot = "compromised-root-K1";
+
+    // Distinct store instances == distinct processes over the same on-disk blob.
+    const cliStore = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    const daemonStore = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+
+    // The CLI revokes the compromised root + lifts the serial.
+    const cliSnapshot: FederationSyncStateSnapshot = {
+      acceptedHighWater: new Map(),
+      outboundHighWater: 0,
+      revokedNodeIds: new Set(),
+      highestEvictionSerial: 0,
+      revokedRootPubkeys: new Set([compromisedRoot]),
+      highestRevocationSerial: 9,
+    };
+    // The daemon, from a STALE in-memory snapshot, only advances a high-water and
+    // KNOWS NOTHING of the CLI's revocation.
+    const daemonSnapshot: FederationSyncStateSnapshot = {
+      acceptedHighWater: new Map([["peer-a", 4]]),
+      outboundHighWater: 2,
+      revokedNodeIds: new Set(),
+      highestEvictionSerial: 0,
+      revokedRootPubkeys: new Set(),
+      highestRevocationSerial: 0,
+    };
+
+    // Fire BOTH persists so their critical sections want to overlap (the slow
+    // write keeps the first in-flight while the second tries to acquire the lock).
+    await Promise.all([
+      cliStore.persist(cliSnapshot),
+      daemonStore.persist(daemonSnapshot),
+    ]);
+    // Snapshot the op-trace of the two persists BEFORE the restart load adds its
+    // own hydrate read.
+    const persistOps = [...storage.ops];
+
+    // A fresh restart hydrates the on-disk blob.
+    const afterRestart = await new FederationSyncStateStore({
+      storage,
+      masterKey: masterKey(),
+    }).load();
+
+    // The compromised root MUST still be revoked and the serial floor preserved,
+    // regardless of which writer won the lock first.
+    expect(afterRestart.revokedRootPubkeys.has(compromisedRoot)).toBe(true);
+    expect(afterRestart.highestRevocationSerial).toBe(9);
+    // The daemon's legitimate high-water advance is also preserved (monotonic max).
+    expect(afterRestart.acceptedHighWater.get("peer-a")).toBe(4);
+    expect(afterRestart.outboundHighWater).toBe(2);
+
+    // PROOF the lock (not just the merge) closed the window: the two persist
+    // critical sections did NOT interleave. With a per-blob read/write op trace,
+    // the loser's merge-READ must come AFTER the winner's WRITE (no read,read,
+    // write,write). Each persist does exactly one merge-read + one write.
+    const reads = persistOps
+      .map((op, i) => ({ op, i }))
+      .filter((e) => e.op.startsWith("read:"));
+    const writes = persistOps
+      .map((op, i) => ({ op, i }))
+      .filter((e) => e.op.startsWith("write:"));
+    expect(reads.length).toBe(2);
+    expect(writes.length).toBe(2);
+    // The second read happens after the first write: serialized, not overlapping.
+    expect(reads[1]!.i).toBeGreaterThan(writes[0]!.i);
   });
 });

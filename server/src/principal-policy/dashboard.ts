@@ -1820,16 +1820,31 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     );
   }
 
-  /** Snapshot the live federation security state for the durable store. */
+  /**
+   * Snapshot the live federation security state for the durable store.
+   *
+   * This carries ONLY this daemon's own in-memory copy of the revoked-ROOT
+   * projection. That copy is NOT, on its own, sufficient to preserve a revocation
+   * the out-of-band `rotate-root --compromised` CLI committed while the daemon was
+   * running: the daemon never learns of the CLI's write, so a high-water/eviction
+   * persist built from this snapshot would, by itself, omit that revoked root. The
+   * cross-process preservation is enforced ONE layer down, by
+   * {@link FederationSyncStateStore} (`writeNow`): it holds a cross-process lock
+   * across the WHOLE read-modify-write (so the daemon's read-modify-write cannot
+   * interleave with the CLI's) and then MONOTONICALLY UNIONs the grow-only security
+   * fields (revoked node ids, revoked root pubkeys, the serial floors, the per-peer
+   * high-waters) over this snapshot before encrypting. So a daemon persist can
+   * never clobber a CLI-committed root revocation, even under a genuine write
+   * overlap; the corrected invariant is "the store's locked read-modify-write
+   * preserves every committed revocation across re-persists," NOT "this snapshot
+   * already contains them."
+   */
   private snapshotFederationSyncState(): FederationSyncStateSnapshot {
     return {
       acceptedHighWater: new Map(this._federationAcceptedHighWater),
       outboundHighWater: this._federationOutboundHighWater,
       revokedNodeIds: new Set(this._federationState.revoked),
       highestEvictionSerial: this._federationState.evictionMaxSerial,
-      // Preserve the durable revoked-ROOT projection across re-persists so a
-      // high-water/eviction write by the daemon never drops a revoked root the
-      // rotate-root CLI committed (Slice 3c-1).
       revokedRootPubkeys: new Set(this._federationRevokedRoots),
       highestRevocationSerial: this._federationHighestRevocationSerial,
     };
