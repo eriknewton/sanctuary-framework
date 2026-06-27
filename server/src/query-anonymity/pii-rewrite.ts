@@ -19,10 +19,13 @@
  *     `{ redacted, placeholders }`. Rho-3 smart mode (iteration-14)
  *     consumes the placeholders for context-aware re-mapping at
  *     concierge render time.
- *   - **Substrate-selector call carries rewritten text only.** The
- *     original text never crosses the outbound boundary once Tier B
- *     fires. The caller is responsible for replacing the field on its
- *     request object before calling the selector.
+ *   - **Substrate-selector call carries rewritten text only ONCE Tier B is
+ *     wired into the live path.** Tier B is NOT yet wired into the production
+ *     substrate selector (deferred; see `effectiveTierBEnabled` and the DEBT
+ *     note in pii-rewrite-routes.ts), so today the original query text still
+ *     reaches the substrate. When wired, the caller replaces the field on its
+ *     request object before calling the selector so the original text does not
+ *     cross the outbound boundary.
  *
  * Castle-walking discipline:
  *   - No new outbound surface. LLM-assist re-uses the existing
