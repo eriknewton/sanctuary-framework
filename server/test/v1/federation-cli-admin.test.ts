@@ -67,7 +67,26 @@ let fortressPath: string;
 let issuer: SeededIssuerFortress;
 const PASSPHRASE = "slice3b-drill-passphrase";
 
+// Hermeticity guard (de-flake): the admin verbs reach `openOperatorSigner`,
+// which sets the PROCESS-GLOBAL `process.env.SANCTUARY_STORAGE_PATH` so
+// `loadConfig()` targets the `--fortress` override
+// (`src/cli/federation-operator-signing.ts`). vitest runs multiple test files
+// in one worker process, and that env var is shared across them. Without
+// snapshot/restore this file would leak a pointer at its just-rm'd temp
+// fortress into the shared worker, so a SIBLING test that later calls
+// `loadConfig()` without its own `--fortress` reads a dead path and races to
+// the wrong exit code (the non-hermetic CLI-subprocess/host-state flake class).
+// Snapshotting both fortress env keys per test makes this file neither a leaker
+// nor a victim. This is isolation only; no assertion is weakened, and the
+// production verb behavior (it still sets the env to drive `loadConfig`) is
+// untouched. Mirrors the established idiom in
+// `test/cli/top-level-fortress-flag.test.ts`.
+let savedStoragePath: string | undefined;
+let savedFortressPath: string | undefined;
+
 beforeEach(async () => {
+  savedStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  savedFortressPath = process.env.SANCTUARY_FORTRESS_PATH;
   fortressPath = await mkdtemp(join(tmpdir(), "slice3b-"));
   const storage = new FilesystemStorage(join(fortressPath, "state"));
   issuer = await seedFederationIssuerFortress({
@@ -80,6 +99,18 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(fortressPath, { recursive: true, force: true });
+  // Restore the process-global fortress env keys exactly as they were so this
+  // file leaves the shared worker env untouched (no dead-path leak to siblings).
+  if (savedStoragePath === undefined) {
+    delete process.env.SANCTUARY_STORAGE_PATH;
+  } else {
+    process.env.SANCTUARY_STORAGE_PATH = savedStoragePath;
+  }
+  if (savedFortressPath === undefined) {
+    delete process.env.SANCTUARY_FORTRESS_PATH;
+  } else {
+    process.env.SANCTUARY_FORTRESS_PATH = savedFortressPath;
+  }
 });
 
 describe("federation enable/disable -- operator-signed, fail-closed", () => {
