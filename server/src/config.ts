@@ -116,6 +116,11 @@ export interface SanctuaryConfig {
       cert_path: string;
       key_path: string;
     };
+    /**
+     * Allow plaintext HTTP on non-loopback dashboard bindings. Default false.
+     * Only set when a separate network layer already encrypts the transport.
+     */
+    allow_plaintext_remote?: boolean;
   };
 
   webhook: {
@@ -185,6 +190,7 @@ export function defaultConfig(): SanctuaryConfig {
       enabled: false,
       port: 3501,
       host: "127.0.0.1",
+      allow_plaintext_remote: false,
     },
     webhook: {
       enabled: false,
@@ -343,6 +349,12 @@ export async function loadConfig(
       cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
       key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY,
     };
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "true") {
+    config.dashboard.allow_plaintext_remote = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "false") {
+    config.dashboard.allow_plaintext_remote = false;
   }
   if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
     config.webhook.enabled = true;
@@ -613,6 +625,16 @@ export function validateConfig(config: SanctuaryConfig): void {
     valueErrors.push(
       `Invalid config value: dashboard.port = "${config.dashboard.port}". ` +
       `Use an integer TCP port in the range 1-65535.`
+    );
+  }
+
+  if (
+    config.dashboard.allow_plaintext_remote !== undefined &&
+    typeof config.dashboard.allow_plaintext_remote !== "boolean"
+  ) {
+    valueErrors.push(
+      `Invalid config value: dashboard.allow_plaintext_remote = "${String(config.dashboard.allow_plaintext_remote)}". ` +
+      `Use true only when a separate network layer already encrypts the transport.`
     );
   }
 

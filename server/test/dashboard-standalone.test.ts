@@ -87,6 +87,7 @@ describe("Standalone Dashboard", () => {
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
+    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
     delete process.env.SANCTUARY_RECOVERY_OUT;
     isolatedDiscoveryOptions = undefined;
   });
@@ -107,6 +108,38 @@ describe("Standalone Dashboard", () => {
     const text = await res.text();
     // Should show login page (we didn't provide auth)
     expect(text).toContain("Sanctuary");
+  });
+
+  it("threads allowPlaintextRemote into the approval channel config", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-remote-plaintext";
+
+    const result = await startDashboardOnFreePort({
+      passphrase: "test-passphrase-remote-plaintext",
+      host: "0.0.0.0",
+      allowPlaintextRemote: true,
+    });
+    dashboard = result.dashboard;
+
+    const channel = dashboard as unknown as {
+      config: { allow_plaintext_remote?: boolean };
+    };
+    expect(channel.config.allow_plaintext_remote).toBe(true);
+  });
+
+  it("refuses standalone non-loopback plaintext when allowPlaintextRemote is unset", async () => {
+    process.env.SANCTUARY_STORAGE_PATH = tempDir;
+    process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-remote-refuse";
+
+    await expect(
+      startStandaloneDashboard({
+        passphrase: "test-passphrase-remote-refuse",
+        host: "0.0.0.0",
+        port: randomTestPort(),
+        noConfirm: true,
+        discoveryOptions: isolatedDiscoveryOptions,
+      })
+    ).rejects.toThrow(/refusing to start on non-loopback interface/i);
   });
 
   it("serves audit log API in standalone mode", async () => {

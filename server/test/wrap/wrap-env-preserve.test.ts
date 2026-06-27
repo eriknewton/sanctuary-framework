@@ -1,6 +1,6 @@
 /**
  * Wrap env-var preservation tests — verifies that running
- * `wrap --openclaw` preserves the three
+ * `wrap --openclaw` preserves the
  * critical env vars in the rewritten config.
  */
 
@@ -20,6 +20,7 @@ describe("Wrap env-var preservation", () => {
     "SANCTUARY_PASSPHRASE",
     "SANCTUARY_DASHBOARD_AUTH_TOKEN",
     "SANCTUARY_DASHBOARD_ENABLED",
+    "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
   ] as const;
 
   beforeEach(async () => {
@@ -51,6 +52,7 @@ describe("Wrap env-var preservation", () => {
       SANCTUARY_PASSPHRASE: "test-pass",
       SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok-123",
       SANCTUARY_DASHBOARD_ENABLED: "true",
+      SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
     });
 
     const result = JSON.parse(await readFile(configPath, "utf-8"));
@@ -58,12 +60,14 @@ describe("Wrap env-var preservation", () => {
     expect(env.SANCTUARY_PASSPHRASE).toBe("test-pass");
     expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("tok-123");
     expect(env.SANCTUARY_DASHBOARD_ENABLED).toBe("true");
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
   });
 
   it("falls back to process.env when no explicit env and no existing entry", async () => {
     process.env.SANCTUARY_PASSPHRASE = "from-env";
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "env-tok";
     process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+    process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
 
     const config: AgentConfig = {
       platform: "openclaw",
@@ -80,6 +84,7 @@ describe("Wrap env-var preservation", () => {
     expect(env.SANCTUARY_PASSPHRASE).toBe("from-env");
     expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("env-tok");
     expect(env.SANCTUARY_DASHBOARD_ENABLED).toBe("true");
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
   });
 
   it("inherits from existing sanctuary entry env when no explicit env", async () => {
@@ -87,6 +92,7 @@ describe("Wrap env-var preservation", () => {
     delete process.env.SANCTUARY_PASSPHRASE;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
+    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
 
     const rawConfig = {
       mcp: {
@@ -98,6 +104,7 @@ describe("Wrap env-var preservation", () => {
               SANCTUARY_PASSPHRASE: "existing-pass",
               SANCTUARY_DASHBOARD_AUTH_TOKEN: "existing-tok",
               SANCTUARY_DASHBOARD_ENABLED: "true",
+              SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
             },
           },
           other: { command: "node", args: ["x.js"] },
@@ -119,12 +126,14 @@ describe("Wrap env-var preservation", () => {
     expect(env.SANCTUARY_PASSPHRASE).toBe("existing-pass");
     expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("existing-tok");
     expect(env.SANCTUARY_DASHBOARD_ENABLED).toBe("true");
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
   });
 
   it("does not inject env vars when none are available", async () => {
     delete process.env.SANCTUARY_PASSPHRASE;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
+    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
 
     const config: AgentConfig = {
       platform: "openclaw",
