@@ -126,7 +126,8 @@ export async function openOperatorSigner(
       loadResult.total > 0
         ? "operator identity files found but none could be decrypted (wrong passphrase?)"
         : "no operator identity in this fortress: federation admin verbs require " +
-          "a default operator identity (run `sanctuary identity` to create one)",
+          "a default operator identity (run `sanctuary identity create`, or " +
+          "re-run `sanctuary init` without --no-identity)",
     );
   }
 

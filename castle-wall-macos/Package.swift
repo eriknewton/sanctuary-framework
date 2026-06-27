@@ -172,7 +172,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CastleWallHostAppTests",
-            dependencies: ["CastleWallHostApp", "AgentDetector"],
+            dependencies: ["CastleWallHostApp", "AgentDetector", "CastleWallIPC"],
             path: "Tests/CastleWallHostAppTests"
         ),
     ]

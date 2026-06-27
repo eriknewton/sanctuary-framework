@@ -106,6 +106,7 @@ import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
+import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import {
   establishMaster,
@@ -1099,6 +1100,19 @@ export async function createSanctuaryServer(options?: {
   });
   const unifiedInboxScheduler = new UnifiedInboxScheduler({
     bridge: unifiedInboxBridge,
+    // Feature-health observability raise path: on the operator-inbox cadence,
+    // recompute the feature-health panel from the integrity-judged audit read and
+    // raise the 3 ratified fault classes (deduped via the bridge). Additive +
+    // display-only; feeds NOTHING back into enforcement. The dashboard owns the
+    // raiser (it has the producer-key load + panel builder); a missing dashboard
+    // or locked log makes this a no-op.
+    //
+    // ALERT LATENCY (operator-facing honesty): the raise rides this existing
+    // ~60s UnifiedInboxScheduler tick, so a feature fault can take up to one
+    // scheduler cycle (best-effort ~60s, not instant) to surface as a
+    // notification. This path adds NO faster heartbeat/poll; it deliberately
+    // reuses the inbox cadence to inherit the integrity-judged audit read.
+    onTick: () => dashboard?.evaluateFeatureFaults(),
   });
   unifiedInboxScheduler.start();
 
@@ -1414,6 +1428,16 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
+  // 16b-read. ERC-8004 Identity OFFLINE verifier (read side). Fully local:
+  // verifies a presented record's signature/shape with NO outbound surface and
+  // no on-chain read. On-chain registry confirmation is a deferred follow-up
+  // (must reuse Verascore's real ERC-8004 ABI), not shipped here.
+  const { tools: erc8004ResolveTools } = createErc8004ResolveTools({
+    auditLog,
+    identityId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
+
   const { tools: agentNativeTools } = createAgentNativeCooperativeTools({
     identityManager,
     namespaceRegistry,
@@ -1493,6 +1517,7 @@ export async function createSanctuaryServer(options?: {
     sdwMemoryProvenanceTool,
     ...complianceTools,
     ...erc8004Tools,
+    ...erc8004ResolveTools,
     ...agentNativeTools,
     ...distressTools,
     manifestTool,

@@ -75,6 +75,24 @@ export interface PiiConfigStoreOptions {
   now?: () => Date;
 }
 
+/**
+ * Result of `PiiConfigStore.patch()`. Carries the updated config plus
+ * an EXPLICIT consent-transition signal so callers (the route's audit
+ * emission) never have to infer the false->true consent flip from
+ * timestamp comparisons.
+ */
+export interface PiiPatchResult {
+  /** The merged + persisted config after the patch. */
+  config: PiiRewriteConfig;
+  /**
+   * True iff this patch recorded consent for the first time (the
+   * `consented_to_trade_off` false->true transition). False on a
+   * no-op re-PATCH where consent was already true, on a true->false
+   * revocation, and on any patch that does not flip consent on.
+   */
+  consentJustRecorded: boolean;
+}
+
 interface PersistedConfig {
   version: 1;
   fortress_id: string;
@@ -172,13 +190,18 @@ export class PiiConfigStore {
    * consent-flip transitions to true, stamps `consented_at` if not
    * already set. On any `enabled` flip, stamps `last_toggled_at`.
    *
-   * Returns the updated config.
+   * Returns the updated config plus an explicit `consentJustRecorded`
+   * signal: true iff this patch flipped `consented_to_trade_off` from
+   * false to true. The signal is computed from state (the merged
+   * patch vs the existing record), NOT from comparing timestamps, so
+   * audit emission keyed on it is deterministic regardless of how the
+   * wall clock samples.
    *
    * Throws `PiiConsentRequired` when the caller asked for
    * `enabled = true` but `consented_to_trade_off` would not also be
    * true post-patch.
    */
-  async patch(patch: Partial<PiiRewriteConfig>): Promise<PiiRewriteConfig> {
+  async patch(patch: Partial<PiiRewriteConfig>): Promise<PiiPatchResult> {
     const existing =
       (await this.get()) ?? defaultPiiRewriteConfig(this.now);
     const merged: PiiRewriteConfig = {
@@ -194,10 +217,11 @@ export class PiiConfigStore {
         "cannot enable Tier B without consent_to_trade_off=true",
       );
     }
-    if (
+    // Explicit false->true consent transition, derived from state.
+    const consentJustRecorded =
       patch.consented_to_trade_off === true &&
-      !existing.consented_to_trade_off
-    ) {
+      !existing.consented_to_trade_off;
+    if (consentJustRecorded) {
       merged.consented_at = this.now().toISOString();
     }
     if (
@@ -208,7 +232,7 @@ export class PiiConfigStore {
       merged.last_toggled_at = this.now().toISOString();
     }
     await this.set(merged);
-    return merged;
+    return { config: merged, consentJustRecorded };
   }
 
   /**

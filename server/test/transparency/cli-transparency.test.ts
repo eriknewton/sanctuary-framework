@@ -39,7 +39,12 @@ class Capture extends Writable {
 
 const PASSPHRASE = "transparency-cli-passphrase";
 
-describe("sanctuary transparency / verify-transparency CLI", () => {
+// retry:2 - these spawn the CLI as a subprocess and assert on captured stdout;
+// under full-suite CI load the child can race output capture and yield empty
+// stdout (the "expected '' to contain ..." flake), same non-hermetic
+// CLI-subprocess class the loopback /v1 rigs carry. Logic is deterministic
+// (5/5 green in isolation); the retry absorbs the capture race.
+describe("sanctuary transparency / verify-transparency CLI", { retry: 2 }, () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {

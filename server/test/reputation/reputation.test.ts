@@ -18,9 +18,12 @@ import {
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
   verifyReputationBundleCompleteness,
+  type Attestation,
   type ReputationBundle,
+  type StoredAttestation,
 } from "../../src/reputation/reputation-store.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   createIdentity,
@@ -33,23 +36,42 @@ import {
   stringToBytes,
   toBase64url,
 } from "../../src/core/encoding.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { hash } from "../../src/core/hashing.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { createReputationTools } from "../../src/reputation/tools.js";
+import {
+  BRIDGE_METRIC_POLICY,
+  bridgeCountBucket,
+} from "../../src/reputation/bridge-metrics.js";
+import { createBridgeCommitment } from "../../src/bridge/bridge.js";
+import type { BridgeCommitment, ConcordiaOutcome } from "../../src/bridge/types.js";
 
-function setupIdentity(masterKey: Uint8Array) {
+function setupIdentity(
+  masterKey: Uint8Array,
+  label = "test-identity"
+) {
   const encryptionKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity(
-    "test-identity",
+    label,
     encryptionKey,
     "recovery-key"
   );
   return { identity: storedIdentity, encryptionKey };
 }
 
-function publicKeysFor(identity: ReturnType<typeof setupIdentity>["identity"]) {
+function parseToolResult(result: { content: Array<{ text: string }> }): Record<string, unknown> {
+  return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+}
+
+function publicKeysFor(
+  ...identities: Array<ReturnType<typeof setupIdentity>["identity"]>
+) {
   const publicKeys = new Map<string, Uint8Array>();
-  publicKeys.set(identity.did, fromBase64url(identity.public_key));
+  for (const identity of identities) {
+    publicKeys.set(identity.did, fromBase64url(identity.public_key));
+  }
   return publicKeys;
 }
 
@@ -90,6 +112,165 @@ function stripManifestAndResign(
   return legacy;
 }
 
+function resignAttestationAndBundle(
+  bundle: ReputationBundle,
+  identity: ReturnType<typeof setupIdentity>["identity"],
+  encryptionKey: Uint8Array
+): ReputationBundle {
+  for (const attestation of bundle.attestations) {
+    attestation.signature = toBase64url(
+      sign(
+        stringToBytes(JSON.stringify(attestation.data)),
+        identity.encrypted_private_key,
+        encryptionKey
+      )
+    );
+  }
+  bundle.completeness_manifest = buildReputationCompletenessManifest(
+    bundle.exported_at,
+    bundle.attestations
+  );
+  bundle.bundle_signature = toBase64url(
+    sign(
+      reputationBundleSigningBytes(bundle),
+      identity.encrypted_private_key,
+      encryptionKey
+    )
+  );
+  return bundle;
+}
+
+async function writeMatchingBridgeCommitment(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  identity: ReturnType<typeof setupIdentity>["identity"],
+  encryptionKey: Uint8Array,
+  options: {
+    interactionId: string;
+    counterpartyDid: string;
+    rounds?: number;
+  }
+): Promise<{
+  commitment: BridgeCommitment;
+  outcome: ConcordiaOutcome;
+}> {
+  await writeStoredIdentityForBridgeVerification(storage, masterKey, identity);
+  const terms = { scope: "privacy" };
+  const outcome: ConcordiaOutcome = {
+    session_id: options.interactionId,
+    protocol_version: "concordia-v1",
+    proposer_did: identity.did,
+    acceptor_did: options.counterpartyDid,
+    terms,
+    terms_hash: toBase64url(hash(stringToBytes(JSON.stringify(terms)))),
+    rounds: options.rounds ?? 3,
+    accepted_at: "2026-06-25T12:00:00.000Z",
+  };
+  const commitment = createBridgeCommitment(
+    outcome,
+    identity,
+    encryptionKey
+  );
+  await writeBridgeCommitmentRecord(storage, masterKey, commitment, outcome);
+  return { commitment, outcome };
+}
+
+async function writeStoredIdentityForBridgeVerification(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  identity: ReturnType<typeof setupIdentity>["identity"]
+): Promise<void> {
+  const identityEncryptionKey = derivePurposeKey(
+    masterKey,
+    "identity-encryption"
+  );
+  const encrypted = encrypt(
+    stringToBytes(JSON.stringify(identity)),
+    identityEncryptionKey
+  );
+  await storage.write(
+    "_identities",
+    identity.identity_id,
+    stringToBytes(JSON.stringify(encrypted))
+  );
+}
+
+async function writeBridgeCommitmentRecord(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  commitment: BridgeCommitment,
+  outcome: ConcordiaOutcome
+): Promise<void> {
+  const bridgeEncryptionKey = derivePurposeKey(masterKey, "bridge-commitments");
+  const encrypted = encrypt(
+    stringToBytes(JSON.stringify({ commitment, outcome })),
+    bridgeEncryptionKey
+  );
+  await storage.write(
+    "_bridge",
+    commitment.bridge_commitment_id,
+    stringToBytes(JSON.stringify(encrypted))
+  );
+}
+
+async function writeBridgeAttestationRecord(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  identity: ReturnType<typeof setupIdentity>["identity"],
+  encryptionKey: Uint8Array,
+  options: {
+    interactionId: string;
+    counterpartyDid: string;
+    metrics: Record<string, number>;
+    metricPolicy?: string;
+  }
+): Promise<StoredAttestation> {
+  const now = new Date().toISOString();
+  const data: Attestation["data"] = {
+    interaction_id: options.interactionId,
+    participant_did: identity.did,
+    counterparty_did: options.counterpartyDid,
+    outcome_type: "negotiation",
+    outcome_result: "completed",
+    metrics: options.metrics,
+    ...(options.metricPolicy !== undefined
+      ? { metric_policy: options.metricPolicy }
+      : {}),
+    context: "concordia-bridge",
+    timestamp: now,
+  };
+  const attestationId = `att-test-${options.interactionId}`;
+  const attestation: Attestation = {
+    attestation_id: attestationId,
+    schema: "sanctuary-interaction-v1",
+    data,
+    signature: toBase64url(
+      sign(
+        stringToBytes(JSON.stringify(data)),
+        identity.encrypted_private_key,
+        encryptionKey
+      )
+    ),
+    signer: identity.did,
+  };
+  const stored: StoredAttestation = {
+    attestation,
+    counterparty_confirmed: false,
+    recorded_at: now,
+  };
+  const reputationKey = derivePurposeKey(masterKey, "l4-reputation");
+  const encrypted = encrypt(
+    stringToBytes(JSON.stringify(stored)),
+    reputationKey
+  );
+  await storage.write(
+    "_reputation",
+    attestationId,
+    stringToBytes(JSON.stringify(encrypted))
+  );
+  return stored;
+}
+
 describe("L4 Reputation Store", () => {
   describe("tool honesty", () => {
     it("describes exported-set completeness without claiming lifetime history", () => {
@@ -120,6 +301,580 @@ describe("L4 Reputation Store", () => {
   });
 
   describe("record + query", () => {
+    it("rejects new Concordia-bridge records without the bridge metric policy", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await expect(
+        store.record(
+          "bridge-missing-policy",
+          "did:key:counterparty",
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: { negotiation_round_bucket: 1 },
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/metric_policy/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects Concordia-bridge raw-term metrics at the record boundary and writes nothing", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await expect(
+        store.record(
+          "bridge-direct-bypass",
+          "did:key:counterparty",
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: { price: 150 },
+            metric_policy: BRIDGE_METRIC_POLICY,
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/price/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("reputation_record refuses Concordia-bridge context even with policy-rated buckets", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const { identity } = setupIdentity(masterKey);
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const recordTool = tools.find((tool) => tool.name === "reputation_record");
+      expect(recordTool).toBeDefined();
+
+      const result = parseToolResult(
+        await recordTool!.handler({
+          interaction_id: "bridge-tool-bypass",
+          counterparty_did: "did:key:counterparty",
+          context: "concordia-bridge",
+          outcome: {
+            type: "negotiation",
+            result: "completed",
+            metrics: {
+              negotiation_round_bucket: 1,
+              declared_concession_bucket: 3,
+            },
+            metric_policy: BRIDGE_METRIC_POLICY,
+          },
+        })
+      );
+
+      expect(result.error).toMatch(/bridge_attest/);
+      expect(result.attestation_id).toBeUndefined();
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects out-of-domain Concordia-bridge metrics at the record boundary and writes nothing", async () => {
+      const cases: Array<{
+        metrics: Record<string, number>;
+        message: RegExp;
+        key: string;
+      }> = [
+        {
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_concession_bucket: 150,
+          },
+          message: /0 to 10/i,
+          key: "declared_concession_bucket",
+        },
+        {
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_response_time_bucket: -1,
+          },
+          message: /0 to 5/i,
+          key: "declared_response_time_bucket",
+        },
+        {
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_reasoning_provided: 123,
+          },
+          message: /0 or 1/i,
+          key: "declared_reasoning_provided",
+        },
+      ];
+
+      for (const scenario of cases) {
+        const storage = new MemoryStorage();
+        const masterKey = generateRandomKey();
+        const store = new ReputationStore(storage, masterKey);
+        const { identity, encryptionKey } = setupIdentity(masterKey);
+
+        await expect(
+          store.record(
+            `bridge-direct-${scenario.key}`,
+            "did:key:counterparty",
+            {
+              type: "negotiation",
+              result: "completed",
+              metrics: scenario.metrics,
+              metric_policy: BRIDGE_METRIC_POLICY,
+            },
+            "concordia-bridge",
+            identity,
+            encryptionKey
+          )
+        ).rejects.toThrow(scenario.message);
+        await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+      }
+    });
+
+    it("rejects policy-rated Concordia-bridge metrics without local bridge commitment provenance", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await expect(
+        store.record(
+          "bridge-no-local-commitment",
+          "did:key:counterparty",
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: {
+              negotiation_round_bucket: 1,
+              declared_offers_made_bucket: 2,
+              declared_response_time_bucket: 0,
+              declared_concession_bucket: 10,
+              declared_reasoning_provided: 1,
+            },
+            metric_policy: BRIDGE_METRIC_POLICY,
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/matching local bridge commitment/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("accepts policy-rated Concordia-bridge metrics when local bridge commitment provenance exists", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "bridge-in-domain";
+      const counterpartyDid = "did:key:counterparty";
+
+      await writeMatchingBridgeCommitment(storage, masterKey, identity, encryptionKey, {
+        interactionId,
+        counterpartyDid,
+      });
+
+      const stored = await store.record(
+        interactionId,
+        counterpartyDid,
+        {
+          type: "negotiation",
+          result: "completed",
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_offers_made_bucket: 2,
+            declared_response_time_bucket: 0,
+            declared_concession_bucket: 10,
+            declared_reasoning_provided: 1,
+          },
+          metric_policy: BRIDGE_METRIC_POLICY,
+        },
+        "concordia-bridge",
+        identity,
+        encryptionKey
+      );
+
+      expect(stored.attestation.data.metrics).toEqual({
+        negotiation_round_bucket: 1,
+        declared_offers_made_bucket: 2,
+        declared_response_time_bucket: 0,
+        declared_concession_bucket: 10,
+        declared_reasoning_provided: 1,
+      });
+      expect(stored.attestation.data.metric_policy).toBe(BRIDGE_METRIC_POLICY);
+      const summary = await store.query({ context: "concordia-bridge" });
+      expect(summary.total_interactions).toBe(1);
+      expect(summary.aggregate_metrics.declared_concession_bucket.mean).toBe(10);
+    });
+
+    it("rejects policy-rated Concordia-bridge metrics when local bridge commitment verification fails", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "bridge-invalid-signature";
+      const counterpartyDid = "did:key:counterparty";
+
+      const { commitment, outcome } = await writeMatchingBridgeCommitment(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 3,
+        }
+      );
+      await writeBridgeCommitmentRecord(
+        storage,
+        masterKey,
+        {
+          ...commitment,
+          signature: toBase64url(new Uint8Array(64)),
+        },
+        outcome
+      );
+
+      await expect(
+        store.record(
+          interactionId,
+          counterpartyDid,
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: {
+              negotiation_round_bucket: bridgeCountBucket(outcome.rounds),
+              declared_offers_made_bucket: 2,
+            },
+            metric_policy: BRIDGE_METRIC_POLICY,
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/matching local bridge commitment/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects policy-rated Concordia-bridge metrics when the bucket does not match the committed outcome", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "bridge-bucket-mismatch";
+      const counterpartyDid = "did:key:counterparty";
+
+      const { outcome } = await writeMatchingBridgeCommitment(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 9,
+        }
+      );
+      expect(bridgeCountBucket(outcome.rounds)).toBe(3);
+
+      await expect(
+        store.record(
+          interactionId,
+          counterpartyDid,
+          {
+            type: "negotiation",
+            result: "completed",
+            metrics: {
+              negotiation_round_bucket: 1,
+              declared_offers_made_bucket: 2,
+            },
+            metric_policy: BRIDGE_METRIC_POLICY,
+          },
+          "concordia-bridge",
+          identity,
+          encryptionKey
+        )
+      ).rejects.toThrow(/matching local bridge commitment/);
+      await expect(storage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("reputation query tools label policy-rated bridge metrics", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "bridge-policy-weighted";
+      const counterpartyDid = "did:key:counterparty";
+
+      await writeMatchingBridgeCommitment(storage, masterKey, identity, encryptionKey, {
+        interactionId,
+        counterpartyDid,
+      });
+      await store.record(
+        interactionId,
+        counterpartyDid,
+        {
+          type: "negotiation",
+          result: "completed",
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_concession_bucket: 3,
+          },
+          metric_policy: BRIDGE_METRIC_POLICY,
+        },
+        "concordia-bridge",
+        identity,
+        encryptionKey
+      );
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const queryTool = tools.find((tool) => tool.name === "reputation_query");
+      const weightedTool = tools.find((tool) => tool.name === "reputation_query_weighted");
+      expect(queryTool).toBeDefined();
+      expect(weightedTool).toBeDefined();
+
+      const queryResult = parseToolResult(
+        await queryTool!.handler({
+          context: "concordia-bridge",
+        })
+      );
+      expect(queryResult.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "policy_rated",
+        policy_rated_attestations: 1,
+        legacy_unbounded_attestations: 0,
+      });
+
+      const result = parseToolResult(
+        await weightedTool!.handler({
+          context: "concordia-bridge",
+          metric: "negotiation_round_bucket",
+        })
+      );
+
+      expect(result.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "policy_rated",
+        policy_rated_attestations: 1,
+        legacy_unbounded_attestations: 0,
+      });
+    });
+
+    it("reputation query tools label mixed bridge evidence and keep weighted summaries metric-scoped", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "bridge-policy-mixed";
+      const counterpartyDid = "did:key:counterparty";
+
+      await writeMatchingBridgeCommitment(storage, masterKey, identity, encryptionKey, {
+        interactionId,
+        counterpartyDid,
+      });
+      await store.record(
+        interactionId,
+        counterpartyDid,
+        {
+          type: "negotiation",
+          result: "completed",
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_concession_bucket: 3,
+          },
+          metric_policy: BRIDGE_METRIC_POLICY,
+        },
+        "concordia-bridge",
+        identity,
+        encryptionKey
+      );
+
+      await writeBridgeAttestationRecord(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId: "legacy-bridge-mixed",
+          counterpartyDid: "did:key:legacy",
+          metrics: {
+            negotiation_rounds: 4,
+            concession_magnitude: 0.25,
+          },
+        }
+      );
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const queryTool = tools.find((tool) => tool.name === "reputation_query");
+      const weightedTool = tools.find((tool) => tool.name === "reputation_query_weighted");
+      expect(queryTool).toBeDefined();
+      expect(weightedTool).toBeDefined();
+
+      const queryResult = parseToolResult(
+        await queryTool!.handler({ context: "concordia-bridge" })
+      );
+      expect(queryResult.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "mixed_policy_and_legacy",
+        policy_rated_attestations: 1,
+        legacy_unbounded_attestations: 1,
+        unverified_policy_claim_attestations: 0,
+      });
+      const querySummary = queryResult.summary as {
+        aggregate_metrics: Record<string, unknown>;
+      };
+      expect(querySummary.aggregate_metrics.negotiation_round_bucket).toBeDefined();
+      expect(querySummary.aggregate_metrics.concession_magnitude).toBeUndefined();
+      expect(querySummary.aggregate_metrics.negotiation_rounds).toBeUndefined();
+
+      const weightedResult = parseToolResult(
+        await weightedTool!.handler({
+          context: "concordia-bridge",
+          metric: "negotiation_round_bucket",
+        })
+      );
+      expect(weightedResult.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "policy_rated",
+        policy_rated_attestations: 1,
+        legacy_unbounded_attestations: 0,
+        unverified_policy_claim_attestations: 0,
+      });
+      const unweightedSummary = weightedResult.unweighted_summary as {
+        aggregate_metrics: Record<string, unknown>;
+      };
+      expect(unweightedSummary.aggregate_metrics.negotiation_round_bucket).toBeDefined();
+      expect(unweightedSummary.aggregate_metrics.concession_magnitude).toBeUndefined();
+      expect(unweightedSummary.aggregate_metrics.negotiation_rounds).toBeUndefined();
+    });
+
+    it("reputation query tools redact stored policy claims without local bridge provenance", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await writeBridgeAttestationRecord(
+        storage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId: "stored-unverified-policy-claim",
+          counterpartyDid: "did:key:counterparty",
+          metrics: {
+            negotiation_round_bucket: 2,
+            declared_concession_bucket: 4,
+          },
+          metricPolicy: BRIDGE_METRIC_POLICY,
+        }
+      );
+
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const queryTool = tools.find((tool) => tool.name === "reputation_query");
+      const weightedTool = tools.find((tool) => tool.name === "reputation_query_weighted");
+      expect(queryTool).toBeDefined();
+      expect(weightedTool).toBeDefined();
+
+      const queryResult = parseToolResult(
+        await queryTool!.handler({ context: "concordia-bridge" })
+      );
+      expect(queryResult.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "unverified_policy_claims",
+        policy_rated_attestations: 0,
+        legacy_unbounded_attestations: 0,
+        unverified_policy_claim_attestations: 1,
+      });
+      const querySummary = queryResult.summary as {
+        aggregate_metrics: Record<string, unknown>;
+        total_interactions: number;
+      };
+      expect(querySummary.total_interactions).toBe(1);
+      expect(querySummary.aggregate_metrics.negotiation_round_bucket).toBeUndefined();
+      expect(querySummary.aggregate_metrics.declared_concession_bucket).toBeUndefined();
+
+      const weightedResult = parseToolResult(
+        await weightedTool!.handler({
+          context: "concordia-bridge",
+          metric: "negotiation_round_bucket",
+        })
+      );
+      expect(weightedResult).toMatchObject({
+        weighted_score: 0,
+        attestation_count: 0,
+      });
+      expect(weightedResult.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "unverified_policy_claims",
+        unverified_policy_claim_attestations: 1,
+      });
+    });
+
+    it("reputation query labels an empty Concordia-bridge context as having no bridge metric evidence", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const { identity } = setupIdentity(masterKey);
+      const identityManager = new IdentityManager(storage, masterKey);
+      await identityManager.save(identity);
+      await identityManager.setPrimary(identity.identity_id);
+      const { tools } = createReputationTools(
+        storage,
+        masterKey,
+        identityManager,
+        new AuditLog(storage, masterKey)
+      );
+      const queryTool = tools.find((tool) => tool.name === "reputation_query");
+      expect(queryTool).toBeDefined();
+
+      const result = parseToolResult(
+        await queryTool!.handler({ context: "concordia-bridge" })
+      );
+      expect(result.bridge_metric_policy).toMatchObject({
+        policy: BRIDGE_METRIC_POLICY,
+        status: "no_bridge_metric_evidence",
+        policy_rated_attestations: 0,
+        legacy_unbounded_attestations: 0,
+      });
+    });
+
     it("records an attestation and queries it back", async () => {
       const storage = new MemoryStorage();
       const masterKey = generateRandomKey();
@@ -317,6 +1072,10 @@ describe("L4 Reputation Store", () => {
       const publicKeys = publicKeysFor(identity);
 
       const verified = store2.verifyBundle(bundle, publicKeys);
+      const importVerified = await store2.verifyBundleForImport(
+        bundle,
+        publicKeys
+      );
       const standaloneCompleteness = verifyReputationBundleCompleteness(bundle);
       expect(verified).toEqual({
         invalid: 0,
@@ -324,6 +1083,7 @@ describe("L4 Reputation Store", () => {
         contexts: ["commerce"],
         completeness_verification: "verified",
       });
+      expect(importVerified).toEqual(verified);
       expect(standaloneCompleteness).toBe(
         verified.completeness_verification
       );
@@ -353,6 +1113,387 @@ describe("L4 Reputation Store", () => {
         "Reputation bundle completeness manifest does not match contents"
       );
       await expect(storage3.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects policy-tagged Concordia-bridge imports with raw-term or out-of-policy metrics before any write", async () => {
+      const cases: Array<{
+        metrics: Record<string, number>;
+        message: RegExp;
+        key: string;
+      }> = [
+        {
+          metrics: { price: 150 },
+          message: /policy bucket metrics/i,
+          key: "price",
+        },
+        {
+          metrics: {
+            negotiation_round_bucket: 1,
+            declared_concession_bucket: 150,
+          },
+          message: /0 to 10/i,
+          key: "declared_concession_bucket",
+        },
+      ];
+
+      for (const scenario of cases) {
+        const storage = new MemoryStorage();
+        const masterKey = generateRandomKey();
+        const store = new ReputationStore(storage, masterKey);
+        const { identity, encryptionKey } = setupIdentity(masterKey);
+
+        await store.record(
+          `import-source-${scenario.key}`,
+          "did:key:cp1",
+          { type: "transaction", result: "completed" },
+          "commerce",
+          identity,
+          encryptionKey
+        );
+
+        const tampered = cloneBundle(await store.exportBundle(identity, encryptionKey));
+        tampered.attestations[0]!.data.context = "concordia-bridge";
+        tampered.attestations[0]!.data.outcome_type = "negotiation";
+        tampered.attestations[0]!.data.metrics = scenario.metrics;
+        tampered.attestations[0]!.data.metric_policy = BRIDGE_METRIC_POLICY;
+        resignAttestationAndBundle(tampered, identity, encryptionKey);
+
+        const storage2 = new MemoryStorage();
+        const store2 = new ReputationStore(storage2, masterKey);
+        const publicKeys = publicKeysFor(identity);
+
+        expect(() => store2.verifyBundle(tampered, publicKeys)).toThrow(
+          scenario.message
+        );
+        expect(() => store2.verifyBundle(tampered, publicKeys)).toThrow(
+          scenario.key
+        );
+        await expect(
+          store2.importBundle(tampered, true, publicKeys)
+        ).rejects.toThrow(scenario.message);
+        await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+      }
+    });
+
+    it("rejects legacy untagged Concordia-bridge imports with exact metrics before any write", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "legacy-bridge-source",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "commerce",
+        identity,
+        encryptionKey
+      );
+
+      const legacyBundle = cloneBundle(
+        await store.exportBundle(identity, encryptionKey)
+      );
+      legacyBundle.attestations[0]!.data.context = "concordia-bridge";
+      legacyBundle.attestations[0]!.data.outcome_type = "negotiation";
+      legacyBundle.attestations[0]!.data.metrics = {
+        negotiation_rounds: 4,
+        offers_made: 2,
+        concession_magnitude: 0.25,
+        response_time_ms: 450,
+        reasoning_provided: 1,
+      };
+      delete legacyBundle.attestations[0]!.data.metric_policy;
+      resignAttestationAndBundle(legacyBundle, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+      expect(() => store2.verifyBundle(legacyBundle, publicKeys)).toThrow(
+        /metric_policy/
+      );
+      await expect(
+        store2.importBundle(legacyBundle, true, publicKeys)
+      ).rejects.toThrow(/metric_policy/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects policy-rated Concordia-bridge imports without matching local bridge commitment provenance", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "policy-bridge-roundtrip",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "commerce",
+        identity,
+        encryptionKey
+      );
+
+      const bundle = cloneBundle(await store.exportBundle(identity, encryptionKey));
+      bundle.attestations[0]!.data.context = "concordia-bridge";
+      bundle.attestations[0]!.data.outcome_type = "negotiation";
+      bundle.attestations[0]!.data.metrics = {
+        negotiation_round_bucket: 2,
+        declared_offers_made_bucket: 1,
+      };
+      bundle.attestations[0]!.data.metric_policy = BRIDGE_METRIC_POLICY;
+      resignAttestationAndBundle(bundle, identity, encryptionKey);
+      expect(bundle.attestations[0]!.data.metric_policy).toBe(
+        BRIDGE_METRIC_POLICY
+      );
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+      expect(store2.verifyBundle(bundle, publicKeys).invalid).toBe(0);
+      await expect(
+        store2.verifyBundleForImport(bundle, publicKeys)
+      ).rejects.toThrow(/matching local bridge commitments/);
+      await expect(
+        store2.importBundle(bundle, true, publicKeys)
+      ).rejects.toThrow(/matching local bridge commitments/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("imports policy-rated Concordia-bridge evidence when local commitment outcome matches", async () => {
+      const masterKey = generateRandomKey();
+      const sourceStorage = new MemoryStorage();
+      const sourceStore = new ReputationStore(sourceStorage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "policy-bridge-import-match";
+      const counterpartyDid = "did:key:cp1";
+
+      const { outcome } = await writeMatchingBridgeCommitment(
+        sourceStorage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 9,
+        }
+      );
+      const expectedBucket = bridgeCountBucket(outcome.rounds);
+
+      await sourceStore.record(
+        interactionId,
+        counterpartyDid,
+        {
+          type: "negotiation",
+          result: "completed",
+          metrics: {
+            negotiation_round_bucket: expectedBucket,
+            declared_offers_made_bucket: 1,
+          },
+          metric_policy: BRIDGE_METRIC_POLICY,
+        },
+        "concordia-bridge",
+        identity,
+        encryptionKey
+      );
+
+      const bundle = await sourceStore.exportBundle(identity, encryptionKey);
+      const destinationStorage = new MemoryStorage();
+      await writeMatchingBridgeCommitment(
+        destinationStorage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 9,
+        }
+      );
+      const destinationStore = new ReputationStore(
+        destinationStorage,
+        masterKey
+      );
+      const publicKeys = publicKeysFor(identity);
+
+      await expect(
+        destinationStore.verifyBundleForImport(bundle, publicKeys)
+      ).resolves.toMatchObject({
+        invalid: 0,
+        unverifiable: 0,
+        contexts: ["concordia-bridge"],
+        completeness_verification: "verified",
+      });
+
+      const result = await destinationStore.importBundle(
+        bundle,
+        true,
+        publicKeys
+      );
+      expect(result.imported).toBe(1);
+      expect(result.invalid).toBe(0);
+      const summary = await destinationStore.query({
+        context: "concordia-bridge",
+      });
+      expect(summary.total_interactions).toBe(1);
+      expect(
+        summary.aggregate_metrics.negotiation_round_bucket.mean
+      ).toBe(expectedBucket);
+    });
+
+    it("rejects policy-rated Concordia-bridge imports when the bucket mismatches local outcome", async () => {
+      const masterKey = generateRandomKey();
+      const sourceStorage = new MemoryStorage();
+      const sourceStore = new ReputationStore(sourceStorage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const interactionId = "policy-bridge-import-bucket-mismatch";
+      const counterpartyDid = "did:key:cp1";
+
+      const { outcome } = await writeMatchingBridgeCommitment(
+        sourceStorage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 9,
+        }
+      );
+      const expectedBucket = bridgeCountBucket(outcome.rounds);
+
+      await sourceStore.record(
+        interactionId,
+        counterpartyDid,
+        {
+          type: "negotiation",
+          result: "completed",
+          metrics: {
+            negotiation_round_bucket: expectedBucket,
+            declared_offers_made_bucket: 1,
+          },
+          metric_policy: BRIDGE_METRIC_POLICY,
+        },
+        "concordia-bridge",
+        identity,
+        encryptionKey
+      );
+
+      const tampered = cloneBundle(
+        await sourceStore.exportBundle(identity, encryptionKey)
+      );
+      tampered.attestations[0]!.data.metrics.negotiation_round_bucket = 1;
+      resignAttestationAndBundle(tampered, identity, encryptionKey);
+
+      const destinationStorage = new MemoryStorage();
+      await writeMatchingBridgeCommitment(
+        destinationStorage,
+        masterKey,
+        identity,
+        encryptionKey,
+        {
+          interactionId,
+          counterpartyDid,
+          rounds: 9,
+        }
+      );
+      const destinationStore = new ReputationStore(
+        destinationStorage,
+        masterKey
+      );
+      const publicKeys = publicKeysFor(identity);
+      expect(destinationStore.verifyBundle(tampered, publicKeys).invalid).toBe(
+        0
+      );
+      await expect(
+        destinationStore.verifyBundleForImport(tampered, publicKeys)
+      ).rejects.toThrow(/matching local bridge commitments/);
+      await expect(
+        destinationStore.importBundle(tampered, true, publicKeys)
+      ).rejects.toThrow(/matching local bridge commitments/);
+      await expect(destinationStorage.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects imported attestations signed by a DID that differs from participant_did", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+      const other = setupIdentity(masterKey, "other-identity");
+
+      await store.record(
+        "signer-participant-mismatch",
+        "did:key:cp1",
+        { type: "transaction", result: "completed" },
+        "commerce",
+        identity,
+        encryptionKey
+      );
+
+      const bundle = cloneBundle(await store.exportBundle(identity, encryptionKey));
+      const attestation = bundle.attestations[0]!;
+      attestation.signer = other.identity.did;
+      attestation.signature = toBase64url(
+        sign(
+          stringToBytes(JSON.stringify(attestation.data)),
+          other.identity.encrypted_private_key,
+          other.encryptionKey
+        )
+      );
+      bundle.completeness_manifest = buildReputationCompletenessManifest(
+        bundle.exported_at,
+        bundle.attestations
+      );
+      bundle.bundle_signature = toBase64url(
+        sign(
+          reputationBundleSigningBytes(bundle),
+          identity.encrypted_private_key,
+          encryptionKey
+        )
+      );
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity, other.identity);
+      expect(() => store2.verifyBundle(bundle, publicKeys)).toThrow(
+        "Reputation bundle contains attestations with invalid or unverifiable signatures"
+      );
+      await expect(
+        store2.importBundle(bundle, true, publicKeys)
+      ).rejects.toThrow(
+        "Reputation bundle contains attestations with invalid or unverifiable signatures"
+      );
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("imports non-bridge-context attestations with domain-specific metrics unchanged", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "import-non-bridge-price",
+        "did:key:cp1",
+        {
+          type: "transaction",
+          result: "completed",
+          metrics: { price: 150 },
+        },
+        "commerce",
+        identity,
+        encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const result = await store2.importBundle(bundle, true, publicKeysFor(identity));
+
+      expect(result.imported).toBe(1);
+      expect(result.invalid).toBe(0);
+      const summary = await store2.query({ context: "commerce" });
+      expect(summary.total_interactions).toBe(1);
+      expect(summary.aggregate_metrics.price.mean).toBe(150);
     });
 
     it("rejects a dropped attestation before any import write", async () => {
