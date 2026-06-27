@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 
+import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -22,6 +23,7 @@ import {
   signFederationPolicyBundlePayload,
   verifyFederationPolicyBundleEvent,
   type FederationPolicyProjection,
+  type FederationPolicyBundleRejectionReason,
 } from "../../src/v1/federation-policy-bundle.js";
 import { makeFederationMaterials, type FedMaterials } from "./fed-materials.js";
 
@@ -81,6 +83,24 @@ function withTamperedPayload(
   return { ...body, event_hash: federationEventHash(body) };
 }
 
+function withInvalidPrincipalChain(materials: FedMaterials): FedMaterials {
+  const signature = fromBase64url(
+    materials.context.issuingPrincipalCert.master_signature,
+  );
+  const invalidSignature = new Uint8Array(signature);
+  invalidSignature[0] ^= 1;
+  return {
+    ...materials,
+    context: {
+      ...materials.context,
+      issuingPrincipalCert: {
+        ...materials.context.issuingPrincipalCert,
+        master_signature: toBase64url(invalidSignature),
+      },
+    },
+  };
+}
+
 async function buildDashboard(
   materials: FedMaterials,
   storage: MemoryStorage,
@@ -117,6 +137,107 @@ async function buildDashboard(
   return { dashboard, deps: dashboard.buildV1FederationDeps() };
 }
 
+function appliedPolicySnapshot(deps: V1FederationDeps, nodeId: string) {
+  return deps.listNodes().find((node) => node.node_id === nodeId)
+    ?.applied_policy ?? null;
+}
+
+async function storedPolicySnapshot(
+  storage: MemoryStorage,
+  masterKey: Uint8Array,
+  nodeId: string,
+) {
+  const snapshot = await new FederationSyncStateStore({
+    storage,
+    masterKey,
+  }).load();
+  return {
+    operatorPolicy: snapshot.operatorPolicy
+      ? {
+          version: snapshot.operatorPolicy.version,
+          hash: snapshot.operatorPolicy.hash,
+          source_event_id: snapshot.operatorPolicy.source_event_id,
+        }
+      : null,
+    nodePolicy: snapshot.appliedPolicyVersions.get(nodeId)
+      ? {
+          version: snapshot.appliedPolicyVersions.get(nodeId)?.version,
+          hash: snapshot.appliedPolicyVersions.get(nodeId)?.hash,
+          source_event_id: snapshot.appliedPolicyVersions.get(nodeId)
+            ?.source_event_id,
+        }
+      : null,
+  };
+}
+
+async function expectRejectedPolicyBundleDoesNotAdvance(params: {
+  materials: FedMaterials;
+  event: FederationEvent;
+  reason: FederationPolicyBundleRejectionReason;
+  currentPolicyVersion?: number | null;
+  priorEvent?: FederationEvent;
+}) {
+  const verification = verifyFederationPolicyBundleEvent({
+    event: params.event,
+    fortressId: params.materials.fortressId,
+    pinnedMaster: params.materials.context.pinnedMasterPubkey,
+    operatorPrincipalCert: params.materials.context.issuingPrincipalCert,
+    currentPolicyVersion: params.currentPolicyVersion ?? null,
+  });
+
+  expect(verification).toEqual({
+    ok: false,
+    reason: params.reason,
+  });
+
+  const storage = new MemoryStorage();
+  const masterKey = new Uint8Array(32).fill(9);
+  const { deps } = await buildDashboard(params.materials, storage, masterKey);
+
+  if (params.priorEvent) {
+    const accepted = await deps.appendFederationEvents([params.priorEvent], {
+      senderNodeId: params.priorEvent.origin_node_id,
+      wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+    });
+    expect(accepted.rejected).toEqual([]);
+    expect(accepted.accepted.map((event) => event.event_id)).toEqual([
+      params.priorEvent.event_id,
+    ]);
+  }
+
+  const beforeEventIds = deps
+    .listFederationEvents()
+    .map((event) => event.event_id);
+  const beforeAppliedPolicy = appliedPolicySnapshot(
+    deps,
+    params.materials.context.nodeId,
+  );
+  const beforeStoredPolicy = await storedPolicySnapshot(
+    storage,
+    masterKey,
+    params.materials.context.nodeId,
+  );
+
+  const rejected = await deps.appendFederationEvents([params.event], {
+    senderNodeId: params.event.origin_node_id,
+    wireVersion: FEDERATION_SYNC_WIRE_VERSION,
+  });
+
+  expect(rejected.accepted).toEqual([]);
+  expect(rejected.rejected).toEqual([
+    { event_id: params.event.event_id, reason: params.reason },
+  ]);
+  expect(deps.listFederationEvents().map((event) => event.event_id)).toEqual(
+    beforeEventIds,
+  );
+  expect(appliedPolicySnapshot(deps, params.materials.context.nodeId)).toEqual(
+    beforeAppliedPolicy,
+  );
+  await expect(
+    storedPolicySnapshot(storage, masterKey, params.materials.context.nodeId),
+  ).resolves.toEqual(beforeStoredPolicy);
+}
+
 describe("operator policy-bundle federation event", () => {
   it("verifies an issuing-principal signature and folds only the signed hash/version", () => {
     const materials = makeFederationMaterials();
@@ -145,6 +266,91 @@ describe("operator policy-bundle federation event", () => {
     });
     expect(projection.appliedByNode.get(materials.context.nodeId)?.version).toBe(7);
     expect(JSON.stringify(event.payload)).not.toContain("tier1_always_approve");
+  });
+
+  it("rejects a wrong-key forged operator signature and leaves policy state unchanged", async () => {
+    const materials = makeFederationMaterials();
+    const event = makePolicyEvent(materials, { version: 7, hash: POLICY_HASH_V7 });
+    const signedAt = event.occurred_at;
+    const forgedPayload = signFederationPolicyBundlePayload({
+      fortressId: materials.fortressId,
+      policyVersion: 7,
+      policyHash: POLICY_HASH_V7,
+      signedAt,
+      operatorPrincipalId: materials.context.issuingPrincipalCert.principal_id,
+      operatorPrincipalPrivateKey: randomBytes(32),
+    });
+    const forged = withTamperedPayload(
+      event,
+      forgedPayload as unknown as Record<string, unknown>,
+    );
+
+    await expectRejectedPolicyBundleDoesNotAdvance({
+      materials,
+      event: forged,
+      reason: "operator_signature_invalid",
+    });
+  });
+
+  it("rejects a fortress mismatch and leaves policy state unchanged", async () => {
+    const materials = makeFederationMaterials();
+    const event = makePolicyEvent(materials, { version: 7, hash: POLICY_HASH_V7 });
+    const mismatched = withTamperedPayload(event, {
+      fortress_id: "different-fortress",
+    });
+
+    await expectRejectedPolicyBundleDoesNotAdvance({
+      materials,
+      event: mismatched,
+      reason: "fortress_mismatch",
+    });
+  });
+
+  it("rejects a principal mismatch and leaves policy state unchanged", async () => {
+    const materials = makeFederationMaterials();
+    const event = makePolicyEvent(materials, { version: 7, hash: POLICY_HASH_V7 });
+    const mismatched = withTamperedPayload(event, {
+      operator_principal_id: "principal-forged",
+    });
+
+    await expectRejectedPolicyBundleDoesNotAdvance({
+      materials,
+      event: mismatched,
+      reason: "principal_mismatch",
+    });
+  });
+
+  it("rejects an invalid principal certificate chain and leaves policy state unchanged", async () => {
+    const materials = withInvalidPrincipalChain(makeFederationMaterials());
+    const event = makePolicyEvent(materials, { version: 7, hash: POLICY_HASH_V7 });
+
+    await expectRejectedPolicyBundleDoesNotAdvance({
+      materials,
+      event,
+      reason: "principal_chain_invalid",
+    });
+  });
+
+  it("rejects an equal-version replay and retains the prior applied policy", async () => {
+    const materials = makeFederationMaterials();
+    const prior = makePolicyEvent(materials, {
+      version: 7,
+      hash: POLICY_HASH_V7,
+    });
+    const replay = makePolicyEvent(materials, {
+      version: 7,
+      hash: POLICY_HASH_V8,
+      sequence: 2,
+      previousHash: prior.event_hash,
+    });
+
+    await expectRejectedPolicyBundleDoesNotAdvance({
+      materials,
+      event: replay,
+      reason: "policy_version_replay",
+      currentPolicyVersion: 7,
+      priorEvent: prior,
+    });
   });
 
   it("rejects a tampered hash and leaves the applied projection unchanged", () => {
