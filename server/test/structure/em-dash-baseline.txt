@@ -205,7 +205,6 @@
 1	server/src/policy-engine/null-policy.ts
 4	server/src/principal-policy/approval-channel.ts
 47	server/src/principal-policy/dashboard-html.ts
-10	server/src/principal-policy/dashboard.ts
 5	server/src/principal-policy/gate.ts
 2	server/src/principal-policy/loader.ts
 3	server/src/principal-policy/posture-home-html.ts
