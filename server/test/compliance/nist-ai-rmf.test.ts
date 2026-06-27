@@ -186,10 +186,11 @@ describe("NIST AI RMF crosswalk, CLI", () => {
   it("writes to a file and reports honest counts when --output is given", async () => {
     const { writeFile, mkdir } = await import("node:fs/promises");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    await runCompliance(["nist-ai-rmf", "--output", "/tmp/nist-crosswalk.md"]);
+    const outputPath = "nist-crosswalk.md";
+    await runCompliance(["nist-ai-rmf", "--output", outputPath]);
     expect(mkdir).toHaveBeenCalled();
     expect(writeFile).toHaveBeenCalledWith(
-      "/tmp/nist-crosswalk.md",
+      outputPath,
       expect.stringContaining("NIST AI RMF"),
       "utf-8"
     );
