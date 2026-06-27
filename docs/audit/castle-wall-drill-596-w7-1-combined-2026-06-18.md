@@ -2,13 +2,16 @@
 title: Castle Wall macOS drill, combined #596 boot-crash + W7-1 initial-arm, 2026-06-18
 date: 2026-06-18
 author: Erik Newton
-status: drill-evidence (hardware results captured by drill thread; coordinator verification PENDING)
+status: superseded-historical-record (coordinator-verified; the #596 FAIL here was later closed by a different real fix, see banner)
 severity: capability-claim evidence, host-app boot-crash regression
 scope: tests PR #621 (#596 follow-up) and PR #633 (W7-1 RunLoop fix) on combined branch drill/596-w7-1-combined
 supersedes_signal_in: docs/audit/castle-wall-macos-fresh-binary-redrill-2026-06-17.md (the #596 RECURS and W7-1 BLOCKER sections)
+superseded_by: docs/audit/castle-wall-macos-fullscope-redrill-2026-06-20.md (#596 async-init fix verified on Mini1) and docs/audit/castle-wall-macos-boot-survival-redrill-2026-06-22.md (F1 closed, 5/5 real reboots on the fixed build)
 ---
 
 # Castle Wall macOS drill, combined #596 + W7-1, 2026-06-18
+
+> SUPERSEDING-EVIDENCE NOTE (merged 2026-06-27 as a corrected historical record): the Test A "#596 FAIL" recorded below is a true account of the 2026-06-18 drill leg, and its central finding held up. The branch fix under test (PR #621) did NOT fix the crash because, as this doc correctly diagnosed, the crash lived at the SwiftUI App-lifecycle layer, not in `ContentView`. PR #621 was therefore closed unmerged. The #596 boot crash was later closed by a DIFFERENT real fix (the SwiftUI-lifecycle async-init fix), verified on Mini1 in the 2026-06-20 full-scope re-drill and confirmed by the 2026-06-22 boot-survival re-drill (F1 closed, 5/5 consecutive real reboots on the fixed build). W7-1 was also subsequently proven (signed-drill session 2026-06-25, v983). Read this doc as the historical record of why the #621 path was rejected, NOT as the current status of #596 (closed) or W7-1 (proven).
 
 Operator: drill thread on the MBA signing host (Erik present for the boot legs, then away). This doc records hardware results for coordinator verification. Until the coordinator independently verifies, every verdict here is provisional and nothing is merged.
 
