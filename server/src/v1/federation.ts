@@ -9,7 +9,7 @@
  *   POST /v1/federation/authorize/complete BOOTSTRAP_TOKEN (pre-session class)
  *
  * The join ceremony is operator-authorized in two crypto-verified steps and
- * is built by WRAPPING the existing mesh lifecycle primitives — it does not
+ * is built by WRAPPING the existing mesh lifecycle primitives - it does not
  * reimplement them:
  *
  *  - `authorize/init` mints a short-lived, operator-principal-signed
@@ -18,14 +18,14 @@
  *  - The joining node assembles a JoinRequest (`sanctuary federation join`)
  *    and submits it to `authorize/complete`, which verifies the bootstrap
  *    token signature (`verifyBootstrapToken`), the node_mode binding, and the
- *    HKDF salt proof (`verifyJoinHkdfSaltProof` — defeats a stolen token held
+ *    HKDF salt proof (`verifyJoinHkdfSaltProof` - defeats a stolen token held
  *    without the master-derived transport key), then runs the operator
  *    approval gate (`JoinApprover`) and issues a NodeIdentityCertificate
  *    (`issueCertificateForApprovedJoin`). This mirrors
  *    `MeshNode.acceptJoinRequest` field-for-field on the same helpers.
  *
  * Fail closed (CLAUDE.md constraint 4): a JoinRequest that cannot be
- * cryptographically verified is DENIED, never trusted — verification is
+ * cryptographically verified is DENIED, never trusted - verification is
  * signature/proof based, never shape based. Every ceremony step writes an
  * audit entry on BOTH success and denial (PR-A1 audit-write-completeness gap,
  * design note 5). The pre-session `authorize/complete` collapses every
@@ -304,7 +304,7 @@ export class JoinCeremony {
   async authorizeComplete(request: JoinRequest): Promise<AuthorizeCompleteResult> {
     // 1. Bootstrap token must verify against the issuing principal cert for
     //    THIS fortress (signature + fortress binding + TTL). Throws on any
-    //    failure — caught and mapped to a uniform denial.
+    //    failure - caught and mapped to a uniform denial.
     try {
       verifyBootstrapToken({
         token: request.bootstrap_token,
@@ -630,6 +630,13 @@ export interface FederationNodeView {
     sent_at: string | null;
     last_sequence: number;
   };
+  applied_policy: {
+    version: number | null;
+    hash: string | null;
+    hash_algorithm: string | null;
+    applied_at: string | null;
+    source_event_id: string | null;
+  };
 }
 
 export interface FederationPostureSummary {
@@ -807,7 +814,7 @@ function handleStatus(deps: V1FederationDeps, res: ServerResponse): void {
  * Verify the inline OPERATOR_SIGNED signature over a federation admin payload.
  * Returns true only when an operator identity is configured AND the signature
  * verifies; otherwise false (the caller maps false to the generic 403, no
- * distinguishable reason — same contract as the agents write path).
+ * distinguishable reason - same contract as the agents write path).
  */
 function verifyOperator(
   deps: V1FederationDeps,
@@ -1888,7 +1895,7 @@ async function handlePeerSync(
   }
 
   // The reciprocal envelope is signed by THIS node and therefore may only carry
-  // THIS node's OWN events (origin == this node id) — the same origin-binding
+  // THIS node's OWN events (origin == this node id) - the same origin-binding
   // invariant the inbound path enforces. A node never forwards another node's
   // events inside its own signed envelope; multi-hop propagation happens through
   // pairwise syncs, not delegated forwarding (which would need its own proof).
@@ -2019,8 +2026,8 @@ function rootRevokedFailClosed(
 
 /**
  * Pre-session join-submission ceremony (BOOTSTRAP_TOKEN auth class). Reached
- * by the router BEFORE the session gate, like session/init. Every failure —
- * federation off, missing materials, bad body, unverifiable request — returns
+ * by the router BEFORE the session gate, like session/init. Every failure -
+ * federation off, missing materials, bad body, unverifiable request - returns
  * the SAME uniform 401 so a probing joining node gets no oracle.
  */
 export async function handleFederationCeremony(

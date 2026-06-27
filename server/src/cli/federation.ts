@@ -15,8 +15,12 @@
  * never leaves this process; only the public key rides in the JoinRequest.
  */
 
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import type { Writable } from "node:stream";
+import { loadConfig } from "../config.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import { readFileCustody } from "../storage/custody-fs.js";
 import { generateNodeKeypair } from "../mesh/lifecycle/join-approver.js";
 import { computeJoinHkdfSaltProof } from "../mesh/lifecycle/bootstrap-token.js";
 import { deriveNodeTransportKey } from "../mesh/trust-root.js";
@@ -62,10 +66,21 @@ import {
   type FederationRotateRootAuditEvent,
 } from "../mesh/federation-rotate-root.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { parsePolicy } from "../principal-policy/loader.js";
 import {
   CustodyUnlockError,
   CustodyRotationInProgressError,
 } from "../core/master-custody.js";
+import { federationEventHash, type FederationEvent } from "../v1/federation.js";
+import {
+  FEDERATION_SYNC_WIRE_VERSION,
+  federationOperatorAuthorityOrigin,
+} from "../v1/federation-revocation.js";
+import {
+  FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+  FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
+  signFederationPolicyBundlePayload,
+} from "../v1/federation-policy-bundle.js";
 import {
   dashboardRequest,
   DashboardRequestError,
@@ -563,6 +578,7 @@ interface AdminFlags {
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
+  policyPath?: string;
 }
 
 function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
@@ -585,6 +601,7 @@ function parseAdminFlags(argv: string[], env: NodeJS.ProcessEnv): AdminFlags {
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
     fortressPath: flag("--fortress"),
+    policyPath: flag("--policy-path"),
   };
 }
 
@@ -673,6 +690,93 @@ async function openAdminSigner(
     err.write(`sanctuary federation ${verb}: unexpected error: ${String(cause)}\n`);
     return 1;
   }
+}
+
+type FederationTrustRootRecordForZeroize =
+  Awaited<ReturnType<FederationTrustRootStore["load"]>>;
+
+function zeroFederationTrustRootRecordSecrets(
+  record: FederationTrustRootRecordForZeroize,
+): void {
+  record?.master_secret.fill(0);
+  record?.master_private_key?.fill(0);
+  record?.issuing_principal_private_key.fill(0);
+  record?.local_node_private_key.fill(0);
+  record?.hybrid?.master_private_keys?.ed25519?.private_key?.fill(0);
+  record?.hybrid?.master_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+  record?.hybrid?.issuing_principal_private_keys?.ed25519?.private_key?.fill(0);
+  record?.hybrid?.issuing_principal_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+  record?.hybrid?.local_node_private_keys?.ed25519?.private_key?.fill(0);
+  record?.hybrid?.local_node_private_keys?.ml_dsa_65?.secret_key?.fill(0);
+}
+
+class PolicyPushInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PolicyPushInputError";
+  }
+}
+
+async function loadPolicyHashForPush(flags: AdminFlags): Promise<{
+  policyVersion: number;
+  policyHash: string;
+}> {
+  const config = await loadConfig();
+  const policyPath = flags.policyPath ?? join(config.storage_path, "principal-policy.yaml");
+  let content: string;
+  try {
+    content = await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new PolicyPushInputError(`could not read principal policy: ${detail}`);
+  }
+  let policyVersion: number;
+  try {
+    const policy = parsePolicy(content);
+    policyVersion = policy.version;
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new PolicyPushInputError(`principal policy is malformed: ${detail}`);
+  }
+  if (!Number.isSafeInteger(policyVersion) || policyVersion < 1) {
+    throw new PolicyPushInputError("principal policy version must be a positive integer");
+  }
+  const policyHash = createHash("sha256").update(content, "utf8").digest("base64url");
+  return { policyVersion, policyHash };
+}
+
+function isFederationEvent(value: unknown): value is FederationEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const event = value as Record<string, unknown>;
+  return (
+    typeof event.event_id === "string" &&
+    typeof event.origin_node_id === "string" &&
+    typeof event.sequence === "number" &&
+    Number.isSafeInteger(event.sequence) &&
+    typeof event.occurred_at === "string" &&
+    typeof event.kind === "string" &&
+    typeof event.payload === "object" &&
+    event.payload !== null &&
+    (event.previous_hash === null || typeof event.previous_hash === "string") &&
+    typeof event.event_hash === "string"
+  );
+}
+
+function sortedAuthorityEvents(
+  responseEvents: unknown,
+  originNodeId: string,
+): FederationEvent[] | null {
+  if (!Array.isArray(responseEvents)) return null;
+  const authorityEvents: FederationEvent[] = [];
+  for (const event of responseEvents) {
+    if (!isFederationEvent(event)) return null;
+    if (event.origin_node_id === originNodeId) authorityEvents.push(event);
+  }
+  authorityEvents.sort((a, b) => a.sequence - b.sequence);
+  return authorityEvents;
 }
 
 /** Map a DashboardRequestError to the catalog exit code + a clear message. */
@@ -929,6 +1033,189 @@ export async function runFederationRevoke(args: {
   } catch (cause) {
     return mapAdminRequestError("revoke", cause, flags.fortressUrl, err);
   } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+/**
+ * `sanctuary federation policy-push`. Operator-signed Tier-1 verb that emits an
+ * operator-authority policy-bundle event through the existing sync envelope.
+ *
+ * Custody contract:
+ *   - The event carries only {policy_version, policy_hash, hash_algorithm} plus
+ *     the Ed25519 signature and public operator-principal id. It never carries
+ *     raw policy contents, policy secrets, or private keys.
+ *   - The bundle is signed by this fortress's federation issuing principal, so
+ *     peers verify it against their pinned federation master before applying the
+ *     version marker. Verification failure rejects the event server-side.
+ *   - No new /v1 route is added. This command opens a /v1 session and posts the
+ *     append-only event to `/v1/federation/sync`.
+ */
+export async function runFederationPolicyPush(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+  /** Test seam: the /v1 session-open ceremony (defaults to the real client). */
+  openSession?: typeof openV1Session;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const request = args.request ?? dashboardRequest;
+  const openSession = args.openSession ?? openV1Session;
+  const action = "/v1/federation/sync";
+  const flags = parseAdminFlags(args.argv, env);
+
+  if (!flags.fortressUrl) {
+    err.write(
+      "sanctuary federation policy-push: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n",
+    );
+    return 1;
+  }
+
+  const signer = await openAdminSigner("policy-push", flags, err);
+  if (typeof signer === "number") return signer;
+
+  let record: FederationTrustRootRecordForZeroize = null;
+  try {
+    let policy: { policyVersion: number; policyHash: string };
+    try {
+      policy = await loadPolicyHashForPush(flags);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      err.write(`sanctuary federation policy-push: ${detail}\n`);
+      return cause instanceof PolicyPushInputError ? 1 : 3;
+    }
+
+    const store = new FederationTrustRootStore(signer.storage, signer.masterKey);
+    try {
+      record = await store.load();
+    } catch (cause) {
+      const detail =
+        cause instanceof FederationTrustRootStoreError ? cause.message : "decrypt failed";
+      err.write(
+        `sanctuary federation policy-push: could not load this fortress's federation ` +
+          `trust root (${detail}). Refusing.\n`,
+      );
+      return 3;
+    }
+    if (record === null) {
+      err.write(
+        "sanctuary federation policy-push: this fortress has no federation trust " +
+          "root (_federation/trust-root-v1). Provision an issuer first. Refusing.\n",
+      );
+      return 3;
+    }
+
+    const sessionToken = await resolveAdminSessionToken(
+      "policy-push",
+      flags,
+      signer,
+      err,
+      openSession,
+    );
+    if (typeof sessionToken === "number") return sessionToken;
+
+    const originNodeId = federationOperatorAuthorityOrigin(
+      record.pinned_master_pubkey.fortress_id,
+    );
+    const baseSyncPayload = {
+      wire_version: FEDERATION_SYNC_WIRE_VERSION,
+      node_id: record.node_id,
+      events: [] as FederationEvent[],
+      cursor: { node_id: originNodeId },
+    };
+    const fetchResponse = (await request(
+      action,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...baseSyncPayload,
+          operator_signature: signer.signPayload(action, baseSyncPayload),
+        }),
+      },
+      adminRequestContext(flags, sessionToken),
+    )) as { events?: unknown };
+
+    const prior = sortedAuthorityEvents(fetchResponse.events, originNodeId);
+    if (prior === null) {
+      err.write(
+        "sanctuary federation policy-push: fortress returned a malformed sync event cursor\n",
+      );
+      return 3;
+    }
+    const previous = prior.length > 0 ? prior[prior.length - 1] : null;
+    const signedAt = new Date().toISOString();
+    const payload = signFederationPolicyBundlePayload({
+      fortressId: record.pinned_master_pubkey.fortress_id,
+      policyVersion: policy.policyVersion,
+      policyHash: policy.policyHash,
+      signedAt,
+      operatorPrincipalId: record.issuing_principal_cert.principal_id,
+      operatorPrincipalPrivateKey: record.issuing_principal_private_key,
+    });
+    const eventWithoutHash = {
+      event_id: `${originNodeId}:${(previous?.sequence ?? 0) + 1}`,
+      origin_node_id: originNodeId,
+      sequence: (previous?.sequence ?? 0) + 1,
+      occurred_at: signedAt,
+      kind: FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+      payload: payload as unknown as Record<string, unknown>,
+      previous_hash: previous?.event_hash ?? null,
+    };
+    const event: FederationEvent = {
+      ...eventWithoutHash,
+      event_hash: federationEventHash(eventWithoutHash),
+    };
+    const pushPayload: Record<string, unknown> = {
+      wire_version: FEDERATION_SYNC_WIRE_VERSION,
+      node_id: record.node_id,
+      events: [event],
+    };
+    if (flags.idempotencyKey !== undefined) {
+      pushPayload.idempotency_key = flags.idempotencyKey;
+    }
+    const pushResponse = (await request(
+      action,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...pushPayload,
+          operator_signature: signer.signPayload(action, pushPayload),
+        }),
+      },
+      adminRequestContext(flags, sessionToken),
+    )) as { accepted?: unknown; rejected?: unknown };
+    const accepted = Array.isArray(pushResponse.accepted)
+      ? pushResponse.accepted
+      : [];
+    if (!accepted.includes(event.event_id)) {
+      err.write(
+        "sanctuary federation policy-push: fortress did not accept the signed policy bundle event\n",
+      );
+      return 3;
+    }
+
+    out.write(
+      `${JSON.stringify(
+        {
+          policy_pushed: true,
+          policy_version: policy.policyVersion,
+          policy_hash: policy.policyHash,
+          hash_algorithm: FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
+          event_id: event.event_id,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  } catch (cause) {
+    return mapAdminRequestError("policy-push", cause, flags.fortressUrl, err);
+  } finally {
+    zeroFederationTrustRootRecordSecrets(record);
     signer.masterKey.fill(0);
   }
 }
@@ -1889,6 +2176,8 @@ Operator (issuer) verbs -- operator-signed, run on the home fortress:
     [--node-mode local|operator_cloud|sovereign_tee]
   sanctuary federation revoke --fortress-url <url> --node-id <id> \\
     [--reason <reason>] [--idempotency-key <s>]
+  sanctuary federation policy-push --fortress-url <url> \\
+    [--policy-path <path>] [--idempotency-key <s>]
 
   enable / disable   Turn federation on/off for this fortress. Operator-signed
                      Tier-1: needs an unlocked default operator identity
@@ -1908,6 +2197,15 @@ Operator (issuer) verbs -- operator-signed, run on the home fortress:
                      (POST /v1/federation/revoke). The fortress folds the event
                      into its revoked-node projection before acknowledging it,
                      so future joins/sync for that node fail closed.
+
+  policy-push        Emit a durable operator-authority policy-bundle event
+                     through POST /v1/federation/sync (no new route). The bundle
+                     carries only the principal-policy version, SHA-256 hash, hash
+                     algorithm, and issuing-principal signature. It never carries
+                     raw policy contents, policy secrets, or private keys. Peers
+                     verify the signature against the pinned federation master
+                     before applying the version marker; failed verification is
+                     rejected, never downgraded to a warning.
 
 Joiner verb -- runs on the joining node:
   Local / sovereign_tee node:
@@ -1977,6 +2275,9 @@ export async function runFederationCommand(args: {
   }
   if (sub === "revoke") {
     return runFederationRevoke({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "policy-push") {
+    return runFederationPolicyPush({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
     `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,

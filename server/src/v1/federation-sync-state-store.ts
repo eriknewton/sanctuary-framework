@@ -56,6 +56,7 @@ import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { bytesToString, stringToBytes } from "../core/encoding.js";
+import type { FederationAppliedPolicyVersion } from "./federation-policy-bundle.js";
 
 /**
  * At-rest location + HKDF label for the durable sync-state record. ADDITIVE and
@@ -101,6 +102,10 @@ export interface FederationSyncStateSnapshot {
   revokedRootPubkeys: Set<string>;
   /** Highest accepted operator-authority revocation serial (replay floor). */
   highestRevocationSerial: number;
+  /** Highest verified operator policy bundle accepted by this daemon. */
+  operatorPolicy: FederationAppliedPolicyVersion | null;
+  /** Per-node applied policy version markers: nodeId -> verified applied marker. */
+  appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
 }
 
 interface PersistedSyncState {
@@ -125,6 +130,18 @@ interface PersistedSyncState {
   revoked_root_pubkeys?: string[];
   /** Highest accepted revocation serial (optional for the same back-compat reason). */
   highest_revocation_serial?: number;
+  /** Highest verified operator policy bundle accepted by this daemon. */
+  operator_policy?: PersistedAppliedPolicyVersion | null;
+  /** Per-node applied policy version markers. */
+  applied_policy_versions?: Array<[string, PersistedAppliedPolicyVersion]>;
+}
+
+interface PersistedAppliedPolicyVersion {
+  version: number;
+  hash: string;
+  hash_algorithm: FederationAppliedPolicyVersion["hash_algorithm"];
+  applied_at: string;
+  source_event_id: string;
 }
 
 export class FederationSyncStateStoreError extends Error {
@@ -143,6 +160,8 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     highestEvictionSerial: 0,
     revokedRootPubkeys: new Set(),
     highestRevocationSerial: 0,
+    operatorPolicy: null,
+    appliedPolicyVersions: new Map(),
   };
 }
 
@@ -283,6 +302,12 @@ export class FederationSyncStateStore {
           highest_eviction_serial: merged.highestEvictionSerial,
           revoked_root_pubkeys: [...merged.revokedRootPubkeys],
           highest_revocation_serial: merged.highestRevocationSerial,
+          operator_policy: merged.operatorPolicy
+            ? encodeAppliedPolicyVersion(merged.operatorPolicy)
+            : null,
+          applied_policy_versions: [...merged.appliedPolicyVersions].map(
+            ([nodeId, marker]) => [nodeId, encodeAppliedPolicyVersion(marker)],
+          ),
         };
         const serialized = stringToBytes(JSON.stringify(persisted));
         try {
@@ -303,6 +328,11 @@ export class FederationSyncStateStore {
 function cloneSnapshot(
   snapshot: FederationSyncStateSnapshot,
 ): FederationSyncStateSnapshot {
+  const operatorPolicy =
+    (snapshot as Partial<FederationSyncStateSnapshot>).operatorPolicy ?? null;
+  const appliedPolicyVersions =
+    (snapshot as Partial<FederationSyncStateSnapshot>).appliedPolicyVersions ??
+    new Map<string, FederationAppliedPolicyVersion>();
   return {
     acceptedHighWater: new Map(snapshot.acceptedHighWater),
     outboundHighWater: snapshot.outboundHighWater,
@@ -310,6 +340,13 @@ function cloneSnapshot(
     highestEvictionSerial: snapshot.highestEvictionSerial,
     revokedRootPubkeys: new Set(snapshot.revokedRootPubkeys),
     highestRevocationSerial: snapshot.highestRevocationSerial,
+    operatorPolicy: operatorPolicy ? { ...operatorPolicy } : null,
+    appliedPolicyVersions: new Map(
+      [...appliedPolicyVersions].map(([nodeId, marker]) => [
+        nodeId,
+        { ...marker },
+      ]),
+    ),
   };
 }
 
@@ -352,6 +389,13 @@ function mergeSyncStateMonotonic(
   for (const nodeId of next.revokedNodeIds) revokedNodeIds.add(nodeId);
   const revokedRootPubkeys = new Set(base.revokedRootPubkeys);
   for (const pubkey of next.revokedRootPubkeys) revokedRootPubkeys.add(pubkey);
+  const appliedPolicyVersions = new Map(base.appliedPolicyVersions);
+  for (const [nodeId, marker] of next.appliedPolicyVersions) {
+    const prior = appliedPolicyVersions.get(nodeId);
+    if (!prior || marker.version > prior.version) {
+      appliedPolicyVersions.set(nodeId, { ...marker });
+    }
+  }
   return {
     acceptedHighWater,
     outboundHighWater: Math.max(base.outboundHighWater, next.outboundHighWater),
@@ -365,6 +409,8 @@ function mergeSyncStateMonotonic(
       base.highestRevocationSerial,
       next.highestRevocationSerial,
     ),
+    operatorPolicy: newerPolicy(base.operatorPolicy, next.operatorPolicy),
+    appliedPolicyVersions,
   };
 }
 
@@ -400,6 +446,10 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
           obj.highest_revocation_serial,
           "highest_revocation_serial",
         );
+  const operatorPolicy = decodeOptionalAppliedPolicyVersion(obj.operator_policy);
+  const appliedPolicyVersions = decodeAppliedPolicyVersions(
+    obj.applied_policy_versions,
+  );
 
   return {
     acceptedHighWater,
@@ -408,6 +458,97 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     highestEvictionSerial,
     revokedRootPubkeys,
     highestRevocationSerial,
+    operatorPolicy,
+    appliedPolicyVersions,
+  };
+}
+
+function newerPolicy(
+  base: FederationAppliedPolicyVersion | null,
+  next: FederationAppliedPolicyVersion | null,
+): FederationAppliedPolicyVersion | null {
+  if (!base) return next ? { ...next } : null;
+  if (!next) return { ...base };
+  return next.version > base.version ? { ...next } : { ...base };
+}
+
+function encodeAppliedPolicyVersion(
+  marker: FederationAppliedPolicyVersion,
+): PersistedAppliedPolicyVersion {
+  return { ...marker };
+}
+
+function decodeOptionalAppliedPolicyVersion(
+  value: unknown,
+): FederationAppliedPolicyVersion | null {
+  if (value === undefined || value === null) return null;
+  return decodeAppliedPolicyVersion(value);
+}
+
+function decodeAppliedPolicyVersions(
+  value: unknown,
+): Map<string, FederationAppliedPolicyVersion> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value)) {
+    throw new FederationSyncStateStoreError(
+      "applied_policy_versions is not an array",
+    );
+  }
+  const out = new Map<string, FederationAppliedPolicyVersion>();
+  for (const pair of value) {
+    if (!Array.isArray(pair) || pair.length !== 2) {
+      throw new FederationSyncStateStoreError(
+        "applied_policy_versions entry is not a [string, object] pair",
+      );
+    }
+    const [nodeId, marker] = pair as [unknown, unknown];
+    if (typeof nodeId !== "string" || nodeId.length === 0) {
+      throw new FederationSyncStateStoreError(
+        "applied_policy_versions node id is invalid",
+      );
+    }
+    out.set(nodeId, decodeAppliedPolicyVersion(marker));
+  }
+  return out;
+}
+
+function decodeAppliedPolicyVersion(
+  value: unknown,
+): FederationAppliedPolicyVersion {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("applied policy marker is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const version = decodeNonNegativeInt(obj.version, "applied policy version");
+  const hash = obj.hash;
+  const hashAlgorithm = obj.hash_algorithm;
+  const appliedAt = obj.applied_at;
+  const sourceEventId = obj.source_event_id;
+  if (version < 1) {
+    throw new FederationSyncStateStoreError("applied policy version is invalid");
+  }
+  if (typeof hash !== "string" || hash.length === 0) {
+    throw new FederationSyncStateStoreError("applied policy hash is invalid");
+  }
+  if (hashAlgorithm !== "sha256-base64url") {
+    throw new FederationSyncStateStoreError(
+      "applied policy hash_algorithm is invalid",
+    );
+  }
+  if (typeof appliedAt !== "string" || appliedAt.length === 0) {
+    throw new FederationSyncStateStoreError("applied policy applied_at is invalid");
+  }
+  if (typeof sourceEventId !== "string" || sourceEventId.length === 0) {
+    throw new FederationSyncStateStoreError(
+      "applied policy source_event_id is invalid",
+    );
+  }
+  return {
+    version,
+    hash,
+    hash_algorithm: hashAlgorithm,
+    applied_at: appliedAt,
+    source_event_id: sourceEventId,
   };
 }
 
