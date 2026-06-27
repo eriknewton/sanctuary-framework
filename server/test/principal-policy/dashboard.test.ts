@@ -7,7 +7,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
-import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
+import {
+  DashboardApprovalChannel,
+  ipv6Slash64Prefix,
+} from "../../src/principal-policy/dashboard.js";
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -79,7 +82,12 @@ describe("Principal Dashboard", () => {
       dashboard = new DashboardApprovalChannel({
         port,
         host: "127.0.0.1",
-        timeout_seconds: 2, // Short timeout for tests
+        // Generous timeout: the human-decision tests (approve/deny/concurrent)
+        // must never race the production auto-deny timer under a >2s event-loop
+        // stall during full-suite CI load. The genuine timeout-behavior test
+        // ("auto-denies on timeout when auto_deny is true") builds its OWN
+        // short-timeout dashboard so this value does not affect it.
+        timeout_seconds: 30,
         auto_deny: true,
       });
       await dashboard.start();
@@ -209,6 +217,7 @@ describe("Principal Dashboard", () => {
 
       const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
       const pending = await listRes.json();
+      expect(pending).toHaveLength(1);
 
       const denyRes = await fetch(
         `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
@@ -230,12 +239,33 @@ describe("Principal Dashboard", () => {
     });
 
     it("auto-denies on timeout when auto_deny is true", async () => {
-      const request = makeRequest();
-      const response = await dashboard.requestApproval(request);
-      // With 2-second timeout, this should auto-deny
-      expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("timeout");
-      expect(dashboard.pendingCount).toBe(0);
+      // The top-level dashboard runs a generous 30s timeout so the
+      // human-decision tests never race the auto-deny under load. This test
+      // genuinely needs a SHORT timeout to observe the auto-deny within the
+      // 5000ms budget, so it builds its own short-timeout dashboard (mirroring
+      // the SEC-002 rig below) and tears it down in a finally.
+      let timeoutDashboard: DashboardApprovalChannel | undefined;
+      let timeoutPort: number;
+      await bindWithRetry(async () => {
+        timeoutPort = randomTestPort();
+        timeoutDashboard = new DashboardApprovalChannel({
+          port: timeoutPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+        });
+        await timeoutDashboard.start();
+      });
+      try {
+        const request = makeRequest();
+        const response = await timeoutDashboard!.requestApproval(request);
+        // With 2-second timeout, this should auto-deny
+        expect(response.decision).toBe("deny");
+        expect(response.decided_by).toBe("timeout");
+        expect(timeoutDashboard!.pendingCount).toBe(0);
+      } finally {
+        await timeoutDashboard?.stop();
+      }
     }, 5000);
 
     it("handles multiple concurrent pending requests", async () => {
@@ -1025,6 +1055,41 @@ describe("Principal Dashboard", () => {
         results.push(res.status);
       }
       expect(results).not.toContain(429);
+    });
+
+    // Federation P1 DoS hardening: the federation peer rate-limit bucket keys
+    // IPv6 to its /64 prefix so an attacker rotating addresses within one /64
+    // shares one bucket. The helper is pure; test it directly.
+    describe("ipv6Slash64Prefix (Federation P1 /64 aggregation)", () => {
+      it("aggregates distinct addresses in the same /64 to the same key", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234:0:0:0:1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:1234:ffff:ffff:ffff:ffff");
+        expect(a).toBe("2001:db8:abcd:1234::/64");
+        expect(a).toBe(b);
+      });
+
+      it("keeps addresses in DIFFERENT /64s on distinct keys", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234::1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:9999::1");
+        expect(a).not.toBe(b);
+      });
+
+      it("expands a single `::` zero-run before taking the prefix", () => {
+        // ::1 -> 0:0:0:0:0:0:0:1 -> first four hextets all zero.
+        expect(ipv6Slash64Prefix("::1")).toBe("0:0:0:0::/64");
+        // fe80::1 -> fe80:0:0:0:...
+        expect(ipv6Slash64Prefix("fe80::1")).toBe("fe80:0:0:0::/64");
+      });
+
+      it("returns null for IPv4, mapped-IPv4, and malformed inputs (caller keys verbatim)", () => {
+        expect(ipv6Slash64Prefix("127.0.0.1")).toBeNull();
+        expect(ipv6Slash64Prefix("203.0.113.7")).toBeNull();
+        expect(ipv6Slash64Prefix("::ffff:1.2.3.4")).toBeNull(); // mapped IPv4
+        expect(ipv6Slash64Prefix("unknown")).toBeNull();
+        expect(ipv6Slash64Prefix("2001:db8::1::2")).toBeNull(); // two "::"
+        expect(ipv6Slash64Prefix("fe80::1%eth0")).toBeNull(); // zone id
+        expect(ipv6Slash64Prefix("gggg::1")).toBeNull(); // non-hex
+      });
     });
   });
 

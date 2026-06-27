@@ -21,6 +21,12 @@ import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import { publicKeyToDid, type StoredIdentity } from "../core/identity.js";
+import {
+  BRIDGE_METRIC_POLICY,
+  BridgeAttestationMetricValidationError,
+  CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+  buildBridgeAttestationMetrics,
+} from "../reputation/bridge-metrics.js";
 
 import {
   createBridgeCommitment,
@@ -30,6 +36,11 @@ import type {
   ConcordiaOutcome,
   BridgeCommitment,
 } from "./types.js";
+
+export {
+  BRIDGE_ATTESTATION_BEHAVIORAL_METRIC_ALLOWLIST,
+  BRIDGE_POLICY_METRIC_ALLOWLIST,
+} from "../reputation/bridge-metrics.js";
 
 // ─── Bridge Store ────────────────────────────────────────────────────────
 // Persists bridge commitments encrypted at rest for later verification
@@ -373,8 +384,46 @@ export function createBridgeTools(
           },
           metrics: {
             type: "object",
+            additionalProperties: false,
             description:
-              "Optional metrics (e.g., rounds, response_time_ms, terms_complexity)",
+              "Optional self-declared bridge behavioral inputs. Sanctuary " +
+              "does not independently verify these declarations; it bounds " +
+              "and buckets them before storage under metric_policy " +
+              `"${BRIDGE_METRIC_POLICY}". Raw deal terms, raw magnitudes, ` +
+              "legacy exact metric names, and unknown keys are rejected.",
+            properties: {
+              declared_offers_made: {
+                type: "integer",
+                minimum: 1,
+                maximum: 64,
+                description:
+                  "Self-declared offer count, integer 1..64. Stored only as " +
+                  "declared_offers_made_bucket, not the exact count.",
+              },
+              declared_concession: {
+                type: "number",
+                minimum: 0,
+                maximum: 1,
+                description:
+                  "Self-declared concession ratio from 0 to 1. Stored only " +
+                  "as declared_concession_bucket (0..10), not the exact ratio.",
+              },
+              declared_reasoning_provided: {
+                type: "boolean",
+                description:
+                  "Self-declared whether reasoning was provided. Stored as " +
+                  "declared_reasoning_provided 0 or 1.",
+              },
+              declared_response_time_ms: {
+                type: "integer",
+                minimum: 0,
+                maximum: 3600000,
+                description:
+                  "Self-declared response latency in milliseconds, integer " +
+                  "0..3600000. Stored only as declared_response_time_bucket, " +
+                  "not exact milliseconds.",
+              },
+            },
           },
           identity_id: {
             type: "string",
@@ -390,7 +439,6 @@ export function createBridgeTools(
           | "partial"
           | "failed"
           | "disputed";
-        const metrics = (args.metrics as Record<string, number>) ?? {};
         const identityId = args.identity_id as string | undefined;
 
         // Load the stored commitment and outcome
@@ -430,11 +478,83 @@ export function createBridgeTools(
           });
         }
 
+        let builtMetrics;
+        try {
+          builtMetrics = buildBridgeAttestationMetrics(outcome, args.metrics);
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
+
         // Determine counterparty DID
         const counterpartyDid =
           outcome.proposer_did === identity.did
             ? outcome.acceptor_did
             : outcome.proposer_did;
+
+        // Idempotency for the SAME-NEGOTIATION replay: a party can call
+        // bridge_attest repeatedly on the same valid commitment. Each call would
+        // otherwise mint a fresh attestation reusing interaction_id =
+        // session_id, and the reputation aggregator counts attestations with no
+        // de-dup, so re-attesting one session would inflate the tallies N-fold.
+        // Detect an attestation this same party has ALREADY recorded for this
+        // session in the bridge context and return it idempotently rather than
+        // recording a second. The counterparty attesting the same session, a
+        // different context, or a different session still records normally.
+        //
+        // SCOPE (do not overclaim): this closes RE-ATTESTATION of the SAME
+        // negotiation (same session_id tuple) only. It does NOT prevent a party
+        // from minting MULTIPLE DISTINCT commitments for one real negotiation:
+        // the session_id is caller-supplied and the session_receipt is not
+        // verified here, so a fresh session_id per call still self-inflates the
+        // tally. That broader self-inflation is NOT closed by this fix and is a
+        // known scoring-engine / collusion concern (the bridge cannot verify a
+        // Concordia session is unique or real without a verified session_receipt
+        // anchor).
+        //
+        // DEBT (bridge self-inflation): verify the Concordia session_receipt (or
+        // another negotiation-unique anchor) so one real negotiation cannot be
+        // re-committed under many session_ids. That is a trust-boundary decision
+        // for Erik (draft-then-approve), not resolved by this dedup.
+        //
+        // Fail CLOSED on the dedup scan: if uniqueness cannot be confirmed
+        // (a storage.list error, or any entry that failed to load/decrypt during
+        // the scan), deny the attest rather than risk recording a duplicate
+        // under a transient error. The aggregate read paths intentionally skip
+        // corrupted entries; this dedup path does not.
+        const dedup = await reputationStore.findExistingAttestationForDedup({
+          interaction_id: outcome.session_id,
+          participant_did: identity.did,
+          counterparty_did: counterpartyDid,
+          context: CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+        });
+        if (!dedup.scanComplete) {
+          return toolResult({
+            error:
+              "Cannot confirm this negotiation was not already attested " +
+              "(reputation store could not be fully read); the attestation was " +
+              "not recorded. Retry once the store is readable.",
+          });
+        }
+        const existingAttestation = dedup.match;
+        if (existingAttestation) {
+          return toolResult({
+            attestation_id: existingAttestation.attestation.attestation_id,
+            bridge_commitment_id: commitmentId,
+            session_id: outcome.session_id,
+            counterparty_did: counterpartyDid,
+            outcome_result: existingAttestation.attestation.data.outcome_result,
+            sovereignty_tier: existingAttestation.attestation.data.sovereignty_tier,
+            metric_policy: existingAttestation.attestation.data.metric_policy,
+            attested_at: existingAttestation.recorded_at,
+            already_attested: true,
+            note:
+              "This negotiation was already attested by this identity; returning " +
+              "the existing attestation. Reputation was not recorded a second time.",
+          });
+        }
 
         // Resolve sovereignty tier from handshake results
         // Check if the counterparty has a known Sanctuary identity
@@ -444,27 +564,30 @@ export function createBridgeTools(
         const tierMeta: TierMetadata = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
         const tier = tierMeta.sovereignty_tier;
 
-        // Include bridge-specific metrics alongside user-provided ones
-        const fullMetrics = {
-          ...metrics,
-          negotiation_rounds: outcome.rounds,
-        };
-
         // Record the reputation attestation
-        const attestation = await reputationStore.record(
-          outcome.session_id, // interaction_id = concordia session
-          counterpartyDid,
-          {
-            type: "negotiation",
-            result: outcomeResult,
-            metrics: fullMetrics,
-          },
-          "concordia-bridge", // context
-          identity,
-          identityEncryptionKey,
-          undefined, // counterparty_attestation
-          tier
-        );
+        let attestation;
+        try {
+          attestation = await reputationStore.record(
+            outcome.session_id, // interaction_id = concordia session
+            counterpartyDid,
+            {
+              type: "negotiation",
+              result: outcomeResult,
+              metrics: builtMetrics.metrics,
+              metric_policy: builtMetrics.policy,
+            },
+            CONCORDIA_BRIDGE_REPUTATION_CONTEXT,
+            identity,
+            identityEncryptionKey,
+            undefined, // counterparty_attestation
+            tier
+          );
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
 
         await auditLog.appendCritical({
           layer: "l4",
@@ -489,7 +612,9 @@ export function createBridgeTools(
           counterparty_did: counterpartyDid,
           outcome_result: outcomeResult,
           sovereignty_tier: tier,
+          metric_policy: attestation.attestation.data.metric_policy,
           attested_at: attestation.recorded_at,
+          already_attested: false,
           note: `Negotiation recorded as reputation attestation. ` +
             `Counterparty sovereignty tier: ${tier} (weight: ${weight}).`,
         });

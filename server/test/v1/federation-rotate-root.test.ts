@@ -40,20 +40,39 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { ROTATION_JOURNAL_KEY as CUSTODY_ROTATION_JOURNAL_KEY } from "../../src/core/master-custody.js";
-import { toBase64url, fromBase64url, stringToBytes } from "../../src/core/encoding.js";
+import {
+  bytesToString,
+  toBase64url,
+  fromBase64url,
+  stringToBytes,
+} from "../../src/core/encoding.js";
+import { encrypt, decrypt, type EncryptedPayload } from "../../src/core/encryption.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import {
   provisionOrLoadFederationTrustRoot,
   federationContextFromTrustRootRecord,
 } from "../../src/mesh/federation-trust-root-store.js";
 import {
   rotateFederationRootRenew,
+  rotateFederationRootCompromised,
   resumeFederationRootRotation,
+  resumeFederationRootCompromised,
   federationRotateRootInProgress,
   verifyFederationRootRotationCertificate,
   FEDERATION_ROTATE_ROOT_JOURNAL_KEY,
   FEDERATION_ROTATE_ROOT_STAGED_KEY,
   FederationRotateRootError,
+  assertHybridRecordWellFormedForRotation,
 } from "../../src/mesh/federation-rotate-root.js";
+import { verifyFederationRootRotationHybridBinding } from "../../src/mesh/trust-root-hybrid.js";
+import {
+  verifyFederationRootRevocationHybridBundle,
+  verifyFederationRootRevocationEvent,
+  type FederationRevocationLogEvent,
+  FEDERATION_ROOT_REVOCATION_EVENT_KIND,
+} from "../../src/v1/federation-revocation.js";
+import { verifySyncEnvelope } from "../../src/v1/federation-sync-envelope.js";
+import { FederationSyncStateStore } from "../../src/v1/federation-sync-state-store.js";
 import { FEDERATION_TRUST_ROOT_NAMESPACE } from "../../src/mesh/federation-trust-root-store.js";
 import {
   verifyCertChain,
@@ -113,6 +132,39 @@ async function loadLive(masterKey: Uint8Array) {
   const loaded = await provisionOrLoadFederationTrustRoot({ storage, masterKey });
   if (loaded === null) throw new Error("expected a provisioned issuer record");
   return loaded.record;
+}
+
+async function tamperStagedRecord(
+  masterKey: Uint8Array,
+  mutate: (record: Record<string, unknown>) => void,
+): Promise<void> {
+  const raw = await storage.read(
+    FEDERATION_TRUST_ROOT_NAMESPACE,
+    FEDERATION_ROTATE_ROOT_STAGED_KEY,
+  );
+  if (raw === null) throw new Error("expected staged rotate-root record");
+  const encryptionKey = derivePurposeKey(masterKey, "federation-trust-root");
+  let plaintext: Uint8Array | undefined;
+  let serialized: Uint8Array | undefined;
+  try {
+    plaintext = decrypt(
+      JSON.parse(bytesToString(raw)) as EncryptedPayload,
+      encryptionKey,
+    );
+    const record = JSON.parse(bytesToString(plaintext)) as Record<string, unknown>;
+    mutate(record);
+    serialized = stringToBytes(JSON.stringify(record));
+    const encrypted = encrypt(serialized, encryptionKey);
+    await storage.write(
+      FEDERATION_TRUST_ROOT_NAMESPACE,
+      FEDERATION_ROTATE_ROOT_STAGED_KEY,
+      stringToBytes(JSON.stringify(encrypted)),
+    );
+  } finally {
+    encryptionKey.fill(0);
+    plaintext?.fill(0);
+    serialized?.fill(0);
+  }
 }
 
 describe("rotate-root --renew: the renewal re-key (P1)", () => {
@@ -194,6 +246,19 @@ describe("rotate-root --renew: the renewal re-key (P1)", () => {
     // The context's pinned master is K2; the issuing principal cert chains to it.
     expect(ctx.pinnedMasterPubkey.public_key).toBe(after.pinned_master_pubkey.public_key);
     verifyPrincipalCertificate(ctx.issuingPrincipalCert, ctx.pinnedMasterPubkey);
+    // Slice 3c-2: the context surfaces the fortress's OWN adopted rotation
+    // lineage (the trusted anchor the pre-session reissue endpoint pins the
+    // predecessor master from, never the request). Sourced from the durable
+    // record, not the wire.
+    expect(ctx.recordedRotationSerial).toBe(after.rotation_serial);
+    expect(ctx.recordedRotationCert?.old_master_pubkey).toBe(
+      after.rotation_cert?.old_master_pubkey,
+    );
+    expect(ctx.recordedRotationCert?.new_master.public_key).toBe(
+      after.pinned_master_pubkey.public_key,
+    );
+    // A classical fortress is NOT hybrid, so the reissue endpoint stays open.
+    expect(ctx.isHybrid).toBe(false);
     masterKey.fill(0);
   });
 
@@ -603,7 +668,7 @@ describe("rotate-root: refuse-if-not-provisioned + fail-closed custody", () => {
     masterKey.fill(0);
   });
 
-  it("usage errors: no mode -> exit 1; --compromise -> exit 1 (not implemented this slice)", async () => {
+  it("usage errors: no mode -> exit 1; --renew + --compromised together -> exit 1 (mutually exclusive)", async () => {
     const { masterKey } = await seedIssuer();
     masterKey.fill(0);
 
@@ -616,18 +681,20 @@ describe("rotate-root: refuse-if-not-provisioned + fail-closed custody", () => {
         err: noMode.stream,
       }),
     ).toBe(1);
-    expect(noMode.get()).toMatch(/--renew|--resume/);
+    expect(noMode.get()).toMatch(/--renew|--resume|--compromised/);
 
-    const compromise = capture();
+    // --renew and --compromised are mutually exclusive intents -> usage error
+    // (returns before any custody unlock, so the fortress is untouched).
+    const conflicting = capture();
     expect(
       await runFederationRotateRoot({
-        argv: ["--compromise", "--fortress", fortressPath],
+        argv: ["--renew", "--compromised", "--fortress", fortressPath],
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
         out: capture().stream,
-        err: compromise.stream,
+        err: conflicting.stream,
       }),
     ).toBe(1);
-    expect(compromise.get()).toMatch(/not implemented in this slice|Slice 3c/i);
+    expect(conflicting.get()).toMatch(/mutually exclusive/i);
   });
 });
 
@@ -678,6 +745,51 @@ describe("rotate-root: no-secret-leak (constraint 6)", () => {
     expect(auditJson).toContain(after.pinned_master_pubkey.public_key);
     masterKey.fill(0);
   });
+
+  it("hybrid compromise stdout + audit contain ZERO hybrid ML-DSA secret bytes", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldSecrets = [
+      toBase64url(before.hybrid!.master_private_keys.ml_dsa_65.secret_key),
+      toBase64url(before.hybrid!.issuing_principal_private_keys.ml_dsa_65.secret_key),
+      toBase64url(before.hybrid!.local_node_private_keys.ml_dsa_65.secret_key),
+    ];
+
+    const out = capture();
+    const err = capture();
+    const code = await runFederationRotateRoot({
+      argv: ["--compromised", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+
+    const after = await loadLive(masterKey);
+    const newSecrets = [
+      toBase64url(after.hybrid!.master_private_keys.ml_dsa_65.secret_key),
+      toBase64url(after.hybrid!.issuing_principal_private_keys.ml_dsa_65.secret_key),
+      toBase64url(after.hybrid!.local_node_private_keys.ml_dsa_65.secret_key),
+    ];
+    const allSecrets = [...oldSecrets, ...newSecrets];
+
+    const stdout = out.get();
+    for (const secret of allSecrets) {
+      expect(stdout).not.toContain(secret);
+    }
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const { entries } = await auditLog.query({
+      operation_type: "federation_root_compromise_revoked",
+      limit: 100,
+    });
+    expect(entries.length).toBeGreaterThan(0);
+    const auditJson = JSON.stringify(entries);
+    for (const secret of allSecrets) {
+      expect(auditJson).not.toContain(secret);
+    }
+    masterKey.fill(0);
+  });
 });
 
 describe("rotate-root: provision -> rotate-root via the CLI dispatcher", () => {
@@ -686,14 +798,21 @@ describe("rotate-root: provision -> rotate-root via the CLI dispatcher", () => {
     const masterKey = Uint8Array.from(seeded.masterKey);
     seeded.masterKey.fill(0);
 
+    // PQC default-on: a bare provision now mints a HYBRID root, and rotate-root
+    // REFUSES on hybrid roots (hybrid signing-master rotation is a deferred
+    // follow-up). This test exercises the provision -> rotate-root path through
+    // the dispatcher, so it must provision the CLASSICAL root that rotate-root
+    // can actually rotate (--classical opts out of the new hybrid default). The
+    // hybrid-root rotate REFUSAL is covered by its own tests above.
     const provCode = await runFederationProvision({
-      argv: ["--node-id", "home-mac", "--fortress", fortressPath],
+      argv: ["--node-id", "home-mac", "--classical", "--fortress", fortressPath],
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       out: capture().stream,
       err: capture().stream,
     });
     expect(provCode).toBe(0);
     const before = await loadLive(masterKey);
+    expect(before.hybrid, "the dispatcher rotate path needs a classical root").toBeUndefined();
 
     const out = capture();
     const err = capture();
@@ -707,6 +826,501 @@ describe("rotate-root: provision -> rotate-root via the CLI dispatcher", () => {
     const after = await loadLive(masterKey);
     expect(after.pinned_master_pubkey.public_key).not.toBe(before.pinned_master_pubkey.public_key);
     expect(after.fortress_id).toBe(before.fortress_id);
+    masterKey.fill(0);
+  });
+});
+
+/**
+ * Seed an issuer fortress provisioned with the HYBRID suite via the REAL
+ * provision CLI (--pqc-hybrid), so the at-rest record carries the
+ * Ed25519+ML-DSA-65 `hybrid` block. Returns the unlocked custody master key.
+ */
+async function seedHybridIssuer(nodeId = "home-mac"): Promise<Uint8Array> {
+  const seeded = await seedCustodyAndOperator({ storage, passphrase: PASSPHRASE });
+  const masterKey = Uint8Array.from(seeded.masterKey);
+  seeded.masterKey.fill(0);
+
+  const provErr = capture();
+  const provCode = await runFederationProvision({
+    argv: ["--node-id", nodeId, "--pqc-hybrid", "--fortress", fortressPath],
+    env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    out: capture().stream,
+    err: provErr.stream,
+  });
+  expect(provCode, `provision stderr: ${provErr.get()}`).toBe(0);
+  const live = await loadLive(masterKey);
+  expect(live.hybrid, "expected a hybrid issuer record").toBeDefined();
+  return masterKey;
+}
+
+describe("rotate-root --renew on a HYBRID root (PQC Slice 3): rotates, no downgrade, both-must-pass", () => {
+  it("rotates the HYBRID master: still hybrid (4032-byte ML-DSA secret), new pinned hybrid master, STABLE fortress_id, certs verify, OLD root gone, hybrid rotation cert verifies BOTH components", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldHybridPinned = structuredClone(before.hybrid!.pinned_master);
+    const oldClassicalPinned = { ...before.pinned_master_pubkey };
+
+    const err = capture();
+    const code = await runFederationRotateRoot({
+      argv: ["--renew", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: err.stream,
+    });
+    expect(code, `stderr: ${err.get()}`).toBe(0);
+
+    const after = await loadLive(masterKey);
+    // STILL hybrid (never downgraded to classical-only).
+    expect(after.hybrid, "rotated record must remain hybrid").toBeDefined();
+    // The 4032-byte ML-DSA-65 secret is present + correct length.
+    expect(after.hybrid!.master_private_keys.ml_dsa_65.secret_key.length).toBe(4032);
+    expect(after.hybrid!.master_private_keys.ed25519.private_key.length).toBe(32);
+    // New pinned HYBRID master differs from old (both components rotated).
+    expect(after.hybrid!.pinned_master.public_keys.ed25519.public_key).not.toBe(
+      oldHybridPinned.public_keys.ed25519.public_key,
+    );
+    expect(after.hybrid!.pinned_master.public_keys.ml_dsa_65.public_key).not.toBe(
+      oldHybridPinned.public_keys.ml_dsa_65.public_key,
+    );
+    // Classical master rotated in lockstep.
+    expect(after.pinned_master_pubkey.public_key).not.toBe(
+      oldClassicalPinned.public_key,
+    );
+    // STABLE fortress_id across both chains.
+    expect(after.fortress_id).toBe(before.fortress_id);
+    expect(after.hybrid!.pinned_master.fortress_id).toBe(before.fortress_id);
+
+    // The rotation cert carries the hybrid binding; it verifies under the OLD
+    // hybrid master with BOTH components (both-must-pass).
+    const cert = after.rotation_cert!;
+    expect(cert.hybrid_rotation, "hybrid rotation cert must carry hybrid binding").toBeDefined();
+    await verifyFederationRootRotationHybridBinding(
+      cert.hybrid_rotation!,
+      oldHybridPinned,
+      {
+        fortress_id: cert.fortress_id,
+        old_master_pubkey: cert.old_master_pubkey,
+        new_master: cert.new_master,
+        rotation_serial: cert.rotation_serial,
+        rotated_at: cert.rotated_at,
+      },
+    );
+    masterKey.fill(0);
+  });
+
+  it("DOWNGRADE GUARD: a hybrid rotation cert does NOT verify with ONLY the Ed25519 component (tampered/stripped ML-DSA half is rejected, both-must-pass)", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldHybridPinned = structuredClone(before.hybrid!.pinned_master);
+
+    await rotateFederationRootRenew({ storage, masterKey });
+    const after = await loadLive(masterKey);
+    const cert = after.rotation_cert!;
+    const binding = structuredClone(cert.hybrid_rotation!);
+
+    // Tamper: corrupt the ML-DSA-65 component sig (the Ed25519 half stays valid).
+    // A both-must-pass verifier MUST reject, never adopt on the Ed25519 half alone.
+    const mlComponent = binding.old_hybrid_master_signature_bundle.components[1]!;
+    const corrupted = {
+      ...binding,
+      old_hybrid_master_signature_bundle: {
+        ...binding.old_hybrid_master_signature_bundle,
+        components: [
+          binding.old_hybrid_master_signature_bundle.components[0]!,
+          { ...mlComponent, sig: "A".repeat(mlComponent.sig.length) },
+        ],
+      },
+    };
+    await expect(
+      verifyFederationRootRotationHybridBinding(corrupted, oldHybridPinned, {
+        fortress_id: cert.fortress_id,
+        old_master_pubkey: cert.old_master_pubkey,
+        new_master: cert.new_master,
+        rotation_serial: cert.rotation_serial,
+        rotated_at: cert.rotated_at,
+      }),
+    ).rejects.toThrow();
+    masterKey.fill(0);
+  });
+
+  it("BINDING GUARD: tampering the outer classical new_master invalidates the hybrid rotation binding", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldHybridPinned = structuredClone(before.hybrid!.pinned_master);
+
+    await rotateFederationRootRenew({ storage, masterKey });
+    const after = await loadLive(masterKey);
+    const cert = after.rotation_cert!;
+    await expect(
+      verifyFederationRootRotationHybridBinding(
+        cert.hybrid_rotation!,
+        oldHybridPinned,
+        {
+          fortress_id: cert.fortress_id,
+          old_master_pubkey: cert.old_master_pubkey,
+          new_master: {
+            ...cert.new_master,
+            public_key: before.pinned_master_pubkey.public_key,
+          },
+          rotation_serial: cert.rotation_serial,
+          rotated_at: cert.rotated_at,
+        },
+      ),
+    ).rejects.toThrow();
+    masterKey.fill(0);
+  });
+
+  it("--resume completes a crashed HYBRID rotation to a clean HYBRID root", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+
+    // Crash AFTER the journal is staged but BEFORE promote completes.
+    await expect(
+      rotateFederationRootRenew({
+        storage,
+        masterKey,
+        failpoint: (p) => {
+          if (p === "journal-staged-written") throw new Error("crash");
+        },
+      }),
+    ).rejects.toThrow();
+    expect(await federationRotateRootInProgress(storage)).toBe(true);
+    // The live root is still the OLD hybrid root (boot-safe).
+    const mid = await loadLive(masterKey);
+    expect(mid.hybrid!.pinned_master.public_keys.ed25519.public_key).toBe(
+      before.hybrid!.pinned_master.public_keys.ed25519.public_key,
+    );
+
+    // Resume completes forward to a clean NEW hybrid root.
+    const result = await resumeFederationRootRotation({ storage, masterKey });
+    expect(result.resumed).toBe(true);
+    const after = await loadLive(masterKey);
+    expect(after.hybrid, "resumed root must be hybrid").toBeDefined();
+    expect(after.hybrid!.master_private_keys.ml_dsa_65.secret_key.length).toBe(4032);
+    expect(after.hybrid!.pinned_master.public_keys.ed25519.public_key).not.toBe(
+      before.hybrid!.pinned_master.public_keys.ed25519.public_key,
+    );
+    expect(await federationRotateRootInProgress(storage)).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("a CLASSICAL root still rotates fine and carries NO hybrid binding (no regression)", async () => {
+    const { masterKey } = await seedIssuer();
+    const before = await loadLive(masterKey);
+    expect(before.hybrid).toBeUndefined();
+
+    const code = await runFederationRotateRoot({
+      argv: ["--renew", "--fortress", fortressPath],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: capture().stream,
+      err: capture().stream,
+    });
+    expect(code).toBe(0);
+    const after = await loadLive(masterKey);
+    expect(after.hybrid).toBeUndefined();
+    expect(after.pinned_master_pubkey.public_key).not.toBe(
+      before.pinned_master_pubkey.public_key,
+    );
+    expect(after.rotation_cert!.hybrid_rotation).toBeUndefined();
+    masterKey.fill(0);
+  });
+});
+
+describe("rotate-root --compromised on a HYBRID root (PQC Slice 3): revokes both old components, PQ-signed revocation, no rotation cert", () => {
+  it("mints new hybrid master + new master_secret, NO rotation cert, revocation binds BOTH old components + verifies under K2 hybrid principal", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldHybridPinned = structuredClone(before.hybrid!.pinned_master);
+    const oldMasterSecret = toBase64url(before.master_secret);
+
+    const result = await rotateFederationRootCompromised({ storage, masterKey });
+
+    const after = await loadLive(masterKey);
+    expect(after.hybrid, "compromise-rotated root must remain hybrid").toBeDefined();
+    // NEW master_secret (compromise rotates it).
+    expect(toBase64url(after.master_secret)).not.toBe(oldMasterSecret);
+    // NEW hybrid master (both components differ).
+    expect(after.hybrid!.pinned_master.public_keys.ed25519.public_key).not.toBe(
+      oldHybridPinned.public_keys.ed25519.public_key,
+    );
+    expect(after.hybrid!.pinned_master.public_keys.ml_dsa_65.public_key).not.toBe(
+      oldHybridPinned.public_keys.ml_dsa_65.public_key,
+    );
+    // NO rotation cert / serial (downgrade-resistance: no old-key-signed artifact).
+    expect(after.rotation_cert).toBeUndefined();
+    expect(after.rotation_serial).toBeUndefined();
+
+    // The revocation binds BOTH old hybrid component public keys.
+    const rev = result.root_revocation;
+    expect(rev.revoked_hybrid).toBeDefined();
+    expect(rev.revoked_hybrid!.ed25519.public_key).toBe(
+      oldHybridPinned.public_keys.ed25519.public_key,
+    );
+    expect(rev.revoked_hybrid!.ml_dsa_65.public_key).toBe(
+      oldHybridPinned.public_keys.ml_dsa_65.public_key,
+    );
+
+    // The revocation's HYBRID bundle (both-must-pass) verifies under the NEW K2
+    // hybrid PRINCIPAL public keys (the revocation's authenticity is PQ-protected).
+    const newPrincipalPubKeys = after.hybrid!.issuing_principal_cert.principal_public_keys;
+    const hybridOk = await verifyFederationRootRevocationHybridBundle(
+      rev,
+      newPrincipalPubKeys,
+    );
+    expect(hybridOk, "hybrid revocation bundle must verify under K2 principal").toBe(true);
+
+    // The classical Ed25519 leg also verifies under the new principal cert.
+    const event: FederationRevocationLogEvent = {
+      event_id: "e1",
+      origin_node_id: `operator:${after.fortress_id}`,
+      sequence: 1,
+      occurred_at: rev.effective_at,
+      kind: FEDERATION_ROOT_REVOCATION_EVENT_KIND,
+      payload: rev as unknown as Record<string, unknown>,
+      previous_hash: null,
+      event_hash: "h1",
+    };
+    const verified = await verifyFederationRootRevocationEvent({
+      event,
+      fortressId: after.fortress_id,
+      pinnedMaster: after.pinned_master_pubkey,
+      operatorPrincipalCert: after.issuing_principal_cert,
+      operatorHybridPrincipalPublicKeys: newPrincipalPubKeys,
+      highestRevocationSerial: 0,
+    });
+    expect(verified.ok, "classical leg must verify under K2 principal").toBe(true);
+    masterKey.fill(0);
+  });
+
+  it("FAIL-CLOSED: a real hybrid compromise revocation with absent or malformed ML-DSA bundle is rejected", async () => {
+    const masterKey = await seedHybridIssuer();
+    const result = await rotateFederationRootCompromised({ storage, masterKey });
+    const after = await loadLive(masterKey);
+    const rev = result.root_revocation;
+    const newPrincipalPubKeys = after.hybrid!.issuing_principal_cert.principal_public_keys;
+    const makeEvent = (payload: Record<string, unknown>): FederationRevocationLogEvent => ({
+      event_id: "e1",
+      origin_node_id: `operator:${after.fortress_id}`,
+      sequence: 1,
+      occurred_at: rev.effective_at,
+      kind: FEDERATION_ROOT_REVOCATION_EVENT_KIND,
+      payload,
+      previous_hash: null,
+      event_hash: "h1",
+    });
+    const missingBundle = { ...(rev as unknown as Record<string, unknown>) };
+    delete missingBundle.operator_signature_bundle;
+    const missing = await verifyFederationRootRevocationEvent({
+      event: makeEvent(missingBundle),
+      fortressId: after.fortress_id,
+      pinnedMaster: after.pinned_master_pubkey,
+      operatorPrincipalCert: after.issuing_principal_cert,
+      operatorHybridPrincipalPublicKeys: newPrincipalPubKeys,
+      highestRevocationSerial: 0,
+    });
+    expect(missing.ok).toBe(false);
+
+    const malformed = await verifyFederationRootRevocationEvent({
+      event: makeEvent({
+        ...(rev as unknown as Record<string, unknown>),
+        operator_signature_bundle: { components: "not-an-array" },
+      }),
+      fortressId: after.fortress_id,
+      pinnedMaster: after.pinned_master_pubkey,
+      operatorPrincipalCert: after.issuing_principal_cert,
+      operatorHybridPrincipalPublicKeys: newPrincipalPubKeys,
+      highestRevocationSerial: 0,
+    });
+    expect(malformed.ok).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("DOWNGRADE GUARD: the revocation hybrid bundle does NOT verify under the OLD K1 principal (signed under K2, never K1)", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldPrincipalPubKeys = structuredClone(
+      before.hybrid!.issuing_principal_cert.principal_public_keys,
+    );
+
+    const result = await rotateFederationRootCompromised({ storage, masterKey });
+    // The OLD K1 hybrid principal must NOT verify the revocation (forge-resistance).
+    const okUnderK1 = await verifyFederationRootRevocationHybridBundle(
+      result.root_revocation,
+      oldPrincipalPubKeys,
+    );
+    expect(okUnderK1).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("both old hybrid component pubkeys + the old classical master land in the durable revoked-root set; a sync envelope chaining to the old classical root is rejected root_revoked", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldClassical = before.pinned_master_pubkey.public_key;
+    const oldEd = before.hybrid!.pinned_master.public_keys.ed25519.public_key;
+    const oldMl = before.hybrid!.pinned_master.public_keys.ml_dsa_65.public_key;
+
+    await rotateFederationRootCompromised({ storage, masterKey });
+
+    // Durable revoked-root set now contains all three old anchors.
+    const syncStore = new FederationSyncStateStore({ storage, masterKey });
+    const snapshot = await syncStore.load();
+    expect(snapshot.revokedRootPubkeys.has(oldClassical)).toBe(true);
+    expect(snapshot.revokedRootPubkeys.has(oldEd)).toBe(true);
+    expect(snapshot.revokedRootPubkeys.has(oldMl)).toBe(true);
+
+    // A sync envelope whose chain terminates at the OLD classical master is
+    // rejected root_revoked (the recipient still pinning K1 denies the sync).
+    const isRootRevoked = (pubkey: string): boolean =>
+      snapshot.revokedRootPubkeys.has(pubkey);
+    const denied = verifySyncEnvelope({
+      envelope: { wire_version: "sanctuary.v1.federation-sync-envelope", note: "shape only" },
+      pinnedMaster: { ...before.pinned_master_pubkey },
+      recipientNodeId: before.node_id,
+      acceptedHighWaterFor: () => null,
+      isNodeRevoked: () => false,
+      isRootRevoked,
+    });
+    expect(denied.ok).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("--resume completes a crashed HYBRID compromise and re-adds BOTH old hybrid components to the revoked set", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldEd = before.hybrid!.pinned_master.public_keys.ed25519.public_key;
+    const oldMl = before.hybrid!.pinned_master.public_keys.ml_dsa_65.public_key;
+
+    // Crash mid-promote (journal still present) so --resume has work to do.
+    await expect(
+      rotateFederationRootCompromised({
+        storage,
+        masterKey,
+        failpoint: (p) => {
+          if (p === "journal-staged-written") throw new Error("crash");
+        },
+      }),
+    ).rejects.toThrow();
+    expect(await federationRotateRootInProgress(storage)).toBe(true);
+
+    const result = await resumeFederationRootCompromised({ storage, masterKey });
+    expect(result.revoked_master_pubkey).toBe(before.pinned_master_pubkey.public_key);
+    expect(result.root_revocation.operator_signature).toBe("");
+    expect(result.root_revocation.signature_note).toMatch(/non-authoritative echo/);
+    expect(result.root_revocation.revoked_hybrid?.ed25519).toEqual({
+      key_ref: "",
+      public_key: oldEd,
+    });
+    expect(result.root_revocation.revoked_hybrid?.ml_dsa_65).toEqual({
+      key_ref: "",
+      public_key: oldMl,
+    });
+    const after = await loadLive(masterKey);
+    expect(after.hybrid).toBeDefined();
+
+    const syncStore = new FederationSyncStateStore({ storage, masterKey });
+    const snapshot = await syncStore.load();
+    expect(snapshot.revokedRootPubkeys.has(oldEd)).toBe(true);
+    expect(snapshot.revokedRootPubkeys.has(oldMl)).toBe(true);
+    expect(await federationRotateRootInProgress(storage)).toBe(false);
+    masterKey.fill(0);
+  });
+
+  it("--resume after a crash AFTER promote re-persists the old classical + hybrid root revocation before clearing the journal", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldClassical = before.pinned_master_pubkey.public_key;
+    const oldEd = before.hybrid!.pinned_master.public_keys.ed25519.public_key;
+    const oldMl = before.hybrid!.pinned_master.public_keys.ml_dsa_65.public_key;
+
+    await expect(
+      rotateFederationRootCompromised({
+        storage,
+        masterKey,
+        failpoint: (p) => {
+          if (p === "compromise-root-promoted") throw new Error("crash after promote");
+        },
+      }),
+    ).rejects.toThrow("crash after promote");
+    expect(await federationRotateRootInProgress(storage)).toBe(true);
+
+    const promoted = await loadLive(masterKey);
+    expect(promoted.pinned_master_pubkey.public_key).not.toBe(oldClassical);
+    const syncStore = new FederationSyncStateStore({ storage, masterKey });
+    const midSnapshot = await syncStore.load();
+    expect(midSnapshot.revokedRootPubkeys.has(oldClassical)).toBe(false);
+    expect(midSnapshot.revokedRootPubkeys.has(oldEd)).toBe(false);
+    expect(midSnapshot.revokedRootPubkeys.has(oldMl)).toBe(false);
+
+    const resumed = await resumeFederationRootCompromised({ storage, masterKey });
+    expect(resumed.root_revocation.operator_signature).toBe("");
+    expect(resumed.root_revocation.signature_note).toMatch(/non-authoritative echo/);
+    expect(resumed.root_revocation.revoked_hybrid?.ed25519).toEqual({
+      key_ref: "",
+      public_key: oldEd,
+    });
+    expect(resumed.root_revocation.revoked_hybrid?.ml_dsa_65).toEqual({
+      key_ref: "",
+      public_key: oldMl,
+    });
+    const snapshot = await syncStore.load();
+    expect(snapshot.revokedRootPubkeys.has(oldClassical)).toBe(true);
+    expect(snapshot.revokedRootPubkeys.has(oldEd)).toBe(true);
+    expect(snapshot.revokedRootPubkeys.has(oldMl)).toBe(true);
+    expect(await federationRotateRootInProgress(storage)).toBe(false);
+    masterKey.fill(0);
+  });
+});
+
+describe("rotate-root on a HYBRID root: malformed hybrid refuses fail-closed (never downgrades to classical)", () => {
+  it("the rotate-boundary guard REFUSES a hybrid record with a truncated ML-DSA secret (FederationRotateRootError) rather than rotating to classical-only", async () => {
+    const masterKey = await seedHybridIssuer();
+    const live = await loadLive(masterKey);
+    const hybrid = structuredClone(live.hybrid!);
+
+    // A well-formed hybrid record passes the guard.
+    expect(() => assertHybridRecordWellFormedForRotation(live.hybrid!)).not.toThrow();
+
+    // Truncate the ML-DSA-65 secret: the guard must REFUSE (constraint 5,
+    // fail-closed) instead of letting a rotation drop the post-quantum half.
+    hybrid.master_private_keys = {
+      ...hybrid.master_private_keys,
+      ml_dsa_65: {
+        key_ref: hybrid.master_private_keys.ml_dsa_65.key_ref,
+        secret_key: hybrid.master_private_keys.ml_dsa_65.secret_key.slice(0, 100),
+      },
+    };
+    expect(() => assertHybridRecordWellFormedForRotation(hybrid)).toThrow(
+      FederationRotateRootError,
+    );
+    masterKey.fill(0);
+  });
+
+  it("the REAL compromised resume path rejects a staged record whose hybrid block is present but non-object", async () => {
+    const masterKey = await seedHybridIssuer();
+    const before = await loadLive(masterKey);
+    const oldClassical = before.pinned_master_pubkey.public_key;
+    const oldHybridEd = before.hybrid!.pinned_master.public_keys.ed25519.public_key;
+
+    await expect(
+      rotateFederationRootCompromised({
+        storage,
+        masterKey,
+        failpoint: (p) => {
+          if (p === "journal-staged-written") throw new Error("crash before promote");
+        },
+      }),
+    ).rejects.toThrow("crash before promote");
+    await tamperStagedRecord(masterKey, (record) => {
+      record.hybrid = "present-but-not-object";
+    });
+
+    await expect(resumeFederationRootCompromised({ storage, masterKey })).rejects.toThrow(
+      /hybrid block/i,
+    );
+    const after = await loadLive(masterKey);
+    expect(after.pinned_master_pubkey.public_key).toBe(oldClassical);
+    expect(after.hybrid!.pinned_master.public_keys.ed25519.public_key).toBe(oldHybridEd);
+    expect(await federationRotateRootInProgress(storage)).toBe(true);
     masterKey.fill(0);
   });
 });

@@ -27,7 +27,7 @@ struct CastleWallHostApp: App {
             // extensionState, filterState) mutate observed state WHILE the graph
             // is being evaluated. AttributeGraph aborts that with a SIGABRT
             // precondition failure ("Publishing changes from within view
-            // updates") — the nondeterministic launch crash seen on the
+            // updates") - the nondeterministic launch crash seen on the
             // 2026-06-15/16 fresh-binary boot drill (v807, 3/5 reboots). `.task`
             // runs after the view is on screen, in an async MainActor context
             // outside the render cycle, so the same mutations are safe.
@@ -35,7 +35,10 @@ struct CastleWallHostApp: App {
                 guard !didRunLaunchSequence else { return }
                 didRunLaunchSequence = true
                 ensureSignerHelper()
-                autoArmProtection()
+                // Arming, both automatic and manual, lives in ContentView: it
+                // re-evaluates on scene activation, helper-state changes, and
+                // a periodic status tick - not only at this first onAppear.
+                filterConfigurationManager.refresh()
             }
         }
     }
@@ -48,39 +51,6 @@ struct CastleWallHostApp: App {
         switch signerHelperManager.helperState {
         case .notRegistered, .notFound, .unknown:
             signerHelperManager.register()
-        default:
-            break
-        }
-    }
-
-    private func autoArmProtection() {
-        filterConfigurationManager.refresh()
-
-        // Helper-as-signer precondition: a daemon cannot sign a policy without
-        // the helper + the trust-anchor pin, so arming before both are ready
-        // would fail-closed the machine to deny-all. Gate on readiness.
-        guard signerHelperManager.isReady else {
-            return
-        }
-
-        switch systemExtensionManager.extensionState {
-        case .activated:
-            // Re-submit an activation request on launch so a newer BUNDLED
-            // extension version replaces the running one. macOS calls
-            // actionForReplacingExtension (-> .replace) only when the bundled
-            // version differs, and completes silently when it is unchanged.
-            // Without this, a rebuilt/fixed extension NEVER loads while an old
-            // one stays activated — root-caused on the 2026-06-11b drill, where
-            // a W5-fixed extension could not reach the box because the host app
-            // only re-enabled the filter and never re-requested activation.
-            systemExtensionManager.activate()
-            if filterConfigurationManager.filterState != .enabled {
-                filterConfigurationManager.enableFilter()
-            }
-        case .activatedRequiresReboot:
-            break
-        case .unknown, .deactivated:
-            systemExtensionManager.activate()
         default:
             break
         }

@@ -21,7 +21,7 @@ import { sha256 } from "@noble/hashes/sha256";
 import { generateRandomKey } from "../core/random.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { DEFAULT_STORAGE_DIR } from "../paths.js";
-import type { ExecResult } from "./passphrase.js";
+import type { ExecResult } from "./exec-result.js";
 
 const CUSTODY_ACCOUNT = "sanctuary";
 const CUSTODY_SERVICE_PREFIX = "sanctuary-custody";
@@ -135,7 +135,14 @@ const SECURITY_INTERACTION_NOT_ALLOWED_MARKERS = [
 /** macOS `security` exit code for errSecItemNotFound (status -25300). */
 const SECURITY_ITEM_NOT_FOUND_CODE = 44;
 
-function classifyDarwinFailure(result: ExecResult): KeychainReadResult {
+/**
+ * Classify a non-zero macOS `security` outcome into found / not-found /
+ * unreachable. Exported so the wrap passphrase path (passphrase.ts) reuses
+ * the SAME error-36 / errSecInteractionNotAllowed detection rather than
+ * re-implementing it (the fortress-key-root-cause-2026-06-23 class: a locked
+ * login keychain over SSH must read as "unreachable", never "not-found").
+ */
+export function classifyDarwinFailure(result: ExecResult): KeychainReadResult {
   const stderr = (result.stderr ?? "").toLowerCase();
   const interactionBlocked =
     result.code === SECURITY_INTERACTION_NOT_ALLOWED_CODE ||
@@ -159,7 +166,12 @@ function classifyDarwinFailure(result: ExecResult): KeychainReadResult {
   };
 }
 
-function classifyLinuxFailure(result: ExecResult): KeychainReadResult {
+/**
+ * Classify a non-zero Linux `secret-tool` outcome into not-found vs
+ * unreachable. Exported so the wrap passphrase path (passphrase.ts) reuses
+ * the SAME D-Bus/locked-collection detection rather than re-implementing it.
+ */
+export function classifyLinuxFailure(result: ExecResult): KeychainReadResult {
   // secret-tool exits 1 with empty stdout for BOTH "no such item" and a
   // refused/locked Secret Service. Distinguish by stderr: a D-Bus / collection
   // error means the keyring is unreachable; a clean empty result means the

@@ -70,6 +70,8 @@ import {
   FEDERATION_TRUST_ROOT_NAMESPACE,
   FEDERATION_TRUST_ROOT_KEY,
   FEDERATION_TRUST_ROOT_HKDF_INFO,
+  FEDERATION_ISSUANCE_SUITE_HYBRID,
+  provisionOrLoadFederationTrustRoot,
 } from "../../src/mesh/federation-trust-root-store.js";
 import {
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
@@ -86,6 +88,21 @@ import {
   OPERATOR_CLOUD_CLAIM_STORE_KEY,
   OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
 } from "../../src/mesh/lifecycle/operator-cloud-join-approver.js";
+import {
+  FEDERATION_SYNC_STATE_STORE_NAMESPACE,
+  FEDERATION_SYNC_STATE_STORE_KEY,
+  FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+} from "../../src/v1/federation-sync-state-store.js";
+import {
+  OPERATOR_CLOUD_JOINED_NODE_NAMESPACE,
+  OPERATOR_CLOUD_JOINED_NODE_KEY,
+  OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO,
+} from "../../src/mesh/operator-cloud-joined-node-store.js";
+import {
+  FEDERATION_REISSUE_CHALLENGE_STORE_NAMESPACE,
+  FEDERATION_REISSUE_CHALLENGE_STORE_KEY,
+  FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
+} from "../../src/v1/federation-reissue-challenge-store.js";
 import type { StoredIdentity } from "../../src/core/identity.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
@@ -576,6 +593,49 @@ describe("master rotation — fail-closed coverage", () => {
     expect(JSON.parse(bytesToString(plain))).toEqual(payload);
   });
 
+  it("PQC Slice 3 merge-bar 6: a HYBRID federation trust root (ML-DSA secret in the same blob) survives custody rotation (re-wraps whole, both keys intact, no new label)", async () => {
+    // The hybrid ML-DSA-65 secret rides INSIDE the _federation/trust-root-v1 blob
+    // (no new HKDF label, no new store). The existing _federation recipe encrypts
+    // the NAMESPACE blob, not per-field, so a custody rotation re-wraps the whole
+    // record including the 4032-byte ML-DSA secret. This proves the secret loads
+    // back intact under the NEW master after a real rotation (no orphan/lockout).
+    const fortress = await buildFortress();
+    const minted = await provisionOrLoadFederationTrustRoot({
+      storage: fortress.storage,
+      masterKey: fortress.master,
+      mint: true,
+      nodeId: "home-mac",
+      issuanceSuite: FEDERATION_ISSUANCE_SUITE_HYBRID,
+    });
+    expect(minted?.record.hybrid).toBeDefined();
+    const beforeSecret = [
+      ...minted!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key,
+    ];
+
+    await rotateMaster(rotateOpts(fortress));
+
+    // Re-open under the rotated custody master and LOAD the record through the
+    // real primitive (validateRecord re-derives the ML-DSA public from the secret
+    // and re-runs the cert-chain coherence checks, so a stranded/garbled secret
+    // would throw here).
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const reloaded = await provisionOrLoadFederationTrustRoot({
+      storage: fortress.storage,
+      masterKey: est.masterKey,
+    });
+    expect(reloaded?.source).toBe("persisted");
+    expect(reloaded!.record.hybrid).toBeDefined();
+    expect([
+      ...reloaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key,
+    ]).toEqual(beforeSecret);
+    expect(
+      reloaded!.record.hybrid!.master_private_keys.ml_dsa_65.secret_key.length,
+    ).toBe(4032);
+  });
+
   it("rotates the federation JOINER trust-root record (_federation/joiner-trust-root-v1, anti-strand) — re-wraps under the new master, no orphan/lockout", async () => {
     // Federation Slice 3a anti-strand guard: the _federation recipe's infos
     // GREW to include "federation-joiner-trust-root". Without it, a custody
@@ -703,13 +763,15 @@ describe("master rotation — fail-closed coverage", () => {
     ).toEqual(joinerPayload);
   });
 
-  it("rotates ALL FOUR _federation records (trust-root, joiner, spent-nonce set, provision-claim set) without strand", async () => {
-    // Anti-strand for the durable single-use replay stores: the spent-nonce set
-    // and the operator-cloud provision-claim set persist blobs into _federation
-    // under NEW HKDF labels. Without those labels in the _federation recipe's
-    // infos, convertPurposeNamespace throws RotationPreflightError and rotateMaster
-    // is DENIED on any fortress that ever consumed a federation nonce/claim. This
-    // proves the grown infos list re-wraps all four under the new master.
+  it("rotates ALL SEVEN _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state, operator-cloud joined-node, reissue challenge set) without strand", async () => {
+    // Anti-strand for the durable single-use replay stores, the Federation 3/3b
+    // P0 durable sync-state store, AND the Operator Cloud Slice 3 joined-node
+    // store: each persists a blob into _federation under a NEW HKDF label.
+    // Without those labels in the _federation recipe's infos, convertPurposeNamespace
+    // throws RotationPreflightError and rotateMaster is DENIED on any fortress that
+    // ever consumed a federation nonce/claim, persisted sync-state, OR joined as an
+    // operator_cloud node, OR accepted a node-cert reissue challenge. This proves
+    // the grown infos list re-wraps all seven.
     //
     // The store labels MUST equal the recipe strings; assert that explicitly so a
     // typo in either place is caught here, not only at a real operator's rotation.
@@ -717,8 +779,18 @@ describe("master rotation — fail-closed coverage", () => {
     expect(OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO).toBe(
       "federation-operator-cloud-provision-claim-set"
     );
+    expect(FEDERATION_SYNC_STATE_STORE_HKDF_INFO).toBe("federation-sync-state");
+    expect(OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO).toBe("operator-cloud-joined-node");
+    expect(FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO).toBe(
+      "federation-reissue-node-cert-challenge-set"
+    );
     expect(BOOTSTRAP_NONCE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
     expect(OPERATOR_CLOUD_CLAIM_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(FEDERATION_SYNC_STATE_STORE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(OPERATOR_CLOUD_JOINED_NODE_NAMESPACE).toBe(FEDERATION_TRUST_ROOT_NAMESPACE);
+    expect(FEDERATION_REISSUE_CHALLENGE_STORE_NAMESPACE).toBe(
+      FEDERATION_TRUST_ROOT_NAMESPACE
+    );
 
     const fortress = await buildFortress();
     const records: Array<{ key: string; info: string; payload: unknown }> = [
@@ -742,8 +814,37 @@ describe("master rotation — fail-closed coverage", () => {
         info: OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO,
         payload: { v: 1, entries: [{ key: "f n nonce", claim: { consumed: true } }] },
       },
+      {
+        key: FEDERATION_SYNC_STATE_STORE_KEY,
+        info: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+        payload: {
+          v: 1,
+          accepted_high_water: [["linux-1", 7]],
+          outbound_high_water: 3,
+          revoked_node_ids: ["evil-node"],
+          highest_eviction_serial: 2,
+        },
+      },
+      {
+        key: OPERATOR_CLOUD_JOINED_NODE_KEY,
+        info: OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO,
+        payload: { record_version: "operator-cloud-joined-node-v1", marker: "oc-joined-node" },
+      },
+      {
+        key: FEDERATION_REISSUE_CHALLENGE_STORE_KEY,
+        info: FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
+        payload: {
+          v: 1,
+          entries: [
+            {
+              key: "fortress node-1 reissue-node-cert challenge-1",
+              expires_at_ms: Date.now() + 60_000,
+            },
+          ],
+        },
+      },
     ];
-    // All four live in the same _federation namespace (no-AAD, purpose-keyed).
+    // All seven live in the same _federation namespace (no-AAD, purpose-keyed).
     for (const r of records) {
       await fortress.storage.write(
         FEDERATION_TRUST_ROOT_NAMESPACE,
@@ -766,7 +867,7 @@ describe("master rotation — fail-closed coverage", () => {
       passphrase: PASSPHRASE,
     });
 
-    // Every one of the four decrypts + reads back under the NEW master.
+    // Every one decrypts + reads back under the NEW master.
     for (const r of records) {
       const raw = JSON.parse(
         bytesToString(

@@ -186,7 +186,14 @@ describe("/v1/nodes + /v1/federation/sync", () => {
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
-  it("uses a peer-sync-specific JSON body cap for certificate-bearing envelopes", async () => {
+  it("uses a peer-sync-specific JSON body cap for certificate-bearing envelopes, with no body-size oracle", async () => {
+    // Federation P1: /sync/peer is pre-session and node-cert-authenticated. The
+    // peer-specific body cap still rejects oversized envelopes (so cert-bearing
+    // hybrid envelopes up to V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES are accepted
+    // for parsing, but bigger is rejected cheaply before JSON.parse). NO-ORACLE
+    // (§2): the over-default-under-peer-cap case and the over-peer-cap case now
+    // BOTH collapse to the SAME generic 403 a verify failure returns, so a probe
+    // cannot tell "too big" from "bad envelope" from the wire.
     const token = await openDurableSession(rig);
     await enable(token);
 
@@ -201,6 +208,7 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES
     );
 
+    // Parsed (under the peer cap) but not a valid envelope -> generic 403.
     const parsedThenRejected = await peerSyncRaw(
       token,
       overDefaultUnderPeerCap
@@ -216,9 +224,11 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       V1_FEDERATION_SYNC_PEER_MAX_BODY_BYTES
     );
 
+    // Rejected before parse (over the peer cap) -> the SAME generic 403, NOT a
+    // distinguishable 400 (no body-size oracle).
     const rejectedBeforeParse = await peerSyncRaw(token, overPeerCap);
-    expect(rejectedBeforeParse.status).toBe(400);
-    expect(await rejectedBeforeParse.json()).toEqual({ error: "bad request" });
+    expect(rejectedBeforeParse.status).toBe(403);
+    expect(await rejectedBeforeParse.json()).toEqual({ error: "forbidden" });
   });
 
   it("rejects legacy unversioned sync requests before appending events", async () => {
