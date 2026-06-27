@@ -1876,6 +1876,21 @@
     }
   },
   {
+    "name": "sanctuary/resolve_erc8004_identity",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "record": {
+          "type": "object",
+          "description": "The presented ERC-8004 identity record to verify, including identity, registry, chain_id, nonce, timestamp, signature, signer_address, and public_key as produced by the signer."
+        }
+      },
+      "required": [
+        "record"
+      ]
+    }
+  },
+  {
     "name": "sanctuary/sign_erc8004_identity",
     "inputSchema": {
       "type": "object",
