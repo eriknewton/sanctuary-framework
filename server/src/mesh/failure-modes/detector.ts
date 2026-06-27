@@ -1,5 +1,5 @@
 /**
- * FailureModeDetector — orchestrator for the five §8 failure modes plus the
+ * FailureModeDetector - orchestrator for the five §8 failure modes plus the
  * §9 recovery cascade integration.
  *
  * Responsibilities:
@@ -150,11 +150,11 @@ export class FailureModeDetector {
   }
 
   /**
-   * Manual tick — exposed so tests can advance state without waiting for the
+   * Manual tick - exposed so tests can advance state without waiting for the
    * timer. Production code can also use this from a higher-resolution clock.
    */
   tick(nowMs: number): void {
-    // 1. Offline detection — promotes nodes to `unreachable` and emits dropouts.
+    // 1. Offline detection - promotes nodes to `unreachable` and emits dropouts.
     this.node.getRoster().checkDropouts(nowMs);
     // 2. Canonical-audit-loss check.
     this.checkCanonicalAuditLoss(nowMs);
@@ -227,7 +227,7 @@ export class FailureModeDetector {
       }
     };
 
-    // §8.3 rollback / chain discontinuity — surfaces from canonical-audit
+    // §8.3 rollback / chain discontinuity - surfaces from canonical-audit
     // batch ingestion path (caught + observable via onAuditBatchRejected).
     this.node.onAuditBatchRejected = (info) => {
       const target = info.emitter_node ?? "<unknown>";
@@ -252,7 +252,7 @@ export class FailureModeDetector {
         state.rollback_detected = true;
       } else {
         // Other audit-batch failures (HKDF chain proof mismatch, signature
-        // failure) are compromise signals — surface as compromised, not
+        // failure) are compromise signals - surface as compromised, not
         // rollback.
         const alert = this.makeAlert({
           mode: FAILURE_MODE.COMPROMISED,
@@ -269,7 +269,7 @@ export class FailureModeDetector {
       }
     };
 
-    // Envelope rejections — `key_attestation` failure / signature mismatch
+    // Envelope rejections - `key_attestation` failure / signature mismatch
     // surfaces here when a peer's signed event fails verification.
     this.node.onEnvelopeRejected = (info) => {
       const target = info.emitter_node ?? "<unknown>";
@@ -289,7 +289,7 @@ export class FailureModeDetector {
       this.emitSentinel(alert);
     };
 
-    // §8.4 split-brain — locator-conflict signal.
+    // §8.4 split-brain - locator-conflict signal.
     this.node.onLocatorUpdate = (evt, result) => {
       const list = this.locatorByAgent.get(evt.payload.agent_id) ?? [];
       list.push(evt);
@@ -301,11 +301,12 @@ export class FailureModeDetector {
 
     // Policy-conflict signal: same agent, same parent_version, two distinct
     // policy_versions arriving from different principals during partition heal.
-    // PolicyBundleStore.upsert emits 'older' or 'applied' but doesn't have a
-    // dedicated 'conflict' branch; we detect here by tracking observed
-    // (agent_id, parent_version) tuples across `applied` updates.
+    // PolicyBundleStore.upsert emits explicit rejection reasons or 'applied',
+    // but not a dedicated 'conflict' branch. We detect here by tracking
+    // observed (agent_id, parent_version) tuples across applied updates.
     const observedPolicy = new Map<string, Set<number>>();
     this.node.onPolicyUpdate = (evt, _result) => {
+      if (_result !== "applied") return;
       const key = `${evt.payload.agent_id}:p${evt.payload.parent_version ?? 0}`;
       const seen = observedPolicy.get(key) ?? new Set();
       seen.add(evt.payload.policy_version);
@@ -315,7 +316,26 @@ export class FailureModeDetector {
       }
     };
 
-    // Lifecycle events — receipt of `dmswitch_triggered` unlocks
+    this.node.onPolicyBundleRejected = (event) => {
+      const alert = this.makeAlert({
+        mode: FAILURE_MODE.ROLLBACK,
+        target: event.agent_id,
+        message: `Policy bundle rejected for ${event.agent_id}: ${event.reason}.`,
+        detail: {
+          signal: "policy_bundle_rejected",
+          event_id: event.event_id,
+          reason: event.reason,
+          incoming_policy_version: event.incoming_policy_version,
+          current_policy_version: event.current_policy_version,
+          valid_from: event.valid_from ?? null,
+          valid_until: event.valid_until ?? null,
+        },
+      });
+      this.publishAlert(alert);
+      this.emitSentinel(alert);
+    };
+
+    // Lifecycle events - receipt of `dmswitch_triggered` unlocks
     // guardian-revocation path and emits sentinel alert.
     this.node.onLifecycleEvent = (evt, _kind) => {
       if (evt.event_type === "dmswitch_triggered") {
@@ -326,7 +346,7 @@ export class FailureModeDetector {
           // failure mode; we tag it as compromised mode for UI grouping at
           // v1.0. v1.x may add a dedicated mode.
           target: "operator_presence",
-          message: `DMswitch fired — operator absence threshold exceeded. Guardian-revocation path is unlocked. Guardians may now coordinate.`,
+          message: `DMswitch fired - operator absence threshold exceeded. Guardian-revocation path is unlocked. Guardians may now coordinate.`,
           detail: {
             signal: "dmswitch_triggered",
             event_id: evt.event_id,
@@ -350,7 +370,7 @@ export class FailureModeDetector {
   }
 
   private missedThreshold(): number {
-    // Roster default — same constant the roster uses internally.
+    // Roster default - same constant the roster uses internally.
     // We reach into the roster's effective threshold via a safe accessor
     // (default if absent).
     return 3;
@@ -506,7 +526,7 @@ export class FailureModeDetector {
   }
 
   /**
-   * Operator-resolution for a split-brain conflict — picks one branch as
+   * Operator-resolution for a split-brain conflict - picks one branch as
    * canonical and emits policy_pinned. Caller MUST persist the choice
    * separately (locator/policy upsert path).
    */
@@ -597,7 +617,7 @@ export class FailureModeDetector {
   }
 
   /**
-   * Operator-acknowledged master rotation acceptance — emits gate_approved
+   * Operator-acknowledged master rotation acceptance - emits gate_approved
    * tagged `master_rotation`. The cascade itself runs through
    * `MeshNode.installMasterRotation`; this is the operator-visible audit
    * trail of the acceptance.
@@ -666,7 +686,7 @@ export class FailureModeDetector {
     return [...this.splitBrainConflicts.values()];
   }
 
-  /** Read-only — has the dmswitch fired (and unlocked guardian-revocation)? */
+  /** Read-only - has the dmswitch fired (and unlocked guardian-revocation)? */
   isDmswitchUnlocked(): boolean {
     return this.dmswitchUnlockedFor;
   }

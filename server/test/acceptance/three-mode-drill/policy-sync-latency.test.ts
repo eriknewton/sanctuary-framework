@@ -1,5 +1,5 @@
 /**
- * §12.3 — Policy-update fan-out within 5 seconds of the authoring emit.
+ * §12.3 - Policy-update fan-out within 5 seconds of the authoring emit.
  *
  * Spec: Review/Sanctuary/Federation_Protocol_V0.1_Spec_2026-04-21.md §12.3
  *
@@ -12,7 +12,7 @@
  * emit. It waits until nodes B and C both have the new version in their
  * version vector, then asserts the elapsed is strictly less than the §12.3
  * 5-second budget. `DEFAULTS.POLICY_DISTRIBUTION_DEADLINE_MS` is the single
- * source of truth for the deadline — the constant is what the spec binds.
+ * source of truth for the deadline - the constant is what the spec binds.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -30,7 +30,7 @@ afterEach(async () => {
   }
 });
 
-describe("three-mode-drill §12.3 — policy update fan-out ≤ 5s on loopback", () => {
+describe("three-mode-drill §12.3 - policy update fan-out ≤ 5s on loopback", () => {
   it(
     "policy emitted on node A applies on B and C within POLICY_DISTRIBUTION_DEADLINE_MS",
     async () => {
@@ -47,6 +47,8 @@ describe("three-mode-drill §12.3 — policy update fan-out ≤ 5s on loopback",
         payload: {
           agent_id: agentId,
           policy_version: 1,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
           policy_blob: policyBlob,
         },
         principal_private_key: drill.root_principal_keypair.privateKey,

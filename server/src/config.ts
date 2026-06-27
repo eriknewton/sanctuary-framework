@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — Configuration
+ * Sanctuary MCP Server - Configuration
  *
  * Loads and validates server configuration from file or environment variables.
  */
@@ -148,6 +148,56 @@ export interface SanctuaryConfig {
   };
 }
 
+export type ConfigDowngradeReason =
+  | "config_version_invalid"
+  | "config_version_rollback"
+  | "state_key_protection_downgrade"
+  | "execution_attestation_disabled"
+  | "dashboard_tls_disabled"
+  | "dashboard_auth_disabled"
+  | "webhook_gate_disabled"
+  | "privacy_filter_disabled"
+  | "privacy_fail_mode_downgrade"
+  | "config_baseline_invalid";
+
+export interface ConfigDowngrade {
+  field: string;
+  reason: ConfigDowngradeReason;
+  previous: unknown;
+  next: unknown;
+}
+
+export class ConfigDowngradeError extends Error {
+  constructor(public readonly downgrades: ConfigDowngrade[]) {
+    super(
+      "Sanctuary configuration downgrade refused: " +
+        downgrades
+          .map((d) => `${d.field} (${d.reason})`)
+          .join(", ")
+    );
+    this.name = "ConfigDowngradeError";
+  }
+}
+
+const CONFIG_SECURITY_BASELINE_VERSION = 1;
+
+interface ConfigSecurityPosture {
+  config_version: string;
+  state_key_protection: SanctuaryConfig["state"]["key_protection"];
+  execution_attestation: boolean;
+  dashboard_tls_configured: boolean;
+  dashboard_auth_configured: boolean;
+  webhook_enabled: boolean;
+  privacy_filter_mode: SanctuaryConfig["privacy_filter"]["mode"];
+  privacy_filter_fail_mode: SanctuaryConfig["privacy_filter"]["fail_mode"];
+}
+
+interface ConfigSecurityBaseline {
+  schema_version: typeof CONFIG_SECURITY_BASELINE_VERSION;
+  observed_at: string;
+  posture: ConfigSecurityPosture;
+}
+
 /** Default configuration */
 export function defaultConfig(): SanctuaryConfig {
   return {
@@ -221,6 +271,7 @@ export async function loadConfig(
   configPath?: string
 ): Promise<SanctuaryConfig> {
   let config = defaultConfig();
+  let loadedConfigFile = false;
 
   // Phase 1: Merge config file on top of defaults
   const storagePath = process.env.SANCTUARY_STORAGE_PATH ?? config.storage_path;
@@ -247,6 +298,7 @@ export async function loadConfig(
       // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
       assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
       validateConfig(config);
+      loadedConfigFile = true;
     }
   } catch (err) {
     if (isErrno(err, "ENOENT")) {
@@ -394,11 +446,12 @@ export async function loadConfig(
     );
   }
 
-  // Phase 3: Always stamp the running version from package.json (Bug 2 fix —
+  // Phase 3: Always stamp the running version from package.json (Bug 2 fix -
   // sanctuary.json may store a stale version from first run)
   config.version = PKG_VERSION;
 
   validateConfig(config);
+  await enforceConfigSecurityBaseline(path, config, loadedConfigFile);
   return config;
 }
 
@@ -465,16 +518,385 @@ export async function saveConfig(
     configPath ?? join(config.storage_path, "sanctuary.json");
   const tmpPath = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   try {
+    assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
+    validateConfig(config);
+    const previous = await readPersistedConfigForDowngradeCheck(path);
+    if (previous) {
+      assertNoConfigDowngrade(previous, config);
+    }
     // Create the temp file 0o600 from the start so the secret-bearing config
     // is never briefly world-readable.
     await writeFile(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600 });
     await rename(tmpPath, path);
+    await writeConfigSecurityBaseline(path, config);
   } catch (err) {
     // Never leave a partial temp file behind, on a write OR a rename failure
     // (e.g. ENOSPC mid-write). Cleanup is itself best-effort.
     await rm(tmpPath, { force: true }).catch(() => {});
     throw err;
   }
+}
+
+function configSecurityBaselinePath(path: string): string {
+  return `${path}.security-baseline.json`;
+}
+
+async function enforceConfigSecurityBaseline(
+  path: string,
+  config: SanctuaryConfig,
+  shouldCreateBaseline: boolean
+): Promise<void> {
+  const baseline = await readConfigSecurityBaseline(path);
+  if (!baseline) {
+    if (shouldCreateBaseline) {
+      await writeConfigSecurityBaseline(path, config);
+    }
+    return;
+  }
+
+  const previous = configFromSecurityPosture(baseline.posture);
+  assertNoConfigDowngrade(previous, config);
+  await writeConfigSecurityBaseline(path, config);
+}
+
+async function readConfigSecurityBaseline(
+  path: string
+): Promise<ConfigSecurityBaseline | null> {
+  const baselinePath = configSecurityBaselinePath(path);
+  let raw: string;
+  try {
+    raw = await readFile(baselinePath, "utf-8");
+  } catch (err) {
+    if (isErrno(err, "ENOENT")) return null;
+    throw configBaselineInvalidError(baselinePath, err);
+  }
+
+  if (raw.trim() === "") {
+    throw configBaselineInvalidError(baselinePath, "empty baseline");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw configBaselineInvalidError(baselinePath, err);
+  }
+
+  return parseConfigSecurityBaseline(parsed, baselinePath);
+}
+
+async function writeConfigSecurityBaseline(
+  path: string,
+  config: SanctuaryConfig
+): Promise<void> {
+  const baselinePath = configSecurityBaselinePath(path);
+  const tmpPath = `${baselinePath}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  const baseline: ConfigSecurityBaseline = {
+    schema_version: CONFIG_SECURITY_BASELINE_VERSION,
+    observed_at: new Date().toISOString(),
+    posture: securityPostureFromConfig(config),
+  };
+  try {
+    await writeFile(tmpPath, JSON.stringify(baseline, null, 2), { mode: 0o600 });
+    await rename(tmpPath, baselinePath);
+  } catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+function parseConfigSecurityBaseline(
+  parsed: unknown,
+  baselinePath: string
+): ConfigSecurityBaseline {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw configBaselineInvalidError(baselinePath, "baseline root must be an object");
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    record.schema_version !== CONFIG_SECURITY_BASELINE_VERSION ||
+    typeof record.observed_at !== "string"
+  ) {
+    throw configBaselineInvalidError(baselinePath, "unsupported baseline schema");
+  }
+  const posture = record.posture;
+  if (posture === null || typeof posture !== "object" || Array.isArray(posture)) {
+    throw configBaselineInvalidError(baselinePath, "baseline posture must be an object");
+  }
+  const p = posture as Record<string, unknown>;
+  if (
+    typeof p.config_version !== "string" ||
+    !isKeyProtectionValue(p.state_key_protection) ||
+    typeof p.execution_attestation !== "boolean" ||
+    typeof p.dashboard_tls_configured !== "boolean" ||
+    typeof p.dashboard_auth_configured !== "boolean" ||
+    typeof p.webhook_enabled !== "boolean" ||
+    !isPrivacyFilterMode(p.privacy_filter_mode) ||
+    !isPrivacyFailMode(p.privacy_filter_fail_mode)
+  ) {
+    throw configBaselineInvalidError(baselinePath, "baseline posture has invalid fields");
+  }
+
+  return {
+    schema_version: CONFIG_SECURITY_BASELINE_VERSION,
+    observed_at: record.observed_at,
+    posture: {
+      config_version: p.config_version,
+      state_key_protection: p.state_key_protection,
+      execution_attestation: p.execution_attestation,
+      dashboard_tls_configured: p.dashboard_tls_configured,
+      dashboard_auth_configured: p.dashboard_auth_configured,
+      webhook_enabled: p.webhook_enabled,
+      privacy_filter_mode: p.privacy_filter_mode,
+      privacy_filter_fail_mode: p.privacy_filter_fail_mode,
+    },
+  };
+}
+
+function configBaselineInvalidError(
+  baselinePath: string,
+  cause: unknown
+): ConfigDowngradeError {
+  return new ConfigDowngradeError([
+    {
+      field: "config.security_baseline",
+      reason: "config_baseline_invalid",
+      previous: baselinePath,
+      next: cause instanceof Error ? cause.message : String(cause),
+    },
+  ]);
+}
+
+function securityPostureFromConfig(config: SanctuaryConfig): ConfigSecurityPosture {
+  return {
+    config_version: config.version,
+    state_key_protection: config.state.key_protection,
+    execution_attestation: config.execution.attestation,
+    dashboard_tls_configured: hasDashboardTls(config),
+    dashboard_auth_configured: hasDashboardAuth(config),
+    webhook_enabled: config.webhook.enabled,
+    privacy_filter_mode: config.privacy_filter.mode,
+    privacy_filter_fail_mode: config.privacy_filter.fail_mode,
+  };
+}
+
+function configFromSecurityPosture(
+  posture: ConfigSecurityPosture
+): SanctuaryConfig {
+  const config = defaultConfig();
+  config.version = posture.config_version;
+  config.state.key_protection = posture.state_key_protection;
+  config.execution.attestation = posture.execution_attestation;
+  config.dashboard = {
+    ...config.dashboard,
+    ...(posture.dashboard_auth_configured ? { auth_token: "configured" } : {}),
+    ...(posture.dashboard_tls_configured
+      ? { tls: { cert_path: "configured", key_path: "configured" } }
+      : {}),
+  };
+  config.webhook.enabled = posture.webhook_enabled;
+  config.privacy_filter.mode = posture.privacy_filter_mode;
+  config.privacy_filter.fail_mode = posture.privacy_filter_fail_mode;
+  return config;
+}
+
+function isKeyProtectionValue(
+  value: unknown
+): value is SanctuaryConfig["state"]["key_protection"] {
+  return value === "none" || value === "passphrase" || value === "hardware-key";
+}
+
+function isPrivacyFilterMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["mode"] {
+  return value === "local" || value === "opf" || value === "off";
+}
+
+function isPrivacyFailMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["fail_mode"] {
+  return value === "closed" || value === "fallback";
+}
+
+async function readPersistedConfigForDowngradeCheck(
+  path: string
+): Promise<SanctuaryConfig | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf-8");
+  } catch (err) {
+    if (isErrno(err, "ENOENT")) return null;
+    throw err;
+  }
+  if (raw.trim() === "") return null;
+  const parsed = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Sanctuary config field \"$root\" must be an object");
+  }
+  const persisted = deepMerge(defaultConfig(), parsed);
+  assertSanctuaryConfigShape(persisted as unknown as Record<string, unknown>);
+  validateConfig(persisted);
+  return persisted;
+}
+
+export function assertNoConfigDowngrade(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): void {
+  const downgrades = detectConfigDowngrades(previous, next);
+  if (downgrades.length > 0) {
+    throw new ConfigDowngradeError(downgrades);
+  }
+}
+
+export function detectConfigDowngrades(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): ConfigDowngrade[] {
+  const downgrades: ConfigDowngrade[] = [];
+  const previousVersion = parseVersion(previous.version);
+  const nextVersion = parseVersion(next.version);
+  if (!previousVersion || !nextVersion) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_invalid",
+      previous: previous.version,
+      next: next.version,
+    });
+  } else if (compareParsedVersions(nextVersion, previousVersion) < 0) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_rollback",
+      previous: previous.version,
+      next: next.version,
+    });
+  }
+
+  const previousKeyProtection = keyProtectionRank(previous.state.key_protection);
+  const nextKeyProtection = keyProtectionRank(next.state.key_protection);
+  if (nextKeyProtection < previousKeyProtection) {
+    downgrades.push({
+      field: "state.key_protection",
+      reason: "state_key_protection_downgrade",
+      previous: previous.state.key_protection,
+      next: next.state.key_protection,
+    });
+  }
+
+  if (previous.execution.attestation && !next.execution.attestation) {
+    downgrades.push({
+      field: "execution.attestation",
+      reason: "execution_attestation_disabled",
+      previous: previous.execution.attestation,
+      next: next.execution.attestation,
+    });
+  }
+
+  if (hasDashboardTls(previous) && !hasDashboardTls(next)) {
+    downgrades.push({
+      field: "dashboard.tls",
+      reason: "dashboard_tls_disabled",
+      previous: previous.dashboard.tls,
+      next: next.dashboard.tls ?? null,
+    });
+  }
+
+  if (hasDashboardAuth(previous) && !hasDashboardAuth(next)) {
+    downgrades.push({
+      field: "dashboard.auth_token",
+      reason: "dashboard_auth_disabled",
+      previous: redactConfiguredSecret(previous.dashboard.auth_token),
+      next: redactConfiguredSecret(next.dashboard.auth_token),
+    });
+  }
+
+  if (previous.webhook.enabled && !next.webhook.enabled) {
+    downgrades.push({
+      field: "webhook.enabled",
+      reason: "webhook_gate_disabled",
+      previous: previous.webhook.enabled,
+      next: next.webhook.enabled,
+    });
+  }
+
+  if (previous.privacy_filter.mode !== "off" && next.privacy_filter.mode === "off") {
+    downgrades.push({
+      field: "privacy_filter.mode",
+      reason: "privacy_filter_disabled",
+      previous: previous.privacy_filter.mode,
+      next: next.privacy_filter.mode,
+    });
+  }
+
+  if (
+    previous.privacy_filter.fail_mode === "closed" &&
+    next.privacy_filter.fail_mode === "fallback"
+  ) {
+    downgrades.push({
+      field: "privacy_filter.fail_mode",
+      reason: "privacy_fail_mode_downgrade",
+      previous: previous.privacy_filter.fail_mode,
+      next: next.privacy_filter.fail_mode,
+    });
+  }
+
+  return downgrades;
+}
+
+function hasDashboardTls(config: SanctuaryConfig): boolean {
+  const tls = config.dashboard.tls;
+  return (
+    typeof tls?.cert_path === "string" &&
+    tls.cert_path.trim().length > 0 &&
+    typeof tls.key_path === "string" &&
+    tls.key_path.trim().length > 0
+  );
+}
+
+function hasDashboardAuth(config: SanctuaryConfig): boolean {
+  const token = config.dashboard.auth_token;
+  return typeof token === "string" && token.trim().length > 0;
+}
+
+function redactConfiguredSecret(value: string | undefined): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return "configured";
+}
+
+function keyProtectionRank(
+  value: SanctuaryConfig["state"]["key_protection"]
+): number {
+  switch (value) {
+    case "none":
+      return 0;
+    case "passphrase":
+      return 1;
+    case "hardware-key":
+      return 2;
+  }
+}
+
+type ParsedVersion = readonly [number, number, number];
+
+function parseVersion(version: string): ParsedVersion | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(version);
+  if (!match) return null;
+  return [
+    Number.parseInt(match[1]!, 10),
+    Number.parseInt(match[2]!, 10),
+    Number.parseInt(match[3]!, 10),
+  ];
+}
+
+function compareParsedVersions(
+  left: ParsedVersion,
+  right: ParsedVersion
+): number {
+  for (let i = 0; i < 3; i += 1) {
+    const delta = left[i]! - right[i]!;
+    if (delta !== 0) return delta;
+  }
+  return 0;
 }
 
 /**
@@ -527,7 +949,7 @@ export function validateConfig(config: SanctuaryConfig): void {
     );
   }
 
-  // Implemented proof_system values: "schnorr-pedersen" (Schnorr proofs + Pedersen commitments + range proofs — genuine ZK)
+  // Implemented proof_system values: "schnorr-pedersen" (Schnorr proofs + Pedersen commitments + range proofs - genuine ZK)
   // Also accepts "commitment-only" (legacy alias, equivalent to schnorr-pedersen)
   // Unimplemented: "groth16", "plonk" (SNARK proof systems not yet available)
   const implementedProofSystem = new Set(["schnorr-pedersen", "commitment-only"]);

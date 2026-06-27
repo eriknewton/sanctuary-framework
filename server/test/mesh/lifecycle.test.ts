@@ -1,5 +1,5 @@
 /**
- * Sanctuary Federation Protocol v0.1 — Lifecycle Orchestrator Tests
+ * Sanctuary Federation Protocol v0.1 - Lifecycle Orchestrator Tests
  *
  * Real-shape tests for the WP-MVP-3 Follow-up #1 (lifecycle orchestrator).
  *
@@ -114,7 +114,7 @@ async function bootstrapFirstNode(opts: {
 }) {
   // Bootstrap a node from scratch using MeshNode.bootstrapFirstNode so
   // the test exercises the same code path as production. The approver
-  // passed in is a placeholder — the materials it would need (principal
+  // passed in is a placeholder - the materials it would need (principal
   // cert + keys) only exist post-bootstrap, so we install the real
   // approver immediately after.
   const transportHandle = opts.transport.attach(opts.node_id ?? "node-1");
@@ -226,10 +226,10 @@ function revokeQuorumInput(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Q8 — per-node key binding
+// Q8 - per-node key binding
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/node-key-binding (Q8) — at-rest per-node key wrap", () => {
+describe("lifecycle/node-key-binding (Q8) - at-rest per-node key wrap", () => {
   it("HKDF-derives a deterministic 32-byte wrapping key from master + node_id", () => {
     const master = randomBytes(32);
     const k1 = deriveNodeKeyWrappingKey({
@@ -317,7 +317,7 @@ describe("lifecycle/node-key-binding (Q8) — at-rest per-node key wrap", () => 
       fortress_master_secret: masterBytes,
       node_id: "node-A",
     });
-    // Simulate caller zeroing the master after persistence — the wrapped
+    // Simulate caller zeroing the master after persistence - the wrapped
     // blob remains decryptable using a fresh copy of the same master
     // (which is what guardian quorum recovery yields).
     masterBytes.fill(0);
@@ -331,10 +331,10 @@ describe("lifecycle/node-key-binding (Q8) — at-rest per-node key wrap", () => 
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Q6 — agent-state-transfer wrapping
+// Q6 - agent-state-transfer wrapping
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/sync (Q6) — agent-state-transfer wrap", () => {
+describe("lifecycle/sync (Q6) - agent-state-transfer wrap", () => {
   it("HKDF-derives the same key on source and destination from the same migration tuple", () => {
     const master = randomBytes(32);
     const k1 = deriveAgentStateTransferKey({
@@ -421,7 +421,7 @@ describe("lifecycle/sync (Q6) — agent-state-transfer wrap", () => {
 // Counter monotonicity
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/counters — strict-advance guarantee", () => {
+describe("lifecycle/counters - strict-advance guarantee", () => {
   it("returns 0,1,2,... on successive next() calls per name", () => {
     const c = new InMemoryCounterStore();
     expect(c.next("envelope_monotonic_seq")).toBe(0);
@@ -438,7 +438,7 @@ describe("lifecycle/counters — strict-advance guarantee", () => {
     expect(c.peek("audit_batch_seq")).toBe(1);
   });
 
-  it("set() refuses to lower a counter — would appear as rollback", () => {
+  it("set() refuses to lower a counter - would appear as rollback", () => {
     const c = new InMemoryCounterStore();
     c.next("audit_batch_seq");
     c.next("audit_batch_seq"); // peek = 2
@@ -450,7 +450,7 @@ describe("lifecycle/counters — strict-advance guarantee", () => {
 // Bootstrap token
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/bootstrap-token — issue + verify gate", () => {
+describe("lifecycle/bootstrap-token - issue + verify gate", () => {
   it("issues a token whose signature verifies under the issuing principal cert", () => {
     const fx = bootFortress();
     const token = issueBootstrapToken({
@@ -544,7 +544,7 @@ describe("lifecycle/bootstrap-token — issue + verify gate", () => {
 // NodeRoster + drop-out detection
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/node-roster — drop-out detection at 3 missed heartbeats", () => {
+describe("lifecycle/node-roster - drop-out detection at 3 missed heartbeats", () => {
   function dummyCert(nodeId: string): import("../../src/mesh/types.js").NodeIdentityCertificate {
     return {
       node_id: nodeId,
@@ -563,17 +563,17 @@ describe("lifecycle/node-roster — drop-out detection at 3 missed heartbeats", 
     const t0 = 1_000_000;
     roster.add(dummyCert("a"), t0);
 
-    // Just under threshold (89s) — still active range, not flagged.
+    // Just under threshold (89s) - still active range, not flagged.
     let events = roster.checkDropouts(t0 + 89_000);
     expect(events).toHaveLength(0);
 
-    // At threshold exactly (90s = 3 * 30s default) — flagged unreachable.
+    // At threshold exactly (90s = 3 * 30s default) - flagged unreachable.
     events = roster.checkDropouts(t0 + 90_000);
     expect(events).toHaveLength(1);
     expect(events[0].reason).toBe("missed_heartbeats");
     expect(roster.presenceOf("a")).toBe("unreachable");
 
-    // Idempotent — second call with no further heartbeats does NOT re-emit.
+    // Idempotent - second call with no further heartbeats does NOT re-emit.
     events = roster.checkDropouts(t0 + 100_000);
     expect(events).toHaveLength(0);
   });
@@ -621,7 +621,7 @@ describe("lifecycle/node-roster — drop-out detection at 3 missed heartbeats", 
 // MeshNode.bootstrapFirstNode + bootstrap → join → revoke flow
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
+describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
   let hub: InMemoryTransport;
 
   beforeEach(() => {
@@ -752,7 +752,7 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
     // Replace approver path: we instantiate a fresh acceptJoinRequest by
     // installing a deny-approver on the canonical node. We do this by
     // building an auxiliary canonical node configured with the deny
-    // approver — keeps the fixture clean.
+    // approver - keeps the fixture clean.
     const denyTransport = hub.attach("auxiliary-deny");
     const denyApprover = createAutoDenyJoinApprover("policy-violation");
     const auxNode = new MeshNode(
@@ -872,6 +872,8 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
         payload: {
           agent_id: "agent-replay",
           policy_version: policyVersion,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
           policy_blob: "policy-" + policyVersion,
         },
         monotonic_seq: seq,
@@ -887,6 +889,35 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
 
     expect(first.node.getReceivedLog()).toHaveLength(afterFirst);
     expect(rejected[0]?.name).toBe("MeshRollbackDetectedError");
+  });
+
+  it("refuses to publish a locally rejected policy bundle", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const observer = hub.attach("observer");
+    const observed: SignedEvent[] = [];
+    observer.subscribe((evt) => observed.push(evt));
+
+    await expect(
+      first.node.publishPolicyUpdate({
+        payload: {
+          agent_id: "agent-expired",
+          policy_version: 1,
+          valid_from: "2020-01-01T00:00:00.000Z",
+          valid_until: "2020-01-02T00:00:00.000Z",
+          policy_blob: "expired-policy",
+        },
+        principal_private_key: first.bootstrap.root_principal_private_key,
+        emitter_principal: first.bootstrap.root_principal_certificate.principal_id,
+      })
+    ).rejects.toThrow(/policy_expired/);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(first.node.getPolicyBundle().versionOf("agent-expired")).toBe(0);
+    expect(first.node.getPolicyBundle().auditEvents()[0]).toMatchObject({
+      reason: "policy_expired",
+      incoming_policy_version: 1,
+    });
+    expect(observed.filter((evt) => evt.event_type === "policy_update")).toHaveLength(0);
   });
 
   it("revoke marks a peer revoked and rejects subsequent envelopes from that peer", async () => {
@@ -1079,10 +1110,10 @@ describe("lifecycle/mesh-node — bootstrap → join → revoke", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Sync — pulls policy + locator + audit
+// Sync - pulls policy + locator + audit
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/sync — initial sync pulls policy + locator + audit", () => {
+describe("lifecycle/sync - initial sync pulls policy + locator + audit", () => {
   it("delta-applies policies past the requester's baseline", () => {
     // Build a sender state with two policy versions; receiver baseline
     // knows v1 → only v2 should ship.
@@ -1098,7 +1129,13 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
       emitter_principal: "p",
       fortress_id: "f",
       causal_parents: [],
-      payload: { agent_id: "agent-A", policy_version: 2, policy_blob: "xyz" },
+      payload: {
+        agent_id: "agent-A",
+        policy_version: 2,
+        valid_from: "2026-06-01T00:00:00.000Z",
+        valid_until: "2099-01-01T00:00:00.000Z",
+        policy_blob: "xyz",
+      },
       payload_hash: "h",
       emitted_at: new Date().toISOString(),
       monotonic_seq: 0,
@@ -1108,6 +1145,8 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
     senderPolicy.upsert(placeholder as SignedEvent<{
       agent_id: string;
       policy_version: number;
+      valid_from: string;
+      valid_until: string;
       policy_blob: string;
     }>);
 
@@ -1153,7 +1192,13 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
         emitter_principal: "p",
         fortress_id: "f",
         causal_parents: [],
-        payload: { agent_id: "agent-A", policy_version: v, policy_blob: "x" },
+        payload: {
+          agent_id: "agent-A",
+          policy_version: v,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
+          policy_blob: "x",
+        },
         payload_hash: "h",
         emitted_at: new Date().toISOString(),
         monotonic_seq: 0,
@@ -1162,6 +1207,8 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
       }) as SignedEvent<{
         agent_id: string;
         policy_version: number;
+        valid_from: string;
+        valid_until: string;
         policy_blob: string;
       }>;
     // Pre-load receiver with v=2; we'll feed v=1 (older) and v=3 (applied).
@@ -1249,7 +1296,7 @@ describe("lifecycle/sync — initial sync pulls policy + locator + audit", () =>
 // Audit buffer + canonical audit log end-to-end
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/audit — buffer flush ships sealed batches", () => {
+describe("lifecycle/audit - buffer flush ships sealed batches", () => {
   let hub: InMemoryTransport;
   beforeEach(() => {
     hub = new InMemoryTransport();
@@ -1291,13 +1338,13 @@ describe("lifecycle/audit — buffer flush ships sealed batches", () => {
 // Rejoin after offline (boot from persisted state)
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/mesh-node — rejoin after offline", () => {
+describe("lifecycle/mesh-node - rejoin after offline", () => {
   it("boots from persisted certificate + wrapped key and resumes signing", async () => {
     const hub = new InMemoryTransport();
     const fx = bootFortress();
     const keyStore = new InMemoryNodeKeyStore();
 
-    // First boot — bootstrap and persist the wrapped key (Q8 path).
+    // First boot - bootstrap and persist the wrapped key (Q8 path).
     const { bootstrap } = await MeshNode.bootstrapFirstNode({
       fortress_id: fx.master_public.fortress_id,
       node_id: "node-A",
@@ -1311,7 +1358,7 @@ describe("lifecycle/mesh-node — rejoin after offline", () => {
       key_store: keyStore,
     });
 
-    // Second boot — fresh MeshNode instance, same persisted store.
+    // Second boot - fresh MeshNode instance, same persisted store.
     hub.detach("node-A-first");
     const rejoinTransport = hub.attach("node-A");
     const node = new MeshNode(
@@ -1341,7 +1388,7 @@ describe("lifecycle/mesh-node — rejoin after offline", () => {
     expect(snap.state).toBe("active");
     expect(snap.cert_present).toBe(true);
 
-    // Resumed signing — emit a heartbeat without throwing.
+    // Resumed signing - emit a heartbeat without throwing.
     const hb = await node.emitHeartbeat();
     expect(hb.event_type).toBe("heartbeat");
     expect(hb.emitter_node).toBe("node-A");
@@ -1400,7 +1447,7 @@ describe("lifecycle/mesh-node — rejoin after offline", () => {
 // Heartbeat emission + counter advance
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("lifecycle/mesh-node — heartbeat emission advances counters", () => {
+describe("lifecycle/mesh-node - heartbeat emission advances counters", () => {
   it("emitHeartbeat advances both heartbeat_seq and envelope_monotonic_seq", async () => {
     const hub = new InMemoryTransport();
     const { node } = await bootstrapFirstNode({ transport: hub });

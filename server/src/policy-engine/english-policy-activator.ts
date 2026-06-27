@@ -58,7 +58,11 @@ import type {
   PrincipalPolicy,
   Tier2Config,
 } from "../principal-policy/types.js";
-import { enforceForcedTiers } from "../principal-policy/loader.js";
+import {
+  detectPrincipalPolicyDowngrades,
+  enforceForcedTiers,
+  type PrincipalPolicyDowngrade,
+} from "../principal-policy/loader.js";
 import type {
   CompiledPolicy,
   CompiledPolicyRule,
@@ -110,6 +114,7 @@ export type ActivationFailure =
   | "policy_conflict_force_required"
   | "already_activated"
   | "invalid_rule"
+  | "policy_posture_downgrade_refused"
   | "policy_io_failed";
 
 export type RevocationFailure =
@@ -124,6 +129,7 @@ export type ActivationOutcome =
       reason: ActivationFailure;
       message: string;
       conflicts?: PolicyConflict[];
+      downgrades?: PrincipalPolicyDowngrade[];
     };
 
 export type RevocationOutcome =
@@ -395,9 +401,9 @@ export class EnglishPolicyActivator {
       }
     }
     const preHash = canonicalPolicyHash(prePolicy);
-    let updatedPolicy: PrincipalPolicy;
+    let structuralPolicy: PrincipalPolicy;
     try {
-      updatedPolicy = applyRule(prePolicy, draft.compiled_rule);
+      structuralPolicy = applyRuleStructural(prePolicy, draft.compiled_rule);
     } catch (err) {
       return {
         ok: false,
@@ -405,6 +411,33 @@ export class EnglishPolicyActivator {
         message: err instanceof Error ? err.message : String(err),
       };
     }
+    const downgrades = detectPrincipalPolicyDowngrades(
+      prePolicy,
+      structuralPolicy,
+    );
+    if (downgrades.length > 0) {
+      const reason: ActivationFailure = "policy_posture_downgrade_refused";
+      await this.auditLog.append(
+        "l2",
+        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
+        operatorId,
+        {
+          draft_id: draft.draft_id,
+          reason,
+          downgrade_fields: downgrades.map((d) => d.field),
+          downgrade_reasons: downgrades.map((d) => d.reason),
+          fortress_id: this.fortressId,
+        },
+        "failure",
+      );
+      return {
+        ok: false,
+        reason,
+        message: "policy activation would weaken the Principal Policy posture",
+        downgrades,
+      };
+    }
+    const updatedPolicy = enforceForcedTiers(structuralPolicy);
 
     try {
       await this.writePolicy(updatedPolicy);

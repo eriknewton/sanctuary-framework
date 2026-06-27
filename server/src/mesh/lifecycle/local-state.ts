@@ -17,21 +17,67 @@ import type {
   SignedEvent,
 } from "../types.js";
 
+export const POLICY_BUNDLE_REJECTION_AUDIT_OP =
+  "mesh_policy_bundle_rejected" as const;
+
+export type PolicyBundleRejectionReason =
+  | "policy_version_replay"
+  | "policy_validity_missing"
+  | "policy_validity_invalid"
+  | "policy_not_yet_valid"
+  | "policy_expired";
+
+export type PolicyBundleUpsertResult =
+  | "applied"
+  | PolicyBundleRejectionReason;
+
+export interface PolicyBundleAuditEvent {
+  operation: typeof POLICY_BUNDLE_REJECTION_AUDIT_OP;
+  emitted_at: string;
+  event_id: string;
+  agent_id: string;
+  reason: PolicyBundleRejectionReason;
+  incoming_policy_version: number;
+  current_policy_version: number;
+  valid_from?: string;
+  valid_until?: string;
+}
+
+export interface PolicyBundleStoreOptions {
+  now?: () => Date;
+  onAuditEvent?: (event: PolicyBundleAuditEvent) => void;
+}
+
 /**
  * Per-agent policy bundle. Holds only the highest-version signed policy
- * event seen for each agent_id. Older versions are dropped on update.
+ * event seen for each agent_id. Stale versions and invalid validity windows
+ * are rejected explicitly and audited, never silently accepted.
  */
 export class PolicyBundleStore {
   private byAgent = new Map<string, SignedEvent<PolicyUpdatePayload>>();
+  private readonly auditEventsList: PolicyBundleAuditEvent[] = [];
+  private readonly now: () => Date;
+  private readonly onAuditEvent?: (event: PolicyBundleAuditEvent) => void;
 
-  upsert(evt: SignedEvent<PolicyUpdatePayload>): "applied" | "older" {
+  constructor(options: PolicyBundleStoreOptions = {}) {
+    this.now = options.now ?? (() => new Date());
+    this.onAuditEvent = options.onAuditEvent;
+  }
+
+  upsert(evt: SignedEvent<PolicyUpdatePayload>): PolicyBundleUpsertResult {
     const existing = this.byAgent.get(evt.payload.agent_id);
     if (
       existing &&
       existing.payload.policy_version >= evt.payload.policy_version
     ) {
-      return "older";
+      return this.reject(evt, "policy_version_replay", existing);
     }
+
+    const windowResult = this.validateWindow(evt.payload);
+    if (windowResult !== "applied") {
+      return this.reject(evt, windowResult, existing);
+    }
+
     this.byAgent.set(evt.payload.agent_id, evt);
     return "applied";
   }
@@ -52,7 +98,7 @@ export class PolicyBundleStore {
   }
 
   /**
-   * Delta query for sync replies — return every event whose policy_version
+   * Delta query for sync replies - return every event whose policy_version
    * is strictly greater than the requester's per-agent baseline. Agents the
    * requester has never seen (no entry in baseline) are included whole.
    */
@@ -73,6 +119,61 @@ export class PolicyBundleStore {
 
   snapshot(): SignedEvent<PolicyUpdatePayload>[] {
     return [...this.byAgent.values()];
+  }
+
+  auditEvents(): readonly PolicyBundleAuditEvent[] {
+    return this.auditEventsList;
+  }
+
+  private validateWindow(
+    payload: PolicyUpdatePayload
+  ): "applied" | Exclude<PolicyBundleRejectionReason, "policy_version_replay"> {
+    if (
+      typeof payload.valid_from !== "string" ||
+      payload.valid_from.length === 0 ||
+      typeof payload.valid_until !== "string" ||
+      payload.valid_until.length === 0
+    ) {
+      return "policy_validity_missing";
+    }
+    const validFromMs = Date.parse(payload.valid_from);
+    const validUntilMs = Date.parse(payload.valid_until);
+    if (
+      !Number.isFinite(validFromMs) ||
+      !Number.isFinite(validUntilMs) ||
+      validFromMs >= validUntilMs
+    ) {
+      return "policy_validity_invalid";
+    }
+    const nowMs = this.now().getTime();
+    if (nowMs < validFromMs) return "policy_not_yet_valid";
+    if (nowMs >= validUntilMs) return "policy_expired";
+    return "applied";
+  }
+
+  private reject(
+    evt: SignedEvent<PolicyUpdatePayload>,
+    reason: PolicyBundleRejectionReason,
+    existing: SignedEvent<PolicyUpdatePayload> | undefined
+  ): PolicyBundleRejectionReason {
+    const auditEvent: PolicyBundleAuditEvent = {
+      operation: POLICY_BUNDLE_REJECTION_AUDIT_OP,
+      emitted_at: this.now().toISOString(),
+      event_id: evt.event_id,
+      agent_id: evt.payload.agent_id,
+      reason,
+      incoming_policy_version: evt.payload.policy_version,
+      current_policy_version: existing?.payload.policy_version ?? 0,
+      ...(evt.payload.valid_from !== undefined
+        ? { valid_from: evt.payload.valid_from }
+        : {}),
+      ...(evt.payload.valid_until !== undefined
+        ? { valid_until: evt.payload.valid_until }
+        : {}),
+    };
+    this.auditEventsList.push(auditEvent);
+    this.onAuditEvent?.(auditEvent);
+    return reason;
   }
 }
 

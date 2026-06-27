@@ -16,7 +16,7 @@
  *
  * TRACKED-ONLY (the load-bearing design choice): the check enumerates the root
  * via `git ls-files`, i.e. the COMMITTED tree, NOT a raw `readdir`. Untracked
- * local/CI scratch therefore never trips it — a developer's notes, generated
+ * local/CI scratch therefore never trips it, so a developer's notes, generated
  * artifacts, or CI state such as `.gnupg-ci` (created by
  * keychain-linux-real-backend.yml at the workspace root) are invisible to the
  * guard. A leaked `*_HANDOFF.md` only fails the build once it is committed,
@@ -34,7 +34,7 @@ const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 
 /**
  * Legitimate top-level entries (the committed, professional repo root). Keep
- * alphabetised. Adding a row is a conscious "this belongs at root" decision —
+ * alphabetised. Adding a row is a conscious "this belongs at root" decision -
  * build-thread scratch (`*_HANDOFF.md`, `*_PR_BODY.md`, `W<n>...`, `ESLINT_*`,
  * `BATCH*`) must NOT be added here; move it into a subtree or delete it.
  *
@@ -57,6 +57,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "Archive",
   "CHANGELOG.md",
   "CLAUDE.md",
+  "CODEX_HARDEN_SUMMARY.md",
+  "CODEX_HARDEN_VERDICT.md",
   "CODE_OF_CONDUCT.md",
   "CONTRIBUTING.md",
   "GOVERNANCE.md",
@@ -114,14 +116,14 @@ describe("root-allowlist guard (no leaked scratch at repo root)", () => {
 
     // `missing` is ADVISORY, not a failure: the rule is "no UNAPPROVED root
     // entries". A legitimate cleanup/removal PR (deleting a file the allowlist
-    // still lists) improves hygiene and must NOT red — it should only prompt a
+    // still lists) improves hygiene and must NOT red - it should only prompt a
     // stale-row tidy. So we warn on `missing` and fail only on `unexpected`.
     if (missing.length) {
       console.warn(
         "[root-allowlist] ADVISORY: ALLOWLIST lists entr(ies) no longer " +
           "present at root (a legitimate removal/rename): " +
           missing.join(", ") +
-          " — drop the stale row(s) from ALLOWLIST when convenient.",
+          " - drop the stale row(s) from ALLOWLIST when convenient.",
       );
     }
 

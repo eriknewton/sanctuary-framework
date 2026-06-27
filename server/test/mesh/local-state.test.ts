@@ -20,7 +20,7 @@ describe("mesh lifecycle local replicated state", () => {
     const other = policyEvent("agent-b", 4);
 
     expect(store.upsert(v2)).toBe("applied");
-    expect(store.upsert(v1)).toBe("older");
+    expect(store.upsert(v1)).toBe("policy_version_replay");
     expect(store.upsert(other)).toBe("applied");
 
     expect(store.get("agent-a")).toBe(v2);
@@ -30,6 +30,52 @@ describe("mesh lifecycle local replicated state", () => {
     expect(store.delta({ "agent-a": 2, "agent-b": 3 })).toEqual([other]);
     expect(store.snapshot()).toEqual([v2, other]);
     expect(store.size()).toBe(2);
+  });
+
+  it("audits lower-version policy bundle replays without replacing the current bundle", () => {
+    const auditEvents: unknown[] = [];
+    const store = new PolicyBundleStore({
+      onAuditEvent: (event) => auditEvents.push(event),
+    });
+    const v2 = policyEvent("agent-a", 2);
+    const v1 = policyEvent("agent-a", 1);
+
+    expect(store.upsert(v2)).toBe("applied");
+    expect(store.upsert(v1)).toBe("policy_version_replay");
+
+    expect(store.get("agent-a")).toBe(v2);
+    expect(store.auditEvents()).toHaveLength(1);
+    expect(auditEvents).toHaveLength(1);
+    expect(store.auditEvents()[0]).toMatchObject({
+      operation: "mesh_policy_bundle_rejected",
+      agent_id: "agent-a",
+      reason: "policy_version_replay",
+      incoming_policy_version: 1,
+      current_policy_version: 2,
+    });
+  });
+
+  it("rejects policy bundles outside their signed validity window", () => {
+    const store = new PolicyBundleStore({
+      now: () => new Date("2026-06-09T12:00:00.000Z"),
+    });
+    const expired = policyEvent("agent-a", 2, {
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2026-06-09T12:00:00.000Z",
+    });
+    const missingWindow = event("policy-missing-window", "policy_update", {
+      agent_id: "agent-a",
+      policy_version: 3,
+      policy_blob: "policy-3",
+    } as PolicyUpdatePayload);
+
+    expect(store.upsert(expired)).toBe("policy_expired");
+    expect(store.upsert(missingWindow)).toBe("policy_validity_missing");
+    expect(store.get("agent-a")).toBeUndefined();
+    expect(store.auditEvents().map((event) => event.reason)).toEqual([
+      "policy_expired",
+      "policy_validity_missing",
+    ]);
   });
 
   it("detects locator conflicts at the same version and advances only newer versions", () => {
@@ -75,10 +121,15 @@ describe("mesh lifecycle local replicated state", () => {
 function policyEvent(
   agentId: string,
   policyVersion: number,
+  window: Pick<PolicyUpdatePayload, "valid_from" | "valid_until"> = {
+    valid_from: "2026-06-01T00:00:00.000Z",
+    valid_until: "2099-01-01T00:00:00.000Z",
+  },
 ): SignedEvent<PolicyUpdatePayload> {
   return event(`policy-${agentId}-${policyVersion}`, "policy_update", {
     agent_id: agentId,
     policy_version: policyVersion,
+    ...window,
     policy_blob: `policy-${policyVersion}`,
   });
 }

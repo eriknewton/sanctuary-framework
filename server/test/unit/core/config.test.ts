@@ -1,12 +1,19 @@
 /**
- * Sanctuary MCP Server — Configuration Tests
+ * Sanctuary MCP Server - Configuration Tests
  *
  * Tests for config precedence (Bug 1: env vars must override file config)
  * and version stamping (Bug 2: version must come from package.json, not stored config).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { loadConfig, saveConfig, defaultConfig, SANCTUARY_VERSION } from "../../../src/config.js";
+import {
+  ConfigDowngradeError,
+  loadConfig,
+  saveConfig,
+  defaultConfig,
+  SANCTUARY_VERSION,
+  type SanctuaryConfig,
+} from "../../../src/config.js";
 import { writeFile, mkdtemp, rm, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -45,7 +52,7 @@ describe("loadConfig", () => {
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  describe("Bug 1: Config precedence — env vars override file config", () => {
+  describe("Bug 1: Config precedence - env vars override file config", () => {
     it("env var SANCTUARY_DASHBOARD_ENABLED=true overrides file dashboard.enabled=false", async () => {
       // Simulate the exact Mac Mini scenario: sanctuary.json has enabled:false,
       // env var sets true. Before the fix, file would win.
@@ -107,7 +114,7 @@ describe("loadConfig", () => {
         dashboard: { enabled: true, port: 7777, host: "0.0.0.0" },
       }));
 
-      // No env vars set — file values should apply
+      // No env vars set - file values should apply
       const config = await loadConfig(configFile);
 
       expect(config.dashboard.enabled).toBe(true);
@@ -116,7 +123,7 @@ describe("loadConfig", () => {
     });
   });
 
-  describe("Bug 2: Version string — always from package.json", () => {
+  describe("Bug 2: Version string - always from package.json", () => {
     it("version comes from package.json even when sanctuary.json stores an old version", async () => {
       // Simulate the Mac Mini scenario: sanctuary.json stores version "0.3.0"
       // from first run, but package.json is 0.5.0
@@ -133,13 +140,13 @@ describe("loadConfig", () => {
     });
 
     it("version matches SANCTUARY_VERSION constant", async () => {
-      // No config file — defaults only
+      // No config file - defaults only
       const config = await loadConfig(join(tempDir, "nonexistent.json"));
       expect(config.version).toBe(SANCTUARY_VERSION);
     });
   });
 
-  describe("Config file missing — graceful fallback", () => {
+  describe("Config file missing - graceful fallback", () => {
     it("returns valid defaults when config file does not exist", async () => {
       const config = await loadConfig(join(tempDir, "nonexistent.json"));
 
@@ -159,11 +166,11 @@ describe("loadConfig", () => {
     });
   });
 
-  describe("Empty / partial config file — transient-write race", () => {
+  describe("Empty / partial config file - transient-write race", () => {
     // A concurrent writer (saveConfig in another process, or a parallel test
     // sharing a config path) truncates to zero bytes before rewriting. A
     // reader that hits that window sees "". This MUST fall back to defaults,
-    // not be treated as corruption — quarantining a file that is about to be
+    // not be treated as corruption - quarantining a file that is about to be
     // valid again is destructive and itself racy. Regression for the
     // "SyntaxError: Unexpected end of JSON input" flake in
     // test/cli/singleton-audit-writes.test.ts.
@@ -177,7 +184,7 @@ describe("loadConfig", () => {
       expect(config.transport).toBe("stdio");
       expect(config.dashboard.enabled).toBe(false);
       expect(config.dashboard.port).toBe(3501);
-      // The file is left untouched — NOT renamed to *.corrupted.*
+      // The file is left untouched - NOT renamed to *.corrupted.*
       expect(await readFile(configFile, "utf-8")).toBe("");
       const files = await readdir(tempDir);
       expect(files.some((file) => file.includes(".corrupted."))).toBe(false);
@@ -209,7 +216,7 @@ describe("loadConfig", () => {
     });
   });
 
-  describe("Atomic save — root cause of the truncate-before-write race", () => {
+  describe("Atomic save - root cause of the truncate-before-write race", () => {
     // saveConfig writes to a temp file then renames into place, so a
     // concurrent loadConfig never observes an empty or partial file. This is
     // the source-side half of the race fix; the loadConfig empty-read
@@ -310,6 +317,148 @@ describe("loadConfig", () => {
       await expect(loadConfig(join(tempDir, "nonexistent.json"))).rejects.toThrow(
         /privacy_filter\.mode/
       );
+    });
+  });
+
+  describe("Config downgrade guard", () => {
+    it("rejects a lower persisted config version and keeps the previous file", async () => {
+      const configFile = join(tempDir, "version-rollback.json");
+      const stronger = defaultConfig();
+      stronger.version = "2.0.0";
+      await saveConfig(stronger, configFile);
+
+      const weaker = cloneConfig(stronger);
+      weaker.version = "1.0.0";
+
+      await expect(saveConfig(weaker, configFile)).rejects.toBeInstanceOf(
+        ConfigDowngradeError
+      );
+      await expect(saveConfig(weaker, configFile)).rejects.toMatchObject({
+        downgrades: [
+          expect.objectContaining({
+            field: "version",
+            reason: "config_version_rollback",
+          }),
+        ],
+      });
+      expect(JSON.parse(await readFile(configFile, "utf-8")).version).toBe("2.0.0");
+    });
+
+    it("rejects dashboard TLS or auth removal and keeps the stronger file", async () => {
+      const configFile = join(tempDir, "dashboard-downgrade.json");
+      const stronger = defaultConfig();
+      stronger.dashboard = {
+        ...stronger.dashboard,
+        enabled: true,
+        auth_token: "auto",
+        tls: { cert_path: "/tmp/sanctuary.test.crt", key_path: "/tmp/sanctuary.test.key" },
+      };
+      await saveConfig(stronger, configFile);
+
+      const weaker = cloneConfig(stronger);
+      delete weaker.dashboard.auth_token;
+      delete weaker.dashboard.tls;
+
+      await expect(saveConfig(weaker, configFile)).rejects.toMatchObject({
+        name: "ConfigDowngradeError",
+        downgrades: expect.arrayContaining([
+          expect.objectContaining({ reason: "dashboard_tls_disabled" }),
+          expect.objectContaining({ reason: "dashboard_auth_disabled" }),
+        ]),
+      });
+      const persisted = JSON.parse(await readFile(configFile, "utf-8"));
+      expect(persisted.dashboard.auth_token).toBe("auto");
+      expect(persisted.dashboard.tls).toEqual(stronger.dashboard.tls);
+    });
+
+    it("rejects disabling a configured webhook approval gate", async () => {
+      const configFile = join(tempDir, "webhook-downgrade.json");
+      const stronger = defaultConfig();
+      stronger.webhook = {
+        ...stronger.webhook,
+        enabled: true,
+        url: "https://approvals.invalid/hook",
+        secret: "test-secret",
+      };
+      await saveConfig(stronger, configFile);
+
+      const weaker = cloneConfig(stronger);
+      weaker.webhook.enabled = false;
+
+      await expect(saveConfig(weaker, configFile)).rejects.toMatchObject({
+        name: "ConfigDowngradeError",
+        downgrades: expect.arrayContaining([
+          expect.objectContaining({
+            field: "webhook.enabled",
+            reason: "webhook_gate_disabled",
+          }),
+        ]),
+      });
+      expect(JSON.parse(await readFile(configFile, "utf-8")).webhook.enabled).toBe(true);
+    });
+
+    it("rejects lower privacy and key-protection posture", async () => {
+      const configFile = join(tempDir, "posture-downgrade.json");
+      const stronger = defaultConfig();
+      stronger.state.key_protection = "passphrase";
+      stronger.privacy_filter.mode = "local";
+      stronger.privacy_filter.fail_mode = "closed";
+      await saveConfig(stronger, configFile);
+
+      const weaker = cloneConfig(stronger);
+      weaker.state.key_protection = "none";
+      weaker.privacy_filter.mode = "off";
+      weaker.privacy_filter.fail_mode = "fallback";
+
+      await expect(saveConfig(weaker, configFile)).rejects.toMatchObject({
+        name: "ConfigDowngradeError",
+        downgrades: expect.arrayContaining([
+          expect.objectContaining({ reason: "state_key_protection_downgrade" }),
+          expect.objectContaining({ reason: "privacy_filter_disabled" }),
+          expect.objectContaining({ reason: "privacy_fail_mode_downgrade" }),
+        ]),
+      });
+      const persisted = JSON.parse(await readFile(configFile, "utf-8"));
+      expect(persisted.state.key_protection).toBe("passphrase");
+      expect(persisted.privacy_filter.fail_mode).toBe("closed");
+    });
+
+    it("rejects a manual config-file downgrade during load", async () => {
+      const configFile = join(tempDir, "manual-downgrade.json");
+      const stronger = defaultConfig();
+      stronger.dashboard = {
+        ...stronger.dashboard,
+        enabled: true,
+        auth_token: "manual-test-secret",
+        tls: { cert_path: "/tmp/sanctuary.test.crt", key_path: "/tmp/sanctuary.test.key" },
+      };
+      stronger.webhook = {
+        ...stronger.webhook,
+        enabled: true,
+        url: "https://approvals.invalid/hook",
+        secret: "webhook-test-secret",
+      };
+      await saveConfig(stronger, configFile);
+
+      const weaker = cloneConfig(stronger);
+      delete weaker.dashboard.auth_token;
+      delete weaker.dashboard.tls;
+      weaker.webhook.enabled = false;
+      await writeFile(configFile, JSON.stringify(weaker, null, 2));
+
+      await expect(loadConfig(configFile)).rejects.toMatchObject({
+        name: "ConfigDowngradeError",
+        downgrades: expect.arrayContaining([
+          expect.objectContaining({ reason: "dashboard_tls_disabled" }),
+          expect.objectContaining({ reason: "dashboard_auth_disabled" }),
+          expect.objectContaining({ reason: "webhook_gate_disabled" }),
+        ]),
+      });
+      const baseline = JSON.parse(
+        await readFile(`${configFile}.security-baseline.json`, "utf-8")
+      );
+      expect(JSON.stringify(baseline)).not.toContain("manual-test-secret");
+      expect(JSON.stringify(baseline)).not.toContain("webhook-test-secret");
     });
   });
 
@@ -481,3 +630,7 @@ describe("loadConfig", () => {
     });
   });
 });
+
+function cloneConfig(config: SanctuaryConfig): SanctuaryConfig {
+  return JSON.parse(JSON.stringify(config)) as SanctuaryConfig;
+}

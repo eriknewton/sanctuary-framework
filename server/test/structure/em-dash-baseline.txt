@@ -1,6 +1,6 @@
 # Em-dash ratchet baseline (DoE review C-1, the no-em-dash rule).
 #
-# The no-em-dash rule (CLAUDE.md, 2026-04-21): ZERO em-dashes (—, U+2014) in
+# The no-em-dash rule (CLAUDE.md, 2026-04-21): ZERO em-dashes (-, U+2014) in
 # public-facing artifacts. This file pins the CURRENT per-file em-dash count
 # across the guard's scope so the guard is a FAIL-ON-NEW ratchet:
 #
@@ -13,7 +13,7 @@
 # (README*, CHANGELOG*, ROADMAP.md, SANCTUARY_ARCHITECTURE.md,
 # sanctuary_framework.md), the public text subtrees (docs/, announcements/,
 # examples/, quickstart/, rfcs/), package metadata + the plugin manifest, and
-# every tracked server/src TS file scanned CODE-ONLY (comments/JSDoc stripped —
+# every tracked server/src TS file scanned CODE-ONLY (comments/JSDoc stripped -
 # the rule exempts code comments).
 #
 # TODO (no-em-dash debt): drive these counts to 0 in dedicated prose-cleanup
@@ -146,7 +146,6 @@
 3	server/src/compliance/eu_ai_act/templates/07_annex_iii_classification.ts
 4	server/src/compliance/eu_ai_act/templates/08_delta.ts
 5	server/src/compliance/eu_ai_act/templates/shared.ts
-1	server/src/config.ts
 37	server/src/core/anti-rollback.ts
 1	server/src/core/identity.ts
 34	server/src/core/master-custody.ts
@@ -175,7 +174,6 @@
 1	server/src/intelligence/substrates/local.ts
 9	server/src/mesh/audit-batch.ts
 4	server/src/mesh/envelope.ts
-10	server/src/mesh/failure-modes/detector.ts
 1	server/src/mesh/guardian/errors.ts
 1	server/src/mesh/guardian/guardian-roster.ts
 5	server/src/mesh/guardian/master-rotation.ts
@@ -185,7 +183,6 @@
 1	server/src/mesh/lifecycle/bootstrap-token.ts
 3	server/src/mesh/lifecycle/counters.ts
 13	server/src/mesh/lifecycle/file-stores.ts
-12	server/src/mesh/lifecycle/mesh-node.ts
 2	server/src/mesh/lifecycle/node-key-binding.ts
 2	server/src/mesh/recovery-flows/canonical-audit-promotion.ts
 2	server/src/mesh/recovery-flows/device-recovery.ts
@@ -206,7 +203,6 @@
 4	server/src/principal-policy/approval-channel.ts
 47	server/src/principal-policy/dashboard-html.ts
 5	server/src/principal-policy/gate.ts
-2	server/src/principal-policy/loader.ts
 2	server/src/principal-policy/tools.ts
 1	server/src/principal-policy/webhook.ts
 2	server/src/proxy/client-manager.ts

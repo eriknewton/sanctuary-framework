@@ -254,11 +254,11 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
     expect(t3Added.tier3_always_allow).toContain("custom_reader_op");
   });
 
-  it("even FORCING past the conflict gate, a tier1_remove draft cannot downgrade a forced op on the live policy", async () => {
+  it("even FORCING past the conflict gate, a tier1_remove draft is refused before live policy write", async () => {
     // The conflict detector is the first-line defense: it flags this as a
     // high-severity contradiction the operator must acknowledge + force. We
-    // deliberately force past it to prove the enforceForcedTiers backstop in
-    // applyRule still neutralizes the downgrade (defense-in-depth).
+    // deliberately force past it to prove the anti-downgrade gate still
+    // refuses the weakening before the live policy is written.
     const rig = makeActivatorRig();
     expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
     const draft = buildCompiled({
@@ -273,15 +273,20 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(outcome.ok).toBe(true);
-    if (outcome.ok) {
-      expect(outcome.updated_policy.tier1_always_approve).toContain(FORCED_T1);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ field: `operation.${FORCED_T1}` }),
+        ]),
+      );
     }
     // And the persisted live policy still gates it.
     expect(rig.livePolicy.current.tier1_always_approve).toContain(FORCED_T1);
   });
 
-  it("even FORCING past the conflict gate, a tier3_add draft cannot smuggle a forced op into Tier 3", async () => {
+  it("even FORCING past the conflict gate, a tier3_add draft is refused before live policy write", async () => {
     const rig = makeActivatorRig();
     const draft = buildCompiled({
       kind: "tier3_add_operation",
@@ -295,10 +300,13 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(outcome.ok).toBe(true);
-    if (outcome.ok) {
-      expect(outcome.updated_policy.tier3_always_allow).not.toContain(
-        FORCED_T1_CLOUD,
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ field: `operation.${FORCED_T1_CLOUD}` }),
+        ]),
       );
     }
     expect(rig.livePolicy.current.tier3_always_allow).not.toContain(
@@ -306,6 +314,39 @@ describe("Xi-2 - applyRule re-asserts the forced-Tier invariant (defense-in-dept
     );
     expect(rig.livePolicy.current.tier1_always_approve).toContain(
       FORCED_T1_CLOUD,
+    );
+  });
+
+  it("rejects a Tier 2 action downgrade after conflicts are acknowledged", async () => {
+    const rig = makeActivatorRig();
+    const draft = buildCompiled({
+      kind: "tier2_set_field",
+      tier2_update: { field: "first_session_policy", value: "allow" },
+    });
+    const conflicts = await rig.activator.checkConflicts(draft, OPERATOR);
+
+    const outcome = await rig.activator.activate(draft, OPERATOR, {
+      conflicts_acknowledged: conflicts,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe("policy_posture_downgrade_refused");
+      expect(outcome.downgrades).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            field: "tier2_anomaly.first_session_policy",
+            reason: "tier2_action_downgrade",
+          }),
+        ]),
+      );
+    }
+    expect(rig.livePolicy.current.tier2_anomaly.first_session_policy).toBe(
+      "approve",
+    );
+    const ops = await auditOps(rig.auditLog);
+    expect(ops).toContain(
+      ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
     );
   });
 });
@@ -552,7 +593,10 @@ describe("Xi-3 - pre-activation conflict gating", () => {
       conflicts_acknowledged: conflicts,
       force_conflict_ids: highIds,
     });
-    expect(forced.ok).toBe(true);
+    expect(forced.ok).toBe(false);
+    if (!forced.ok) {
+      expect(forced.reason).toBe("policy_posture_downgrade_refused");
+    }
     const ops = await auditOps(rig.auditLog);
     expect(ops).toContain(
       ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_CONFLICT_USED,
