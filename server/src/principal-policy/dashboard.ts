@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — Principal Dashboard
+ * Sanctuary MCP Server - Principal Dashboard
  *
  * HTTP-based approval channel that serves a real-time web dashboard
  * for human principals to approve/deny agent operations.
@@ -363,7 +363,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * and read the local attestation store for reputation EVIDENCE (counts, not a
    * score). Optional: when absent (standalone / un-wired), the Recognition panel
    * falls back to audit-event counts and a `null` (amber) reputation row. Never
-   * used to fetch any external reputation score — there is no such path.
+   * used to fetch any external reputation score - there is no such path.
    */
   private storage: StorageBackend | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
@@ -413,14 +413,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * are treated as authenticated without requiring a Bearer token or
    * dashboard session cookie. Only the `startStandaloneDashboard` boot
    * path enables this, and ONLY after the supplied passphrase successfully
-   * decrypts at least one stored identity — proving the caller already
+   * decrypts at least one stored identity - proving the caller already
    * holds the primary secret that protects every piece of Sanctuary state.
    *
    * Rationale: the dashboard auth token is a dashboard-access credential
    * layered on top of the master-key unlock. Once the operator has already
    * presented the passphrase on the command line (terminal-side auth), a
    * second login prompt in the auto-opened browser just trains users to
-   * paste secrets into web forms — the exact habit Sanctuary exists to
+   * paste secrets into web forms - the exact habit Sanctuary exists to
    * discourage. Remote (non-loopback) callers still require the bearer
    * token, so this is a localhost-only ergonomics unlock, not a network
    * policy change.
@@ -454,7 +454,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * Federation PR-A1: RFC v7 challenge-response session ceremony +
    * opaque session tokens for the additive `/v1` API surface. Constructed
-   * unconditionally — the `/v1` skeleton is always mounted; its auth is
+   * unconditionally - the `/v1` skeleton is always mounted; its auth is
    * fail-closed and independent of the legacy bearer/session model
    * (which it bridges through {@link V1SessionService}'s attestation
    * check, never bypasses).
@@ -473,7 +473,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Phase S1: split-process supervisor bridge. Set by the standalone process
    * once the supervisor socket path + per-boot auth secret are known (it owns
    * the in-memory master for the transient-key handoff). When null, protect
-   * fails closed with 503 `unavailable` — never a silent success, never the
+   * fails closed with 503 `unavailable` - never a silent success, never the
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
@@ -645,7 +645,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.v1Sessions = new V1SessionService({
       auth: {
         // PR-A3: the credentialed session path is a durable Ed25519 operator
-        // attestation verified against THIS key — the same operator identity
+        // attestation verified against THIS key - the same operator identity
         // key the OPERATOR_SIGNED write path resolves. The bearer-token path
         // is gone (replace-not-extend); loopback auto-auth remains a
         // network-position fallback only.
@@ -947,7 +947,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): Promise<boolean> {
     if (!this.distressInbox) return false;
     // SECURITY (codex round-1 HIGH): authenticate through the dashboard's own
-    // checkAuth — the SAME gate the `/api/audit-log` route uses, which already
+    // checkAuth - the SAME gate the `/api/audit-log` route uses, which already
     // serves every distress envelope. This honors bearer token AND the login
     // session cookie (the route-helper's authMiddleware checks neither cookie),
     // so the operator's browser works and a tokenless non-browser caller is
@@ -1196,8 +1196,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `/api/posture/*` (G1 unwrapped roster, G2 today's-story digest, G4
    * enforcement-evidenced Castle Wall arm state, G5 per-agent effective reach).
    *
-   * Auth: the JSON routes and the HTML page run through `checkAuth` — the SAME
-   * gate `/api/audit-log` uses — before this dispatcher is reached (the caller
+   * Auth: the JSON routes and the HTML page run through `checkAuth` - the SAME
+   * gate `/api/audit-log` uses - before this dispatcher is reached (the caller
    * checks it). Returns true when served, false to fall through to legacy.
    *
    * Dependencies are resolved lazily per request so post-unlock wiring (the
@@ -1277,7 +1277,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * posture surface the embedded native web view and any browser both land on.
    *
    * Auth contract (Delta Review A3 remediation): the shell is a STATIC page that
-   * carries no posture data — it negotiates its own auth client-side (loopback
+   * carries no posture data - it negotiates its own auth client-side (loopback
    * auto-auth or a pasted bearer) and fetches `/api/posture/*` for every byte of
    * evidence, and those JSON routes stay behind `checkAuth`. So the shell itself
    * is served WITHOUT a server-side auth gate, identically on `/` and
@@ -1330,7 +1330,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `{ status: "unknown" }` placeholder it carried before.
    *
    * Auth scope (Delta Review A3 remediation): this is deliberately NOT exposed
-   * on the unauthenticated `/api/health` probe — that surface stays a cheap
+   * on the unauthenticated `/api/health` probe - that surface stays a cheap
    * O(1) liveness answer with no posture and no audit scan. The detailed
    * posture leaves the server only behind auth: this builder feeds the
    * SESSION_TOKEN-gated `/v1/status` document (and `/api/posture/castle-wall`
@@ -1429,10 +1429,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * Recognition panel (P5): count persisted Concordia-bridge commitments by
    * listing the reserved `_bridge` namespace. This is the "committed receipts"
-   * count — a LOCAL storage read with NO Concordia process running and NO
+   * count - a LOCAL storage read with NO Concordia process running and NO
    * external fetch. Returns `undefined` when no storage backend is wired so the
    * shaper takes its documented audit-event lower-bound fallback (returning `0`
-   * would assert a fact — "zero bridge commitments" — that an un-wired store
+   * would assert a fact - "zero bridge commitments" - that an un-wired store
    * cannot establish, suppressing the fallback). A list failure likewise
    * propagates so the route layer's try/catch degrades to the audit-event count
    * rather than fabricating a number.
@@ -1447,7 +1447,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Recognition panel (P5): gather LOCAL reputation EVIDENCE (attestation counts,
    * tier distribution, dispute count, most-recent timestamp, and the local
    * `verascore_linked` publish flag) for the primary identity. This reads the
-   * local attestation store ONLY — it never fetches a Verascore (or any vendor)
+   * local attestation store ONLY - it never fetches a Verascore (or any vendor)
    * score, and it returns COUNTS, not a number-on-a-scale. Returns `null` when
    * the storage backend, master key, or a primary identity is unavailable, which
    * the panel renders as an amber "no evidence yet" row (never green).
@@ -1509,7 +1509,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
     // Only `present` is a permanent cache (the `status === "present"` guard
     // above short-circuits future loads). `unreadable` is stored so THIS request
-    // fails honestly, and `absent` is stored as undefined — both are re-evaluated
+    // fails honestly, and `absent` is stored as undefined - both are re-evaluated
     // on the next request, so a post-provision write (or a fixed permission) is
     // always picked up.
     this._producerKeyLoad = load.status === "absent" ? undefined : load;
@@ -1537,7 +1537,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `{ ok, version, daemon, listener, federation, identity, castle_wall }`.
    *
    * Field discipline: identity is an EXPLICIT pick of public fields from
-   * the stored identity — never a spread, so the encrypted private key
+   * the stored identity - never a spread, so the encrypted private key
    * blob can never ride along into an HTTP response (CLAUDE.md
    * constraint 6). Federation is honestly `enabled: false` until the
    * PR-A3 listener work.
@@ -1547,7 +1547,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * {@link buildStatusCastleWall} → {@link buildCastleWallPosture} path), not the
    * old dead `{ status: "unknown" }` placeholder. This document is served ONLY
    * to a SESSION_TOKEN holder with the status-read capability, so the detailed
-   * posture (and the audit scan that derives it) stays behind auth — it is NOT
+   * posture (and the audit scan that derives it) stays behind auth - it is NOT
    * on the unauthenticated `/api/health` probe. Honesty is preserved: the shaper
    * returns `unknown` / `degraded` (never `armed`) whenever there is no fresh,
    * verified enforcement evidence.
@@ -1667,7 +1667,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * the old identity's agents (multi-identity isolation). But
    * `v11Bindings.identityId` may be a SYNTHETIC fortress-scoped id
    * (`fortress:<path>`) on a fresh standalone boot, where the real signing
-   * identity only exists as the default — there `get()` returns undefined and
+   * identity only exists as the default - there `get()` returns undefined and
    * we fall back to the default so valid signed requests are not rejected. The
    * hub is single-operator in v1.1, so the fallback does not widen authority.
    */
@@ -2166,7 +2166,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * attested on THIS node. The event rides the hash-chained log and, once a
    * peer accepts the envelope that carries it (cert-chain verified), the agent
    * is RECOGNIZED across the operator's machines without re-minting its
-   * identity — the "identity survives a substrate move" property. Called by the
+   * identity - the "identity survives a substrate move" property. Called by the
    * agent-protect path (and by the marquee integration test) when a fortress
    * node admits an agent. Returns the appended event for the caller to surface.
    */
@@ -2492,7 +2492,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Also write to stderr as a fallback notification
     process.stderr.write(
-      `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) — open dashboard to respond\n`
+      `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) - open dashboard to respond\n`
     );
 
     return new Promise<ApprovalResponse>((resolve) => {
@@ -2541,7 +2541,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Verify bearer token authentication.
    *
    * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
-   * header — never in URL query strings. For SSE and page loads that cannot
+   * header - never in URL query strings. For SSE and page loads that cannot
    * set headers, a short-lived session token (obtained via POST /auth/session)
    * is accepted via ?session= query parameter.
    *
@@ -2555,7 +2555,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): boolean {
     if (!this.authToken) return true; // Auth disabled
 
-    // v0.10.2: loopback auto-auth — see _autoAuthLocalhost comment.
+    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment.
     //
     // SCOPE LIMIT (loopback-no-autoauth-for-approvals): `requireToken`
     // suppresses this shortcut so a state-changing approval decision
@@ -2599,12 +2599,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
-    // This was the vulnerability — tokens in URLs leak to logs, history, and Referer headers.
+    // This was the vulnerability - tokens in URLs leak to logs, history, and Referer headers.
 
     // For GET / requests from browsers, serve login page instead of JSON 401
     // (checked in handleRequest before checkAuth is called for this path)
     res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized — use Authorization: Bearer header or a valid session" }));
+    res.end(JSON.stringify({ error: "Unauthorized - use Authorization: Bearer header or a valid session" }));
     return false;
   }
 
@@ -2687,7 +2687,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Validate a session ID — must exist and not be expired.
+   * Validate a session ID - must exist and not be expired.
    */
   private validateSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
@@ -2863,7 +2863,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers — restrict to same-origin; the dashboard is served by this server
+    // CORS headers - restrict to same-origin; the dashboard is served by this server
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
@@ -2925,14 +2925,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // (which previously owned `/`), the auth gate, and the legacy route table,
     // so both paths serve the one unauthenticated static shell under the same
     // auth contract (the shell's data fetches stay behind checkAuth). Matches
-    // ONLY `/` and `/posture` — `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
+    // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
     // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
     // the posture JSON API included) fall through untouched.
     if (this.dispatchRootPosture(res, url, method)) return;
 
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
-    // and never falls through to legacy routing — fail-closed 401 for
+    // and never falls through to legacy routing - fail-closed 401 for
     // unauthenticated callers on every /v1 path. NOTE: `/v1.0` and
     // `/v1.1` (legacy dashboard HTML) do not match this prefix.
     if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
@@ -3199,7 +3199,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // the evidence-based Castle Wall posture. A prior revision attached the full
     // arm-state object (origin/operator id, verdict counts, enforcement
     // timestamps) here and ran an unbounded audit-log scan + per-entry Ed25519
-    // re-verify on every call — that both leaked the detailed posture to any
+    // re-verify on every call - that both leaked the detailed posture to any
     // anonymous caller and gave an unauthenticated DoS amplifier. The honest
     // arm-state lives ONLY behind auth: `/api/posture/castle-wall` (checkAuth;
     // the native app reaches it via loopback auto-auth) and the `/v1/status`
@@ -3259,7 +3259,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    // SEC-012: Session exchange does its own auth (header-only) — let it through before checkAuth
+    // SEC-012: Session exchange does its own auth (header-only) - let it through before checkAuth
     if (method === "POST" && url.pathname === "/auth/session") {
       if (!this.checkRateLimit(req, res, "general")) return;
       try {
@@ -3278,7 +3278,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // legacy login flow.
     if (method === "GET" && url.pathname === "/v1.0" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
-        // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
+        // Login page is a view - no rate limit (auth brute force is gated on /auth/session).
         this.serveLoginPage(res);
         return;
       }
@@ -3354,7 +3354,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Rate limiting: apply general limit to authenticated API requests only.
     // HTML view routes (`/`, `/dashboard`, `/fortress`) and the long-lived SSE
-    // stream (`/events`) are exempt — operator page loads and browser
+    // stream (`/events`) are exempt - operator page loads and browser
     // refreshes must never 429. Decision endpoints (approve/deny) and the
     // session-exchange endpoint keep their own stricter limits below.
     if (!isDashboardViewRoute(method, url.pathname)) {
@@ -3438,13 +3438,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private handleSessionExchange(req: IncomingMessage, res: ServerResponse): void {
     if (!this.authToken) {
-      // Auth disabled — sessions not needed
+      // Auth disabled - sessions not needed
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ session_id: "no-auth" }));
       return;
     }
 
-    // Only accept the long-lived token via Authorization header — NEVER from URL
+    // Only accept the long-lived token via Authorization header - NEVER from URL
     const authHeader = req.headers.authorization;
     if (!authHeader) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -3993,7 +3993,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // ── Proxy Server Handlers ───────────────────────────────────────────
 
   /**
-   * GET /api/proxy/servers — list upstream proxy servers and their status.
+   * GET /api/proxy/servers - list upstream proxy servers and their status.
    */
   private handleProxyServers(res: ServerResponse): void {
     const profile = this.profileStore?.get();
@@ -4020,7 +4020,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * POST /api/proxy/servers — update upstream server configuration.
+   * POST /api/proxy/servers - update upstream server configuration.
    * This is a dashboard action (human-initiated), so it's allowed with audit logging
    * rather than requiring Tier 1 approval.
    */
@@ -4188,7 +4188,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // them to the browser. No new transport.
   //
   // Spec §8 + §9. Spawn-prompt acceptance criterion 7: "Mesh Health dashboard
-  // panel renders via existing SSE /events channel — no new transport. Every
+  // panel renders via existing SSE /events channel - no new transport. Every
   // state transition produces an observable SSE event."
 
   /** Push a Mesh Health snapshot (full re-render trigger on the client). */
@@ -4209,7 +4209,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * Open a URL in the system's default browser.
    * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
-   * Fails silently — dashboard still works via terminal URL.
+   * Fails silently - dashboard still works via terminal URL.
    */
   private openInBrowser(url: string): void {
     const os = platform();
