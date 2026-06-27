@@ -18,9 +18,10 @@
 
 import { realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { join } from "node:path";
 import { Writable } from "node:stream";
+
+import { getSanctuaryVersion } from "../version.js";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
@@ -61,10 +62,12 @@ import {
 import { verifyAgainstLog } from "../transparency/against-log.js";
 import type { FetchLike } from "../transparency/rekor-client.js";
 
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../../package.json") as {
-  version: string;
-};
+// Canonical version source. The previous `require("../../package.json")`
+// resolved to the repo-root package.json (which has no `version`) once this
+// module is bundled to server/dist/, so the persisted checkpoint dropped its
+// daemon.version and the reader rejected the chain as malformed. The helper
+// reads server/package.json from BOTH src/ and dist/ and never yields undefined.
+const PKG_VERSION = getSanctuaryVersion();
 
 /**
  * Dedicated exit code for a PARTIAL verify-transparency result (a suffix

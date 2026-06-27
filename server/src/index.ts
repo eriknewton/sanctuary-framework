@@ -106,6 +106,7 @@ import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
+import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import {
   establishMaster,
@@ -122,7 +123,8 @@ import {
   probeAuditHeadAnchor,
   deriveAuditEpochKeys,
 } from "./operational/audit-log.js";
-import { discloseRecoveryKey } from "./wrap/recovery-key-disclosure.js";
+import { escrowBootRecoveryKey } from "./wrap/boot-recovery-escrow.js";
+import { detectCustodyFactorOrphan } from "./wrap/orphan-detection.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -169,7 +171,13 @@ export async function createSanctuaryServer(options?: {
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
   await tightenStoragePermissions(config.storage_path);
 
-  // 3. Initialize storage backend
+  // 3. Initialize storage backend. When the CALLER injects a storage backend
+  // (embedding / in-memory test harness), the caller owns key custody and the
+  // boot path does not impose the off-host escrow gate. The escrow gate exists
+  // to protect the REAL-HOST filesystem first run (where a minted recovery key
+  // would otherwise be orphaned inside the fortress dir); it only applies when
+  // the boot path owns a filesystem fortress.
+  const bootOwnsStorage = options?.storage === undefined;
   const storage = options?.storage ?? new FilesystemStorage(
     `${config.storage_path}/state`
   );
@@ -380,6 +388,35 @@ export async function createSanctuaryServer(options?: {
           "pin; re-provision it with 'sanctuary castle-wall re-pin' when ready.\n"
       );
     }
+  }
+
+  // 5orphan. Custody-factor orphan detection (element 5): WARN before lockout.
+  // If the envelope enrolled an OS-keyring custody factor but that keyring item
+  // is now GONE (reachable keyring, missing item), the operator is one factor
+  // away from needing the recovery key. Boot is NEVER refused on this signal
+  // (F3: a warn, not a brick); a locked/unreachable keyring is inconclusive and
+  // raises no alarm. Best-effort: a detector error never blocks boot.
+  try {
+    const orphan = await detectCustodyFactorOrphan(storage, config.storage_path);
+    if (orphan.verdict === "orphaned") {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "custody_factor_orphan_detected",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          custody_service: orphan.custodyService,
+          recovery_escrow: orphan.recoveryEscrow,
+        },
+      });
+      // SAFETY: stderr is the operator-facing channel for boot diagnostics.
+      console.error(`\nSanctuary: ${orphan.message}\n`);
+    }
+  } catch (err) {
+    console.error(
+      "Sanctuary: custody-factor orphan check could not complete: " +
+        (err instanceof Error ? err.message : String(err))
+    );
   }
 
   // 5a. Reset-history continuity (v1.0.2 item a). If a prior nuke left a
@@ -1063,6 +1100,19 @@ export async function createSanctuaryServer(options?: {
   });
   const unifiedInboxScheduler = new UnifiedInboxScheduler({
     bridge: unifiedInboxBridge,
+    // Feature-health observability raise path: on the operator-inbox cadence,
+    // recompute the feature-health panel from the integrity-judged audit read and
+    // raise the 3 ratified fault classes (deduped via the bridge). Additive +
+    // display-only; feeds NOTHING back into enforcement. The dashboard owns the
+    // raiser (it has the producer-key load + panel builder); a missing dashboard
+    // or locked log makes this a no-op.
+    //
+    // ALERT LATENCY (operator-facing honesty): the raise rides this existing
+    // ~60s UnifiedInboxScheduler tick, so a feature fault can take up to one
+    // scheduler cycle (best-effort ~60s, not instant) to surface as a
+    // notification. This path adds NO faster heartbeat/poll; it deliberately
+    // reuses the inbox cadence to inherit the integrity-judged audit read.
+    onTick: () => dashboard?.evaluateFeatureFaults(),
   });
   unifiedInboxScheduler.start();
 
@@ -1378,6 +1428,16 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
+  // 16b-read. ERC-8004 Identity OFFLINE verifier (read side). Fully local:
+  // verifies a presented record's signature/shape with NO outbound surface and
+  // no on-chain read. On-chain registry confirmation is a deferred follow-up
+  // (must reuse Verascore's real ERC-8004 ABI), not shipped here.
+  const { tools: erc8004ResolveTools } = createErc8004ResolveTools({
+    auditLog,
+    identityId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
+
   const { tools: agentNativeTools } = createAgentNativeCooperativeTools({
     identityManager,
     namespaceRegistry,
@@ -1457,6 +1517,7 @@ export async function createSanctuaryServer(options?: {
     sdwMemoryProvenanceTool,
     ...complianceTools,
     ...erc8004Tools,
+    ...erc8004ResolveTools,
     ...agentNativeTools,
     ...distressTools,
     manifestTool,
@@ -1605,18 +1666,35 @@ export async function createSanctuaryServer(options?: {
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  // 22. Disclose the full recovery key if generated (shown once, never again).
-  // The MCP server stdio path is not interactive (the host harness owns
-  // stdin), so we disclose via banner + recovery-key.txt file but skip the
-  // confirmation prompt. Operators who want the prompt should run
-  // `sanctuary init` first instead of letting the stdio server first-run
-  // generate the key.
-  if (recoveryKey) {
-    await discloseRecoveryKey({
+  // 22. Escrow the full recovery key off-host if one was generated on this
+  // first run (the durable fix). The recovery key is NEVER written inside the
+  // fortress dir and NEVER printed to stdout/stderr/log (the MCP host harness
+  // captures those streams): it is disclosed ONLY on the controlling terminal
+  // (/dev/tty) for the human to store in their password manager, and/or
+  // escrowed to an explicit off-host target. The MCP stdio host owns stdin, so
+  // the tty confirmation is skipped (noConfirm); the hard provisioning gate
+  // then requires an off-host escrow target (SANCTUARY_RECOVERY_OUT, or a
+  // passphrase for OS-keyring escrow) and FAILS CLOSED otherwise rather than
+  // leaving the freshly minted key uncaptured. Operators who want the
+  // interactive confirmation should run `sanctuary init` first.
+  if (recoveryKey && bootOwnsStorage) {
+    const escrowOpts: Parameters<typeof escrowBootRecoveryKey>[0] = {
       recoveryKey,
       storagePath: config.storage_path,
-      mode: "stdio-server",
-    });
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+      // The host harness owns stdin, so there is no interactive confirmation
+      // (noConfirm). The hard provisioning gate then requires a DURABLE
+      // off-host target and fails closed otherwise. When a passphrase is in
+      // play we escrow the recovery key to the OS keyring (best-effort,
+      // read-back-verified) exactly as `sanctuary init` does, so a
+      // passphrase-provisioned fortress gets a recoverable second factor; with
+      // no passphrase the operator must supply SANCTUARY_RECOVERY_OUT (or run
+      // interactively) or boot fails closed rather than minting an uncaptured
+      // sole-factor key.
+      noConfirm: true,
+      attemptKeychainEscrow: !!passphrase,
+    };
+    await escrowBootRecoveryKey(escrowOpts);
   }
 
   return {

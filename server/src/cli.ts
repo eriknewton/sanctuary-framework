@@ -142,15 +142,17 @@ async function main(): Promise<void> {
     const { parseInitArgs, runInit, printInitHelp } = await import(
       "./wrap/init.js"
     );
-    const opts = parseInitArgs(args.slice(1));
-    if (opts.helpRequested) {
-      printInitHelp();
-      process.exit(0);
-    }
     try {
+      const opts = parseInitArgs(args.slice(1));
+      if (opts.helpRequested) {
+        printInitHelp();
+        process.exit(0);
+      }
       await runInit(opts);
       process.exit(0);
-    } catch {
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand; print only the error message, never any recovery-key material.
+      console.error(`\n  Sanctuary init failed: ${formatCliError(err)}\n`);
       process.exit(1);
     }
   }
@@ -193,6 +195,12 @@ async function main(): Promise<void> {
   if (args[0] === "generate") {
     const { runGenerateCommand } = await import("./cli/generate.js");
     const code = await runGenerateCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "deploy") {
+    const { runDeployCommand } = await import("./cli/deploy.js");
+    const code = await runDeployCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -242,6 +250,12 @@ async function main(): Promise<void> {
   if (args[0] === "federation") {
     const { runFederationCommand } = await import("./cli/federation.js");
     const code = await runFederationCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "plugin") {
+    const { runPluginCommand } = await import("./cli/plugin.js");
+    const code = await runPluginCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -585,6 +599,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let multi = false;
   let tenant: string | undefined;
   let noConfirm = false;
+  let recoveryOut: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -603,6 +618,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       tenant = args[++i];
     } else if (args[i] === "--no-confirm") {
       noConfirm = true;
+    } else if (args[i] === "--recovery-out" && args[i + 1]) {
+      recoveryOut = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -647,6 +664,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     port,
     host,
     ...(tenant !== undefined ? { tenant } : {}),
+    ...(recoveryOut !== undefined ? { recoveryOut } : {}),
     noConfirm,
   });
 
@@ -733,6 +751,7 @@ Usage:
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
+  sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary export-passphrase             # Print stored passphrase
@@ -789,6 +808,9 @@ Subcommands:
 
   generate             Emit local deployment templates.
                        Use "sanctuary generate --help" for options.
+
+  deploy               Emit provider-neutral deployment skeletons.
+                       Use "sanctuary deploy --help" for options.
 
   identity             Inspect the active identity (DID, public key).
                        Use "sanctuary identity --help" for options.
@@ -855,8 +877,16 @@ Options:
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state; scans every
                        tenant on the host and deep-links into per-tenant dashboards.
-  --no-confirm         Skip the recovery-key confirmation prompt on first run.
-                       Required for non-TTY callers (CI, launchd, systemd).
+  --no-confirm         Skip the interactive recovery-key off-host-capture
+                       confirmation on first run. Required for non-TTY callers
+                       (CI, launchd, systemd). When set, an off-host escrow
+                       target MUST exist (--recovery-out / SANCTUARY_RECOVERY_OUT,
+                       or SANCTUARY_PASSPHRASE for OS-keyring escrow) or the boot
+                       fails closed rather than leaving the key uncaptured.
+  --recovery-out <path>
+                       On a first-run mint, write the plaintext recovery key to
+                       this exact path OUTSIDE the fortress directory (durable
+                       off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
   --help, -h           Show this help
 
 Environment variables:
@@ -864,6 +894,7 @@ Environment variables:
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
+  SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
   SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode
@@ -942,6 +973,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
       return true;
     }
+    case "deploy": {
+      const { runDeployCommand } = await import("./cli/deploy.js");
+      await runDeployCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     case "castle-wall":
       printCastleWallHelp();
       return true;
@@ -959,7 +995,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "provision-pin") {
     const { runProvisionPin } = await import("./cli/castle-wall.js");
-    return runProvisionPin();
+    return runProvisionPin(args.slice(1));
   }
 
   if (command === "status") {
@@ -1050,6 +1086,8 @@ function printCastleWallHelp(): void {
 
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
+                     --fortress <path>  Target a specific fortress (defaults to
+                                        SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH).
     status           Show pinned-key fingerprint and sysext status.
     enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
                      Refuses without a reachable policy daemon; --force overrides.
@@ -1177,6 +1215,15 @@ function drainAndExit(code: number): void {
   }
   process.exitCode = code;
   process.stdout.write("", () => process.exit(code));
+}
+
+function formatCliError(err: unknown): string {
+  if (err instanceof Error) {
+    const name =
+      err.name && err.name !== "Error" ? `${err.name}: ` : "";
+    return `${name}${err.message}`;
+  }
+  return String(err);
 }
 
 main().catch((err) => {

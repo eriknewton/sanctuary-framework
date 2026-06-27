@@ -763,3 +763,49 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
     expect(region).toMatch(/"present"[^\n]*pill green/);
   });
 });
+
+describe("posture home - Fleet panel (Slice 1) honesty", () => {
+  it("ships the fleet section hidden by default (absent until federation says otherwise)", () => {
+    const html = renderPostureHomeHTML();
+    // The section exists in the shell but is display:none until the gated fetch
+    // confirms a provisioned fleet (available:true). So a non-federated fortress
+    // never shows a fabricated roster.
+    expect(html).toContain('id="fleet-section"');
+    expect(html).toMatch(/id="fleet-section"[^>]*style="display:none"/);
+    expect(html).toContain('id="fleet"');
+    // Boot wires the gated loader.
+    expect(html).toContain("loadFleetOnce()");
+  });
+
+  it("never fakes green: admitted is the ONLY green trust pill; untrusted/revoked are red", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function fleetTrustPill(state)");
+    const end = html.indexOf("function fleetReachLabel(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // admitted -> green; revoked -> red; the default (untrusted / unevaluable)
+    // -> red. There must be NO amber and NO green outside the admitted branch.
+    expect(region).toMatch(/"admitted"[^\n]*pill green/);
+    expect(region).toMatch(/"revoked"[^\n]*pill red/);
+    // The fail-closed default branch is red, NEVER amber and NEVER green.
+    expect(region).toContain('"pill red">UNTRUSTED');
+    expect(region).not.toMatch(/UNTRUSTED[^\n]*pill amber/);
+    // Green appears ONLY on the admitted line.
+    expect(region).not.toMatch(/"revoked"[^\n]*pill green/);
+    expect(region).not.toContain('pill green">UNTRUSTED');
+  });
+
+  it("keeps reach (liveness) separate from trust: reach never uses a green trust pill", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function fleetReachLabel(reach)");
+    const end = html.indexOf("function fleetTrustWhy(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // Reach is informational. A "recent"/reachable node must NOT borrow the green
+    // trust pill (that would launder liveness into trust). It uses a muted chip.
+    expect(region).not.toContain("pill green");
+    expect(region).toContain("reachable");
+  });
+});

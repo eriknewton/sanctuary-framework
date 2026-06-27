@@ -10,9 +10,12 @@
  * `pushSyncToPeer` runs on the SENDING node. It:
  *   1. Wraps this node's outbound event slice in a {@link FederationSyncEnvelope}
  *      signed by this node's identity key (`signSyncEnvelope`).
- *   2. POSTs it to the peer's `/v1/federation/sync/peer` over HTTP, carrying a
- *      /v1 session token (network-access gate) — NOT this node's operator key,
- *      and NEVER any private key material (constraint 6).
+ *   2. POSTs it to the peer's `/v1/federation/sync/peer` over HTTP. Federation
+ *      P1: this route is pre-session and node-cert-authenticated, so NO session
+ *      token is required (the optional `sessionToken` is retained only for the
+ *      A4 loopback/transitional rigs). NEVER any private key material crosses the
+ *      wire (constraint 6); the node certificate in the envelope is the sole
+ *      credential.
  *   3. Verifies the peer's RECIPROCAL envelope the same way the peer verified
  *      ours: the response envelope's node certificate must chain to the SHARED
  *      pinned fortress-master (`verifySyncEnvelope`). A reply that does not
@@ -72,8 +75,14 @@ export interface PushSyncParams {
   peerUrl: string;
   /** The recipient peer's node id (binds the envelope to that machine). */
   recipientNodeId: string;
-  /** A valid /v1 session token on the peer daemon (network-access gate). */
-  sessionToken: string;
+  /**
+   * Federation P1: OPTIONAL. `/v1/federation/sync/peer` is now pre-session and
+   * node-cert-authenticated, so no session token is required. When omitted (or
+   * empty), the request carries NO `Authorization` header: the node certificate
+   * in the envelope is the sole credential. Retained for the A4 loopback /
+   * transitional rigs that still mint a session.
+   */
+  sessionToken?: string;
   /** This node's slice to push (its outbound hash-chained events). */
   events: FederationEvent[];
   /** Monotonic-per-(sender,recipient) high-water this push stamps. */
@@ -156,7 +165,12 @@ export async function pushSyncToPeer(
     response = (await request(
       "/v1/federation/sync/peer",
       { method: "POST", body: JSON.stringify(envelope) },
-      { dashboardUrl: params.peerUrl, authToken: params.sessionToken },
+      // Federation P1: pre-session route. Pass the explicit empty string when no
+      // session token is supplied so dashboardRequest sends NO `Authorization`
+      // header (an empty authToken wins over the env fallback); the node cert in
+      // the envelope is the sole credential. A supplied token is still forwarded
+      // for the transitional loopback rigs.
+      { dashboardUrl: params.peerUrl, authToken: params.sessionToken ?? "" },
     )) as PeerSyncResponse;
   } catch (cause) {
     if (cause instanceof DashboardRequestError) {

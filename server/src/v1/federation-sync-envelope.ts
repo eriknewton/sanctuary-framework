@@ -213,6 +213,7 @@ export type SyncEnvelopeVerification =
       ok: true;
       senderNodeId: string;
       senderNodePubkey: string;
+      senderNodeCert: NodeIdentityCertificate;
       wireVersion: typeof FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
       syncHighWater: number;
       events: FederationEvent[];
@@ -228,6 +229,7 @@ export type SyncEnvelopeDenialReason =
   | "cert_node_id_mismatch"
   | "cert_chain_invalid"
   | "node_revoked"
+  | "root_revoked"
   | "revocation_state_unavailable"
   | "envelope_signature_invalid"
   | "event_hash_invalid"
@@ -245,6 +247,16 @@ export type SyncEnvelopeDenialReason =
  * is this fortress node's own id. `acceptedHighWaterFor(senderNodeId)` returns
  * the highest high-water this recipient has already accepted from that sender
  * (or null if never), which gates rollback.
+ *
+ * `isRootRevoked` (RR-1, Federation 3/3b P0) is the OPTIONAL revoked-root
+ * predicate: it answers whether the fortress-master pubkey the chain terminates
+ * at has been revoked (rotate-root Slice 3c compromise recovery). It is
+ * feature-inert in P0 (the set is empty until 3c populates it) but wired here
+ * now. When supplied it is checked AFTER the chain verifies (the chain proves
+ * the terminal master IS this pinned master) and BEFORE the node-revocation
+ * check; a `true` answer or a throw denies. When omitted, no root-revocation
+ * gate runs (back-compatible for callers, and the loopback `/sync` path, that
+ * have not wired it).
  */
 export function verifySyncEnvelope(input: {
   envelope: unknown;
@@ -252,6 +264,7 @@ export function verifySyncEnvelope(input: {
   recipientNodeId: string;
   acceptedHighWaterFor(senderNodeId: string): number | null;
   isNodeRevoked(senderNodeId: string): boolean;
+  isRootRevoked?(masterPubkeyB64u: string): boolean;
 }): SyncEnvelopeVerification {
   if (typeof input.envelope !== "object" || input.envelope === null) {
     return { ok: false, reason: "malformed_envelope" };
@@ -274,6 +287,21 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "recipient_mismatch" };
   }
 
+  // 1b. If THIS recipient is still pinning a revoked root anchor, deny before
+  //     looking at sender cert details. Hybrid compromise revocations can place
+  //     Ed25519 OR ML-DSA component public keys in the same revoked-root set; a
+  //     stale recipient pinning either old component should get the honest
+  //     root_revoked reason rather than a later cert-chain symptom.
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(input.pinnedMaster.public_key)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
+  }
+
   // 2. The sender_node_id MUST equal the id inside the presented certificate —
   //    no claiming to be one node while presenting another's cert.
   if (env.sender_node_id !== env.sender_node_cert.node_id) {
@@ -289,6 +317,24 @@ export function verifySyncEnvelope(input: {
     verifyCertChain(env.sender_node_cert, env.issuing_principal_cert, input.pinnedMaster);
   } catch {
     return { ok: false, reason: "cert_chain_invalid" };
+  }
+
+  // 3b. Revoked-ROOT check (RR-1; ACTIVE once rotate-root Slice 3c-1 populates the
+  //     set). The local pinned root was checked above before chain validation.
+  //     Here we ALSO reject a STRAGGLER cert whose chain root (the cert's own
+  //     parent_chain.fortress_master_pubkey) is a revoked root, even though the
+  //     chain verified against the recipient's pinned master. Normally these are
+  //     the same value (the chain check above proved it), but checking the cert's
+  //     declared root explicitly is defense-in-depth: a K1-rooted cert is rejected
+  //     wherever it surfaces, independent of what the recipient currently pins.
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(env.sender_node_cert.parent_chain.fortress_master_pubkey)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
   }
 
   // 4. Revocation projection check. This hook is supplied by the /v1 dashboard
@@ -370,6 +416,7 @@ export function verifySyncEnvelope(input: {
     ok: true,
     senderNodeId: env.sender_node_id,
     senderNodePubkey: env.sender_node_cert.node_pubkey,
+    senderNodeCert: env.sender_node_cert,
     wireVersion: env.wire_version,
     syncHighWater: env.sync_high_water,
     events: env.events,

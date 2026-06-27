@@ -16,6 +16,7 @@ import {
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
 import { resolveStoragePath } from "../paths.js";
+import { getSanctuaryVersion } from "../version.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
@@ -207,6 +208,21 @@ interface LeaseStatusFile {
   heartbeat_interval_seconds: number;
   updated_at: string;
   source: "castle-wall-cli";
+}
+
+type ContentFilterStatusForLease = "enabled" | "disabled" | "unknown" | null;
+
+function formatDeadManLeaseStatus(
+  lease: LeaseStatusFile,
+  contentFilterState: ContentFilterStatusForLease,
+): string {
+  const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
+  const filter =
+    contentFilterState === null ? "" : `; content-filter=${contentFilterState}`;
+  return (
+    `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}` +
+    `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
+  );
 }
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
@@ -428,12 +444,24 @@ export async function runAuditFindings(
 }
 
 export async function runProvisionPin(
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
   const err = ctx.err ?? process.stderr;
   const env = ctx.env ?? process.env;
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, exactly like every
+  // other castle-wall custody verb (re-pin, daemon, audit-*) and like the
+  // federation/identity/transparency verbs. Before this, provision-pin
+  // silently DROPPED its `--fortress` arg and read SANCTUARY_STORAGE_PATH
+  // only, so `castle-wall provision-pin --fortress <good>` loaded the custody
+  // envelope from a DIFFERENT (default/stale) fortress than the one named -
+  // surfacing as "custody envelope exists but has an unsupported shape or
+  // version" while federation/identity verbs against the SAME --fortress path
+  // worked (2026-06-24 stock-CLI drill). resolveFortressArg falls back to
+  // resolveStoragePath(env) when no flag is given, preserving prior behavior.
+  const { fortress } = parseCastleWallArgs(argv);
+  const storagePath = resolveFortressArg(fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
 
@@ -1030,14 +1058,7 @@ export async function runStatus(
   }
 
   write(out, `Castle Wall sysext: ${sysextState}\n`);
-  const lease = await readLeaseStatus(storagePath);
-  if (lease) {
-    const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
-    write(
-      out,
-      `Dead-man lease: ${lease.armed ? "armed" : "disarmed"}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`,
-    );
-  }
+  let contentFilterState: ContentFilterStatusForLease = null;
 
   // Sysext "[activated enabled]" only means installed, not filtering. When the
   // host-app binary is present, corroborate the live NE filter state through
@@ -1054,6 +1075,7 @@ export async function runStatus(
         report?.ok &&
         (report.state === "enabled" || report.state === "disabled")
       ) {
+        contentFilterState = report.state;
         write(out, `Content filter: ${report.state}\n`);
         if (report.build?.git_sha && report.build?.headless_contract_version) {
           write(
@@ -1074,9 +1096,11 @@ export async function runStatus(
             : undefined) ??
           (result.stderr.trim() ||
             `host app exited with code ${result.exitCode}`);
+        contentFilterState = "unknown";
         write(out, `Content filter: unknown (${reason})\n`);
       }
     } catch (error) {
+      contentFilterState = "unknown";
       write(
         out,
         `Content filter: unknown (${
@@ -1084,6 +1108,10 @@ export async function runStatus(
         })\n`,
       );
     }
+  }
+  const lease = await readLeaseStatus(storagePath);
+  if (lease) {
+    write(out, formatDeadManLeaseStatus(lease, contentFilterState));
   }
   return 0;
 }
@@ -1355,11 +1383,12 @@ export async function runDaemon(
       const { resolveTransparencySigner } = await import(
         "../transparency/signer.js"
       );
-      const { createRequire } = await import("node:module");
       const { realpathSync } = await import("node:fs");
-      const { version: pkgVersion } = createRequire(import.meta.url)(
-        "../../package.json",
-      ) as { version: string };
+      // Canonical version source. A bare require("../../package.json") resolves
+      // to the repo-root package.json (no `version`) once bundled to
+      // server/dist/, which corrupts the persisted checkpoint chain; the helper
+      // reads server/package.json from both src/ and dist/.
+      const pkgVersion = getSanctuaryVersion();
       transparencyScheduler = startTransparencyScheduler({
         intervalMs,
         emit: async () => {

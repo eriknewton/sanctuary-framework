@@ -13,10 +13,63 @@ import {
   parseWrapArgs,
   formatWrapSuccess,
   runWrap,
+  validateDevDist,
+  DevDistInvalidError,
   WRAP_GOVERNOR_DEFAULTS,
   type DashboardStarter,
   type RunWrapDeps,
 } from "../../src/wrap/cli.js";
+
+describe("validateDevDist (Finding 4, 2026-06-25)", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-devdist-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("accepts an existing .js file", async () => {
+    const p = join(dir, "index.js");
+    await writeFile(p, "// built entrypoint\n");
+    await expect(validateDevDist(p)).resolves.toBeUndefined();
+  });
+
+  it("rejects a non-existent path (would fail silently at MCP spawn time)", async () => {
+    const p = join(dir, "does-not-exist.js");
+    await expect(validateDevDist(p)).rejects.toBeInstanceOf(DevDistInvalidError);
+    await expect(validateDevDist(p)).rejects.toThrow(/no such file/);
+  });
+
+  it("rejects a path that does not end in .js", async () => {
+    const p = join(dir, "index.ts");
+    await writeFile(p, "// not a build artifact\n");
+    await expect(validateDevDist(p)).rejects.toThrow(/does not end in '\.js'/);
+  });
+
+  it("rejects a directory masquerading as the entrypoint", async () => {
+    // A directory named like a .js file must not pass (it would spawn-fail).
+    const p = join(dir, "dist.js");
+    await import("node:fs/promises").then((fs) =>
+      fs.mkdir(p, { recursive: true }),
+    );
+    await expect(validateDevDist(p)).rejects.toThrow(/not a regular file/);
+  });
+
+  it("the error message is actionable (names .js + the silent-spawn-failure reason)", async () => {
+    const p = join(dir, "typo.js");
+    let thrown: unknown;
+    try {
+      await validateDevDist(p);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(DevDistInvalidError);
+    const msg = (thrown as Error).message;
+    expect(msg).toContain(".js");
+    expect(msg).toContain("fail silently at spawn time");
+  });
+});
 
 describe("parseWrapArgs", () => {
   it("parses --openclaw flag", () => {
@@ -144,8 +197,12 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
     expect(out).toContain("Sentinels Degraded (no TEE)");
-    expect(out).toContain("Charter Full");
-    expect(out).toContain("Heralds Full");
+    // Honesty (Finding 3, 2026-06-25): Charter/Heralds are "ready" after a
+    // wrap, not the superlative "Full" (reserved for observed/verified state).
+    expect(out).toContain("Charter: ready");
+    expect(out).toContain("Heralds: ready");
+    expect(out).not.toContain("Charter Full");
+    expect(out).not.toContain("Heralds Full");
     // L1-L4 numbering was MANDATORY-retired 2026-05-24; it must not reappear.
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });

@@ -92,17 +92,22 @@ export async function runNodesCommand(args: {
 }
 
 function renderTable(nodes: Array<Record<string, unknown>>): string {
-  if (nodes.length === 0) return "NODE ID  STATUS  LAST SYNC\n";
+  if (nodes.length === 0) return "NODE ID  MODE     TRUST BOUNDARY  STATUS  LAST SYNC\n";
   const rows = nodes.map((node) => {
     const sync = node.last_sync as Record<string, unknown> | undefined;
+    const boundary = node.trust_boundary as Record<string, unknown> | undefined;
     return [
       String(node.node_id ?? ""),
+      String(node.node_mode ?? "unknown"),
+      String(boundary?.label ?? "unknown"),
       String(node.attestation_status ?? "unknown"),
       String(sync?.received_at ?? sync?.sent_at ?? "never"),
     ];
   });
   return [
-    "NODE ID  STATUS    LAST SYNC",
-    ...rows.map(([id, status, last]) => `${id}  ${status}  ${last}`),
+    "NODE ID  MODE     TRUST BOUNDARY  STATUS    LAST SYNC",
+    ...rows.map(([id, mode, boundary, status, last]) =>
+      `${id}  ${mode}  ${boundary}  ${status}  ${last}`
+    ),
   ].join("\n") + "\n";
 }

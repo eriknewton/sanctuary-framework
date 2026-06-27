@@ -1,0 +1,11 @@
+[project]
+name = "sanctuary-memory"
+version = "0.1.0"
+description = "Microsoft Agent Framework ContextProvider backed by Sanctuary SDW memory tools."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

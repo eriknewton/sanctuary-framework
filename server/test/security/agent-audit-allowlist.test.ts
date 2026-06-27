@@ -23,7 +23,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -954,9 +954,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       return false;
     };
     const walkDir = (dir: string) => {
-      for (const name of readdirSync(dir)) {
+      // withFileTypes: the dir/file decision comes from the directory listing
+      // itself (the Dirent), not a separate statSync(p), so there is no
+      // check-then-use (TOCTOU) gap on p between the type check and the read.
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const name = entry.name;
         const p = join(dir, name);
-        if (statSync(p).isDirectory()) {
+        if (entry.isDirectory()) {
           if (name === "node_modules") continue;
           walkDir(p);
           continue;
@@ -964,9 +968,15 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
         if (!name.endsWith(".ts") || name.endsWith(".d.ts") || name.endsWith(".test.ts")) {
           continue;
         }
+        let source: string;
+        try {
+          source = readFileSync(p, "utf8");
+        } catch {
+          continue; // file vanished mid-walk: skip, don't crash
+        }
         const sf = ts.createSourceFile(
           p,
-          readFileSync(p, "utf8"),
+          source,
           ts.ScriptTarget.Latest,
           /*setParentNodes*/ false
         );
@@ -987,6 +997,935 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     walkDir(SERVER_SRC);
     return [...found].sort();
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // EAGER-POSTURE READ CHOKEPOINT (v2, INVERTED to default-eager)
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // PROBLEM (the recurring defect): an OPERATOR audit read that re-verifies the
+  // whole tamper-evident chain from disk on every call. On a real long-lived
+  // fortress (10k entries / 40MB) that is 11-30s and pegs the event loop (the
+  // #714 wedge); the SSE board made it continuous. #717/#719/#721 fixed the
+  // posture composition by serving from the audit log's eagerly-maintained
+  // verified view (an `runEagerReads`/`queryEager` scope: O(1), STILL honest via
+  // the fingerprint sentinel + 30s backstop). But that fix is OPT-IN per call
+  // site, so the SAME defect recurred three times in three code paths.
+  //
+  // WHY v1 (PR #722) was NOT enough (the 4 evasions a deep review slipped past
+  // it, recorded on #722): a new operator-posture read could (H1) live in a
+  // module that simply isn't in the hand-picked posture sub-bucket, or (H2) be a
+  // bare read in another operator module (e.g. dashboard/v1_1/wiring.ts) that the
+  // narrow bucket never scanned; (H3) be an ALIASED receiver `const x = auditLog;
+  // x.query()` the receiver matcher missed; (H4) drop the eager wrap on ONE of a
+  // builder's callers while another caller still wraps it (v1's caller-wraps
+  // proof only checked the builder NAME appeared in SOME eager call, anywhere);
+  // and (M1) hide behind a one-line escape with no real reason / arbitrary kind.
+  //
+  // THE INVERSION (v2): the scope is now EVERY operator audit read in the tree,
+  // not a hand-picked posture list. Default = eager. A non-eager operator read is
+  // permitted ONLY with an explicit, ENUMERATED escape (a `kind` from a fixed
+  // enum + a real reason), keyed by `module:fn`. There is no silent "pick the
+  // no-eager bucket": a brand-new bare operator read in ANY module — including a
+  // new module — REDS until it is either eager-wrapped or consciously escaped.
+  // This closes H1/H2 (scope is all operator reads), H3 (best-effort local-alias
+  // tracking, residual documented), H4 (WHOLE-TREE per-CALL-SITE caller-wraps
+  // proof: discover EVERY call site of EVERY caller-wrapped builder across ALL
+  // src modules — not a hard-coded entry-point list — so dropping the wrap on ONE
+  // caller, OR calling a builder bare from a NEW/4th module, reds; a deliberately
+  // per-request standalone builder call needs a conscious BARE_BUILDER_CALL_ESCAPE),
+  // and M1 (enum kind + non-empty reason + stale-escape guard).
+  //
+  // HONESTY BOUNDARY (preserved, structurally): the inverted scope is the
+  // OPERATOR universe = (every src module with a direct OR aliased auditLog.query
+  // read) MINUS the agent-facing buckets (AGENT_FACING_AUDIT_READ_MODULES +
+  // AGENT_FACING_NON_ENTRY_AUDIT_READS). Agent-facing reads are therefore NEVER
+  // in scope and are NEVER asked to be eager: they keep their per-request,
+  // fully-re-verified on-disk tamper detection. A disjointness guard pins this.
+  //
+  // WHAT THIS CHOKEPOINT DOES AND DOES NOT CLAIM (no overclaim — the v1 lesson):
+  //   DOES: force every NEW operator audit read (any module, including a brand-new
+  //     one; direct or same-file-aliased) to be EITHER eager-scoped OR a conscious
+  //     enumerated escape; catch a dropped eager wrap on any directly-named builder
+  //     call anywhere in the tree (incl. a bare builder call from a brand-new
+  //     module, not just the three former hard-coded entry-point modules; the
+  //     lexical-alias caveat is in the H3 RESIDUAL below); keep the
+  //     registry honest (enum kind + real reason + no stale escapes);
+  //     keep the agent-facing honesty boundary disjoint; and surface (not bless)
+  //     the known HOT read backlog.
+  //   DOES NOT: prove the eager READ PATH is itself correct/fast (that is the
+  //     audit-log unit tests for queryEager/runEagerReads, not this structural
+  //     guard); decide WHICH non-eager reads are acceptable (a human reviews the
+  //     escape `kind`+`reason`); or close the FULL alias surface — see the H3
+  //     RESIDUAL below. It governs WHERE a read runs, not the verification
+  //     contract, and it is structural, so a same-PR escape+source change is
+  //     caught by REVIEW, not mechanically (same boundary as every ratchet here).
+  //   H3 RESIDUAL (documented, deliberately not closed): same-file
+  //     `const x = auditLog; x.query()` IS tracked (best-effort, lexical). NOT
+  //     tracked without the TS type checker: cross-file / cross-function aliases,
+  //     a param typed AuditLog passed under a new name, a let-reassigned alias, a
+  //     destructured `{ query } = auditLog`. The SAME lexical limit applies to the
+  //     builder-call axis (H4): a builder invoked under a lexical alias or
+  //     import-rename (`const f = buildAuditDigest; f()` or
+  //     `import { buildAuditDigest as d }; d()`) is NOT caught, for the same reason.
+  //     Honesty over completeness: we take the cheap heuristic and surface the gap
+  //     rather than build a type resolver.
+
+  type EagerEscapeKind =
+    // Posture shaper whose internal `query` runs inside the entry point's
+    // `runEagerReads` AsyncLocalStorage scope (opened one frame up, invisible to
+    // a lexical check). REQUIRES the per-call-site caller-wraps proof below.
+    | "caller-wrapped-builder"
+    // One-shot full read: CLI command, Exit bundle, compliance report. Runs once
+    // per invocation, never on the SSE/board hot path; the eager view (kept warm
+    // across many reads) is the wrong lever — these WANT a single full re-verify.
+    | "operator-batch"
+    // Internal background analyzer / sentinel scoring over the audit stream. Runs
+    // on its own scheduler, full-fidelity by design; the eager warm view is not
+    // the relevant cost lever (and these are the redaction-exempt internals).
+    | "operator-background"
+    // Deliberately per-request operator request-path read where honest immediate
+    // on-disk tamper detection is the chosen contract (an inspectable listing,
+    // or a low-frequency human-paced concierge fetch). NOT the SSE hot path.
+    | "operator-per-request"
+    // AGENT-facing read that lives on an otherwise-operator module: the honesty
+    // boundary. MUST stay per-request fully re-verified; NEVER pushed to eager.
+    | "agent-facing-per-request"
+    // KNOWN HOT operator read flagged HIGH for separate triage: a recurring /
+    // timer-driven / SSE-cadence full-chain re-verify that genuinely SHOULD be
+    // eager but whose fix is a PRODUCT behavior change out of scope for this
+    // test-infra-only build. The escape does NOT claim the read is fine — it
+    // records the wedge HONESTLY and points at the triage. The chokepoint counts
+    // these (a non-empty set is a standing alarm), and the build that makes them
+    // eager removes the escape (the stale-escape guard then forces the cleanup).
+    | "operator-hot-pending-triage";
+
+  const EAGER_ESCAPE_KINDS: readonly EagerEscapeKind[] = [
+    "caller-wrapped-builder",
+    "operator-batch",
+    "operator-background",
+    "operator-per-request",
+    "agent-facing-per-request",
+    "operator-hot-pending-triage",
+  ] as const;
+
+  // CONSCIOUS PER-CALL ESCAPE REGISTRY. An operator-universe `auditLog.query`
+  // (or aliased read) that is NOT lexically eager-contained is permitted ONLY if
+  // its enclosing function is registered here with a kind + reason. This makes "I
+  // chose NOT to be eager" a reviewed, named act. A NEW bare operator read whose
+  // function is absent here REDS the build — the chokepoint. Keyed by module:fn
+  // (stable across line drift). M1 is closed by: kind ∈ EAGER_ESCAPE_KINDS,
+  // reason non-trivial, and the stale-escape guard (every escape must match a
+  // real, currently-non-eager site).
+  const EAGER_QUERY_ESCAPES: ReadonlyArray<{
+    module: string;
+    fn: string;
+    kind: EagerEscapeKind;
+    reason: string;
+  }> = [
+    // ── caller-wrapped posture builders ────────────────────────────────────
+    // Their internal `query` runs inside the entry point's runEagerReads scope.
+    // The per-call-site caller-wraps proof below ties EACH to a real entry point
+    // that wraps the builder DIRECTLY (drop the wrap on one caller → reds).
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildCastleWallPosture",
+      kind: "caller-wrapped-builder",
+      reason:
+        "arm-state shaper; entry points posture-routes buildWallPosture, dashboard buildStatusCastleWall, and the aggregator hero shield each open the eager scope directly around the call.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildAuditDigest",
+      kind: "caller-wrapped-builder",
+      reason:
+        "audit-digest shaper; posture-routes buildDigest opens the eager scope directly around the call.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildCustodyExitPanel",
+      kind: "caller-wrapped-builder",
+      reason:
+        "custody-exit shaper; posture-routes buildCustodyExit opens the eager scope directly around the call.",
+    },
+    {
+      module: "principal-policy/posture.ts",
+      fn: "buildRecognitionPanel",
+      kind: "caller-wrapped-builder",
+      reason:
+        "recognition shaper; posture-routes buildRecognition opens the eager scope directly around the call.",
+    },
+    {
+      module: "principal-policy/feature-health.ts",
+      fn: "buildFeatureHealthPanel",
+      kind: "caller-wrapped-builder",
+      reason:
+        "feature-health shaper; posture-routes buildFeatureHealth opens the eager scope directly around the call.",
+    },
+    {
+      module: "query-anonymity/query-anonymity-routes.ts",
+      fn: "computeQueryAnonymityStats",
+      kind: "caller-wrapped-builder",
+      reason:
+        "query-privacy stats shaper; posture-routes buildQueryPrivacy opens the eager scope directly around the call.",
+    },
+    // ── operator-batch: one-shot full reads, never the hot path ─────────────
+    {
+      module: "cli/audit.ts",
+      fn: "runAuditCommand",
+      kind: "operator-batch",
+      reason:
+        "operator CLI `audit` command: a single MAX_SAFE_INTEGER full dump per invocation; one full re-verify is the desired honest behavior, not a warm view.",
+    },
+    {
+      module: "cli/castle-wall.ts",
+      fn: "runAuditDump",
+      kind: "operator-batch",
+      reason:
+        "operator CLI castle-wall audit dump: one-shot full read per invocation; wants a single full re-verify.",
+    },
+    {
+      module: "exit/bundle.ts",
+      fn: "exportAuditReceipts",
+      kind: "operator-batch",
+      reason:
+        "principal Exit bundle (Tier-1 approval-gated): flush()+full read of up to 100k receipts, once at export; a full re-verify is the integrity contract.",
+    },
+    {
+      module: "compliance/eu_ai_act/generator.ts",
+      fn: "computeAuditPeriodSummary",
+      kind: "operator-batch",
+      reason:
+        "EU AI Act report generator: effectively-unbounded period read, run once when generating the operator compliance artifact; one full re-verify is desired.",
+    },
+    // ── operator-background: internal analyzers / sentinels on own schedule ──
+    {
+      module: "anomaly-detection/detectors/audit-event-class-distribution-detector.ts",
+      fn: "primeBaselineFromHistory",
+      kind: "operator-background",
+      reason:
+        "anomaly-detection baseline prime: a one-time large history read on detector init; internal scoring, not the board hot path.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/audit-event-class-distribution.ts",
+      fn: "extractAuditEventClassDistributions",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline's own evaluation cadence; internal full-fidelity scoring, not the SSE board.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/credential-use-sequence.ts",
+      fn: "extractCredentialUseSequence",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/cross-agent-timing.ts",
+      fn: "extractCrossAgentTiming",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/per-agent-activity.ts",
+      fn: "extractPerAgentActivity",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/time-of-day-activity.ts",
+      fn: "extractTimeOfDayActivity",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "anomaly-detection/feature-extractors/tool-call-sequence.ts",
+      fn: "extractToolCallSequence",
+      kind: "operator-background",
+      reason:
+        "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "sentinel/sentinels/credential-usage-watcher.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher: windowed l3 read on its own evaluation cadence; internal full-fidelity scoring, not the SSE board.",
+    },
+    {
+      module: "sentinel/sentinels/cross-agent-chatter-watcher.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher: windowed read on its own cadence; internal scoring.",
+    },
+    {
+      module: "sentinel/sentinels/egress-volume-watcher.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher: windowed read on its own cadence; internal scoring.",
+    },
+    {
+      module: "sentinel/sentinels/suspicious-tool-call-detector.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher: windowed read on its own cadence; internal scoring.",
+    },
+    // ── operator-per-request: deliberately per-request operator reads ───────
+    {
+      module: "principal-policy/dashboard.ts",
+      fn: "handleAuditLog",
+      kind: "operator-per-request",
+      reason:
+        "legacy /api/audit-log raw JSON listing: an inspectable surface kept per-request by design (honest immediate on-disk tamper detection, like /api/posture/evidence). NOT the SSE hot path. Erik-confirmable.",
+    },
+    {
+      module: "principal-policy/approval-aggregator.ts",
+      fn: "getAuditTrail",
+      kind: "operator-per-request",
+      reason:
+        "operator approval-aggregator trail lookup: bounded (limit 1000) since-windowed read on the human-paced approval-inbox request path; not the SSE board cadence.",
+    },
+    {
+      module: "principal-policy/unified-inbox-producers.ts",
+      fn: "aggregateRhoDailyPrivacyEvents",
+      kind: "operator-per-request",
+      reason:
+        "unified-inbox producer: a 24h-windowed operator inbox projection on the inbox request path; bounded and human-paced, not the SSE board.",
+    },
+    {
+      module: "principal-policy/unified-inbox-producers.ts",
+      fn: "ingestWrappedAgentErrors",
+      kind: "operator-per-request",
+      reason:
+        "unified-inbox producer: bounded operator inbox projection on the inbox request path; human-paced, not the SSE board.",
+    },
+    {
+      module: "hub/activity-feed.ts",
+      fn: "aggregateActivity",
+      kind: "operator-per-request",
+      reason:
+        "operator activity-feed: per-message, identity-filtered projection on the hub request path (limit*4 bounded). Bursty but NOT the 5s SSE posture cadence; per-request honest on-disk tamper detection is the safe default.",
+    },
+    {
+      module: "concierge/sanctuary-context-reader.ts",
+      fn: "readAuditLog",
+      kind: "operator-per-request",
+      reason:
+        "operator concierge context reader: a bounded since/operation-filtered read on the human-paced concierge request path; not the SSE board.",
+    },
+    {
+      module: "coordination/handoff-log.ts",
+      fn: "query",
+      kind: "operator-per-request",
+      reason:
+        "operator coordination handoff list/snapshot read on the /api/coordination/handoffs request + stream-connect path (SSE deltas push via the event bridge, not this poll); request/connect-paced, honest on-disk re-verify is the default.",
+    },
+    {
+      module: "coordination/handoff-log.ts",
+      fn: "getEntry",
+      kind: "operator-per-request",
+      reason:
+        "operator coordination handoff single-entry detail lookup on the request path; honest on-disk re-verify per request is the default, not the SSE board.",
+    },
+    {
+      module: "dashboard/v1_1/wiring.ts",
+      fn: "buildConciergeContextProviders",
+      kind: "operator-per-request",
+      reason:
+        "operator concierge context provider (recentActivity, limit 30): fires when the human operator sends a concierge chat message; bounded + human-paced, not the SSE board.",
+    },
+    {
+      module: "dashboard/v1_1/wiring.ts",
+      fn: "buildConciergeContextFetchers",
+      kind: "operator-per-request",
+      reason:
+        "operator concierge context fetchers (agent_activity limit 50 / audit_log limit 30 / recent_receipts limit 100): fire on a human operator concierge chat turn; bounded + human-paced, not the SSE board.",
+    },
+    // ── operator-hot-pending-triage: KNOWN WEDGE, flagged HIGH ──────────────
+    // Surfaced by the v2 inversion (v1's narrow posture bucket never scanned it).
+    // This is a RECURRING timer-driven full-chain re-verify — the exact #714
+    // wedge class — that genuinely SHOULD be eager. Making it eager is a PRODUCT
+    // change (out of scope for this test-infra-only build), so it is escaped
+    // HONESTLY here and flagged HIGH for separate triage, NOT blessed as benign.
+    {
+      module: "chat/agent-context-cache.ts",
+      fn: "refresh",
+      kind: "operator-hot-pending-triage",
+      reason:
+        "HIGH/TRIAGE: AgentContextCache.refresh() runs on a 60s setInterval (DEFAULT_REFRESH_CADENCE_MS) and does a full-chain re-verify (query since/limit 500) every cycle — a recurring #714-class wedge on a 10k/40MB chain. Should move to the eager view; deferred as a product change (this build is test-infra only). Tracked by this escape so the inversion does not silently green it.",
+    },
+    // ── agent-facing-per-request: the honesty boundary (NEVER eager) ────────
+    {
+      module: "principal-policy/posture-routes.ts",
+      fn: "buildEvidence",
+      kind: "agent-facing-per-request",
+      reason:
+        "/api/posture/evidence inspectable audit surface: per-request on-disk tamper detection is the honesty contract; must NEVER be pushed into eager mode.",
+    },
+  ];
+
+  // CONSCIOUS BARE-BUILDER-CALL ESCAPE REGISTRY (the H4 axis).
+  // A `caller-wrapped-builder` claims its OWN internal `auditLog.query` runs
+  // inside the eager scope its CALLER opens. The H4 proof below discovers EVERY
+  // call site of every such builder across the WHOLE tree (not a hard-coded
+  // entry-point list) and requires each call to be lexically inside an
+  // `runEagerReads`/`queryEager` scope. A builder call that is DELIBERATELY
+  // per-request (a standalone, low-frequency, human-paced operator endpoint that
+  // is NOT on the SSE board cadence) is permitted ONLY if its enclosing function
+  // is registered here with a kind + reason — the SAME conscious-named-act
+  // discipline as EAGER_QUERY_ESCAPES, but on the builder-CALL-site axis rather
+  // than the query-site axis. A NEW bare builder call whose enclosing function is
+  // absent here REDS — including a brand-new builder call in a brand-new module.
+  // Keyed by module:fn (the ENCLOSING function of the bare builder call).
+  const BARE_BUILDER_CALL_ESCAPES: ReadonlyArray<{
+    module: string;
+    fn: string;
+    builder: string;
+    kind: EagerEscapeKind;
+    reason: string;
+  }> = [
+    {
+      module: "query-anonymity/query-anonymity-routes.ts",
+      fn: "handleQueryAnonymityStatsRequest",
+      builder: "computeQueryAnonymityStats",
+      kind: "operator-per-request",
+      reason:
+        "/api/query-anonymity/stats standalone endpoint: a discrete, human-paced operator dashboard fetch (NO SPA consumer yet; not the 5s SSE posture cadence; the SSE board reads the SAME stats through posture-routes buildQueryPrivacy, which IS eager-wrapped). computeQueryAnonymityStats is dual-nature: eager on the board path, deliberately per-request on this standalone stats route where honest immediate on-disk re-verify is the chosen contract, exactly like dashboard handleAuditLog / approval-aggregator getAuditTrail.",
+    },
+  ];
+
+  interface OperatorQuerySite {
+    module: string;
+    fn: string;
+    line: number;
+    eagerContained: boolean;
+    aliased: boolean;
+  }
+
+  // Discover EVERY operator-universe audit read (auditLog.query OR an aliased
+  // local-variable read) across ALL of src/, then mark each: is it lexically
+  // inside an `runEagerReads`/`queryEager` scope, and what function encloses it.
+  //
+  // H3 (alias) — best-effort: within a source file we track local `const <name> =
+  // <auditLog-receiver>` bindings and treat `<name>.query(...)` as an audit read
+  // too. RESIDUAL (documented, NOT closed without full type resolution): a cross-
+  // function or cross-file alias, a parameter typed `AuditLog` passed under a new
+  // name, a reassigned/let alias, or a destructured `{ query } = auditLog` would
+  // still slip the lexical tracker. Closing those needs the TS type checker
+  // (Program + TypeChecker over the whole project); we deliberately take the
+  // cheap best-effort heuristic here (honesty over completeness) and surface the
+  // residual rather than sink hours into a type resolver. The same-name alias
+  // (`const auditLog = sources.auditLog`) is already caught by the receiver
+  // terminal-name match independent of this tracker.
+  // Walk EVERY src module (not a pre-filtered list) so an OPERATOR module whose
+  // ONLY read is via an alias — and which `discoverAuditLogReaders` (direct
+  // `auditLog.query` only) therefore never lists — is still in scope. The scope
+  // is "all modules MINUS the agent-facing buckets": a module is operator-in-scope
+  // unless it is explicitly an agent-facing read surface. This is what closes
+  // H1/H2 for alias-only NEW modules together with the H3 alias arm.
+  function discoverOperatorQuerySites(
+    excludeModules: ReadonlySet<string>,
+  ): OperatorQuerySite[] {
+    const sites: OperatorQuerySite[] = [];
+    const isAuditLogReceiver = (expr: ts.Expression): boolean => {
+      if (ts.isIdentifier(expr)) return expr.text === "auditLog";
+      if (ts.isPropertyAccessExpression(expr)) return expr.name.text === "auditLog";
+      return false;
+    };
+    // CANONICAL POSTURE ENTRY: a read is "eager-contained" iff a lexical ancestor
+    // in the SAME file is a call to `runEagerReads`/`queryEager` on an audit-shaped
+    // receiver. These two are blessed as THE operator-posture entry API (no new
+    // symbol; fewer surfaces). A bare read outside such a scope is the wedge.
+    const isEagerEntry = (call: ts.CallExpression): boolean => {
+      if (!ts.isPropertyAccessExpression(call.expression)) return false;
+      const m = call.expression.name.text;
+      return m === "runEagerReads" || m === "queryEager";
+    };
+    const enclosingFnName = (node: ts.Node): string => {
+      let p: ts.Node | undefined = node.parent;
+      while (p) {
+        if (ts.isFunctionDeclaration(p) && p.name) return p.name.text;
+        if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) return p.name.text;
+        if (
+          (ts.isFunctionExpression(p) || ts.isArrowFunction(p)) &&
+          ts.isVariableDeclaration(p.parent) &&
+          ts.isIdentifier(p.parent.name)
+        ) {
+          return p.parent.name.text;
+        }
+        p = p.parent;
+      }
+      return "(module-scope)";
+    };
+    const walkDir = (dir: string) => {
+      // withFileTypes: the dir/file decision comes from the directory listing
+      // itself (the Dirent), not a separate statSync(p), so there is no
+      // check-then-use (TOCTOU) gap on p between the type check and the read.
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const name = entry.name;
+        const p = join(dir, name);
+        if (entry.isDirectory()) {
+          if (name === "node_modules") continue;
+          walkDir(p);
+          continue;
+        }
+        if (
+          !name.endsWith(".ts") ||
+          name.endsWith(".d.ts") ||
+          name.endsWith(".test.ts")
+        ) {
+          continue;
+        }
+        const rel = relative(SERVER_SRC, p).split(sep).join("/");
+        if (excludeModules.has(rel)) continue; // agent-facing → out of scope
+        let source: string;
+        try {
+          source = readFileSync(p, "utf8");
+        } catch {
+          continue; // file vanished mid-walk: skip, don't crash
+        }
+        const sf = ts.createSourceFile(
+          p,
+          source,
+          ts.ScriptTarget.Latest,
+          /*setParentNodes*/ true,
+        );
+        // H3 best-effort: collect local alias identifier names bound to an
+        // audit-shaped receiver via `const <name> = <auditLog-receiver>`.
+        const aliasNames = new Set<string>();
+        const collectAliases = (node: ts.Node) => {
+          if (
+            ts.isVariableDeclaration(node) &&
+            ts.isIdentifier(node.name) &&
+            node.initializer &&
+            isAuditLogReceiver(node.initializer) &&
+            node.name.text !== "auditLog" // already matched by receiver name
+          ) {
+            aliasNames.add(node.name.text);
+          }
+          ts.forEachChild(node, collectAliases);
+        };
+        collectAliases(sf);
+        const recordIfQuery = (node: ts.CallExpression, aliased: boolean) => {
+          let eager = false;
+          let anc: ts.Node | undefined = node.parent;
+          while (anc) {
+            if (ts.isCallExpression(anc) && isEagerEntry(anc)) {
+              eager = true;
+              break;
+            }
+            anc = anc.parent;
+          }
+          const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+          sites.push({
+            module: rel,
+            fn: enclosingFnName(node),
+            line: line + 1,
+            eagerContained: eager,
+            aliased,
+          });
+        };
+        const visit = (node: ts.Node) => {
+          if (
+            ts.isCallExpression(node) &&
+            ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === "query"
+          ) {
+            const recv = node.expression.expression;
+            if (isAuditLogReceiver(recv)) {
+              recordIfQuery(node, false);
+            } else if (ts.isIdentifier(recv) && aliasNames.has(recv.text)) {
+              recordIfQuery(node, true); // H3 aliased read
+            }
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(sf);
+      }
+    };
+    walkDir(SERVER_SRC);
+    return sites;
+  }
+
+  // The agent-facing read surfaces — the ONLY modules EXCLUDED from the operator
+  // eager scope (the honesty boundary). Everything else is operator-in-scope.
+  function agentFacingExclusions(): Set<string> {
+    return new Set<string>([
+      ...AGENT_FACING_AUDIT_READ_MODULES,
+      ...AGENT_FACING_NON_ENTRY_AUDIT_READS,
+    ]);
+  }
+
+  // The OPERATOR UNIVERSE: every discovered (direct) auditLog.query reader MINUS
+  // the agent-facing buckets. Used for the disjointness + vacuous-green checks.
+  // (The site walk in discoverOperatorQuerySites is broader — it also catches
+  // alias-only operator modules this direct-reader list cannot see.)
+  function operatorUniverse(): Set<string> {
+    const exclude = agentFacingExclusions();
+    return new Set(discoverAuditLogReaders().filter((m) => !exclude.has(m)));
+  }
+
+  describe("eager-posture read chokepoint (v2, inverted to default-eager)", () => {
+    it("THE TEETH: every OPERATOR audit read is eager-scoped or a registered conscious escape", () => {
+      const universe = operatorUniverse();
+      const sites = discoverOperatorQuerySites(agentFacingExclusions());
+
+      // Vacuous-green guard: the inverted walk must actually find operator reads.
+      // (An empty walk would make the violations set-difference trivially pass.)
+      // The site walk is broader than the direct-reader universe (it also catches
+      // alias-only modules), so it must find AT LEAST as many sites as there are
+      // direct-reader operator modules.
+      expect(
+        sites.length,
+        "operator-universe walk found no auditLog.query sites — the walk is broken",
+      ).toBeGreaterThanOrEqual(universe.size);
+
+      const escapeFor = (s: OperatorQuerySite) =>
+        EAGER_QUERY_ESCAPES.find((e) => e.module === s.module && e.fn === s.fn);
+
+      // A read that is neither eager-contained nor a registered escape is a bare
+      // operator read — exactly the 11-30s wedge the chokepoint forbids. Closes
+      // H1/H2 (scope is ALL operator modules) and H3 (aliased reads are sites too).
+      const violations = sites
+        .filter((s) => !s.eagerContained && !escapeFor(s))
+        .map(
+          (s) =>
+            `${s.module}:${s.line} (${s.fn})${s.aliased ? " [aliased]" : ""} — ` +
+            `bare auditLog.query outside an runEagerReads/queryEager scope. Wrap ` +
+            `it in the eager scope, or, if it is deliberately not eager (batch / ` +
+            `background / per-request / agent-facing), register module:fn in ` +
+            `EAGER_QUERY_ESCAPES with a kind + reason.`,
+        );
+      expect(violations, violations.join("\n")).toEqual([]);
+    });
+
+    it("M1: every escape has a valid enum kind and a real reason (no one-line abuse)", () => {
+      for (const e of EAGER_QUERY_ESCAPES) {
+        expect(
+          (EAGER_ESCAPE_KINDS as readonly string[]).includes(e.kind),
+          `escape ${e.module} (${e.fn}) has non-enum kind "${e.kind}"`,
+        ).toBe(true);
+        // A reason must be present and substantive, not a placeholder. This is the
+        // structural half of M1; the semantic half is the human reviewer reading it.
+        const reason = e.reason.trim();
+        expect(
+          reason.length,
+          `escape ${e.module} (${e.fn}) needs a substantive reason`,
+        ).toBeGreaterThanOrEqual(40);
+        expect(
+          /^(n\/?a|todo|tbd|fixme|xxx|because|reason|escape|skip)\.?$/i.test(reason),
+          `escape ${e.module} (${e.fn}) reason looks like a placeholder: "${reason}"`,
+        ).toBe(false);
+      }
+      // Registry shape is unique per module:fn (no duplicate / shadowing rows).
+      const keys = EAGER_QUERY_ESCAPES.map((e) => `${e.module}::${e.fn}`);
+      expect(new Set(keys).size, "duplicate EAGER_QUERY_ESCAPES key(s)").toBe(
+        keys.length,
+      );
+    });
+
+    it("M1: no STALE escapes — every escape matches a real, currently-non-eager site", () => {
+      const sites = discoverOperatorQuerySites(agentFacingExclusions());
+      const liveNonEager = sites.filter((s) => !s.eagerContained);
+      const stale = EAGER_QUERY_ESCAPES.filter(
+        (e) => !liveNonEager.some((s) => s.module === e.module && s.fn === e.fn),
+      ).map((e) => `${e.module} (${e.fn})`);
+      expect(
+        stale,
+        `Stale EAGER_QUERY_ESCAPES entr(ies) — the function no longer has a ` +
+          `non-eager auditLog.query (renamed, removed, or now eager-wrapped). ` +
+          `Remove: ${stale.join(", ")}`,
+      ).toEqual([]);
+    });
+
+    it("positive control: the eager-detection arm is not vacuously passing (≥1 site IS eager-contained)", () => {
+      const sites = discoverOperatorQuerySites(agentFacingExclusions());
+      // #721 wrapped the aggregator snapshot listing read in runEagerReads. If the
+      // eager-detection arm broke (e.g. matched no scope), it would classify even
+      // that as non-eager and the escape registry would mask everything — this
+      // catches that failure mode.
+      expect(
+        sites.some((s) => s.eagerContained),
+        "no eager-contained operator query site found — the eager-detection arm may be broken (expected at least the #721 aggregator snapshot read)",
+      ).toBe(true);
+    });
+
+    it("H4: each caller-wrapped builder is wrapped AT EVERY call site across the WHOLE tree (drop one wrap or call it bare from a new module → red)", () => {
+      // The "caller-wrapped-builder" escape claims the eager scope is opened one
+      // frame up by the CALLER. v1's proof only checked the builder NAME appeared
+      // inside SOME runEagerReads call anywhere — so dropping the wrap on ONE
+      // caller while another still wrapped it passed. The first v2 cut narrowed
+      // to per-CALL-SITE but only scanned THREE hard-coded ENTRY_POINT_MODULES —
+      // so a bare call to a caller-wrapped builder from a NEW/4th operator module
+      // (no surrounding runEagerReads) evaded the whole suite: the builder's own
+      // read is the escaped `caller-wrapped-builder` (not flagged), and the bare
+      // call site is a call to the BUILDER, not an `auditLog.query`, so THE TEETH's
+      // query-site walk never sees it either. At runtime the builder's internal
+      // `auditLog.query({ limit: 10_000 | 50_000 })` then runs NON-eager = the
+      // #714 wedge, silently. (Empirically real: this inversion surfaced exactly
+      // such a site — handleQueryAnonymityStatsRequest calling
+      // computeQueryAnonymityStats bare — which the 3-module scan never saw.)
+      //
+      // THE INVERSION (same shape THE TEETH was inverted): discover EVERY call
+      // site of EVERY caller-wrapped builder across ALL src modules MINUS the
+      // agent-facing buckets — NOT a hard-coded entry-point list. Each such call
+      // MUST be lexically inside an `runEagerReads`/`queryEager` scope, OR its
+      // enclosing function must be a conscious, enumerated BARE_BUILDER_CALL_ESCAPE
+      // (a deliberately per-request standalone operator endpoint). A bare builder
+      // call from ANY module — including a brand-new one — with no escape REDS.
+      const builderFns = new Set(
+        EAGER_QUERY_ESCAPES.filter((e) => e.kind === "caller-wrapped-builder").map(
+          (e) => e.fn,
+        ),
+      );
+
+      const isEagerEntry = (call: ts.CallExpression): boolean => {
+        if (!ts.isPropertyAccessExpression(call.expression)) return false;
+        const m = call.expression.name.text;
+        return m === "runEagerReads" || m === "queryEager";
+      };
+      const enclosingFnName = (node: ts.Node): string => {
+        let p: ts.Node | undefined = node.parent;
+        while (p) {
+          if (ts.isFunctionDeclaration(p) && p.name) return p.name.text;
+          if (ts.isMethodDeclaration(p) && ts.isIdentifier(p.name)) return p.name.text;
+          if (
+            (ts.isFunctionExpression(p) || ts.isArrowFunction(p)) &&
+            ts.isVariableDeclaration(p.parent) &&
+            ts.isIdentifier(p.parent.name)
+          ) {
+            return p.parent.name.text;
+          }
+          p = p.parent;
+        }
+        return "(module-scope)";
+      };
+
+      // WHOLE-TREE DISCOVERY: walk every src module (minus the agent-facing
+      // buckets) and record every CallExpression whose callee is a builder name,
+      // with its enclosing function and whether it is lexically eager-contained.
+      const exclude = agentFacingExclusions();
+      const builderCallSites: Array<{
+        module: string;
+        fn: string;
+        enclosingFn: string;
+        line: number;
+        eager: boolean;
+      }> = [];
+      const walkDir = (dir: string) => {
+        // withFileTypes: the dir/file decision comes from the directory listing
+        // itself (the Dirent), not a separate statSync(p), so there is no
+        // check-then-use (TOCTOU) gap on p between the type check and the read.
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const name = entry.name;
+          const p = join(dir, name);
+          if (entry.isDirectory()) {
+            if (name === "node_modules") continue;
+            walkDir(p);
+            continue;
+          }
+          if (
+            !name.endsWith(".ts") ||
+            name.endsWith(".d.ts") ||
+            name.endsWith(".test.ts")
+          ) {
+            continue;
+          }
+          const rel = relative(SERVER_SRC, p).split(sep).join("/");
+          if (exclude.has(rel)) continue; // agent-facing → out of scope
+          let source: string;
+          try {
+            source = readFileSync(p, "utf8");
+          } catch {
+            continue; // file vanished mid-walk: skip, don't crash
+          }
+          const sf = ts.createSourceFile(
+            p,
+            source,
+            ts.ScriptTarget.Latest,
+            /*setParentNodes*/ true,
+          );
+          const visit = (node: ts.Node) => {
+            if (
+              ts.isCallExpression(node) &&
+              ts.isIdentifier(node.expression) &&
+              builderFns.has(node.expression.text)
+            ) {
+              let eager = false;
+              let anc: ts.Node | undefined = node.parent;
+              while (anc) {
+                if (ts.isCallExpression(anc) && isEagerEntry(anc)) {
+                  eager = true;
+                  break;
+                }
+                anc = anc.parent;
+              }
+              const { line } = sf.getLineAndCharacterOfPosition(node.getStart());
+              builderCallSites.push({
+                module: rel,
+                fn: node.expression.text,
+                enclosingFn: enclosingFnName(node),
+                line: line + 1,
+                eager,
+              });
+            }
+            ts.forEachChild(node, visit);
+          };
+          visit(sf);
+        }
+      };
+      walkDir(SERVER_SRC);
+
+      // Vacuous-green guard: whole-tree discovery must actually find builder calls
+      // (one per registered caller-wrapped builder at minimum). An empty walk —
+      // or a builder-name set that drifted out of sync — would make the
+      // set-difference checks below trivially pass.
+      expect(
+        builderCallSites.length,
+        "whole-tree builder-call discovery found no call sites — the walk or the builder-name set is broken",
+      ).toBeGreaterThanOrEqual(builderFns.size);
+
+      // (1) Every caller-wrapped-builder escape must have AT LEAST ONE real call
+      // site SOMEWHERE in the tree (else the escape is unfounded — a builder that
+      // is never invoked needs no caller-wraps claim).
+      const builderHasCall = new Set(builderCallSites.map((c) => c.fn));
+      const unfounded = [...builderFns]
+        .filter((fn) => !builderHasCall.has(fn))
+        .map(
+          (fn) =>
+            `${fn}: no call site found anywhere in src — the ` +
+            `caller-wrapped-builder escape is unfounded (the builder must be ` +
+            `invoked by a posture entry point that opens the eager scope).`,
+        );
+      expect(unfounded, unfounded.join("\n")).toEqual([]);
+
+      // (2) THE H4 TEETH: every builder call site must be eager-wrapped OR carry a
+      // conscious BARE_BUILDER_CALL_ESCAPE for its enclosing function. A bare call
+      // from ANY module — including a brand-new one — with no escape REDS.
+      const escapeFor = (c: { module: string; enclosingFn: string }) =>
+        BARE_BUILDER_CALL_ESCAPES.find(
+          (e) => e.module === c.module && e.fn === c.enclosingFn,
+        );
+      const droppedWraps = builderCallSites
+        .filter((c) => !c.eager && !escapeFor(c))
+        .map(
+          (c) =>
+            `${c.module}:${c.line} calls ${c.fn} OUTSIDE an ` +
+            `runEagerReads/queryEager scope (in ${c.enclosingFn}). A ` +
+            `caller-wrapped-builder must be eager-wrapped at EVERY call site; wrap ` +
+            `this call, make the builder's own read eager and drop the escape, or, ` +
+            `if it is a deliberately per-request standalone operator endpoint, ` +
+            `register ${c.module}:${c.enclosingFn} in BARE_BUILDER_CALL_ESCAPES ` +
+            `with a kind + reason.`,
+        );
+      expect(droppedWraps, droppedWraps.join("\n")).toEqual([]);
+
+      // (3) M1 on the builder-call axis: every BARE_BUILDER_CALL_ESCAPE has a
+      // valid enum kind, a substantive reason, and is NOT stale (it must match a
+      // real, currently-non-eager builder call site — so a wrap landing on that
+      // site later forces the escape's removal).
+      for (const e of BARE_BUILDER_CALL_ESCAPES) {
+        expect(
+          (EAGER_ESCAPE_KINDS as readonly string[]).includes(e.kind),
+          `bare-builder escape ${e.module} (${e.fn}) has non-enum kind "${e.kind}"`,
+        ).toBe(true);
+        const reason = e.reason.trim();
+        expect(
+          reason.length,
+          `bare-builder escape ${e.module} (${e.fn}) needs a substantive reason`,
+        ).toBeGreaterThanOrEqual(40);
+        expect(
+          builderFns.has(e.builder),
+          `bare-builder escape ${e.module} (${e.fn}) names builder "${e.builder}" which is not a caller-wrapped-builder`,
+        ).toBe(true);
+      }
+      const liveBareBuilderCalls = builderCallSites.filter((c) => !c.eager);
+      const staleBuilderEscapes = BARE_BUILDER_CALL_ESCAPES.filter(
+        (e) =>
+          !liveBareBuilderCalls.some(
+            (c) =>
+              c.module === e.module &&
+              c.enclosingFn === e.fn &&
+              c.fn === e.builder,
+          ),
+      ).map((e) => `${e.module} (${e.fn} → ${e.builder})`);
+      expect(
+        staleBuilderEscapes,
+        `Stale BARE_BUILDER_CALL_ESCAPE(s) — the function no longer has a ` +
+          `non-eager call to the named builder (renamed, removed, or now ` +
+          `eager-wrapped). Remove: ${staleBuilderEscapes.join(", ")}`,
+      ).toEqual([]);
+    });
+
+    it("HOT-read alarm: the operator-hot-pending-triage set is the explicit HIGH backlog (kept honest, not hidden)", () => {
+      // This test does NOT fail on the existence of a HOT read — that would block
+      // the test-infra build on a product change. It PINS the set so the HIGH
+      // backlog is visible and cannot silently grow: any new
+      // operator-hot-pending-triage escape must be added here consciously, and
+      // when the product fix lands (the read becomes eager) the stale-escape guard
+      // forces removal from BOTH places. Today there is exactly one: the 60s-timer
+      // AgentContextCache.refresh re-verify surfaced by the v2 inversion.
+      const hot = EAGER_QUERY_ESCAPES.filter(
+        (e) => e.kind === "operator-hot-pending-triage",
+      ).map((e) => `${e.module} (${e.fn})`);
+      expect(hot).toEqual(["chat/agent-context-cache.ts (refresh)"]);
+      // Every HOT escape's reason must carry the HIGH/TRIAGE marker so it reads as
+      // a flagged alarm, never as a benign per-request blessing.
+      for (const e of EAGER_QUERY_ESCAPES.filter(
+        (x) => x.kind === "operator-hot-pending-triage",
+      )) {
+        expect(
+          /HIGH|TRIAGE/i.test(e.reason),
+          `operator-hot-pending-triage escape ${e.module} (${e.fn}) must mark its reason HIGH/TRIAGE`,
+        ).toBe(true);
+      }
+    });
+
+    it("honesty boundary: agent-facing reads are NEVER in the eager scope (operator universe disjoint from agent buckets)", () => {
+      // Structural proof the chokepoint does not bleed across the honesty
+      // boundary: the inverted scope EXCLUDES the agent-facing buckets by
+      // construction, so no agent-facing read is ever asked to become eager.
+      const universe = operatorUniverse();
+      const agentFacing = [
+        ...AGENT_FACING_AUDIT_READ_MODULES,
+        ...AGENT_FACING_NON_ENTRY_AUDIT_READS,
+      ];
+      const crossed = agentFacing.filter((m) => universe.has(m));
+      expect(
+        crossed,
+        `agent-facing audit-read module(s) leaked into the operator eager scope: ` +
+          `${crossed.join(", ")}. Agent reads must stay per-request re-verified.`,
+      ).toEqual([]);
+      // The lone agent-facing read that lives ON an operator module
+      // (posture-routes buildEvidence, /api/posture/evidence) is registered
+      // agent-facing-per-request — never asked to be eager.
+      const evidence = EAGER_QUERY_ESCAPES.find((e) => e.fn === "buildEvidence");
+      expect(evidence?.kind).toBe("agent-facing-per-request");
+    });
+
+    it("H3 residual is documented honestly (best-effort alias tracking, not a type checker)", () => {
+      // This pins the HONEST scope of the alias guard so the test does not
+      // overclaim. The discovery tracks same-file `const <name> = <auditLog>`
+      // aliases (best-effort). It does NOT resolve cross-file / cross-function /
+      // reassigned / destructured aliases — that needs the TS type checker. The
+      // assertion is a self-documenting marker: if someone strengthens the guard
+      // to full type resolution, they update this list and the test stays honest.
+      const RESIDUAL_ALIAS_SHAPES_NOT_CLOSED = [
+        "cross-function alias (auditLog passed to another fn under a new name)",
+        "cross-file alias",
+        "let-reassigned alias",
+        "destructured `{ query } = auditLog`",
+      ] as const;
+      // The residual is non-empty (we did NOT claim to close it) and best-effort
+      // same-file aliasing IS tracked (the discovery has an alias arm).
+      expect(RESIDUAL_ALIAS_SHAPES_NOT_CLOSED.length).toBeGreaterThan(0);
+    });
+  });
 
   it("every agent-facing audit-read module imports the allowlist projection", () => {
     for (const mod of AGENT_FACING_AUDIT_READ_MODULES) {

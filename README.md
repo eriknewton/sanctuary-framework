@@ -4,19 +4,21 @@
 [![npm version](https://img.shields.io/npm/v/@sanctuary-framework/mcp-server.svg)](https://www.npmjs.com/package/@sanctuary-framework/mcp-server)
 [![License](https://img.shields.io/npm/l/@sanctuary-framework/mcp-server.svg)](LICENSE)
 
-**Your Agent. Your Machine. Your Keys.**
+**The firewall and control panel for your AI agents.**
 
-Sanctuary wraps any AI agent harness in a substrate that protects you at the kernel, signs every action with keys you hold, and keeps the data and reputation your agents accumulate on your hardware. Whether you run one agent or a fleet, the substrate stays yours.
+Sanctuary wraps any AI agent, on your machine or in your cloud, so every action it takes is blocked at the network layer if you did not allow it, signed with keys only you hold, and logged to an audit trail you can actually read. One dashboard manages the security and privacy of every agent you run, whether that is one agent on your laptop or a whole fleet across your machines. Your data, and the reputation your agents build, stay on hardware you control, and you can pick them up and leave whenever you want. No lock-in.
 
-Sovereignty used to be embodied. In the physical world, your body provided the perimeter, the custody, the memory, and the audit trail by default. When you act through an AI agent, the substrate around the agent has to do that job, and almost always doesn't. Sanctuary is what does. The same architecture serves any sovereign acting through agents: a person, a company, eventually an agent itself.
-
-Today: cryptographic identity you hold, kernel-level enforcement that holds even when the agent doesn't cooperate (Linux proven; macOS in flight), and a portable audit trail that travels across machines and vendors. In scope: the Sovereign Data Warehouse (your working data, query history, and document corpus on your substrate, not a vendor's silo) and federation across your own machines.
-
-Already running OpenClaw, Hermes, Claude Code, Cursor, Cline, or Mastra?
+Already running Claude Code, Cursor, Hermes, OpenClaw, Cline, or Mastra?
 
 ```bash
-npx @sanctuary-framework/mcp-server protect --openclaw
+npx @sanctuary-framework/mcp-server protect --claude-code
 ```
+
+That one command puts the wall, the keys, the audit trail, and the dashboard around the agent you already use. You keep your harness; Sanctuary adds the protection underneath.
+
+**Under the hood:** a kernel-level wall that holds even when a prompt-injected agent tries to misbehave (Linux today, macOS in progress), cryptographic identity and encrypted state the platform running your agent cannot read, and full data portability so you are never trapped in one vendor. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
+
+Why this exists: [What Sovereign Actually Means](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html).
 
 ---
 
@@ -280,10 +282,10 @@ Sanctuary is designed to run the same rights substrate in three places. Local mo
 | Mode | Status | What it is | Who picks this |
 |---|---|---|---|
 | **On your machines** (Local) | Shipping | Runs on the Macs, Linux boxes, or Windows machines you already own. Nothing leaves your house unless you tell it to. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
-| **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account. Same code, same keys, on rented hardware you control. | Prosumers, small businesses, operators with light IT but no rack at home. |
+| **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account with operator-approved scoped node custody. The provider is inside the node runtime trust boundary until sovereign TEE mode is verified by hardware attestation. | Prosumers, small businesses, operators with light IT but no rack at home. |
 | **In a sealed cloud box we manage** (Sovereign-managed TEE) | Roadmapped (v2) | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
-The operator holds the keys in every mode. The sovereign-managed mode will require hardware attestation before it is treated as shipped.
+The operator remains the custody root in every mode. Commodity operator-cloud mode does not put the cloud provider outside the runtime trust boundary; sovereign-managed mode requires hardware attestation before it is treated as shipped.
 
 ---
 

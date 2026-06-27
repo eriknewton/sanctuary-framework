@@ -116,6 +116,18 @@ export function createBridgeCommitment(
   const commitmentId = `bridge-${Date.now()}-${toBase64url(randomBytes(8))}`;
   const now = new Date().toISOString();
 
+  // 0. Recompute terms_hash and fail closed on mismatch.
+  //    The signature below binds terms_hash, so the committer must not be able
+  //    to sign a hash that is a lie about the terms. This is the SAME recompute
+  //    verifyBridgeCommitment performs (terms_hash_match); moving it earlier so
+  //    the signature only ever binds a true terms_hash, rather than catching the
+  //    lie later at verify/attest time. Generic error: nothing is persisted or
+  //    signed.
+  const computedTermsHash = toBase64url(hash(stringToBytes(stableStringify(outcome.terms))));
+  if (computedTermsHash !== outcome.terms_hash) {
+    throw new Error("terms_hash does not match the canonical terms serialization");
+  }
+
   // 1. Canonical serialization of the outcome
   const canonicalBytes = canonicalize(outcome);
   const canonicalString = new TextDecoder().decode(canonicalBytes);

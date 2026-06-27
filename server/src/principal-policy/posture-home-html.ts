@@ -245,6 +245,23 @@ export function renderPostureHomeHTML(): string {
     <div class="grid" id="agents"><span class="empty">Loading…</span></div>
   </section>
 
+  <!--
+    Fleet (Fleet Console Slice 1). Hidden by default and only revealed when this
+    fortress has federation provisioned (the /api/posture/fleet endpoint returns
+    200 with available:true). A 404 (federation not wired) or available:false
+    (not provisioned) keeps this section display:none so the panel is ABSENT,
+    never a greyed shell or a fabricated "all admitted" roster over a fortress
+    with no fleet. SEE / MONITOR only, no trust actions here (a later slice adds
+    in-console admit/revoke).
+  -->
+  <section id="fleet-section" style="display:none">
+    <div class="section-head">
+      <h2>Fleet</h2>
+      <span class="sub" id="fleet-summary"></span>
+    </div>
+    <div class="panel" id="fleet"><span class="empty">Loading…</span></div>
+  </section>
+
   <section>
     <h2>Approvals waiting</h2>
     <div class="panel" id="approvals"><span class="empty">Loading…</span></div>
@@ -508,6 +525,10 @@ export function renderPostureHomeHTML(): string {
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
           : "No activity in the window.";
+      case "floor_met":
+        return "Activity met the minimum volume you declared for this feature.";
+      case "below_expected_floor":
+        return "Below the minimum volume you declared for this feature. This is your stated expectation being quiet, not a detected fault.";
       case "integrity_tainted":
         return "Audit integrity finding present; status cannot be trusted.";
       case "freshness_scan_incomplete":
@@ -732,6 +753,47 @@ export function renderPostureHomeHTML(): string {
     });
   }
   function loadRecognitionOnce() { loadRecognition(0); }
+
+  // ── Fleet roster (Fleet Console Slice 1) ────────────────────────────────
+  // A separate, federation-gated fetch (NOT on the home payload, so a fortress
+  // with no federation never receives any roster data). A 200 with
+  // available:true reveals the panel; a 404 (federation not wired) or
+  // available:false (not provisioned) keeps it hidden (honest absence), never a
+  // fabricated roster. Unlike Recognition, the fleet is RE-POLLED on a cadence so
+  // a revocation (a machine going from admitted -> revoked, or an unevaluable
+  // machine flipping to untrusted) shows up live on the board without a reload.
+  var FLEET_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+  var FLEET_REFRESH_MS = 15000;
+  var fleetRefreshTimer = null;
+  function scheduleFleetRefresh() {
+    if (fleetRefreshTimer !== null) return;
+    fleetRefreshTimer = setInterval(function () { loadFleet(0); }, FLEET_REFRESH_MS);
+  }
+  function loadFleet(attempt) {
+    var section = document.getElementById("fleet-section");
+    if (!section) return;
+    api("/api/posture/fleet").then(function (roster) {
+      renderFleet(roster);
+      // Once we have ANY successful read, keep the panel current on a cadence so
+      // trust changes (revoke / unevaluable) flip the board live. renderFleet
+      // hides the section honestly when available:false, so a provisioned-then-
+      // disabled fortress is handled by the renderer, not a stop here.
+      scheduleFleetRefresh();
+    }).catch(function (err) {
+      // A 404 is a definitive "federation not wired on this dashboard" absence:
+      // stop and leave the panel hidden. Anything else (503 locked, transient
+      // network) is retryable so the panel appears once the fortress unlocks.
+      var msg = err && err.message ? String(err.message) : "";
+      if (/-> 404$/.test(msg)) { section.style.display = "none"; return; }
+      var i = attempt || 0;
+      if (i >= FLEET_RETRY_MS.length) {
+        setTimeout(function () { loadFleet(i); }, FLEET_RETRY_MS[FLEET_RETRY_MS.length - 1]);
+        return;
+      }
+      setTimeout(function () { loadFleet(i + 1); }, FLEET_RETRY_MS[i]);
+    });
+  }
+  function loadFleetOnce() { loadFleet(0); }
 
   // "Never fake green" for the Query-privacy section. Mirrors the canonical pure
   // mapper exported from this module (queryPrivacyPill). GREEN is earned ONLY by
@@ -1052,6 +1114,91 @@ export function renderPostureHomeHTML(): string {
     }).join("");
   }
 
+  // "Never fake green" for the fleet roster. GREEN (admitted) is earned ONLY by
+  // the federation layer's own revocation verdict returning "not revoked" for a
+  // node it could EVALUATE. A revoked node is red; an UNEVALUABLE node (the
+  // fail-closed case) is also red ("untrusted"), NEVER amber and never green:
+  // the same fail-closed model the sync chokepoint applies. The server already
+  // computed this verdict via isNodeRevoked; the page only colors it.
+  function fleetTrustPill(state) {
+    if (state === "admitted") return '<span class="pill green">ADMITTED</span>';
+    if (state === "revoked") return '<span class="pill red">REVOKED</span>';
+    // untrusted == unevaluable revocation state, fail-closed. Red, not amber.
+    return '<span class="pill red">UNTRUSTED</span>';
+  }
+
+  // Reach is liveness telemetry, NOT a trust signal, so it uses a SEPARATE,
+  // muted vocabulary and never a green/red trust pill: a node's reach can never
+  // launder it into looking trusted. "recent" is informational, not "all well."
+  function fleetReachLabel(reach) {
+    if (reach === "recent") return '<span class="pill" style="background:#1c2330">reachable</span>';
+    if (reach === "stale") return '<span class="pill amber">no recent sync</span>';
+    return '<span class="pill amber">never synced</span>';
+  }
+
+  function fleetTrustWhy(node) {
+    if (node.trust_state === "admitted") {
+      return "Admitted to the fleet. The federation layer confirms this machine is not revoked.";
+    }
+    if (node.trust_state === "revoked") {
+      return "Revoked by you. This machine is locked out across the fleet.";
+    }
+    // untrusted: distinguish the fail-closed unevaluable case in plain English.
+    return node.trust_evaluable === false
+      ? "Trust could not be evaluated for this machine right now, so it is shown UNTRUSTED by design (fail-closed), not assumed safe."
+      : "This machine is not in good standing and is shown untrusted.";
+  }
+
+  function renderFleet(roster) {
+    var section = document.getElementById("fleet-section");
+    var el = document.getElementById("fleet");
+    var summaryEl = document.getElementById("fleet-summary");
+    if (!section || !el) return;
+    // Honest absence: a fortress with no federation provisioned has no fleet to
+    // present. Keep the section hidden rather than render an empty green shell.
+    if (!roster || roster.available !== true) {
+      section.style.display = "none";
+      return;
+    }
+    section.style.display = "";
+    var s = roster.summary || { total: 0, admitted: 0, revoked: 0, untrusted: 0 };
+    if (summaryEl) {
+      var parts = [esc(s.total) + " machine" + (s.total === 1 ? "" : "s")];
+      if (s.admitted) parts.push(esc(s.admitted) + " admitted");
+      if (s.revoked) parts.push(esc(s.revoked) + " revoked");
+      if (s.untrusted) parts.push(esc(s.untrusted) + " untrusted");
+      summaryEl.textContent = parts.join(" · ");
+    }
+    var head =
+      '<div class="evidence">Fleet ' + (roster.enabled ? "on" : "off") +
+      " · this machine <code>" + esc(roster.node_id) + "</code>" +
+      " · fortress <code>" + esc(roster.fortress_id) + "</code>" +
+      " · eviction serial " + esc(roster.eviction_serial) + "</div>";
+    var nodes = roster.nodes || [];
+    if (!nodes.length) {
+      el.innerHTML = head +
+        '<div class="empty">No other machines admitted to this fleet yet.</div>';
+      return;
+    }
+    var rows = nodes.map(function (n) {
+      var modeNote = n.provider_in_trust_boundary
+        ? ' · <span class="why">provider in trust boundary</span>'
+        : "";
+      return '<div class="story-line">' +
+        fleetTrustPill(n.trust_state) + " &nbsp;" +
+        "<code>" + esc(n.node_id) + "</code>" +
+        (n.label ? " (" + esc(n.label) + ")" : "") +
+        " &nbsp;" + fleetReachLabel(n.reach) +
+        '<div class="evidence">' + esc(fleetTrustWhy(n)) +
+        " · mode " + esc(n.node_mode) + modeNote +
+        (n.last_sync_received_at
+          ? " · last sync " + esc(n.last_sync_received_at)
+          : " · no sync received") +
+        "</div></div>";
+    }).join("");
+    el.innerHTML = head + rows;
+  }
+
   function renderWall(w) {
     var el = document.getElementById("wall");
     var meaning = w.arm_state === "armed"
@@ -1305,6 +1452,10 @@ export function renderPostureHomeHTML(): string {
   // NOT on the home payload, so an off-fortress never receives any of its data).
   // Loaded once at boot: the gate flag is config and stable within a session.
   loadRecognitionOnce();
+  // Fleet roster (Fleet Console Slice 1) is a separate, federation-gated fetch
+  // (also NOT on the home payload). Loaded at boot; it self-schedules a refresh
+  // cadence on first success so revocations flip the board live.
+  loadFleetOnce();
 })();
 </script>
 </body>

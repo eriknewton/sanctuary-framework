@@ -59,19 +59,40 @@ import {
   PII_REWRITE_API_PREFIX,
   handlePiiRewriteRoute,
   emitPiiRewriteAudit,
+  effectiveTierBEnabled,
+  TIER_B_INACTIVE_REASON,
 } from "../../src/query-anonymity/pii-rewrite-routes.js";
 
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
 const IDENTITY = "identity_test";
 
-function makeRig(opts?: { fortressId?: string }) {
+function makeRig(opts?: { fortressId?: string; now?: () => Date }) {
   const fortressId = opts?.fortressId ?? FORTRESS_A;
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
-  const store = new PiiConfigStore({ storage, masterKey, fortressId });
+  const store = new PiiConfigStore({
+    storage,
+    masterKey,
+    fortressId,
+    now: opts?.now,
+  });
   return { storage, masterKey, auditLog, store, fortressId };
+}
+
+/**
+ * A `now` provider whose every call returns a STRICTLY-INCREASING
+ * timestamp, guaranteeing the two independent samples inside
+ * `patch()` (`updated_at` then `consented_at`) differ. This is the
+ * exact condition that broke the old timestamp-equality heuristic:
+ * with mismatched timestamps the legacy
+ * `consented_at === updated_at` comparison is false and the consent
+ * audit event was silently dropped.
+ */
+function strictlyIncreasingNow(startMs = Date.UTC(2026, 0, 1)): () => Date {
+  let tick = startMs;
+  return () => new Date((tick += 1000));
 }
 
 /**
@@ -245,10 +266,7 @@ describe("Rho-2 LLM-assist on residuals", () => {
   });
 });
 
-// retry:2 - the consent-audit emission races under full-suite parallel load
-// (passes 26/26 in isolation); retry re-runs, so a genuine regression still
-// fails all attempts (not a regression-masking skip).
-describe("Rho-2 PiiConfigStore lifecycle", { retry: 2 }, () => {
+describe("Rho-2 PiiConfigStore lifecycle", () => {
   it("default config is off + no consent; returned on first read", async () => {
     const { store } = makeRig();
     const config = await store.get();
@@ -265,7 +283,7 @@ describe("Rho-2 PiiConfigStore lifecycle", { retry: 2 }, () => {
 
   it("patches consent + enable together; stamps consented_at + last_toggled_at", async () => {
     const { store } = makeRig();
-    const result = await store.patch({
+    const { config: result, consentJustRecorded } = await store.patch({
       enabled: true,
       consented_to_trade_off: true,
     });
@@ -273,22 +291,62 @@ describe("Rho-2 PiiConfigStore lifecycle", { retry: 2 }, () => {
     expect(result.consented_to_trade_off).toBe(true);
     expect(result.consented_at).toBeDefined();
     expect(result.last_toggled_at).toBeDefined();
+    // The false->true consent flip is signalled explicitly.
+    expect(consentJustRecorded).toBe(true);
   });
 
   it("consented_at is stamped once and never overwritten on re-toggle", async () => {
     const { store } = makeRig();
-    const first = await store.patch({
+    const { config: first } = await store.patch({
       enabled: true,
       consented_to_trade_off: true,
     });
     const consentedAt = first.consented_at!;
     // Wait a tick so timestamps would differ if overwritten.
     await new Promise((resolve) => setTimeout(resolve, 5));
-    const toggled = await store.patch({ enabled: false });
+    const { config: toggled } = await store.patch({ enabled: false });
     expect(toggled.consented_at).toBe(consentedAt);
     await new Promise((resolve) => setTimeout(resolve, 5));
-    const reenabled = await store.patch({ enabled: true });
+    const { config: reenabled } = await store.patch({ enabled: true });
     expect(reenabled.consented_at).toBe(consentedAt);
+  });
+
+  it("consentJustRecorded fires on exactly the false->true transition only", async () => {
+    const { store } = makeRig();
+    // First consent: false -> true => signal true.
+    const first = await store.patch({ consented_to_trade_off: true });
+    expect(first.consentJustRecorded).toBe(true);
+    // No-op re-PATCH with consent already true => signal false.
+    const reaffirm = await store.patch({ consented_to_trade_off: true });
+    expect(reaffirm.consentJustRecorded).toBe(false);
+    // Non-consent patch (toggle a different field) => signal false.
+    const otherField = await store.patch({ enabled: true });
+    expect(otherField.consentJustRecorded).toBe(false);
+  });
+
+  it("consentJustRecorded is false on revocation and on non-consent patches", async () => {
+    const { store } = makeRig();
+    await store.patch({ consented_to_trade_off: true });
+    // Revocation true -> false => not a recording event.
+    const revoked = await store.patch({ consented_to_trade_off: false });
+    expect(revoked.consentJustRecorded).toBe(false);
+    expect(revoked.config.consented_to_trade_off).toBe(false);
+    // A patch that never mentions consent => signal false.
+    const noConsentField = await store.patch({ smart_mode_enabled: false });
+    expect(noConsentField.consentJustRecorded).toBe(false);
+  });
+
+  it("consentJustRecorded stays deterministic when wall-clock samples differ", async () => {
+    // strictlyIncreasingNow guarantees updated_at != consented_at,
+    // the exact condition that defeated the old timestamp-equality
+    // heuristic. The explicit signal must still report the transition.
+    const { store } = makeRig({ now: strictlyIncreasingNow() });
+    const result = await store.patch({ consented_to_trade_off: true });
+    expect(result.consentJustRecorded).toBe(true);
+    expect(result.config.consented_at).toBeDefined();
+    // Sanity: the two samples really did diverge (would have broken
+    // the legacy comparison).
+    expect(result.config.consented_at).not.toBe(result.config.updated_at);
   });
 
   it("shouldRewrite honors per-query override (true/false/undefined)", async () => {
@@ -431,6 +489,91 @@ describe("Rho-2 HTTP routes", () => {
     }
   });
 
+  it("emits CONSENT_RECORDED even when the two wall-clock samples differ (audit-completeness race fix)", async () => {
+    // Make-or-break: inject a now() that returns DIFFERENT timestamps
+    // for the two samples in patch() (updated_at then consented_at).
+    // Under the old `consented_at === updated_at` heuristic this
+    // mismatch silently dropped the consent audit event. The explicit
+    // transition signal must emit it deterministically.
+    const rig = makeRig({ now: strictlyIncreasingNow() });
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          consented_to_trade_off: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const ops = audit.entries.map((e) => e.operation);
+      // The whole point: the consent event fires despite mismatched
+      // timestamps.
+      expect(ops).toContain(PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED);
+      expect(ops).toContain(PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED);
+      // Consent is durably recorded (no regression).
+      const config = await rig.store.get();
+      expect(config?.consented_at).toBeDefined();
+      expect(config?.consented_to_trade_off).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("does NOT re-emit CONSENT_RECORDED on a no-op re-PATCH where consent was already true", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      // First flip records consent.
+      await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ consented_to_trade_off: true }),
+      });
+      // Second PATCH re-affirms consent (already true) + toggles a
+      // different field; must NOT produce a second consent event.
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          consented_to_trade_off: true,
+          enabled: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const consentEvents = audit.entries.filter(
+        (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED,
+      );
+      expect(consentEvents.length).toBe(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("does NOT emit CONSENT_RECORDED on a non-consent-field patch", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      // smart_mode_enabled=false patch with no consent => 200, no
+      // consent event.
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ smart_mode_enabled: false }),
+      });
+      expect(res.status).toBe(200);
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const ops = audit.entries.map((e) => e.operation);
+      expect(ops).not.toContain(PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED);
+      expect(ops).toContain(PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED);
+    } finally {
+      await close();
+    }
+  });
+
   it("GET /api/query-anonymity/pii/trade-off returns the explainer text", async () => {
     const rig = makeRig();
     const { base, close } = await makeServer(rig);
@@ -441,6 +584,89 @@ describe("Rho-2 HTTP routes", () => {
       expect(body.data.explainer).toBe(PII_TRADE_OFF_EXPLAINER);
       expect(body.data.explainer).toContain("Tier B PII rewrite");
       expect(body.data.explainer).toContain("OFF by default");
+    } finally {
+      await close();
+    }
+  });
+
+  it("GET config surfaces the true (inactive) effective Tier B state", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: {
+          effective_tier_b_enabled: boolean;
+          inactive_reason: string | null;
+        };
+      };
+      expect(body.data.effective_tier_b_enabled).toBe(false);
+      expect(body.data.inactive_reason).toBe(TIER_B_INACTIVE_REASON);
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH config does NOT report effective_tier_b_enabled=true while inactive (response body)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          consented_to_trade_off: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: {
+          config: { enabled: boolean };
+          effective_tier_b_enabled: boolean;
+          inactive_reason: string | null;
+        };
+      };
+      // The operator's preference is persisted...
+      expect(body.data.config.enabled).toBe(true);
+      // ...but the surface must NOT claim the protection is active.
+      expect(body.data.effective_tier_b_enabled).toBe(false);
+      expect(body.data.inactive_reason).toBe(TIER_B_INACTIVE_REASON);
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH config audit event reports the true (inactive) effective state, not the inert toggle", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          smart_mode_enabled: true,
+          consented_to_trade_off: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const updated = audit.entries.find(
+        (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED,
+      );
+      expect(updated).toBeDefined();
+      // Stored preference is recorded honestly...
+      expect(updated?.details?.["enabled"]).toBe(true);
+      expect(updated?.details?.["smart_mode_enabled"]).toBe(true);
+      // ...but the EFFECTIVE state is false (no redactor wired), and the
+      // reason is recorded. The old code emitted
+      // `enabled || smart_mode_enabled` (would be true) here.
+      expect(updated?.details?.["effective_tier_b_enabled"]).toBe(false);
+      expect(updated?.details?.["inactive_reason"]).toBe(
+        TIER_B_INACTIVE_REASON,
+      );
     } finally {
       await close();
     }
@@ -503,6 +729,34 @@ describe("Rho-2 audit emission helper", () => {
     expect(
       (entry?.details?.["redaction_counts"] as Record<string, number>).email,
     ).toBe(1);
+  });
+});
+
+describe("Rho-2 Tier B honesty (never-overclaim)", () => {
+  it("explainer carries a not-yet-active notice", () => {
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("not yet active");
+  });
+
+  it("explainer no longer asserts an active 'never crosses the outbound boundary' protection", () => {
+    // The present-tense overclaim ("Your original text never crosses
+    // the outbound boundary") must be gone; any boundary language must
+    // be future-tense/conditional. Guard against the exact prior copy.
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
+      "Your original text never crosses the outbound boundary",
+    );
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain("never crosses");
+  });
+
+  it("explainer describes the protection in the future tense, not as currently-on", () => {
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("once active");
+    // No present-tense active-protection claim at the top.
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
+      "scrubs personal information from your queries\nbefore they reach",
+    );
+  });
+
+  it("effectiveTierBEnabled() is false until the redactor is wired", () => {
+    expect(effectiveTierBEnabled()).toBe(false);
   });
 });
 

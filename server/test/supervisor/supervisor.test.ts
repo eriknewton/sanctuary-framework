@@ -149,6 +149,39 @@ describe("Supervisor.protect", () => {
     expect([...k2]).toEqual([0, 0, 0, 0]);
   });
 
+  it("a CONCURRENT duplicate does NOT get a false success when the sole launch FAILS (codex S1 R7-H1)", async () => {
+    // The duplicate must coalesce onto the in-flight launch and inherit its REAL
+    // outcome — not return a premature `already-protected` off the synchronously
+    // -set base==="protecting" entry. If the winner's launch fails, the
+    // duplicate must ALSO fail, never report a false success.
+    const launcher = new MockLauncher();
+    let failLaunch!: () => void;
+    const gate = new Promise<void>((_resolve, reject) => {
+      failLaunch = () => reject(new Error("launch failed"));
+    });
+    launcher.launch = async (_spec) => {
+      launcher.launchCount++;
+      await gate; // hangs until the test fails it
+      throw new Error("unreachable");
+    };
+    const { sup } = makeSupervisor({ launcher });
+    const k1 = makeKey(1);
+    const k2 = makeKey(2);
+    const p1 = sup.protect({ agent_id: "a1", harness: "claude_code", config_path: "/c", transientKey: k1 });
+    const p2 = sup.protect({ agent_id: "a1", harness: "claude_code", config_path: "/c", transientKey: k2 });
+    await Promise.resolve();
+    failLaunch();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(launcher.launchCount).toBe(1); // exactly one launch attempt
+    // BOTH calls must report the failure — no false success for the duplicate.
+    expect(r1.ok).toBe(false);
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toBe("unavailable");
+    // The duplicate's key was zeroed; the entry is dropped (no key resident).
+    expect([...k2]).toEqual([0, 0, 0, 0]);
+    expect(sup.status("a1")).toEqual([]);
+  });
+
   it("does NOT keep the key resident when refused for rotation (codex H4/M3)", async () => {
     const { sup } = makeSupervisor({ rotation: true });
     const key = makeKey(5);

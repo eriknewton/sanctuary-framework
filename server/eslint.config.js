@@ -35,4 +35,29 @@ export default tseslint.config(
       "preserve-caught-error": "warn",
     },
   },
+  {
+    // Plain JS/MJS/CJS files under src/ are Node-runtime scripts (the
+    // first-party reference plugin and build helpers), not part of the
+    // TypeScript project. They run under Node, so declare the Node runtime
+    // globals they rely on; otherwise `no-undef` (from js.configs.recommended)
+    // false-positives on `process`, `Buffer`, etc.
+    files: ["src/**/*.{js,mjs,cjs}"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: {
+        process: "readonly",
+        Buffer: "readonly",
+        console: "readonly",
+        globalThis: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        URL: "readonly",
+        TextEncoder: "readonly",
+        TextDecoder: "readonly",
+      },
+    },
+  },
 );

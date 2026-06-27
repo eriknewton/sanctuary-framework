@@ -344,6 +344,46 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     infos: ["l2-anomaly-classifier-state-v1"],
   },
   _bridge: { kind: "purpose-encrypted", infos: ["bridge-commitments"] },
+  _federation: {
+    kind: "purpose-encrypted",
+    infos: [
+      "federation-trust-root",
+      "federation-joiner-trust-root",
+      // Durable single-use replay sets persisted under _federation by the
+      // standalone nonce store and the operator-cloud claim store. Both blobs
+      // are derivePurposeKey(master, <label>) with NO AAD (like the trust-root
+      // store), so the no-AAD candidate re-wraps them. Without these labels a
+      // fortress that consumed a federation nonce/claim would strand its replay
+      // set and rotateMaster would abort (RotationPreflightError). The strings
+      // MUST equal BOOTSTRAP_NONCE_STORE_HKDF_INFO and
+      // OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO (asserted in master-rotation.test).
+      "federation-bootstrap-nonce-spent-set",
+      "federation-operator-cloud-provision-claim-set",
+      // Durable peer-sync security state (Federation 3/3b P0): per-sender
+      // accepted high-water + outbound high-water + folded revocation
+      // projection, persisted under _federation by the sync-state store. Same
+      // no-AAD derivePurposeKey blob, so the no-AAD candidate re-wraps it.
+      // Without this label a fortress that ever persisted sync-state would
+      // strand it and rotateMaster would abort. MUST equal
+      // FEDERATION_SYNC_STATE_STORE_HKDF_INFO (asserted in master-rotation.test).
+      "federation-sync-state",
+      // Operator Cloud (Slice 3 boot-wire): the cloud node's at-rest joined-node
+      // record (non-issuer scoped-custody runtime state), persisted under
+      // _federation by the operator-cloud joined-node store. Same no-AAD
+      // derivePurposeKey blob, so the no-AAD candidate re-wraps it. Without this
+      // label a fortress that ever joined as an operator_cloud node would strand
+      // its joined-node record and rotateMaster would abort. MUST equal
+      // OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO (asserted in master-rotation.test).
+      "operator-cloud-joined-node",
+      // Durable server-issued challenge spent-set for the pre-session
+      // federation node-cert reissue endpoint (Slice 3c-2). Same no-AAD
+      // derivePurposeKey blob; without this label a fortress that accepted a
+      // reissue proof would strand the replay set on custody master rotation.
+      // MUST equal FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO (asserted in
+      // master-rotation.test).
+      "federation-reissue-node-cert-challenge-set",
+    ],
+  },
   _fortress_mode: {
     kind: "namespace-info-encrypted",
     infos: ["sanctuary-fortress-mode-v1"],
@@ -383,7 +423,6 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     kind: "unsupported",
     reason: UNSUPPORTED_DEFERRAL,
   },
-  _federation: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _handshake: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _shr: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _composition: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
@@ -1402,6 +1441,20 @@ export async function rotateMaster(
     throw new RotationPreflightError(
       "a rotation is already in progress on this fortress; resume it with " +
         "`sanctuary rotate-master --resume`"
+    );
+  }
+
+  // Mutual exclusion with the federation rotate-root journal (Slice 3a). A
+  // federation signing-master rotation re-keys the _federation/trust-root-v1
+  // payload; running a custody rotation concurrently could re-encrypt a
+  // half-rotated payload. Refuse until the federation rotation is resumed. The
+  // namespace/key are the literal mesh constants (core must not import mesh, the
+  // wrong layering direction): FEDERATION_TRUST_ROOT_NAMESPACE +
+  // FEDERATION_ROTATE_ROOT_JOURNAL_KEY in mesh/federation-rotate-root.ts.
+  if (await storage.read("_federation", "rotate-root-journal")) {
+    throw new RotationPreflightError(
+      "a federation rotate-root is in progress on this fortress; finish it " +
+        "(`sanctuary federation rotate-root --resume`) before rotating the custody master"
     );
   }
 

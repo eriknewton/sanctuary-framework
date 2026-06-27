@@ -77,6 +77,28 @@ final class HeadlessFilterCLITests: XCTestCase {
         }
     }
 
+    // MARK: - RunLoop wait
+
+    func testWaitForDrainsRunLoopDeliveredCompletion() {
+        let started = Date()
+
+        let result = HeadlessFilterCLI.waitFor(1.0) { completion in
+            RunLoop.current.perform(inModes: [.default]) {
+                completion(nil)
+            }
+        }
+
+        switch result {
+        case .completed(nil):
+            break
+        case let .completed(.some(error)):
+            XCTFail("expected success, got \(error)")
+        case .timedOut:
+            XCTFail("run-loop-delivered completion timed out")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5)
+    }
+
     // MARK: - report-file (LaunchServices/Tahoe round-trip)
 
     func testParseReportFilePath() {

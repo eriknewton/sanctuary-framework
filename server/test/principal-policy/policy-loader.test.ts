@@ -18,7 +18,9 @@ import {
   extractOperationName,
   DEFAULT_POLICY,
   loadPrincipalPolicy,
+  enforceForcedTiers,
 } from "../../src/principal-policy/loader.js";
+import type { PrincipalPolicy } from "../../src/principal-policy/types.js";
 
 describe("Principal Policy Loader", () => {
   describe("parsePolicy — YAML", () => {
@@ -59,6 +61,8 @@ approval_channel:
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
         "memory_delete",
+        "operator_cloud_provision",
+        "federation_node_join",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -206,6 +210,8 @@ approval_channel:
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
         "memory_delete",
+        "operator_cloud_provision",
+        "federation_node_join",
       ]);
     });
 
@@ -231,6 +237,8 @@ approval_channel:
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
         "memory_delete",
+        "operator_cloud_provision",
+        "federation_node_join",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -269,6 +277,8 @@ approval_channel:
         "audit_export_siem",
         "compliance_generate_eu_ai_act_bundle",
         "memory_delete",
+        "operator_cloud_provision",
+        "federation_node_join",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
@@ -276,6 +286,60 @@ approval_channel:
       expect(policy.tier2_anomaly.max_signs_per_minute).toBe(10);
       // SEC-002: auto_deny is stripped by the parser — always undefined
       expect(policy.approval_channel.auto_deny).toBeUndefined();
+    });
+  });
+
+  describe("enforceForcedTiers (shared normalizer)", () => {
+    // Forced-Tier-1 ops (the non-relaxable subset enforced on BOTH the load
+    // path and the policy-mutation path).
+    const forcedT1 = "identity_sign";
+    const forcedCloud = "operator_cloud_provision";
+
+    function bare(
+      tier1: string[],
+      tier3: string[],
+    ): PrincipalPolicy {
+      return {
+        ...JSON.parse(JSON.stringify(DEFAULT_POLICY)),
+        tier1_always_approve: tier1,
+        tier3_always_allow: tier3,
+      } as PrincipalPolicy;
+    }
+
+    it("force-adds a forced op missing from Tier 1", () => {
+      const out = enforceForcedTiers(bare(["state_export"], ["state_read"]));
+      expect(out.tier1_always_approve).toContain(forcedT1);
+      expect(out.tier1_always_approve).toContain(forcedCloud);
+    });
+
+    it("prunes a forced op out of Tier 3 (and keeps it in Tier 1)", () => {
+      const out = enforceForcedTiers(
+        bare(["state_export"], ["state_read", forcedCloud]),
+      );
+      expect(out.tier3_always_allow).not.toContain(forcedCloud);
+      expect(out.tier1_always_approve).toContain(forcedCloud);
+    });
+
+    it("leaves non-forced operations untouched (no over-correction)", () => {
+      const out = enforceForcedTiers(
+        bare(["custom_t1"], ["state_read", "custom_reader"]),
+      );
+      expect(out.tier1_always_approve).toContain("custom_t1");
+      expect(out.tier3_always_allow).toContain("custom_reader");
+    });
+
+    it("is idempotent: applying twice equals applying once", () => {
+      const once = enforceForcedTiers(
+        bare(["state_export"], ["state_read", forcedCloud]),
+      );
+      const twice = enforceForcedTiers(once);
+      expect(twice.tier1_always_approve).toEqual(once.tier1_always_approve);
+      expect(twice.tier3_always_allow).toEqual(once.tier3_always_allow);
+    });
+
+    it("ensures the forced-Tier-3 distress lane is present", () => {
+      const out = enforceForcedTiers(bare(["state_export"], ["state_read"]));
+      expect(out.tier3_always_allow).toContain("sanctuary_distress");
     });
   });
 
@@ -346,6 +410,8 @@ approval_channel:
           "audit_export_siem",
           "compliance_generate_eu_ai_act_bundle",
           "memory_delete",
+          "operator_cloud_provision",
+          "federation_node_join",
         ];
 
         for (const tool of forcedTier1Tools) {

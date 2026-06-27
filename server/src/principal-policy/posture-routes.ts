@@ -88,6 +88,7 @@ import {
 } from "../query-anonymity/query-anonymity-routes.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
 import { renderPostureEvidenceHTML } from "./posture-evidence-html.js";
+import type { FleetRoster } from "./fleet-roster.js";
 import {
   handlePostureStream,
   type PostureStreamRegistry,
@@ -167,6 +168,17 @@ export interface PostureRouteDeps {
   gatherRecognitionReputation?: () => Promise<RecognitionReputationEvidence | null>;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
+  /**
+   * Fleet Console Slice 1: build the federation-backed fleet roster on demand.
+   * Supplied by the dashboard, which holds the live federation deps; the route
+   * is a thin presenter over it (the dashboard runs `buildFleetRoster` against
+   * the SAME `V1FederationDeps` and revocation projection the `/v1` endpoints
+   * use, so trust is the federation layer's verdict, never re-derived here).
+   * Resolved lazily per request so post-provision wiring is observed. When
+   * ABSENT, the fleet route is disabled (404 within the namespace); additive,
+   * so an unwired dashboard simply has no fleet panel rather than a broken one.
+   */
+  fleetRoster?: () => FleetRoster;
   /**
    * Castle Wall reach rules visible for the fortress. Phase 1 sources these
    * from the curated allowlist (the structured destination set the dashboard
@@ -479,6 +491,34 @@ export async function handlePostureRoute(
       return true;
     }
 
+    // Fleet Console Slice 1: the federation-backed fleet roster (the operator's
+    // own admitted machines, each with its fail-closed trust verdict + a reach
+    // indicator). LOOPBACK-ONLY read; SEE/MONITOR only (no trust mutation here).
+    //
+    // ABSENCE: when the dashboard does not supply `fleetRoster` (federation not
+    // wired in this build path), the route 404s within the namespace so the page
+    // simply omits the fleet panel; additive, never a broken/empty-green shell.
+    //
+    // TRUST: the roster's per-node verdict comes from `buildFleetRoster` reading
+    // the federation layer's own `isNodeRevoked` projection (the SAME one every
+    // sync path routes through), fail-closed: an unevaluable node renders
+    // `untrusted`, never amber, never silently admitted. The presenter never
+    // re-derives trust from a `/v1/nodes` response field. No key material is on
+    // the roster shape.
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/fleet`) {
+      if (!deps.fleetRoster) {
+        writeJSON(res, 404, {
+          error: "fleet_unavailable",
+          reason: "federation is not wired on this dashboard; the fleet panel is absent",
+          origin_machine: om,
+        });
+        return true;
+      }
+      const roster = await buildFleet(deps);
+      writeJSON(res, 200, roster);
+      return true;
+    }
+
     if (method === "GET" && path.startsWith(`${POSTURE_API_PREFIX}/reach/`)) {
       // Decode in its own guard: a malformed percent-encoding throws from
       // decodeURIComponent and must surface as a 400 client error, not a 500.
@@ -600,6 +640,9 @@ async function buildFeatureHealth(
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
       originMachine: deps.originMachine,
+      // Surface the per-plugin attribution rows on the operator posture surface.
+      // Read-only projection over the same audit read; never enforcement-bearing.
+      includePluginRows: true,
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -801,6 +844,20 @@ async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> 
     wrappedAgents: deps.listAgents(),
     detectedHarnesses: detected,
   });
+}
+
+/**
+ * Fleet Console Slice 1: resolve the federation-backed fleet roster.
+ *
+ * The roster is built by the dashboard-supplied `fleetRoster` closure, which
+ * runs `buildFleetRoster` against the live `V1FederationDeps`. We wrap the read
+ * in `runEagerReads` so it shares the same maintained-view read scope as the
+ * other always-on posture panels and the cross-machine fan-out stays cheap. The
+ * caller has already guarded `deps.fleetRoster` non-null (404 otherwise).
+ */
+async function buildFleet(deps: PostureRouteDeps): Promise<FleetRoster> {
+  const resolve = deps.fleetRoster as () => FleetRoster;
+  return (deps.auditLog as AuditLog).runEagerReads(async () => resolve());
 }
 
 function buildReach(
