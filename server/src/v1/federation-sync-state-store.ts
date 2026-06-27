@@ -118,7 +118,7 @@ interface PersistedSyncState {
    * Folded revoked-root pubkeys (Slice 3c-1). Optional on read for
    * forward/backward field-compatibility within v1: a pre-3c-1 record (written
    * before this field existed) decodes to the empty set; a fresh write always
-   * includes it. Adding a field to an existing v1 blob is additive — the AEAD
+   * includes it. Adding a field to an existing v1 blob is additive - the AEAD
    * tag still authenticates the whole record, so a tampered/truncated blob still
    * fails closed.
    */
