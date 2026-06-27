@@ -8,6 +8,75 @@ import {
 import type { FeatureHealthStatus } from "../../src/principal-policy/feature-health.js";
 import type { CustodyState } from "../../src/principal-policy/posture.js";
 
+type StoryDigestFixture = {
+  total_operations: number;
+  kernel_blocks: number;
+  kernel_allows: number;
+  approvals_denied: number;
+  approvals_granted: number;
+  chain_verified: boolean;
+  integrity_finding_count: number;
+};
+
+type StoryHarness = {
+  renderStory: (digest: StoryDigestFixture) => void;
+  wireStoryToggle: () => void;
+  storyEl: { innerHTML: string };
+  toggle: {
+    checked: boolean;
+    listeners: Record<string, () => void>;
+    addEventListener: (event: string, listener: () => void) => void;
+  };
+  store: Record<string, string>;
+};
+
+function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
+  const html = renderPostureHomeHTML();
+  const escStart = html.indexOf("function esc(s)");
+  const escEnd = html.indexOf('  // "Never fake green": ARMED');
+  const storyStart = html.indexOf("var STORY_PLAIN_SUMMARY_KEY");
+  const storyEnd = html.indexOf("function renderAnomalies(findings)");
+  expect(escStart).toBeGreaterThan(-1);
+  expect(escEnd).toBeGreaterThan(escStart);
+  expect(storyStart).toBeGreaterThan(-1);
+  expect(storyEnd).toBeGreaterThan(storyStart);
+
+  const storyEl = { innerHTML: "" };
+  const toggle = {
+    checked: false,
+    listeners: {} as Record<string, () => void>,
+    addEventListener(event: string, listener: () => void): void {
+      this.listeners[event] = listener;
+    },
+  };
+  const document = {
+    getElementById(id: string) {
+      if (id === "story") return storyEl;
+      if (id === "story-plain-summary") return toggle;
+      return null;
+    },
+  };
+  const store = { ...initialStore };
+  const sessionStorage = {
+    getItem(key: string): string | null {
+      return Object.prototype.hasOwnProperty.call(store, key) ? store[key]! : null;
+    },
+    setItem(key: string, value: string): void {
+      store[key] = value;
+    },
+  };
+  const source =
+    html.slice(escStart, escEnd) +
+    "\n" +
+    html.slice(storyStart, storyEnd) +
+    "\nreturn { renderStory: renderStory, wireStoryToggle: wireStoryToggle };";
+  const helpers = new Function("document", "sessionStorage", source)(
+    document,
+    sessionStorage,
+  ) as Pick<StoryHarness, "renderStory" | "wireStoryToggle">;
+  return { ...helpers, storyEl, toggle, store };
+}
+
 /**
  * Slice 2 of the unified posture dashboard: the feature-health panel is now
  * rendered on Home. These tests pin the #617/#634 honesty contract on the new
@@ -73,6 +142,94 @@ describe("posture home — feature-health panel honesty", () => {
   });
 });
 
+describe("posture home - Today's story plain summary toggle", () => {
+  const digest: StoryDigestFixture = {
+    total_operations: 212,
+    kernel_blocks: 4,
+    kernel_allows: 208,
+    approvals_denied: 1,
+    approvals_granted: 3,
+    chain_verified: true,
+    integrity_finding_count: 0,
+  };
+
+  it("renders factual counts by default and leaves the Plain summary toggle off", () => {
+    const h = storyHarness();
+    h.wireStoryToggle();
+    h.renderStory(digest);
+
+    expect(h.toggle.checked).toBe(false);
+    expect(h.storyEl.innerHTML).toContain(
+      '<div class="story-line"><strong>212</strong> operations in the last 24h.</div>',
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "<strong>4</strong> outbound connections blocked at the kernel; 208 allowed.",
+    );
+    expect(h.storyEl.innerHTML).not.toContain("story-summary");
+  });
+
+  it("toggled ON renders prose from the same counts and stores only the session preference", () => {
+    const h = storyHarness();
+    h.wireStoryToggle();
+    h.renderStory(digest);
+
+    h.toggle.checked = true;
+    h.toggle.listeners.change!();
+
+    expect(h.store.postureStoryPlainSummary).toBe("1");
+    expect(h.storyEl.innerHTML).toContain('<p class="story-summary">');
+    expect(h.storyEl.innerHTML).toContain(
+      "Today your agents ran <strong>212</strong> operations",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "Sanctuary blocked <strong>4</strong> outbound connections and allowed <strong>208</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "You denied <strong>1</strong> approvals and granted <strong>3</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "The audit log verified clean: no tampering.",
+    );
+    expect(h.storyEl.innerHTML).not.toContain("—");
+    expect(h.storyEl.innerHTML.toLowerCase()).not.toContain("sovereignty");
+  });
+
+  it("restores the session preference, says zero counts plainly, and toggles back to factual rows", () => {
+    const h = storyHarness({ postureStoryPlainSummary: "1" });
+    h.wireStoryToggle();
+    h.renderStory({
+      total_operations: 0,
+      kernel_blocks: 0,
+      kernel_allows: 0,
+      approvals_denied: 0,
+      approvals_granted: 0,
+      chain_verified: false,
+      integrity_finding_count: 2,
+    });
+
+    expect(h.toggle.checked).toBe(true);
+    expect(h.storyEl.innerHTML).toContain("ran <strong>0</strong> operations");
+    expect(h.storyEl.innerHTML).toContain(
+      "blocked <strong>0</strong> outbound connections and allowed <strong>0</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "denied <strong>0</strong> approvals and granted <strong>0</strong>",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "The audit log is unverified: 2 integrity finding(s).",
+    );
+
+    h.toggle.checked = false;
+    h.toggle.listeners.change!();
+
+    expect(h.store.postureStoryPlainSummary).toBe("0");
+    expect(h.storyEl.innerHTML).toContain(
+      '<div class="story-line"><strong>0</strong> operations in the last 24h.</div>',
+    );
+    expect(h.storyEl.innerHTML).not.toContain("story-summary");
+  });
+});
+
 /**
  * Slice 3 of the unified posture dashboard: the Custody and Exit panel. These
  * tests pin the #617 honesty contract on the new tile — custody is GREEN NEVER
@@ -112,19 +269,26 @@ describe("posture home — Custody and Exit panel honesty", () => {
     expect(fnSource).not.toContain("pill green");
   });
 
-  it("surfaces the exit export as a capability WITHOUT claiming a clean-exit guarantee", () => {
+  it("surfaces the exit evidence bundle as a capability WITHOUT claiming a clean-exit guarantee", () => {
     const html = renderPostureHomeHTML();
-    // The honest exit affordance: export available, Tier-1 gated. The command
-    // string is sourced from the panel at render time; the renderer falls back
-    // to the literal `sanctuary exit` verb, which is therefore present statically.
-    expect(html).toContain("export available");
-    expect(html).toContain("sanctuary exit");
+    const start = html.indexOf("function renderCustodyExit(panel)");
+    const end = html.indexOf("// ── Recognition + portability");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // The honest exit affordance is display-named as an evidence bundle and
+    // remains Tier-1 gated. The command string is sourced from the panel at
+    // render time; the renderer falls back to the literal `sanctuary exit` verb,
+    // which is therefore present statically.
+    expect(region).toContain("evidence bundle");
+    expect(region).toContain("sanctuary exit");
     // It is a Tier-1 (approval-gated) operation, surfaced honestly.
-    expect(html).toContain("a Tier-1 operation");
+    expect(region).toContain("a Tier-1 operation");
     // And the explicit honesty disclaimer that the full clean-exit guarantee is
     // NOT yet earned (delta review). No "clean exit guaranteed" claim on Home.
-    expect(html).toContain("does not yet mean a guaranteed clean exit");
-    expect(html.toLowerCase()).not.toContain("clean exit guaranteed");
+    expect(region).toContain("does not yet mean a guaranteed clean exit");
+    expect(region).not.toContain("export available");
+    expect(region.toLowerCase()).not.toContain("clean exit guaranteed");
   });
 
   it("uses no em-dashes in the rendered Custody and Exit user-facing copy", () => {
@@ -264,6 +428,7 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(end).toBeGreaterThan(start);
     const fn = html.slice(start, end);
     // The existing mint endpoint and method.
+    expect(fn).toContain('if (urlSession) return Promise.resolve("?session=" + encodeURIComponent(urlSession))');
     expect(fn).toContain('fetch("/auth/session", {');
     expect(fn).toContain('method: "POST"');
     // The long-lived bearer travels in the Authorization header of the POST,
@@ -309,6 +474,31 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     expect(html).not.toContain('"/api/posture/stream?token=');
   });
 
+  it("threads the one-click ?session= credential into board reads and decision POSTs", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain("function readUrlSession()");
+    expect(html).toContain('new URLSearchParams(location.search || "").get("session")');
+    expect(html).toContain("function credentialedPath(path)");
+    expect(html).toContain('u.searchParams.set("session", urlSession)');
+
+    const apiStart = html.indexOf("function api(path)");
+    const apiEnd = html.indexOf("function rememberToken");
+    expect(apiStart).toBeGreaterThan(-1);
+    expect(apiEnd).toBeGreaterThan(apiStart);
+    const apiFn = html.slice(apiStart, apiEnd);
+    expect(apiFn).toContain("var url = credentialedPath(path)");
+    expect(apiFn).toContain("fetch(url, opts)");
+
+    const decisionStart = html.indexOf("function postDecision(path, retried)");
+    const decisionEnd = html.indexOf("// SEC-012 stream handshake");
+    expect(decisionStart).toBeGreaterThan(-1);
+    expect(decisionEnd).toBeGreaterThan(decisionStart);
+    const decisionFn = html.slice(decisionStart, decisionEnd);
+    expect(decisionFn).toContain("fetch(credentialedPath(path),");
+    expect(decisionFn).toContain('method: "POST"');
+    expect(decisionFn).not.toContain('"Authorization": "Bearer " + urlSession');
+  });
+
   it("degrades to honest polling on mint failure / 401 / expiry - the mint never throws and reconnect re-mints", () => {
     const html = renderPostureHomeHTML();
     const mStart = html.indexOf("function mintStreamSession()");
@@ -337,5 +527,285 @@ describe("posture home - SEC-012 SSE ?session= handshake", () => {
     const end = html.indexOf("function esc(");
     const region = html.slice(start, end);
     expect(region).not.toContain("—");
+  });
+});
+
+describe("posture home - folded approval controls", () => {
+  type ApprovalState = {
+    rows: Array<{
+      source: string;
+      approve_path: string;
+      deny_path: string;
+      review_href: string;
+    }>;
+    can_decide: boolean;
+    mode: string;
+  };
+  type ApprovalHelpers = {
+    buildApprovalState: (
+      legacyBody: unknown,
+      inboxBody: unknown,
+      status: unknown,
+    ) => ApprovalState;
+  };
+
+  function approvalHelpers(): ApprovalHelpers {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function normalizeLegacyApproval");
+    const end = html.indexOf("function renderApprovals");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const source =
+      html.slice(start, end) +
+      "\nreturn { buildApprovalState: buildApprovalState };";
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    return new Function(source)() as ApprovalHelpers;
+  }
+
+  it("refreshes both approval read models plus status before rendering", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function refreshAuxiliary()");
+    expect(start).toBeGreaterThan(-1);
+    const region = html.slice(start, start + 700);
+    expect(region).toContain('api("/api/pending")');
+    expect(region).toContain('api("/api/approval-inbox?status=pending")');
+    expect(region).toContain('api("/api/status")');
+    expect(region).toContain("buildApprovalState(rest[0], rest[1], rest[2])");
+  });
+
+  it("default co-located mode renders decision routes against the legacy pending inbox", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-1", operation: "state_export", tier: 1 }],
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      {
+        standalone_mode: false,
+        decision_capable: true,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.can_decide).toBe(true);
+    expect(state.mode).toBe("co-located");
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]!.source).toBe("legacy");
+    expect(state.rows[0]!.approve_path).toBe("/api/approve/legacy-1");
+    expect(state.rows[0]!.deny_path).toBe("/api/deny/legacy-1");
+  });
+
+  it("replace mode renders decision routes against the approval inbox", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-should-not-win", operation: "state_export", tier: 1 }],
+      {
+        data: {
+          entries: [
+            {
+              aggregator_id: "agg-1",
+              action_summary: "state export",
+              source_harness: "claude-code",
+            },
+          ],
+        },
+      },
+      {
+        standalone_mode: false,
+        decision_capable: true,
+        policy: { approval_redirect: { enabled: true, mode: "replace" } },
+      },
+    );
+    expect(state.can_decide).toBe(true);
+    expect(state.rows).toHaveLength(1);
+    expect(state.rows[0]!.source).toBe("approval-inbox");
+    expect(state.rows[0]!.approve_path).toBe("/api/approval-inbox/agg-1/approve");
+    expect(state.rows[0]!.deny_path).toBe("/api/approval-inbox/agg-1/deny");
+  });
+
+  it("standalone mode keeps the approval section read-only", () => {
+    const helpers = approvalHelpers();
+    const state = helpers.buildApprovalState(
+      [{ id: "legacy-1", operation: "state_export", tier: 1 }],
+      { data: { entries: [] } },
+      {
+        standalone_mode: true,
+        decision_capable: false,
+        policy: { approval_redirect: { enabled: false, mode: "replace" } },
+      },
+    );
+    expect(state.mode).toBe("standalone");
+    expect(state.can_decide).toBe(false);
+
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderApprovals(approvalState)");
+    const end = html.indexOf("function wireApprovalButtons");
+    const region = html.slice(start, end);
+    expect(region).toContain("approvalState && approvalState.can_decide");
+    expect(html).toContain("status.decision_capable === true");
+    expect(region).toContain("review &rarr;");
+  });
+
+  it("decision POSTs prefer the bearer header and retry once after a 401 prompt", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function decisionHeaders()");
+    const end = html.indexOf("// SEC-012 stream handshake");
+    const region = html.slice(start, end);
+    expect(region).toContain('method: "POST"');
+    expect(region).toContain('credentials: "same-origin"');
+    expect(region).toContain('headers["Authorization"] = "Bearer " + token');
+    expect(region).toContain("r.status === 401 && !retried");
+    expect(region).toContain("promptForToken()");
+    expect(region).toContain("return postDecision(path, true)");
+  });
+});
+
+/**
+ * Recognition + portability panel (P5) renderer honesty. The panel is the most
+ * impartiality-loaded surface: these assert the rendered HTML/source honors the
+ * contract — the panel is hidden until the composition gate is confirmed, it
+ * never fetches a vendor score, and counterparty verification is labeled local
+ * bridge crypto. The client is a self-contained string, so (per the convention
+ * above) we assert on the embedded source rather than running a DOM.
+ */
+describe("posture home - Recognition panel (P5) impartiality", () => {
+  it("renders the Recognition section hidden by default (absent until composition gate confirmed)", () => {
+    const html = renderPostureHomeHTML();
+    expect(html).toContain('id="recognition-section"');
+    // The section markup carries display:none so the panel is absent (never a
+    // greyed shell) until /api/posture/recognition returns 200.
+    const idx = html.indexOf('id="recognition-section"');
+    const sectionTag = html.slice(idx - 40, idx + 60);
+    expect(sectionTag).toContain('style="display:none"');
+  });
+
+  it("reveals the section only on a 200 and hides it on any error (404 = composition off)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // On success the section is revealed; on catch it is hidden (absent).
+    expect(region).toContain('section.style.display = ""');
+    expect(region).toContain('section.style.display = "none"');
+    expect(region).toContain("/api/posture/recognition");
+  });
+
+  it("retries on a locked (503) first response so the panel appears after unlock, but a 404 (composition off) is a permanent absence (#651)", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function loadRecognition(attempt)");
+    const end = html.indexOf("function loadRecognitionOnce()");
+    const region = html.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    // A 404 stops retrying (composition off is a config fact, not a transient
+    // lock): the catch returns early on a 404.
+    expect(region).toMatch(/404\$/);
+    expect(region).toContain("return;");
+    // Any non-404 error schedules a retry via setTimeout + backoff so a locked /
+    // booting fortress recovers the panel after unlock. The first one-shot fetch
+    // alone would have left the panel hidden forever.
+    expect(region).toContain("setTimeout(");
+    expect(region).toContain("loadRecognition(");
+    // The retry never renders a greyed shell while waiting: the section stays
+    // display:none until a 200, so there is exactly one reveal path.
+    expect(region).toContain('section.style.display = "none"');
+  });
+
+  it("never fetches a vendor reputation score: no score-fetch path in the page source", () => {
+    const html = renderPostureHomeHTML();
+    // There is no Verascore (or any vendor) score-fetch URL anywhere in the page.
+    expect(html).not.toContain("verascore.ai/api");
+    expect(html).not.toContain("api.verascore");
+    expect(html).not.toMatch(/fetch\([^)]*score/i);
+  });
+
+  it("labels counterparty verification as LOCAL bridge crypto, never 'by Concordia/Verascore'", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function renderRecognition");
+    const end = html.indexOf("function loadRecognitionOnce");
+    const region = html.slice(start, end);
+    expect(region).toContain("local_bridge_crypto");
+    expect(region).toContain("verified locally");
+    expect(region.toLowerCase()).not.toContain("verified by concordia");
+    expect(region.toLowerCase()).not.toContain("verified by verascore");
+  });
+
+  it("never-fake-green: the reputation pill is amber unless evidence is present", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function recognitionRepPill");
+    const end = html.indexOf("function renderRecognition");
+    const region = html.slice(start, end);
+    // Green is returned ONLY for "present"; everything else is amber.
+    expect(region).toContain('"present"');
+    expect(region).toContain('pill green');
+    expect(region).toContain('pill amber');
+    // The amber "no evidence yet" copy must be the default branch.
+    expect(region).toContain("no evidence yet");
+    // NEGATIVE GUARD (#651 LOW): green must bind STRICTLY to the "present" state.
+    // Mirror featureHealthPill's guards: no branch keyed on a non-present state
+    // (the "red" branch, or the default "no evidence yet" branch) may emit a
+    // green pill. The `[^\n]*` keeps the match on a single source line so a green
+    // branch elsewhere cannot satisfy it. This turns the weak presence check into
+    // a real never-fake-green assertion: a future edit that returns green for
+    // "red" or for the amber default would fail here.
+    expect(region).not.toMatch(/"red"[^\n]*pill green/);
+    expect(region).not.toMatch(/no evidence yet[^\n]*pill green/);
+    // The green pill line is the "present" line: assert green is co-located with
+    // the present state, never with another state token on its line.
+    expect(region).toMatch(/"present"[^\n]*pill green/);
+  });
+});
+
+describe("posture home - Fleet panel (Slice 1) honesty", () => {
+  it("ships the fleet section hidden by default (absent until federation says otherwise)", () => {
+    const html = renderPostureHomeHTML();
+    // The section exists in the shell but is display:none until the gated fetch
+    // confirms a provisioned fleet (available:true). So a non-federated fortress
+    // never shows a fabricated roster.
+    expect(html).toContain('id="fleet-section"');
+    expect(html).toMatch(/id="fleet-section"[^>]*style="display:none"/);
+    expect(html).toContain('id="fleet"');
+    // Boot wires the gated loader.
+    expect(html).toContain("loadFleetOnce()");
+  });
+
+  it("never fakes green: admitted is the ONLY green trust pill; untrusted/revoked are red", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function fleetTrustPill(state)");
+    const end = html.indexOf("function fleetReachLabel(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // admitted -> green; revoked -> red; the default (untrusted / unevaluable)
+    // -> red. There must be NO amber and NO green outside the admitted branch.
+    expect(region).toMatch(/"admitted"[^\n]*pill green/);
+    expect(region).toMatch(/"revoked"[^\n]*pill red/);
+    // The fail-closed default branch is red, NEVER amber and NEVER green.
+    expect(region).toContain('"pill red">UNTRUSTED');
+    expect(region).not.toMatch(/UNTRUSTED[^\n]*pill amber/);
+    // Green appears ONLY on the admitted line.
+    expect(region).not.toMatch(/"revoked"[^\n]*pill green/);
+    expect(region).not.toContain('pill green">UNTRUSTED');
+  });
+
+  it("keeps reach (liveness) separate from trust: reach never uses a green trust pill", () => {
+    const html = renderPostureHomeHTML();
+    const start = html.indexOf("function fleetReachLabel(reach)");
+    const end = html.indexOf("function fleetTrustWhy(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const region = html.slice(start, end);
+    // Reach is informational. A "recent"/reachable node must NOT borrow the green
+    // trust pill (that would launder liveness into trust). It uses a muted chip.
+    expect(region).not.toContain("pill green");
+    expect(region).toContain("reachable");
   });
 });

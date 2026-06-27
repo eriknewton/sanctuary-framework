@@ -17,7 +17,7 @@ jobs:
         node-version: [22, 24]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Use Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v6
@@ -65,6 +65,21 @@ jobs:
         working-directory: server
         run: npm run build
 
+      - name: Run SDW memory-provider sidecar tests (cross-agent isolation gate)
+        # Gates the sanctuary-memory provider's pytest suite in CI so the
+        # cross-agent memory isolation test (and the no-unselected-persistence
+        # + content-hash + delete-pending-approval tests) guard future changes.
+        # Runs once (node 24 only); the provider is pure-stdlib so pytest is the
+        # only dependency. Tests use the in-process stub layer (no live server,
+        # no keychain).
+        if: matrix.node-version == 24
+        run: |
+          cd sidecars/sanctuary-memory
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install pytest==8.4.2
+          .venv/bin/python -m pytest -q
+
       - name: Install libsecret + Secret Service backend
         if: runner.os == 'Linux'
         uses: ./.github/actions/setup-linux-secret-service
@@ -97,7 +112,7 @@ jobs:
     # thread the caught error through `cause`).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Use Node.js 24
         uses: actions/setup-node@v6

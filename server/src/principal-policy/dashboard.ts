@@ -1,5 +1,5 @@
 /**
- * Sanctuary MCP Server — Principal Dashboard
+ * Sanctuary MCP Server - Principal Dashboard
  *
  * HTTP-based approval channel that serves a real-time web dashboard
  * for human principals to approve/deny agent operations.
@@ -29,6 +29,10 @@ import {
   loadFortressProducerKey,
   type ProducerKeyLoad,
 } from "../castle-wall/runtime/producer-signature.js";
+import {
+  loadBrokerProducerKey,
+  type BrokerProducerKeyLoad,
+} from "../broker-mcp/producer-signature.js";
 import { SANCTUARY_VERSION as PKG_VERSION } from "../config.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
@@ -39,6 +43,10 @@ import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
 import { generateSHR, type SHRGeneratorOptions } from "../shr/generator.js";
+import { gatherReputationEvidence } from "../shr/tools.js";
+import { ReputationStore } from "../reputation/reputation-store.js";
+import type { StorageBackend } from "../storage/interface.js";
+import type { RecognitionReputationEvidence } from "./posture.js";
 import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
@@ -46,6 +54,7 @@ import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
 import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
   getProtectionSnapshot,
   type AggregatorSources,
@@ -54,18 +63,30 @@ import { constantTimeEquals } from "../http/auth.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { V1SessionService } from "../v1/session-service.js";
 import { handleV1Request } from "../v1/router.js";
+import { denyForbidden } from "../v1/http.js";
 import {
   handlePostureRoute,
   POSTURE_API_PREFIX,
   POSTURE_HOME_PATH,
   POSTURE_AGENT_PATH_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_STREAM_PATH,
   type PostureRouteDeps,
 } from "./posture-routes.js";
+import { renderPostureHomeHTML } from "./posture-home-html.js";
+import { buildFleetRoster } from "./fleet-roster.js";
+import {
+  buildCastleWallPosture,
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  mapPlatform,
+  type CastleWallPosture,
+} from "./posture.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
 } from "./posture-stream.js";
+import { buildFeatureHealthPanel } from "./feature-health.js";
+import { FeatureFaultRaiser } from "./feature-fault-raise.js";
 import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
 import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
@@ -76,15 +97,41 @@ import {
 } from "../v1/agents.js";
 import { SupervisorBridge } from "../supervisor/dashboard-bridge.js";
 import {
+  assertNonIssuerContextHasNoIssuerAuthority,
+  federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
+  type FederationAppendOptions,
   type FederationAppendResult,
   type FederationContext,
   type FederationEvent,
   type FederationNodeView,
+  type FederationPostureSummary,
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import {
+  deriveNodePosture,
+  NODE_TRUST_BOUNDARY_VERSION,
+  OPERATOR_CLOUD_DISCLOSURE,
+  type NodeModeForPosture,
+} from "../mesh/node-posture.js";
+import {
+  acceptFederationEventsFailClosed,
+  FEDERATION_NODE_EVICTION_EVENT_KIND,
+  federationOperatorAuthorityOrigin,
+  foldAcceptedFederationNodeEvictionEvent,
+  foldFederationNodeEvictionEvent,
+  isFederationOperatorAuthorityEvent,
+  renewNodeIdentityCertificateIfDue,
+  startFederationNodeCertificateAutoRenewal,
+  type FederationNodeCertificateAutoRenewalHandle,
+} from "../v1/federation-revocation.js";
+import {
+  FederationSyncStateStore,
+  type FederationSyncStateSnapshot,
+} from "../v1/federation-sync-state-store.js";
+import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
@@ -187,11 +234,67 @@ const MAX_SESSIONS = 1000;
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1-minute window
 const RATE_LIMIT_GENERAL = 120;       // max general API requests per window
 const RATE_LIMIT_DECISIONS = 20;      // max approve/deny decisions per window
+// Federation P1: dedicated bucket for the pre-session, node-cert-authenticated
+// `/v1/federation/sync/peer` route. Each request triggers one cryptographic
+// envelope verification, so the budget is tighter than the general bucket and
+// (unlike the dashboard buckets) does NOT exempt loopback: a remote peer can
+// arrive via a loopback-presenting transport (a tunnel), so a loopback exemption
+// would let such a peer flood the verify path unthrottled, and the exemption is
+// itself a probing asymmetry. See checkRateLimit's `exemptLoopback` flag.
+const RATE_LIMIT_FEDERATION_PEER = 60; // max peer-sync attempts per window per /64
 const MAX_RATE_LIMIT_ENTRIES = 10_000; // cap the tracking map to prevent memory exhaustion
+// Federation P1 DoS hardening: a global ceiling on concurrent in-flight
+// crypto-verify (envelope verification) on the unauthenticated peer-sync route,
+// so an unauthenticated flood cannot exhaust CPU faster than the per-/64 rate
+// limit alone would bound it. Over-ceiling requests get the SAME generic
+// rejection as a verify failure (no distinguishable error → no oracle).
+const MAX_CONCURRENT_PEER_VERIFY = 16;
+
+type RateLimitClass = "general" | "decisions" | "federation_peer";
 
 interface RateLimitEntry {
-  general: number[];   // timestamps of general requests
-  decisions: number[]; // timestamps of decision requests
+  general: number[];        // timestamps of general requests
+  decisions: number[];      // timestamps of decision requests
+  federation_peer: number[]; // timestamps of federation peer-sync requests
+}
+
+/**
+ * Federation P1 DoS hardening: return the /64 prefix key for an IPv6 address, or
+ * null when the input is not an IPv6 literal (IPv4 / "unknown" / already a mapped
+ * IPv4 normalized upstream). A /64 is the smallest IPv6 block a host is normally
+ * delegated, so an attacker rotating source addresses within their /64 must share
+ * one rate-limit bucket. We take the first four hextets after expanding any single
+ * `::` zero-run. Keyed as `"<h0>:<h1>:<h2>:<h3>::/64"` so it can never collide
+ * with a verbatim address key. Conservative: any parse ambiguity returns null so
+ * the caller falls back to the exact-address key (fail safe; never wider than the
+ * input intended).
+ */
+export function ipv6Slash64Prefix(addr: string): string | null {
+  // Reject anything without a colon (IPv4 / "unknown") and zone ids / ports.
+  if (!addr.includes(":")) return null;
+  if (addr.includes("%") || addr.includes("/")) return null;
+  // An IPv4-mapped form (::ffff:1.2.3.4) is an IPv4 address; do not /64 it.
+  if (addr.includes(".")) return null;
+  const doubleColonCount = (addr.match(/::/g) ?? []).length;
+  if (doubleColonCount > 1) return null; // malformed: more than one "::"
+  let hextets: string[];
+  if (doubleColonCount === 1) {
+    const [head, tail] = addr.split("::");
+    const headParts = head ? head.split(":") : [];
+    const tailParts = tail ? tail.split(":") : [];
+    const missing = 8 - headParts.length - tailParts.length;
+    if (missing < 0) return null;
+    hextets = [...headParts, ...Array<string>(missing).fill("0"), ...tailParts];
+  } else {
+    hextets = addr.split(":");
+  }
+  if (hextets.length !== 8) return null;
+  // Each hextet must be 1-4 hex digits.
+  for (const h of hextets) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(h)) return null;
+  }
+  const prefix = hextets.slice(0, 4).map((h) => h.toLowerCase()).join(":");
+  return `${prefix}::/64`;
 }
 
 /**
@@ -220,8 +323,19 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     // operator page load), so it is exempt from the general rate limit the
     // same way `/posture` and `/fortress` are. Its data fetches still hit the
     // throttled JSON endpoints.
-    path.startsWith(POSTURE_AGENT_PATH_PREFIX)
+    path.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+    // The Evidence View HTML shell is a dashboard view route: an operator page
+    // load that loads the filterable audit table. Its data fetch (`GET
+    // /api/posture/evidence`) still hits the throttled JSON endpoints.
+    path === POSTURE_EVIDENCE_PATH
   );
+}
+
+interface FederationDashboardState {
+  eventLog: FederationEvent[];
+  revoked: Set<string>;
+  evictionMaxSerial: number;
+  nodes: Map<string, FederationNodeView>;
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
@@ -243,6 +357,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private identityManager: IdentityManager | null = null;
   private handshakeResults: Map<string, HandshakeResult> | null = null;
   private shrOpts: SHRGeneratorOptions | null = null;
+  /**
+   * Storage backend, injected for the Recognition panel (P5) so the dashboard
+   * can list persisted Concordia-bridge commitments (`storage.list("_bridge")`)
+   * and read the local attestation store for reputation EVIDENCE (counts, not a
+   * score). Optional: when absent (standalone / un-wired), the Recognition panel
+   * falls back to audit-event counts and a `null` (amber) reputation row. Never
+   * used to fetch any external reputation score - there is no such path.
+   */
+  private storage: StorageBackend | null = null;
   private _sanctuaryConfig: SanctuaryConfig | null = null;
   private profileStore: SovereigntyProfileStore | null = null;
   private clientManager: ClientManager | null = null;
@@ -263,6 +386,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * consumer wrote with (Slice P single-source contract).
    */
   private _producerKeyLoad: ProducerKeyLoad | undefined = undefined;
+  private _brokerProducerKeyLoad: BrokerProducerKeyLoad | undefined = undefined;
   private dashboardHTML: string;
   private fortressHTML: string | null = null;
   private loginHTML: string;
@@ -275,6 +399,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
   /** Rate limiting: per-IP request tracking */
   private rateLimits: Map<string, RateLimitEntry> = new Map();
+  /**
+   * Federation P1 DoS hardening: count of in-flight crypto-verify on the
+   * unauthenticated `/v1/federation/sync/peer` route. Bounded by
+   * MAX_CONCURRENT_PEER_VERIFY so an unauthenticated flood cannot exhaust CPU on
+   * envelope verification faster than the per-/64 rate limit alone would bound.
+   */
+  private inFlightPeerVerify = 0;
   /** Whether the dashboard is running in standalone mode (no MCP server) */
   private _standaloneMode = false;
   /**
@@ -282,14 +413,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * are treated as authenticated without requiring a Bearer token or
    * dashboard session cookie. Only the `startStandaloneDashboard` boot
    * path enables this, and ONLY after the supplied passphrase successfully
-   * decrypts at least one stored identity — proving the caller already
+   * decrypts at least one stored identity - proving the caller already
    * holds the primary secret that protects every piece of Sanctuary state.
    *
    * Rationale: the dashboard auth token is a dashboard-access credential
    * layered on top of the master-key unlock. Once the operator has already
    * presented the passphrase on the command line (terminal-side auth), a
    * second login prompt in the auto-opened browser just trains users to
-   * paste secrets into web forms — the exact habit Sanctuary exists to
+   * paste secrets into web forms - the exact habit Sanctuary exists to
    * discourage. Remote (non-loopback) callers still require the bearer
    * token, so this is a localhost-only ergonomics unlock, not a network
    * policy change.
@@ -315,15 +446,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _autoAuthLocalhost = false;
   /**
    * v1.1 routes (dashboard HTML at /v1.1, hub API at /api/hub/*) are
-   * mounted additively when set. Legacy routes at / continue to serve
-   * regardless. Default route flip is deferred to v1.2.
+   * mounted additively when set. `/` is the posture shell; `/dashboard`
+   * and `/v1.1` remain v1.1 SPA compatibility aliases.
    */
   private v11Bindings: V11Bindings | null = null;
 
   /**
    * Federation PR-A1: RFC v7 challenge-response session ceremony +
    * opaque session tokens for the additive `/v1` API surface. Constructed
-   * unconditionally — the `/v1` skeleton is always mounted; its auth is
+   * unconditionally - the `/v1` skeleton is always mounted; its auth is
    * fail-closed and independent of the legacy bearer/session model
    * (which it bridges through {@link V1SessionService}'s attestation
    * check, never bypasses).
@@ -342,7 +473,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Phase S1: split-process supervisor bridge. Set by the standalone process
    * once the supervisor socket path + per-boot auth secret are known (it owns
    * the in-memory master for the transient-key handoff). When null, protect
-   * fails closed with 503 `unavailable` — never a silent success, never the
+   * fails closed with 503 `unavailable` - never a silent success, never the
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
@@ -359,8 +490,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
   private readonly _federationRoster = new Set<string>();
-  private readonly _federationNodes = new Map<string, FederationNodeView>();
-  private readonly _federationEventLog: FederationEvent[] = [];
+  private _federationState: FederationDashboardState = {
+    eventLog: [],
+    revoked: new Set<string>(),
+    evictionMaxSerial: 0,
+    nodes: new Map<string, FederationNodeView>(),
+  };
+  private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
   /**
    * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
    * highest envelope high-water accepted per sender node id (whole-envelope
@@ -369,6 +505,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private readonly _federationAcceptedHighWater = new Map<string, number>();
   private _federationOutboundHighWater = 0;
+  /**
+   * Federation 3/3b P0: DURABLE peer-sync security state. The store persists +
+   * rehydrates the per-sender accepted high-water, the outbound high-water, and
+   * the folded revocation projection (revoked-node set + highest eviction
+   * serial) so anti-replay and revocation memory survive a daemon restart.
+   * `null` when no storage/master key is wired (tests / minimal rigs run purely
+   * in memory with the same semantics).
+   */
+  private _federationSyncStateStore: FederationSyncStateStore | null = null;
+  private _federationReissueChallengeStore = new FederationReissueChallengeStore();
+  private _federationReissueChallengeStoreUnavailable = false;
+  /**
+   * FAIL-CLOSED latch (DUR-4 / CC-2). Set true when the durable sync-state
+   * record is PRESENT but could not be decrypted/parsed on boot (at-rest
+   * tamper/corruption). While true the sync paths must DENY rather than serve on
+   * empty anti-replay + empty revocation memory (never silently un-revoke or
+   * re-open the replay window). Cleared only by a clean (re)hydration.
+   */
+  private _federationSyncStateUnavailable = false;
+  /**
+   * RR-1 pre-wire (Federation 3/3b P0). The set of REVOKED fortress-master
+   * (root) pubkeys, base64url. Empty in P0 and populated only by rotate-root
+   * Slice 3c compromise recovery; wired feature-inert at all three chokepoints
+   * now. Persisting/wiring 3c's population is a 3c concern, not P0's.
+   */
+  private readonly _federationRevokedRoots = new Set<string>();
+  /**
+   * Slice 3c-1: the highest accepted root-revocation serial, the replay floor
+   * carried alongside {@link _federationRevokedRoots}. Loaded from the durable
+   * sync-state projection on boot and preserved in {@link
+   * snapshotFederationSyncState} so a re-persist never regresses it. The daemon
+   * does not itself MINT root revocations (the rotate-root CLI does, persisting
+   * directly into the durable store); the daemon only enforces the loaded set.
+   */
+  private _federationHighestRevocationSerial = 0;
 
   /**
    * v1.3 WP-V1.3-10 Cross-Harness Approval Inbox aggregator. Mounted
@@ -442,6 +613,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private unifiedInboxPrefsStore: UnifiedInboxPrefsStore | null = null;
   private unifiedInboxFortressId: string | null = null;
   private unifiedInboxIdentityId: string | null = null;
+  /**
+   * Feature-health fault-raise driver (observability Slice: OS-notification raise
+   * path). Built lazily when the unified-inbox bridge is wired, it recomputes the
+   * feature-health panel from the SAME integrity-judged audit read the posture
+   * surface uses and raises the 3 ratified fault classes to the inbox bridge,
+   * deduped + rate-limited. Display-only: it feeds NOTHING back into enforcement.
+   * Ticked on the unified-inbox scheduler's cadence via `evaluateFeatureFaults`.
+   */
+  private featureFaultRaiser: FeatureFaultRaiser | null = null;
 
   constructor(config: DashboardConfig) {
     this.config = config;
@@ -465,7 +645,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.v1Sessions = new V1SessionService({
       auth: {
         // PR-A3: the credentialed session path is a durable Ed25519 operator
-        // attestation verified against THIS key — the same operator identity
+        // attestation verified against THIS key - the same operator identity
         // key the OPERATOR_SIGNED write path resolves. The bearer-token path
         // is gone (replace-not-extend); loopback auto-auth remains a
         // network-position fallback only.
@@ -491,6 +671,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     sanctuaryConfig?: SanctuaryConfig;
     profileStore?: SovereigntyProfileStore;
     clientManager?: ClientManager;
+    /** Storage backend for the Recognition panel (bridge list + reputation read). */
+    storage?: StorageBackend;
   }): void {
     this.policy = deps.policy;
     this.baseline = deps.baseline;
@@ -498,6 +680,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (deps.identityManager) this.identityManager = deps.identityManager;
     if (deps.handshakeResults) this.handshakeResults = deps.handshakeResults;
     if (deps.shrOpts) this.shrOpts = deps.shrOpts;
+    if (deps.storage) this.storage = deps.storage;
     if (deps.sanctuaryConfig) this._sanctuaryConfig = deps.sanctuaryConfig;
     if (deps.profileStore) this.profileStore = deps.profileStore;
     if (deps.clientManager) this.clientManager = deps.clientManager;
@@ -661,6 +844,68 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.unifiedInboxPrefsStore = opts.prefsStore ?? null;
     this.unifiedInboxFortressId = opts.fortressId ?? null;
     this.unifiedInboxIdentityId = opts.identityId ?? null;
+    // Wire the feature-health fault-raise driver onto the now-available inbox
+    // bridge (the notification sink). Built once; it holds the prior panel so the
+    // ON->OFF `feature_silently_off` transition can be computed across cycles.
+    this.featureFaultRaiser = opts.bridge
+      ? new FeatureFaultRaiser({
+          bridge: opts.bridge,
+          buildPanel: () => this.buildFeatureHealthPanelForRaise(),
+        })
+      : null;
+  }
+
+  /**
+   * Recompute the feature-health panel for the fault-raise driver, from the SAME
+   * integrity-judged eager audit read and the SAME producer-key load the posture
+   * `/api/posture/feature-health` route uses, so the raise can never diverge from
+   * the dashboard on what is green / fault. Includes the per-plugin rows so the
+   * `plugin_failure_surge` class can read its host-minted error-rate fault. Pure
+   * read: builds a presentation object, drives no mutation, exposes no key.
+   */
+  private async buildFeatureHealthPanelForRaise(): Promise<
+    Awaited<ReturnType<typeof buildFeatureHealthPanel>>
+  > {
+    if (this.auditLog === null) {
+      throw new Error("feature-health raise: audit log unavailable");
+    }
+    await this.ensureProducerKeyLoaded();
+    await this.ensureBrokerProducerKeyLoaded();
+    const load = this._producerKeyLoad;
+    const brokerLoad = this._brokerProducerKeyLoad;
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    const auditLog = this.auditLog;
+    return auditLog.runEagerReads(() =>
+      buildFeatureHealthPanel({
+        auditLog,
+        originMachine,
+        includePluginRows: true,
+        pinnedProducerKeyB64url:
+          load?.status === "present" ? load.keyB64url : null,
+        ...(load?.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+        brokerPinnedProducerKeyB64url:
+          brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+        ...(brokerLoad?.status === "unreadable"
+          ? { brokerProducerKeyExpectedButUnavailable: true }
+          : {}),
+      }),
+    );
+  }
+
+  /**
+   * One feature-health fault-raise evaluation cycle, ticked on the unified-inbox
+   * scheduler's cadence (`index.ts` passes this as the scheduler `onTick`). A
+   * no-op when the raiser is not wired (no inbox bridge / locked log). Never
+   * throws into the scheduler: the driver swallows a panel-build failure.
+   */
+  async evaluateFeatureFaults(): Promise<void> {
+    if (!this.featureFaultRaiser) return;
+    await this.featureFaultRaiser.evaluate();
   }
 
   /**
@@ -702,7 +947,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): Promise<boolean> {
     if (!this.distressInbox) return false;
     // SECURITY (codex round-1 HIGH): authenticate through the dashboard's own
-    // checkAuth — the SAME gate the `/api/audit-log` route uses, which already
+    // checkAuth - the SAME gate the `/api/audit-log` route uses, which already
     // serves every distress envelope. This honors bearer token AND the login
     // session cookie (the route-helper's authMiddleware checks neither cookie),
     // so the operator's browser works and a tokenless non-browser caller is
@@ -951,8 +1196,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `/api/posture/*` (G1 unwrapped roster, G2 today's-story digest, G4
    * enforcement-evidenced Castle Wall arm state, G5 per-agent effective reach).
    *
-   * Auth: the JSON routes and the HTML page run through `checkAuth` — the SAME
-   * gate `/api/audit-log` uses — before this dispatcher is reached (the caller
+   * Auth: the JSON routes and the HTML page run through `checkAuth` - the SAME
+   * gate `/api/audit-log` uses - before this dispatcher is reached (the caller
    * checks it). Returns true when served, false to fall through to legacy.
    *
    * Dependencies are resolved lazily per request so post-unlock wiring (the
@@ -976,7 +1221,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `unreadable` → fail honestly (the readers force non-green via
     // `producerKeyExpectedButUnavailable`), never the channel basis.
     await this.ensureProducerKeyLoaded();
+    await this.ensureBrokerProducerKeyLoaded();
     const load = this._producerKeyLoad;
+    const brokerLoad = this._brokerProducerKeyLoad;
     // Recognition precursor: resolve the composition render-gate flag via the
     // canonical resolver (default-off). The fortress config carries no composition
     // input today, so this resolves to the honest `false` default; when an input
@@ -988,16 +1235,241 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       auditLog: this.auditLog ?? null,
       originMachine,
       compositionEnabled,
+      // Recognition panel (P5) impure sources, resolved lazily per request so
+      // post-unlock wiring is observed. Both are LOCAL reads only: a count of
+      // persisted bridge commitments, and the local attestation-store evidence
+      // (COUNTS, never a score). They are only consulted when the route builds
+      // the panel (composition-enabled); the panel is absent otherwise.
+      countBridgeCommitments: () => this.countBridgeCommitments(),
+      gatherRecognitionReputation: () => this.gatherRecognitionReputation(),
       listAgents: () => this.v11Bindings?.hubService.listAgents() ?? [],
+      // Fleet Console Slice 1: present the federation-backed fleet roster over
+      // the SAME live `V1FederationDeps` (and the SAME `isNodeRevoked`
+      // projection) the `/v1` federation endpoints use, so the panel's trust
+      // verdict is the federation layer's, never re-derived from a response
+      // shape. The eviction serial is fleet context only. Read-only: this builds
+      // a presentation object and drives no mutation, exposes no key material.
+      fleetRoster: () =>
+        buildFleetRoster(this.buildV1FederationDeps(), {
+          evictionSerial: this._federationState.evictionMaxSerial,
+        }),
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
+      resolveBrokerPinnedProducerKey: () =>
+        brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
+      brokerProducerKeyExpectedButUnavailable:
+        brokerLoad?.status === "unreadable",
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
       streamRegistry: this.postureStreamRegistry,
     };
     return handlePostureRoute(deps, req, res, url, method);
+  }
+
+  /**
+   * One-surface root-flip: the posture board is the default page served at BOTH
+   * `/` and `/posture`.
+   *
+   * Serves the posture-home HTML shell (`renderPostureHomeHTML`) byte-for-byte
+   * identically on the root path and the `/posture` alias. This is the one
+   * posture surface the embedded native web view and any browser both land on.
+   *
+   * Auth contract (Delta Review A3 remediation): the shell is a STATIC page that
+   * carries no posture data - it negotiates its own auth client-side (loopback
+   * auto-auth or a pasted bearer) and fetches `/api/posture/*` for every byte of
+   * evidence, and those JSON routes stay behind `checkAuth`. So the shell itself
+   * is served WITHOUT a server-side auth gate, identically on `/` and
+   * `/posture`. Previously `/` was served here (unauthenticated) while
+   * `/posture`'s HTML was served by the posture router AFTER `checkAuth`, so the
+   * two surfaces had divergent auth contracts and were only "equivalent" when
+   * the test rig disabled auth. Serving both here, before the auth gate, makes
+   * them genuinely one surface under the real production auth posture. The
+   * `/posture` HTML branch was removed from {@link handlePostureRoute}
+   * accordingly (it would now be unreachable); the data routes it owns are
+   * unchanged.
+   *
+   * Scope: this matches ONLY the bare root path (`/`) and the `/posture` alias.
+   * `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`, `/posture/agent/:id`, and every
+   * `/api/*` route (including the approval channel and the posture JSON API) are
+   * untouched and keep their existing handlers and auth gates.
+   *
+   * Surface scope: this standalone `DashboardApprovalChannel` owns live approval
+   * decisions. The SEPARATE co-located `wrap` server (`dashboard/api.ts`, the
+   * `sanctuary wrap` / "Protect" HTTP server) performs its own fold: `/` and
+   * `/posture` serve the posture shell, `/api/posture/*` stays behind read auth,
+   * and `/dashboard` + `/v1.1` remain v1.1 compatibility aliases.
+   *
+   * Returns true when it served the posture board shell; false to fall through
+   * to the existing v1.1 / legacy dispatch ladder.
+   */
+  private dispatchRootPosture(
+    res: ServerResponse,
+    url: URL,
+    method: string,
+  ): boolean {
+    if (
+      method !== "GET" ||
+      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+    ) {
+      return false;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureHomeHTML());
+    return true;
+  }
+
+  /**
+   * Build the evidence-gated Castle Wall arm-state the SAME way
+   * `/api/posture/castle-wall` derives it, so the AUTHENTICATED `/v1/status`
+   * document can report ONE honest arm-state instead of the dead
+   * `{ status: "unknown" }` placeholder it carried before.
+   *
+   * Auth scope (Delta Review A3 remediation): this is deliberately NOT exposed
+   * on the unauthenticated `/api/health` probe - that surface stays a cheap
+   * O(1) liveness answer with no posture and no audit scan. The detailed
+   * posture leaves the server only behind auth: this builder feeds the
+   * SESSION_TOKEN-gated `/v1/status` document (and `/api/posture/castle-wall`
+   * derives the same shape behind checkAuth). The native badge sources from
+   * `/api/posture/castle-wall`, never from `/api/health`.
+   *
+   * Resolves dependencies the same way {@link dispatchPosture} does (origin
+   * machine, the pinned producer key load, the unlocked audit log): green
+   * (`armed`) is derived by the ONE canonical {@link buildCastleWallPosture}
+   * shaper and nowhere else. The only divergence from the `/api/posture/...`
+   * route is the locked/absent-audit case: that route 503s (it need not answer
+   * when it cannot evidence posture), whereas a status document must answer 200,
+   * so this builder returns an honest `unknown` placeholder instead of routing
+   * through the shaper (whose `auditLog` input is typed non-null, so the null
+   * case genuinely cannot reach it). Honesty is preserved end-to-end: when the
+   * audit log is locked/absent, or the producer key is expected-but-unreadable,
+   * or evidence is stale, the result is `unknown` / `degraded` (never `armed`).
+   * Green (`armed`) is only ever returned for fresh, observed enforcement
+   * evidence, and only from the canonical shaper.
+   *
+   * Never throws into the request path: any unexpected failure resolves to an
+   * honest `unknown` posture so the status document always answers.
+   */
+  private async buildStatusCastleWall(): Promise<CastleWallPosture> {
+    const originMachine =
+      this.v11Bindings?.fortressId ??
+      this.identityManager?.getPrimaryIdentityId() ??
+      "local";
+    try {
+      // Reuse the same producer-key load + audit log + origin attribution the
+      // posture dispatcher uses, so the two surfaces can never diverge on green.
+      await this.ensureProducerKeyLoaded();
+      const load = this._producerKeyLoad;
+      if (this.auditLog === null) {
+        // No unlocked audit log ⇒ no enforcement evidence to read. Honest
+        // `unknown` (amber), never green, never a fabricated placeholder.
+        return {
+          origin_machine: originMachine,
+          arm_state: "unknown",
+          platform: mapPlatform(process.platform),
+          evidence_basis: "no_evidence",
+          last_enforcement_evidence_at: null,
+          // Report the real freshness window (not 0) so this fallback matches
+          // the canonical buildCastleWallPosture shaper, whose own
+          // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+          freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+          verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+          audit_integrity_ok: true,
+          producer_authenticity: "not_applicable",
+        };
+      }
+      // EAGER SCOPE (badge surface): `/v1/status` is the SESSION_TOKEN-gated
+      // operator status document the native app polls for the arm badge, exactly
+      // like the `/api/posture/castle-wall` route #717 already wraps. Run the
+      // shaper's audit read on the eagerly-maintained verified view so a badge
+      // poll on a 10k-entry chain is bounded-cost (O(1)) instead of an 11-30s
+      // full-chain re-verify per request. Honesty is unchanged: the eager view
+      // reflects every server-written entry with NO lag, the #717 fingerprint
+      // sentinel plus throttled backstop catch out-of-band tampering, and the
+      // shaper's own freshness/evidence gating (unknown / degraded, never armed
+      // without fresh verified evidence) is untouched: only WHERE its `query`
+      // runs changes. This is the operator/badge read, NOT the agent-facing
+      // `/api/posture/evidence` audit surface (which deliberately stays
+      // per-request re-verified).
+      return await this.auditLog.runEagerReads(() =>
+        buildCastleWallPosture({
+          auditLog: this.auditLog as AuditLog,
+          originMachine,
+          pinnedProducerKeyB64url:
+            load?.status === "present" ? load.keyB64url : null,
+          ...(load?.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
+    } catch {
+      // Defensive: a health probe must never fail. Fall back to an honest
+      // `unknown` posture rather than throwing or claiming green.
+      return {
+        origin_machine: originMachine,
+        arm_state: "unknown",
+        platform: mapPlatform(process.platform),
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        // Report the real freshness window (not 0) so this fallback matches
+        // the canonical buildCastleWallPosture shaper, whose own
+        // unknown/degraded fallbacks all return DEFAULT_ENFORCEMENT_FRESHNESS_MS.
+        freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        producer_authenticity: "not_applicable",
+      };
+    }
+  }
+
+  /**
+   * Recognition panel (P5): count persisted Concordia-bridge commitments by
+   * listing the reserved `_bridge` namespace. This is the "committed receipts"
+   * count - a LOCAL storage read with NO Concordia process running and NO
+   * external fetch. Returns `undefined` when no storage backend is wired so the
+   * shaper takes its documented audit-event lower-bound fallback (returning `0`
+   * would assert a fact - "zero bridge commitments" - that an un-wired store
+   * cannot establish, suppressing the fallback). A list failure likewise
+   * propagates so the route layer's try/catch degrades to the audit-event count
+   * rather than fabricating a number.
+   */
+  private async countBridgeCommitments(): Promise<number | undefined> {
+    if (!this.storage) return undefined;
+    const entries = await this.storage.list("_bridge");
+    return entries.length;
+  }
+
+  /**
+   * Recognition panel (P5): gather LOCAL reputation EVIDENCE (attestation counts,
+   * tier distribution, dispute count, most-recent timestamp, and the local
+   * `verascore_linked` publish flag) for the primary identity. This reads the
+   * local attestation store ONLY - it never fetches a Verascore (or any vendor)
+   * score, and it returns COUNTS, not a number-on-a-scale. Returns `null` when
+   * the storage backend, master key, or a primary identity is unavailable, which
+   * the panel renders as an amber "no evidence yet" row (never green).
+   */
+  private async gatherRecognitionReputation(): Promise<RecognitionReputationEvidence | null> {
+    if (!this.storage || !this.shrOpts || !this.identityManager) return null;
+    const identity = this.identityManager.getDefault();
+    if (!identity) return null;
+    const reputationStore = new ReputationStore(this.storage, this.shrOpts.masterKey);
+    if (this.auditLog === null) return null;
+    const evidence = await gatherReputationEvidence(reputationStore, this.auditLog, {
+      identity_id: identity.identity_id,
+      did: identity.did,
+    });
+    // Project to the panel's evidence shape (counts only; never a score).
+    return {
+      attestation_count: evidence.attestation_count,
+      tier_distribution: evidence.tier_distribution,
+      most_recent_attestation_at: evidence.most_recent_attestation_at,
+      dispute_count: evidence.dispute_count,
+      verascore_linked: evidence.verascore_linked,
+    };
   }
 
   /**
@@ -1037,10 +1509,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
     // Only `present` is a permanent cache (the `status === "present"` guard
     // above short-circuits future loads). `unreadable` is stored so THIS request
-    // fails honestly, and `absent` is stored as undefined — both are re-evaluated
+    // fails honestly, and `absent` is stored as undefined - both are re-evaluated
     // on the next request, so a post-provision write (or a fixed permission) is
     // always picked up.
     this._producerKeyLoad = load.status === "absent" ? undefined : load;
+  }
+
+  private async ensureBrokerProducerKeyLoaded(): Promise<void> {
+    if (this._brokerProducerKeyLoad?.status === "present") return;
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) {
+      this._brokerProducerKeyLoad = undefined;
+      return;
+    }
+    let load: BrokerProducerKeyLoad;
+    try {
+      load = await loadBrokerProducerKey(storagePath);
+    } catch {
+      load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
+    }
+    this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
   }
 
   /**
@@ -1049,14 +1537,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * `{ ok, version, daemon, listener, federation, identity, castle_wall }`.
    *
    * Field discipline: identity is an EXPLICIT pick of public fields from
-   * the stored identity — never a spread, so the encrypted private key
+   * the stored identity - never a spread, so the encrypted private key
    * blob can never ride along into an HTTP response (CLAUDE.md
    * constraint 6). Federation is honestly `enabled: false` until the
-   * PR-A3 listener work; castle_wall reports `unknown` until status
-   * wiring lands later in the stack.
+   * PR-A3 listener work.
+   *
+   * Delta Review A3: `castle_wall` now carries the SAME evidence-gated arm-state
+   * `/api/posture/castle-wall` derives (via the canonical
+   * {@link buildStatusCastleWall} → {@link buildCastleWallPosture} path), not the
+   * old dead `{ status: "unknown" }` placeholder. This document is served ONLY
+   * to a SESSION_TOKEN holder with the status-read capability, so the detailed
+   * posture (and the audit scan that derives it) stays behind auth - it is NOT
+   * on the unauthenticated `/api/health` probe. Honesty is preserved: the shaper
+   * returns `unknown` / `degraded` (never `armed`) whenever there is no fresh,
+   * verified enforcement evidence.
    */
-  private buildV1FullStatus(): Record<string, unknown> {
+  private async buildV1FullStatus(): Promise<Record<string, unknown>> {
     const identity = this.identityManager?.getDefault();
+    const castleWall = await this.buildStatusCastleWall();
+    const federationPosture = this.buildFederationPostureSummary();
     return {
       ok: true,
       version: PKG_VERSION,
@@ -1073,6 +1572,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         enabled: this._federationEnabled && this._federationContext !== null,
         provisioned: this._federationContext !== null,
         roster_size: this._federationRoster.size,
+        operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+        provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+        tee_attested: federationPosture.tee_attested,
+        trust_boundary: federationPosture,
       },
       identity: identity
         ? {
@@ -1083,7 +1586,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             created_at: identity.created_at,
           }
         : null,
-      castle_wall: { status: "unknown" },
+      castle_wall: castleWall,
     };
   }
 
@@ -1164,7 +1667,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * the old identity's agents (multi-identity isolation). But
    * `v11Bindings.identityId` may be a SYNTHETIC fortress-scoped id
    * (`fortress:<path>`) on a fresh standalone boot, where the real signing
-   * identity only exists as the default — there `get()` returns undefined and
+   * identity only exists as the default - there `get()` returns undefined and
    * we fall back to the default so valid signed requests are not rejected. The
    * hub is single-operator in v1.1, so the fallback does not widen authority.
    */
@@ -1190,8 +1693,189 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * flag (a federation with no materials cannot be enabled).
    */
   setFederationContext(ctx: FederationContext | null): void {
+    this.stopFederationCertificateAutoRenewal();
+    if (ctx !== null) {
+      assertNonIssuerContextHasNoIssuerAuthority(ctx);
+    }
     this._federationContext = ctx;
-    if (ctx === null) this._federationEnabled = false;
+    if (ctx === null) {
+      this._federationEnabled = false;
+      this._federationState = {
+        ...this._federationState,
+        revoked: new Set<string>(),
+        evictionMaxSerial: 0,
+      };
+      return;
+    }
+    this.reprojectFederationRevocations(ctx);
+    ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
+    this._federationRenewal = startFederationNodeCertificateAutoRenewal({
+      renewNow: () => this.renewLocalFederationNodeCertificate(),
+      config: ctx.nodeCertificateRenewal,
+    });
+  }
+
+  /** True when federation materials are bound (issuer or joiner context). */
+  isFederationProvisioned(): boolean {
+    return this._federationContext !== null;
+  }
+
+  /**
+   * Federation 3/3b P0: bind the durable peer-sync security-state store and
+   * rehydrate it. Call from the boot path AFTER {@link setFederationContext}
+   * (the projection it loads supersedes the empty-log reprojection
+   * setFederationContext just ran). Tests / minimal rigs that never call this
+   * run purely in memory with the same fail-closed semantics.
+   *
+   * FAIL-CLOSED (DUR-4 / CC-2): a record that is PRESENT but
+   * undecryptable/unparseable (at-rest tamper/corruption) makes the load THROW.
+   * We catch it, latch {@link _federationSyncStateUnavailable} so the sync paths
+   * DENY (never serve on empty anti-replay + empty revocation memory), and
+   * return so the daemon still boots provisioned-but-not-serving rather than
+   * crashing or silently resetting. A clean load clears the latch and
+   * rehydrates all four fields; an absent record (fresh fortress) loads the
+   * empty/zero snapshot and serves normally.
+   */
+  async setFederationSyncStateStore(
+    store: FederationSyncStateStore | null,
+  ): Promise<void> {
+    this._federationSyncStateStore = store;
+    if (store === null) {
+      this._federationSyncStateUnavailable = false;
+      return;
+    }
+    await this.hydrateFederationSyncState();
+  }
+
+  /**
+   * Federation 3c-2: bind the durable server-issued challenge spent-set for the
+   * pre-session node-cert reissue endpoint. Minimal rigs default to an in-memory
+   * store; production boot replaces it with a durable store so accepted proofs
+   * cannot be replayed after restart. A present-but-corrupt record latches the
+   * endpoint unavailable (fail closed) without preventing dashboard boot.
+   */
+  async setFederationReissueChallengeStore(
+    store: FederationReissueChallengeStore | null,
+  ): Promise<void> {
+    this._federationReissueChallengeStore = store ?? new FederationReissueChallengeStore();
+    this._federationReissueChallengeStoreUnavailable = false;
+    if (store === null) return;
+    try {
+      await store.init();
+    } catch {
+      this._federationReissueChallengeStoreUnavailable = true;
+    }
+  }
+
+  /**
+   * Load the durable sync-state snapshot into the live in-memory fields.
+   * Internal to {@link setFederationSyncStateStore}; separated for testability.
+   */
+  private async hydrateFederationSyncState(): Promise<void> {
+    const store = this._federationSyncStateStore;
+    if (store === null) return;
+    let snapshot: FederationSyncStateSnapshot;
+    try {
+      snapshot = await store.load();
+    } catch {
+      // Present-but-corrupt -> fail closed. Do NOT touch the live fields (no
+      // half-applied state); latch unavailability so every sync path denies.
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    this._federationSyncStateUnavailable = false;
+    this._federationAcceptedHighWater.clear();
+    for (const [nodeId, highWater] of snapshot.acceptedHighWater) {
+      this._federationAcceptedHighWater.set(nodeId, highWater);
+    }
+    // Never regress the outbound counter below an already-issued value.
+    this._federationOutboundHighWater = Math.max(
+      this._federationOutboundHighWater,
+      snapshot.outboundHighWater,
+    );
+    // The durable revocation projection is the SOLE post-restart guarantor of
+    // who is revoked (CC-2). It supersedes the empty-log reprojection: union the
+    // durable revoked-set over the live one and lift the eviction-serial floor.
+    const mergedRevoked = new Set(this._federationState.revoked);
+    for (const nodeId of snapshot.revokedNodeIds) mergedRevoked.add(nodeId);
+    this._federationState = {
+      ...this._federationState,
+      revoked: mergedRevoked,
+      evictionMaxSerial: Math.max(
+        this._federationState.evictionMaxSerial,
+        snapshot.highestEvictionSerial,
+      ),
+    };
+    // Slice 3c-1: rehydrate the durable revoked-ROOT projection so a compromise
+    // rotate's revocation of the old root SURVIVES a restart. This is the
+    // standing-weakness fix for roots: union the durable set over the live one
+    // (grow-only) and lift the revocation-serial floor. _federationRevokedRoots
+    // is the set every enforcement chokepoint (sync, /sync/peer, join) reads.
+    for (const pubkey of snapshot.revokedRootPubkeys) {
+      this._federationRevokedRoots.add(pubkey);
+    }
+    this._federationHighestRevocationSerial = Math.max(
+      this._federationHighestRevocationSerial,
+      snapshot.highestRevocationSerial,
+    );
+  }
+
+  /**
+   * Snapshot the live federation security state for the durable store.
+   *
+   * This carries ONLY this daemon's own in-memory copy of the revoked-ROOT
+   * projection. That copy is NOT, on its own, sufficient to preserve a revocation
+   * the out-of-band `rotate-root --compromised` CLI committed while the daemon was
+   * running: the daemon never learns of the CLI's write, so a high-water/eviction
+   * persist built from this snapshot would, by itself, omit that revoked root. The
+   * cross-process preservation is enforced ONE layer down, by
+   * {@link FederationSyncStateStore} (`writeNow`): it holds a cross-process lock
+   * across the WHOLE read-modify-write (so the daemon's read-modify-write cannot
+   * interleave with the CLI's) and then MONOTONICALLY UNIONs the grow-only security
+   * fields (revoked node ids, revoked root pubkeys, the serial floors, the per-peer
+   * high-waters) over this snapshot before encrypting. So a daemon persist can
+   * never clobber a CLI-committed root revocation, even under a genuine write
+   * overlap; the corrected invariant is "the store's locked read-modify-write
+   * preserves every committed revocation across re-persists," NOT "this snapshot
+   * already contains them."
+   */
+  private snapshotFederationSyncState(): FederationSyncStateSnapshot {
+    return {
+      acceptedHighWater: new Map(this._federationAcceptedHighWater),
+      outboundHighWater: this._federationOutboundHighWater,
+      revokedNodeIds: new Set(this._federationState.revoked),
+      highestEvictionSerial: this._federationState.evictionMaxSerial,
+      revokedRootPubkeys: new Set(this._federationRevokedRoots),
+      highestRevocationSerial: this._federationHighestRevocationSerial,
+    };
+  }
+
+  /**
+   * Persist the current federation security-state snapshot. A no-op (resolves)
+   * when no durable store is wired (in-memory rigs). THROWS on a store write
+   * failure so the caller can fail closed: a security-state advance MUST NOT be
+   * acknowledged unless it durably committed.
+   */
+  private async persistFederationSyncState(): Promise<void> {
+    const store = this._federationSyncStateStore;
+    if (store === null) return;
+    await store.persist(this.snapshotFederationSyncState());
+  }
+
+  /** RR-1 (Federation 3/3b P0): is this fortress-master (root) pubkey revoked? */
+  private isFederationRootRevoked(masterPubkeyB64u: string): boolean {
+    return this._federationRevokedRoots.has(masterPubkeyB64u);
+  }
+
+  /**
+   * Fail-closed guard (DUR-4): THROW when the durable sync-state record was
+   * present-but-corrupt on boot, so the sync paths that catch it deny rather
+   * than operate on empty anti-replay + empty revocation memory.
+   */
+  private assertFederationSyncStateAvailable(): void {
+    if (this._federationSyncStateUnavailable) {
+      throw new Error("federation_sync_state_unavailable");
+    }
   }
 
   /**
@@ -1210,31 +1894,106 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       rosterNodeIds: () => [...this._federationRoster],
-      recordJoin: (nodeId) => {
-        this._federationRoster.add(nodeId);
-        this.upsertFederationNode(nodeId, {
+      recordJoin: (certificate) => {
+        this._federationRoster.add(certificate.node_id);
+        this.upsertFederationNode(certificate.node_id, {
           attestation_status: "verified",
+          node_mode: certificate.node_mode,
         });
         this.appendLocalFederationEvent("node.joined", {
-          node_id: nodeId,
+          node_id: certificate.node_id,
+          node_mode: certificate.node_mode,
         });
       },
-      listNodes: () => [...this._federationNodes.values()],
+      listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
-      appendFederationEvents: (events) => this.appendFederationEvents(events),
+      appendFederationEvents: async (events, options) => {
+        // Fail closed: if the durable record was present-but-corrupt on boot,
+        // refuse to append on empty/untrusted revocation memory.
+        this.assertFederationSyncStateAvailable();
+        const before = this._federationState.evictionMaxSerial;
+        const result = this.appendFederationEvents(events, options);
+        // Persist ONLY when an operator-authority eviction advanced the durable
+        // revocation projection. On a persist failure THROW so the handler
+        // denies this sync (no false "accepted" acknowledgment), but DELIBERATELY
+        // do NOT un-apply the in-memory revocation: revocation is grow-only and
+        // "revoked in memory but not yet durable" is the FAIL-SAFE direction
+        // (un-revoking would be the dangerous one). The whole-snapshot persist is
+        // idempotent, so the next successful security-state write (the peer's
+        // retry, a later eviction, or any accepted high-water) carries this
+        // revocation to disk; the worst case is the SAME pre-existing
+        // forgotten-on-restart window this slice otherwise closes, never a
+        // silent un-revoke.
+        if (this._federationState.evictionMaxSerial > before) {
+          await this.persistFederationSyncState();
+        }
+        return result;
+      },
       acceptedHighWaterFor: (senderNodeId) =>
         this._federationAcceptedHighWater.get(senderNodeId) ?? null,
-      recordAcceptedHighWater: (senderNodeId, highWater) => {
+      recordAcceptedHighWater: async (senderNodeId, highWater, certificate) => {
+        // Fail closed on an unavailable durable record (corrupt-on-boot).
+        if (this._federationSyncStateUnavailable) return false;
         const prior = this._federationAcceptedHighWater.get(senderNodeId) ?? 0;
         // Defensive: only ever advance (the handler already gates rollback).
-        if (highWater > prior) {
+        const advanced = highWater > prior;
+        if (advanced) {
           this._federationAcceptedHighWater.set(senderNodeId, highWater);
         }
         this.upsertFederationNode(senderNodeId, {
           attestation_status: "verified",
+          ...(certificate ? { node_mode: certificate.node_mode } : {}),
         });
+        // Persist the advance BEFORE acknowledging it. On a persist failure roll
+        // the high-water back and report false so the handler denies (the accept
+        // is not acknowledged with a high-water that a restart would forget).
+        if (advanced) {
+          try {
+            await this.persistFederationSyncState();
+          } catch {
+            this._federationAcceptedHighWater.set(senderNodeId, prior);
+            return false;
+          }
+        }
+        return true;
       },
-      nextOutboundHighWater: () => ++this._federationOutboundHighWater,
+      nextOutboundHighWater: async () => {
+        // Fail closed on an unavailable durable record (corrupt-on-boot).
+        this.assertFederationSyncStateAvailable();
+        const next = ++this._federationOutboundHighWater;
+        try {
+          // Persist the reserved counter BEFORE handing it out so a restart can
+          // never re-emit it. On failure roll back and THROW (caller omits the
+          // reciprocal slice rather than signing on an un-committed counter).
+          await this.persistFederationSyncState();
+        } catch (err) {
+          // Roll back ONLY if no concurrent caller advanced past us (decrement is
+          // monotonic-safe: if another reservation already bumped the counter, a
+          // blind `next - 1` would clobber it, so only undo our own increment).
+          if (this._federationOutboundHighWater === next) {
+            this._federationOutboundHighWater = next - 1;
+          }
+          throw err;
+        }
+        return next;
+      },
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      isRootRevoked: (masterPubkeyB64u) =>
+        this.isFederationRootRevoked(masterPubkeyB64u),
+      renewLocalNodeCertificate: () => {
+        this.renewLocalFederationNodeCertificate();
+      },
+      issueReissueChallenge: async (params) => {
+        if (this._federationReissueChallengeStoreUnavailable) {
+          throw new Error("federation_reissue_challenge_store_unavailable");
+        }
+        return this._federationReissueChallengeStore.issue(params);
+      },
+      consumeReissueChallenge: async (params) => {
+        if (this._federationReissueChallengeStoreUnavailable) return false;
+        return this._federationReissueChallengeStore.consume(params);
+      },
+      federationPosture: () => this.buildFederationPostureSummary(),
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
@@ -1246,18 +2005,121 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     };
   }
 
+  private stopFederationCertificateAutoRenewal(): void {
+    this._federationRenewal?.stop();
+    this._federationRenewal = null;
+  }
+
+  private renewLocalFederationNodeCertificate(): void {
+    const ctx = this._federationContext;
+    if (ctx === null) return;
+    if (!federationContextHasIssuerAuthority(ctx)) return;
+    const result = renewNodeIdentityCertificateIfDue({
+      certificate: ctx.localNodeCert ?? null,
+      localNodeId: ctx.nodeId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+      operatorPrincipalPrivateKey: ctx.getIssuingPrincipalPrivateKey(),
+      masterPrivateKey: ctx.getMasterPrivateKey?.(),
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      config: ctx.nodeCertificateRenewal,
+    });
+    if (result.renewed) {
+      ctx.localNodeCert = result.certificate;
+      void this.auditLog?.append(
+        "l2",
+        "v1_federation_node_cert_auto_renewed",
+        result.certificate.node_id,
+        {
+          previous_expires_at: result.previousExpiresAt,
+          next_expires_at: result.nextExpiresAt,
+        },
+        "success",
+      ).catch(() => {
+        // Best-effort observability only; renewal already completed.
+      });
+    }
+  }
+
+  private isFederationNodeRevoked(nodeId: string): boolean {
+    return this._federationState.revoked.has(nodeId);
+  }
+
+  private reprojectFederationRevocations(ctx: FederationContext): void {
+    const projection = {
+      revokedNodeIds: new Set<string>(),
+      highestEvictionSerial: 0,
+    };
+    const events = this._federationState.eventLog
+      .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
+      .sort((a, b) => a.sequence - b.sequence);
+    for (const event of events) {
+      const folded = foldAcceptedFederationNodeEvictionEvent({
+        event,
+        projection,
+        fortressId: ctx.fortressId,
+      });
+      if (!folded.ok) continue;
+    }
+    this._federationState = {
+      ...this._federationState,
+      revoked: projection.revokedNodeIds,
+      evictionMaxSerial: projection.highestEvictionSerial,
+    };
+  }
+
+  private foldFederationEvictionEvent(
+    event: FederationEvent,
+    projection: {
+      revokedNodeIds: Set<string>;
+      highestEvictionSerial: number;
+    },
+  ): { ok: true } | { ok: false; reason: string } {
+    const ctx = this._federationContext;
+    if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
+    const folded = foldFederationNodeEvictionEvent({
+      event,
+      projection,
+      fortressId: ctx.fortressId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+    });
+    if (!folded.ok) return { ok: false, reason: folded.reason };
+    return { ok: true };
+  }
+
   private upsertFederationNode(
     nodeId: string,
     update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
     },
   ): FederationNodeView {
+    const nextNodes = new Map(this._federationState.nodes);
+    const node = this.buildFederationNodeUpsert(nextNodes, nodeId, update);
+    nextNodes.set(nodeId, node);
+    this._federationState = {
+      ...this._federationState,
+      nodes: nextNodes,
+    };
+    return node;
+  }
+
+  private buildFederationNodeUpsert(
+    nodes: Map<string, FederationNodeView>,
+    nodeId: string,
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+      last_sync?: Partial<FederationNodeView["last_sync"]>;
+    },
+  ): FederationNodeView {
     const now = new Date().toISOString();
-    const existing = this._federationNodes.get(nodeId);
-    const node: FederationNodeView = {
+    const existing = nodes.get(nodeId);
+    const nodeMode = update?.node_mode ?? existing?.node_mode ?? "unknown";
+    const posture = this.buildFederationNodePosture(nodeMode);
+    return {
       node_id: nodeId,
       label: update?.label ?? existing?.label ?? null,
       attestation_status: update?.attestation_status ?? existing?.attestation_status ?? "unknown",
+      ...posture,
       first_seen: existing?.first_seen ?? update?.first_seen ?? now,
       last_seen: update?.last_seen ?? now,
       last_sync: {
@@ -1266,8 +2128,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
       },
     };
-    this._federationNodes.set(nodeId, node);
-    return node;
+  }
+
+  private buildFederationNodePosture(
+    nodeMode: NodeModeForPosture,
+  ): ReturnType<typeof deriveNodePosture> {
+    return deriveNodePosture({
+      nodeMode,
+      verifiedTeeEvidence: false,
+    });
+  }
+
+  private buildFederationPostureSummary(): FederationPostureSummary {
+    const nodes = [...this._federationState.nodes.values()];
+    const localNodes = nodes.filter((node) => node.node_mode === "local").length;
+    const operatorCloudNodes = nodes.filter((node) => node.node_mode === "operator_cloud").length;
+    const sovereignTeeNodes = nodes.filter((node) => node.node_mode === "sovereign_tee").length;
+    const unknownNodes = nodes.filter((node) => node.node_mode === "unknown").length;
+    const providerInTrustBoundary = nodes.some(
+      (node) => node.trust_boundary.provider_in_trust_boundary,
+    );
+    const teeAttested = nodes.some((node) => node.tee_attested === true);
+    return {
+      version: NODE_TRUST_BOUNDARY_VERSION,
+      local_nodes: localNodes,
+      operator_cloud_nodes: operatorCloudNodes,
+      sovereign_tee_nodes: sovereignTeeNodes,
+      unknown_nodes: unknownNodes,
+      provider_in_trust_boundary: providerInTrustBoundary,
+      tee_attested: teeAttested,
+      disclosure: operatorCloudNodes > 0 ? OPERATOR_CLOUD_DISCLOSURE : null,
+    };
   }
 
   /**
@@ -1275,7 +2166,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * attested on THIS node. The event rides the hash-chained log and, once a
    * peer accepts the envelope that carries it (cert-chain verified), the agent
    * is RECOGNIZED across the operator's machines without re-minting its
-   * identity — the "identity survives a substrate move" property. Called by the
+   * identity - the "identity survives a substrate move" property. Called by the
    * agent-protect path (and by the marquee integration test) when a fortress
    * node admits an agent. Returns the appended event for the caller to surface.
    */
@@ -1287,7 +2178,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private appendLocalFederationEvent(kind: string, payload: Record<string, unknown>): FederationEvent {
     const originNodeId = this._federationContext?.nodeId ?? "local";
-    const previous = [...this._federationEventLog]
+    const previous = [...this._federationState.eventLog]
       .reverse()
       .find((event) => event.origin_node_id === originNodeId);
     const eventWithoutHash = {
@@ -1303,22 +2194,79 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...eventWithoutHash,
       event_hash: federationEventHash(eventWithoutHash),
     };
-    this._federationEventLog.push(event);
+    this._federationState = {
+      ...this._federationState,
+      eventLog: [...this._federationState.eventLog, event],
+    };
     return event;
   }
 
   private listFederationEvents(since?: FederationSyncCursor): FederationEvent[] {
     const nodeId = since?.node_id;
     const after = since?.after_sequence ?? 0;
-    return this._federationEventLog.filter((event) => {
+    return this._federationState.eventLog.filter((event) => {
       if (nodeId && event.origin_node_id !== nodeId) return false;
       return event.sequence > after;
     });
   }
 
-  private appendFederationEvents(events: FederationEvent[]): FederationAppendResult {
+  private appendFederationEvents(
+    events: FederationEvent[],
+    options?: FederationAppendOptions,
+  ): FederationAppendResult {
+    const ctx = this._federationContext;
+    if (ctx === null) {
+      return {
+        accepted: [],
+        rejected: events.map((event) => ({
+          event_id: event.event_id,
+          reason: "federation_not_provisioned",
+        })),
+      };
+    }
+    return acceptFederationEventsFailClosed({
+      events,
+      fortressId: ctx.fortressId,
+      senderNodeId: options?.senderNodeId,
+      wireVersion: options?.wireVersion,
+      isNodeRevoked: (nodeId) => this.isFederationNodeRevoked(nodeId),
+      validateEvents: (batch) =>
+        this.validateFederationEventsAfterRevocationGate(batch),
+      appendEvents: (batch) =>
+        this.appendFederationEventsAfterRevocationGate(batch),
+    });
+  }
+
+  private validateFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
+  private appendFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult {
+    const staged = this.stageFederationEventsAfterRevocationGate(events);
+    this._federationState = staged.nextState;
+    return { accepted: staged.accepted, rejected: staged.rejected };
+  }
+
+  private stageFederationEventsAfterRevocationGate(
+    events: FederationEvent[],
+  ): FederationAppendResult & {
+    nextState: FederationDashboardState;
+  } {
     const accepted: FederationEvent[] = [];
     const rejected: Array<{ event_id: string; reason: string }> = [];
+    const currentState = this._federationState;
+    const nextEventLog = [...currentState.eventLog];
+    const knownEventIds = new Set(currentState.eventLog.map((event) => event.event_id));
+    const nextNodes = new Map(currentState.nodes);
+    const evictionProjection = {
+      revokedNodeIds: new Set(currentState.revoked),
+      highestEvictionSerial: currentState.evictionMaxSerial,
+    };
     const byNode = new Map<string, FederationEvent[]>();
     for (const event of events) {
       const list = byNode.get(event.origin_node_id) ?? [];
@@ -1328,7 +2276,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     for (const [nodeId, nodeEvents] of byNode) {
       nodeEvents.sort((a, b) => a.sequence - b.sequence);
-      let last = [...this._federationEventLog]
+      let last = [...nextEventLog]
         .reverse()
         .find((event) => event.origin_node_id === nodeId);
       for (const event of nodeEvents) {
@@ -1336,7 +2284,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "hash_mismatch" });
           continue;
         }
-        if (this._federationEventLog.some((existing) => existing.event_id === event.event_id)) {
+        if (knownEventIds.has(event.event_id)) {
           rejected.push({ event_id: event.event_id, reason: "replay" });
           continue;
         }
@@ -1348,19 +2296,52 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           rejected.push({ event_id: event.event_id, reason: "previous_hash_mismatch" });
           continue;
         }
-        this._federationEventLog.push(event);
+        const ctx = this._federationContext;
+        const operatorAuthorityOrigin =
+          ctx === null ? null : federationOperatorAuthorityOrigin(ctx.fortressId);
+        const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+        const isAuthorityOrigin =
+          operatorAuthorityOrigin !== null &&
+          event.origin_node_id === operatorAuthorityOrigin;
+        if (isEvictionKind || isAuthorityOrigin) {
+          if (
+            ctx === null ||
+            !isFederationOperatorAuthorityEvent(event, ctx.fortressId)
+          ) {
+            rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
+            continue;
+          }
+          const folded = this.foldFederationEvictionEvent(event, evictionProjection);
+          if (!folded.ok) {
+            rejected.push({ event_id: event.event_id, reason: folded.reason });
+            continue;
+          }
+        }
+        nextEventLog.push(event);
+        knownEventIds.add(event.event_id);
         accepted.push(event);
         last = event;
-        this.upsertFederationNode(nodeId, {
-          attestation_status: "verified",
-          last_sync: {
-            received_at: new Date().toISOString(),
-            last_sequence: event.sequence,
-          },
-        });
+        if (!isAuthorityOrigin) {
+          nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
+            attestation_status: "verified",
+            last_sync: {
+              received_at: new Date().toISOString(),
+              last_sequence: event.sequence,
+            },
+          }));
+        }
       }
     }
-    return { accepted, rejected };
+    return {
+      accepted,
+      rejected,
+      nextState: {
+        eventLog: nextEventLog,
+        revoked: evictionProjection.revokedNodeIds,
+        evictionMaxSerial: evictionProjection.highestEvictionSerial,
+        nodes: nextNodes,
+      },
+    };
   }
 
   /**
@@ -1489,6 +2470,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       clearInterval(this.sessionCleanupTimer);
       this.sessionCleanupTimer = null;
     }
+    this.stopFederationCertificateAutoRenewal();
 
     // Clean up rate limit tracking
     this.rateLimits.clear();
@@ -1510,7 +2492,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Also write to stderr as a fallback notification
     process.stderr.write(
-      `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) — open dashboard to respond\n`
+      `[Sanctuary] Approval required: ${request.operation} (Tier ${request.tier}) - open dashboard to respond\n`
     );
 
     return new Promise<ApprovalResponse>((resolve) => {
@@ -1559,7 +2541,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Verify bearer token authentication.
    *
    * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
-   * header — never in URL query strings. For SSE and page loads that cannot
+   * header - never in URL query strings. For SSE and page loads that cannot
    * set headers, a short-lived session token (obtained via POST /auth/session)
    * is accepted via ?session= query parameter.
    *
@@ -1573,7 +2555,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   ): boolean {
     if (!this.authToken) return true; // Auth disabled
 
-    // v0.10.2: loopback auto-auth — see _autoAuthLocalhost comment.
+    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment.
     //
     // SCOPE LIMIT (loopback-no-autoauth-for-approvals): `requireToken`
     // suppresses this shortcut so a state-changing approval decision
@@ -1617,12 +2599,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
-    // This was the vulnerability — tokens in URLs leak to logs, history, and Referer headers.
+    // This was the vulnerability - tokens in URLs leak to logs, history, and Referer headers.
 
     // For GET / requests from browsers, serve login page instead of JSON 401
     // (checked in handleRequest before checkAuth is called for this path)
     res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized — use Authorization: Bearer header or a valid session" }));
+    res.end(JSON.stringify({ error: "Unauthorized - use Authorization: Bearer header or a valid session" }));
     return false;
   }
 
@@ -1705,7 +2687,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Validate a session ID — must exist and not be expired.
+   * Validate a session ID - must exist and not be expired.
    */
   private validateSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
@@ -1741,6 +2723,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Federation P1 DoS hardening: derive the rate-limit MAP KEY for an address.
+   * For the federation peer class we aggregate IPv6 addresses to their /64
+   * prefix, so an attacker who rotates source addresses within a single /64
+   * (the smallest routable IPv6 allocation, trivially obtained) shares ONE
+   * bucket instead of getting a fresh budget per address. IPv4 and non-IPv6
+   * literals are keyed verbatim (no /64 concept). The dashboard/browser classes
+   * keep per-exact-address keying (a NAT'd office should not share a browser
+   * bucket).
+   */
+  private rateLimitKey(addr: string, aggregateIpv6: boolean): string {
+    if (!aggregateIpv6) return addr;
+    return ipv6Slash64Prefix(addr) ?? addr;
+  }
+
+  /**
    * v1.3.0 (XXXXX): loopback addresses are exempt from rate limiting.
    * The operator's local browser, autonomous tooling, and drill-via-curl
    * flows should never be locked out of their own dashboard.
@@ -1750,41 +2747,81 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Per-class rate-limit policy. The dashboard/browser classes exempt loopback
+   * (operator-local requests must never 429) and key per exact address. The
+   * federation peer class does NEITHER: it must throttle loopback (a tunneled
+   * remote peer can present as loopback) and aggregates IPv6 to /64 (DoS
+   * hardening). Centralized so the policy difference is in one place.
+   */
+  private rateLimitPolicy(type: RateLimitClass): {
+    limit: number;
+    exemptLoopback: boolean;
+    aggregateIpv6: boolean;
+  } {
+    switch (type) {
+      case "decisions":
+        return { limit: RATE_LIMIT_DECISIONS, exemptLoopback: true, aggregateIpv6: false };
+      case "federation_peer":
+        return {
+          limit: RATE_LIMIT_FEDERATION_PEER,
+          exemptLoopback: false,
+          aggregateIpv6: true,
+        };
+      case "general":
+      default:
+        return { limit: RATE_LIMIT_GENERAL, exemptLoopback: true, aggregateIpv6: false };
+    }
+  }
+
+  /**
    * Check rate limit for a request. Returns true if allowed, false if rate-limited.
    * When rate-limited, sends a 429 response.
    *
-   * v1.3.0 (XXXXX): loopback addresses bypass rate limiting entirely.
+   * v1.3.0 (XXXXX): the dashboard/browser classes ("general"/"decisions") exempt
+   * loopback (operator-local requests: browser polling, autonomous tooling,
+   * drill-via-curl) must never 429. Federation P1: the "federation_peer" class
+   * does NOT exempt loopback and aggregates IPv6 to /64 (see rateLimitPolicy).
+   *
+   * NO-ORACLE (Federation P1 §2/§3): the 429 fires identically for every caller
+   * regardless of federation membership/enabled-state. It runs BEFORE any
+   * federation-state check, so it leaks only "you are being throttled". The body
+   * carries NO federation-state detail and the Retry-After is derived purely from
+   * the FIXED window bucket (oldest timestamp + window), never from any internal
+   * federation state, so it is not a timing oracle.
    */
   private checkRateLimit(
     req: IncomingMessage,
     res: ServerResponse,
-    type: "general" | "decisions"
+    type: RateLimitClass
   ): boolean {
+    const { limit, exemptLoopback, aggregateIpv6 } = this.rateLimitPolicy(type);
     const addr = this.getRemoteAddr(req);
 
-    // v1.3.0 (XXXXX): loopback is always allowed. Operator-local requests
-    // (browser polling, autonomous tooling, drill-via-curl) must never 429.
-    if (this.isLoopbackAddr(addr)) return true;
+    // Loopback exemption is per-class: dashboard/browser classes keep it; the
+    // federation peer class drops it (a tunneled remote peer can present as
+    // loopback, and the exemption is itself a probing asymmetry).
+    if (exemptLoopback && this.isLoopbackAddr(addr)) return true;
 
+    const key = this.rateLimitKey(addr, aggregateIpv6);
     const now = Date.now();
     const windowStart = now - RATE_LIMIT_WINDOW_MS;
 
-    // Get or create entry for this address
-    let entry = this.rateLimits.get(addr);
+    // Get or create entry for this key
+    let entry = this.rateLimits.get(key);
     if (!entry) {
       // Cap the tracking map to prevent memory exhaustion
       if (this.rateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
         this.pruneRateLimits(now);
       }
-      entry = { general: [], decisions: [] };
-      this.rateLimits.set(addr, entry);
+      entry = { general: [], decisions: [], federation_peer: [] };
+      this.rateLimits.set(key, entry);
     }
 
     // Prune old timestamps from the window
     entry.general = entry.general.filter(t => t > windowStart);
     entry.decisions = entry.decisions.filter(t => t > windowStart);
+    entry.federation_peer = entry.federation_peer.filter(t => t > windowStart);
 
-    const limit = type === "decisions" ? RATE_LIMIT_DECISIONS : RATE_LIMIT_GENERAL;
     const timestamps = entry[type];
 
     if (timestamps.length >= limit) {
@@ -1812,7 +2849,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     for (const [addr, entry] of this.rateLimits) {
       const hasRecent =
         entry.general.some(t => t > windowStart) ||
-        entry.decisions.some(t => t > windowStart);
+        entry.decisions.some(t => t > windowStart) ||
+        entry.federation_peer.some(t => t > windowStart);
       if (!hasRecent) {
         this.rateLimits.delete(addr);
       }
@@ -1825,7 +2863,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers — restrict to same-origin; the dashboard is served by this server
+    // CORS headers - restrict to same-origin; the dashboard is served by this server
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
@@ -1882,22 +2920,85 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _origin: string | undefined,
     _selfOrigin: string,
   ): void {
+    // One-surface root-flip: the posture board is the default page at `/` AND
+    // its `/posture` alias. Intercepted here, BEFORE the v1.1 SPA dispatch
+    // (which previously owned `/`), the auth gate, and the legacy route table,
+    // so both paths serve the one unauthenticated static shell under the same
+    // auth contract (the shell's data fetches stay behind checkAuth). Matches
+    // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
+    // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
+    // the posture JSON API included) fall through untouched.
+    if (this.dispatchRootPosture(res, url, method)) return;
+
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
-    // and never falls through to legacy routing — fail-closed 401 for
+    // and never falls through to legacy routing - fail-closed 401 for
     // unauthenticated callers on every /v1 path. NOTE: `/v1.0` and
     // `/v1.1` (legacy dashboard HTML) do not match this prefix.
     if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
       // Ceremony endpoints get the stricter decision-class rate limit
       // (auth brute-force guard); reads get the general limit. The federation
       // join-submission ceremony is an auth surface too (bootstrap-token
-      // brute-force guard), so it shares the decisions budget.
-      const limitClass =
-        url.pathname.startsWith("/v1/session/") ||
-        url.pathname.startsWith("/v1/federation/authorize/")
-          ? "decisions"
-          : "general";
+      // brute-force guard), so it shares the decisions budget. Federation P1: the
+      // pre-session, node-cert-authenticated peer-sync route gets its OWN
+      // dedicated bucket (no loopback exemption, IPv6 /64 aggregation, tighter
+      // budget, global concurrent-verify ceiling) because it is reachable with no
+      // session and each request triggers a crypto verification.
+      const limitClass: RateLimitClass =
+        url.pathname === "/v1/federation/sync/peer"
+          ? "federation_peer"
+          : url.pathname.startsWith("/v1/session/") ||
+              url.pathname.startsWith("/v1/federation/authorize/")
+            ? "decisions"
+            : "general";
       if (!this.checkRateLimit(req, res, limitClass)) return;
+      // Federation P1 DoS hardening: bound concurrent in-flight crypto-verify on
+      // the unauthenticated peer-sync route. Over the ceiling, reject with the
+      // SAME generic 403 a verify failure returns (no distinguishable error → no
+      // membership/enabled-state oracle). The counter is released in a finally
+      // after the handler resolves.
+      //
+      // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
+      // ceiling bound CPU spent on crypto verification, but do NOT bound a
+      // slow-loris socket-exhaustion attack: there is no listener read/idle
+      // timeout and no max-connection bound. `v1/http.ts` readJsonBody has no
+      // read timeout, and the server uses Node's default `requestTimeout`. The
+      // listener read/idle timeout + max-connection bound are deferred because
+      // they touch shared server-listener config (not just this route).
+      if (limitClass === "federation_peer") {
+        if (this.inFlightPeerVerify >= MAX_CONCURRENT_PEER_VERIFY) {
+          // Byte-identical to every other 403 on this route (incl.
+          // Cache-Control: no-store) so the over-ceiling rejection is not a
+          // wire-distinguishable oracle.
+          denyForbidden(res);
+          return;
+        }
+        this.inFlightPeerVerify++;
+        handleV1Request(
+          {
+            sessions: this.v1Sessions,
+            isLoopbackRequest: (r) => this.isLoopbackRequest(r),
+            buildFullStatus: () => this.buildV1FullStatus(),
+            version: PKG_VERSION,
+            agents: this.buildV1AgentsDeps(),
+            federation: this.buildV1FederationDeps(),
+          },
+          req,
+          res,
+          url,
+          method,
+        )
+          .catch(() => {
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Internal server error" }));
+            }
+          })
+          .finally(() => {
+            this.inFlightPeerVerify--;
+          });
+        return;
+      }
       handleV1Request(
         {
           sessions: this.v1Sessions,
@@ -2063,9 +3164,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // v1.1.1 hotfix: try v1.1 dispatch first. dispatchV11 returns true when
     // the request matched a v1.1 route (dashboard HTML at /v1.1, hub API
-    // at /api/hub/*). When false, fall through to the legacy route table
-    // below so v1.0 surfaces stay live (additive mount, default route flip
-    // deferred to v1.2).
+    // at /api/hub/*). When false, fall through to the legacy route table below
+    // so v1.0 surfaces stay live; `/` was already handled by the posture shell.
     if (this.v11Bindings) {
       this.dispatchV11(req, res, url, method)
         .then((handled) => {
@@ -2093,16 +3193,73 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // v1.3.0 (XXXXX): /api/health is exempt from auth AND rate limiting.
     // Health checks must always respond so the multi-aggregator health probe
     // pattern (multi-server.ts) and external monitoring work reliably.
+    //
+    // SECURITY (Delta Review A3 remediation): this probe is UNAUTHENTICATED and
+    // unthrottled, so it stays a cheap O(1) liveness answer and MUST NOT carry
+    // the evidence-based Castle Wall posture. A prior revision attached the full
+    // arm-state object (origin/operator id, verdict counts, enforcement
+    // timestamps) here and ran an unbounded audit-log scan + per-entry Ed25519
+    // re-verify on every call - that both leaked the detailed posture to any
+    // anonymous caller and gave an unauthenticated DoS amplifier. The honest
+    // arm-state lives ONLY behind auth: `/api/posture/castle-wall` (checkAuth;
+    // the native app reaches it via loopback auto-auth) and the `/v1/status`
+    // document (the v1 SESSION_TOKEN ceremony). The native badge sources its
+    // arm-state from `/api/posture/castle-wall`, never from this probe. The
+    // `{ ok, mode }` shape is the only contract the CLI health probe + external
+    // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify({ ok: true, mode: "principal-policy" }));
+      // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
+      // `since` restart-detection signal. NO `ready`/`supervisor` here -
+      // those would be a co-resident-agent oracle on this unauthenticated
+      // probe (brief HIGH-1) and live ONLY on the auth-gated /api/readiness.
+      res.end(
+        JSON.stringify({
+          ok: true,
+          mode: "principal-policy",
+          instance: getProcessInstance(),
+          since: getProcessSince(),
+        }),
+      );
       return;
     }
 
-    // SEC-012: Session exchange does its own auth (header-only) — let it through before checkAuth
+    // /api/readiness (AUTH-GATED, brief D3): the readiness/supervisor signal
+    // lives behind the SAME auth as the other authenticated read routes
+    // (checkAuth: bearer token, session, or loopback auto-auth). It reports
+    // readiness, never posture - "serving" means unlocked + read surface
+    // live, NOT "your agents are protected" (that stays on the evidence-gated
+    // /api/posture/castle-wall).
+    //
+    // `supervisor` reports the REAL bridge state, not a mask. This dashboard
+    // CAN run Protect: protect routes through `this.supervisorBridge`
+    // (launchProtect), and when that bridge is null Protect fails closed with
+    // 503 (see buildV1Bindings). So an absent bridge is not "not applicable"
+    // here - it GUARANTEES a 503 - and the honest signal is "unwired", never
+    // "n/a". The bridge is wired post-unlock via setSupervisorBridge(); until
+    // then "unwired" tells the host app Protect will 503. (setSupervisorBridge
+    // is not called in production yet, so today this honestly reports
+    // "unwired".)
+    if (method === "GET" && url.pathname === "/api/readiness") {
+      if (!this.checkRateLimit(req, res, "general")) return;
+      if (!this.checkAuth(req, url, res)) return;
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          ready: this.identityManager ? "serving" : "locked",
+          supervisor: this.supervisorBridge ? "wired" : "unwired",
+        }),
+      );
+      return;
+    }
+
+    // SEC-012: Session exchange does its own auth (header-only) - let it through before checkAuth
     if (method === "POST" && url.pathname === "/auth/session") {
       if (!this.checkRateLimit(req, res, "general")) return;
       try {
@@ -2115,13 +3272,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // For GET /v1.0: serve login page if not authenticated (instead of JSON 401).
-    // v1.1.7: root path now serves the v1.1 SPA (handled by dispatchV11
-    // above). The legacy four-panel dashboard moved to /v1.0; the login
-    // page mirrors that move so unauthenticated requests at /v1.0 still
-    // hit the legacy login flow.
+    // Root now serves the posture shell; /dashboard and /v1.1 remain v1.1 SPA
+    // aliases. The legacy four-panel dashboard moved to /v1.0; the login page
+    // mirrors that move so unauthenticated requests at /v1.0 still hit the
+    // legacy login flow.
     if (method === "GET" && url.pathname === "/v1.0" && this.authToken) {
       if (!this.isAuthenticated(req, url)) {
-        // Login page is a view — no rate limit (auth brute force is gated on /auth/session).
+        // Login page is a view - no rate limit (auth brute force is gated on /auth/session).
         this.serveLoginPage(res);
         return;
       }
@@ -2149,14 +3306,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     )
       return;
 
-    // Sovereignty Posture Dashboard (Phase 1): the posture-home HTML at
-    // `/posture` and the gap endpoints at `/api/posture/*`. Dispatched AFTER
-    // checkAuth (same gate as `/api/audit-log`) and before the legacy route
-    // table. The dispatch is async; when it serves the request it returns
-    // true, otherwise we fall through to the legacy table below.
+    // Sovereignty Posture Dashboard: the authenticated posture surface, namely
+    // the per-agent drill-down HTML at `/posture/agent/:id` and the JSON gap
+    // endpoints at `/api/posture/*`. Dispatched AFTER checkAuth (same gate as
+    // `/api/audit-log`) and before the legacy route table. The dispatch is
+    // async; when it serves the request it returns true, otherwise we fall
+    // through to the legacy table below.
+    //
+    // NOTE (root-flip): the `/posture` HOME HTML is NOT served here. `GET /`
+    // and `GET /posture` are intercepted earlier by `dispatchRootPosture`
+    // (BEFORE checkAuth) and serve the one unauthenticated static shell, and
+    // `handlePostureRoute` no longer carries a `/posture` HTML branch. So
+    // `POSTURE_HOME_PATH` is intentionally absent from the condition below.
     if (
-      url.pathname === POSTURE_HOME_PATH ||
       url.pathname.startsWith(POSTURE_AGENT_PATH_PREFIX) ||
+      // Phase 2: the Evidence View HTML shell is served by the posture router
+      // AFTER checkAuth (same gate), so it gets the same auth model as the
+      // per-agent drill-down and the JSON endpoints.
+      url.pathname === POSTURE_EVIDENCE_PATH ||
       url.pathname === POSTURE_API_PREFIX ||
       url.pathname.startsWith(`${POSTURE_API_PREFIX}/`) ||
       // Phase 2: the query-privacy stats endpoint is dispatched through the
@@ -2187,7 +3354,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Rate limiting: apply general limit to authenticated API requests only.
     // HTML view routes (`/`, `/dashboard`, `/fortress`) and the long-lived SSE
-    // stream (`/events`) are exempt — operator page loads and browser
+    // stream (`/events`) are exempt - operator page loads and browser
     // refreshes must never 429. Decision endpoints (approve/deny) and the
     // session-exchange endpoint keep their own stricter limits below.
     if (!isDashboardViewRoute(method, url.pathname)) {
@@ -2198,8 +3365,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
-        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root and
-        // /dashboard now route to the v1.1 SPA via dispatchV11 above.
+        // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
+        // posture shell; /dashboard and /v1.1 remain v1.1 SPA aliases.
         if (this.fortressHTML) {
           this.serveFortressView(res);
         } else {
@@ -2271,13 +3438,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private handleSessionExchange(req: IncomingMessage, res: ServerResponse): void {
     if (!this.authToken) {
-      // Auth disabled — sessions not needed
+      // Auth disabled - sessions not needed
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ session_id: "no-auth" }));
       return;
     }
 
-    // Only accept the long-lived token via Authorization header — NEVER from URL
+    // Only accept the long-lived token via Authorization header - NEVER from URL
     const authHeader = req.headers.authorization;
     if (!authHeader) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -2387,6 +3554,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
         },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
+        },
       };
     }
 
@@ -2489,6 +3660,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       pending_count: this.pending.size,
       connected_clients: this.sseClients.size,
       standalone_mode: this._standaloneMode,
+      decision_capable: !this._standaloneMode,
     };
 
     if (this.baseline) {
@@ -2504,6 +3676,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           type: this.policy.approval_channel.type,
           timeout_seconds: this.policy.approval_channel.timeout_seconds,
           auto_deny: true, // SEC-002: hardcoded, not configurable
+        },
+        approval_redirect: {
+          enabled: this.policy.approval_redirect?.enabled === true,
+          mode: this.policy.approval_redirect?.mode === "notify" ? "notify" : "replace",
         },
       };
     }
@@ -2609,6 +3785,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       : score >= 65 ? "degraded"
       : score >= 25 ? "minimal"
       : "unverified";
+    const federationPosture = this.buildFederationPostureSummary();
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -2622,6 +3799,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       degradations: shr.body.degradations,
       capabilities: shr.body.capabilities,
+      federation: {
+        operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+        provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+        tee_attested: federationPosture.tee_attested,
+        trust_boundary: federationPosture,
+      },
       config_loaded: this._sanctuaryConfig != null,
     }));
   }
@@ -2707,8 +3890,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     try {
       const profile = this.profileStore.get();
       const prompt = generateSystemPrompt(profile);
+      const federationPosture = this.buildFederationPostureSummary();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ profile, system_prompt: prompt }));
+      res.end(JSON.stringify({
+        profile,
+        system_prompt: prompt,
+        deployment_posture: {
+          operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+          provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+          tee_attested: federationPosture.tee_attested,
+          trust_boundary: federationPosture,
+        },
+      }));
     } catch {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Failed to read sovereignty profile" }));
@@ -2740,6 +3933,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const updates: SovereigntyProfileUpdate = JSON.parse(body);
         const updated = await this.profileStore!.update(updates);
         const prompt = generateSystemPrompt(updated);
+        const federationPosture = this.buildFederationPostureSummary();
+        const deploymentPosture = {
+          operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+          provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+          tee_attested: federationPosture.tee_attested,
+          trust_boundary: federationPosture,
+        };
 
         // Audit log the dashboard-initiated change
         if (this.auditLog) {
@@ -2764,16 +3964,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
               audit_failed: true,
               profile: updated,
               system_prompt: prompt,
+              deployment_posture: deploymentPosture,
             }));
             return;
           }
         }
 
         // Broadcast to SSE clients
-        this.broadcastSSE("sovereignty-profile-update", { profile: updated, system_prompt: prompt });
+        this.broadcastSSE("sovereignty-profile-update", {
+          profile: updated,
+          system_prompt: prompt,
+          deployment_posture: deploymentPosture,
+        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ profile: updated, system_prompt: prompt }));
+        res.end(JSON.stringify({
+          profile: updated,
+          system_prompt: prompt,
+          deployment_posture: deploymentPosture,
+        }));
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid JSON body" }));
@@ -2784,7 +3993,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // ── Proxy Server Handlers ───────────────────────────────────────────
 
   /**
-   * GET /api/proxy/servers — list upstream proxy servers and their status.
+   * GET /api/proxy/servers - list upstream proxy servers and their status.
    */
   private handleProxyServers(res: ServerResponse): void {
     const profile = this.profileStore?.get();
@@ -2811,7 +4020,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * POST /api/proxy/servers — update upstream server configuration.
+   * POST /api/proxy/servers - update upstream server configuration.
    * This is a dashboard action (human-initiated), so it's allowed with audit logging
    * rather than requiring Tier 1 approval.
    */
@@ -2979,7 +4188,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // them to the browser. No new transport.
   //
   // Spec §8 + §9. Spawn-prompt acceptance criterion 7: "Mesh Health dashboard
-  // panel renders via existing SSE /events channel — no new transport. Every
+  // panel renders via existing SSE /events channel - no new transport. Every
   // state transition produces an observable SSE event."
 
   /** Push a Mesh Health snapshot (full re-render trigger on the client). */
@@ -3000,7 +4209,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * Open a URL in the system's default browser.
    * Cross-platform: macOS (open), Linux (xdg-open), Windows (start).
-   * Fails silently — dashboard still works via terminal URL.
+   * Fails silently - dashboard still works via terminal URL.
    */
   private openInBrowser(url: string): void {
     const os = platform();

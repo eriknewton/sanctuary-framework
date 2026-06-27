@@ -7,12 +7,22 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
-import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
-import type { ApprovalRequest, ApprovalResponse } from "../../src/principal-policy/types.js";
+import {
+  DashboardApprovalChannel,
+  ipv6Slash64Prefix,
+} from "../../src/principal-policy/dashboard.js";
+import type {
+  ApprovalRequest,
+  ApprovalResponse,
+  PrincipalPolicy,
+} from "../../src/principal-policy/types.js";
 import {
   bindWithRetry,
   randomTestPort,
 } from "../util/port-collision-retry.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 async function requestNoKeepAlive(
   url: string,
@@ -72,7 +82,12 @@ describe("Principal Dashboard", () => {
       dashboard = new DashboardApprovalChannel({
         port,
         host: "127.0.0.1",
-        timeout_seconds: 2, // Short timeout for tests
+        // Generous timeout: the human-decision tests (approve/deny/concurrent)
+        // must never race the production auto-deny timer under a >2s event-loop
+        // stall during full-suite CI load. The genuine timeout-behavior test
+        // ("auto-denies on timeout when auto_deny is true") builds its OWN
+        // short-timeout dashboard so this value does not affect it.
+        timeout_seconds: 30,
         auto_deny: true,
       });
       await dashboard.start();
@@ -121,6 +136,43 @@ describe("Principal Dashboard", () => {
     });
   });
 
+  // ── /api/readiness supervisor bridge (brief D3, Fix 1) ───────────────
+  // The principal-policy dashboard CAN run Protect: it routes through the
+  // supervisor bridge, and an absent bridge means Protect fails closed with
+  // 503. So `supervisor` must report the REAL bridge state - "unwired" when
+  // null (the production reality today, since setSupervisorBridge is not yet
+  // called in production), "wired" once a bridge is bound. It must never mask
+  // an absent bridge as "n/a" here, because absence guarantees a 503.
+  describe("/api/readiness supervisor signal", () => {
+    it("reports supervisor=unwired when no bridge is bound (Protect would 503)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.supervisor).toBe("unwired");
+      // It must NOT mask the absent bridge as "n/a": absence => 503.
+      expect(body.supervisor).not.toBe("n/a");
+    });
+
+    it("reports supervisor=wired once a bridge is bound via setSupervisorBridge", async () => {
+      // The readiness handler only checks the bridge for presence (truthiness);
+      // it never calls into it for the readiness value, so a bare stub is
+      // sufficient ground truth for "a bridge is bound".
+      const stubBridge = {
+        launchProtect: async () => ({ ok: false }),
+      } as unknown as Parameters<typeof dashboard.setSupervisorBridge>[0];
+      dashboard.setSupervisorBridge(stubBridge);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.supervisor).toBe("wired");
+      } finally {
+        // Detach so we don't leak the stub into sibling tests.
+        dashboard.setSupervisorBridge(null);
+      }
+    });
+  });
+
   // ── Approval Flow ────────────────────────────────────────────────────
 
   describe("Approval Flow", () => {
@@ -165,6 +217,7 @@ describe("Principal Dashboard", () => {
 
       const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
       const pending = await listRes.json();
+      expect(pending).toHaveLength(1);
 
       const denyRes = await fetch(
         `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
@@ -186,12 +239,33 @@ describe("Principal Dashboard", () => {
     });
 
     it("auto-denies on timeout when auto_deny is true", async () => {
-      const request = makeRequest();
-      const response = await dashboard.requestApproval(request);
-      // With 2-second timeout, this should auto-deny
-      expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("timeout");
-      expect(dashboard.pendingCount).toBe(0);
+      // The top-level dashboard runs a generous 30s timeout so the
+      // human-decision tests never race the auto-deny under load. This test
+      // genuinely needs a SHORT timeout to observe the auto-deny within the
+      // 5000ms budget, so it builds its own short-timeout dashboard (mirroring
+      // the SEC-002 rig below) and tears it down in a finally.
+      let timeoutDashboard: DashboardApprovalChannel | undefined;
+      let timeoutPort: number;
+      await bindWithRetry(async () => {
+        timeoutPort = randomTestPort();
+        timeoutDashboard = new DashboardApprovalChannel({
+          port: timeoutPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+        });
+        await timeoutDashboard.start();
+      });
+      try {
+        const request = makeRequest();
+        const response = await timeoutDashboard!.requestApproval(request);
+        // With 2-second timeout, this should auto-deny
+        expect(response.decision).toBe("deny");
+        expect(response.decided_by).toBe("timeout");
+        expect(timeoutDashboard!.pendingCount).toBe(0);
+      } finally {
+        await timeoutDashboard?.stop();
+      }
     }, 5000);
 
     it("handles multiple concurrent pending requests", async () => {
@@ -369,6 +443,96 @@ describe("Principal Dashboard", () => {
       expect(data.pending_count).toBe(0);
     });
 
+    // ── /api/readiness (auth-gated, brief D3) ─────────────────────────
+    it("rejects /api/readiness without an auth token", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      // It must not leak readiness in the unauthorized body.
+      expect(data.ready).toBeUndefined();
+      expect(data.supervisor).toBeUndefined();
+    });
+
+    it("rejects /api/readiness with a same-length wrong bearer token", async () => {
+      const wrongToken = AUTH_TOKEN.replace("12345", "54321");
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${wrongToken}` },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    it("returns { ready, supervisor } with a valid bearer token (locked by default)", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(Object.keys(data).sort()).toEqual(["ready", "supervisor"]);
+      // No identity manager wired on this rig -> honest "locked". No supervisor
+      // bridge bound on this rig -> honest "unwired" (the principal-policy
+      // dashboard CAN run Protect, so an absent bridge guarantees a Protect 503;
+      // masking that as "n/a" would be dishonest, brief Fix 1).
+      expect(data.ready).toBe("locked");
+      expect(data.supervisor).toBe("unwired");
+    });
+
+    it("reports ready=serving once an identity manager is wired (unlocked)", async () => {
+      authDashboard.setDependencies({
+        policy: {} as never,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: {} as never,
+        identityManager: {} as never,
+      });
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/readiness`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ready).toBe("serving");
+      // Still no supervisor bridge bound -> honest "unwired" (see above).
+      expect(data.supervisor).toBe("unwired");
+    });
+
+    it("includes approval_redirect mode in /api/status for folded approval routing", async () => {
+      const policy: PrincipalPolicy = {
+        version: 1,
+        tier1_always_approve: ["state_export"],
+        tier2_anomaly: {
+          new_namespace_access: "approve",
+          new_counterparty: "approve",
+          frequency_spike_multiplier: 3,
+          max_signs_per_minute: 10,
+          bulk_read_threshold: 20,
+          first_session_policy: "approve",
+        },
+        tier3_always_allow: [],
+        approval_channel: {
+          type: "callback",
+          timeout_seconds: 2,
+          auto_deny: true,
+        },
+        approval_redirect: {
+          enabled: true,
+          mode: "replace",
+        },
+      };
+      authDashboard.setDependencies({
+        policy,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: {} as never,
+      });
+
+      const res = await fetch(`http://127.0.0.1:${authPort}/api/status`, {
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.policy.approval_redirect).toEqual({
+        enabled: true,
+        mode: "replace",
+      });
+    });
+
     it("gates GET /api/posture/composition behind the SAME checkAuth gate", async () => {
       // Recognition precursor: the composition gate endpoint must sit behind the
       // same bearer gate as the rest of /api/posture/*, never a weaker path.
@@ -412,6 +576,17 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(401);
     });
 
+    it("sets the dashboard login cookie SameSite=Strict", async () => {
+      const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      const cookie = res.headers.get("set-cookie") ?? "";
+      expect(cookie).toContain("sanctuary_session=");
+      expect(cookie).toContain("SameSite=Strict");
+    });
+
     it("rejects long-lived token in query parameter (SEC-012)", async () => {
       // SEC-012: The long-lived auth token must NOT be accepted via URL query string.
       // Before the SEC-012 fix, this returned 200. Now it must return 401.
@@ -433,6 +608,83 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.pending_count).toBe(0);
+    });
+
+    it("one-click session authenticates posture reads and approval decisions, while invalid sessions stay 401", async () => {
+      const policy: PrincipalPolicy = {
+        version: 1,
+        tier1_always_approve: ["state_export"],
+        tier2_anomaly: {
+          new_namespace_access: "approve",
+          new_counterparty: "approve",
+          frequency_spike_multiplier: 3,
+          max_signs_per_minute: 10,
+          bulk_read_threshold: 20,
+          first_session_policy: "approve",
+        },
+        tier3_always_allow: [],
+        approval_channel: {
+          type: "dashboard",
+          timeout_seconds: 2,
+          auto_deny: true,
+        },
+      };
+      authDashboard.setDependencies({
+        policy,
+        baseline: { getProfile: () => ({}) } as never,
+        auditLog: new AuditLog(new MemoryStorage(), generateRandomKey()),
+      });
+
+      const exchangeRes = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchangeRes.status).toBe(200);
+      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Strict");
+      const { session_id } = await exchangeRes.json();
+      const session = encodeURIComponent(session_id);
+
+      const postureRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/home?session=${session}`,
+      );
+      expect(postureRes.status).toBe(200);
+      const posture = await postureRes.json();
+      expect(posture.stream_available).toBe(true);
+
+      const request: ApprovalRequest = {
+        operation: "state_export",
+        tier: 1,
+        reason: "One-click session decision",
+        context: {},
+        timestamp: new Date().toISOString(),
+      };
+      const approvalPromise = authDashboard.requestApproval(request);
+      const pendingRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/pending?session=${session}`,
+      );
+      expect(pendingRes.status).toBe(200);
+      const pending = await pendingRes.json();
+      expect(pending).toHaveLength(1);
+
+      const badRead = await fetch(
+        `http://127.0.0.1:${authPort}/api/posture/home?session=not-a-valid-session`,
+      );
+      expect(badRead.status).toBe(401);
+      const badDecision = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}?session=not-a-valid-session`,
+        { method: "POST" },
+      );
+      expect(badDecision.status).toBe(401);
+      expect(authDashboard.pendingCount).toBe(1);
+
+      const decisionRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}?session=${session}`,
+        { method: "POST" },
+      );
+      expect(decisionRes.status).toBe(200);
+      const decision = await approvalPromise;
+      expect(decision.decision).toBe("approve");
+      expect(decision.decided_by).toBe("human");
     });
 
     it("serves legacy dashboard HTML at /v1.0 with bearer header (SEC-012)", async () => {
@@ -628,6 +880,36 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
     });
 
+    // dashboard-native-embed-loopback-read: the castle-wall-macos native app
+    // embeds the posture board and reads `/api/posture/castle-wall` for the arm
+    // badge over a TOKENLESS loopback request (no bearer token, no session,
+    // see PostureWebView/SanctuaryServerBridge). That read MUST clear the auth
+    // gate under loopback auto-auth, otherwise the badge sticks on "Checking
+    // enforcement…" and the embed renders a raw 401 page. This locks the
+    // posture-read route as a read-only route the auto-auth fast path covers
+    // (NOT a `requireToken` approval-decision route). Its companion above
+    // (`rejects a tokenless loopback POST /api/approve/:id (401)`) locks the
+    // opposite half: the approval-decision surface stays 401 even with auto-auth
+    // on. Scope note: this `beforeEach` toggles the flag directly via
+    // `setAutoAuthLocalhost(true)`, so what is locked here is the routing-layer
+    // (`checkAuth`) carve-out (posture reads pass, approve/deny stay 401), NOT
+    // the wiring that turns the flag on. The `sanctuary --dashboard` boot path
+    // (`createSanctuaryServer` in index.ts) enables this fast path the same way
+    // `sanctuary dashboard` does, but that boot wiring is a 1:1 copy of the
+    // proven dashboard-standalone guard and is not directly exercised by this
+    // test; reverting the index.ts change would not fail these cases.
+    it("tokenless loopback GET /api/posture/castle-wall is NOT 401 under auto-auth (native embed read)", async () => {
+      const res = await fetch(
+        `http://127.0.0.1:${autoPort}/api/posture/castle-wall`,
+      );
+      // The contract the native embed needs is the AUTH boundary: a tokenless
+      // loopback read must clear `checkAuth` (never 401). This bare test channel
+      // has no posture dependencies wired, so the handler itself may 404/503;
+      // what matters here is that auto-auth let the request THROUGH the auth
+      // gate (in contrast to the approve/deny routes, which stay 401).
+      expect(res.status).not.toBe(401);
+    });
+
     // legacy-dashboard-approval-route: the approval DECISION routes are
     // dispatched POST-only. There is no live GET handler, so a GET can never
     // release a Tier-1 op — closing any residual "self-approve via GET"
@@ -774,6 +1056,41 @@ describe("Principal Dashboard", () => {
       }
       expect(results).not.toContain(429);
     });
+
+    // Federation P1 DoS hardening: the federation peer rate-limit bucket keys
+    // IPv6 to its /64 prefix so an attacker rotating addresses within one /64
+    // shares one bucket. The helper is pure; test it directly.
+    describe("ipv6Slash64Prefix (Federation P1 /64 aggregation)", () => {
+      it("aggregates distinct addresses in the same /64 to the same key", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234:0:0:0:1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:1234:ffff:ffff:ffff:ffff");
+        expect(a).toBe("2001:db8:abcd:1234::/64");
+        expect(a).toBe(b);
+      });
+
+      it("keeps addresses in DIFFERENT /64s on distinct keys", () => {
+        const a = ipv6Slash64Prefix("2001:db8:abcd:1234::1");
+        const b = ipv6Slash64Prefix("2001:db8:abcd:9999::1");
+        expect(a).not.toBe(b);
+      });
+
+      it("expands a single `::` zero-run before taking the prefix", () => {
+        // ::1 -> 0:0:0:0:0:0:0:1 -> first four hextets all zero.
+        expect(ipv6Slash64Prefix("::1")).toBe("0:0:0:0::/64");
+        // fe80::1 -> fe80:0:0:0:...
+        expect(ipv6Slash64Prefix("fe80::1")).toBe("fe80:0:0:0::/64");
+      });
+
+      it("returns null for IPv4, mapped-IPv4, and malformed inputs (caller keys verbatim)", () => {
+        expect(ipv6Slash64Prefix("127.0.0.1")).toBeNull();
+        expect(ipv6Slash64Prefix("203.0.113.7")).toBeNull();
+        expect(ipv6Slash64Prefix("::ffff:1.2.3.4")).toBeNull(); // mapped IPv4
+        expect(ipv6Slash64Prefix("unknown")).toBeNull();
+        expect(ipv6Slash64Prefix("2001:db8::1::2")).toBeNull(); // two "::"
+        expect(ipv6Slash64Prefix("fe80::1%eth0")).toBeNull(); // zone id
+        expect(ipv6Slash64Prefix("gggg::1")).toBeNull(); // non-hex
+      });
+    });
   });
 
   // ── Cleanup ──────────────────────────────────────────────────────────
@@ -809,6 +1126,9 @@ describe("Principal Dashboard", () => {
       const data = await res.json();
       expect(data.ok).toBe(true);
       expect(data.mode).toBe("principal-policy");
+      // brief D3: opaque restart-detection signal is present.
+      expect(typeof data.instance).toBe("string");
+      expect(typeof data.since).toBe("number");
     });
 
     it("/api/health has no-store cache header (XXXXX)", async () => {
@@ -835,6 +1155,130 @@ describe("Principal Dashboard", () => {
         ),
       );
       expect(results.every((s) => s === 200)).toBe(true);
+    });
+  });
+
+  // ── One-surface root-flip (Piece C) ─────────────────────────────────
+
+  describe("Root-flip: posture board served at /", () => {
+    it("GET / serves the posture board HTML (the one posture surface)", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/html");
+      const body = await res.text();
+      // The posture-home shell fetches the posture API client-side; that string
+      // is the durable signature of the posture board (not the legacy/v1.1 SPA).
+      expect(body).toContain("/api/posture/home");
+    });
+
+    it("GET / and GET /posture serve byte-for-byte the same posture board", async () => {
+      const [rootRes, postureRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/`),
+        fetch(`http://127.0.0.1:${port}/posture`),
+      ]);
+      expect(rootRes.status).toBe(200);
+      expect(postureRes.status).toBe(200);
+      const [rootBody, postureBody] = await Promise.all([
+        rootRes.text(),
+        postureRes.text(),
+      ]);
+      // /posture remains a working alias of the same one surface.
+      expect(rootBody).toBe(postureBody);
+    });
+
+    it("root-flip does NOT regress the approval-channel routes", async () => {
+      // /api/pending still answers (the pending-approvals inbox source).
+      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      expect(pendingRes.status).toBe(200);
+      expect(await pendingRes.json()).toEqual([]);
+
+      // An Approve still round-trips through /api/approve/:id and resolves the
+      // blocked Tier-1 call (the same approval behavior, reached via the board).
+      const approvePromise = dashboard.requestApproval({
+        operation: "state_export",
+        tier: 1,
+        reason: "root-flip approval round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const approveList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(approveList).toHaveLength(1);
+      const approveRes = await fetch(
+        `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
+        { method: "POST" },
+      );
+      expect(approveRes.status).toBe(200);
+      expect((await approvePromise).decision).toBe("approve");
+
+      // A Deny still round-trips through /api/deny/:id.
+      const denyPromise = dashboard.requestApproval({
+        operation: "identity_rotate",
+        tier: 1,
+        reason: "root-flip deny round-trip",
+        context: { namespace: "test" },
+        timestamp: new Date().toISOString(),
+      });
+      const denyList = await (
+        await fetch(`http://127.0.0.1:${port}/api/pending`)
+      ).json();
+      expect(denyList).toHaveLength(1);
+      const denyRes = await fetch(
+        `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
+        { method: "POST" },
+      );
+      expect(denyRes.status).toBe(200);
+      expect((await denyPromise).decision).toBe("deny");
+    });
+
+    it("root-flip leaves /v1.0 and unknown routes intact", async () => {
+      // The legacy four-panel dashboard is still reachable at its own URL.
+      const v10 = await fetch(`http://127.0.0.1:${port}/v1.0`);
+      expect(v10.status).toBe(200);
+      expect(await v10.text()).toContain("Principal Dashboard");
+      // The flip matches ONLY the bare root path; unknown routes still 404.
+      const unknown = await fetch(`http://127.0.0.1:${port}/nonexistent`);
+      expect(unknown.status).toBe(404);
+    });
+  });
+
+  // ── /api/health stays a cheap, non-sensitive liveness probe (A3 remediation) ──
+
+  describe("/api/health does NOT leak the Castle Wall posture", () => {
+    // SECURITY regression guard (Delta Review A3 remediation): a prior revision
+    // attached the full evidence-based Castle Wall posture (origin/operator id,
+    // verdict counts, enforcement timestamps) to this UNAUTHENTICATED probe and
+    // ran an unbounded audit scan + per-entry Ed25519 re-verify per call. That
+    // is reverted: `/api/health` is a cheap O(1) `{ ok, mode }` liveness answer
+    // ONLY. The honest arm-state lives behind auth (`/api/posture/castle-wall`,
+    // `/v1/status`), never here.
+    it("returns ONLY { ok, mode, instance, since } — no castle_wall, no posture, no readiness", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.ok).toBe(true);
+      expect(data.mode).toBe("principal-policy");
+      // brief D3: the opaque restart-detection signal is allowed (instance is a
+      // per-boot id, since is the process start time - neither is state).
+      expect(typeof data.instance).toBe("string");
+      expect(typeof data.since).toBe("number");
+      // The detailed posture (and the fields that would leak operator identity
+      // or enforcement telemetry) must NOT be on the unauthenticated probe.
+      expect(data.castle_wall).toBeUndefined();
+      expect(data.arm_state).toBeUndefined();
+      expect(data.origin_machine).toBeUndefined();
+      expect(data.verdict_counts).toBeUndefined();
+      // brief HIGH-1: readiness/supervisor MUST NOT appear on the unauthenticated
+      // probe - those are a co-resident-agent oracle and live only behind auth.
+      expect(data.ready).toBeUndefined();
+      expect(data.supervisor).toBeUndefined();
+      expect(Object.keys(data).sort()).toEqual(["instance", "mode", "ok", "since"]);
+    });
+
+    it("/api/health keeps its no-store cache header", async () => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      expect(res.headers.get("cache-control")).toBe("no-store");
     });
   });
 });

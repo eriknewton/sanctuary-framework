@@ -64,9 +64,18 @@ import type {
 import { canonicalJson } from "./operator-signed.js";
 import type { FederationEvent } from "./federation.js";
 import { validateFederationEventHash } from "./federation.js";
+import {
+  FEDERATION_SYNC_WIRE_VERSION,
+  isFederationOperatorAuthorityEvent,
+} from "./federation-revocation.js";
+
+/** Current peer-sync envelope wire version. Peers must run lockstep. */
+export const FEDERATION_SYNC_ENVELOPE_WIRE_VERSION =
+  FEDERATION_SYNC_WIRE_VERSION;
 
 /** Domain separator for the cross-node sync envelope signature (versioned). */
-export const V1_FEDERATION_SYNC_ENVELOPE_DOMAIN = "sanctuary.v1.federation-sync-envelope";
+export const V1_FEDERATION_SYNC_ENVELOPE_DOMAIN =
+  FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
 
 /**
  * The wire shape a sending node wraps around its event-log slice. The
@@ -75,6 +84,8 @@ export const V1_FEDERATION_SYNC_ENVELOPE_DOMAIN = "sanctuary.v1.federation-sync-
  * node-key signature over {@link buildSyncEnvelopeMessage}.
  */
 export interface FederationSyncEnvelope {
+  /** Lockstep wire version. Mismatch is a fail-closed rejection. */
+  wire_version: typeof FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
   /** Fortress both nodes belong to (must equal the recipient's). */
   fortress_id: string;
   /** The sending node's id (must equal `sender_node_cert.node_id`). */
@@ -118,13 +129,15 @@ function u64BE(value: number): Uint8Array {
 /**
  * Build the exact bytes a sending node signs (and a recipient verifies) for a
  * sync envelope. Injective length-prefixed encoding under a domain separator
- * over (fortress_id, sender_node_id, recipient_node_id, sync_high_water,
- * canonical events). The events are canonicalized WITH their hashes so the
- * signature commits to the precise slice; the recipient re-validates each
- * per-event hash independently, so the signature need not (and does not)
+ * over (wire_version, fortress_id, sender_node_id, recipient_node_id,
+ * sync_high_water, canonical events). The events are canonicalized WITH their
+ * hashes, so the signature commits to the precise slice; the recipient
+ * re-validates each per-event hash independently, so the signature need not
+ * (and does not)
  * re-derive them.
  */
 export function buildSyncEnvelopeMessage(input: {
+  wireVersion: typeof FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
   fortressId: string;
   senderNodeId: string;
   recipientNodeId: string;
@@ -135,6 +148,7 @@ export function buildSyncEnvelopeMessage(input: {
   const encoder = new TextEncoder();
   const parts = [
     encoder.encode(V1_FEDERATION_SYNC_ENVELOPE_DOMAIN),
+    lengthPrefixed(encoder.encode(input.wireVersion)),
     lengthPrefixed(encoder.encode(input.fortressId)),
     lengthPrefixed(encoder.encode(input.senderNodeId)),
     lengthPrefixed(encoder.encode(input.recipientNodeId)),
@@ -170,6 +184,7 @@ export function signSyncEnvelope(params: {
   nodePrivateKey: Uint8Array;
 }): FederationSyncEnvelope {
   const message = buildSyncEnvelopeMessage({
+    wireVersion: FEDERATION_SYNC_ENVELOPE_WIRE_VERSION,
     fortressId: params.fortressId,
     senderNodeId: params.senderNodeId,
     recipientNodeId: params.recipientNodeId,
@@ -179,6 +194,7 @@ export function signSyncEnvelope(params: {
   });
   const signature = ed25519.sign(message, params.nodePrivateKey);
   return {
+    wire_version: FEDERATION_SYNC_ENVELOPE_WIRE_VERSION,
     fortress_id: params.fortressId,
     sender_node_id: params.senderNodeId,
     recipient_node_id: params.recipientNodeId,
@@ -197,6 +213,8 @@ export type SyncEnvelopeVerification =
       ok: true;
       senderNodeId: string;
       senderNodePubkey: string;
+      senderNodeCert: NodeIdentityCertificate;
+      wireVersion: typeof FEDERATION_SYNC_ENVELOPE_WIRE_VERSION;
       syncHighWater: number;
       events: FederationEvent[];
       cursor?: { node_id?: string; after_sequence?: number };
@@ -207,8 +225,12 @@ export type SyncEnvelopeDenialReason =
   | "malformed_envelope"
   | "fortress_mismatch"
   | "recipient_mismatch"
+  | "unsupported_wire_version"
   | "cert_node_id_mismatch"
   | "cert_chain_invalid"
+  | "node_revoked"
+  | "root_revoked"
+  | "revocation_state_unavailable"
   | "envelope_signature_invalid"
   | "event_hash_invalid"
   | "origin_node_mismatch"
@@ -225,13 +247,33 @@ export type SyncEnvelopeDenialReason =
  * is this fortress node's own id. `acceptedHighWaterFor(senderNodeId)` returns
  * the highest high-water this recipient has already accepted from that sender
  * (or null if never), which gates rollback.
+ *
+ * `isRootRevoked` (RR-1, Federation 3/3b P0) is the OPTIONAL revoked-root
+ * predicate: it answers whether the fortress-master pubkey the chain terminates
+ * at has been revoked (rotate-root Slice 3c compromise recovery). It is
+ * feature-inert in P0 (the set is empty until 3c populates it) but wired here
+ * now. When supplied it is checked AFTER the chain verifies (the chain proves
+ * the terminal master IS this pinned master) and BEFORE the node-revocation
+ * check; a `true` answer or a throw denies. When omitted, no root-revocation
+ * gate runs (back-compatible for callers, and the loopback `/sync` path, that
+ * have not wired it).
  */
 export function verifySyncEnvelope(input: {
   envelope: unknown;
   pinnedMaster: FortressMasterPublicKey;
   recipientNodeId: string;
   acceptedHighWaterFor(senderNodeId: string): number | null;
+  isNodeRevoked(senderNodeId: string): boolean;
+  isRootRevoked?(masterPubkeyB64u: string): boolean;
 }): SyncEnvelopeVerification {
+  if (typeof input.envelope !== "object" || input.envelope === null) {
+    return { ok: false, reason: "malformed_envelope" };
+  }
+  const wireVersion = (input.envelope as Record<string, unknown>).wire_version;
+  if (wireVersion !== FEDERATION_SYNC_ENVELOPE_WIRE_VERSION) {
+    return { ok: false, reason: "unsupported_wire_version" };
+  }
+
   const env = parseEnvelope(input.envelope);
   if (env === null) return { ok: false, reason: "malformed_envelope" };
 
@@ -243,6 +285,21 @@ export function verifySyncEnvelope(input: {
   }
   if (env.recipient_node_id !== input.recipientNodeId) {
     return { ok: false, reason: "recipient_mismatch" };
+  }
+
+  // 1b. If THIS recipient is still pinning a revoked root anchor, deny before
+  //     looking at sender cert details. Hybrid compromise revocations can place
+  //     Ed25519 OR ML-DSA component public keys in the same revoked-root set; a
+  //     stale recipient pinning either old component should get the honest
+  //     root_revoked reason rather than a later cert-chain symptom.
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(input.pinnedMaster.public_key)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
   }
 
   // 2. The sender_node_id MUST equal the id inside the presented certificate —
@@ -262,7 +319,39 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "cert_chain_invalid" };
   }
 
-  // 4. Envelope signature MUST verify against the pubkey INSIDE the verified
+  // 3b. Revoked-ROOT check (RR-1; ACTIVE once rotate-root Slice 3c-1 populates the
+  //     set). The local pinned root was checked above before chain validation.
+  //     Here we ALSO reject a STRAGGLER cert whose chain root (the cert's own
+  //     parent_chain.fortress_master_pubkey) is a revoked root, even though the
+  //     chain verified against the recipient's pinned master. Normally these are
+  //     the same value (the chain check above proved it), but checking the cert's
+  //     declared root explicitly is defense-in-depth: a K1-rooted cert is rejected
+  //     wherever it surfaces, independent of what the recipient currently pins.
+  if (typeof input.isRootRevoked === "function") {
+    try {
+      if (input.isRootRevoked(env.sender_node_cert.parent_chain.fortress_master_pubkey)) {
+        return { ok: false, reason: "root_revoked" };
+      }
+    } catch {
+      return { ok: false, reason: "revocation_state_unavailable" };
+    }
+  }
+
+  // 4. Revocation projection check. This hook is supplied by the /v1 dashboard
+  //    projection of verified operator-authority eviction events. If the hook
+  //    is absent or throws, the revocation state is unevaluable, so deny.
+  if (typeof input.isNodeRevoked !== "function") {
+    return { ok: false, reason: "revocation_state_unavailable" };
+  }
+  try {
+    if (input.isNodeRevoked(env.sender_node_id)) {
+      return { ok: false, reason: "node_revoked" };
+    }
+  } catch {
+    return { ok: false, reason: "revocation_state_unavailable" };
+  }
+
+  // 5. Envelope signature MUST verify against the pubkey INSIDE the verified
   //    cert (not any pubkey supplied alongside). Binds the event slice to a
   //    node the operator actually admitted.
   let nodePubkey: Uint8Array;
@@ -277,6 +366,7 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "malformed_envelope" };
   }
   const message = buildSyncEnvelopeMessage({
+    wireVersion: env.wire_version,
     fortressId: env.fortress_id,
     senderNodeId: env.sender_node_id,
     recipientNodeId: env.recipient_node_id,
@@ -288,7 +378,7 @@ export function verifySyncEnvelope(input: {
     return { ok: false, reason: "envelope_signature_invalid" };
   }
 
-  // 5. Every per-event hash must be self-consistent. (The signature commits to
+  // 6. Every per-event hash must be self-consistent. (The signature commits to
   //    the slice; this rejects a slice whose events were tampered before the
   //    sender signed, OR an honest sender that shipped a corrupt event.)
   for (const event of env.events) {
@@ -301,12 +391,19 @@ export function verifySyncEnvelope(input: {
     // recipient verifies nodes by appended origins) minting a phantom "verified"
     // node it never admitted. A node may only speak for ITSELF on the peer-sync
     // path; cross-node forwarding, if ever added, needs its own delegation proof.
-    if (event.origin_node_id !== env.sender_node_id) {
+    const relayedOperatorAuthorityEvent = isFederationOperatorAuthorityEvent(
+      event,
+      env.fortress_id,
+    );
+    if (
+      event.origin_node_id !== env.sender_node_id &&
+      !relayedOperatorAuthorityEvent
+    ) {
       return { ok: false, reason: "origin_node_mismatch" };
     }
   }
 
-  // 6. Rollback guard: the high-water MUST strictly advance past the highest
+  // 7. Rollback guard: the high-water MUST strictly advance past the highest
   //    this recipient has accepted from this sender. Re-presenting a stale
   //    (validly-signed) envelope is rejected because its high-water no longer
   //    advances.
@@ -319,6 +416,8 @@ export function verifySyncEnvelope(input: {
     ok: true,
     senderNodeId: env.sender_node_id,
     senderNodePubkey: env.sender_node_cert.node_pubkey,
+    senderNodeCert: env.sender_node_cert,
+    wireVersion: env.wire_version,
     syncHighWater: env.sync_high_water,
     events: env.events,
     ...(env.cursor ? { cursor: env.cursor } : {}),
@@ -329,6 +428,7 @@ export function verifySyncEnvelope(input: {
 function parseEnvelope(body: unknown): FederationSyncEnvelope | null {
   if (typeof body !== "object" || body === null) return null;
   const e = body as Record<string, unknown>;
+  if (e.wire_version !== FEDERATION_SYNC_ENVELOPE_WIRE_VERSION) return null;
   if (typeof e.fortress_id !== "string" || e.fortress_id.length === 0) return null;
   if (typeof e.sender_node_id !== "string" || e.sender_node_id.length === 0) return null;
   if (typeof e.recipient_node_id !== "string" || e.recipient_node_id.length === 0) return null;
@@ -374,6 +474,7 @@ function parseEnvelope(body: unknown): FederationSyncEnvelope | null {
   }
 
   return {
+    wire_version: FEDERATION_SYNC_ENVELOPE_WIRE_VERSION,
     fortress_id: e.fortress_id,
     sender_node_id: e.sender_node_id,
     recipient_node_id: e.recipient_node_id,

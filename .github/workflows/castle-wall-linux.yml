@@ -23,7 +23,7 @@ jobs:
     # without additional capability grants. CAP_NET_ADMIN is available
     # to root by default on GitHub Actions Ubuntu runners.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -36,7 +36,7 @@ jobs:
           lsmod | grep nfnetlink || echo "nfnetlink modules may be built-in"
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master, pinned 2026-06-16
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, pinned 2026-06-16
         with:
           toolchain: 1.95.0
           components: clippy
@@ -138,7 +138,7 @@ jobs:
   sanctuary-jail-static:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install cross/static toolchain packages
         run: |
@@ -146,7 +146,7 @@ jobs:
           sudo apt-get install -y -qq musl-tools gcc-aarch64-linux-gnu file
 
       - name: Install pinned Rust toolchain with musl targets
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master, pinned 2026-06-16
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master, pinned 2026-06-16
         with:
           toolchain: 1.95.0
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl

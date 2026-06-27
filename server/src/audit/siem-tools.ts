@@ -31,12 +31,9 @@ export function createSIEMTools(
     {
       name: "audit_export_siem",
       description:
-        "Export audit log events in SIEM-standard formats (CEF or OCSF) for ingestion into " +
-        "Splunk, Datadog, QRadar, and other security information and event management (SIEM) platforms. " +
-        "Encrypted audit entries are decrypted and formatted according to your chosen standard. " +
-        "Tier 1 — operator approval required: SIEM forwarding is an operator function, and the " +
-        "bulk export reveals each operation's policy tier and approve/deny decision, so it is not " +
-        "auto-allowed to the agent (prevents policy-inference).",
+        "Export the caller's own redacted audit view in CEF or OCSF (for SIEMs such as Splunk or " +
+        "Datadog). Raw policy tier, rule ids, system/gate entries, and approve-vs-auto distinctions " +
+        "are not included; Tier 1 approval still required (bulk audit export).",
       inputSchema: {
         type: "object",
         properties: {

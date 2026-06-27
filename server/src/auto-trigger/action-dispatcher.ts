@@ -303,11 +303,26 @@ export class AutoTriggerActionRegistry implements ActionClass {
     finding: SentinelFinding,
     context?: ActionClassContext,
   ): ActionClass {
+    const sentinelId = finding.sentinel_id.toLowerCase();
+
+    // Plugin-host composition boundary (Plugin Host design review H1). A finding
+    // sourced from a plugin (`sentinel_id` begins "plugin:") is observability-only:
+    // it can NEVER select an enforcement action class. A plugin author picks their
+    // own reverse-DNS id and their own `signals`/`details`, so allowing either to
+    // steer `block_egress`/`auto_deny_tool` would let a plugin pick its own
+    // enforcement trigger — exactly what the verdict algebra forbids ("object,
+    // never authorize"). Plugin findings route to the inbox-only fallback
+    // regardless of id substring or any vendor-supplied detail key. Promoting a
+    // plugin finding to an auto-fire rung is a separate, operator-driven Tier-1
+    // decision and is not expressible through this attacker-influenced path.
+    if (sentinelId.startsWith("plugin:")) {
+      return this.fallback();
+    }
+
     const explicit = stringDetail(finding, "auto_trigger_action_class");
     if (isActionClassId(explicit)) {
       return this.actions.get(explicit) ?? this.fallback();
     }
-    const sentinelId = finding.sentinel_id.toLowerCase();
     if (
       sentinelId.includes("egress") ||
       stringDetail(finding, "destination") ||

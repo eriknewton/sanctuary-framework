@@ -31,6 +31,7 @@
 
 import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
+import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
 
 /**
  * "Never fake green" + "never imply anonymity" for the Query-privacy section
@@ -179,6 +180,23 @@ export function renderPostureHomeHTML(): string {
   .fh-row .name { flex: 1; }
   .fh-row .why { color: var(--muted); font-size: 12px; }
   .fh-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .approval-row {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid var(--border);
+  }
+  .approval-row:last-child { border-bottom: 0; }
+  .approval-main { min-width: 0; }
+  .approval-title { font-weight: 600; }
+  .approval-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .approval-actions { display: flex; gap: 8px; flex: none; }
+  .approval-actions button {
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
+    color: var(--text); background: var(--panel-2); cursor: pointer; font-size: 12px;
+  }
+  .approval-actions button.approve { border-color: rgba(46,160,67,.55); }
+  .approval-actions button.deny { border-color: rgba(248,81,73,.55); }
+  .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
+  .approval-error { color: var(--red); font-size: 12px; margin-top: 8px; }
   .footer {
     margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
     border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
@@ -202,6 +220,11 @@ export function renderPostureHomeHTML(): string {
   .conn.live .dot { background: var(--green); }
   .conn.reconnecting .dot { background: var(--amber); }
   .conn .updated { color: var(--muted); }
+  .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0; }
+  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; user-select: none; }
+  .story-toggle input { margin: 0; }
+  .story-summary { margin: 0; }
 </style>
 </head>
 <body>
@@ -222,13 +245,36 @@ export function renderPostureHomeHTML(): string {
     <div class="grid" id="agents"><span class="empty">Loading…</span></div>
   </section>
 
+  <!--
+    Fleet (Fleet Console Slice 1). Hidden by default and only revealed when this
+    fortress has federation provisioned (the /api/posture/fleet endpoint returns
+    200 with available:true). A 404 (federation not wired) or available:false
+    (not provisioned) keeps this section display:none so the panel is ABSENT,
+    never a greyed shell or a fabricated "all admitted" roster over a fortress
+    with no fleet. SEE / MONITOR only, no trust actions here (a later slice adds
+    in-console admit/revoke).
+  -->
+  <section id="fleet-section" style="display:none">
+    <div class="section-head">
+      <h2>Fleet</h2>
+      <span class="sub" id="fleet-summary"></span>
+    </div>
+    <div class="panel" id="fleet"><span class="empty">Loading…</span></div>
+  </section>
+
   <section>
     <h2>Approvals waiting</h2>
     <div class="panel" id="approvals"><span class="empty">Loading…</span></div>
   </section>
 
   <section>
-    <h2>Today's story</h2>
+    <div class="section-head">
+      <h2>Today's story</h2>
+      <label class="story-toggle">
+        <input type="checkbox" id="story-plain-summary" />
+        Plain summary
+      </label>
+    </div>
     <div class="panel" id="story"><span class="empty">Loading…</span></div>
   </section>
 
@@ -257,6 +303,18 @@ export function renderPostureHomeHTML(): string {
     <div class="panel" id="queryprivacy"><span class="empty">Loading…</span></div>
   </section>
 
+  <!--
+    Recognition + portability (P5). Hidden by default and only revealed when the
+    composition gate is ON (the /api/posture/recognition endpoint returns 200).
+    When composition is OFF the endpoint 404s and this section stays display:none
+    so the panel is ABSENT, never a greyed shell that would imply a Concordia /
+    Verascore dependency.
+  -->
+  <section id="recognition-section" style="display:none">
+    <h2>Recognition and portability</h2>
+    <div class="panel" id="recognition"><span class="empty">Loading…</span></div>
+  </section>
+
   <div class="footer">
     <strong>Your data, your machine.</strong>
     State: encrypted at rest (AES-256-GCM) under <code>~/.sanctuary</code> on this machine.
@@ -273,13 +331,80 @@ export function renderPostureHomeHTML(): string {
   // login session cookie rides along; if a token is in the URL hash we use it.
   var tokenMatch = /[#&]token=([^&]+)/.exec(location.hash);
   var token = tokenMatch ? decodeURIComponent(tokenMatch[1]) : null;
+  if (!token && typeof sessionStorage !== "undefined") {
+    token = sessionStorage.getItem("authToken") || null;
+  }
+
+  function readUrlSession() {
+    try {
+      var value = new URLSearchParams(location.search || "").get("session");
+      // Dashboard sessions are server-minted opaque URL-safe ids. Reject odd
+      // characters rather than reflecting them into any follow-up request URL.
+      if (value && /^[A-Za-z0-9_-]{1,256}$/.test(value)) return value;
+    } catch (e) {}
+    return null;
+  }
+
+  var urlSession = readUrlSession();
+
+  function credentialedPath(path) {
+    if (!urlSession) return path;
+    try {
+      var u = new URL(path, location.origin);
+      if (u.origin !== location.origin) return path;
+      u.searchParams.set("session", urlSession);
+      return u.pathname + u.search + u.hash;
+    } catch (e) {
+      return path;
+    }
+  }
 
   function api(path) {
     var opts = { credentials: "same-origin", headers: {} };
     if (token) opts.headers["Authorization"] = "Bearer " + token;
-    return fetch(path, opts).then(function (r) {
+    var url = credentialedPath(path);
+    return fetch(url, opts).then(function (r) {
       if (!r.ok) throw new Error(path + " -> " + r.status);
       return r.json();
+    });
+  }
+
+  function rememberToken(value) {
+    token = value;
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("authToken", value);
+    }
+  }
+
+  function promptForToken() {
+    if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
+    var entered = window.prompt("Sanctuary operator token required for approval decisions.");
+    if (!entered) return null;
+    entered = entered.trim();
+    if (!entered) return null;
+    rememberToken(entered);
+    return entered;
+  }
+
+  function decisionHeaders() {
+    var headers = {};
+    if (token) headers["Authorization"] = "Bearer " + token;
+    return headers;
+  }
+
+  function postDecision(path, retried) {
+    return fetch(credentialedPath(path), {
+      method: "POST",
+      credentials: "same-origin",
+      headers: decisionHeaders(),
+      cache: "no-store",
+    }).then(function (r) {
+      if (r.status === 401 && !retried) {
+        if (!promptForToken()) return null;
+        return postDecision(path, true);
+      }
+      if (!r.ok) throw new Error(path + " -> " + r.status);
+      return r.json().catch(function () { return {}; });
     });
   }
 
@@ -306,6 +431,7 @@ export function renderPostureHomeHTML(): string {
   // polling honestly. Reuses the dashboard's existing session TTL (we do not
   // lengthen it) and never puts the long-lived token in a URL.
   function mintStreamSession() {
+    if (urlSession) return Promise.resolve("?session=" + encodeURIComponent(urlSession));
     if (!token || hasSessionCookie()) return Promise.resolve("");
     return fetch("/auth/session", {
       method: "POST",
@@ -341,13 +467,9 @@ export function renderPostureHomeHTML(): string {
   // green. A no-longer-protected agent (mid-unwrap, or observed not enforcing)
   // is red. This mirrors the wall pill's evidence-gated color model so the most-
   // screenshotted tile can no longer overclaim enforcement from policy intent.
-  function agentPill(row) {
-    if (row.enforcement_active === "active")
-      return '<span class="pill green">enforcement active</span>';
-    if (row.policy_protected && row.enforcement_active !== "active")
-      return '<span class="pill amber">protection requested</span>';
-    return '<span class="pill red">not enforcing</span>';
-  }
+  // The function body is the SHARED source of truth (posture-html-shared.ts) so
+  // the drill-down cannot weaken this color model independently (#641).
+  ${AGENT_PILL_FN_SOURCE}
 
   // "Never fake green" for the feature-health panel. Mirrors the canonical
   // pure mapper exported from this module (featureHealthPill). GREEN is earned
@@ -363,7 +485,17 @@ export function renderPostureHomeHTML(): string {
 
   // Plain-English reason copy, derived from the endpoint's stable basis enum.
   // Never leaks rule internals; phrases the honest non-green cases plainly.
+  //
+  // HONESTY: the liveness bases (alive_no_recent_enforcement / dead_no_heartbeat
+  // / intentionally_stopped / no_evidence_self_reporting) are SHARED between the
+  // Castle Wall row and the broker DAEMON row, but they mean different things.
+  // For Castle Wall, a fresh heartbeat means "armed but idle" (no flow filtered).
+  // For the broker daemon it means ONLY "the process is up" - NOT that it would
+  // mint/deny a token correctly, NOT that the keychain is reachable. So the
+  // broker daemon row gets PROCESS-LIVENESS copy ("broker daemon alive"), never
+  // "healthy"/green. Branch on the stable feature_id to keep both honest.
   function featureWhy(row) {
+    var isBrokerDaemon = row.feature_id === "secret_broker_daemon";
     switch (row.basis) {
       case "fresh_enforcement_evidence":
         return "Confirmed by fresh enforcement evidence.";
@@ -374,11 +506,29 @@ export function renderPostureHomeHTML(): string {
       case "stale_evidence":
         return "Evidence is stale; recent state cannot be confirmed.";
       case "no_evidence_self_reporting":
-        return "No recent evidence; working state cannot be confirmed.";
+        return isBrokerDaemon
+          ? "No recent heartbeat ever seen; cannot tell a never-started daemon from one that stopped long ago."
+          : "No recent evidence; working state cannot be confirmed.";
+      case "alive_no_recent_enforcement":
+        return isBrokerDaemon
+          ? "Broker daemon alive (recent heartbeat). Process liveness only - this does NOT confirm it would correctly mint or deny a token, nor that the keychain is reachable."
+          : "The wall is alive (recent heartbeat) but has not filtered a flow in the window.";
+      case "dead_no_heartbeat":
+        return isBrokerDaemon
+          ? "The broker daemon was running but its heartbeat stopped; the process appears to have silently died."
+          : "The wall was running but its heartbeat stopped; it appears to have silently died.";
+      case "intentionally_stopped":
+        return isBrokerDaemon
+          ? "The broker daemon was intentionally stopped (clean shutdown); it is off on purpose, not dead."
+          : "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
           : "No activity in the window.";
+      case "floor_met":
+        return "Activity met the minimum volume you declared for this feature.";
+      case "below_expected_floor":
+        return "Below the minimum volume you declared for this feature. This is your stated expectation being quiet, not a detected fault.";
       case "integrity_tainted":
         return "Audit integrity finding present; status cannot be trusted.";
       case "freshness_scan_incomplete":
@@ -463,22 +613,187 @@ export function renderPostureHomeHTML(): string {
     }
     // Exit / portability: the honest capability statement. The Tier-1-gated CLI
     // export exists; the FULL clean-exit guarantee is NOT yet earned, so we say
-    // "export available" and never assert the full clean-exit claim on Home.
+    // "evidence bundle" and never assert the full clean-exit claim on Home.
     html +=
       '<div class="evidence" style="margin-top:10px">Exit and portability: ' +
       (panel.exit_state === "export_available"
-        ? '<span class="pill amber">export available</span> ' +
-          "Export your fortress as a portable bundle with <code>" +
+        ? '<span class="pill amber">evidence bundle</span> ' +
+          "Create a portable evidence bundle with <code>" +
           esc(panel.exit_command || "sanctuary exit") +
           "</code> (a Tier-1 operation: it requires your approval before it runs)."
         : "unknown") +
       "</div>";
     html +=
-      '<div class="fh-note">Export available does not yet mean a guaranteed clean exit: ' +
-      "the portable-bundle export ships, but the full clean-exit guarantee (complete, " +
+      '<div class="fh-note">An evidence bundle does not yet mean a guaranteed clean exit: ' +
+      "the portable evidence-bundle command ships, but the full clean-exit guarantee (complete, " +
       "verifiable handover with nothing left behind) is not yet earned, so it is not claimed here.</div>";
     el.innerHTML = html;
   }
+
+  // ── Recognition + portability (P5) ──────────────────────────────────────
+  // The single most impartiality-loaded panel. Hard rules, all visible here:
+  //   - NO SCORE: this renderer never reads or shows a Verascore (or any vendor)
+  //     reputation score. It shows LOCAL attestation COUNTS only, plus the local
+  //     "published?" boolean. There is no score field on the payload to render.
+  //   - LOCAL VERIFICATION: counterparty verification is labeled as LOCAL bridge
+  //     cryptography, keyed off panel.receipts.verification_basis. It is NEVER
+  //     labeled "verified by Concordia" or "verified by Verascore".
+  //   - NEVER FAKE GREEN: the reputation row is green ONLY when real attestation
+  //     evidence is present (reputation_state === "present"); otherwise amber.
+  //     The portable-identity export is an amber capability, never green.
+  function recognitionRepPill(state) {
+    if (state === "present") return '<span class="pill green">on record</span>';
+    return '<span class="pill amber">no evidence yet</span>';
+  }
+  function renderRecognition(panel) {
+    var section = document.getElementById("recognition-section");
+    var el = document.getElementById("recognition");
+    if (!el || !section) return;
+    if (!panel) {
+      el.innerHTML = '<span class="empty">No recognition data.</span>';
+      return;
+    }
+    var r = panel.receipts || {};
+    // Counterparty receipts. The verification label is keyed strictly off the
+    // payload's frozen basis constant so it can never drift to a vendor claim.
+    var verifyLabel =
+      r.verification_basis === "local_bridge_crypto"
+        ? "verified locally by Sanctuary's bridge cryptography (signature + commitment recomputation + terms-hash match)"
+        : "verification basis unknown";
+    var html =
+      '<div class="evidence">Counterparty receipts (Concordia bridge): ' +
+      '<code>' + esc(r.committed) + '</code> committed · ' +
+      '<code>' + esc(r.verified_true) + '</code> ' + esc(verifyLabel) +
+      (r.verified_false ? ' · <code>' + esc(r.verified_false) + '</code> failed verification' : '') +
+      ' · <code>' + esc(r.attested) + '</code> attested to reputation.</div>';
+    html +=
+      '<div class="fh-note">These counts come from your local bridge audit and storage with no Concordia process running. ' +
+      'A receipt proves the revealed terms match what was committed and is bound to the named parties; it is not a full counterparty track record.</div>';
+    // Honest cap disclosure (#651 LOW): the verify/attest counts read the most
+    // recent audit_query_cap entries, so on a very busy fortress they are a lower
+    // bound, not a complete tally. Disclose it rather than silently undercounting.
+    if (r.receipts_capped) {
+      html +=
+        '<div class="fh-note">Note: verify/attest counts cover the most recent ' +
+        '<code>' + esc(r.audit_query_cap) + '</code> audit entries, so on a very busy fortress they are a lower bound (not a complete all-time tally).</div>';
+    }
+    // Local reputation EVIDENCE (counts only; NEVER a score).
+    var ev = panel.reputation_evidence;
+    html +=
+      '<div style="margin-top:10px">' + recognitionRepPill(panel.reputation_state) +
+      ' &nbsp;Local reputation evidence (counts from your own attestation store, not a score)</div>';
+    if (ev) {
+      html +=
+        '<div class="evidence"><code>' + esc(ev.attestation_count) + '</code> attestation(s) · ' +
+        '<code>' + esc(ev.dispute_count) + '</code> dispute(s)' +
+        (ev.most_recent_attestation_at ? ' · most recent ' + esc(ev.most_recent_attestation_at) : '') +
+        ' · external publish: ' +
+        (ev.verascore_linked
+          ? '<span class="pill amber">published</span> (you ran reputation_publish; this is a local flag, not a fetched score)'
+          : '<span class="pill amber">not published</span>') +
+        '.</div>';
+    } else {
+      html +=
+        '<div class="fh-note">No local reputation evidence yet, so this row is amber, not green. ' +
+        'Sanctuary never fetches or displays an external reputation score.</div>';
+    }
+    // Portable identity: the Slice-3 amber capability treatment, reused.
+    html +=
+      '<div class="evidence" style="margin-top:10px">Portable identity: ' +
+      (panel.export_state === "export_available"
+        ? '<span class="pill amber">export available</span> ' +
+          'Export your portable identity bundle with <code>' +
+          esc(panel.export_tool || "sanctuary_export_identity_bundle") +
+          '</code> (a Tier-1 operation: it requires your approval before it runs).'
+        : 'unknown') +
+      '</div>';
+    if (!panel.audit_integrity_ok) {
+      html += '<div class="err">Audit integrity finding present - receipt counts may be incomplete.</div>';
+    }
+    el.innerHTML = html;
+  }
+
+  // Fetch the Recognition panel behind the composition render gate. A 200 reveals
+  // the section; a 404 (composition OFF) leaves it hidden so the panel is ABSENT,
+  // never a greyed shell that implies a dependency.
+  //
+  // RETRY ON LOCKED (#651 MEDIUM): the panel sits behind the audit-unlock 503
+  // guard, so the very first fetch can land while the fortress is still locked
+  // (a 503). A one-shot fetch would then keep the panel hidden FOREVER even after
+  // the operator unlocks. So we retry with capped backoff on ANY status that is
+  // not a definitive 404. A 404 means composition is off (a config fact that does
+  // not change within a session): that stays an honest, permanent absence and we
+  // stop. We never render a greyed shell while retrying: the section stays
+  // display:none until a 200 supplies real evidence, so a locked/booting fortress
+  // shows nothing (honest absence), not a composition-off implication.
+  var RECOGNITION_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+  function loadRecognition(attempt) {
+    var section = document.getElementById("recognition-section");
+    if (!section) return;
+    api("/api/posture/recognition").then(function (panel) {
+      // composition_enabled is always true on a served panel; reveal + render.
+      section.style.display = "";
+      renderRecognition(panel);
+    }).catch(function (err) {
+      // Keep the panel absent while we decide. Never a greyed/empty card.
+      section.style.display = "none";
+      // api() throws Error("<path> -> <status>"); a 404 is a definitive
+      // composition-off absence, so stop. Anything else (503 locked, transient
+      // network) is retryable so the panel appears once the fortress unlocks.
+      var msg = err && err.message ? String(err.message) : "";
+      if (/-> 404$/.test(msg)) return;
+      var i = attempt || 0;
+      if (i >= RECOGNITION_RETRY_MS.length) {
+        // Settle at the slowest cadence so a long-locked fortress still recovers
+        // the panel after unlock without hammering the endpoint.
+        setTimeout(function () { loadRecognition(i); }, RECOGNITION_RETRY_MS[RECOGNITION_RETRY_MS.length - 1]);
+        return;
+      }
+      setTimeout(function () { loadRecognition(i + 1); }, RECOGNITION_RETRY_MS[i]);
+    });
+  }
+  function loadRecognitionOnce() { loadRecognition(0); }
+
+  // ── Fleet roster (Fleet Console Slice 1) ────────────────────────────────
+  // A separate, federation-gated fetch (NOT on the home payload, so a fortress
+  // with no federation never receives any roster data). A 200 with
+  // available:true reveals the panel; a 404 (federation not wired) or
+  // available:false (not provisioned) keeps it hidden (honest absence), never a
+  // fabricated roster. Unlike Recognition, the fleet is RE-POLLED on a cadence so
+  // a revocation (a machine going from admitted -> revoked, or an unevaluable
+  // machine flipping to untrusted) shows up live on the board without a reload.
+  var FLEET_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+  var FLEET_REFRESH_MS = 15000;
+  var fleetRefreshTimer = null;
+  function scheduleFleetRefresh() {
+    if (fleetRefreshTimer !== null) return;
+    fleetRefreshTimer = setInterval(function () { loadFleet(0); }, FLEET_REFRESH_MS);
+  }
+  function loadFleet(attempt) {
+    var section = document.getElementById("fleet-section");
+    if (!section) return;
+    api("/api/posture/fleet").then(function (roster) {
+      renderFleet(roster);
+      // Once we have ANY successful read, keep the panel current on a cadence so
+      // trust changes (revoke / unevaluable) flip the board live. renderFleet
+      // hides the section honestly when available:false, so a provisioned-then-
+      // disabled fortress is handled by the renderer, not a stop here.
+      scheduleFleetRefresh();
+    }).catch(function (err) {
+      // A 404 is a definitive "federation not wired on this dashboard" absence:
+      // stop and leave the panel hidden. Anything else (503 locked, transient
+      // network) is retryable so the panel appears once the fortress unlocks.
+      var msg = err && err.message ? String(err.message) : "";
+      if (/-> 404$/.test(msg)) { section.style.display = "none"; return; }
+      var i = attempt || 0;
+      if (i >= FLEET_RETRY_MS.length) {
+        setTimeout(function () { loadFleet(i); }, FLEET_RETRY_MS[FLEET_RETRY_MS.length - 1]);
+        return;
+      }
+      setTimeout(function () { loadFleet(i + 1); }, FLEET_RETRY_MS[i]);
+    });
+  }
+  function loadFleetOnce() { loadFleet(0); }
 
   // "Never fake green" for the Query-privacy section. Mirrors the canonical pure
   // mapper exported from this module (queryPrivacyPill). GREEN is earned ONLY by
@@ -538,9 +853,9 @@ export function renderPostureHomeHTML(): string {
     el.innerHTML = headline + rows + note;
   }
 
-  function renderBanner(home, pending, anomalies) {
+  function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
-    var pendingCount = (pending && pending.length) || 0;
+    var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
     document.getElementById("origin").textContent =
       "Machine: " + home.origin_machine + " · single-machine view (federation off)";
     document.getElementById("banner").innerHTML =
@@ -592,21 +907,178 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
-  function renderApprovals(pending) {
-    if (!pending || !pending.length) {
+  function normalizeLegacyApproval(p) {
+    var id = p && (p.id || p.request_id);
+    if (!id) return null;
+    return {
+      id: String(id),
+      source: "legacy",
+      title: p.operation || "pending operation",
+      detail: (p.reason || "") + (p.tier ? " · Tier " + p.tier : ""),
+      review_href: "/api/pending",
+      approve_path: "/api/approve/" + encodeURIComponent(id),
+      deny_path: "/api/deny/" + encodeURIComponent(id),
+    };
+  }
+
+  function normalizeInboxApproval(p) {
+    var id = p && p.aggregator_id;
+    if (!id) return null;
+    return {
+      id: String(id),
+      source: "approval-inbox",
+      title: p.action_summary || p.policy_rule_id || "pending operation",
+      detail: (p.source_harness || "approval inbox") +
+        (p.source_agent_id ? " · " + p.source_agent_id : ""),
+      review_href: "/api/approval-inbox/" + encodeURIComponent(id),
+      approve_path: "/api/approval-inbox/" + encodeURIComponent(id) + "/approve",
+      deny_path: "/api/approval-inbox/" + encodeURIComponent(id) + "/deny",
+    };
+  }
+
+  function mapRows(items, mapper) {
+    var rows = [];
+    (items || []).forEach(function (item) {
+      var row = mapper(item);
+      if (row) rows.push(row);
+    });
+    return rows;
+  }
+
+  function approvalRedirect(status) {
+    return status && status.policy && status.policy.approval_redirect
+      ? status.policy.approval_redirect
+      : { enabled: false, mode: "replace" };
+  }
+
+  function chooseApprovalRows(legacyRows, inboxRows, status) {
+    var redirect = approvalRedirect(status);
+    if (redirect.enabled === true && redirect.mode === "replace") {
+      return { rows: inboxRows, source: "approval-inbox" };
+    }
+    if (legacyRows.length) return { rows: legacyRows, source: "legacy" };
+    if (inboxRows.length) return { rows: inboxRows, source: "approval-inbox" };
+    return { rows: [], source: "none" };
+  }
+
+  function buildApprovalState(legacyBody, inboxBody, status) {
+    var legacyList = legacyBody && legacyBody.pending ? legacyBody.pending : legacyBody;
+    var inboxList = inboxBody && inboxBody.data && inboxBody.data.entries
+      ? inboxBody.data.entries
+      : [];
+    var selected = chooseApprovalRows(
+      mapRows(legacyList || [], normalizeLegacyApproval),
+      mapRows(inboxList || [], normalizeInboxApproval),
+      status || null
+    );
+    return {
+      rows: selected.rows,
+      source: selected.source,
+      can_decide: !!status && status.decision_capable === true,
+      mode: status
+        ? (status.standalone_mode === true ? "standalone" : "co-located")
+        : "unknown",
+    };
+  }
+
+  function renderApprovals(approvalState) {
+    var pending = (approvalState && approvalState.rows) || [];
+    if (!pending.length) {
       document.getElementById("approvals").innerHTML = '<span class="empty">Nothing needs you.</span>';
       return;
     }
     var html = "";
     pending.forEach(function (p) {
-      html += '<div class="story-line">' + esc(p.operation || p.id || "pending operation") +
-        ' — <a href="/api/pending">review &rarr;</a></div>';
+      html += '<div class="approval-row" data-approval-row="' + esc(p.id) + '">' +
+        '<div class="approval-main"><div class="approval-title">' + esc(p.title) + "</div>" +
+        (p.detail ? '<div class="approval-detail">' + esc(p.detail) + "</div>" : "") +
+        '<div class="approval-detail"><a href="' + esc(p.review_href) + '">review &rarr;</a></div>' +
+        '<div class="approval-error" data-approval-error="' + esc(p.id) + '"></div></div>';
+      if (approvalState && approvalState.can_decide) {
+        html += '<div class="approval-actions">' +
+          '<button class="approve" data-decision-path="' + esc(p.approve_path) + '" data-approval-id="' + esc(p.id) + '">Approve</button>' +
+          '<button class="deny" data-decision-path="' + esc(p.deny_path) + '" data-approval-id="' + esc(p.id) + '">Deny</button>' +
+          "</div>";
+      }
+      html += "</div>";
     });
-    document.getElementById("approvals").innerHTML = html;
+    var el = document.getElementById("approvals");
+    el.innerHTML = html;
+    if (approvalState && approvalState.can_decide) wireApprovalButtons(el);
+  }
+
+  function wireApprovalButtons(el) {
+    Array.prototype.forEach.call(el.querySelectorAll("button[data-decision-path]"), function (button) {
+      button.addEventListener("click", function () {
+        var path = button.getAttribute("data-decision-path");
+        var id = button.getAttribute("data-approval-id");
+        if (!path) return;
+        var row = id ? el.querySelector('[data-approval-row="' + id + '"]') : null;
+        var rowButtons = row ? row.querySelectorAll("button[data-decision-path]") : [button];
+        Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = true; });
+        var error = id ? el.querySelector('[data-approval-error="' + id + '"]') : null;
+        if (error) error.textContent = "";
+        postDecision(path, false).then(function (result) {
+          if (result === null) {
+            Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = false; });
+            return;
+          }
+          pollOnce();
+        }).catch(function (err) {
+          Array.prototype.forEach.call(rowButtons, function (b) { b.disabled = false; });
+          if (error) error.textContent = "Decision failed: " + (err && err.message ? err.message : "unknown error");
+        });
+      });
+    });
+  }
+
+  var STORY_PLAIN_SUMMARY_KEY = "postureStoryPlainSummary";
+  var lastStoryDigest = null;
+
+  function readStoryPlainSummaryPreference() {
+    try {
+      return typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(STORY_PLAIN_SUMMARY_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setStoryPlainSummaryPreference(enabled) {
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem(STORY_PLAIN_SUMMARY_KEY, enabled ? "1" : "0");
+      }
+    } catch (e) {}
+  }
+
+  function syncStoryToggle() {
+    var toggle = document.getElementById("story-plain-summary");
+    if (!toggle) return;
+    toggle.checked = readStoryPlainSummaryPreference();
+  }
+
+  function renderStoryPlainSummary(d) {
+    var chainText = d.chain_verified
+      ? "The audit log verified clean: no tampering."
+      : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
+    return '<p class="story-summary">Today your agents ran <strong>' + esc(d.total_operations) +
+      "</strong> operations in the last 24h. Sanctuary blocked <strong>" + esc(d.kernel_blocks) +
+      "</strong> outbound connections and allowed <strong>" + esc(d.kernel_allows) +
+      "</strong>. You denied <strong>" + esc(d.approvals_denied) +
+      "</strong> approvals and granted <strong>" + esc(d.approvals_granted) +
+      "</strong>. " + esc(chainText) + "</p>" +
+      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
   }
 
   function renderStory(d) {
     var el = document.getElementById("story");
+    lastStoryDigest = d;
+    syncStoryToggle();
+    if (readStoryPlainSummaryPreference()) {
+      el.innerHTML = renderStoryPlainSummary(d);
+      return;
+    }
     var lines = [];
     lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h.");
     lines.push("<strong>" + d.kernel_blocks + "</strong> outbound connections blocked at the kernel; " +
@@ -620,6 +1092,16 @@ export function renderPostureHomeHTML(): string {
       '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
   }
 
+  function wireStoryToggle() {
+    var toggle = document.getElementById("story-plain-summary");
+    if (!toggle) return;
+    syncStoryToggle();
+    toggle.addEventListener("change", function () {
+      setStoryPlainSummaryPreference(toggle.checked === true);
+      if (lastStoryDigest) renderStory(lastStoryDigest);
+    });
+  }
+
   function renderAnomalies(findings) {
     var el = document.getElementById("anomalies");
     if (!findings || !findings.length) {
@@ -630,6 +1112,91 @@ export function renderPostureHomeHTML(): string {
       return '<div class="story-line"><span class="pill amber">' + esc(f.severity || "finding") + "</span> " +
         esc(f.summary || f.detector_id || f.finding_id || "anomaly") + "</div>";
     }).join("");
+  }
+
+  // "Never fake green" for the fleet roster. GREEN (admitted) is earned ONLY by
+  // the federation layer's own revocation verdict returning "not revoked" for a
+  // node it could EVALUATE. A revoked node is red; an UNEVALUABLE node (the
+  // fail-closed case) is also red ("untrusted"), NEVER amber and never green:
+  // the same fail-closed model the sync chokepoint applies. The server already
+  // computed this verdict via isNodeRevoked; the page only colors it.
+  function fleetTrustPill(state) {
+    if (state === "admitted") return '<span class="pill green">ADMITTED</span>';
+    if (state === "revoked") return '<span class="pill red">REVOKED</span>';
+    // untrusted == unevaluable revocation state, fail-closed. Red, not amber.
+    return '<span class="pill red">UNTRUSTED</span>';
+  }
+
+  // Reach is liveness telemetry, NOT a trust signal, so it uses a SEPARATE,
+  // muted vocabulary and never a green/red trust pill: a node's reach can never
+  // launder it into looking trusted. "recent" is informational, not "all well."
+  function fleetReachLabel(reach) {
+    if (reach === "recent") return '<span class="pill" style="background:#1c2330">reachable</span>';
+    if (reach === "stale") return '<span class="pill amber">no recent sync</span>';
+    return '<span class="pill amber">never synced</span>';
+  }
+
+  function fleetTrustWhy(node) {
+    if (node.trust_state === "admitted") {
+      return "Admitted to the fleet. The federation layer confirms this machine is not revoked.";
+    }
+    if (node.trust_state === "revoked") {
+      return "Revoked by you. This machine is locked out across the fleet.";
+    }
+    // untrusted: distinguish the fail-closed unevaluable case in plain English.
+    return node.trust_evaluable === false
+      ? "Trust could not be evaluated for this machine right now, so it is shown UNTRUSTED by design (fail-closed), not assumed safe."
+      : "This machine is not in good standing and is shown untrusted.";
+  }
+
+  function renderFleet(roster) {
+    var section = document.getElementById("fleet-section");
+    var el = document.getElementById("fleet");
+    var summaryEl = document.getElementById("fleet-summary");
+    if (!section || !el) return;
+    // Honest absence: a fortress with no federation provisioned has no fleet to
+    // present. Keep the section hidden rather than render an empty green shell.
+    if (!roster || roster.available !== true) {
+      section.style.display = "none";
+      return;
+    }
+    section.style.display = "";
+    var s = roster.summary || { total: 0, admitted: 0, revoked: 0, untrusted: 0 };
+    if (summaryEl) {
+      var parts = [esc(s.total) + " machine" + (s.total === 1 ? "" : "s")];
+      if (s.admitted) parts.push(esc(s.admitted) + " admitted");
+      if (s.revoked) parts.push(esc(s.revoked) + " revoked");
+      if (s.untrusted) parts.push(esc(s.untrusted) + " untrusted");
+      summaryEl.textContent = parts.join(" · ");
+    }
+    var head =
+      '<div class="evidence">Fleet ' + (roster.enabled ? "on" : "off") +
+      " · this machine <code>" + esc(roster.node_id) + "</code>" +
+      " · fortress <code>" + esc(roster.fortress_id) + "</code>" +
+      " · eviction serial " + esc(roster.eviction_serial) + "</div>";
+    var nodes = roster.nodes || [];
+    if (!nodes.length) {
+      el.innerHTML = head +
+        '<div class="empty">No other machines admitted to this fleet yet.</div>';
+      return;
+    }
+    var rows = nodes.map(function (n) {
+      var modeNote = n.provider_in_trust_boundary
+        ? ' · <span class="why">provider in trust boundary</span>'
+        : "";
+      return '<div class="story-line">' +
+        fleetTrustPill(n.trust_state) + " &nbsp;" +
+        "<code>" + esc(n.node_id) + "</code>" +
+        (n.label ? " (" + esc(n.label) + ")" : "") +
+        " &nbsp;" + fleetReachLabel(n.reach) +
+        '<div class="evidence">' + esc(fleetTrustWhy(n)) +
+        " · mode " + esc(n.node_mode) + modeNote +
+        (n.last_sync_received_at
+          ? " · last sync " + esc(n.last_sync_received_at)
+          : " · no sync received") +
+        "</div></div>";
+    }).join("");
+    el.innerHTML = head + rows;
   }
 
   function renderWall(w) {
@@ -669,12 +1236,12 @@ export function renderPostureHomeHTML(): string {
   // pending-approvals + anomaly findings come from the existing endpoints (not
   // carried on the home payload), so the caller passes the most recent values it
   // has; both default to empty arrays when never fetched.
-  function renderHome(home, pending, findings) {
-    pending = pending || [];
+  function renderHome(home, approvals, findings) {
+    approvals = approvals || { rows: [], can_decide: false, mode: "unknown", source: "none" };
     findings = findings || [];
-    renderBanner(home, pending, findings);
+    renderBanner(home, approvals, findings);
     renderAgents(home);
-    renderApprovals(pending);
+    renderApprovals(approvals);
     renderStory(home.digest);
     renderAnomalies(findings);
     renderWall(home.castle_wall);
@@ -694,6 +1261,7 @@ export function renderPostureHomeHTML(): string {
   // honest value the last real frame produced - but the connection banner makes
   // the freshness of that frame unmistakable.
   var lastFrameAt = null; // ms epoch of the last successful render, or null.
+  var streamAvailable = false;
   // If no fresh frame arrives within this window, the view is treated as stale
   // even if a socket is nominally open. Comfortably larger than the server push
   // cadence (5s) + heartbeat (15s) so a single missed tick is not flapped.
@@ -735,15 +1303,17 @@ export function renderPostureHomeHTML(): string {
   // Not carried on the home payload, so refreshed alongside each home frame.
   // Failures degrade to empty (never block the home render); these are honest
   // empties, not green claims.
-  var lastPending = [];
+  var lastApprovals = { rows: [], can_decide: false, mode: "unknown", source: "none" };
   var lastFindings = [];
   function refreshAuxiliary() {
     return Promise.all([
-      api("/api/pending").catch(function () { return { pending: [] }; }),
+      api("/api/pending").catch(function () { return []; }),
+      api("/api/approval-inbox?status=pending").catch(function () { return { data: { entries: [] } }; }),
+      api("/api/status").catch(function () { return null; }),
       api("/api/anomaly/findings").catch(function () { return { findings: [] }; }),
     ]).then(function (rest) {
-      lastPending = rest[0].pending || rest[0] || [];
-      lastFindings = rest[1].findings || rest[1] || [];
+      lastApprovals = buildApprovalState(rest[0], rest[1], rest[2]);
+      lastFindings = rest[3].findings || rest[3] || [];
     });
   }
 
@@ -752,7 +1322,8 @@ export function renderPostureHomeHTML(): string {
   // advanced, so the "Live" indicator is earned by a real, fully-rendered frame.
   function applyHome(home) {
     return refreshAuxiliary().then(function () {
-      renderHome(home, lastPending, lastFindings);
+      streamAvailable = home && home.stream_available === true;
+      renderHome(home, lastApprovals, lastFindings);
       lastFrameAt = Date.now();
       setConn("live");
     });
@@ -765,7 +1336,11 @@ export function renderPostureHomeHTML(): string {
   // surfaces an honest error in the banner and leaves the indicator amber.
   function pollOnce() {
     return api("/api/posture/home")
-      .then(function (home) { return applyHome(home); })
+      .then(function (home) {
+        return applyHome(home).then(function () {
+          if (supportsSSE && streamAvailable && !es && reconnectTimer === null) connectStream();
+        });
+      })
       .catch(function (e) {
         setConn("reconnecting");
         document.getElementById("banner").innerHTML =
@@ -809,6 +1384,7 @@ export function renderPostureHomeHTML(): string {
   }
 
   function connectStream() {
+    if (!streamAvailable) { startPolling(); return; }
     if (!supportsSSE) { startPolling(); return; }
     if (es) { try { es.close(); } catch (e) {} es = null; }
     // EventSource cannot set an Authorization header. On loopback / cookie auth
@@ -868,10 +1444,18 @@ export function renderPostureHomeHTML(): string {
   // first paint even before the stream connects), then attach the live stream.
   // If SSE is unavailable, this degrades to the prior poll-only behavior.
   setConn("reconnecting");
+  wireStoryToggle();
   pollOnce().then(function () {
-    if (supportsSSE) connectStream();
-    else startPolling();
+    if (!supportsSSE || !streamAvailable) startPolling();
   });
+  // Recognition + portability (P5) is a separate, composition-gated fetch (it is
+  // NOT on the home payload, so an off-fortress never receives any of its data).
+  // Loaded once at boot: the gate flag is config and stable within a session.
+  loadRecognitionOnce();
+  // Fleet roster (Fleet Console Slice 1) is a separate, federation-gated fetch
+  // (also NOT on the home payload). Loaded at boot; it self-schedules a refresh
+  // cadence on first success so revocations flip the board live.
+  loadFleetOnce();
 })();
 </script>
 </body>

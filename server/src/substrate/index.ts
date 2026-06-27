@@ -77,3 +77,60 @@ export {
   parseGovernance,
   governanceHash,
 } from "./governance.js";
+
+export {
+  type PluginContribution,
+  type PluginContributionVerdict,
+  boundContributionRationale,
+} from "./attribution.js";
+
+export {
+  type PluginLifecycleState,
+  type PluginSuspensionReason,
+  type PluginLifecycleHook,
+  type PluginLifecycleRecord,
+  type PluginLifecycleAuditSink,
+  PLUGIN_AUDIT_OPS,
+  PluginLifecycleController,
+} from "./lifecycle.js";
+
+export {
+  type PluginRuntimeClient,
+  type RealizedConfinementReport,
+  type PluginLaunchConfig,
+  type RunningPluginRegistration,
+  type EgressConsultationInput,
+  type EgressConsultationResult,
+  type PluginHealth,
+  type PluginSupervisorOptions,
+  PLUGIN_CONFINEMENT_KIND,
+  PLUGIN_SECCOMP_PROFILE_ID,
+  DEFAULT_INLINE_TIMEOUT_MS,
+  DEFAULT_EGRESS_TIMEOUT_MS,
+  MAX_VERDICT_FRAME_BYTES,
+  MAX_REQUEST_FRAME_BYTES,
+  PluginInvocationError,
+  FramedJsonPluginClient,
+  PluginSupervisor,
+  projectEgressDecisionRequest,
+  parseConfinementReport,
+  validateConfinementReport,
+} from "./supervisor.js";
+
+export {
+  REFERENCE_BLOCKLIST_PLUGIN_ID,
+  REFERENCE_BLOCKLIST_SIGNER_ID,
+  REFERENCE_BLOCKLIST_KEY_ID,
+  REFERENCE_BLOCKLIST_ENTRY,
+  REFERENCE_SIGNER_PUBKEY_FILENAME,
+  type LoadedReferenceBundle,
+  type SpawnedPlugin,
+  referenceBlocklistBundleDir,
+  enumerateBundle,
+  buildReferenceDescriptor,
+  signDescriptor,
+  loadReferenceBlocklistBundle,
+  readBundledSigner,
+  loadBundledReferenceBlocklist,
+  spawnReferencePlugin,
+} from "./reference-plugin/index.js";

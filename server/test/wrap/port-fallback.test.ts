@@ -84,12 +84,34 @@ describe("startDashboardWithFallback — rc.2 MAX_PORT regression", () => {
     const { starter, attempts } = makeStarter(busy);
     await expect(
       startDashboardWithFallback(starter, preferred, "t", "test")
-    ).rejects.toThrow(/No free dashboard port in the 20 ports starting at 3511/);
+    ).rejects.toThrow(
+      /No free dashboard port in the range 3511-3530 \(all 20 tried\)/
+    );
     expect(attempts.length).toBe(PORT_FALLBACK_ATTEMPTS);
     expect(attempts[0]).toBe(preferred);
     expect(attempts[PORT_FALLBACK_ATTEMPTS - 1]).toBe(
       preferred + PORT_FALLBACK_ATTEMPTS - 1
     );
+  });
+
+  it("exhaustion error gives actionable --port guidance without banned copy", async () => {
+    const preferred = 3501;
+    const busy: number[] = [];
+    for (let i = 0; i < PORT_FALLBACK_ATTEMPTS; i++) busy.push(preferred + i);
+    const { starter } = makeStarter(busy);
+    try {
+      await startDashboardWithFallback(starter, preferred, "t", "test");
+      throw new Error("expected throw");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toContain("No free dashboard port in the range 3501-3520");
+      expect(msg).toContain("(all 20 tried)");
+      expect(msg).toContain("EADDRINUSE: port 3520");
+      expect(msg).toContain("Stop the other Sanctuary instance");
+      expect(msg).toContain("sanctuary wrap <your-flags> --port <port>");
+      expect(msg).not.toContain("—");
+      expect(msg.toLowerCase()).not.toContain("sovereignty");
+    }
   });
 
   it("exhaustion error names a sensible port range (not backwards, not empty)", async () => {
@@ -104,7 +126,7 @@ describe("startDashboardWithFallback — rc.2 MAX_PORT regression", () => {
       const msg = (e as Error).message;
       // rc.2 produced "No free dashboard port in range 3511-3510" — a
       // backwards range. The fixed message names the forward window.
-      expect(msg).toMatch(/tried 3511-3530/);
+      expect(msg).toMatch(/range 3511-3530/);
       expect(msg).not.toMatch(/3511-3510/);
     }
   });

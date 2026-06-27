@@ -27,8 +27,24 @@
  *                                  gate flag (config, NOT evidence-gated). Carries
  *                                  NO Concordia/Verascore data - only the flag and
  *                                  origin_machine. Behind the SAME checkAuth gate.
+ *   GET /api/posture/recognition - Recognition + portability panel (P5). GATED on
+ *                                  composition-enabled (404 when off, so the panel
+ *                                  is ABSENT not greyed). LOCAL-evidence only:
+ *                                  bridge receipt counts + local reputation
+ *                                  EVIDENCE (counts, never a score) + the portable-
+ *                                  identity export capability. No score-fetch path;
+ *                                  counterparty verification is local bridge crypto.
+ *   GET /api/posture/evidence    - Phase 2 Evidence View (design section 2.5):
+ *                                  filterable audit-entry table with chain
+ *                                  integrity_findings surfaced ON-VIEW. Operator-
+ *                                  gated (same checkAuth as all other posture JSON
+ *                                  routes); never unauthenticated. Filters: agent,
+ *                                  since, operation_type, layer, result, limit.
+ *                                  Reuses AuditLog.query() verbatim; adds NO new
+ *                                  backend query logic.
  *   GET /posture                 - the posture home HTML.
  *   GET /posture/agent/:id       - the per-agent drill-down HTML (Slice 4).
+ *   GET /posture/evidence        - the Phase 2 Evidence View HTML shell.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -36,7 +52,7 @@ import type { AuditLog } from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { detectAgentConfigWithDiagnostics, getPlatformPaths } from "../wrap/config-reader.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
-import { CURATED_ALLOWLIST } from "../castle-wall/runtime/curated-allowlist.js";
+import { resolveCuratedRules } from "../castle-wall/runtime/curated-allowlist.js";
 import {
   buildCastleWallPosture,
   buildAuditDigest,
@@ -44,6 +60,7 @@ import {
   buildAgentReach,
   buildPostureAgentRows,
   buildCustodyExitPanel,
+  buildRecognitionPanel,
   PLATFORM_TO_HARNESS,
   type DetectedHarness,
   type ReachRule,
@@ -52,6 +69,8 @@ import {
   type UnwrappedRoster,
   type AgentEffectiveReach,
   type CustodyExitPanel,
+  type RecognitionPanel,
+  type RecognitionReputationEvidence,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -67,8 +86,9 @@ import {
   handleQueryAnonymityStatsRequest,
   QUERY_ANONYMITY_API_PREFIX,
 } from "../query-anonymity/query-anonymity-routes.js";
-import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { renderPostureAgentHTML } from "./posture-agent-html.js";
+import { renderPostureEvidenceHTML } from "./posture-evidence-html.js";
+import type { FleetRoster } from "./fleet-roster.js";
 import {
   handlePostureStream,
   type PostureStreamRegistry,
@@ -95,6 +115,13 @@ export const POSTURE_STREAM_PATH = `${POSTURE_API_PREFIX}/stream`;
  * from the path in the browser, so the route only matches the prefix here.
  */
 export const POSTURE_AGENT_PATH_PREFIX = "/posture/agent/";
+/**
+ * Evidence View HTML page (Phase 2, design section 2.5): `/posture/evidence`.
+ * A filterable audit-entry table with chain integrity_findings surfaced on-view.
+ * Served behind the SAME checkAuth gate as `/posture/agent/:id` and the posture
+ * JSON endpoints. The data comes from `/api/posture/evidence` (JSON, same gate).
+ */
+export const POSTURE_EVIDENCE_PATH = "/posture/evidence";
 
 /**
  * Dependencies the route layer needs from the dashboard. All are resolved
@@ -116,8 +143,42 @@ export interface PostureRouteDeps {
    * absent is treated as `false` (honest default-off).
    */
   compositionEnabled?: boolean;
+  /**
+   * Recognition panel (P5): count of persisted Concordia-bridge commitments
+   * (`storage.list("_bridge")`). Supplied by the dashboard, which holds the
+   * storage backend; resolved lazily per request so post-unlock wiring is
+   * observed. Optional - when absent, OR when it resolves to `undefined` (no
+   * storage backend wired, so the count is unknowable), the recognition shaper
+   * falls back to the count of `bridge_commit` audit events (an honest lower
+   * bound, never a fabricated count). A resolved `0` is a real "zero persisted
+   * commitments" fact and is used as-is. Carries NO Concordia/Verascore data
+   * beyond a local count.
+   */
+  countBridgeCommitments?: () => Promise<number | undefined>;
+  /**
+   * Recognition panel (P5): pre-gathered LOCAL reputation EVIDENCE (counts only)
+   * for the primary identity - NOT a score and NOT a fetched Verascore value.
+   * Supplied by the dashboard, which holds the identity + master key needed to
+   * read the local attestation store. Resolved lazily per request. Returns
+   * `null` when no reputation store is wired / readable, which renders the
+   * reputation row amber ("no evidence yet"), never green-from-absence. There is
+   * NO score-fetch path anywhere in this flow; this is the only reputation input
+   * the panel ever sees.
+   */
+  gatherRecognitionReputation?: () => Promise<RecognitionReputationEvidence | null>;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
+  /**
+   * Fleet Console Slice 1: build the federation-backed fleet roster on demand.
+   * Supplied by the dashboard, which holds the live federation deps; the route
+   * is a thin presenter over it (the dashboard runs `buildFleetRoster` against
+   * the SAME `V1FederationDeps` and revocation projection the `/v1` endpoints
+   * use, so trust is the federation layer's verdict, never re-derived here).
+   * Resolved lazily per request so post-provision wiring is observed. When
+   * ABSENT, the fleet route is disabled (404 within the namespace); additive,
+   * so an unwired dashboard simply has no fleet panel rather than a broken one.
+   */
+  fleetRoster?: () => FleetRoster;
   /**
    * Castle Wall reach rules visible for the fortress. Phase 1 sources these
    * from the curated allowlist (the structured destination set the dashboard
@@ -125,6 +186,18 @@ export interface PostureRouteDeps {
    * this later without changing the shape. Optional override for tests.
    */
   listReachRules?: () => ReachRule[];
+  /**
+   * The curated rule ids the operator has ACTUALLY enabled on disk (#641). The
+   * default `curatedReachRules()` shaper sources reach lines from these ids via
+   * `resolveCuratedRules`, instead of mapping the entire curated catalog, so a
+   * never-configured fortress reports NO wall rules (an honest red gap) rather
+   * than a fabricated default-deny over the full curated set. When this returns
+   * `null` / an empty list, or when it is absent (no enabled manifest readable),
+   * the reach view shows the honest "No Castle Wall ruleset applies" gap.
+   * Resolved lazily per request so post-provision wiring is observed. Ignored
+   * when `listReachRules` is supplied (the explicit override wins, e.g. tests).
+   */
+  listEnabledCuratedRuleIds?: () => readonly string[] | null;
   /**
    * Scan for installed harnesses by config-file presence. Optional override so
    * tests inject a deterministic detection set instead of touching the real
@@ -155,6 +228,10 @@ export interface PostureRouteDeps {
    * exclusive with a non-null `resolvePinnedProducerKey()`.
    */
   producerKeyExpectedButUnavailable?: boolean;
+  /** Pinned public key for the broker daemon liveness producer. */
+  resolveBrokerPinnedProducerKey?: () => string | null;
+  /** Broker liveness producer key exists or is expected but could not be read. */
+  brokerProducerKeyExpectedButUnavailable?: boolean;
   /**
    * Shared active-stream registry for the SSE live-refresh endpoint
    * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
@@ -190,15 +267,14 @@ export async function handlePostureRoute(
 ): Promise<boolean> {
   const path = url.pathname;
 
-  // Posture home HTML.
-  if (method === "GET" && path === POSTURE_HOME_PATH) {
-    res.writeHead(200, {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-cache",
-    });
-    res.end(renderPostureHomeHTML());
-    return true;
-  }
+  // NOTE (Delta Review A3 remediation): the posture-home HTML at `/posture` is
+  // NO LONGER served here. The dashboard now serves the `/posture` shell (and
+  // `/`) BEFORE its auth gate, byte-for-byte the same unauthenticated static
+  // shell, so `/` and `/posture` are genuinely one surface under the same auth
+  // contract (see `DashboardApprovalChannel.dispatchRootPosture`). This branch
+  // would be unreachable for `GET /posture`; the data routes below are
+  // unchanged and still run behind `checkAuth`. `POSTURE_HOME_PATH` is still
+  // exported for the dashboard's routing/view-route classification.
 
   // Per-agent drill-down HTML (Slice 4). The page is a static shell; it parses
   // the :id from the path and fetches `/api/posture/reach/:id` + `/api/posture/
@@ -211,6 +287,19 @@ export async function handlePostureRoute(
       "Cache-Control": "no-cache",
     });
     res.end(renderPostureAgentHTML());
+    return true;
+  }
+
+  // Evidence View HTML shell (Phase 2, design section 2.5). A static shell that
+  // fetches `/api/posture/evidence` client-side behind this same auth gate. The
+  // page filters are applied client-side via URL params passed to the JSON API.
+  // Operator-gated: served only AFTER checkAuth (same gate as the JSON routes).
+  if (method === "GET" && path === POSTURE_EVIDENCE_PATH) {
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+    res.end(renderPostureEvidenceHTML());
     return true;
   }
 
@@ -344,8 +433,88 @@ export async function handlePostureRoute(
       return true;
     }
 
+    // Evidence View JSON endpoint (Phase 2, design section 2.5). Filterable
+    // audit-entry table with integrity_findings surfaced ON-VIEW.  Reuses
+    // AuditLog.query() verbatim; adds NO new backend query logic.
+    //
+    // HONESTY: integrity_findings are returned as-is from the query result and
+    // must be surfaced by the client.  A chain with findings must NEVER render
+    // green on the client side.  The operator audit is their own data, but it is
+    // ALWAYS operator-gated (this route is behind checkAuth, unreachable to any
+    // unauthenticated caller or non-operator, and cross-tenant is structurally
+    // impossible because each fortress runs a separate AuditLog instance keyed
+    // to its own encrypted storage namespace).
+    //
+    // Supported query params (all optional, all map to existing AuditLog.query()
+    // options; any unrecognised param is silently ignored):
+    //   ?agent=<identity_id>         filter by identity_id
+    //   ?since=<ISO-string>          filter entries at or after this timestamp
+    //   ?operation_type=<string>     filter by operation name
+    //   ?layer=<l1|l2|l3|l4>        filter by layer
+    //   ?result=<success|failure>    filter by result
+    //   ?limit=<number>              max entries to return (default 50, cap 500)
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/evidence`) {
+      const result = await buildEvidence(deps, url);
+      writeJSON(res, 200, result);
+      return true;
+    }
+
+    // Recognition + portability panel (P5). GATED on composition-enabled: when
+    // composition is OFF the panel is ABSENT entirely (404 within the namespace,
+    // NOT a greyed/empty payload), so its mere existence never implies a
+    // Concordia/Verascore dependency. When ON it returns LOCAL-evidence-only
+    // receipt counts + local reputation evidence (counts, NOT a score) + the
+    // portable-identity export capability. It reaches here only after the
+    // audit-null 503 guard above, so it is never built against a locked log.
+    // IMPARTIALITY: there is no score-fetch path; counterparty verification is
+    // labeled local bridge crypto; rows are amber unless evidence is present.
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/recognition`) {
+      if (deps.compositionEnabled !== true) {
+        // Honest absence: composition off => the Recognition panel does not
+        // exist on this fortress. 404 (not an empty 200) so the page omits the
+        // panel rather than rendering a greyed/implied-dependency shell.
+        writeJSON(res, 404, {
+          error: "recognition_unavailable",
+          reason: "composition is disabled; the recognition panel is absent",
+          origin_machine: om,
+        });
+        return true;
+      }
+      const panel = await buildRecognition(deps);
+      writeJSON(res, 200, panel);
+      return true;
+    }
+
     if (method === "GET" && path === `${POSTURE_API_PREFIX}/unwrapped`) {
       const roster = await buildUnwrapped(deps);
+      writeJSON(res, 200, roster);
+      return true;
+    }
+
+    // Fleet Console Slice 1: the federation-backed fleet roster (the operator's
+    // own admitted machines, each with its fail-closed trust verdict + a reach
+    // indicator). LOOPBACK-ONLY read; SEE/MONITOR only (no trust mutation here).
+    //
+    // ABSENCE: when the dashboard does not supply `fleetRoster` (federation not
+    // wired in this build path), the route 404s within the namespace so the page
+    // simply omits the fleet panel; additive, never a broken/empty-green shell.
+    //
+    // TRUST: the roster's per-node verdict comes from `buildFleetRoster` reading
+    // the federation layer's own `isNodeRevoked` projection (the SAME one every
+    // sync path routes through), fail-closed: an unevaluable node renders
+    // `untrusted`, never amber, never silently admitted. The presenter never
+    // re-derives trust from a `/v1/nodes` response field. No key material is on
+    // the roster shape.
+    if (method === "GET" && path === `${POSTURE_API_PREFIX}/fleet`) {
+      if (!deps.fleetRoster) {
+        writeJSON(res, 404, {
+          error: "fleet_unavailable",
+          reason: "federation is not wired on this dashboard; the fleet panel is absent",
+          origin_machine: om,
+        });
+        return true;
+      }
+      const roster = await buildFleet(deps);
       writeJSON(res, 200, roster);
       return true;
     }
@@ -397,57 +566,98 @@ export async function handlePostureRoute(
 
 // ── Composition helpers ──────────────────────────────────────────────
 
+// The always-on posture surface (home board + per-panel endpoints + SSE push)
+// composes several full-window audit reads per paint. Each helper below wraps its
+// build in `AuditLog.runEagerReads` so those reads serve from the eagerly-
+// maintained verified view with an EVENT-DRIVEN out-of-band fingerprint sentinel
+// plus a throttled backstop re-verify, instead of a full chain re-scan per request.
+// On a real 10k-entry / 40MB chain the old path
+// was 11-30s and pegged the event loop, and the SSE cadence made an open board
+// recompute it continuously and wedge the server (the #714 drill). HONESTY is
+// preserved: the eager view reflects every server-written entry with NO lag (the
+// server is the sole appender and verifies each entry as it appends), and the
+// strict integrity-findings contract is unchanged, so `chain_verified` /
+// `integrity_finding_count` / feature-health can never serve stale-green. The
+// agent-facing `/api/posture/evidence` read (`buildEvidence`) deliberately stays
+// on the full per-request re-verify path, keeping per-request on-disk tamper
+// detection on the inspectable audit surface.
 async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPosture> {
-  return buildCastleWallPosture({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCastleWallPosture({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
-  return buildAuditDigest({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildAuditDigest({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
- * Feature-usage health panel. Cache-invalidation rule (review must-fix #4): the
- * panel is recomputed from the audit chain on every request via
- * `buildFeatureHealthPanel`, which reads `AuditLog.query` fresh and re-scans for
- * integrity findings each call. Because each response reflects the current
- * chain head, a post-fault refresh can never show stale green - there is no
- * cross-request cache to invalidate at this layer.
+ * Feature-usage health panel. NEVER-STALE-GREEN rule (the new honesty argument,
+ * superseding the prior "uncached by design" note): the panel reads the audit
+ * chain through `buildFeatureHealthPanel`, which goes via the AuditLog's EAGER
+ * read path here (wrapped in `runEagerReads`). The eager view is maintained on
+ * EVERY append (the server is the sole appender and verifies each new entry as it
+ * records it), so the panel always reflects the current chain head with NO lag.
+ * A post-fault refresh can never show stale green. This is NOT a lazily-cached
+ * value that could fall behind an append: it is the eagerly-maintained verified
+ * state, and a detected integrity finding (at load, on the next eager read via the
+ * fingerprint sentinel, or on the throttled backstop out-of-band re-verify) forces
+ * every row to `unknown`/non-green via the existing `audit_integrity_ok=false`
+ * lever. What the eager path changes versus the old code is ONLY the cadence of the
+ * OUT-OF-BAND on-disk re-scan (a direct file edit that bypasses the server): a
+ * fingerprint-changing edit (count / newest key / per-entry size or mtime) is
+ * caught EVENT-DRIVEN on the next eager read, and only the residual same-length,
+ * mtime-preserved edit waits for the throttled backstop re-verify, instead of
+ * re-verifying the whole chain on every paint (the #714 wedge).
  */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
 ): Promise<FeatureHealthPanel> {
-  return buildFeatureHealthPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
-    pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
-      ? deps.resolvePinnedProducerKey()
-      : null,
-    ...(deps.producerKeyExpectedButUnavailable
-      ? { producerKeyExpectedButUnavailable: true }
-      : {}),
-  });
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildFeatureHealthPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      // Surface the per-plugin attribution rows on the operator posture surface.
+      // Read-only projection over the same audit read; never enforcement-bearing.
+      includePluginRows: true,
+      ...(deps.now ? { now: deps.now() } : {}),
+      pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
+        ? deps.resolvePinnedProducerKey()
+        : null,
+      brokerPinnedProducerKeyB64url: deps.resolveBrokerPinnedProducerKey
+        ? deps.resolveBrokerPinnedProducerKey()
+        : null,
+      ...(deps.producerKeyExpectedButUnavailable
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(deps.brokerProducerKeyExpectedButUnavailable
+        ? { brokerProducerKeyExpectedButUnavailable: true }
+        : {}),
+    }),
+  );
 }
 
 /**
@@ -463,10 +673,13 @@ async function buildQueryPrivacy(
 ): Promise<QueryPrivacySection> {
   let stats: { total_outbound_calls: number; total_headers_stripped: number; window: "24h" } | null;
   try {
-    const computed = await computeQueryAnonymityStats({
-      auditLog: deps.auditLog as AuditLog,
-      ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
-    });
+    // Eager read (posture surface): bounded-cost, throttled out-of-band re-verify.
+    const computed = await (deps.auditLog as AuditLog).runEagerReads(() =>
+      computeQueryAnonymityStats({
+        auditLog: deps.auditLog as AuditLog,
+        ...(deps.now ? { now: () => new Date(deps.now!()) } : {}),
+      }),
+    );
     stats = {
       window: computed.window,
       total_outbound_calls: computed.total_outbound_calls,
@@ -497,11 +710,129 @@ async function buildQueryPrivacy(
 async function buildCustodyExit(
   deps: PostureRouteDeps,
 ): Promise<CustodyExitPanel> {
-  return buildCustodyExitPanel({
-    auditLog: deps.auditLog as AuditLog,
-    originMachine: deps.originMachine,
-    ...(deps.now ? { now: deps.now() } : {}),
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildCustodyExitPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+    }),
+  );
+}
+
+/**
+ * Evidence View JSON endpoint (Phase 2, design section 2.5). Reads the audit
+ * chain via `AuditLog.query()` with the operator-supplied filter params and
+ * returns entries + integrity_findings.  Adds NO new backend query logic; it is
+ * a thin URL-param-to-query-options adapter over the existing query API.
+ *
+ * Supported URL params (all optional; unrecognised params are ignored):
+ *   ?agent=<string>            - maps to query.identity_id
+ *   ?since=<ISO-string>        - maps to query.since
+ *   ?operation_type=<string>   - maps to query.operation_type
+ *   ?layer=<l1|l2|l3|l4>      - maps to query.layer
+ *   ?result=<success|failure>  - applied as post-filter (query has no result
+ *                                field; we filter after the query returns)
+ *   ?limit=<number>            - capped at 500; defaults to 50
+ */
+async function buildEvidence(
+  deps: PostureRouteDeps,
+  url: URL,
+): Promise<{
+  origin_machine: string;
+  entries: import("../operational/audit-log.js").AuditEntry[];
+  total: number;
+  integrity_findings: import("../operational/audit-log.js").AuditIntegrityFinding[];
+}> {
+  const auditLog = deps.auditLog as AuditLog;
+
+  // Parse filter params defensively: invalid values are silently ignored so the
+  // endpoint degrades gracefully (a bad param gives unfiltered results, not 500).
+  const agentParam = url.searchParams.get("agent") ?? undefined;
+  const sinceParam = url.searchParams.get("since") ?? undefined;
+  const opParam = url.searchParams.get("operation_type") ?? undefined;
+  const resultParam = url.searchParams.get("result") ?? undefined;
+
+  const layerRaw = url.searchParams.get("layer");
+  const validLayers = ["l1", "l2", "l3", "l4"] as const;
+  type Layer = (typeof validLayers)[number];
+  const layerParam: Layer | undefined =
+    validLayers.includes(layerRaw as Layer) ? (layerRaw as Layer) : undefined;
+
+  const limitRaw = Number(url.searchParams.get("limit") ?? "50");
+  const limitParam = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.min(Math.floor(limitRaw), 500)
+    : 50;
+
+  const queryResult = await auditLog.query({
+    since: sinceParam,
+    layer: layerParam,
+    operation_type: opParam,
+    identity_id: agentParam,
+    limit: limitParam,
   });
+
+  // Result filter is applied as a post-filter (AuditLog.query has no result
+  // param).  We re-derive total to reflect post-filter count.
+  let entries = queryResult.entries;
+  const total = queryResult.total;
+  if (resultParam === "success" || resultParam === "failure") {
+    entries = entries.filter((e) => e.result === resultParam);
+    // total is queryResult.total: the in-window count BEFORE the result
+    // post-filter (and before the limit slice).  It is NOT the count of matched
+    // entries; the client can compare entries.length against total to detect
+    // truncation at the query level, but cannot infer how many in-window entries
+    // matched the result filter.  This is the honest reading of the number.
+  }
+
+  return {
+    origin_machine: deps.originMachine,
+    entries,
+    total,
+    integrity_findings: queryResult.integrity_findings,
+  };
+}
+
+/**
+ * Recognition + portability panel (P5). The route already enforced the
+ * composition-enabled render gate and the audit-unlock 503 before we reach here,
+ * so this helper only shapes evidence. It resolves the two optional impure
+ * sources defensively: a failed bridge-commitment list or a failed reputation
+ * gather degrades to the honest fallback (audit-event lower bound / `null` amber
+ * row) rather than throwing, so a partial-evidence fortress still renders an
+ * honest panel instead of a 500. There is NO score fetch on any of these paths.
+ */
+async function buildRecognition(deps: PostureRouteDeps): Promise<RecognitionPanel> {
+  let committedReceiptCount: number | undefined;
+  if (deps.countBridgeCommitments) {
+    try {
+      committedReceiptCount = await deps.countBridgeCommitments();
+    } catch {
+      // A failed `_bridge` list is not evidence of zero receipts: leave it
+      // undefined so the shaper falls back to the audit-event lower bound.
+      committedReceiptCount = undefined;
+    }
+  }
+
+  let reputationEvidence: RecognitionReputationEvidence | null = null;
+  if (deps.gatherRecognitionReputation) {
+    try {
+      reputationEvidence = await deps.gatherRecognitionReputation();
+    } catch {
+      // A failed reputation read is NOT evidence of health: null renders the
+      // reputation row amber ("no evidence yet"), never green.
+      reputationEvidence = null;
+    }
+  }
+
+  return (deps.auditLog as AuditLog).runEagerReads(() =>
+    buildRecognitionPanel({
+      auditLog: deps.auditLog as AuditLog,
+      originMachine: deps.originMachine,
+      ...(deps.now ? { now: deps.now() } : {}),
+      ...(committedReceiptCount !== undefined ? { committedReceiptCount } : {}),
+      reputationEvidence,
+    }),
+  );
 }
 
 async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> {
@@ -515,6 +846,20 @@ async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> 
   });
 }
 
+/**
+ * Fleet Console Slice 1: resolve the federation-backed fleet roster.
+ *
+ * The roster is built by the dashboard-supplied `fleetRoster` closure, which
+ * runs `buildFleetRoster` against the live `V1FederationDeps`. We wrap the read
+ * in `runEagerReads` so it shares the same maintained-view read scope as the
+ * other always-on posture panels and the cross-machine fan-out stays cheap. The
+ * caller has already guarded `deps.fleetRoster` non-null (404 otherwise).
+ */
+async function buildFleet(deps: PostureRouteDeps): Promise<FleetRoster> {
+  const resolve = deps.fleetRoster as () => FleetRoster;
+  return (deps.auditLog as AuditLog).runEagerReads(async () => resolve());
+}
+
 function buildReach(
   deps: PostureRouteDeps,
   agentId: string,
@@ -523,12 +868,29 @@ function buildReach(
   if (!agent) return null;
   const rules = deps.listReachRules
     ? deps.listReachRules()
-    : curatedReachRules();
+    : curatedReachRules(
+        deps.listEnabledCuratedRuleIds
+          ? deps.listEnabledCuratedRuleIds()
+          : null,
+      );
+  // #641 honesty gate: derive enforcement_confirmed from the SAME per-agent
+  // signal the agent pill uses, via the canonical row shaper (single source of
+  // truth: never re-implement the policy-vs-enforcement split). Today this is
+  // always false (no per-agent live enforcement signal exists), so the reach
+  // view renders rules as configured, not as confirmed OS enforcement. Routing
+  // it through `buildPostureAgentRows` means any future per-agent enforcement
+  // probe lights up the pill AND the reach view together, with no second path.
+  const [row] = buildPostureAgentRows({
+    originMachine: deps.originMachine,
+    records: [agent],
+  });
+  const enforcementConfirmed = row?.enforcement_active === "active";
   return buildAgentReach({
     originMachine: deps.originMachine,
     agentId,
     harness: agent.harness,
     rules,
+    enforcementConfirmed,
   });
 }
 
@@ -566,6 +928,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
   return {
     origin_machine: deps.originMachine,
+    stream_available: deps.streamRegistry !== undefined,
     castle_wall: castleWall,
     digest,
     unwrapped,
@@ -625,25 +988,36 @@ async function scanInstalledHarnesses(
 }
 
 /**
- * Phase 1 reach rules from the curated allowlist. Every curated entry is a
- * Castle Wall (kernel-enforced) rule. When a daemon-sourced live manifest
- * becomes readable from the dashboard, this becomes the live ruleset with the
- * same shape.
+ * Reach rules from the curated allowlist, scoped to the rules the operator has
+ * ACTUALLY enabled (#641). Phase 1 read-only source for the dashboard (no daemon
+ * dependency). Curated entries are `default_enabled: false` and are NOT
+ * auto-applied at install; mapping the entire catalog would have shown
+ * never-enabled rules as an operator-enabled, kernel-enforced default-deny: the
+ * fabricated posture #641 fixes. Instead we source via `resolveCuratedRules`
+ * over the operator's enabled rule ids: an empty / null id set yields NO rules,
+ * so the reach view reports `has_wall_policy=false` and surfaces the honest red
+ * "No Castle Wall ruleset applies to this agent" gap rather than a fabricated
+ * default-deny. The `castle_wall` enforcing layer is a CONFIGURATION fact (these
+ * rules target the wall); whether the OS is actually enforcing them is gated
+ * separately by `enforcement_confirmed` on the payload.
  */
-function curatedReachRules(): ReachRule[] {
-  return CURATED_ALLOWLIST.map((entry) => {
+function curatedReachRules(
+  enabledRuleIds: readonly string[] | null,
+): ReachRule[] {
+  if (!enabledRuleIds || enabledRuleIds.length === 0) return [];
+  return resolveCuratedRules(enabledRuleIds).map((allowRule) => {
     const rule: ReachRule = {
-      rule_id: entry.rule.id,
-      disposition: entry.rule.disposition,
+      rule_id: allowRule.id,
+      disposition: allowRule.disposition,
       enforcing_layer: "castle_wall",
     };
-    const match = entry.rule.match;
+    const match = allowRule.match;
     if (match.host !== undefined) rule.host = match.host;
     if (match.host_pattern !== undefined) rule.host_pattern = match.host_pattern;
     if (match.ip !== undefined) rule.ip = match.ip;
     if (match.cidr !== undefined) rule.cidr = match.cidr;
-    if (entry.rule.scope?.agent_ids !== undefined) {
-      rule.agent_ids = entry.rule.scope.agent_ids;
+    if (allowRule.scope?.agent_ids !== undefined) {
+      rule.agent_ids = allowRule.scope.agent_ids;
     }
     return rule;
   });

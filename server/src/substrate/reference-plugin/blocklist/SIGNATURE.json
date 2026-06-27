@@ -1,0 +1,43 @@
+{
+  "descriptor": {
+    "schema": "sanctuary.plugin.bundle/v1",
+    "alg": "ed25519",
+    "signer_id": "ai.sanctuary.first-party",
+    "key_id": "release-v1",
+    "plugin_id": "ai.sanctuary.blocklist",
+    "version": "1.0.0",
+    "channel": "stable",
+    "governance_hash": "e99a635430415ca5c3099f6cf39297ac7b2efa8180d45e316a12062984a4f5d2",
+    "files": [
+      {
+        "path": "bin/blocklist.mjs",
+        "type": "file",
+        "mode_exec": true,
+        "size": 8073,
+        "sha256": "1510bce40db34abe7cd0d5dc40be2ced44e9a25a5d0c9caaef1c3a7df955c5d4"
+      },
+      {
+        "path": "first-party-signer.json",
+        "type": "file",
+        "mode_exec": false,
+        "size": 140,
+        "sha256": "aee601c1f63e50ae185b45d5f564c637273e32157ad47c7cdcabf35e42ff40ec"
+      },
+      {
+        "path": "governance.yaml",
+        "type": "file",
+        "mode_exec": false,
+        "size": 1051,
+        "sha256": "e99a635430415ca5c3099f6cf39297ac7b2efa8180d45e316a12062984a4f5d2"
+      },
+      {
+        "path": "rules/blocklist.txt",
+        "type": "file",
+        "mode_exec": false,
+        "size": 529,
+        "sha256": "53dcccfa96efe6457ac4df56429d4d1107d4d831df6d55b560a090995f94c00b"
+      }
+    ]
+  },
+  "signature": "P18t0SDlhgtQd6XImovfQwX0vA7n98LO/Iiiyj6wV07r8swu6GNF78SvAocNUMKRzvH9yINLsp/n3ERmp4eSCg=="
+}

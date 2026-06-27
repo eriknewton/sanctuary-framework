@@ -18,9 +18,8 @@ export function createOperationalHardeningTools(
     {
       name: "l2_hardening_status",
       description:
-        "L2 Process Hardening Status — Verify software-based operational isolation. " +
-        "Reports memory protection, process isolation level, filesystem permissions, " +
-        "and overall hardening assessment. Read-only. Tier 3 — always allowed.",
+        "Report a heuristic L2 process-hardening assessment: ASLR/environment/filesystem " +
+        "checks plus configured or assumed memory-protection signals and overall status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -97,10 +96,9 @@ export function createOperationalHardeningTools(
     {
       name: "l2_verify_isolation",
       description:
-        "Verify L2 process isolation at runtime. Checks whether the Sanctuary server " +
-        "is running in an isolated environment (container, VM, sandbox) and validates " +
-        "filesystem and memory protections. Reports isolation level and any issues. " +
-        "Read-only. Tier 3 — always allowed.",
+        "Assess L2 process isolation at runtime: detect container/VM/sandbox signals, " +
+        "check storage-dir permissions, and report configured/assumed memory-protection " +
+        "indicators.",
       inputSchema: {
         type: "object",
         properties: {

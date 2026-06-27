@@ -1,5 +1,5 @@
 /**
- * Sanctuary exit machinery — Slice 1: ownership provenance (memory class).
+ * Sanctuary exit machinery - Slice 1: ownership provenance (memory class).
  *
  * This module adds the *ownership* axis to the exit path. It is orthogonal to
  * the SDW *secrecy* taint lattice (`sdw/provenance.ts`): secrecy controls
@@ -17,10 +17,10 @@
  *
  *   1. `memory_class` rides a forgeable carrier on any write path that bypasses
  *      or re-mints the sealed minter (the documented `taintClean` /
- *      caller-asserted `mintPersistable` hole — `sdw/README.md:17-29`). SDW has
+ *      caller-asserted `mintPersistable` hole - `sdw/README.md:17-29`). SDW has
  *      no live crown-jewel consumers yet, so the sealed minter is bypassable.
  *      Routing real sources through the sealed minter and retiring the
- *      caller-asserted path is **Slice 2 — the SECURITY PRECONDITION** for any
+ *      caller-asserted path is **Slice 2 - the SECURITY PRECONDITION** for any
  *      external clean-exit claim. Until then `memory_class` is forgeable on
  *      un-instrumented paths.
  *   2. Tombstone is not erasure: a full-disk snapshot restore resurrects
@@ -43,7 +43,7 @@
  * was minted for (no stamp-confusion across records), the ownership-classed exit
  * path does not weaken the existing export: an entry only travels when a live,
  * record-bound, sealed `agent_owned` stamp says so. The residual is the
- * disclosed M-1/A1 hole — on un-instrumented or re-authoring paths `memory_class`
+ * disclosed M-1/A1 hole - on un-instrumented or re-authoring paths `memory_class`
  * is forgeable, which is why those paths conservatively stay with the operator
  * and why NO external clean-exit claim ships until Slice 2 binds stamps to
  * provenance at the source.
@@ -87,12 +87,20 @@ export interface ProvenanceStamp {
   readonly written_at: string;
   readonly derived_from: readonly string[];
   /**
+   * Full lineage edges retained for signature-verified re-minting after a
+   * stamp round-trips through disk. `derived_from` remains the compact
+   * lineage-id list for existing consumers; this field preserves the classes
+   * needed to recompute `shared_entangled` rather than trusting a declared
+   * class.
+   */
+  readonly derived_from_edges?: readonly DerivedFromEdge[];
+  /**
    * The exit-partition identity of the record this stamp was minted FOR (the
    * `"<namespace>/<key>"` of the state entry, or any stable per-record id). The
    * partition requires `entry_binding === candidate.id` so a sealed stamp minted
    * for record A cannot be presented to release record B (the stamp-confusion
    * attack). A stamp minted with no binding (`undefined`) is never includable
-   * via the bundle partition — it can only be used for classification/telemetry.
+   * via the bundle partition - it can only be used for classification/telemetry.
    */
   readonly entry_binding?: string;
 }
@@ -117,7 +125,7 @@ export interface MintStampInput {
    * Lineage ids this datum is derived from, paired with the class each derived
    * lineage carried. The caller supplies the edges; the class is then computed
    * deterministically, never declared. An omitted edge is the residual A1 hole
-   * (semantic re-authoring) — disclosed, not solved, by this slice.
+   * (semantic re-authoring) - disclosed, not solved, by this slice.
    */
   readonly derived_from?: readonly DerivedFromEdge[];
   readonly written_at?: string;
@@ -193,11 +201,17 @@ export function mintProvenanceStamp(input: MintStampInput): SealedProvenanceStam
   assertNonEmpty(input.origin_ref, "origin_ref");
   assertNonEmpty(input.lineage_id, "lineage_id");
   const memory_class = classifyMemoryClass(input);
-  const derived_from = Object.freeze(
+  const derived_from_edges = Object.freeze(
     (input.derived_from ?? []).map((edge) => {
       assertEdge(edge);
-      return edge.lineage_id;
+      return Object.freeze({
+        lineage_id: edge.lineage_id,
+        memory_class: edge.memory_class,
+      });
     }),
+  );
+  const derived_from = Object.freeze(
+    derived_from_edges.map((edge) => edge.lineage_id),
   );
   if (input.entry_binding !== undefined) {
     assertNonEmpty(input.entry_binding, "entry_binding");
@@ -211,6 +225,9 @@ export function mintProvenanceStamp(input: MintStampInput): SealedProvenanceStam
     lineage_id: { value: input.lineage_id, enumerable: true },
     written_at: { value: input.written_at ?? new Date().toISOString(), enumerable: true },
     derived_from: { value: derived_from, enumerable: true },
+    ...(derived_from_edges.length > 0
+      ? { derived_from_edges: { value: derived_from_edges, enumerable: true } }
+      : {}),
     ...(input.entry_binding !== undefined
       ? { entry_binding: { value: input.entry_binding, enumerable: true } }
       : {}),
@@ -259,24 +276,37 @@ export function serializeStamp(stamp: SealedProvenanceStamp): ProvenanceStamp {
     lineage_id: stamp.lineage_id,
     written_at: stamp.written_at,
     derived_from: [...stamp.derived_from],
+    ...(stamp.derived_from_edges !== undefined
+      ? {
+          derived_from_edges: stamp.derived_from_edges.map((edge) => ({
+            lineage_id: edge.lineage_id,
+            memory_class: edge.memory_class,
+          })),
+        }
+      : {}),
     ...(stamp.entry_binding !== undefined ? { entry_binding: stamp.entry_binding } : {}),
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Conservative partition — the load-bearing exit-boundary filter.
+// Conservative partition - the load-bearing exit-boundary filter.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * A candidate record at the partition boundary. `sealedStamp` is the in-process
  * sealed stamp when (and only when) this record was minted via the sealed
  * minter in this process and the stamp object was carried through unchanged. On
- * every other path it is undefined — a deserialized-from-disk stamp, an
- * un-instrumented write, a re-minted stamp — and the partition treats the
+ * every other path it is undefined - a deserialized-from-disk stamp, an
+ * un-instrumented write, a re-minted stamp - and the partition treats the
  * record as unsealed.
  */
 export interface PartitionCandidate {
   readonly id: string;
+  /**
+   * The durable state envelope failed verification before the partition could
+   * re-mint a live seal. This is excluded before any class decision.
+   */
+  readonly verificationFailed?: boolean;
   /**
    * The in-process sealed stamp, if present. Carrying the live object (not a
    * deserialized copy) is what proves the record went through the sealed minter
@@ -292,7 +322,9 @@ export interface PartitionCandidate {
 }
 
 export type PartitionExclusionReason =
+  | "unstamped_defaulted_operator_owned"
   | "unsealed_stamp_defaulted_operator_owned"
+  | "state_envelope_verification_failed"
   | "stamp_binding_mismatch_defaulted_operator_owned"
   | "class_operator_owned"
   | "class_shared_entangled_no_consent"
@@ -303,7 +335,7 @@ export type PartitionExclusionReason =
  * `ConsentReleaseReceipt` (defined in `consent.ts`), restated here to avoid a
  * cyclic import. The partition only releases a `shared_entangled` record when a
  * receipt for its exact lineage exists with `disposition: "released_to_agent"`
- * and `memory_class: "shared_entangled"` — a raw lineage-id string is no longer
+ * and `memory_class: "shared_entangled"` - a raw lineage-id string is no longer
  * sufficient (codex MED: an unauthenticated string list let a caller release
  * shared data without an audited receipt).
  */
@@ -400,18 +432,31 @@ function decideOne(
   candidate: PartitionCandidate,
   released: ReadonlyMap<string, PartitionConsentRelease>,
 ): PartitionDecision {
+  if (candidate.verificationFailed === true) {
+    return {
+      id: candidate.id,
+      effective_class: "operator_owned",
+      includable: false,
+      reason: "state_envelope_verification_failed",
+      sealed: false,
+    };
+  }
+
   const sealed = isSealedStamp(candidate.sealedStamp);
 
   if (!sealed) {
     // Conservative default: any record whose stamp did not arrive through the
     // sealed minter is treated as operator_owned and excluded. We NEVER honor a
-    // declared `agent_owned` on an unsealed record — that is precisely the
+    // declared `agent_owned` on an unsealed record - that is precisely the
     // forgery the default exists to defeat.
     return {
       id: candidate.id,
       effective_class: "operator_owned",
       includable: false,
-      reason: "unsealed_stamp_defaulted_operator_owned",
+      reason:
+        candidate.declaredStamp === undefined && candidate.sealedStamp === undefined
+          ? "unstamped_defaulted_operator_owned"
+          : "unsealed_stamp_defaulted_operator_owned",
       sealed: false,
     };
   }

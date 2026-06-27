@@ -244,6 +244,104 @@ describe("Context Gate Tools", () => {
       });
     });
 
+    it("uses nesting-aware filtered output before applying the privacy backstop", async () => {
+      const { findTool } = setup();
+      const setPolicyTool = findTool("context_gate_set_policy");
+      const setResult = await setPolicyTool.handler({
+        policy_name: "nested-safe-context",
+        rules: [
+          {
+            provider: "inference",
+            allow: ["user", "name", "profile", "note", "prompt"],
+            redact: ["ssn", "secret_code"],
+            hash: ["user_id"],
+            summarize: [],
+          },
+        ],
+      });
+      const policy = JSON.parse(setResult.content[0].text);
+
+      const filterTool = findTool("context_gate_filter");
+      const result = await filterTool.handler({
+        policy_id: policy.policy_id,
+        provider: "inference",
+        context: {
+          user: {
+            name: "Ada",
+            ssn: "123-45-6789",
+            user_id: "user-abc-123",
+            profile: {
+              note: "safe nested note",
+              secret_code: "deep-secret-value",
+            },
+          },
+          prompt: "Email jane@example.com about the test",
+        },
+      });
+
+      const parsed = JSON.parse(result.content[0].text);
+      const user = parsed.safe_context.user;
+      expect(parsed.blocked).toBe(false);
+      expect(user.name).toBe("Ada");
+      expect(user.ssn).toBe("[REDACTED]");
+      expect(user.user_id).toMatch(/^\[HASH:[^\]]+\]$/);
+      expect(user.profile.note).toBe("safe nested note");
+      expect(user.profile.secret_code).toBe("[REDACTED]");
+      expect(parsed.safe_context.prompt).toBe("Email EMAIL_1 about the test");
+      expect(parsed.summary.privacy_filtered_spans).toBe(1);
+      expect(parsed.privacy_filter.findings[0]).toMatchObject({
+        path: "$.prompt",
+        class: "email",
+        action: "placeholder",
+        placeholder: "EMAIL_1",
+      });
+
+      const serializedSafeContext = JSON.stringify(parsed.safe_context);
+      expect(serializedSafeContext).not.toContain("123-45-6789");
+      expect(serializedSafeContext).not.toContain("user-abc-123");
+      expect(serializedSafeContext).not.toContain("deep-secret-value");
+      expect(serializedSafeContext).not.toContain("jane@example.com");
+    });
+
+    it("blocks nested deny decisions without emitting safe_context", async () => {
+      const { findTool } = setup();
+      const setPolicyTool = findTool("context_gate_set_policy");
+      const setResult = await setPolicyTool.handler({
+        policy_name: "nested-deny",
+        rules: [
+          {
+            provider: "inference",
+            allow: ["user", "name"],
+            redact: [],
+            hash: [],
+            summarize: [],
+          },
+        ],
+        default_action: "deny",
+      });
+      const policy = JSON.parse(setResult.content[0].text);
+
+      const filterTool = findTool("context_gate_filter");
+      const result = await filterTool.handler({
+        policy_id: policy.policy_id,
+        provider: "inference",
+        context: {
+          user: {
+            name: "Ada",
+            private_note: "nested-denied-secret",
+          },
+        },
+      });
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.blocked).toBe(true);
+      expect(parsed.safe_context).toBeUndefined();
+      expect(parsed.denied_fields).toEqual([
+        expect.objectContaining({ field: "user.private_note" }),
+      ]);
+      expect(result.content[0].text).not.toContain("nested-denied-secret");
+    });
+
     it("returns error for non-existent policy", async () => {
       const { findTool } = setup();
       const tool = findTool("context_gate_filter");
@@ -304,9 +402,23 @@ describe("Context Gate Tools", () => {
       const auditLog = new AuditLog(storage, masterKey);
       const profile = createDefaultProfile();
       profile.features.context_gating.enabled = true;
-      const { tools, enforcer } = createContextGateTools(storage, masterKey, auditLog, {
+      const { tools, enforcer, policyStore } = createContextGateTools(storage, masterKey, auditLog, {
         getProfile: () => profile,
       });
+      const policy = await policyStore.create(
+        "status-test-policy",
+        [
+          {
+            provider: "tool-api",
+            allow: ["task"],
+            redact: ["api_key"],
+            hash: [],
+            summarize: [],
+          },
+        ],
+        "redact"
+      );
+      profile.features.context_gating.policy_id = policy.policy_id;
       initializeContextGateEnforcerFromProfile(enforcer, profile);
 
       await enforcer.filterArgs("proxy/test/call", { api_key: "secret", task: "ok" }, {

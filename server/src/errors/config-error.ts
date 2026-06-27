@@ -1,6 +1,13 @@
 export type ConfigFailureClassification =
   | "corrupted"
   | "schema-mismatch"
+  // A structurally-valid, well-typed config file whose only problem is an
+  // out-of-range or non-integer scalar VALUE (e.g. dashboard.port = 70000, or
+  // privacy_filter.timeout_ms below the floor). This is a recoverable input
+  // typo, NOT corruption or a schema mismatch, so the loader fails CLOSED
+  // (refuses to start) WITHOUT quarantining (renaming away) the operator's
+  // file; the value is meant to be fixed in place.
+  | "invalid-value"
   | "unreadable";
 
 export interface ConfigLoadErrorOptions {

@@ -1,0 +1,4 @@
+# Sanctuary memory provider direct dependencies.
+# Runtime intentionally uses only the Python standard library.
+# The Microsoft agent_framework packages were not importable in the provided
+# offline build venv; live subclassing remains unverified.

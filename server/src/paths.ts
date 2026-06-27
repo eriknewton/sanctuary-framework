@@ -9,14 +9,80 @@
  * helpers so two instances on the same host can pick distinct locations.
  */
 
+import { access, constants, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /** Default top-level storage directory when no env override is set. */
 export const DEFAULT_STORAGE_DIR = ".sanctuary";
 
 /** Default dashboard port — matched by config.ts default. */
 export const DEFAULT_DASHBOARD_PORT = 3501;
+
+export type FortressPathWritableResult =
+  | { ok: true }
+  | { ok: false; path: string; reason: string };
+
+const ACCESS_FAILURE_CODES = new Set(["EACCES", "EROFS", "ENOENT"]);
+
+/**
+ * Check only the filesystem location that `mkdir -p <fortressPath>` needs.
+ *
+ * If the fortress path exists, check that exact path. If it does not exist,
+ * check the nearest existing ancestor. Unknown filesystem states are allowed
+ * to continue so this preflight never becomes stricter than the later write.
+ */
+export async function preflightFortressPathWritable(
+  fortressPath: string,
+): Promise<FortressPathWritableResult> {
+  const targetPath = resolve(fortressPath);
+  let currentPath = targetPath;
+
+  while (true) {
+    try {
+      await stat(currentPath);
+      return checkWritable(currentPath);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code !== "ENOENT") {
+        const accessResult = await checkWritable(currentPath);
+        return accessResult.ok ? { ok: true } : accessResult;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        return { ok: false, path: currentPath, reason: "ENOENT" };
+      }
+      currentPath = parentPath;
+    }
+  }
+}
+
+export function formatFortressPathWritableError(
+  fortressPath: string,
+  result: Exclude<FortressPathWritableResult, { ok: true }>,
+): string {
+  return `Sanctuary cannot create its secure storage at ${fortressPath}: ${result.reason}. Make sure you can write to ${result.path}, or pass --fortress <writable-path> to choose a different location.`;
+}
+
+async function checkWritable(path: string): Promise<FortressPathWritableResult> {
+  try {
+    await access(path, constants.W_OK);
+    return { ok: true };
+  } catch (error) {
+    const reason = errorCode(error);
+    if (reason && ACCESS_FAILURE_CODES.has(reason)) {
+      return { ok: false, path, reason };
+    }
+    return { ok: true };
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
 
 /**
  * Resolve the storage path for a Sanctuary instance.
@@ -38,12 +104,48 @@ export function resolveStoragePath(
 }
 
 /**
+ * Strictly parse a whole-string TCP port from an env var.
+ *
+ * `parseInt("80abc", 10)` returns `80`: it stops at the first non-digit and
+ * silently TRUNCATES, which would bind the dashboard to a port the operator
+ * never typed. This matches the strict env parse in `config.ts` (the
+ * `loadConfig` reader) byte-for-byte on the regex: both accept ASCII digits
+ * only (no leading sign), so the same env value never resolves to two different
+ * ports across the two readers. After the digit-only screen, enforce the valid
+ * TCP range 1..65535. Any non-clean-integer, signed, or out-of-range value
+ * yields `undefined` so the caller falls back to the documented default rather
+ * than binding a truncated or out-of-spec port.
+ *
+ * Returns `undefined` for "", "+8443", "-1", "80abc", "0x10", "3501 5",
+ * "70000", "0", or any value that is not a clean in-range unsigned integer.
+ */
+function parseStrictPortEnv(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    return undefined;
+  }
+  return parsed;
+}
+
+/**
  * Resolve the dashboard starting port.
  *
  * Precedence (highest wins):
  *   1. Explicit port argument (e.g. `--port` CLI flag)
- *   2. `SANCTUARY_DASHBOARD_PORT` env var
+ *   2. `SANCTUARY_DASHBOARD_PORT` env var (strict whole-string parse,
+ *      validated to the 1..65535 TCP range)
  *   3. Default 3501
+ *
+ * The env-var read is strict and range-checked so an invalid value (e.g.
+ * "80abc", which the old lenient `parseInt` truncated to 80, or "70000",
+ * which is out of the TCP range) does NOT silently bind a wrong port. Such
+ * values fall back to the default: the same invalid-port hole that the
+ * `loadConfig` reader closes by failing closed, closed here on the wrap
+ * (Protect) boot path by ignoring the bad value.
  *
  * Auto-fallback (chosen port, then the next PORT_FALLBACK_ATTEMPTS-1
  * consecutive ports) is handled downstream once a port is chosen.
@@ -57,8 +159,8 @@ export function resolveDashboardPort(
   }
   const envPort = env.SANCTUARY_DASHBOARD_PORT;
   if (envPort) {
-    const parsed = parseInt(envPort, 10);
-    if (!Number.isNaN(parsed)) return parsed;
+    const parsed = parseStrictPortEnv(envPort);
+    if (parsed !== undefined) return parsed;
   }
   return DEFAULT_DASHBOARD_PORT;
 }

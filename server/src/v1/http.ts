@@ -49,20 +49,21 @@ export function denyNotFound(res: ServerResponse): void {
 
 /**
  * Read and JSON-parse a bounded request body. Returns `undefined` on an
- * empty body, a body over {@link MAX_BODY_BYTES}, or invalid JSON — the
+ * empty body, a body over the supplied cap, or invalid JSON — the
  * caller decides how to map `undefined` (the ceremony endpoints collapse
  * it into the generic 401; the agent write endpoints treat it as a 400
  * bad-request because the caller is already authenticated).
  */
 export async function readJsonBody(
   req: IncomingMessage,
+  maxBodyBytes = MAX_BODY_BYTES,
 ): Promise<unknown | undefined> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const buf = chunk as Buffer;
     size += buf.length;
-    if (size > MAX_BODY_BYTES) return undefined;
+    if (size > maxBodyBytes) return undefined;
     chunks.push(buf);
   }
   const text = Buffer.concat(chunks).toString("utf-8");

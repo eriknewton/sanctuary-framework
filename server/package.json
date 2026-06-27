@@ -26,7 +26,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup && node scripts/copy-templates.js",
+    "build": "node scripts/sign-reference-plugin.mjs && tsup && node scripts/copy-templates.js",
+    "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "pretest": "npm run build",
@@ -73,6 +74,7 @@
     "@noble/ciphers": "2.2.0",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
+    "@noble/post-quantum": "0.6.1",
     "hash-wasm": "4.12.0",
     "it-length-prefixed": "9.1.1",
     "it-pipe": "3.0.1",

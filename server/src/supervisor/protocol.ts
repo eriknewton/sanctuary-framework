@@ -31,8 +31,12 @@
  * The TRANSIENT KEY (the fortress master, or a per-agent derived capability)
  * is carried only inside the `protect` request's authenticated, length-bounded
  * frame, and only while the operator is launching an agent. It is never
- * written to disk and is zeroed by the supervisor once handed to the child's
- * enforcement chain (see supervisor.ts). It never touches the HTTP surface.
+ * written to disk and never touches the HTTP surface. Residency, stated
+ * honestly (do NOT over-claim — codex S1): on a FAILED/refused/timed-out/
+ * superseded/burst-parked launch the supervisor zeroes the key immediately;
+ * on a SUCCESSFUL launch it RETAINS the key in memory for the agent's lifetime
+ * (Tier A keeps it resident to restart the child on crash) and zeroes it on
+ * unprotect/shutdown. See supervisor.ts for the exact zeroing points.
  *
  * This file is transport-shaping + crypto only; the supervisor lifecycle lives
  * in supervisor.ts and the Node socket plumbing in socket-server.ts /
@@ -41,6 +45,7 @@
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { LOCAL_HARNESS_KINDS } from "../contracts/v1.1/local-agent-records.js";
 
 /** Wire-protocol version. A mismatch is rejected (no silent downgrade). */
 export const SUPERVISOR_PROTOCOL_VERSION = 1 as const;
@@ -80,7 +85,9 @@ export interface ProtectRequest {
   /**
    * The transient unlock key (base64url of the fortress master, or a derived
    * per-agent capability). Carried ONLY inside this authenticated frame;
-   * never logged, never persisted. The supervisor zeroes it after launch.
+   * never logged, never persisted. Residency (honest — codex S1): zeroed on a
+   * failed/refused launch; RETAINED for the agent lifetime on a successful one
+   * (Tier A crash-restart), then zeroed on unprotect/shutdown.
    */
   transient_key_b64: string;
 }
@@ -187,9 +194,20 @@ export type DecodeOutcome =
 /**
  * Streaming frame decoder with a hard buffer bound and MAC verification.
  * Drops (returns "error") on:
- *   - a length prefix claiming more than MAX_FRAME_BYTES (before allocating);
+ *   - a length prefix claiming more than MAX_FRAME_BYTES — rejected as soon as
+ *     the 4-byte prefix is readable, so the decoder NEVER waits to buffer the
+ *     claimed payload (no unbounded allocation driven by a hostile length);
  *   - an HMAC that does not verify (constant-time compare);
  *   - JSON that does not parse.
+ *
+ * Allocation honesty (do NOT over-claim — codex S1): `push` does concat the
+ * raw incoming chunk onto its working buffer BEFORE reading the length prefix,
+ * so allocation is bounded by what the transport hands it per chunk, not zero.
+ * The hard bound is enforced by the caller: SupervisorSocketServer caps total
+ * bytes per connection at PER_CONNECTION_READ_BUDGET (MAX_FRAME_BYTES + header)
+ * and destroys the socket past it, so the decoder's working buffer can never
+ * exceed ~one max frame. The two layers together give the bound; the prefix
+ * check just rejects an over-claimed length before waiting for those bytes.
  * The caller closes the connection on any "error" — the protocol does not
  * attempt to resynchronise a corrupt stream.
  */
@@ -245,16 +263,9 @@ export class FrameDecoder {
 // ── Shape validation (post-MAC) ─────────────────────────────────────────────
 
 /** Known harness kinds a supervised spec may name. Unknown ⇒ bad_request. */
-export const SUPERVISOR_KNOWN_HARNESSES: ReadonlySet<string> = new Set([
-  "openclaw",
-  "hermes",
-  "claude_code",
-  "cursor",
-  "cline",
-  "mastra",
-  "generic_mcp",
-  "other",
-]);
+export const SUPERVISOR_KNOWN_HARNESSES: ReadonlySet<string> = new Set(
+  LOCAL_HARNESS_KINDS,
+);
 
 /**
  * Validate a decoded-and-MAC-verified object into a typed request. Returns

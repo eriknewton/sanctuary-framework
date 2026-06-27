@@ -44,6 +44,51 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
 import {
+  BROKER_EVIDENCE_BASIS_DETAIL_KEY,
+  BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  BROKER_PRODUCER_KID_DETAIL_KEY,
+  BROKER_PRODUCER_SIG_DETAIL_KEY,
+  BROKER_PRODUCER_SIGNATURE_SCHEME_DETAIL_KEY,
+  BROKER_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  brokerSignedCanonicalOperation,
+  verifyBrokerProducerSignature,
+  type BrokerProducerSignatureInput,
+} from "../broker-mcp/producer-signature.js";
+
+/**
+ * The RAW `operation` string the persisted SIGNED canonical body attests to,
+ * read straight from the signed bytes (NOT mapped to any read-side vocabulary).
+ * Returns null on any parse failure / shape mismatch (fail closed).
+ *
+ * This is the authoritative operation for a `producer_signed_verified` entry:
+ * the signature is over the canonical body, so the body's `operation` is what
+ * the daemon actually attested to, whereas the top-level `entry.operation` is a
+ * forgeable label an in-process writer chooses when it re-appends the entry. A
+ * reader that counts a verified entry by `entry.operation` WITHOUT confirming it
+ * matches the signed body lets a genuine signed tuple be relabeled into a
+ * different slot (e.g. a signed liveness heartbeat stapled onto an `egress_blocked`
+ * entry to manufacture green). Each reader maps this raw op into its own
+ * vocabulary and compares to the entry op to close that staple attack.
+ */
+export function signedCanonicalOperation(
+  details: Record<string, unknown>,
+): string | null {
+  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  if (typeof canonical !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(canonical);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const op = (parsed as Record<string, unknown>).operation;
+  return typeof op === "string" ? op : null;
+}
+import {
   verifyProducerSignature,
   type ProducerSignatureInput,
   type ProducerSignatureVerdict,
@@ -195,6 +240,63 @@ export function reverifyEntryProducerSignature(
 }
 
 /**
+ * Re-verify a broker daemon liveness / stand-down producer signature.
+ *
+ * Broker differs from Castle Wall's macOS floor: this producer is Node-side and
+ * is expected to have a dedicated key. Without the pinned broker producer
+ * public key, a broker heartbeat cannot count on the channel basis.
+ */
+export function reverifyBrokerEntryProducerSignature(
+  details: unknown,
+  pinnedProducerKeyB64url: string | null,
+): EntryReverifyResult {
+  if (!isRecord(details)) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  if (details[BROKER_EVIDENCE_BASIS_DETAIL_KEY] !== BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  if (pinnedProducerKeyB64url === null) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+
+  const signatureB64url = details[BROKER_PRODUCER_SIG_DETAIL_KEY];
+  const keyId = details[BROKER_PRODUCER_KID_DETAIL_KEY];
+  const signatureScheme = details[BROKER_PRODUCER_SIGNATURE_SCHEME_DETAIL_KEY];
+  const eventCanonicalJson = details[BROKER_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
+  const capturedAtUnixMs = details[BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+  const seq = details.seq;
+
+  if (
+    typeof signatureB64url !== "string" ||
+    typeof keyId !== "string" ||
+    typeof signatureScheme !== "string" ||
+    typeof eventCanonicalJson !== "string" ||
+    typeof capturedAtUnixMs !== "number" ||
+    typeof seq !== "number"
+  ) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+
+  const input: BrokerProducerSignatureInput = {
+    eventCanonicalJson,
+    capturedAtUnixMs,
+    seq,
+    signatureB64url,
+    keyId,
+    signatureScheme,
+  };
+  const verdict = verifyBrokerProducerSignature(input, pinnedProducerKeyB64url);
+  if (!verdict.ok) {
+    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+  }
+  return {
+    basis: "producer_signed_verified",
+    signedCapturedAtMs: capturedAtUnixMs,
+  };
+}
+
+/**
  * Does this re-verification basis permit a Castle Wall ENFORCEMENT-EVIDENCE
  * entry to count toward a GREEN arm-state / kernel-block / active tally?
  *
@@ -223,6 +325,44 @@ export function enforcementEntryCounts(
 }
 
 /**
+ * Does this re-verification basis permit a Castle Wall LIVENESS HEARTBEAT
+ * (observability Slice 2) to count as a fresh "the daemon is alive" signal?
+ *
+ * A heartbeat is NOT enforcement evidence and NEVER earns green; its only job is
+ * to split the absence-of-enforcement case into alive-but-idle vs silently-dead.
+ * So the trust asymmetry is the INVERSE of `enforcementEntryCounts`:
+ *
+ *  - The real heartbeat producer (`macos-daemon.ts:emitAuditHeartbeat`) writes
+ *    the beat as a DIRECT `auditLog.append`, NOT through the signing audit
+ *    consumer, so a genuine production beat carries the `cw_source` marker on the
+ *    CHANNEL basis with NO producer signature — on EVERY host, Linux included
+ *    (the daemon has no read-side signing path for this entry). Gating the beat
+ *    with `enforcementEntryCounts` would therefore drop every genuine beat on a
+ *    key-bearing host and render the marquee silent-death alarm INERT on Linux
+ *    (the platform the thesis-gate designates as the one that matters). That is
+ *    the capability gap this rule closes.
+ *  - A forged beat that CLAIMS `producer_signed` but whose signature fails
+ *    re-verify (`producer_signed_rejected`) must still NOT count: that is the one
+ *    way an in-process forger could fake "I am alive" to SUPPRESS the
+ *    silent-death alarm. (The channel-basis marker is forgeable by an in-process
+ *    writer too, exactly as in `posture.ts` — but a forged channel beat only ever
+ *    suppresses a RED alarm into `unknown`, never manufactures green, so it is no
+ *    more permissive than the shipped marker trust boundary.)
+ *
+ * Net: a heartbeat counts on BOTH no-key and key-bearing hosts unless it is a
+ * rejected producer-signed forgery. The rule is independent of `keyPresent`
+ * because a genuine beat is channel-basis on every host.
+ */
+export function livenessEntryCounts(basis: EntryReverifyBasis): boolean {
+  return basis !== "producer_signed_rejected";
+}
+
+/** Broker liveness counts only on a verified producer signature. */
+export function brokerLivenessEntryCounts(basis: EntryReverifyBasis): boolean {
+  return basis === "producer_signed_verified";
+}
+
+/**
  * A stable dedup key for a re-verified producer-signed entry, used to count each
  * genuine signed enforcement event AT MOST ONCE.
  *
@@ -244,5 +384,21 @@ export function producerSignedDedupKey(
   const seq = details.seq;
   const sig = details[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY];
   if (typeof seq !== "number" || typeof sig !== "string") return null;
-  return `${seq} ${sig}`;
+  return `${seq}|${sig}`;
+}
+
+export function brokerSignedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  return brokerSignedCanonicalOperation(details) === entryOperation;
+}
+
+export function brokerProducerSignedDedupKey(
+  details: Record<string, unknown>,
+): string | null {
+  const seq = details.seq;
+  const sig = details[BROKER_PRODUCER_SIG_DETAIL_KEY];
+  if (typeof seq !== "number" || typeof sig !== "string") return null;
+  return `${seq}|${sig}`;
 }

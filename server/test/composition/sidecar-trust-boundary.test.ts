@@ -17,6 +17,10 @@ import {
 } from "../../src/composition/concordia-adapter.js";
 import { SidecarResponseShapeError } from "../../src/composition/errors.js";
 import {
+  clearPublishedSignals,
+  getPublishedSignals,
+} from "../../src/composition/verascore-hook.js";
+import {
   assertBoolean,
   assertChecksRecord,
   assertNonEmptyString,
@@ -59,6 +63,21 @@ const baseReceipt: ConcordiaReceipt = {
   packed_at: "2026-04-25T00:00:00Z",
 };
 
+function makePackResponse(
+  attestation_metadata?: Record<string, unknown>
+): SidecarResponse {
+  return {
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      receipt_id: "rcpt-1",
+      signature: "sig",
+      packed_at: "2026-04-25T00:00:00Z",
+      ...(attestation_metadata === undefined ? {} : { attestation_metadata }),
+    },
+  };
+}
+
 describe("composition: sidecar trust boundary (#1)", () => {
   describe("packConcordiaReceipt runtime shape validation", () => {
     it("throws SidecarResponseShapeError when receipt_id is missing", async () => {
@@ -92,6 +111,84 @@ describe("composition: sidecar trust boundary (#1)", () => {
 
     it("throws SidecarResponseShapeError when result is not an object", async () => {
       const rpc = makeRpcClient({ jsonrpc: "2.0", id: 1, result: "not-an-object" });
+      await expect(packConcordiaReceipt(rpc, baseEvent)).rejects.toBeInstanceOf(
+        SidecarResponseShapeError
+      );
+    });
+
+    it("passes allowlisted behavioral attestation metadata unchanged", async () => {
+      const metadata = {
+        commitment_class: "delivery",
+        references_count: 2,
+        counterparty_count: 1,
+        offers_made: 3,
+        concession_magnitude: 0.25,
+        reasoning_provided: true,
+      };
+      const rpc = makeRpcClient(makePackResponse(metadata));
+
+      const receipt = await packConcordiaReceipt(rpc, baseEvent);
+
+      expect(receipt.attestation_metadata).toEqual(metadata);
+    });
+
+    it("rejects raw-term attestation metadata keys before Verascore emission", async () => {
+      clearPublishedSignals();
+      const rawTermKeys = [
+        "price",
+        "amount",
+        "quantity",
+        "total",
+        "terms",
+        "currency",
+      ];
+
+      for (const rawKey of rawTermKeys) {
+        const rpc = makeRpcClient(makePackResponse({ [rawKey]: "private-term" }));
+        await expect(packConcordiaReceipt(rpc, baseEvent)).rejects.toBeInstanceOf(
+          SidecarResponseShapeError
+        );
+      }
+      expect(getPublishedSignals()).toHaveLength(0);
+    });
+
+    it("rejects raw-term attestation metadata keys without echoing key or value", async () => {
+      const rpc = makeRpcClient(makePackResponse({ price: 999 }));
+
+      const error = await packConcordiaReceipt(rpc, baseEvent).then(
+        () => undefined,
+        (caught: unknown) => caught
+      );
+
+      expect(error).toBeInstanceOf(SidecarResponseShapeError);
+      expect((error as Error).message).toContain(
+        "Concordia sidecar attestation_metadata contains a disallowed field"
+      );
+      expect((error as Error).message).not.toContain("price");
+      expect((error as Error).message).not.toContain("999");
+    });
+
+    it("rejects non-allowlisted attestation metadata keys fail-closed", async () => {
+      const rpc = makeRpcClient(
+        makePackResponse({
+          commitment_class: "delivery",
+          negotiation_notes: "behavioral note",
+        })
+      );
+
+      await expect(packConcordiaReceipt(rpc, baseEvent)).rejects.toBeInstanceOf(
+        SidecarResponseShapeError
+      );
+    });
+
+    it("rejects raw-term-like attestation metadata values", async () => {
+      const rpc = makeRpcClient(
+        makePackResponse({
+          commitment_class: "delivery for $100",
+          references_count: 1,
+        })
+      );
+
       await expect(packConcordiaReceipt(rpc, baseEvent)).rejects.toBeInstanceOf(
         SidecarResponseShapeError
       );

@@ -4,8 +4,8 @@
  * v1.1.0 shipped the v1.1 dashboard module + hub API but no entry-point
  * server imported them. From an operator's perspective v1.1.0 delivered
  * no interactive new functionality. The hotfix mounts v1.1 routes
- * additively at /v1.1 (HTML) and /api/hub/* (API); legacy routes at /
- * continue to serve.
+ * additively at /v1.1 (HTML) and /api/hub/* (API); the legacy dashboard
+ * root behavior has since been superseded by the posture shell root.
  *
  * These tests boot a real DashboardApprovalChannel instance, call
  * setV11Bindings with stub-empty hub state, and assert end-to-end that
@@ -161,19 +161,53 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET / serves the v1.1 SPA (v1.1.7 root-route flip)", async () => {
-    const res = await fetch(`${rig.baseUrl}/`, {
-      headers: { Authorization: `Bearer ${rig.authToken}` },
-    });
+  it("GET / serves the posture board shell WITHOUT a token (real auth path)", async () => {
+    // The one-surface correction flips the default page at `/` to the posture
+    // board (the same shell `/posture` serves), even with v1.1 bindings wired.
+    // This rig sets a real `auth_token`, so this exercises the PRODUCTION auth
+    // path (not an auth-disabled rig): the static shell carries no posture data
+    // and must be served WITHOUT a bearer, while its `/api/posture/*` data
+    // fetches stay behind checkAuth (asserted by the 401 test below). The v1.1
+    // SPA is preserved at /dashboard and /v1.1 (asserted below).
+    const res = await fetch(`${rig.baseUrl}/`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    // SPA marker: the inline client mounts on #main and #fortress.
-    expect(html).toContain('id="main"');
-    expect(html).toContain('id="fortress"');
+    // Posture-board marker: the shell fetches the posture API client-side. It is
+    // NOT the v1.1 SPA (which mounts on #main / #fortress).
+    expect(html).toContain("/api/posture/home");
+    expect(html).not.toContain('id="fortress"');
   });
 
-  it("GET /dashboard serves the v1.1 SPA (v1.1.7 alias)", async () => {
+  it("GET / and GET /posture are ONE surface under real auth (byte-for-byte, no token)", async () => {
+    // Delta Review A3 remediation: `/` and `/posture` must serve the SAME shell
+    // under the SAME auth posture. Before the fix `/` was unauthenticated while
+    // `/posture`'s HTML sat behind checkAuth, so the equivalence only held when
+    // a test rig disabled auth. With a real `auth_token` set, BOTH paths must
+    // answer 200 with the identical shell to an UNAUTHENTICATED caller.
+    const [rootRes, postureRes] = await Promise.all([
+      fetch(`${rig.baseUrl}/`),
+      fetch(`${rig.baseUrl}/posture`),
+    ]);
+    expect(rootRes.status).toBe(200);
+    expect(postureRes.status).toBe(200);
+    const [rootBody, postureBody] = await Promise.all([
+      rootRes.text(),
+      postureRes.text(),
+    ]);
+    expect(rootBody).toBe(postureBody);
+    expect(rootBody).toContain("/api/posture/home");
+  });
+
+  it("the posture shell's data routes stay behind auth (401 without a token)", async () => {
+    // The shell is unauthenticated, but every byte of EVIDENCE it renders comes
+    // from `/api/posture/*`, which must reject an unauthenticated caller. This
+    // is the other half of the one-surface auth contract.
+    const res = await fetch(`${rig.baseUrl}/api/posture/home`);
+    expect(res.status).toBe(401);
+  });
+
+  it("GET /dashboard serves the v1.1 SPA (v1.1.7 alias, preserved post root-flip)", async () => {
     const res = await fetch(`${rig.baseUrl}/dashboard`, {
       headers: { Authorization: `Bearer ${rig.authToken}` },
     });

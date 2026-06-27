@@ -68,7 +68,7 @@ jobs:
       # default and raised "could not find .gpg-id file".
       GNUPGHOME: ${{ github.workspace }}/.gnupg-ci
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Use Node.js 22
         uses: actions/setup-node@v6

@@ -15,6 +15,9 @@ import {
   type APIDeps,
 } from "../../src/dashboard/api.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 function mockReq(opts: { url?: string; method?: string; headers?: Record<string, string> }): IncomingMessage {
   return {
@@ -198,14 +201,108 @@ describe("Dashboard API", () => {
       expect(create).not.toHaveBeenCalled();
     });
 
-    it("serves /api/health", async () => {
+    it("serves /api/health without auth with ok/mode + opaque instance/since (brief D3)", async () => {
       const res = mockRes();
       const deps = makeDeps();
-      const req = mockReq({ url: "/api/health", headers: { authorization: "Bearer tok" } });
+      const req = mockReq({ url: "/api/health" });
       const matched = await handleRequest(deps, req, res);
       expect(matched).toBe(true);
       expect(res._status).toBe(200);
-      expect(res._body).toContain("ok");
+      const body = JSON.parse(res._body);
+      // brief D3: `{ ok, mode }` plus the opaque restart-detection signal.
+      expect(Object.keys(body).sort()).toEqual(["instance", "mode", "ok", "since"]);
+      expect(body.ok).toBe(true);
+      expect(body.mode).toBe("co-located");
+      expect(typeof body.instance).toBe("string");
+      expect(typeof body.since).toBe("number");
+      // brief HIGH-1: readiness/posture MUST NOT be on the unauthenticated probe.
+      expect(body.ready).toBeUndefined();
+      expect(body.supervisor).toBeUndefined();
+    });
+
+    it("/api/readiness returns 401 without auth (brief D3 auth gate)", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({ url: "/api/readiness" });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBeUndefined();
+      expect(body.supervisor).toBeUndefined();
+    });
+
+    it("/api/readiness returns ready=locked + supervisor=n/a with auth, no identity manager", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(Object.keys(body).sort()).toEqual(["ready", "supervisor"]);
+      expect(body.ready).toBe("locked");
+      // "n/a" is honest in THIS mode only: the api.ts co-located read-aggregator
+      // dashboard has no Protect launch route, so an absent bridge does NOT
+      // guarantee a 503 (contrast the principal-policy dashboard, where absence
+      // => 503 and the honest value is "unwired", brief Fix 1).
+      expect(body.supervisor).toBe("n/a");
+    });
+
+    it("/api/readiness reports ready=serving when an identity manager is wired", async () => {
+      const res = mockRes();
+      const deps = makeDeps({
+        sources: {
+          mode: "co-located" as const,
+          identityManager: {} as any,
+          auditLog: { query: vi.fn(async () => ({ entries: [], total: 0 })) },
+        } as any,
+      });
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBe("serving");
+    });
+
+    it("/api/readiness honors an explicit readiness + supervisor provider", async () => {
+      const res = mockRes();
+      const deps = makeDeps({
+        readiness: () => "serving",
+        supervisorStatus: () => "wired",
+      });
+      const req = mockReq({
+        url: "/api/readiness",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body);
+      expect(body.ready).toBe("serving");
+      expect(body.supervisor).toBe("wired");
+    });
+
+    it("wrap-auto posture home reports no live stream when no stream registry is wired", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      deps.sources.auditLog = new AuditLog(new MemoryStorage(), generateRandomKey()) as any;
+      const req = mockReq({
+        url: "/api/posture/home",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      const body = JSON.parse(res._body) as { stream_available?: boolean };
+      expect(body.stream_available).toBe(false);
     });
 
     it("returns 503 for approvals when no handlers", async () => {

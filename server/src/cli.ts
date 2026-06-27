@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate } from "./update-check.js";
+import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
 import { createRequire } from "node:module";
@@ -25,7 +26,19 @@ export { TOP_LEVEL_SUBCOMMANDS } from "./cli/subcommands.js";
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
 
+/**
+ * Fallback exit deadline for the broker daemon's clean shutdown. If the
+ * stand-down audit flush wedges on a storage backend that never settles, the
+ * SIGTERM/SIGINT handler would otherwise hang forever (the signal listener
+ * suppresses Node's default termination). The watchdog forces `process.exit(0)`
+ * after this window so the daemon dies promptly instead of waiting for an OS
+ * SIGKILL. Generous enough that a healthy flush always finishes first.
+ */
+const BROKER_SHUTDOWN_WATCHDOG_MS = 5000;
+
 async function main(): Promise<void> {
+  assertSupportedNodeVersion();
+
   // Parse CLI flags
   const invokedAs = basename(process.argv[1] ?? "");
   let args = process.argv.slice(2);
@@ -90,7 +103,7 @@ async function main(): Promise<void> {
     // split-process supervisor, the transient master key arrives on an
     // inherited one-shot fd (never env/argv). Consume + close it at the
     // earliest point so it cannot linger for a same-uid `/proc/<pid>/fd` race,
-    // and FAIL CLOSED in supervisor mode — never silently fall through to the
+    // and FAIL CLOSED in supervisor mode: never silently fall through to the
     // passphrase/keychain path. Threading the raw master into wrap custody
     // (`establishWrapCustody`) is the drill-gated last mile (S1 acceptance is
     // Erik-present on the signing host); until that lands, supervisor mode
@@ -129,15 +142,17 @@ async function main(): Promise<void> {
     const { parseInitArgs, runInit, printInitHelp } = await import(
       "./wrap/init.js"
     );
-    const opts = parseInitArgs(args.slice(1));
-    if (opts.helpRequested) {
-      printInitHelp();
-      process.exit(0);
-    }
     try {
+      const opts = parseInitArgs(args.slice(1));
+      if (opts.helpRequested) {
+        printInitHelp();
+        process.exit(0);
+      }
       await runInit(opts);
       process.exit(0);
-    } catch {
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand; print only the error message, never any recovery-key material.
+      console.error(`\n  Sanctuary init failed: ${formatCliError(err)}\n`);
       process.exit(1);
     }
   }
@@ -180,6 +195,12 @@ async function main(): Promise<void> {
   if (args[0] === "generate") {
     const { runGenerateCommand } = await import("./cli/generate.js");
     const code = await runGenerateCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "deploy") {
+    const { runDeployCommand } = await import("./cli/deploy.js");
+    const code = await runDeployCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -229,6 +250,12 @@ async function main(): Promise<void> {
   if (args[0] === "federation") {
     const { runFederationCommand } = await import("./cli/federation.js");
     const code = await runFederationCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "plugin") {
+    const { runPluginCommand } = await import("./cli/plugin.js");
+    const code = await runPluginCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -420,7 +447,7 @@ Commands:
     const agentId = process.env.SANCTUARY_AGENT_ID ?? "mcp-host";
     const fortressId =
       process.env.SANCTUARY_FORTRESS_ID ?? fortressIdFromStoragePath(config.storage_path);
-    const { broker } = await openBroker();
+    const { broker, auditLog } = await openBroker();
     const server = createBrokerMcpServer(broker, {
       skill: process.env.SANCTUARY_BROKER_SKILL ?? process.env.SANCTUARY_SKILL_NAME ?? agentId,
       agentId,
@@ -429,8 +456,76 @@ Commands:
       fortressId,
       audience: process.env.SANCTUARY_BROKER_AUDIENCE ?? "sanctuary-broker",
     });
+    const { loadOrCreateBrokerProducerSigner } = await import(
+      "./broker-mcp/producer-signature.js"
+    );
+    const producerSigner = await loadOrCreateBrokerProducerSigner(
+      config.storage_path,
+    );
     const transport = new StdioServerTransport();
     await server.connect(transport);
+
+    // Observability (Option C): periodic process-liveness heartbeat for the
+    // long-running broker daemon. A reader (principal-policy/feature-health.ts)
+    // turns a MISSING heartbeat in a quiet window into an honest "broker daemon
+    // silently died" alarm instead of `unknown`. HONEST SCOPE: this proves only
+    // that this daemon PROCESS is alive, NOT that it would correctly mint/deny a
+    // token and NOT that the keychain backend is reachable.
+    const { startBrokerLivenessHeartbeat } = await import("./broker-mcp/liveness-heartbeat.js");
+    const liveness = startBrokerLivenessHeartbeat({
+      auditLog,
+      fortressId,
+      producerSigner,
+    });
+
+    // CRITICAL (the #657 false-RED lesson): a clean broker-server shutdown must
+    // record an INTENTIONAL stand-down. Without it, every deliberate stop reads
+    // as a silent death for the whole digest window. Wire it to SIGTERM / SIGINT
+    // AND the transport/server close hook, then exit. `standDown()` is
+    // idempotent, so overlapping triggers emit at most one stand-down.
+    let shuttingDown = false;
+    const shutdownBroker = (exit: boolean): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      // Fire and forget: standDown() resolves even if the append/flush
+      // *rejects* (fail toward the alarm), and process.exit owns the lifecycle
+      // from here. But standDown() awaits auditLog.flush(), which awaits the
+      // pending storage writes; a wedged backend that never SETTLES (neither
+      // resolves nor rejects) would hang the flush, so the `.finally` never
+      // fires. Installing a SIGTERM/SIGINT listener suppresses Node's default
+      // termination, so without a fallback the daemon would hang on the signal
+      // until the OS SIGKILLs it after its grace period. Arm a watchdog that
+      // forces exit if the stand-down flush does not complete in time. It is
+      // `.unref()`ed so it never keeps the event loop alive: a fast clean
+      // stand-down still exits promptly via the `.finally` below.
+      if (exit) {
+        const watchdog = setTimeout(() => {
+          // SAFETY: stderr is the operator-facing CLI channel; no logger in scope.
+          console.error(
+            "Sanctuary Secret Broker: stand-down flush did not complete in " +
+            `${String(BROKER_SHUTDOWN_WATCHDOG_MS)}ms; forcing exit.`,
+          );
+          // Exit NON-ZERO on the watchdog path: a wedged stand-down flush is a
+          // DEGRADED shutdown (the stand-down marker may not have been durably
+          // written), not a clean one. Reporting it as exit 0 would tell a
+          // process supervisor "clean exit" for what is really a storage wedge -
+          // an overclaim on the very honesty surface this feature serves. The
+          // clean `.finally` path below keeps exit 0.
+          process.exit(1);
+        }, BROKER_SHUTDOWN_WATCHDOG_MS);
+        watchdog.unref();
+        void liveness.standDown().finally(() => {
+          clearTimeout(watchdog);
+          process.exit(0);
+        });
+        return;
+      }
+      void liveness.standDown();
+    };
+    server.onclose = () => shutdownBroker(true);
+    process.on("SIGTERM", () => shutdownBroker(true));
+    process.on("SIGINT", () => shutdownBroker(true));
+
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error("Sanctuary Secret Broker MCP server running (stdio)");
     return;
@@ -504,6 +599,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let multi = false;
   let tenant: string | undefined;
   let noConfirm = false;
+  let recoveryOut: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -522,6 +618,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       tenant = args[++i];
     } else if (args[i] === "--no-confirm") {
       noConfirm = true;
+    } else if (args[i] === "--recovery-out" && args[i + 1]) {
+      recoveryOut = args[++i];
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -566,6 +664,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     port,
     host,
     ...(tenant !== undefined ? { tenant } : {}),
+    ...(recoveryOut !== undefined ? { recoveryOut } : {}),
     noConfirm,
   });
 
@@ -652,6 +751,7 @@ Usage:
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
   sanctuary verify-transparency [opts]    # Verify a checkpoint chain offline
   sanctuary generate systemd [opts]       # Emit systemd service unit
+  sanctuary deploy operator-cloud plan    # Emit operator-cloud deploy skeleton
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary export-passphrase             # Print stored passphrase
@@ -709,6 +809,9 @@ Subcommands:
   generate             Emit local deployment templates.
                        Use "sanctuary generate --help" for options.
 
+  deploy               Emit provider-neutral deployment skeletons.
+                       Use "sanctuary deploy --help" for options.
+
   identity             Inspect the active identity (DID, public key).
                        Use "sanctuary identity --help" for options.
 
@@ -739,6 +842,7 @@ Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
+  SANCTUARY_RECOVERY_OUT            Init recovery-key plaintext output path
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
@@ -773,8 +877,16 @@ Options:
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state; scans every
                        tenant on the host and deep-links into per-tenant dashboards.
-  --no-confirm         Skip the recovery-key confirmation prompt on first run.
-                       Required for non-TTY callers (CI, launchd, systemd).
+  --no-confirm         Skip the interactive recovery-key off-host-capture
+                       confirmation on first run. Required for non-TTY callers
+                       (CI, launchd, systemd). When set, an off-host escrow
+                       target MUST exist (--recovery-out / SANCTUARY_RECOVERY_OUT,
+                       or SANCTUARY_PASSPHRASE for OS-keyring escrow) or the boot
+                       fails closed rather than leaving the key uncaptured.
+  --recovery-out <path>
+                       On a first-run mint, write the plaintext recovery key to
+                       this exact path OUTSIDE the fortress directory (durable
+                       off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
   --help, -h           Show this help
 
 Environment variables:
@@ -782,6 +894,7 @@ Environment variables:
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
   SANCTUARY_PASSPHRASE              Key derivation passphrase
   SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
+  SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
   SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode
@@ -860,6 +973,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
       return true;
     }
+    case "deploy": {
+      const { runDeployCommand } = await import("./cli/deploy.js");
+      await runDeployCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
     case "castle-wall":
       printCastleWallHelp();
       return true;
@@ -877,7 +995,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "provision-pin") {
     const { runProvisionPin } = await import("./cli/castle-wall.js");
-    return runProvisionPin();
+    return runProvisionPin(args.slice(1));
   }
 
   if (command === "status") {
@@ -968,6 +1086,8 @@ function printCastleWallHelp(): void {
 
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
+                     --fortress <path>  Target a specific fortress (defaults to
+                                        SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH).
     status           Show pinned-key fingerprint and sysext status.
     enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
                      Refuses without a reachable policy daemon; --force overrides.
@@ -1033,6 +1153,7 @@ function printWrapHelpEarly(): void {
     sanctuary protect --claude-code    Protect Claude Code
     sanctuary protect --cursor         Protect Cursor
     sanctuary protect --cline          Protect Cline (VS Code extension)
+    sanctuary protect --mastra         Protect Mastra
     sanctuary protect --wrap <path>    Protect a specific MCP config file
     sanctuary protect --unwrap         Restore original config
 
@@ -1044,6 +1165,7 @@ function printWrapHelpEarly(): void {
     --claude-code      Auto-detect and wrap Claude Code
     --cursor           Auto-detect and wrap Cursor
     --cline            Auto-detect and wrap Cline (VS Code extension)
+    --mastra           Auto-detect and wrap Mastra
     --wrap <path>      Wrap a specific MCP config file
     --unwrap           Restore original config from backup
     --passphrase <p>   Override the stored passphrase (one-off)
@@ -1093,6 +1215,15 @@ function drainAndExit(code: number): void {
   }
   process.exitCode = code;
   process.stdout.write("", () => process.exit(code));
+}
+
+function formatCliError(err: unknown): string {
+  if (err instanceof Error) {
+    const name =
+      err.name && err.name !== "Error" ? `${err.name}: ` : "";
+    return `${name}${err.message}`;
+  }
+  return String(err);
 }
 
 main().catch((err) => {

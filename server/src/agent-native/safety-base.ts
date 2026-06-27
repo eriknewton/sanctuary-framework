@@ -8,7 +8,11 @@ import {
 } from "../tool-args.js";
 
 export type RiskTier = 1 | 2 | 3;
-export type RemediationClass = "request_review" | "try_lower_scope" | "wait";
+export type RemediationClass =
+  | "request_review"
+  | "try_lower_scope"
+  | "unavailable"
+  | "wait";
 export type RetryAfterBucket = null | "later" | "minutes" | "hours";
 
 export interface FixedDenial {

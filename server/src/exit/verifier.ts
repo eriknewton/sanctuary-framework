@@ -2,8 +2,9 @@
  * Sanctuary v1.1 exit-bundle verifier.
  *
  * Verifies the signed SANCTUARY_EXIT_BUNDLE_V1 manifest, every artifact hash,
- * and the exported identity / reputation signatures that are independently
- * verifiable from public material in the bundle.
+ * and the exported identity / reputation signatures and exported-set
+ * completeness manifests that are independently verifiable from public
+ * material in the bundle.
  */
 
 /**
@@ -38,6 +39,12 @@ import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { hash } from "../core/hashing.js";
 import { canonicalize, canonicalizeToBytes } from "../mesh/canonical-json.js";
 import {
+  reputationBundleSigningBytes,
+  verifyReputationBundleCompleteness,
+  type ReputationBundle,
+  type ReputationBundleCompletenessVerification,
+} from "../reputation/reputation-store.js";
+import {
   readFileCustody,
   readFileCustodyWithStats,
 } from "../storage/custody-fs.js";
@@ -59,6 +66,10 @@ export interface ExitBundleDetailedVerifierResult
   };
   reputation?: {
     bundle_signature_valid: boolean | "unverifiable";
+    completeness:
+      | ReputationBundleCompletenessVerification
+      | "mismatch";
+    completeness_error?: string;
     attestation_count: number;
     verified_attestations: number;
     invalid_attestations: number;
@@ -261,17 +272,7 @@ function verifyReputationArtifact(
   reputationArtifact: unknown,
   publicKeysByDid: Map<string, Uint8Array>
 ): ExitBundleDetailedVerifierResult["reputation"] {
-  const bundle = reputationArtifact as {
-    version?: string;
-    attestations?: Array<{
-      data: unknown;
-      signature: string;
-      signer: string;
-    }>;
-    exported_at?: string;
-    exporter_did?: string;
-    bundle_signature?: string;
-  };
+  const bundle = reputationArtifact as Partial<ReputationBundle>;
   const attestations = Array.isArray(bundle.attestations)
     ? bundle.attestations
     : [];
@@ -279,6 +280,7 @@ function verifyReputationArtifact(
   let bundleSignatureValid: boolean | "unverifiable" = "unverifiable";
   if (
     bundle.version === "SANCTUARY_REP_V1" &&
+    typeof bundle.exported_at === "string" &&
     typeof bundle.exporter_did === "string" &&
     typeof bundle.bundle_signature === "string"
   ) {
@@ -289,13 +291,45 @@ function verifyReputationArtifact(
         attestations,
         exported_at: bundle.exported_at,
         exporter_did: bundle.exporter_did,
+        completeness_manifest: bundle.completeness_manifest,
       };
-      bundleSignatureValid = ed25519.verify(
-        fromBase64url(bundle.bundle_signature),
-        stringToBytes(JSON.stringify(signedBody)),
+      const signature = fromBase64url(bundle.bundle_signature);
+      const currentSignatureValid = ed25519.verify(
+        signature,
+        reputationBundleSigningBytes(signedBody),
         exporterKey
       );
+      const legacySignatureValid =
+        bundle.completeness_manifest === undefined &&
+        ed25519.verify(
+          signature,
+          stringToBytes(
+            JSON.stringify({
+              version: signedBody.version,
+              attestations: signedBody.attestations,
+              exported_at: signedBody.exported_at,
+              exporter_did: signedBody.exporter_did,
+            })
+          ),
+          exporterKey
+        );
+      bundleSignatureValid = currentSignatureValid || legacySignatureValid;
     }
+  }
+
+  let completeness:
+    | ReputationBundleCompletenessVerification
+    | "mismatch" = "mismatch";
+  let completenessError: string | undefined;
+  try {
+    completeness = verifyReputationBundleCompleteness(bundle, {
+      allowUnverifiedLegacy: true,
+    });
+  } catch (error) {
+    completenessError =
+      error instanceof Error
+        ? error.message
+        : "Reputation bundle completeness verification failed";
   }
 
   let verified = 0;
@@ -318,6 +352,10 @@ function verifyReputationArtifact(
 
   return {
     bundle_signature_valid: bundleSignatureValid,
+    completeness,
+    ...(completenessError !== undefined
+      ? { completeness_error: completenessError }
+      : {}),
     attestation_count: attestations.length,
     verified_attestations: verified,
     invalid_attestations: invalid,
@@ -519,6 +557,24 @@ export async function verifyExitBundle(
     unsupportedArtifacts.push(
       "audit_receipts: individual audit entries are not signed in the legacy L2 audit log; verifier pins them by signed manifest hash"
     );
+    // Surface the export-cap truncation marker so the operator is told the
+    // carried receipts are an incomplete (most-recent) slice, not the full
+    // population that `total` reports.
+    const auditJson = auditArtifact.json as {
+      truncated?: unknown;
+      omitted_count?: unknown;
+    };
+    if (auditJson.truncated === true) {
+      const omitted =
+        typeof auditJson.omitted_count === "number"
+          ? auditJson.omitted_count
+          : undefined;
+      warnings.push(
+        omitted !== undefined
+          ? `audit receipts are truncated: the oldest ${omitted} entries were omitted by the export cap`
+          : "audit receipts are truncated: the oldest entries were omitted by the export cap"
+      );
+    }
   }
 
   const reputationArtifact = await loadExitArtifact(root, manifest, "reputation_bundle");
@@ -541,11 +597,28 @@ export async function verifyExitBundle(
         `${reputation.invalid_attestations} reputation attestation(s) failed signature verification`
       );
     }
+    if (reputation.completeness === "mismatch") {
+      warnings.push(
+        reputation.completeness_error !== undefined
+          ? `reputation bundle completeness mismatch: ${reputation.completeness_error}`
+          : "reputation bundle completeness mismatch"
+      );
+    } else if (
+      reputation.completeness === "unverified-completeness-legacy-bundle"
+    ) {
+      warnings.push(
+        "reputation bundle has no completeness manifest; exported-set completeness is unverified"
+      );
+    }
   }
 
   const reputationBundleFailed = reputation?.bundle_signature_valid === false;
   const reputationAttestationFailed = (reputation?.invalid_attestations ?? 0) > 0;
-  const reputationFailed = reputationBundleFailed || reputationAttestationFailed;
+  const reputationCompletenessFailed = reputation?.completeness === "mismatch";
+  const reputationFailed =
+    reputationBundleFailed ||
+    reputationAttestationFailed ||
+    reputationCompletenessFailed;
   const identityFailed = identity ? !identity.signature_valid : false;
   const unverifiableCount = reputation?.unverifiable_attestations ?? 0;
   const unverifiableFailed =
@@ -560,9 +633,10 @@ export async function verifyExitBundle(
   // Full-sweep #77: route the specific failure cause so importers and
   // operators see what went wrong without having to parse the warnings
   // array. Priority ordering: identity (cryptographic-binding broken)
-  // beats reputation-bundle (provenance broken) beats individual
-  // attestation invalidity beats unverifiable signers (which is
-  // policy-relaxable via the explicit opt-in flag).
+  // beats reputation-bundle (provenance broken) beats completeness
+  // mismatch (signed manifest does not describe the body) beats
+  // individual attestation invalidity beats unverifiable signers
+  // (which is policy-relaxable via the explicit opt-in flag).
   let detailedFailureClass:
     | NonNullable<ExitBundleVerifierResult["failure_class"]>
     | undefined;
@@ -570,6 +644,8 @@ export async function verifyExitBundle(
     detailedFailureClass = "identity_signature_invalid";
   } else if (reputationBundleFailed) {
     detailedFailureClass = "reputation_bundle_signature_invalid";
+  } else if (reputationCompletenessFailed) {
+    detailedFailureClass = "reputation_completeness_mismatch";
   } else if (reputationAttestationFailed) {
     detailedFailureClass = "reputation_attestation_signature_invalid";
   } else if (unverifiableFailed) {

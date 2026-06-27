@@ -101,6 +101,8 @@ export interface ContextFilterResult {
   fields_summarized: number;
   fields_denied: number;
   decisions: FieldFilterResult[];
+  /** Context after policy filtering, safe to pass to the span privacy filter */
+  filtered_output: Record<string, unknown>;
   /** SHA-256 hash of the original context (for audit trail) */
   original_context_hash: string;
   /** SHA-256 hash of the filtered output (for audit trail) */
@@ -387,6 +389,7 @@ export function filterContext(
     fields_summarized: summarized,
     fields_denied: denied,
     decisions,
+    filtered_output: filteredOutput,
     original_context_hash: originalHash,
     filtered_context_hash: filteredHash,
     filtered_at: new Date().toISOString(),

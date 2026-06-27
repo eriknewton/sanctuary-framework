@@ -52,7 +52,21 @@ describe("proxy context gate filter", () => {
     const auditLog = new AuditLog(storage, masterKey);
     const profile = createDefaultProfile();
     profile.features.context_gating.enabled = true;
-    const { enforcer } = createContextGateTools(storage, masterKey, auditLog);
+    const { enforcer, policyStore } = createContextGateTools(storage, masterKey, auditLog);
+    const policy = await policyStore.create(
+      "proxy-redaction-policy",
+      [
+        {
+          provider: "tool-api",
+          allow: ["payload"],
+          redact: ["api_key"],
+          hash: [],
+          summarize: [],
+        },
+      ],
+      "redact"
+    );
+    profile.features.context_gating.policy_id = policy.policy_id;
     initializeContextGateEnforcerFromProfile(enforcer, profile);
     const clientManager = createMockClientManager();
 

@@ -78,6 +78,23 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  * - memory_delete: irreversible SDW memory deletion must not be relaxable by a
  *   hand-authored policy once the inert memory tool factory is wired.
  */
+/**
+ * Operator Cloud Slice 2 (non-relaxable cloud-custody gate, MANDATORY): minting
+ * a scoped cloud-custody export (`operator_cloud_provision`) and admitting any
+ * federation node (`federation_node_join`) are exports of custody material /
+ * trust-boundary changes that a hand-authored policy must NEVER be able to relax
+ * into Tier 3 or auto-approve. This is the SINGLE SOURCE OF TRUTH consumed by
+ * BOTH enforcement points: the policy loader (`FORCED_TIER1_OPERATIONS` below,
+ * applied at policy-load merge time) AND the runtime classifier
+ * (`gate.ts`'s `FORCED_TIER1_OPERATIONS`, applied at `classifyRiskTier` time).
+ * Both lists spread this set so they cannot drift apart silently; a drift guard
+ * test pins that both contain every entry here.
+ */
+export const NON_RELAXABLE_CLOUD_TIER1_OPERATIONS = [
+  "operator_cloud_provision",
+  "federation_node_join",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -88,7 +105,50 @@ const FORCED_TIER1_OPERATIONS = [
   "audit_export_siem",
   "compliance_generate_eu_ai_act_bundle",
   "memory_delete",
+  ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
 ] as const;
+
+/**
+ * Apply the forced-Tier invariants to a fully-formed PrincipalPolicy and
+ * return a normalized copy. This is the SINGLE source of the force-add /
+ * prune logic, factored out of validatePolicy so BOTH enforcement points
+ * uphold it byte-identically:
+ *
+ *   - the policy LOADER (validatePolicy, at load/merge time), and
+ *   - the policy MUTATION path (EnglishPolicyActivator.applyRule, when an
+ *     activated English-policy draft rewrites the live policy).
+ *
+ * Without this on the mutation path, an activated draft could drop a
+ * forced-Tier-1 op out of Tier 1 (a tier1_remove_operation) or smuggle one
+ * into Tier 3 (a tier3_add_operation) — a silent enforcement downgrade
+ * (Hard Constraint #5: never silently degrade; #7: policy integrity).
+ *
+ * Behavior, applied to the policy AS GIVEN (does NOT re-merge defaults):
+ *   - force-ADD every FORCED_TIER1_OPERATIONS entry into tier1_always_approve
+ *     (appended in declaration order after existing entries; deduplicated), and
+ *   - PRUNE every FORCED_TIER1_OPERATIONS entry out of tier3_always_allow, and
+ *   - ensure every FORCED_TIER3_OPERATIONS entry is present in
+ *     tier3_always_allow (the guaranteed distress lane).
+ *
+ * Ordering is preserved so validatePolicy's load-path output is unchanged:
+ * existing tier1 entries first, then forced ops; existing tier3 entries
+ * first, then any missing forced-tier3 ops, with forced-tier1 ops filtered
+ * out. Idempotent: enforceForcedTiers(enforceForcedTiers(p)) === one pass.
+ */
+export function enforceForcedTiers(policy: PrincipalPolicy): PrincipalPolicy {
+  const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
+  const mergedTier1 = [
+    ...new Set([...policy.tier1_always_approve, ...FORCED_TIER1_OPERATIONS]),
+  ];
+  const mergedTier3 = [
+    ...new Set([...policy.tier3_always_allow, ...FORCED_TIER3_OPERATIONS]),
+  ].filter((op) => !forcedTier1.has(op));
+  return {
+    ...policy,
+    tier1_always_approve: mergedTier1,
+    tier3_always_allow: mergedTier3,
+  };
+}
 
 /**
  * HABEAS PORT (agent-side sovereignty, ratified 2026-06-12): operations that
@@ -142,6 +202,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
     "federation_node_join",
+    // Operator Cloud Slice 2: minting a scoped cloud-custody provision bundle is
+    // a custody export and must always require operator approval. Also enrolled
+    // in NON_RELAXABLE_CLOUD_TIER1_OPERATIONS so a hand-authored policy cannot
+    // relax it.
+    "operator_cloud_provision",
     "sanctuary_forget",
     "sanctuary_compound_execute",
     "sanctuary_audit_search_widen",
@@ -374,32 +439,23 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
 
   // Merge tier3: user's list + any new defaults added in later versions.
   // This ensures upgrades automatically include new read-only tools
-  // without requiring operators to manually edit their policy file.
+  // without requiring operators to manually edit their policy file. The
+  // forced-Tier invariants (force-add to Tier 1, prune from Tier 3, ensure
+  // forced-Tier-3) are applied by enforceForcedTiers below — the SINGLE
+  // source shared with the policy-mutation path so both can never drift.
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
-  const forcedTier1 = new Set<string>(FORCED_TIER1_OPERATIONS);
-  const mergedTier3 = [
-    ...new Set([
-      ...userTier3,
-      ...DEFAULT_POLICY.tier3_always_allow,
-      ...FORCED_TIER3_OPERATIONS,
-    ]),
-  ].filter((op) => !forcedTier1.has(op));
-
-  const mergedTier1 = [
-    ...new Set([
-      ...rawTier1,
-      ...FORCED_TIER1_OPERATIONS,
-    ]),
+  const mergedTier3Pre = [
+    ...new Set([...userTier3, ...DEFAULT_POLICY.tier3_always_allow]),
   ];
 
-  return {
+  return enforceForcedTiers({
     version: (raw.version as number) ?? 1,
-    tier1_always_approve: mergedTier1,
+    tier1_always_approve: rawTier1,
     tier2_anomaly: {
       ...DEFAULT_TIER2,
       ...((raw.tier2_anomaly as Record<string, unknown>) ?? {}),
     } as Tier2Config,
-    tier3_always_allow: mergedTier3,
+    tier3_always_allow: mergedTier3Pre,
     approval_channel: (() => {
       const merged = {
         ...DEFAULT_CHANNEL,
@@ -411,7 +467,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
       return merged;
     })(),
     approval_redirect: parseApprovalRedirect(raw.approval_redirect),
-  };
+  });
 }
 
 /**

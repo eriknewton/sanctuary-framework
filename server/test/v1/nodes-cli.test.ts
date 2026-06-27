@@ -54,6 +54,33 @@ describe("sanctuary nodes list", () => {
     expect(JSON.parse(out.get()).nodes[0].node_id).toBe("linux-1");
   });
 
+  it("prints node mode and trust-boundary label in table output", async () => {
+    const out = capture();
+    const code = await runNodesCommand({
+      argv: ["list", "--session-token", "session"],
+      env: {},
+      out: out.stream,
+      err: capture().stream,
+      request: async () => ({
+        nodes: [
+          {
+            node_id: "cloud-1",
+            node_mode: "operator_cloud",
+            attestation_status: "verified",
+            trust_boundary: { label: "provider in trust boundary, not TEE" },
+            last_sync: { received_at: "2026-06-10T00:00:00.000Z" },
+          },
+        ],
+        total: 1,
+      }),
+    });
+    expect(code).toBe(0);
+    expect(out.get()).toContain("MODE");
+    expect(out.get()).toContain("TRUST BOUNDARY");
+    expect(out.get()).toContain("operator_cloud");
+    expect(out.get()).toContain("provider in trust boundary, not TEE");
+  });
+
   it("maps auth failures to exit code 3", async () => {
     const err = capture();
     const code = await runNodesCommand({

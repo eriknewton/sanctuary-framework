@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { renderPostureAgentHTML } from "../../src/principal-policy/posture-agent-html.js";
+import { renderPostureHomeHTML } from "../../src/principal-policy/posture-home-html.js";
+
+/**
+ * Extract the source of a named `function NAME(` ... matching-brace block from a
+ * rendered page string. Used to pin the honesty-critical client functions
+ * byte-for-byte across the two posture surfaces (#641). Brace-balanced so it is
+ * robust to nested blocks.
+ */
+function extractFnSource(html: string, fnHeader: string): string {
+  const start = html.indexOf(fnHeader);
+  if (start === -1) throw new Error("function not found: " + fnHeader);
+  const open = html.indexOf("{", start);
+  let depth = 0;
+  for (let i = open; i < html.length; i++) {
+    const ch = html[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return html.slice(start, i + 1);
+    }
+  }
+  throw new Error("unbalanced braces for: " + fnHeader);
+}
 
 /**
  * Slice 4 of the unified posture dashboard: the per-agent drill-down page. These
@@ -113,5 +136,99 @@ describe("posture agent drill-down - distress tile honesty", () => {
     // The inbox fetch falls back to an empty inbox on error rather than crashing
     // or implying anything green.
     expect(html).toContain('renderDistress({ data: { entries: [], count: 0 } })');
+  });
+});
+
+/**
+ * #641: the reach drill-down's ENFORCEMENT presentation must be gated on the
+ * SAME enforcement evidence the agent Standing pill uses. A curated rule on disk
+ * is CONFIGURATION, not proof the OS is enforcing it. So when enforcement is not
+ * confirmed (today: always, since no per-agent live enforcement signal exists),
+ * the reach table must NOT emit a green Castle Wall pill, a green deny pill, or
+ * the "only the destinations listed below are reachable" default-deny-in-effect
+ * claim. Green OS-enforcement coloring + that claim are reserved for the
+ * enforcement_confirmed case.
+ */
+describe("posture agent drill-down - reach enforcement honesty (#641)", () => {
+  it("the reach renderer keys OS-enforcement coloring on enforcement_confirmed", () => {
+    const html = renderPostureAgentHTML();
+    const fnSource = extractFnSource(html, "function renderReach(reach)");
+    // The honesty gate exists and reads the SAME evidence the pill keys on.
+    expect(fnSource).toContain("reach.enforcement_confirmed === true");
+  });
+
+  it("the deny disposition pill is green ONLY under confirmed enforcement", () => {
+    const html = renderPostureAgentHTML();
+    const fnSource = extractFnSource(
+      html,
+      "function dispositionPill(d, enforcementConfirmed)",
+    );
+    // Green deny is gated on enforcementConfirmed; the un-confirmed branch is a
+    // non-green "deny (configured)" amber pill.
+    expect(fnSource).toContain("enforcementConfirmed");
+    expect(fnSource).toContain('pill amber">deny (configured)');
+    // The ONLY green branch must sit inside the enforcementConfirmed ternary, so
+    // a green deny can never be emitted when enforcement is unconfirmed.
+    expect(fnSource).toMatch(
+      /enforcementConfirmed\s*\?\s*'<span class="pill green">deny<\/span>'/,
+    );
+  });
+
+  it("the Castle Wall layer pill is green ONLY under confirmed enforcement", () => {
+    const html = renderPostureAgentHTML();
+    const fnSource = extractFnSource(
+      html,
+      "function layerLabel(layer, enforcementConfirmed)",
+    );
+    expect(fnSource).toContain("enforcementConfirmed");
+    // Un-confirmed castle_wall lines render amber "Castle Wall (configured)".
+    expect(fnSource).toContain('pill amber">Castle Wall (configured)');
+    // The green Castle Wall pill sits strictly inside the confirmed branch.
+    expect(fnSource).toMatch(
+      /enforcementConfirmed\s*\?\s*'<span class="pill green">Castle Wall<\/span>'/,
+    );
+  });
+
+  it("does NOT claim default-deny is in effect unless enforcement is confirmed", () => {
+    const html = renderPostureAgentHTML();
+    const fnSource = extractFnSource(html, "function renderReach(reach)");
+    // The default-deny-in-effect copy must be gated behind the confirmed branch
+    // (the else of `!enforcementConfirmed`), never emitted unconditionally.
+    const defaultDenyIdx = fnSource.indexOf(
+      "only the destinations listed below are reachable",
+    );
+    expect(defaultDenyIdx).toBeGreaterThan(-1);
+    const gateIdx = fnSource.indexOf("!enforcementConfirmed");
+    expect(gateIdx).toBeGreaterThan(-1);
+    // The honest "configured, not confirmed enforcing" copy precedes the
+    // default-deny claim and is the branch taken when enforcement is unconfirmed.
+    // (The page source splits the sentence across concatenated string literals,
+    // so assert a contiguous literal fragment, not the rendered concatenation.)
+    expect(fnSource).toContain(
+      "operating system is not confirmed to be enforcing them",
+    );
+    expect(fnSource).toContain(
+      "not a confirmed in-effect block",
+    );
+  });
+});
+
+/**
+ * #641 LOW: the agent Standing pill is the most-screenshotted honesty surface,
+ * and it is rendered on BOTH the Home grid and the per-agent drill-down. The two
+ * copies MUST be byte-identical so the "never fake green" contract cannot
+ * silently drift on one surface. They now share a single source of truth
+ * (posture-html-shared.ts); this test pins that they render identically.
+ */
+describe("posture agentPill byte-identity across surfaces (#641)", () => {
+  it("the agentPill body is byte-identical on Home and on the drill-down", () => {
+    const home = extractFnSource(renderPostureHomeHTML(), "function agentPill(row)");
+    const agent = extractFnSource(renderPostureAgentHTML(), "function agentPill(row)");
+    expect(agent).toBe(home);
+    // And it still encodes the honesty contract (green only on confirmed active).
+    expect(home).toContain('enforcement_active === "active"');
+    expect(home).toContain('pill green">enforcement active');
+    expect(home).toContain('pill amber">protection requested');
+    expect(home).not.toMatch(/policy_protected[^\n]*pill green/);
   });
 });

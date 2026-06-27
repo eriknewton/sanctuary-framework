@@ -24,6 +24,10 @@ import {
 } from "../../src/mesh/canonical-json.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { hash as sha256 } from "../../src/core/hashing.js";
+import {
+  reputationBundleSigningBytes,
+  type ReputationBundle,
+} from "../../src/reputation/reputation-store.js";
 
 interface ToolDef {
   name: string;
@@ -338,6 +342,97 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     await writeFile(manifestPath, jsonBytes(manifest));
   }
 
+  const ACTIVATION_NAMESPACES = [
+    "_exit_public_identities",
+    "_exit_policy_sets",
+    "_exit_audit_receipts",
+    "_exit_commitments",
+    "_exit_placeholder_metadata",
+    "_exit_imports",
+    "_reputation",
+    "_audit",
+  ] as const;
+
+  async function activationNamespaceSnapshot(
+    storage: MemoryStorage
+  ): Promise<Record<string, string[]>> {
+    const snapshot: Record<string, string[]> = {};
+    for (const namespace of ACTIVATION_NAMESPACES) {
+      snapshot[namespace] = (await storage.list(namespace)).map(
+        (entry) => entry.key
+      );
+    }
+    return snapshot;
+  }
+
+  async function expectNoActivationWritesAfterRejectedImport(
+    bundleDir: string,
+    destination: Awaited<ReturnType<typeof makeHarness>>,
+    options: { acceptUnverifiableAttestations?: boolean } = {}
+  ): Promise<void> {
+    const before = await activationNamespaceSnapshot(destination.storage);
+    let result:
+      | Awaited<ReturnType<typeof importExitBundle>>
+      | undefined;
+    let thrown: unknown;
+    try {
+      result = await importExitBundle({
+        bundleDir,
+        storage: destination.storage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        ...options,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    if (thrown === undefined) {
+      expect(result?.activated).toBe(false);
+      expect(result?.staged_artifacts).toEqual([]);
+    }
+    expect(thrown ?? result).toBeDefined();
+    await destination.auditLog.flush();
+    await expect(activationNamespaceSnapshot(destination.storage)).resolves.toEqual(
+      before
+    );
+  }
+
+  function signReputationBody(
+    source: Awaited<ReturnType<typeof makeHarness>>,
+    body: {
+      version: "SANCTUARY_REP_V1";
+      attestations: ReputationBundle["attestations"];
+      exported_at: string;
+      exporter_did: string;
+      completeness_manifest?: ReputationBundle["completeness_manifest"];
+    },
+    legacyJson = false
+  ): string {
+    const identity = source.identityManager.getDefault();
+    if (!identity) throw new Error("no default identity");
+    const identityEncryptionKey = derivePurposeKey(
+      source.masterKey,
+      "identity-encryption"
+    );
+    const bytes = legacyJson
+      ? stringToBytes(
+          JSON.stringify({
+            version: body.version,
+            attestations: body.attestations,
+            exported_at: body.exported_at,
+            exporter_did: body.exporter_did,
+          })
+        )
+      : reputationBundleSigningBytes(body);
+    return toBase64url(
+      identitySign(bytes, identity.encrypted_private_key, identityEncryptionKey)
+    );
+  }
+
   it("#77: verifier surfaces identity_signature_invalid when public_identity signature is tampered", async () => {
     const source = await makeHarness();
     await callTool(source.tools, "identity_create", { label: "tampered-id" });
@@ -407,6 +502,204 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(result.passed).toBe(false);
     expect(result.failure_class).toBe("reputation_bundle_signature_invalid");
     expect(result.reputation?.bundle_signature_valid).toBe(false);
+
+    const destination = await makeHarness();
+    await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
+  });
+
+  it("exit activation rejects manifestless reputation before staging artifacts", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "missing-rep-manifest",
+    });
+    const identityId = created.identity_id as string;
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "missing-manifest-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 90 },
+      },
+      context: "exit-atomicity",
+      identity_id: identityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-atomicity-missing-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => {
+        const bundle = parsed as unknown as ReputationBundle;
+        const legacy = { ...bundle } as Record<string, unknown>;
+        delete legacy.completeness_manifest;
+        legacy.bundle_signature = signReputationBody(
+          source,
+          {
+            version: bundle.version,
+            attestations: bundle.attestations,
+            exported_at: bundle.exported_at,
+            exporter_did: bundle.exporter_did,
+          },
+          true
+        );
+        return legacy;
+      },
+      source
+    );
+
+    const outerVerification = await verifyExitBundle(bundleDir);
+    expect(outerVerification.passed).toBe(true);
+    expect(outerVerification.reputation?.completeness).toBe(
+      "unverified-completeness-legacy-bundle"
+    );
+    expect(outerVerification.reputation?.completeness).not.toBe("verified");
+
+    const destination = await makeHarness();
+    await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
+  });
+
+  it("exit activation rejects mismatched reputation completeness before staging artifacts", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "bad-rep-manifest",
+    });
+    const identityId = created.identity_id as string;
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "bad-manifest-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 91 },
+      },
+      context: "exit-atomicity",
+      identity_id: identityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-atomicity-bad-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => {
+        const bundle = parsed as unknown as ReputationBundle;
+        const tampered = {
+          ...bundle,
+          completeness_manifest: {
+            ...bundle.completeness_manifest!,
+            total_attestation_count: bundle.attestations.length + 1,
+          },
+        };
+        return {
+          ...tampered,
+          bundle_signature: signReputationBody(source, tampered),
+        } as unknown as Record<string, unknown>;
+      },
+      source
+    );
+
+    const outerVerification = await verifyExitBundle(bundleDir);
+    expect(outerVerification.passed).toBe(false);
+    expect(outerVerification.failure_class).toBe(
+      "reputation_completeness_mismatch"
+    );
+    expect(outerVerification.reputation?.bundle_signature_valid).toBe(true);
+    expect(outerVerification.reputation?.completeness).toBe("mismatch");
+
+    const destination = await makeHarness();
+    await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
+  });
+
+  it("verify-exit-bundle fails when a signed reputation body is truncated against its completeness manifest", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "truncated-rep-manifest",
+    });
+    const identityId = created.identity_id as string;
+    for (const interactionId of ["truncated-001", "truncated-002"]) {
+      await callTool(source.tools, "reputation_record", {
+        interaction_id: interactionId,
+        counterparty_did: "did:key:counterparty",
+        outcome: {
+          type: "transaction",
+          result: "completed",
+          metrics: { score: 94 },
+        },
+        context: "exit-truncation",
+        identity_id: identityId,
+      });
+    }
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-truncated-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    await tamperArtifactInternalField(
+      bundleDir,
+      "reputation_bundle",
+      (parsed) => {
+        const bundle = parsed as unknown as ReputationBundle;
+        const truncated = {
+          ...bundle,
+          attestations: bundle.attestations.slice(0, 1),
+        };
+        return {
+          ...truncated,
+          bundle_signature: signReputationBody(source, truncated),
+        } as unknown as Record<string, unknown>;
+      },
+      source
+    );
+
+    const result = await verifyExitBundle(bundleDir);
+    expect(result.passed).toBe(false);
+    expect(result.failure_class).toBe("reputation_completeness_mismatch");
+    expect(result.reputation?.bundle_signature_valid).toBe(true);
+    expect(result.reputation?.attestation_count).toBe(1);
+    expect(result.reputation?.completeness).toBe("mismatch");
+    expect(result.warnings.join("\n")).toContain(
+      "Reputation bundle completeness manifest does not match contents"
+    );
+  });
+
+  it("exit activation leaves no artifacts for unverifiable reputation without opt-in", async () => {
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", {
+      label: "primary-only-in-bundle",
+    });
+    const secondary = await callTool(source.tools, "identity_create", {
+      label: "secondary-reputation-signer",
+    });
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "unverifiable-atomicity-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 92 },
+      },
+      context: "exit-atomicity",
+      identity_id: secondary.identity_id as string,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-atomicity-unverifiable-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const outerVerification = await verifyExitBundle(bundleDir);
+    expect(outerVerification.passed).toBe(false);
+    expect(outerVerification.failure_class).toBe(
+      "reputation_unverifiable_attestations"
+    );
+
+    const destination = await makeHarness();
+    await expectNoActivationWritesAfterRejectedImport(bundleDir, destination);
   });
 
   it("#55: verifier still passes clean bundles with no unverifiable attestations", async () => {
@@ -434,7 +727,54 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
 
     const verified = await verifyExitBundle(bundleDir);
     expect(verified.passed).toBe(true);
+    expect(verified.reputation?.completeness).toBe("verified");
     expect(verified.reputation?.unverifiable_attestations).toBe(0);
     expect(verified.reputation?.verified_attestations).toBe(1);
+  });
+
+  it("exit activation happy path still stages and imports reputation", async () => {
+    const source = await makeHarness();
+    const created = await callTool(source.tools, "identity_create", {
+      label: "atomicity-happy",
+    });
+    const identityId = created.identity_id as string;
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "atomicity-happy-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 93 },
+      },
+      context: "exit-atomicity",
+      identity_id: identityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-atomicity-happy-"));
+    tempDirs.push(bundleDir);
+    await exportFromSource(source, bundleDir);
+
+    const destination = await makeHarness();
+    const imported = await importExitBundle({
+      bundleDir,
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+    });
+
+    expect(imported.verified).toBe(true);
+    expect(imported.activated).toBe(true);
+    expect(imported.reputation.imported_attestations).toBe(1);
+    expect([...imported.staged_artifacts].sort()).toEqual([
+      "audit_receipts",
+      "commitments",
+      "placeholder_vault_metadata",
+      "policy_set",
+      "public_identity",
+      "reputation_bundle",
+    ]);
   });
 });

@@ -107,6 +107,9 @@ describe("SDW memory tools: surface + tier classification", () => {
     expect(tools.get("memory_search")!.tool_class).toBe("read");
     expect(tools.get("memory_list")!.tool_class).toBe("read");
     expect(tools.get("memory_count")!.tool_class).toBe("read");
+    expect(
+      tools.get("memory_search")!.inputSchema.properties as Record<string, unknown>,
+    ).not.toHaveProperty("include_text");
   });
 
   it("memory_delete is described as Tier 1 / irreversible (MUST-NEVER #3)", () => {
@@ -160,6 +163,53 @@ describe("SDW memory tools: end-to-end loop", () => {
 
     const countAfter = parse(await tools.get("memory_count")!.handler({}));
     expect(countAfter.count).toBe(0);
+  });
+
+  it("insert and list return metadata only, while explicit get returns the full body", async () => {
+    const { tools } = makeTools();
+    const body =
+      "projection guard unique body " +
+      "alpha ".repeat(80) +
+      "bulk memory dump sentinel";
+
+    const inserted = parse(
+      await tools.get("memory_insert")!.handler({
+        text: body,
+        taint: "agent_derived_clean",
+        tags: ["projection", "guard"],
+        passage_id: "projection-guard",
+      }),
+    );
+    const insertedPassage = inserted.passage as Record<string, unknown>;
+    expect(insertedPassage).toMatchObject({
+      passage_id: "projection-guard",
+      owner_ref: "tools-archive",
+      created_at: NOW,
+      chunk_count: 1,
+      tag_count: 2,
+    });
+    expect(insertedPassage.content_hash).toEqual(expect.any(String));
+    expect(insertedPassage).not.toHaveProperty("text");
+    expect(insertedPassage).not.toHaveProperty("tags");
+    expect(JSON.stringify(inserted)).not.toContain(body);
+
+    const listed = parse(await tools.get("memory_list")!.handler({}));
+    const listedPassage = (listed.passages as Array<Record<string, unknown>>)[0]!;
+    expect(listedPassage).toMatchObject({
+      passage_id: "projection-guard",
+      owner_ref: "tools-archive",
+      created_at: NOW,
+      chunk_count: 1,
+      tag_count: 2,
+    });
+    expect(listedPassage.content_hash).toEqual(expect.any(String));
+    expect(listedPassage).not.toHaveProperty("text");
+    expect(listedPassage).not.toHaveProperty("tags");
+    expect(JSON.stringify(listed)).not.toContain(body);
+
+    const got = parse(await tools.get("memory_get")!.handler({ passage_id: "projection-guard" }));
+    expect(got.found).toBe(true);
+    expect((got.passage as Record<string, unknown>).text).toBe(body);
   });
 
   it("memory_get returns found:false for a missing passage (no leak)", async () => {
@@ -313,6 +363,57 @@ describe("SDW memory tools: custody + denial discipline", () => {
     });
     const searched = parse(await tools.get("memory_search")!.handler({ text: "" }));
     expect((searched.results as unknown[]).length).toBe(0);
+  });
+
+  it("memory_search returns metadata only by default, even for short matched bodies", async () => {
+    const { tools } = makeTools();
+    const body = "short body with needle-safe-marker and walkable-unique-suffix";
+    await tools.get("memory_insert")!.handler({
+      text: body,
+      taint: "agent_derived_clean",
+      tags: ["search"],
+      passage_id: "short-search-projection",
+    });
+
+    const searched = parse(
+      await tools.get("memory_search")!.handler({ text: "needle-safe-marker" }),
+    );
+    const [result] = searched.results as Array<Record<string, unknown>>;
+    expect(result).toBeDefined();
+    expect(JSON.stringify(searched)).not.toContain(body);
+    expect(JSON.stringify(searched)).not.toContain("needle-safe-marker");
+    expect(JSON.stringify(searched)).not.toContain("walkable-unique-suffix");
+    expect((result.passage as Record<string, unknown>).passage_id).toBe(
+      "short-search-projection",
+    );
+    expect(result.passage as Record<string, unknown>).not.toHaveProperty("text");
+    expect(result).not.toHaveProperty("snippet");
+  });
+
+  it("memory_search stays metadata-only even if legacy include_text input is supplied", async () => {
+    const { tools } = makeTools();
+    const body =
+      "explicit search body " +
+      "left context ".repeat(40) +
+      "include-text-marker " +
+      "right context ".repeat(40);
+    await tools.get("memory_insert")!.handler({
+      text: body,
+      taint: "agent_derived_clean",
+      passage_id: "search-include-text",
+    });
+
+    const searched = parse(
+      await tools.get("memory_search")!.handler({
+        text: "include-text-marker",
+        include_text: true,
+      }),
+    );
+    const [result] = searched.results as Array<Record<string, unknown>>;
+    expect(JSON.stringify(searched)).not.toContain(body);
+    expect(JSON.stringify(searched)).not.toContain("include-text-marker");
+    expect(result.passage as Record<string, unknown>).not.toHaveProperty("text");
+    expect(result).not.toHaveProperty("snippet");
   });
 
   it("audits successful read paths with result counts", async () => {

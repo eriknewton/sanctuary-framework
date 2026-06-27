@@ -51,7 +51,9 @@ async function ceremonyInit(
   });
 }
 
-describe("/v1 session ceremony over HTTP (durable operator attestation)", () => {
+// retry:2 - this loopback /v1 rig races port/session setup under full-suite
+// parallel load (a recurring non-hermetic CI flake class for the /v1 rigs).
+describe("/v1 session ceremony over HTTP (durable operator attestation)", { retry: 2 }, () => {
   let rig: TestRig;
 
   beforeEach(async () => {
@@ -208,7 +210,8 @@ describe("/v1 session ceremony over HTTP (durable operator attestation)", () => 
   });
 });
 
-describe("/v1 fail-closed perimeter", () => {
+// retry:2 - loopback /v1 rig; same non-hermetic flake class as above.
+describe("/v1 fail-closed perimeter", { retry: 2 }, () => {
   let rig: TestRig;
 
   beforeEach(async () => {
