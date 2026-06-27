@@ -169,7 +169,6 @@
 8	server/src/system-prompt-generator.ts
 2	server/src/templates/cli.ts
 1	server/src/workload-lifecycle/payload.ts
-2	server/src/wrap/custody-flow.ts
 1	server/src/wrap/fortress-view.ts
 3	server/src/wrap/init.ts
 1	server/src/wrap/passphrase.ts

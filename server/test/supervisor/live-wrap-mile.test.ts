@@ -1,5 +1,5 @@
 /**
- * Phase S1 — LIVE wrap-launch mile (custody-hold + teardown via real runWrap).
+ * Phase S1 - LIVE wrap-launch mile (custody-hold + teardown via real runWrap).
  *
  * The hermetic A1 legs (#527) proved the supervisor MACHINERY against a stub
  * `wrap` that read its key and exited 2. This file proves the LIVE mile that

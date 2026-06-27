@@ -1,5 +1,5 @@
 /**
- * Sanctuary wrap — custody establishment flow
+ * Sanctuary wrap - custody establishment flow
  *
  * The interactive-CLI face of the unified custody scheme
  * (core/master-custody.ts) used by `sanctuary wrap`:
@@ -9,10 +9,10 @@
  *    force capture + re-entry verification on interactive runs.
  *  - Legacy fortress: migrate in place on this unlock (same master, no data
  *    re-encryption), then complete custody by minting the recovery wrap the
- *    legacy scheme never had — the 2026-06-12 incident cure.
+ *    legacy scheme never had - the 2026-06-12 incident cure.
  *  - Recovery-key-custody fortress (created by `sanctuary init`): enroll
  *    the passphrase as a NEW wrap by first unlocking with the recovery key
- *    (interactive prompt) — never by deriving a parallel master.
+ *    (interactive prompt) - never by deriving a parallel master.
  *
  * Every degraded decision (headless install, unverified capture) is audited
  * as a distinct path, never a silent relaxation (F6/F13).
@@ -103,7 +103,7 @@ export async function establishWrapCustody(
     // The passphrase did not unlock. If this fortress's custody is
     // recovery-key-based (created by `sanctuary init`, no passphrase wrap
     // enrolled yet), the correct move is to unlock with the recovery key
-    // and ADD the passphrase as a new wrap — never to derive a parallel
+    // and ADD the passphrase as a new wrap - never to derive a parallel
     // master. Anything else stays fail-closed.
     const envelope = await readCustodyEnvelope(storage);
     const recoveryCustody =
@@ -143,7 +143,7 @@ export async function establishWrapCustody(
       );
       origin = "recovery-unlock-enroll";
     } else {
-      // Migration was deferred (unverifiable existing data) — the recovery
+      // Migration was deferred (unverifiable existing data) - the recovery
       // key unlocked legacy-style; no envelope exists to enroll into yet.
       origin = result.origin;
     }
@@ -186,10 +186,10 @@ export async function establishWrapCustody(
 
   if (!envelope) {
     // Migration deferred: no envelope to mint into. Loud, honest, no
-    // silent custody claims — the fortress stays legacy until verifiable
+    // silent custody claims - the fortress stays legacy until verifiable
     // evidence exists (e.g. after the first identity is created).
     (opts.io?.output ?? process.stderr).write(
-      "\n  Note: this fortress's custody migration was DEFERRED — its existing data\n" +
+      "\n  Note: this fortress's custody migration was DEFERRED - its existing data\n" +
         "  could not be verified against the supplied credential, so no recovery\n" +
         "  key was issued this run. Re-run wrap after the fortress has been used\n" +
         "  (a stored identity gives migration its verification evidence).\n"
@@ -216,12 +216,12 @@ export async function establishWrapCustody(
     });
     if (!disclosure.fileWritten) {
       // A recovery-key.txt already existed (a stale artifact from a legacy
-      // path — the misleading-file trap from the 2026-06-12 incident).
+      // path - the misleading-file trap from the 2026-06-12 incident).
       // Single-issuance protects the existing file; make the mismatch LOUD.
       (opts.io?.output ?? process.stderr).write(
         "\n  WARNING: an existing recovery-key.txt was found and was NOT overwritten.\n" +
           "  Its key is OUTDATED and does not unlock this fortress. The key printed\n" +
-          "  in the banner above is the real one — save THAT, then delete the stale file.\n"
+          "  in the banner above is the real one - save THAT, then delete the stale file.\n"
       );
       await auditLog.appendCritical({
         layer: "l2",
@@ -291,7 +291,7 @@ export interface SupervisedWrapCustodyOptions {
   storagePath: string;
   /**
    * The raw 32-byte fortress master the supervisor handed over the one-shot fd
-   * (the dashboard's already-unlocked in-memory master — Tier A). This buffer
+   * (the dashboard's already-unlocked in-memory master - Tier A). This buffer
    * is OWNED by the caller (`runWrap`), which zeroes it on teardown; this
    * function MUST NOT zero or retain a reference to it beyond the returned
    * `masterKey` (which IS the same buffer, threaded forward intentionally).
@@ -304,18 +304,18 @@ export interface SupervisedWrapCustodyOptions {
  * live mile). The supervisor process already unlocked the fortress and holds
  * the master in memory; it hands a copy to this child over a one-shot fd
  * (never env/argv). The child must NOT re-derive a master from a passphrase
- * (there is none in supervised mode) and must NOT mint a new one — it must
+ * (there is none in supervised mode) and must NOT mint a new one - it must
  * adopt the supervisor's master AS the fortress master, but only after proving
  * it actually unlocks THIS fortress.
  *
- * Fail-closed gates (never silently degrade — constraint #5):
+ * Fail-closed gates (never silently degrade - constraint #5):
  *   1. A master rotation in flight ⇒ refuse (defense in depth; the supervisor's
  *      rotation guard already refused, but the child re-checks at the on-disk
  *      truth so a rotation journaled after the socket request still refuses).
  *   2. NO custody envelope on disk ⇒ refuse. A supervised launch is only ever
  *      issued against a fortress the dashboard already unlocked, which by
  *      construction has an established envelope. A legacy/fresh fortress (no
- *      envelope) must never be "established" from an ambient master — that
+ *      envelope) must never be "established" from an ambient master - that
  *      would mint custody over existing data with no recovery wrap. The
  *      operator runs an interactive `sanctuary wrap` once to establish custody
  *      before it can be supervised.
@@ -327,7 +327,7 @@ export interface SupervisedWrapCustodyOptions {
  *
  * On success the returned `masterKey` IS the supplied buffer (threaded forward
  * so `runWrap` can zero exactly one buffer on teardown). No new credential is
- * introduced and nothing extra is written to disk — identical custody posture
+ * introduced and nothing extra is written to disk - identical custody posture
  * to the dashboard's own in-memory hold (Tier A, design §3).
  */
 export async function establishSupervisedWrapCustody(

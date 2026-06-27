@@ -2723,7 +2723,7 @@ export async function runWrap(
   if (supervised) {
     // Phase S1 live mile: establish custody from the supervisor's raw master,
     // verified against the on-disk envelope. Fail CLOSED on any verify failure,
-    // a missing envelope, or a rotation in flight — never run the enforcement
+    // a missing envelope, or a rotation in flight - never run the enforcement
     // chain on a master that does not own this fortress (#5). The supplied
     // buffer is threaded forward as wrapCustody.masterKey and zeroed on
     // teardown below.
@@ -2772,7 +2772,7 @@ export async function runWrap(
       : passphraseValue !== undefined);
 
   // Teardown zeroing for the supervised master (custody invariant: teardown
-  // zeroes the key, no residency after teardown — A1 hermetic leg). The same
+  // zeroes the key, no residency after teardown - A1 hermetic leg). The same
   // buffer is wrapCustody.masterKey; zero it once on every exit path.
   if (supervised && wrapCustody !== undefined) {
     const masterToZero = wrapCustody.masterKey;

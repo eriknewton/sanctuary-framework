@@ -103,14 +103,14 @@ async function main(): Promise<void> {
     const { parseWrapArgs, runWrap } = await import("./wrap/cli.js");
     const opts = parseWrapArgs(args.slice(1));
 
-    // Phase S1 supervisor handoff (codex R3-H1) — LIVE wrap-launch mile.
+    // Phase S1 supervisor handoff (codex R3-H1) - LIVE wrap-launch mile.
     // When launched BY the split-process supervisor, the fortress master
     // arrives on an inherited one-shot fd (never env/argv). Read + close it at
     // the earliest point so it cannot linger for a same-uid `/proc/<pid>/fd`
     // race, then thread the RAW master into `runWrap` so it establishes custody
     // directly (verified against the on-disk envelope, fail-closed) and runs
     // the full enforcement chain. FAIL CLOSED in supervisor mode: a handoff
-    // failure NEVER falls through to the passphrase/keychain path — that would
+    // failure NEVER falls through to the passphrase/keychain path; that would
     // boot the agent on a credential the operator did not intend for this
     // launch. The raw master is OWNED by runWrap, which zeroes it on teardown
     // (custody invariant: teardown zeroes the key).

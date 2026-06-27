@@ -4,7 +4,7 @@
  * establishWrapCustody is the `sanctuary wrap` face of the unified scheme:
  * fresh fortresses get one master wrapped under passphrase + minted
  * recovery key; legacy fortresses migrate in place and THEN get the
- * recovery wrap the legacy scheme never had — the incident cure.
+ * recovery wrap the legacy scheme never had - the incident cure.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -236,7 +236,7 @@ describe("establishSupervisedWrapCustody (Phase S1 live mile)", () => {
   });
 
   it("FAILS CLOSED when there is no custody envelope (fresh/legacy fortress)", async () => {
-    // No envelope established — a supervised launch must refuse rather than
+    // No envelope established - a supervised launch must refuse rather than
     // mint custody over (possibly existing) data from an ambient master.
     const master = new Uint8Array(32).fill(3);
     await expect(
