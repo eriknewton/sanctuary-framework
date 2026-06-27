@@ -19,6 +19,10 @@ path = "src/main.rs"
 name = "sanctuary-jail"
 path = "src/bin/sanctuary-jail.rs"
 
+[[bin]]
+name = "sanctuary-plugin-launcher"
+path = "src/bin/sanctuary-plugin-launcher.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -28,7 +32,7 @@ sha2 = "=0.10.9"
 hex = "0.4"
 base64 = "0.22"
 thiserror = "1.0"
-nix = { version = "=0.27.1", default-features = false, features = ["fs", "user", "signal", "socket", "process", "poll", "net"] }
+nix = { version = "=0.27.1", default-features = false, features = ["fs", "user", "signal", "socket", "process", "poll", "net", "sched", "mount", "resource"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

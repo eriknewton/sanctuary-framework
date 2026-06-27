@@ -37,17 +37,33 @@ import {
   type CustodyEnvelope,
   type CustodyWrap,
 } from "../core/master-custody.js";
-import { getOrCreateKeychainCustodyKey } from "./keychain-custody.js";
+import {
+  getOrCreateKeychainCustodyKey,
+  storeRecoveryKeyInKeychain,
+  type KeychainCustodyOptions,
+} from "./keychain-custody.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { createIdentity } from "../core/identity.js";
+import { IdentityManager } from "../cognitive/tools.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   discloseRecoveryKey,
+  preflightRecoveryKeyOutputFile,
+  resolveRecoveryKeyOutputPath,
   verifyRecoveryKeyReentry,
+  writeRecoveryKeyFile,
   RecoveryKeyConfirmationDeclinedError,
   RecoveryKeyConfirmationNonInteractiveError,
+  RecoveryKeyOutputPathInsideFortressError,
   RecoveryKeyReentryMismatchError,
+  type DiscloseRecoveryKeyResult,
 } from "./recovery-key-disclosure.js";
-import { DEFAULT_STORAGE_DIR } from "../paths.js";
+import {
+  DEFAULT_STORAGE_DIR,
+  formatFortressPathWritableError,
+  preflightFortressPathWritable,
+} from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
 /**
@@ -67,6 +83,11 @@ export interface InitOptions {
   /** Allow init against a non-empty directory. Refuses without this flag. */
   force?: boolean;
   /**
+   * Exact plaintext recovery-key destination. When set, the key is written
+   * here instead of <fortress>/recovery-key.txt. Must be outside fortress.
+   */
+  recoveryOut?: string;
+  /**
    * Skip the Castle Wall global-pin provisioning step. Default init writes
    * the machine-wide enforcement anchor at
    * /Library/Application Support/Sanctuary/castle-pinned-pubkey, so a
@@ -77,6 +98,16 @@ export interface InitOptions {
    * non-interactive harnesses. Default behavior (no flag) is unchanged.
    */
   noPin?: boolean;
+  /**
+   * Skip seeding the default operator identity. Default init mints a single
+   * Ed25519 operator identity (the one every Tier-1 operator-signed surface,
+   * federation, did:web, exit, needs) under the fortress's existing custody,
+   * so a stock `init` fortress can drive federation admin verbs with no extra
+   * step. With this flag set, init mints NO identity (the "custody-only,
+   * bring-your-own-identity-later" path); run `sanctuary identity create`
+   * later when ready. Mirrors --no-pin. Default behavior (no flag) is to seed.
+   */
+  noIdentity?: boolean;
 }
 
 /**
@@ -106,6 +137,34 @@ export function resolveNoPin(
     return false;
   }
   return NO_PIN_ENV_OPT_IN.has(raw.trim().toLowerCase());
+}
+
+/**
+ * Explicit opt-in values for SANCTUARY_INIT_NO_IDENTITY. Skipping the default
+ * operator-identity seed leaves a fortress that cannot drive any Tier-1
+ * operator-signed surface, so the env var is an allowlist (NOT "anything
+ * truthy"): only these exact values opt out. Mirrors NO_PIN_ENV_OPT_IN.
+ */
+const NO_IDENTITY_ENV_OPT_IN = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Resolve whether the default operator-identity seed should be skipped.
+ * Precedence: the --no-identity CLI flag wins; otherwise
+ * SANCTUARY_INIT_NO_IDENTITY opts out only when set to an explicit
+ * allowlisted value (1/true/yes/on, case-insensitive). Default is to seed.
+ */
+export function resolveNoIdentity(
+  options: { noIdentity?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (options.noIdentity) {
+    return true;
+  }
+  const raw = env.SANCTUARY_INIT_NO_IDENTITY;
+  if (raw === undefined) {
+    return false;
+  }
+  return NO_IDENTITY_ENV_OPT_IN.has(raw.trim().toLowerCase());
 }
 
 export interface InitResult {
@@ -163,6 +222,10 @@ async function isDirectoryEmpty(path: string): Promise<boolean> {
  */
 export interface RunInitDeps {
   provisionPin?: typeof runProvisionPin;
+  /** Test seam: inject a mock OS-keyring backend for recovery-key storage. */
+  recoveryKeychain?: KeychainCustodyOptions;
+  /** Test seam: simulate a race after preflight but before O_EXCL capture. */
+  beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
 }
 
 export async function runInit(
@@ -171,6 +234,38 @@ export async function runInit(
 ): Promise<InitResult> {
   const provisionPin = deps.provisionPin ?? runProvisionPin;
   const fortressPath = resolveFortressPath(options);
+  let recoveryKeyOutputPath: string | undefined;
+  try {
+    recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
+      recoveryOut: options.recoveryOut,
+      storagePath: fortressPath,
+      env: process.env,
+    });
+    if (recoveryKeyOutputPath) {
+      await preflightRecoveryKeyOutputFile(recoveryKeyOutputPath);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const prefix =
+      err instanceof RecoveryKeyOutputPathInsideFortressError
+        ? "recovery key output refused"
+        : "recovery key output unavailable";
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
+    throw err;
+  }
+
+  const fortressWritable = await preflightFortressPathWritable(fortressPath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: ${formatFortressPathWritableError(
+        fortressPath,
+        fortressWritable,
+      )}\n`,
+    );
+    throw new Error("fortress path is not writable");
+  }
 
   if (!options.force) {
     const empty = await isDirectoryEmpty(fortressPath);
@@ -206,6 +301,7 @@ export async function runInit(
   const masterKey = generateRandomKey();
   const recoveryKeyBytes = generateRandomKey();
   const recoveryKey = toBase64url(recoveryKeyBytes);
+  const fortressId = fortressIdFromStoragePath(fortressPath);
 
   const wraps: CustodyWrap[] = [
     wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
@@ -215,6 +311,14 @@ export async function runInit(
     }),
   ];
   recoveryKeyBytes.fill(0);
+
+  if (!recoveryKeyOutputPath) {
+    await storeRecoveryKeyInKeychain(
+      fortressPath,
+      recoveryKey,
+      deps.recoveryKeychain
+    );
+  }
 
   // Second factor. Interactive installs MUST enroll one (the two-factor
   // floor refuses trust-bearing writes — including the Castle pin below —
@@ -242,6 +346,26 @@ export async function runInit(
     }
   }
 
+  let prewrittenRecoveryKeyFile:
+    | Awaited<ReturnType<typeof writeRecoveryKeyFile>>
+    | undefined;
+  if (recoveryKeyOutputPath) {
+    try {
+      await deps.beforeRecoveryKeyOutputWrite?.(recoveryKeyOutputPath);
+      prewrittenRecoveryKeyFile = await writeRecoveryKeyFile({
+        storagePath: fortressPath,
+        recoveryKeyFilePath: recoveryKeyOutputPath,
+        recoveryKey,
+        fortressId,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary init: recovery key output unavailable: ${message}\n`);
+      throw err;
+    }
+  }
+
   let envelope: CustodyEnvelope = await writeCustodyEnvelope(
     storage,
     {
@@ -260,14 +384,41 @@ export async function runInit(
   // Disclose first (banner + recovery-key.txt), then force re-entry
   // verification on the interactive path. Verification is end-to-end: the
   // re-entered key must actually unwrap the master.
-  let disclosure: { filePath: string };
+  let disclosure: DiscloseRecoveryKeyResult;
   try {
-    disclosure = await discloseRecoveryKey({
+    const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
       recoveryKey,
       storagePath: fortressPath,
-      fortressId: fortressIdFromStoragePath(fortressPath),
+      fortressId,
       mode: "no-confirm", // capture/verification below replaces the Y/N prompt
-    });
+    };
+    if (recoveryKeyOutputPath) {
+      if (!prewrittenRecoveryKeyFile) {
+        throw new Error("custom recovery-key output was not captured");
+      }
+      disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
+      disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
+    }
+    disclosure = await discloseRecoveryKey(disclosureOptions);
+    if (interactive && !recoveryKeyOutputPath && disclosure.fileWritten) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        "\n  WARNING: the only plaintext recovery-key copy currently lives inside\n" +
+          "  the fortress directory. It will be lost if that directory is cleared;\n" +
+          "  a later master rotation also mints a new recovery key.\n" +
+          "  Re-run with --recovery-out <path outside the fortress>, or move this\n" +
+          "  file now.\n",
+      );
+    }
+    if (interactive && !recoveryKeyOutputPath && !disclosure.fileWritten) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        "\n  WARNING: the default recovery-key.txt already existed and was not\n" +
+          "  overwritten. It may contain a prior recovery key. The authoritative\n" +
+          "  new recovery key is the one shown above and re-entered now; save\n" +
+          "  that key outside the fortress.\n",
+      );
+    }
     if (interactive) {
       await verifyRecoveryKeyReentry({
         check: async (entered) => {
@@ -304,7 +455,7 @@ export async function runInit(
   await auditLog.appendCritical({
     layer: "l2",
     operation: "custody_envelope_created",
-    identity_id: fortressIdFromStoragePath(fortressPath),
+    identity_id: fortressId,
     result: "success",
     details: {
       install_mode: envelope.install_mode,
@@ -317,13 +468,132 @@ export async function runInit(
     await auditLog.appendCritical({
       layer: "l2",
       operation: "custody_headless_install",
-      identity_id: fortressIdFromStoragePath(fortressPath),
+      identity_id: fortressId,
       result: "success",
       details: {
         source: "sanctuary-init",
         flag: "--no-confirm",
       },
     });
+  }
+
+  // Default operator identity seed. Every Tier-1 operator-signed surface
+  // (federation admin verbs, did:web, exit) needs a default operator
+  // identity, and a fortress with none is a half-provisioned state. By
+  // default init mints ONE Ed25519 operator identity under the fortress's
+  // EXISTING custody: the private key is encrypted with the master-derived
+  // "identity-encryption" purpose key (the same key sign() decrypts under),
+  // so the existing master-key recovery/escrow path recovers it too: no new
+  // independently-orphanable secret, nothing written to disk in plaintext.
+  // --no-identity (or SANCTUARY_INIT_NO_IDENTITY) skips it. Reuses the
+  // existing createIdentity + IdentityManager.saveNew primitives; no new
+  // crypto. A defensive guard (below) skips minting if a default identity is
+  // already visible under the current master; note a normal --force re-init
+  // derives a NEW master, so the prior identity is invisible (not skipped) and
+  // a fresh "operator" identity is minted under the new custody.
+  const skipIdentity = resolveNoIdentity(options);
+  if (skipIdentity) {
+    await auditLog.appendCritical({
+      layer: "l2",
+      operation: "operator_identity_seed_skipped",
+      identity_id: fortressId,
+      result: "success",
+      details: {
+        source: "sanctuary-init",
+        reason: options.noIdentity ? "--no-identity" : "SANCTUARY_INIT_NO_IDENTITY",
+      },
+    });
+  } else {
+    try {
+      const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+      try {
+        const identityManager = new IdentityManager(storage, masterKey);
+        await identityManager.load();
+        const existing = identityManager.getDefault();
+        if (existing) {
+          // Defensive: skip minting if a default operator identity is already
+          // visible under the CURRENT master. Not reachable via a normal
+          // `runInit` (a fresh init has an empty fortress, and a --force
+          // re-init derives a brand-new random master under which the prior
+          // `_identities` blobs cannot decrypt, so getDefault() returns
+          // undefined), but this guards any future path that seeds under an
+          // already-established master.
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seed_skipped",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              reason: "default-operator-identity-already-exists",
+              existing_identity_id: existing.identity_id,
+            },
+          });
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `\n  Sanctuary init: a default operator identity already exists` +
+              ` (${existing.identity_id}); leaving it unchanged.\n`,
+          );
+        } else {
+          const { storedIdentity } = createIdentity(
+            "operator",
+            identityEncKey,
+            passphrase ? "passphrase" : "recovery-key",
+          );
+          await identityManager.saveNew(storedIdentity);
+          await auditLog.appendCritical({
+            layer: "l2",
+            operation: "operator_identity_seeded",
+            identity_id: fortressId,
+            result: "success",
+            details: {
+              source: "sanctuary-init",
+              seeded_identity_id: storedIdentity.identity_id,
+              label: "operator",
+            },
+          });
+        }
+      } finally {
+        // Zero the symmetric key that wraps the new private key as soon as it
+        // has done its job (success, the skip path, or error), mirroring how
+        // the raw private key is zeroed inside createIdentity. masterKey
+        // itself is zeroed on the error path below and on the success path
+        // after pin provisioning.
+        identityEncKey.fill(0);
+      }
+    } catch (err) {
+      // Fail-closed (AGENTS.md #5): never leave a half-provisioned fortress
+      // with custody but no operator identity when the operator did not opt
+      // out. --no-identity is the only supported way to skip the seed.
+      const message = err instanceof Error ? err.message : String(err);
+      await auditLog.flush();
+      masterKey.fill(0);
+      // Honesty (Finding 2, 2026-06-25): the custody envelope and the recovery
+      // key just shown are already written and INTACT at this point; only the
+      // operator-identity seed failed. The old message said "Re-run init", but
+      // a plain `init` re-run REFUSES (the fortress dir is now non-empty) and a
+      // `--force` re-init mints a brand-new random master, ORPHANING the
+      // recovery key the operator was just told to save. Give the two
+      // remediations that actually work and do not contradict the
+      // non-empty/--force guards.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Sanctuary init: failed to seed the default operator identity:` +
+          ` ${message}\n` +
+          `  The fortress custody was provisioned and the recovery key shown above` +
+          ` is valid, but it has NO operator identity yet. To finish, do ONE of:\n` +
+          `    - add the identity to this existing fortress (custody is intact):\n` +
+          `        sanctuary identity create --fortress ${fortressPath}\n` +
+          `    - OR start over with a fresh master (this DISCARDS the recovery key` +
+          ` shown above; a new one will be minted):\n` +
+          `        sanctuary init --force --fortress ${fortressPath}\n` +
+          `  A plain \`sanctuary init\` re-run will refuse: this fortress directory` +
+          ` is no longer empty.\n`,
+      );
+      throw new Error(`operator identity seed failed: ${message}`, {
+        cause: err,
+      });
+    }
   }
   // Castle Wall global-pin provisioning. By default init writes the
   // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
@@ -334,7 +604,7 @@ export async function runInit(
     await auditLog.appendCritical({
       layer: "l2",
       operation: "castle_pin_provision_skipped",
-      identity_id: fortressIdFromStoragePath(fortressPath),
+      identity_id: fortressId,
       result: "success",
       details: {
         source: "sanctuary-init",
@@ -355,7 +625,7 @@ export async function runInit(
         `  Run \`sanctuary castle-wall provision-pin\` against this fortress when ready.\n`,
     );
   } else {
-    const pinResult = await provisionPin({
+    const pinResult = await provisionPin([], {
       out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
       env: {
         ...process.env,
@@ -394,6 +664,13 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-pin":
         opts.noPin = true;
         break;
+      case "--no-identity":
+        opts.noIdentity = true;
+        break;
+      case "--recovery-out":
+        opts.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
+        i++;
+        break;
       case "--help":
       case "-h":
         opts.helpRequested = true;
@@ -401,6 +678,18 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
     }
   }
   return opts;
+}
+
+function readRequiredPathArg(
+  argv: string[],
+  index: number,
+  flag: string,
+): string {
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`${flag} requires a path value`);
+  }
+  return value;
 }
 
 export function printInitHelp(): void {
@@ -418,6 +707,11 @@ Options:
   --force              Allow init against a non-empty directory.
   --no-confirm         Skip the recovery-key Y/N confirmation. Required
                        for non-TTY callers (CI, launchd, systemd).
+  --recovery-out <path>
+                       Write the plaintext recovery key to this exact path
+                       instead of <fortress>/recovery-key.txt. The path must
+                       be outside the fortress directory. Also honors
+                       SANCTUARY_RECOVERY_OUT when this flag is absent.
   --no-pin             Do NOT provision the machine-wide Castle Wall pin.
                        Default init writes the host-wide enforcement anchor
                        at /Library/Application Support/Sanctuary/; use this
@@ -427,6 +721,13 @@ Options:
                        \`sanctuary castle-wall provision-pin\` when ready.
                        Also settable via SANCTUARY_INIT_NO_PIN=1 for
                        non-interactive harnesses.
+  --no-identity        Do NOT seed the default operator identity. Default
+                       init mints one Ed25519 operator identity under the
+                       fortress's existing custody so federation admin verbs
+                       work from a stock init; use this for a custody-only
+                       fortress and add an identity later with
+                       \`sanctuary identity create\`. Also settable via
+                       SANCTUARY_INIT_NO_IDENTITY=1.
   --help, -h           Show this help.
 
 What init does:
@@ -437,14 +738,20 @@ What init does:
   3. Enrolls a second custody factor on interactive installs: an OS-keyring
      custody key when available, else a passphrase from SANCTUARY_PASSPHRASE.
   4. Prints the full recovery key in a bordered banner AND writes it to
-     <fortress>/recovery-key.txt mode 0600 with explicit move-off-host
-     instructions, then (interactive) requires you to re-enter it — the
-     re-entered key must actually unwrap the master. Single-issuance:
-     existing recovery-key.txt is never overwritten.
+     <fortress>/recovery-key.txt mode 0600, or to --recovery-out when set,
+     with explicit move-off-host instructions, then (interactive) requires
+     you to re-enter it — the re-entered key must actually unwrap the
+     master. Single-issuance: existing recovery-key files are never
+     overwritten.
   5. With --no-confirm: records an explicit, audited headless install
      (custody_headless_install in the audit log) instead of the
      re-entry verification.
-  6. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
+  6. Seeds the default operator identity (a single Ed25519 key encrypted
+     under the fortress's existing custody) unless --no-identity (or
+     SANCTUARY_INIT_NO_IDENTITY) is set. This is the identity every Tier-1
+     operator-signed surface (federation admin verbs, did:web, exit) signs
+     with. Idempotent: an existing default identity is left unchanged.
+  7. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
      anchor) unless --no-pin (or SANCTUARY_INIT_NO_PIN) is set, in which
      case it records an audited castle_pin_provision_skipped entry and
      prints a reminder to provision the pin explicitly when ready.

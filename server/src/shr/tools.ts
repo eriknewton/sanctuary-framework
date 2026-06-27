@@ -92,9 +92,9 @@ export function createSHRTools(
     {
       name: "shr_generate",
       description:
-        "Generate a signed Sovereignty Health Report (SHR) — a machine-readable, " +
-        "cryptographically signed advertisement of this instance's sovereignty posture. " +
-        "Present this to counterparties to prove your sovereignty capabilities.",
+        "Generate a signed Sovereignty Health Report (SHR), a machine-readable posture claim. " +
+        "Present it as a signed, fresh advertisement whose signature/identity-binding/expiry/schema " +
+        "can be verified; it does not independently prove every advertised runtime capability.",
       inputSchema: {
         type: "object",
         properties: {

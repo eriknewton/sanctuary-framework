@@ -18,11 +18,48 @@ import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { exportExitBundle, importExitBundle, exitBundleManifestShape } from "./bundle.js";
-import type { ExitBundleDidWebBinding } from "../contracts/v1.1/exit-bundle-manifest.js";
+import type {
+  ExitBundleDidWebBinding,
+  ExitBundleVerifierResult,
+} from "../contracts/v1.1/exit-bundle-manifest.js";
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
+
+/**
+ * Failure classes that mean the SIGNED MANIFEST itself did not verify (bad
+ * signature, unknown/invalid scheme or version, or a manifest-internal
+ * integrity break: aggregate-hash mismatch, unsafe/duplicate artifact path).
+ * Every OTHER failure class is a downstream artifact problem (a hash mismatch,
+ * a bad reputation bundle, an unverifiable attestation): the manifest's own
+ * signature is cryptographically valid even though the overall verdict fails.
+ * The `verify` CLI's `manifest:` line must reflect the manifest-specific
+ * status, not the overall verdict, so a valid manifest with a failing
+ * downstream artifact is not mislabeled `manifest: failed`.
+ */
+const MANIFEST_INTEGRITY_FAILURE_CLASSES: ReadonlySet<
+  NonNullable<ExitBundleVerifierResult["failure_class"]>
+> = new Set([
+  "manifest_signature_invalid",
+  "manifest_unknown_version",
+  "manifest_signature_scheme_invalid",
+  "aggregate_hash_mismatch",
+  "artifact_path_unsafe",
+  "artifact_path_duplicate",
+]);
+
+/**
+ * True when the signed manifest itself verified, regardless of any downstream
+ * artifact failure. A passing overall verdict trivially implies a verified
+ * manifest; a failing verdict implies a verified manifest UNLESS the failure
+ * class is itself a manifest-integrity break.
+ */
+function manifestSignatureVerified(result: ExitBundleVerifierResult): boolean {
+  if (result.passed) return true;
+  if (result.failure_class === undefined) return true;
+  return !MANIFEST_INTEGRITY_FAILURE_CLASSES.has(result.failure_class);
+}
 
 export interface ExitCommandArgs {
   argv: string[];
@@ -163,7 +200,7 @@ Usage: sanctuary exit <command> [options]
 
 Commands:
   export --out <dir>          Create a SANCTUARY_EXIT_BUNDLE_V1 directory
-  verify <dir>                Verify manifest, audit receipts, and reputation bundle
+  verify <dir>                Verify manifest, artifacts, signatures, and exported-set completeness
   import <dir> [--activate]   Verify, report conflicts, and optionally activate
   manifest-shape              Print the v1.1 manifest shape
 
@@ -313,13 +350,20 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         );
       } else {
         write(out, `verdict: ${result.passed ? "PASS" : "FAIL"}\n`);
-        write(out, `manifest: ${result.passed ? "verified" : "failed"}\n`);
+        write(
+          out,
+          `manifest: ${manifestSignatureVerified(result) ? "verified" : "failed"}\n`
+        );
         write(out, `identity: ${result.manifest_summary.identity_id}\n`);
         write(out, `artifacts: ${result.manifest_summary.artifact_count}\n`);
         if (result.reputation) {
           write(
             out,
             `reputation: ${result.reputation.verified_attestations}/${result.reputation.attestation_count} attestations verified\n`
+          );
+          write(
+            out,
+            `reputation completeness: ${result.reputation.completeness}\n`
           );
         }
         for (const warning of result.warnings) write(out, `warning: ${warning}\n`);

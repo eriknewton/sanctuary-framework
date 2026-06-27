@@ -201,6 +201,152 @@ export class CustodyCredentialMissingError extends CustodyUnlockError {
 }
 
 /**
+ * Non-secret factor inventory for the actionable unlock-failure diagnostic
+ * (element 2). Built from the custody envelope's policy metadata (wrap types,
+ * verified flags, install mode) — NEVER any key material or KDF parameters
+ * (CLAUDE.md #6) — plus the live OS-keyring reachability the boot path probed.
+ */
+export interface UnlockDiagnosticInput {
+  /** Distinct enrolled custody factor types (passphrase / recovery-key / keychain). */
+  enrolledFactors: CustodyWrapType[];
+  /** Whether a passphrase wrap exists. */
+  hasPassphraseFactor: boolean;
+  /** Whether a keychain (OS-keyring) custody wrap exists. */
+  hasKeychainFactor: boolean;
+  /**
+   * Live reachability of the OS keyring, when the boot path probed it:
+   *  - "unreachable": the keyring is locked / no GUI / error 36 (element 3),
+   *  - "not-found": reachable but the item is absent,
+   *  - "found": the item is present (so a missing factor is NOT the keyring),
+   *  - undefined: not probed.
+   */
+  keychainReachability?: "found" | "not-found" | "unreachable";
+  /** Operator-facing storage path (hint only; never crypto). */
+  storagePathHint?: string;
+  /** The per-tenant passphrase keyring service name, for the GUI-unlock hint. */
+  keychainServiceHint?: string;
+}
+
+/**
+ * Build the actionable unlock-failure message (element 2). States which
+ * factors are enrolled, whether the OS keyring is locked vs the item absent,
+ * the GUI unlock step, and the literal `SANCTUARY_RECOVERY_KEY=...` recovery
+ * command. Deliberately does NOT print where any key is stored on disk — on
+ * the durable-fix boot paths there is no on-disk recovery copy, and pointing
+ * at one would be the at-rest co-located secret this fix removes.
+ */
+export function buildActionableUnlockMessage(
+  input: UnlockDiagnosticInput
+): string {
+  const lines: string[] = [];
+  lines.push(
+    "Sanctuary: cannot unlock this fortress" +
+      (input.storagePathHint ? ` at ${input.storagePathHint}` : "") +
+      " with the available factors."
+  );
+  lines.push("");
+
+  // What is enrolled (non-secret metadata only).
+  if (input.enrolledFactors.length > 0) {
+    const human = input.enrolledFactors
+      .map((f) =>
+        f === "passphrase"
+          ? "passphrase"
+          : f === "recovery-key"
+            ? "recovery key"
+            : "OS keyring (Keychain / Secret Service)"
+      )
+      .join(", ");
+    lines.push(`Enrolled recovery factors on this fortress: ${human}.`);
+  } else {
+    lines.push(
+      "No custody envelope factor metadata is readable; this may be a legacy fortress."
+    );
+  }
+
+  // Keychain-locked guidance (the headless / SSH lockout, element 3).
+  if (input.hasKeychainFactor) {
+    if (input.keychainReachability === "unreachable") {
+      lines.push("");
+      lines.push(
+        "The OS keyring factor is enrolled but the keyring is LOCKED or unreachable\n" +
+          "in this session (typical over SSH / headless: macOS error 36, or no D-Bus\n" +
+          "session bus on Linux). Either:\n" +
+          "  - run from a desktop session and unlock the keyring via its GUI\n" +
+          "    (Keychain Access on macOS, Seahorse / KWallet on Linux), or\n" +
+          "  - provide an explicit factor below instead."
+      );
+    } else if (input.keychainReachability === "not-found") {
+      lines.push("");
+      lines.push(
+        "The OS keyring factor is enrolled but its item is MISSING from the keyring\n" +
+          "(it may have been deleted). Use an explicit factor below to recover."
+      );
+    }
+  }
+
+  // The explicit, always-available recovery commands.
+  lines.push("");
+  lines.push("Provide ONE of these explicitly to start:");
+  if (input.hasPassphraseFactor) {
+    lines.push("  SANCTUARY_PASSPHRASE=<your fortress passphrase>");
+  }
+  lines.push(
+    "  SANCTUARY_RECOVERY_KEY=<the recovery key you saved in your password manager>"
+  );
+  lines.push("");
+  lines.push(
+    "Example:\n" +
+      "  SANCTUARY_RECOVERY_KEY=... sanctuary dashboard" +
+      (input.storagePathHint ? ` --fortress ${input.storagePathHint}` : "")
+  );
+  if (input.keychainServiceHint) {
+    lines.push("");
+    lines.push(
+      `This tenant's passphrase keyring service: ${input.keychainServiceHint}\n` +
+        "(see server/docs/keychain-schema.md for the keychain layout)."
+    );
+  }
+  lines.push("");
+  lines.push(
+    "Refusing to start without a valid credential (starting with a wrong master\n" +
+      "would split state, not recover it)."
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Read the non-secret factor inventory from a fortress's custody envelope for
+ * the unlock diagnostic. Returns empty when there is no readable envelope
+ * (legacy / first run). Never touches key material or KDF params.
+ */
+export async function readEnrolledFactors(storage: StorageBackend): Promise<{
+  enrolledFactors: CustodyWrapType[];
+  hasPassphraseFactor: boolean;
+  hasKeychainFactor: boolean;
+}> {
+  let envelope: CustodyEnvelope | null = null;
+  try {
+    envelope = await readCustodyEnvelope(storage);
+  } catch {
+    // Unreadable envelope: report nothing rather than throw from a diagnostic.
+  }
+  if (!envelope) {
+    return {
+      enrolledFactors: [],
+      hasPassphraseFactor: false,
+      hasKeychainFactor: false,
+    };
+  }
+  const distinct = Array.from(new Set(envelope.wraps.map((w) => w.type)));
+  return {
+    enrolledFactors: distinct,
+    hasPassphraseFactor: distinct.includes("passphrase"),
+    hasKeychainFactor: distinct.includes("keychain"),
+  };
+}
+
+/**
  * Migration refused because the derived master failed to decrypt existing
  * fortress data. Writing an envelope from an unverified master would lock
  * in a wrong credential and brick boots with the right one — fail closed

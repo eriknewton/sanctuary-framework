@@ -22,7 +22,8 @@
  *     which is NON-ATOMIC (a concurrent reader can see a gap; a concurrent
  *     writer can fill it). The handler reports `mutation_strategy:
  *     "delete_then_insert"` on these ops so the non-atomicity is visible.
- *   - `rename` is read + delete-old + insert-new, also non-atomic.
+ *   - `rename` is read + insert-new + delete-old, also non-atomic. The handler
+ *     reports `mutation_strategy: "insert_then_delete"` for that path.
  * This is the lost-update gap the verdict's per-agent-append + curated-
  * promotion design closes; a single agent's own scope is single-writer, so the
  * non-atomic window is harmless there, but the handler never pretends the op is
@@ -65,12 +66,17 @@ export interface AnthropicMemoryResult {
    * insert/delete-only backend, this names the strategy so the caller (and a
    * reader of the audit) sees the mismatch honestly.
    */
-  readonly mutation_strategy?: "delete_then_insert";
+  readonly mutation_strategy?: "delete_then_insert" | "insert_then_delete";
   readonly error_code?: string;
 }
 
-/** Persistable taint for memory-tool-originated content (agent file edits). */
-const MEMORY_TOOL_TAINT = "agent_derived_clean" as const;
+const MAX_MEMORY_FILE_TEXT_BYTES = 1024 * 1024;
+
+/**
+ * Persistable taint for memory-tool-originated content. The model supplies this
+ * text, so keep the provenance conservative; the classifier still gates writes.
+ */
+const MEMORY_TOOL_TAINT = "user_content" as const;
 
 /**
  * Map a `/memories/<name>` path to an SDW-identifier-safe passage id. The raw
@@ -107,18 +113,21 @@ export async function applyAnthropicMemoryCommand(
   switch (command.command) {
     case "view": {
       const passage = await safeGet(adapter, command.path);
-      if (passage === null) return fail("not_found", `No memory at ${command.path}`);
+      if (passage === null) return fail("not_found", "Memory not found");
       return { ok: true, content: passage.text };
     }
 
     case "create": {
+      if (!fitsMemoryFileCap(command.file_text)) {
+        return fail("too_large", "Memory file is too large");
+      }
       const id = passageIdForPath(command.path);
       // create is write-new; an existing path is a conflict (the adapter throws
       // duplicate_passage). The handler surfaces it rather than silently
       // overwriting (no silent lost update).
       const existing = await safeGet(adapter, command.path);
       if (existing !== null) {
-        return fail("exists", `Memory already exists at ${command.path}; use str_replace`);
+        return fail("exists", "Memory already exists; use str_replace");
       }
       try {
         await adapter.insertPassage(
@@ -128,14 +137,14 @@ export async function applyAnthropicMemoryCommand(
       } catch (error) {
         return fail("write_rejected", describeWriteError(error));
       }
-      return { ok: true, content: `Created memory at ${command.path}` };
+      return { ok: true, content: "Created memory" };
     }
 
     case "str_replace": {
       const passage = await safeGet(adapter, command.path);
-      if (passage === null) return fail("not_found", `No memory at ${command.path}`);
+      if (passage === null) return fail("not_found", "Memory not found");
       if (!passage.text.includes(command.old_str)) {
-        return fail("no_match", `old_str not found in ${command.path}`);
+        return fail("no_match", "old_str not found");
       }
       // Use a function replacer so new_str is inserted LITERALLY. A plain
       // string replacement makes String.prototype.replace interpret $-patterns
@@ -148,11 +157,11 @@ export async function applyAnthropicMemoryCommand(
 
     case "insert": {
       const passage = await safeGet(adapter, command.path);
-      if (passage === null) return fail("not_found", `No memory at ${command.path}`);
+      if (passage === null) return fail("not_found", "Memory not found");
       const lines = passage.text.split("\n");
       const at = command.insert_line;
       if (!Number.isInteger(at) || at < 0 || at > lines.length) {
-        return fail("bad_line", `insert_line ${at} out of range for ${command.path}`);
+        return fail("bad_line", `insert_line ${at} out of range`);
       }
       lines.splice(at, 0, command.insert_text);
       // NON-ATOMIC: mid-file insert requires mutation -> delete then re-insert.
@@ -162,16 +171,16 @@ export async function applyAnthropicMemoryCommand(
     case "delete": {
       const id = passageIdForPath(command.path);
       const deleted = await adapter.deletePassage(id);
-      if (!deleted) return fail("not_found", `No memory at ${command.path}`);
-      return { ok: true, content: `Deleted memory at ${command.path}` };
+      if (!deleted) return fail("not_found", "Memory not found");
+      return { ok: true, content: "Deleted memory" };
     }
 
     case "rename": {
       const passage = await safeGet(adapter, command.old_path);
-      if (passage === null) return fail("not_found", `No memory at ${command.old_path}`);
+      if (passage === null) return fail("not_found", "Memory not found");
       const destExisting = await safeGet(adapter, command.new_path);
       if (destExisting !== null) {
-        return fail("exists", `Memory already exists at ${command.new_path}`);
+        return fail("exists", "Memory already exists");
       }
       const newId = passageIdForPath(command.new_path);
       // NON-ATOMIC: read old -> insert new -> delete old.
@@ -183,11 +192,12 @@ export async function applyAnthropicMemoryCommand(
       } catch (error) {
         return fail("write_rejected", describeWriteError(error));
       }
-      await adapter.deletePassage(passageIdForPath(command.old_path));
+      const oldDeleted = await adapter.deletePassage(passageIdForPath(command.old_path));
+      if (!oldDeleted) return fail("old_delete_failed", "Rename could not remove original memory");
       return {
         ok: true,
-        content: `Renamed ${command.old_path} -> ${command.new_path}`,
-        mutation_strategy: "delete_then_insert",
+        content: "Renamed memory",
+        mutation_strategy: "insert_then_delete",
       };
     }
 
@@ -214,6 +224,9 @@ async function mutateByReplace(
   path: string,
   nextText: string,
 ): Promise<AnthropicMemoryResult> {
+  if (!fitsMemoryFileCap(nextText)) {
+    return fail("too_large", "Memory file is too large");
+  }
   const id = passageIdForPath(path);
   await adapter.deletePassage(id);
   try {
@@ -225,20 +238,17 @@ async function mutateByReplace(
   }
   return {
     ok: true,
-    content: `Updated memory at ${path}`,
+    content: "Updated memory",
     mutation_strategy: "delete_then_insert",
   };
 }
 
-function describeWriteError(error: unknown): string {
+function fitsMemoryFileCap(text: string): boolean {
+  return Buffer.byteLength(text, "utf8") <= MAX_MEMORY_FILE_TEXT_BYTES;
+}
+
+function describeWriteError(_error: unknown): string {
   // The adapter's write-gate rejects secrets (classifier_reject) and duplicate
-  // ids; surface a category, never the rejected content.
-  const category =
-    error !== null &&
-    typeof error === "object" &&
-    "category" in error &&
-    typeof (error as { category: unknown }).category === "string"
-      ? (error as { category: string }).category
-      : "write_failed";
-  return `write rejected (${category})`;
+  // ids; keep those categories out of model-visible content.
+  return "write rejected";
 }

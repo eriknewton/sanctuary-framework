@@ -1,12 +1,12 @@
 /**
- * Sanctuary MCP Server — `sanctuary rotate-master` CLI subcommand
+ * Sanctuary MCP Server - `sanctuary rotate-master` CLI subcommand
  *
  * Interactive-only front end for the master-rotation engine
  * (core/master-rotation.ts). Master rotation is an irreversible Tier-1
  * operation class (CLAUDE.md #3): the human gate here is a typed
  * confirmation ("ROTATE" + the fortress name) AFTER a preflight summary of
  * exactly what will be re-encrypted. There is deliberately NO `--no-confirm`
- * and NO headless path in this round — unattended rotation is part of the
+ * and NO headless path in this round - unattended rotation is part of the
  * headless-daemon custody model (Erik's D3) and stays deferred.
  *
  * Crash recovery: `--resume` drives a journaled rotation forward to
@@ -29,11 +29,17 @@ import {
   RotationResumeError,
   type RotationPlanSummary,
 } from "../core/master-rotation.js";
-import { getOrCreateKeychainCustodyKey } from "../wrap/keychain-custody.js";
+import {
+  getOrCreateKeychainCustodyKey,
+  storeRecoveryKeyInKeychain,
+  RecoveryKeyKeychainStoreError,
+} from "../wrap/keychain-custody.js";
 import { readCustodyEnvelope } from "../core/master-custody.js";
 import {
-  discloseRecoveryKey,
+  preflightRecoveryKeyOutputFile,
+  resolveRecoveryKeyOutputPath,
   verifyRecoveryKeyReentry,
+  writeRecoveryKeyFile,
   type DisclosureIo,
 } from "../wrap/recovery-key-disclosure.js";
 
@@ -50,6 +56,7 @@ export interface RotateMasterCliArgs {
 
 interface ParsedArgs {
   storage?: string;
+  recoveryOut?: string;
   resume: boolean;
   help: boolean;
 }
@@ -62,11 +69,26 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--resume") out.resume = true;
     else if ((a === "--fortress" || a === "--storage") && argv[i + 1]) {
       out.storage = argv[++i];
+    } else if (a === "--recovery-out") {
+      out.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
+      i++;
     } else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
   }
   return out;
+}
+
+function readRequiredPathArg(
+  argv: string[],
+  index: number,
+  flag: string
+): string {
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`${flag} requires a path value`);
+  }
+  return value;
 }
 
 function printUsage(out: NodeJS.WritableStream): void {
@@ -77,7 +99,7 @@ Rotate the fortress master key: a fresh random master is minted, every piece
 of fortress data is re-encrypted under it, custody is re-wrapped (your
 passphrase, a NEW recovery key you must capture and re-enter, and the OS
 keyring where available), and the old master is retired. The audit chain is
-NOT rewritten — it stays verifiable across the rotation; the retiring audit
+NOT rewritten - it stays verifiable across the rotation; the retiring audit
 key is wrapped under the new master instead.
 
 This is an irreversible, interactively confirmed operation. Use it when the
@@ -86,6 +108,10 @@ old master or a credential for it may have been exposed.
 Options:
   --fortress <path>   Override the fortress storage path.
   --storage <path>    Alias for --fortress.
+  --recovery-out <path>
+                      Write the NEW plaintext recovery key to this exact
+                      path instead of <fortress>/recovery-key.txt. The path
+                      must be outside the fortress directory.
   --resume            Resume a rotation interrupted by a crash or power loss.
                       Idempotent; requires the fortress passphrase.
   --help, -h          Show this help.
@@ -102,6 +128,103 @@ markers, and any leaked copy of the old master no longer unlock anything.
 async function fileExists(path: string): Promise<boolean> {
   try {
     await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Capture the NEW recovery key minted by a rotation. Anti-strand (element 4):
+ * a rotation must never strand the operator with a key that exists only inside
+ * the fortress directory, so confirmed OFF-HOST capture is a HARD precondition
+ * of returning true (the rotation engine aborts, mutating nothing, on false).
+ *
+ * Durable-fix posture: the NEW recovery key is NEVER written inside the fortress
+ * directory. It is escrowed to an explicit off-host target (--recovery-out file
+ * and/or the OS-keyring recovery escrow), shown on the controlling terminal for
+ * the operator to store in their password manager, and re-entry verified. If no
+ * off-host escrow target was reachable (no --recovery-out AND the OS keyring is
+ * unavailable), capture FAILS so the rotation aborts before any data is touched.
+ */
+export async function captureRotatedRecoveryKey(opts: {
+  recoveryKey: string;
+  verify: (entered: string) => Promise<boolean>;
+  storagePath: string;
+  fortressId: string;
+  recoveryKeyFilePath?: string;
+  io: DisclosureIo;
+  err: NodeJS.WritableStream;
+  /** Test seam: inject a mock OS-keyring backend for recovery escrow. */
+  recoveryKeychain?: Parameters<typeof storeRecoveryKeyInKeychain>[2];
+}): Promise<boolean> {
+  let recoveryOutPath: string | undefined;
+  let keychainService: string | undefined;
+
+  // 1. Off-host plaintext copy (outside the fortress), when --recovery-out was
+  //    supplied. Single-issuance + O_EXCL + O_NOFOLLOW (the #661 machinery).
+  if (opts.recoveryKeyFilePath) {
+    await writeRecoveryKeyFile({
+      storagePath: opts.storagePath,
+      recoveryKeyFilePath: opts.recoveryKeyFilePath,
+      recoveryKey: opts.recoveryKey,
+      fortressId: opts.fortressId,
+    });
+    recoveryOutPath = opts.recoveryKeyFilePath;
+  }
+
+  // 2. OS-keyring recovery escrow (a recoverable second factor). Best-effort:
+  //    a locked / absent keyring does not by itself satisfy the precondition.
+  try {
+    const { service } = await storeRecoveryKeyInKeychain(
+      opts.storagePath,
+      opts.recoveryKey,
+      opts.recoveryKeychain ?? {}
+    );
+    keychainService = service;
+  } catch (err) {
+    if (!(err instanceof RecoveryKeyKeychainStoreError)) throw err;
+    // keyring not usable here - fall through to the off-host file requirement
+  }
+
+  // 3. HARD anti-strand precondition: there MUST be a durable off-host copy of
+  //    the new key. With neither, refuse capture so the rotation aborts before
+  //    touching data (the OLD recovery key keeps working).
+  if (!recoveryOutPath && !keychainService) {
+    opts.err.write(
+      "\n  Refusing to rotate: the NEW recovery key has no durable off-host\n" +
+        "  escrow target on this run. Sanctuary will NOT write it inside the\n" +
+        "  fortress directory (that copy gets wiped and strands you). Re-run with\n" +
+        "  --recovery-out <path outside the fortress>, or from a session where the\n" +
+        "  OS keyring is unlocked, so the new key is captured before rotation.\n\n"
+    );
+    return false;
+  }
+
+  // 4. Disclose on the controlling terminal (the rotation io channel; never an
+  //    in-fortress file) and re-entry verify. The key is shown for the operator
+  //    to confirm against what they just saved off-host.
+  const escrowNote =
+    (recoveryOutPath
+      ? `\n  Off-host plaintext copy written to:\n    ${recoveryOutPath}\n`
+      : "") +
+    (keychainService
+      ? `  Escrowed in the OS keyring (service ${keychainService}).\n`
+      : "");
+  opts.io.output.write(
+    "\n  ================ NEW RECOVERY KEY (rotation) ================\n" +
+      "  This is shown only on this terminal. Store it in your password\n" +
+      "  manager. It is NOT written inside the fortress directory.\n\n" +
+      `  Recovery key:\n    ${opts.recoveryKey}\n` +
+      escrowNote +
+      "  ============================================================\n"
+  );
+  opts.err.write(
+    "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
+      "  completes. Your previous recovery key stops working at that point.\n\n"
+  );
+  try {
+    await verifyRecoveryKeyReentry({ check: opts.verify, io: opts.io });
     return true;
   } catch {
     return false;
@@ -189,6 +312,20 @@ export async function runRotateMasterCommand(
 
   const storagePath =
     parsed.storage ?? args.storagePath ?? resolveStoragePath(process.env, home);
+  let recoveryKeyFilePath: string | undefined;
+  try {
+    recoveryKeyFilePath = resolveRecoveryKeyOutputPath({
+      recoveryOut: parsed.recoveryOut,
+      storagePath,
+      env: process.env,
+    });
+    if (recoveryKeyFilePath) {
+      await preflightRecoveryKeyOutputFile(recoveryKeyFilePath);
+    }
+  } catch (e) {
+    err.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    return 1;
+  }
   const statePath = join(storagePath, "state");
   const fortressId = fortressIdFromStoragePath(storagePath);
   const fortressName = basename(storagePath) || "sanctuary";
@@ -254,7 +391,7 @@ export async function runRotateMasterCommand(
     }
 
     // Keychain custody key (re-creates the keychain wrap where the OS
-    // keyring is available; null elsewhere — surfaced in the plan summary).
+    // keyring is available; null elsewhere - surfaced in the plan summary).
     let keychainKey: Uint8Array | null = null;
     const envelope = await readCustodyEnvelope(storage);
     if (envelope?.wraps.some((w) => w.type === "keychain")) {
@@ -290,23 +427,18 @@ export async function runRotateMasterCommand(
         return true;
       },
       captureRecoveryKey: async (recoveryKey, verify) => {
-        await discloseRecoveryKey({
+        const captureOptions: Parameters<typeof captureRotatedRecoveryKey>[0] = {
           recoveryKey,
+          verify,
           storagePath,
           fortressId,
-          mode: "no-confirm", // re-entry verification below replaces the Y/N
           io,
-        });
-        err.write(
-          "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
-            "  completes. Your previous recovery key stops working at that point.\n\n"
-        );
-        try {
-          await verifyRecoveryKeyReentry({ check: verify, io });
-          return true;
-        } catch {
-          return false;
+          err,
+        };
+        if (recoveryKeyFilePath) {
+          captureOptions.recoveryKeyFilePath = recoveryKeyFilePath;
         }
+        return captureRotatedRecoveryKey(captureOptions);
       },
     });
 

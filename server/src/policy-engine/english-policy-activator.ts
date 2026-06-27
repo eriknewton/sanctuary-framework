@@ -58,6 +58,7 @@ import type {
   PrincipalPolicy,
   Tier2Config,
 } from "../principal-policy/types.js";
+import { enforceForcedTiers } from "../principal-policy/loader.js";
 import type {
   CompiledPolicy,
   CompiledPolicyRule,
@@ -599,8 +600,34 @@ export class EnglishPolicyActivator {
  * Apply a compiled rule to a PrincipalPolicy. Pure function; returns
  * a new policy object. Throws on rules that name a field outside the
  * Tier2Config schema.
+ *
+ * The structural rule is applied first (applyRuleStructural), then the
+ * forced-Tier invariants are re-asserted via enforceForcedTiers, the SAME
+ * normalizer the policy loader runs at load time. This closes a defense-in-
+ * depth fail-open: a tier1_remove_operation could otherwise drop a forced
+ * Tier-1 op (e.g. identity_sign) out of Tier 1, and a tier3_add_operation
+ * could otherwise smuggle one (e.g. operator_cloud_provision) into Tier 3,
+ * a silent enforcement downgrade. Because activate AND revoke both route through
+ * applyRule, both uphold the invariant the loader guarantees (Hard
+ * Constraint #5: never silently degrade; #7: policy integrity).
+ *
+ * Non-forced operations are unaffected: enforceForcedTiers only touches the
+ * forced-Tier sets, so a legitimate mutation of any other operation applies
+ * exactly as the structural rule produced it.
  */
 export function applyRule(
+  policy: PrincipalPolicy,
+  rule: CompiledPolicyRule,
+): PrincipalPolicy {
+  return enforceForcedTiers(applyRuleStructural(policy, rule));
+}
+
+/**
+ * The raw structural rule application. Maps (PrincipalPolicy,
+ * CompiledPolicyRule) -> PrincipalPolicy without re-asserting the
+ * forced-Tier invariants; applyRule wraps this with enforceForcedTiers.
+ */
+function applyRuleStructural(
   policy: PrincipalPolicy,
   rule: CompiledPolicyRule,
 ): PrincipalPolicy {

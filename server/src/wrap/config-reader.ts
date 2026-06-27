@@ -2,7 +2,7 @@
  * Sanctuary Wrap — Agent Config Reader
  *
  * Detects and reads MCP server configurations from various agent platforms.
- * Supports: OpenClaw, Claude Code, Cursor, Cline, and generic MCP config files.
+ * Supports: OpenClaw, Claude Code, Cursor, Cline, Mastra, and generic MCP config files.
  *
  * Security invariant: Never modifies configs without explicit request.
  * All original configs are backed up before any modification.
@@ -24,6 +24,7 @@ export type AgentPlatform =
   | "claude-code"
   | "cursor"
   | "hermes"
+  | "mastra"
   | "cline"
   | "generic";
 
@@ -144,6 +145,11 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
             "settings",
             "cline_mcp_settings.json"
           ),
+    ],
+    "mastra": [
+      join(home, ".mastra", "mcp.json"),
+      join(home, "mastra", "mcp.json"),
+      join(home, ".config", "mastra", "mcp.json"),
     ],
     "generic": [],
   };
@@ -1014,6 +1020,17 @@ function extractServers(config: unknown, platform: AgentPlatform): MCPServerEntr
   // fields that `parseServerEntry` already understands.
   if (platform === "hermes") {
     const mcpServers = obj.mcp_servers as Record<string, unknown> | undefined;
+    if (mcpServers && typeof mcpServers === "object") {
+      for (const [name, serverConfig] of Object.entries(mcpServers)) {
+        if (isCanonicalSanctuaryName(name)) continue;
+        const entry = parseServerEntry(name, serverConfig);
+        if (entry) servers.push(entry);
+      }
+    }
+  }
+
+  if (platform === "mastra") {
+    const mcpServers = obj.mcpServers as Record<string, unknown> | undefined;
     if (mcpServers && typeof mcpServers === "object") {
       for (const [name, serverConfig] of Object.entries(mcpServers)) {
         if (isCanonicalSanctuaryName(name)) continue;

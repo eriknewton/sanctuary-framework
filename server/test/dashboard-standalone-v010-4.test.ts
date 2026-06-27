@@ -226,11 +226,15 @@ describe("v0.10.4: standalone dashboard discovers wrapped sub-tenants", () => {
       threw = err as Error;
     }
     expect(threw).not.toBeNull();
-    // v0.10.4 actionable error: names the storage path and points at the
-    // schema doc; never recommends the misleading single-passphrase fix.
-    expect(threw!.message).toMatch(/Existing encrypted data found at /);
+    // Actionable error (element 2): names the storage path, points at the
+    // schema doc, and hands over the literal SANCTUARY_RECOVERY_KEY recovery
+    // command; never recommends the misleading single-passphrase fix and never
+    // prints an on-disk key location.
+    expect(threw!.message).toMatch(/cannot unlock this fortress/);
     expect(threw!.message).toContain(root);
     expect(threw!.message).toMatch(/keychain-schema\.md/);
+    expect(threw!.message).toContain("SANCTUARY_RECOVERY_KEY=");
+    expect(threw!.message).not.toContain("recovery-key.txt");
   });
 
   it("--tenant <name> resolves a wrapped tenant by name and boots against its storage path", async () => {

@@ -13,6 +13,7 @@
  * for a spec amendment before changing the schema.
  */
 
+import type { SignatureBundle } from "../core/crypto-suite-registry.js";
 import type { NodeMode, SignatureScheme, V01EventType } from "./constants.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -75,6 +76,12 @@ export interface PrincipalCertificate {
  * Spec: §2.2, §10.2, §10.4.
  */
 export interface NodeIdentityCertificate {
+  /**
+   * Explicit signed node-certificate shape marker. Present on expiring v1 node
+   * certs so mismatched peers fail on a versioned cert shape instead of an
+   * ambiguous signature mismatch. Legacy non-expiring certs omit it.
+   */
+  certificate_version?: string;
   /** 128-bit UUID for this node, stable for node lifetime. */
   node_id: string;
   /** Base64url-encoded Ed25519 public key (32 bytes). */
@@ -85,6 +92,11 @@ export interface NodeIdentityCertificate {
   fortress_id: string;
   /** ISO8601 timestamp of join. */
   joined_at: string;
+  /**
+   * ISO8601 timestamp of optional node-cert expiry. Legacy certificates that
+   * omit this field remain non-expiring for migration compatibility.
+   */
+  expires_at?: string;
   /**
    * Capability bitmap. Bit 0 is the v0.1 default (standard_fortress_node).
    * Bits 1-2 are v0.1 opt-in. Bits 3-31 are RESERVED for v1.x.
@@ -116,6 +128,153 @@ export interface NodeIdentityCertificate {
   delegated_grants?: unknown[];
   /** RESERVED — TCB attestation lineage history (v1.x deeper attestation). Empty at v0.1. */
   attestation_lineage_chain?: unknown[];
+}
+
+/**
+ * Federation root-rotation certificate (rotate-root --renew, Slice 3a).
+ *
+ * The verifiable OLD -> NEW link emitted by the renewal path: the PREVIOUS
+ * fortress-master private key (K1) signs an attestation that K2 (the new master
+ * public key) is the successor under the SAME, stable fortress_id. A joiner that
+ * still pins K1 adopts K2 by verifying this cert against the key it currently
+ * pins (Slice 3b); the strictly-monotonic `rotation_serial` defeats a rollback
+ * or replay of an older rotation cert.
+ *
+ * FROZEN WIRE SURFACE. The signature is Ed25519 over
+ * canonicalize({kind, fortress_id, old_master_pubkey, new_master,
+ * rotation_serial, rotated_at}) by K1's private key (NOT the signature field).
+ * The cert is PUBLIC: it leaks nothing (an old-key signature over a public key).
+ */
+export interface FederationRootRotationCertificate {
+  /** Domain-separation tag; always this literal for Slice 3a renewal. */
+  kind: "federation-root-rotation";
+  /** The stable fortress identity that survives the rotation. */
+  fortress_id: string;
+  /** Base64url Ed25519 public key of the PREVIOUS master (K1) that SIGNS this. */
+  old_master_pubkey: string;
+  /** The NEW pinned master (K2) this cert attests, under the same fortress_id. */
+  new_master: FortressMasterPublicKey;
+  /** Strictly-monotonic rotation serial of this rotation (replay/rollback proof). */
+  rotation_serial: number;
+  /** ISO8601 timestamp of the rotation. */
+  rotated_at: string;
+  /** Base64url Ed25519 signature over the canonical body by the OLD master (K1). */
+  old_master_signature: string;
+  /**
+   * PQC Slice 3 (hybrid rotate-root --renew): the post-quantum half of the
+   * old->new link for a HYBRID fortress. Present ONLY when the rotated fortress
+   * is hybrid; absent (undefined) on a classical rotation so a classical
+   * rotation cert stays byte-for-byte unchanged.
+   *
+   * When present, this binds the OLD hybrid master (both Ed25519 + ML-DSA-65
+   * components) to the NEW hybrid master (both components) AND to the full
+   * classical certificate body above (`old_master_pubkey`, `new_master`,
+   * `fortress_id`, `rotation_serial`, `rotated_at`). It carries a HYBRID
+   * signature bundle (both-must-pass) produced by the OLD hybrid master's two
+   * private keys. A hybrid joiner MUST verify this bundle (both components) to
+   * adopt the new hybrid master; verifying only the classical `old_master_signature`
+   * (Ed25519) above is a silent post-quantum DOWNGRADE of the rotation link and
+   * is rejected fail-closed. The classical Ed25519 link above remains valid for a
+   * current-version (classical) joiner adopting the Ed25519 chain.
+   */
+  hybrid_rotation?: FederationRootRotationHybridBinding;
+}
+
+/**
+ * PQC Slice 3 hybrid binding for a root-rotation certificate (rotate-root
+ * --renew on a HYBRID fortress). The OLD hybrid master attests the NEW hybrid
+ * master with a both-must-pass hybrid signature bundle. PUBLIC (an old-key
+ * signature over public keys); leaks nothing.
+ */
+export interface FederationRootRotationHybridBinding {
+  /** The PREVIOUS hybrid master (K1) public keys that SIGN this binding. */
+  old_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  /** The NEW hybrid master (K2) public keys this binding attests. */
+  new_hybrid_master: FortressMasterPublicKeysV2Hybrid;
+  /**
+   * Hybrid signature bundle (Ed25519 + ML-DSA-65, in that fixed order) over the
+   * canonical hybrid-rotation body by the OLD hybrid master's two private keys.
+   * Both components must verify (`bundleMatchesSuitePolicy` + both-must-pass).
+   */
+  old_hybrid_master_signature_bundle: SignatureBundle;
+}
+
+/**
+ * Hybrid public-key pair carried by v2 certificates. Both key refs are signed
+ * into the certificate body and must match the verifying signature bundle.
+ */
+export interface HybridCertificatePublicKeys {
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly ed25519: {
+    readonly key_ref: string;
+    /** Base64url-encoded Ed25519 public key (32 bytes). */
+    readonly public_key: string;
+  };
+  readonly ml_dsa_65: {
+    readonly key_ref: string;
+    /** Base64url-encoded ML-DSA-65 public key (1952 bytes). */
+    readonly public_key: string;
+  };
+}
+
+/**
+ * v2 fortress-master public key descriptor for the hybrid trust-root chain.
+ *
+ * Secret material remains local-only; the ML-DSA-65 private key is generated
+ * and returned only by the bootstrap helper so the caller can immediately store
+ * it in encrypted state and zero the plaintext.
+ */
+export interface FortressMasterPublicKeysV2Hybrid {
+  readonly key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly fortress_id: string;
+  readonly created_at: string;
+  readonly public_keys: HybridCertificatePublicKeys;
+}
+
+/** Principal certificate signed by the v2 hybrid fortress-master key. */
+export interface PrincipalCertificateV2Hybrid {
+  readonly certificate_version: "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly principal_id: string;
+  readonly principal_public_keys: HybridCertificatePublicKeys;
+  readonly role: "root" | "partner" | "associate";
+  readonly fortress_id: string;
+  readonly issued_at: string;
+  readonly expires_at?: string;
+  readonly master_signature_bundle: SignatureBundle;
+}
+
+/** Per-node certificate signed by both principal and fortress-master v2 keys. */
+export interface NodeIdentityCertificateV2Hybrid {
+  readonly certificate_version: "sanctuary.node-cert.v2.hybrid-ed25519-ml-dsa-65";
+  readonly signature_suite: "ed25519+ml-dsa-v1";
+  readonly node_id: string;
+  readonly node_public_keys: HybridCertificatePublicKeys;
+  readonly node_mode: NodeMode;
+  readonly fortress_id: string;
+  readonly joined_at: string;
+  readonly expires_at?: string;
+  readonly capabilities: number;
+  readonly parent_chain: {
+    readonly fortress_master_key_version: "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65";
+    readonly fortress_master_key_refs: {
+      readonly ed25519: string;
+      readonly ml_dsa_65: string;
+    };
+    readonly principal_certificate_version: "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65";
+    readonly principal_id: string;
+    readonly principal_key_refs: {
+      readonly ed25519: string;
+      readonly ml_dsa_65: string;
+    };
+  };
+  readonly tee_attestation_hash?: string;
+  readonly principal_signature_bundle: SignatureBundle;
+  /** Required in v2 hybrid chains; absence is a downgrade failure. */
+  readonly master_signature_bundle: SignatureBundle;
+  readonly delegated_grants?: unknown[];
+  readonly attestation_lineage_chain?: unknown[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════

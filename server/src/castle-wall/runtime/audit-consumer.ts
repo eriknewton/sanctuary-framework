@@ -39,7 +39,7 @@ import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-br
 import { ingestCastleWallBlockedEgress } from "../../principal-policy/unified-inbox-producers.js";
 
 /**
- * The set of event types that constitute *enforcement evidence* — the ones a
+ * The set of event types that constitute *enforcement evidence* - the ones a
  * forged entry could use to fake a "the wall is doing its job" green light.
  * When a pinned producer key is configured, these REQUIRE a valid producer
  * signature; non-enforcement control events (handshake outcomes, ack/dup
@@ -203,11 +203,27 @@ export class AuditConsumer {
   private lastAckedSeq: number | null = null;
   private lastEventCanonicalHash: string | null = null;
   /**
+   * FIX 2 (codex CRITICAL - defense in depth against acking past an unpersisted
+   * event). Set to the seq of an event that VALIDATED + chained cleanly but then
+   * FAILED to persist durably (a transient disk/transport fault), so no ack was
+   * sent and the chain anchor did not advance. While this is non-null the
+   * consumer owes that seq: it must NOT bootstrap-accept any LATER event, because
+   * doing so would advance + ack past the un-anchored event and let the daemon
+   * truncate its WAL through the gap (silent audit data loss). Cleared the moment
+   * any event persists successfully (including a retry of the same seq).
+   *
+   * This is distinct from a REFUSED forgery: a forgery is correctly never
+   * persisted, but the consumer never OWED that seq (the daemon's own WAL chain
+   * is intact), so a following genuine event legitimately continues - we do not
+   * set this on a signature/chain rejection, only on a persistence failure.
+   */
+  private pendingUnpersistedSeq: number | null = null;
+  /**
    * The TOFU-pinned producer public key (base64url-no-pad, 32 raw bytes). When
    * set, enforcement-evidence events MUST carry a producer signature that
    * verifies against this key (fail closed). When null, the consumer accepts on
    * the legacy channel-authenticity basis and stamps the entry as
-   * `channel_authenticated_unsigned` — honest about NOT being per-producer
+   * `channel_authenticated_unsigned` - honest about NOT being per-producer
    * authenticated.
    */
   private readonly pinnedProducerKeyB64url: string | null;
@@ -370,6 +386,11 @@ export class AuditConsumer {
       }
       await this.sink.flush();
     } catch (err) {
+      // FIX 2: remember the seq we owe so a LATER event cannot bootstrap-ack
+      // past it (no WAL truncation through an unpersisted event). The cursor /
+      // chain anchor are deliberately NOT advanced and no ack is sent.
+      const failedSeq = Number(envelope.event.details.seq);
+      if (Number.isSafeInteger(failedSeq)) this.pendingUnpersistedSeq = failedSeq;
       await this.emitPersistenceFailure(err, envelope.event);
       throw err;
     }
@@ -378,6 +399,8 @@ export class AuditConsumer {
     // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
     this.lastEventCanonicalHash = computeCanonicalHash(envelope.event);
+    // The owed seq (if any) is now durable - clear the FIX 2 guard.
+    this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
     await this.tryAck(envelope, envelope.event.event_type);
   }
@@ -489,6 +512,28 @@ export class AuditConsumer {
     if (this.lastEventCanonicalHash !== null && priorHash !== this.lastEventCanonicalHash) {
       return { kind: "error", reason: "wal_chain_verification_failed" };
     }
+    // FIX 2 (codex CRITICAL - never bootstrap-accept past an UNPERSISTED event).
+    //
+    // We are in the BOOTSTRAP state here (`lastEventCanonicalHash === null`): no
+    // verified on-disk chain anchor exists, so `priorHash` cannot be checked. A
+    // genuine first event (genesis, or a from-null re-pull) is legitimately
+    // accepted here. The dangerous case: a PRIOR event validated + chained but
+    // then FAILED to persist (`pendingUnpersistedSeq` is set, anchor still null),
+    // and now a LATER event (seq > the owed seq) arrives. Accepting it would
+    // advance + ack past the un-anchored event, letting the daemon truncate its
+    // WAL through the gap (silent audit data loss). So while a seq is owed, only a
+    // RETRY of that same seq may proceed; any higher seq is refused. (A retry of
+    // the SAME seq with different content is already caught as `seq_regression`
+    // once that seq persists; here we only block skipping AHEAD.)
+    if (
+      this.pendingUnpersistedSeq !== null &&
+      seq > this.pendingUnpersistedSeq
+    ) {
+      return {
+        kind: "error",
+        reason: "wal_chain_bootstrap_after_unpersisted_event",
+      };
+    }
     return { kind: "ok" };
   }
 
@@ -496,12 +541,12 @@ export class AuditConsumer {
    * Decide whether an event's producer signature is acceptable, and with what
    * evidence basis. Returns one of:
    *
-   *   - `verified` — a producer signature verified against the pinned key
+   *   - `verified` - a producer signature verified against the pinned key
    *     (per-producer authenticated; the forgery hole is closed for this entry).
-   *   - `unsigned` — accepted on the legacy channel-authenticity basis, either
+   *   - `unsigned` - accepted on the legacy channel-authenticity basis, either
    *     because no pinned producer key is configured OR because the event is
    *     not enforcement evidence (control/diagnostic events are not gated).
-   *   - `rejected` — enforcement evidence that, with a pinned producer key
+   *   - `rejected` - enforcement evidence that, with a pinned producer key
    *     configured, lacked a valid signature. The caller fails closed.
    */
   private evaluateProducerSignature(
@@ -518,14 +563,14 @@ export class AuditConsumer {
       return { kind: "rejected", reason: "producer_signature_absent" };
     }
     // Parse the signed WAL body. The signature (verified below) is over THIS
-    // body; once verified, the body — not the attacker-controllable
-    // `envelope.event` — is the authoritative source for the persisted
+    // body; once verified, the body - not the attacker-controllable
+    // `envelope.event` - is the authoritative source for the persisted
     // evidence. We bind only the one cross-shape invariant the persist path
     // needs: the signed `operation` must map to the `event_type` slot the entry
     // is filed under (so a verified "allow" body can't be filed as a "block").
     // Every OTHER evidence field (agent, destination, decision provenance, rule
     // id) is taken FROM the signed body in `buildDetailsForEvent`, which
-    // structurally eliminates the staple/strip/fabricate attack class — there is
+    // structurally eliminates the staple/strip/fabricate attack class - there is
     // nothing to mismatch because we do not trust the event's fields for signed
     // evidence. (codex L1 findings R2–R5.)
     const parsed = parseSignedBody(envelope.producer.eventCanonicalJson);
@@ -576,7 +621,7 @@ export class AuditConsumer {
       signedBody: parsed.body,
       // The exact signed inputs, persisted so a read-side consumer can
       // reconstruct the signed message and RE-verify (Slice R). Stored
-      // verbatim — never re-canonicalized — so the reader hashes identical
+      // verbatim - never re-canonicalized - so the reader hashes identical
       // bytes to the daemon and this consumer.
       eventCanonicalJson: envelope.producer.eventCanonicalJson,
       capturedAtUnixMs: envelope.producer.capturedAtUnixMs,
@@ -733,7 +778,7 @@ function buildDetailsForEvent(
     // R-1: persist the EXACT signed inputs so a read-side consumer can
     // reconstruct the signed message and re-verify the signature against the
     // pinned key (the seq is already preserved as `out.seq` above). Stored
-    // verbatim — the reader must hash identical bytes to what the daemon
+    // verbatim - the reader must hash identical bytes to what the daemon
     // signed, so re-canonicalizing here would break verification.
     out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY] =
       signature.eventCanonicalJson;

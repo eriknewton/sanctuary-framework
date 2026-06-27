@@ -36,8 +36,14 @@ import {
   AutoApproveChannel,
   CallbackApprovalChannel,
 } from "../../src/principal-policy/approval-channel.js";
-import type { PrincipalPolicy } from "../../src/principal-policy/types.js";
-import { AuditLog } from "../../src/operational/audit-log.js";
+import {
+  AggregatorBackedChannel,
+} from "../../src/principal-policy/channels/aggregator-backed-channel.js";
+import type {
+  ApprovalRequest,
+  PrincipalPolicy,
+} from "../../src/principal-policy/types.js";
+import { AuditLog, type AuditEntryInput } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
@@ -119,6 +125,56 @@ interface AggregatorRig {
   masterKey: Uint8Array;
   auditLog: AuditLog;
   aggregator: ApprovalAggregator;
+}
+
+class FailingAggregatorWriteStorage extends MemoryStorage {
+  failAggregatorWrites = false;
+
+  override async write(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<void> {
+    if (this.failAggregatorWrites && namespace === APPROVAL_AGGREGATOR_NAMESPACE) {
+      throw new Error("aggregator persist down");
+    }
+    await super.write(namespace, key, data);
+  }
+}
+
+function failResolvedAudits(auditLog: AuditLog): void {
+  const originalAppendCritical = auditLog.appendCritical.bind(auditLog);
+  auditLog.appendCritical = async (entry: AuditEntryInput): Promise<void> => {
+    if (entry.operation === APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED) {
+      throw new Error("audit down");
+    }
+    await originalAppendCritical(entry);
+  };
+}
+
+async function expectChannelDoesNotObserveDecision(
+  aggregator: ApprovalAggregator,
+  event: ApprovalGateEvent,
+): Promise<void> {
+  const channel = new AggregatorBackedChannel({
+    underlying: new AutoApproveChannel(),
+    aggregator,
+    resolveRedirect: () => ({ enabled: true, mode: "replace" }),
+    replaceModeTimeoutMs: 20,
+  });
+  const request: ApprovalRequest = {
+    operation: event.operation,
+    tier: event.tier,
+    reason: event.reason,
+    context: event.context,
+    timestamp: event.request_timestamp,
+    ...(event.args_binding !== undefined
+      ? { args_binding: event.args_binding }
+      : {}),
+  };
+  const response = await channel.requestApproval(request);
+  expect(response.decision).toBe("deny");
+  expect(response.decided_by).toBe("timeout");
 }
 
 function makeAggregator(opts?: {
@@ -251,6 +307,122 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator", () => {
     expect(resolvedEvents[0]?.details?.["decided_by"]).toBe("operator_via_http");
   });
 
+  it("resolve() remains idempotent and writes the resolved audit event exactly once", async () => {
+    const { aggregator, auditLog } = makeAggregator();
+    const entry = await aggregator.ingest(makeRequestedEvent());
+    expect(entry).not.toBeNull();
+
+    const first = await aggregator.resolve(
+      entry!.aggregator_id,
+      "approved",
+      "operator_first",
+    );
+    const second = await aggregator.resolve(
+      entry!.aggregator_id,
+      "denied",
+      "operator_second",
+    );
+
+    expect(first.status).toBe("approved");
+    expect(second.status).toBe("approved");
+    expect(second.resolved_by).toBe("operator_first");
+    const audit = await auditLog.query({ layer: "l2", limit: 100 });
+    const resolvedEvents = audit.entries.filter(
+      (e) => e.operation === APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+    );
+    expect(resolvedEvents.length).toBe(1);
+    expect(resolvedEvents[0]?.details?.["decision"]).toBe("approved");
+  });
+
+  it("appendCritical failure leaves HTTP-style resolve pending and unobservable to the channel", async () => {
+    const { aggregator, auditLog } = makeAggregator();
+    const requested = makeRequestedEvent();
+    const entry = await aggregator.ingest(requested);
+    expect(entry).not.toBeNull();
+    failResolvedAudits(auditLog);
+
+    await expect(
+      aggregator.resolve(entry!.aggregator_id, "approved", "operator_via_http"),
+    ).rejects.toThrow("audit down");
+
+    const after = await aggregator.getEntry(entry!.aggregator_id);
+    expect(after?.status).toBe("pending");
+    expect(after?.resolved_at).toBeUndefined();
+    expect(after?.resolved_by).toBeUndefined();
+    const pending = await aggregator.list({ status: "pending" });
+    expect(pending.map((candidate) => candidate.aggregator_id)).toContain(
+      entry!.aggregator_id,
+    );
+    await expectChannelDoesNotObserveDecision(aggregator, requested);
+  });
+
+  it("appendCritical failure leaves gate resolved events pending", async () => {
+    const { aggregator, auditLog } = makeAggregator();
+    const requested = makeRequestedEvent();
+    const entry = await aggregator.ingest(requested);
+    expect(entry).not.toBeNull();
+    failResolvedAudits(auditLog);
+
+    await expect(aggregator.ingest(makeResolvedEvent())).rejects.toThrow(
+      "audit down",
+    );
+
+    const after = await aggregator.getEntry(entry!.aggregator_id);
+    expect(after?.status).toBe("pending");
+    expect(after?.resolved_at).toBeUndefined();
+    await expectChannelDoesNotObserveDecision(aggregator, requested);
+  });
+
+  it("persist failure after a durable resolved audit leaves the entry pending in memory and storage", async () => {
+    const storage = new FailingAggregatorWriteStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const aggregator = new ApprovalAggregator({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: IDENTITY,
+      fortressId: FORTRESS,
+      pendingTtlMs: 60_000,
+      resolveSourceContext: () => ({
+        source_harness: "claude-code",
+        source_agent_id: "agent-default",
+      }),
+    });
+    const requested = makeRequestedEvent();
+    const entry = await aggregator.ingest(requested);
+    expect(entry).not.toBeNull();
+
+    storage.failAggregatorWrites = true;
+    await expect(
+      aggregator.resolve(entry!.aggregator_id, "denied", "operator_via_http"),
+    ).rejects.toThrow("aggregator persist down");
+
+    const after = await aggregator.getEntry(entry!.aggregator_id);
+    expect(after?.status).toBe("pending");
+    expect(after?.resolved_at).toBeUndefined();
+    await expectChannelDoesNotObserveDecision(aggregator, requested);
+
+    const audit = await auditLog.query({ layer: "l2", limit: 100 });
+    const resolvedEvents = audit.entries.filter(
+      (candidate) =>
+        candidate.operation === APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED,
+    );
+    expect(resolvedEvents.length).toBe(1);
+
+    storage.failAggregatorWrites = false;
+    const restarted = new ApprovalAggregator({
+      storage,
+      masterKey,
+      auditLog: new AuditLog(storage, masterKey),
+      identityId: IDENTITY,
+      fortressId: FORTRESS,
+    });
+    const restartedEntry = await restarted.getEntry(entry!.aggregator_id);
+    expect(restartedEntry?.status).toBe("pending");
+    expect(restartedEntry?.resolved_at).toBeUndefined();
+  });
+
   it("resolve() on an unknown id throws not_found", async () => {
     const { aggregator } = makeAggregator();
     await expect(
@@ -269,6 +441,25 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator", () => {
     expect(listedExpired[0]?.resolved_by).toBe("system_ttl");
     const listedPending = await aggregator.list({ status: "pending" });
     expect(listedPending.length).toBe(0);
+  });
+
+  it("expiration audit failure leaves a stale entry pending", async () => {
+    const clock = makeFixedClock(Date.parse("2026-05-09T12:00:00.000Z"));
+    const { aggregator, auditLog } = makeAggregator({
+      pendingTtlMs: 1000,
+      now: clock.now,
+    });
+    const entry = await aggregator.ingest(makeRequestedEvent());
+    expect(entry).not.toBeNull();
+    failResolvedAudits(auditLog);
+    clock.advance(2000);
+
+    await expect(aggregator.list({ status: "expired" })).rejects.toThrow(
+      "audit down",
+    );
+    const after = await aggregator.getEntry(entry!.aggregator_id);
+    expect(after?.status).toBe("pending");
+    expect(after?.resolved_at).toBeUndefined();
   });
 
   // 5. resolution from gate event records `timeout` on channel_failure
@@ -453,6 +644,7 @@ interface RouteRig {
   server: Server;
   url: string;
   aggregator: ApprovalAggregator;
+  auditLog: AuditLog;
   authToken: string;
   stop: () => Promise<void>;
 }
@@ -497,6 +689,7 @@ async function startRouteRig(opts?: {
     server,
     url: `http://127.0.0.1:${port}`,
     aggregator,
+    auditLog,
     authToken,
     stop: () =>
       new Promise<void>((resolve) => server.close(() => resolve())),
@@ -601,6 +794,36 @@ describe("WP-V1.3-10 Upsilon-1 ApprovalAggregator HTTP routes", () => {
     };
     expect(body.data.entry.status).toBe("approved");
     expect(body.data.entry.resolved_by).toBe("operator_test");
+  });
+
+  it("POST /:id/approve returns 500 and leaves the entry pending when resolved audit append fails", async () => {
+    const requested: ApprovalGateEvent = {
+      phase: "requested",
+      operation: "state_export",
+      tier: 1,
+      reason: "tier1",
+      context: { harness: "claude-code", agent_id: "agent-x" },
+      request_timestamp: "2026-05-09T12:00:00.000Z",
+      correlation_id: "corr-approve-audit-fail",
+    };
+    const entry = await rig.aggregator.ingest(requested);
+    expect(entry).not.toBeNull();
+    failResolvedAudits(rig.auditLog);
+
+    const res = await fetch(
+      `${rig.url}${APPROVAL_INBOX_API_PREFIX}/${entry?.aggregator_id}/approve`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "internal_error" });
+
+    const after = await rig.aggregator.getEntry(entry!.aggregator_id);
+    expect(after?.status).toBe("pending");
+    expect(after?.resolved_at).toBeUndefined();
+    await expectChannelDoesNotObserveDecision(rig.aggregator, requested);
   });
 
   // 18. POST /:id/deny route flips status to denied

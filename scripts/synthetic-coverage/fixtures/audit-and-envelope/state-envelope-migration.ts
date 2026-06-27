@@ -174,7 +174,7 @@ registerFixture(CLAIM_ID, CLAIM_LABEL, "state-envelope-migration: future-version
   const target = await rig();
   await seedSchema2Entry(target, "agent-state", "future-version", "schema 2 value");
   const entry = await readEntry(target.storage, "agent-state", "future-version");
-  entry.v = 3;
+  entry.v = 4;
   await writeEntry(target.storage, "agent-state", "future-version", entry);
 
   try {

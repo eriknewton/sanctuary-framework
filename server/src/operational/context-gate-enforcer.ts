@@ -6,30 +6,35 @@
  * call voluntarily), the enforcer runs automatically on every tool call
  * when enabled.
  *
- * This enforces minimum-necessary-context by default and makes bypassing
- * context protection explicit (requires reconfiguration).
+ * With a bound context-gating policy, this enforces minimum-necessary-context
+ * and makes bypassing context protection explicit (requires reconfiguration).
+ * Without a bound policy, enabled context gating fails closed.
  *
  * Security invariants:
  * - The enforcer wraps every tool handler when enabled
  * - Filtering decisions are audit-logged
- * - Default action on missing policy: fallback to built-in sensitive patterns
+ * - Default action on missing policy: block the request before egress
  * - Denied fields block the entire request (with logged reason)
  * - Redacted fields are stripped from tool arguments
- * - log_only mode logs what would be filtered but passes original args
+ * - With a bound policy, log_only mode logs filtering and passes original args
  */
 
 import type { ToolHandler } from "../router.js";
 import type { ContextGatePolicyStore } from "./context-gate.js";
-import { filterContext, matchesPattern, type ContextGatePolicy } from "./context-gate.js";
+import {
+  filterContext,
+  type ContextGatePolicy,
+} from "./context-gate.js";
 import type { AuditLog } from "./audit-log.js";
-import { stringToBytes } from "../core/encoding.js";
-import { hashToString } from "../core/hashing.js";
 import { toolResult } from "../router.js";
 import {
   applyLocalPrivacyFilter,
   applyPrivacyPlaceholders,
   type PrivacyPlaceholderVault,
 } from "./privacy-filter.js";
+
+const NO_POLICY_BOUND_OPERATOR_MESSAGE =
+  "context-gating enabled but no policy bound; bind a context-gating policy or disable gating.";
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
@@ -58,6 +63,22 @@ export class ContextGateBlockedError extends Error {
   }
 }
 
+/**
+ * Thrown by the proxy pre-forward path when context gating is enabled but no
+ * usable policy is bound. The proxy catches this typed error, denies the call,
+ * and returns only its generic denial to the agent.
+ */
+export class ContextGateNoPolicyError extends Error {
+  readonly toolName: string;
+
+  constructor(toolName: string) {
+    super(NO_POLICY_BOUND_OPERATOR_MESSAGE);
+    this.name = "ContextGateNoPolicyError";
+    this.toolName = toolName;
+    Object.setPrototypeOf(this, ContextGateNoPolicyError.prototype);
+  }
+}
+
 // ── Configuration ───────────────────────────────────────────────────────
 
 export interface EnforcerConfig {
@@ -72,36 +93,6 @@ export interface EnforcerConfig {
   /** What to do when a field triggers deny action: "block" or "redact" */
   on_deny: "block" | "redact";
 }
-
-// ── Built-in Sensitive Field Patterns ───────────────────────────────────
-
-/**
- * Built-in patterns for sensitive fields.
- * Used as fallback when no explicit policy is configured.
- * These are applied even without a policy to provide baseline protection.
- */
-const BUILTIN_SENSITIVE_PATTERNS = [
-  "*_key",
-  "*_token",
-  "*_secret",
-  "api_key",
-  "access_token",
-  "refresh_token",
-  "password",
-  "passwd",
-  "credential*",
-  "auth_*",
-  "ssn",
-  "social_security*",
-  "tax_id*",
-  "credit_card*",
-  "card_number*",
-  "cvv",
-  "cvc",
-  "private_key",
-  "secret_key",
-  "master_key",
-];
 
 // ── Enforcer Status ─────────────────────────────────────────────────────
 
@@ -156,13 +147,13 @@ export class ContextGateEnforcer {
    * 1. Checks if tool should be filtered (based on bypass_prefixes)
    * 2. If not filtering, calls original handler directly
    * 3. If filtering:
-   *    a. Gets the active policy or falls back to built-in patterns
+   *    a. Gets the active policy or denies the call if none is bound
    *    b. Calls filterContext() with tool arguments
    *    c. If any field triggered "deny" and on_deny is "block", returns error
    *    d. If on_deny is "redact", replaces denied fields with "[REDACTED]"
    *    e. Calls original handler with filtered arguments
    *    f. Logs the filtering decision
-   * 4. In log_only mode: runs filter, logs what would happen, passes original args
+   * 4. With a bound policy in log_only mode: runs filter, logs, passes original args
    */
   wrapHandler(toolName: string, originalHandler: ToolHandler): ToolHandler {
     return async (args: Record<string, unknown>) => {
@@ -193,12 +184,7 @@ export class ContextGateEnforcer {
           policy
         );
       } else {
-        // Fall back to built-in sensitive pattern matching
-        return this.filterWithBuiltinPatterns(
-          toolName,
-          args,
-          originalHandler
-        );
+        return this.blockNoPolicy(toolName);
       }
     };
   }
@@ -266,7 +252,9 @@ export class ContextGateEnforcer {
       return this.filterWithPolicy(toolName, args, originalHandler, policy);
     }
 
-    return this.filterWithBuiltinPatterns(toolName, args, originalHandler);
+    await this.auditNoPolicyBlock(toolName);
+    this.stats.calls_blocked++;
+    throw new ContextGateNoPolicyError(toolName);
   }
 
   /**
@@ -315,11 +303,11 @@ export class ContextGateEnforcer {
       // If on_deny is "redact", continue with filtered args below
     }
 
-    // Build filtered arguments, then scrub sensitive spans inside allowed values.
-    const filteredArgs = this.buildFilteredArgs(args, result.decisions);
+    // Start from the recursively filtered output, then scrub sensitive spans
+    // inside otherwise allowed values.
     const privacyFiltered = this.privacyVault
-      ? await applyPrivacyPlaceholders(filteredArgs, this.privacyVault, policy.policy_id)
-      : applyLocalPrivacyFilter(filteredArgs);
+      ? await applyPrivacyPlaceholders(result.filtered_output, this.privacyVault, policy.policy_id)
+      : applyLocalPrivacyFilter(result.filtered_output);
 
     if (this.config.log_only) {
       // Log but pass original args
@@ -375,138 +363,29 @@ export class ContextGateEnforcer {
     return originalHandler(privacyFiltered.value as Record<string, unknown>);
   }
 
-  /**
-   * Filter tool arguments using built-in sensitive patterns.
-   * This provides baseline protection when no explicit policy is configured.
-   */
-  private async filterWithBuiltinPatterns(
-    toolName: string,
-    args: Record<string, unknown>,
-    originalHandler: ToolHandler
+  private async blockNoPolicy(
+    toolName: string
   ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-    const fieldsToRedact: string[] = [];
-    const originalHash = hashToString(
-      stringToBytes(JSON.stringify(args))
-    );
+    this.stats.calls_blocked++;
+    await this.auditNoPolicyBlock(toolName);
+    return toolResult({
+      error: "Operation not permitted",
+    });
+  }
 
-    // Check each field against built-in patterns
-    for (const field of Object.keys(args)) {
-      if (matchesPattern(field, BUILTIN_SENSITIVE_PATTERNS)) {
-        fieldsToRedact.push(field);
-      }
-    }
-
-    if (fieldsToRedact.length === 0) {
-      const privacyFiltered = this.privacyVault
-        ? await applyPrivacyPlaceholders(args, this.privacyVault, `builtin:${toolName}`)
-        : applyLocalPrivacyFilter(args);
-      if (privacyFiltered.findings.length > 0) {
-        const filteredHash = hashToString(
-          stringToBytes(JSON.stringify(privacyFiltered.value))
-        );
-
-        if (this.config.log_only) {
-          void this.auditLog.append(
-            "l2",
-            "context_gate_enforcer_builtin_privacy_log_only",
-            "system",
-            {
-              tool_name: toolName,
-              privacy_findings: privacyFiltered.findings.length,
-              privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
-              original_context_hash: originalHash,
-            }
-          );
-          this.markFilterSuccess();
-          return originalHandler(args);
-        }
-
-        void this.auditLog.append(
-          "l2",
-          "context_gate_enforcer_builtin_privacy_filter",
-          "system",
-          {
-            tool_name: toolName,
-            privacy_findings: privacyFiltered.findings.length,
-            privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
-            original_context_hash: originalHash,
-          filtered_context_hash: filteredHash,
-        }
-      );
-      this.markFilterSuccess();
-      return originalHandler(privacyFiltered.value as Record<string, unknown>);
-    }
-
-      // No sensitive fields detected — pass through
-      void this.auditLog.append(
-        "l2",
-        "context_gate_enforcer_builtin_pass",
-        "system",
-        {
-          tool_name: toolName,
-          reason: "No sensitive field patterns detected",
-        }
-      );
-      this.markFilterSuccess();
-      return originalHandler(args);
-    }
-
-    // Build filtered arguments
-    const filteredArgs: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(args)) {
-      if (fieldsToRedact.includes(key)) {
-        filteredArgs[key] = "[REDACTED]";
-      } else {
-        filteredArgs[key] = value;
-      }
-    }
-
-    const privacyFiltered = this.privacyVault
-      ? await applyPrivacyPlaceholders(filteredArgs, this.privacyVault, `builtin:${toolName}`)
-      : applyLocalPrivacyFilter(filteredArgs);
-    const filteredHash = hashToString(
-      stringToBytes(JSON.stringify(privacyFiltered.value))
-    );
-
-    if (this.config.log_only) {
-      void this.auditLog.append(
-        "l2",
-        "context_gate_enforcer_builtin_log_only",
-        "system",
-        {
-          tool_name: toolName,
-          fields_redacted: fieldsToRedact.length,
-          redacted_fields: fieldsToRedact,
-          privacy_findings: privacyFiltered.findings.length,
-          privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
-          original_context_hash: originalHash,
-        }
-      );
-      this.stats.fields_redacted += fieldsToRedact.length;
-      this.markFilterSuccess();
-      return originalHandler(args);
-    }
-
-    // Execute handler with filtered arguments
-    void this.auditLog.append(
-      "l2",
-      "context_gate_enforcer_builtin_filter",
-      "system",
-      {
+  private async auditNoPolicyBlock(toolName: string): Promise<void> {
+    await this.auditLog.appendCritical({
+      layer: "l2",
+      operation: "context_gate_enforcer_no_policy_block",
+      identity_id: "system",
+      result: "failure",
+      details: {
         tool_name: toolName,
-        fields_redacted: fieldsToRedact.length,
-        redacted_fields: fieldsToRedact,
-        privacy_findings: privacyFiltered.findings.length,
-        privacy_classes: [...new Set(privacyFiltered.findings.map((f) => f.class))],
-        original_context_hash: originalHash,
-        filtered_context_hash: filteredHash,
-      }
-    );
-
-    this.stats.fields_redacted += fieldsToRedact.length;
-    this.markFilterSuccess();
-
-    return originalHandler(privacyFiltered.value as Record<string, unknown>);
+        decision: "denied",
+        reason: "context_gating_no_policy_bound",
+        message: NO_POLICY_BOUND_OPERATOR_MESSAGE,
+      },
+    });
   }
 
   /**
@@ -550,39 +429,6 @@ export class ContextGateEnforcer {
       return "analytics";
     }
     return "tool-api";
-  }
-
-  /**
-   * Build filtered arguments from filter decisions.
-   */
-  private buildFilteredArgs(
-    originalArgs: Record<string, unknown>,
-    decisions: Array<{ field: string; action: string; hash_value?: string }>
-  ): Record<string, unknown> {
-    const filtered: Record<string, unknown> = {};
-
-    for (const decision of decisions) {
-      switch (decision.action) {
-        case "allow":
-          filtered[decision.field] = originalArgs[decision.field];
-          break;
-        case "redact":
-          // Include field with redacted value
-          filtered[decision.field] = "[REDACTED]";
-          break;
-        case "hash":
-          filtered[decision.field] = decision.hash_value;
-          break;
-        case "summarize":
-          filtered[decision.field] = originalArgs[decision.field];
-          break;
-        case "deny":
-          // Field excluded — denied
-          break;
-      }
-    }
-
-    return filtered;
   }
 
   /**
@@ -686,8 +532,3 @@ function parseBlockMarker(
   }
   return null;
 }
-
-/**
- * Export built-in patterns for testing and reference.
- */
-export { BUILTIN_SENSITIVE_PATTERNS };

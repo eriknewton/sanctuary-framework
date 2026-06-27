@@ -7,7 +7,7 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
 import type { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { persistUserProvidedPassphrase } from "../src/wrap/passphrase.js";
@@ -15,6 +15,15 @@ import {
   bindWithRetry,
   randomTestPort,
 } from "./util/port-collision-retry.js";
+
+type StandaloneDashboardStartOptions = Omit<
+  Parameters<typeof startStandaloneDashboard>[0],
+  "port"
+>;
+
+let isolatedDiscoveryOptions:
+  | StandaloneDashboardStartOptions["discoveryOptions"]
+  | undefined;
 
 /**
  * Boot startStandaloneDashboard with a freshly chosen port, retrying on
@@ -26,7 +35,16 @@ async function startDashboardOnFreePort(
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
   return bindWithRetry(async () => {
     const port = randomTestPort();
-    const dashboard = await startStandaloneDashboard({ ...options, port });
+    const dashboard = await startStandaloneDashboard({
+      // Durable-fix: a first-run mint now requires confirmed off-host capture.
+      // In CI there is no tty, so default to noConfirm + an off-host escrow
+      // target (SANCTUARY_RECOVERY_OUT, set per-test) so the gate is satisfied
+      // deterministically. Individual tests may still override noConfirm.
+      noConfirm: true,
+      ...options,
+      discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
+      port,
+    });
     return { dashboard, port };
   });
 }
@@ -34,11 +52,26 @@ async function startDashboardOnFreePort(
 describe("Standalone Dashboard", () => {
   let dashboard: DashboardApprovalChannel | null = null;
   let tempDir: string;
+  let escrowDir: string;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "sanctuary-test-dashboard-"));
+    escrowDir = await mkdtemp(join(tmpdir(), "sanctuary-test-dash-escrow-"));
+    const discoveryRoot = join(tempDir, "discovery-root");
+    const discoveryHome = join(tempDir, "discovery-home");
+    await mkdir(discoveryRoot, { recursive: true, mode: 0o700 });
+    await mkdir(discoveryHome, { recursive: true, mode: 0o700 });
+    isolatedDiscoveryOptions = {
+      root: discoveryRoot,
+      home: discoveryHome,
+      env: {},
+    };
     // Ensure test environment flags are set (auto-open is skipped in test)
     process.env.VITEST = "true";
+    // Durable-fix: off-host recovery escrow target for first-run mints, so the
+    // provisioning gate is satisfied non-interactively (no tty in CI). In a
+    // SEPARATE temp dir so it is always outside the fortress storage path.
+    process.env.SANCTUARY_RECOVERY_OUT = join(escrowDir, "recovery.txt");
   });
 
   afterEach(async () => {
@@ -48,11 +81,14 @@ describe("Standalone Dashboard", () => {
     }
     // Clean up temp storage
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await rm(escrowDir, { recursive: true, force: true }).catch(() => {});
     // Clean up env vars
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_DASHBOARD_ENABLED;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
     delete process.env.SANCTUARY_DASHBOARD_PORT;
+    delete process.env.SANCTUARY_RECOVERY_OUT;
+    isolatedDiscoveryOptions = undefined;
   });
 
   it("starts a standalone dashboard HTTP server", async () => {
@@ -152,7 +188,10 @@ describe("Standalone Dashboard", () => {
 
   it("rejects unauthenticated /api/snapshot requests in standalone mode", async () => {
     // The fix must not weaken the auth posture: /api/snapshot sits behind
-    // the same bearer-token gate as every other legacy /api/* route.
+    // the same bearer-token gate as every other legacy /api/* route. The
+    // helper also pins tenant discovery to an empty test root, so this fresh
+    // fortress cannot auto-discover a parallel tenant and engage loopback
+    // auto-auth.
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-snapshot-auth";
 
@@ -206,6 +245,7 @@ describe("Standalone Dashboard", () => {
       dashboard2 = await startStandaloneDashboard({
         port: randomTestPort(),
         host: "127.0.0.1",
+        discoveryOptions: isolatedDiscoveryOptions,
       });
       // If we get here, clean up and fail
       await dashboard2.stop();

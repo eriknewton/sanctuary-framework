@@ -1,5 +1,5 @@
 {
-  "tool_count": 88,
+  "tool_count": 96,
   "tools": [
     {
       "name": "identity_create",
@@ -276,6 +276,11 @@
               "version"
             ],
             "default": "skip"
+          },
+          "allow_unverified_legacy": {
+            "type": "boolean",
+            "default": false,
+            "description": "Explicitly import a manifestless legacy bundle without completeness guarantees. Default false rejects bundles that predate authenticated completeness verification."
           }
         },
         "required": [
@@ -718,6 +723,11 @@
           "bundle": {
             "type": "string",
             "description": "Base64url-encoded reputation bundle"
+          },
+          "allow_unverified_legacy": {
+            "type": "boolean",
+            "default": false,
+            "description": "Explicitly import a manifestless legacy reputation bundle without completeness guarantees. Default false rejects bundles that predate signed completeness verification."
           }
         },
         "required": [
@@ -1224,7 +1234,32 @@
           },
           "metrics": {
             "type": "object",
-            "description": "Optional metrics (e.g., rounds, response_time_ms, terms_complexity)"
+            "additionalProperties": false,
+            "description": "Optional self-declared bridge behavioral inputs. Sanctuary does not independently verify these declarations; it bounds and buckets them before storage under metric_policy \"concordia-bridge-behavioral-v1\". Raw deal terms, raw magnitudes, legacy exact metric names, and unknown keys are rejected.",
+            "properties": {
+              "declared_offers_made": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+                "description": "Self-declared offer count, integer 1..64. Stored only as declared_offers_made_bucket, not the exact count."
+              },
+              "declared_concession": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Self-declared concession ratio from 0 to 1. Stored only as declared_concession_bucket (0..10), not the exact ratio."
+              },
+              "declared_reasoning_provided": {
+                "type": "boolean",
+                "description": "Self-declared whether reasoning was provided. Stored as declared_reasoning_provided 0 or 1."
+              },
+              "declared_response_time_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3600000,
+                "description": "Self-declared response latency in milliseconds, integer 0..3600000. Stored only as declared_response_time_bucket, not exact milliseconds."
+              }
+            }
           },
           "identity_id": {
             "type": "string",
@@ -1380,11 +1415,11 @@
           },
           "log_only": {
             "type": "boolean",
-            "description": "Enable log_only mode: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
+            "description": "Enable log_only mode with a bound policy: filter decisions are logged but original args are passed to handlers. Useful for monitoring before enabling actual filtering. Default: leave unchanged."
           },
           "default_policy_id": {
             "type": "string",
-            "description": "Set the default context-gating policy to use for filtering. If not set, the enforcer uses built-in sensitive field patterns. Default: leave unchanged."
+            "description": "Set the default context-gating policy to use for filtering. If not set while the enforcer is enabled, calls are blocked. Default: leave unchanged."
           },
           "on_deny": {
             "type": "string",
@@ -1669,6 +1704,133 @@
       }
     },
     {
+      "name": "memory_insert",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Passage text to store"
+          },
+          "taint": {
+            "type": "string",
+            "enum": [
+              "user_content",
+              "agent_derived_clean",
+              "system_generated"
+            ],
+            "description": "Provenance of the text: user_content (conversation-derived), agent_derived_clean (agent summary), or system_generated. This is a hint, not a secret-free guarantee: forbidden taints and secret-classifier hits are rejected before encryption."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional tags (SDW identifier grammar)"
+          },
+          "passage_id": {
+            "type": "string",
+            "description": "Optional caller-supplied id (SDW identifier grammar); generated if absent"
+          }
+        },
+        "required": [
+          "text",
+          "taint"
+        ]
+      }
+    },
+    {
+      "name": "memory_get",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "passage_id": {
+            "type": "string",
+            "description": "Passage id to fetch"
+          }
+        },
+        "required": [
+          "passage_id"
+        ]
+      }
+    },
+    {
+      "name": "memory_search",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Case-insensitive substring to match"
+          },
+          "tag": {
+            "type": "string",
+            "description": "Optional: restrict to passages carrying this tag"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Optional max results"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "memory_list",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "number",
+            "description": "Optional max results"
+          },
+          "after": {
+            "type": "string",
+            "description": "Optional cursor: return ids strictly after this one"
+          }
+        }
+      }
+    },
+    {
+      "name": "memory_count",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "memory_delete",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "passage_id": {
+            "type": "string",
+            "description": "Passage id to delete"
+          }
+        },
+        "required": [
+          "passage_id"
+        ]
+      }
+    },
+    {
+      "name": "sdw_memory_provenance",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "passage_id": {
+            "type": "string",
+            "description": "Passage id to inspect provenance for"
+          }
+        },
+        "required": [
+          "passage_id"
+        ]
+      }
+    },
+    {
       "name": "compliance_eu_ai_act_annex_iii_classify",
       "inputSchema": {
         "type": "object",
@@ -1787,6 +1949,21 @@
           "chain_id",
           "agent_id",
           "nonce"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary/resolve_erc8004_identity",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "record": {
+            "type": "object",
+            "description": "The presented ERC-8004 identity record to verify, including identity, registry, chain_id, nonce, timestamp, signature, signer_address, and public_key as produced by the signer."
+          }
+        },
+        "required": [
+          "record"
         ]
       }
     },

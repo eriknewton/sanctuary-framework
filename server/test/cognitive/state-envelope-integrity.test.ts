@@ -121,6 +121,59 @@ describe("state envelope integrity", () => {
     expect(read?.signature_verified).toBe(true);
   });
 
+  it("new writes carry schema-3 signed provenance", async () => {
+    const { storage, stateStore, identity, identityEncKey } = makeStateRig();
+
+    await stateStore.write(
+      "memory",
+      "profile",
+      "trusted value",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+
+    const entry = await readEntry(storage, "memory", "profile");
+    expect(entry.v).toBe(3);
+    expect(entry.metadata.schema_version).toBe(3);
+    expect(entry.provenance_stamp).toMatchObject({
+      origin_actor: "operator",
+      origin_ref: identity.storedIdentity.identity_id,
+      entry_binding: "memory/profile",
+      memory_class: "operator_owned",
+    });
+    expect(entry.envelope?.metadata.schema_version).toBe(3);
+    expect(entry.envelope?.provenance_stamp).toEqual(entry.provenance_stamp);
+  });
+
+  it("tampering with signed provenance fails verification before read", async () => {
+    const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
+
+    await stateStore.write(
+      "memory",
+      "profile",
+      "trusted value",
+      identity.storedIdentity.identity_id,
+      identity.storedIdentity.encrypted_private_key,
+      identityEncKey
+    );
+
+    const entry = await readEntry(storage, "memory", "profile");
+    entry.provenance_stamp = {
+      ...entry.provenance_stamp!,
+      origin_actor: "agent",
+      memory_class: "agent_owned",
+    };
+    entry.envelope!.provenance_stamp = entry.provenance_stamp;
+    await writeEntry(storage, "memory", "profile", entry);
+
+    const freshStore = new StateStore(storage, masterKey);
+    await expect(freshStore.read("memory", "profile")).rejects.toMatchObject({
+      name: "StateVerificationError",
+      classification: "signature_mismatch",
+    } satisfies Partial<StateVerificationError>);
+  });
+
   it("detects namespace metadata tampering after write", async () => {
     const { storage, masterKey, stateStore, identity, identityEncKey } = makeStateRig();
 
@@ -206,6 +259,15 @@ describe("state envelope integrity", () => {
 
   it("loads legacy schema-1 entries with a warning", async () => {
     const { storage, masterKey, identity, identityEncKey } = makeStateRig();
+    await storage.write(
+      "_identities",
+      identity.storedIdentity.identity_id,
+      stringToBytes(
+        JSON.stringify(
+          encrypt(stringToBytes(JSON.stringify(identity.storedIdentity)), identityEncKey)
+        )
+      )
+    );
     await writeLegacyEntry({
       storage,
       masterKey,
@@ -220,8 +282,15 @@ describe("state envelope integrity", () => {
     const read = await freshStore.read("legacy", "k");
 
     expect(read?.value).toBe("legacy value");
-    expect(read?.signature_verified).toBe(false);
+    expect(read?.signature_verified).toBe(true);
     expect(read?.warnings?.[0]?.name).toBe("LegacyEnvelopeWarning");
+    const migrated = await readEntry(storage, "legacy", "k");
+    expect(migrated.v).toBe(2);
+    expect(migrated.provenance_stamp).toBeUndefined();
+    expect(migrated.envelope?.provenance_stamp).toBeUndefined();
+
+    const reread = await new StateStore(storage, masterKey).read("legacy", "k");
+    expect(reread?.value).toBe("legacy value");
   });
 
   it("state_read returns an error on verification failure", async () => {

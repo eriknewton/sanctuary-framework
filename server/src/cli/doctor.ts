@@ -9,20 +9,25 @@ import { createHash } from "node:crypto";
 import { access, constants, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { createRequire } from "node:module";
+import { getSanctuaryVersion } from "../version.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
+import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
+import { checkNodeVersion } from "./node-version.js";
 import { exportAuditChain } from "./audit-chain-export.js";
 import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
 
-const require = createRequire(import.meta.url);
-const { version: PKG_VERSION } = require("../../package.json");
+// Canonical version source. A bare `require("../../package.json")` resolves to
+// the repo-root package.json (no `version`) when bundled to server/dist/; the
+// helper reads server/package.json from both src/ and dist/ and never returns
+// undefined.
+const PKG_VERSION = getSanctuaryVersion();
 
 export type DoctorStatus = "OK" | "WARN" | "FAIL";
 
@@ -41,6 +46,7 @@ export interface DoctorCommandArgs {
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   storagePath?: string;
+  nodeVersion?: string;
 }
 
 function write(stream: Writable, text: string): void {
@@ -72,6 +78,7 @@ export async function runDoctorCommand(
       storagePath,
       platform: args.platform ?? process.platform,
       execSyncFn: args.execSyncFn,
+      nodeVersion: args.nodeVersion,
     });
     if (json) {
       write(
@@ -103,17 +110,80 @@ export async function runDoctorChecks(opts: {
   storagePath: string;
   platform: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
+  nodeVersion?: string;
 }): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
+  checks.push(checkRequiredNodeVersion(opts.nodeVersion));
   checks.push(await checkStateDir(opts.storagePath));
   const masterKey = await resolveMasterKeyIfAvailable(opts.storagePath, opts.env);
   checks.push(await checkIdentity(opts.storagePath, masterKey));
   checks.push(await checkPolicy(opts.storagePath));
   checks.push(await checkAuditChain(opts.storagePath));
+  checks.push(await checkCustodyFactors(opts.storagePath));
   checks.push(checkRuntime());
   checks.push(await checkCastleWall(opts));
   if (masterKey) masterKey.fill(0);
   return checks;
+}
+
+/**
+ * Custody-factor orphan check (element 5): WARN before a lockout. If the
+ * envelope enrolled an OS-keyring custody factor but the keyring item is GONE,
+ * surface a WARN so the operator re-enrolls / confirms their recovery key
+ * before they are locked out. A locked/unreachable keyring is inconclusive
+ * (no GUI / SSH) and reports OK rather than a false alarm; no enrolled keychain
+ * factor is OK (nothing to orphan). Read-only; never unlocks anything.
+ */
+async function checkCustodyFactors(storagePath: string): Promise<DoctorCheck> {
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let result;
+  try {
+    result = await detectCustodyFactorOrphan(storage, storagePath);
+  } catch (error) {
+    return warn(
+      "custody factors",
+      `could not check custody factors: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after unlocking the OS keyring",
+    );
+  }
+  if (result.verdict === "orphaned") {
+    return warn(
+      "custody factors",
+      `enrolled OS-keyring custody factor is MISSING (service ${result.custodyService})`,
+      "confirm your recovery key is saved off-host, then re-run sanctuary wrap / init to re-enroll the keychain factor",
+    );
+  }
+  if (result.verdict === "inconclusive") {
+    return ok(
+      "custody factors",
+      "OS keyring unreachable this session; keychain factor not verified",
+      "unlock the OS keyring (GUI) to verify, or provide SANCTUARY_RECOVERY_KEY",
+    );
+  }
+  if (result.verdict === "no-factor") {
+    return ok("custody factors", "no OS-keyring custody factor enrolled", "none");
+  }
+  return ok(
+    "custody factors",
+    `enrolled OS-keyring custody factor present (service ${result.custodyService})`,
+    "none",
+  );
+}
+
+function checkRequiredNodeVersion(nodeVersion?: string): DoctorCheck {
+  const result = checkNodeVersion(nodeVersion);
+  if (result.supported) {
+    return ok(
+      "node version",
+      `Node.js ${result.actualVersion} satisfies ${result.requiredMajor}.x or later`,
+      "none",
+    );
+  }
+  return fail(
+    "node version",
+    result.message,
+    `upgrade Node.js to ${result.requiredMajor}.x or later`,
+  );
 }
 
 async function checkStateDir(storagePath: string): Promise<DoctorCheck> {

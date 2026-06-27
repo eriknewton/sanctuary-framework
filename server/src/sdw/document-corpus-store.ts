@@ -7,13 +7,22 @@ import {
   type SdwDocumentChunkRecord,
   type SdwDocumentRecord,
 } from "./records.js";
-import { mintPersistable, sdwBackendWrite, type Taint } from "./write-gate.js";
+import { mintPersistable, sdwBackendWrite, type Persistable, type Taint } from "./write-gate.js";
 import { decodeSdwRecord } from "./store-codec.js";
 
 export interface SdwDocumentCorpusStoreOptions {
   readonly storage: StorageBackend;
   readonly masterKey: Uint8Array;
   readonly fortressId: string;
+}
+
+export interface SdwCorpusTxn {
+  writePersistable<T extends SdwDocumentRecord | SdwDocumentChunkRecord>(
+    persistable: Persistable<T>,
+    encryptionKey: Uint8Array,
+    fortressId: string,
+  ): Promise<void>;
+  read(namespace: string, key: string): Promise<Uint8Array | null>;
 }
 
 export class SdwDocumentCorpusStore {
@@ -27,7 +36,7 @@ export class SdwDocumentCorpusStore {
     this.fortressId = options.fortressId;
   }
 
-  async putDocument(record: SdwDocumentRecord, taint: Taint): Promise<void> {
+  async putDocument(record: SdwDocumentRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
     const storageKey = documentKey(record.document_id);
     const persistable = mintPersistable(
       { value: record, taint },
@@ -35,10 +44,14 @@ export class SdwDocumentCorpusStore {
       storageKey,
       this.fortressId,
     );
+    if (txn !== undefined) {
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      return;
+    }
     await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
   }
 
-  async putChunk(record: SdwDocumentChunkRecord, taint: Taint): Promise<void> {
+  async putChunk(record: SdwDocumentChunkRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
     const storageKey = documentChunkStorageKey(record);
     const persistable = mintPersistable(
       { value: record, taint },
@@ -46,12 +59,16 @@ export class SdwDocumentCorpusStore {
       storageKey,
       this.fortressId,
     );
+    if (txn !== undefined) {
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      return;
+    }
     await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
   }
 
-  async getDocument(documentId: string): Promise<SdwDocumentRecord | null> {
+  async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {
     const storageKey = documentKey(documentId);
-    const raw = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
     return decodeSdwRecord<SdwDocumentRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,

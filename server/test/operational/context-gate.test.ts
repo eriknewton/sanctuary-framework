@@ -337,6 +337,14 @@ describe("L2 Context Gating", () => {
       expect(decisions.get("user_id")!.action).toBe("hash");
       expect(decisions.get("user_id")!.hash_value).toBeDefined();
       expect(decisions.get("conversation_history")!.action).toBe("summarize");
+      expect(result.filtered_output).toEqual({
+        task_description: "Summarize this document",
+        current_query: "What are the key points?",
+        api_key: "[REDACTED]",
+        memory: "[REDACTED]",
+        user_id: `[HASH:${decisions.get("user_id")!.hash_value}]`,
+        conversation_history: "[SUMMARIZE]",
+      });
     });
 
     it("produces content hashes for audit trail", () => {
@@ -634,13 +642,35 @@ describe("L2 Context Gating", () => {
       const context = {
         metadata: { api_key: "sk-secret-12345", note: "safe to share" },
       };
-      const before = filterContext(nestedPolicy(), "inference", context);
-      // Rebuild the same shape the filter would emit and confirm the secret is gone.
-      // (We assert via the filtered hash differing from the original and the
-      //  redact decision; the value itself never appears in any decision.)
-      expect(before.original_context_hash).not.toBe(before.filtered_context_hash);
-      const serialized = JSON.stringify(before.decisions);
+      const result = filterContext(nestedPolicy(), "inference", context);
+      const filteredMetadata = result.filtered_output.metadata as Record<string, unknown>;
+      expect(filteredMetadata.api_key).toBe("[REDACTED]");
+      expect(filteredMetadata.note).toBe("safe to share");
+      expect(result.original_context_hash).not.toBe(result.filtered_context_hash);
+      const serialized = JSON.stringify(result.filtered_output);
       expect(serialized).not.toContain("sk-secret-12345");
+    });
+
+    it("omits a nested denied child from the filtered output", () => {
+      const policy = makePolicy([
+        {
+          provider: "inference",
+          allow: ["metadata", "note"],
+          redact: [],
+          hash: [],
+          summarize: [],
+        },
+      ], "deny");
+      const context = {
+        metadata: { note: "safe to share", private_note: "nested-denied-secret" },
+      };
+      const result = filterContext(policy, "inference", context);
+      const filteredMetadata = result.filtered_output.metadata as Record<string, unknown>;
+
+      expect(result.decisions.find((d) => d.field === "metadata.private_note")?.action).toBe("deny");
+      expect(filteredMetadata.note).toBe("safe to share");
+      expect(filteredMetadata).not.toHaveProperty("private_note");
+      expect(JSON.stringify(result.filtered_output)).not.toContain("nested-denied-secret");
     });
 
     it("catches a nested secret via a wildcard pattern", () => {
@@ -686,6 +716,34 @@ describe("L2 Context Gating", () => {
       const d = result.decisions.find((x) => x.field === "metadata.user_id");
       expect(d?.action).toBe("hash");
       expect(d?.hash_value).toBeDefined();
+      const filteredMetadata = result.filtered_output.metadata as Record<string, unknown>;
+      expect(filteredMetadata.user_id).toBe(`[HASH:${d?.hash_value}]`);
+      expect(JSON.stringify(result.filtered_output)).not.toContain("abc-123");
+    });
+
+    it("redacts a deeply nested field in the filtered output", () => {
+      const policy = nestedPolicy({
+        allow: ["metadata", "profile", "details", "note"],
+        redact: ["secret_code"],
+      });
+      const context = {
+        metadata: {
+          profile: {
+            details: {
+              note: "safe to share",
+              secret_code: "deep-secret-value",
+            },
+          },
+        },
+      };
+      const result = filterContext(policy, "inference", context);
+      const filteredMetadata = result.filtered_output.metadata as Record<string, unknown>;
+      const profile = filteredMetadata.profile as Record<string, unknown>;
+      const details = profile.details as Record<string, unknown>;
+
+      expect(details.note).toBe("safe to share");
+      expect(details.secret_code).toBe("[REDACTED]");
+      expect(JSON.stringify(result.filtered_output)).not.toContain("deep-secret-value");
     });
 
     it("flat contexts are unchanged by recursion (backward compatible)", () => {

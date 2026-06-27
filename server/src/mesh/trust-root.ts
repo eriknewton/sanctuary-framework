@@ -43,10 +43,18 @@ import {
   MeshReservedCapabilityBitError,
 } from "./errors.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "./types.js";
+
+export const NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING =
+  "sanctuary.v1.expiring-node-cert" as const;
+
+/** Domain-separation tag for the rotate-root renewal rotation certificate. */
+export const FEDERATION_ROOT_ROTATION_KIND =
+  "federation-root-rotation" as const;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Bootstrap
@@ -145,6 +153,7 @@ export function issueNodeIdentityCertificate(params: {
   capabilities: number;
   parent_chain: NodeIdentityCertificate["parent_chain"];
   principal_private_key: Uint8Array;
+  expires_at?: string;
   tee_attestation_hash?: string;
   /** Optional — set to attach master_signature (recommended; REQUIRED at v1.x). */
   master_private_key?: Uint8Array;
@@ -157,13 +166,22 @@ export function issueNodeIdentityCertificate(params: {
       "v0.1 node cert MUST set at least CAP_STANDARD_FORTRESS_NODE (bit 0)"
     );
   }
+  if (params.node_mode !== "sovereign_tee" && params.tee_attestation_hash !== undefined) {
+    throw new MeshChainError(
+      "TEE attestation hash is only accepted for sovereign_tee node certificates"
+    );
+  }
 
   const body = {
+    certificate_version: params.expires_at
+      ? NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING
+      : undefined,
     node_id: params.node_id,
     node_pubkey: toBase64url(params.node_pubkey),
     node_mode: params.node_mode,
     fortress_id: params.fortress_id,
     joined_at: new Date().toISOString(),
+    expires_at: params.expires_at,
     capabilities: params.capabilities,
     parent_chain: params.parent_chain,
     tee_attestation_hash: params.tee_attestation_hash,
@@ -197,14 +215,15 @@ export function issueNodeIdentityCertificate(params: {
  */
 export function verifyPrincipalCertificate(
   cert: PrincipalCertificate,
-  pinnedMasterPubkey: FortressMasterPublicKey
+  pinnedMasterPubkey: FortressMasterPublicKey,
+  nowMs = Date.now()
 ): void {
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
     throw new MeshChainError(
       `principal cert fortress_id=${cert.fortress_id} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
     );
   }
-  if (cert.expires_at && Date.parse(cert.expires_at) < Date.now()) {
+  if (cert.expires_at && Date.parse(cert.expires_at) < nowMs) {
     throw new MeshChainError(
       `principal cert ${cert.principal_id} expired at ${cert.expires_at}`
     );
@@ -249,7 +268,8 @@ export function verifyPrincipalCertificate(
 export function verifyCertChain(
   cert: NodeIdentityCertificate,
   principalCert: PrincipalCertificate,
-  pinnedMasterPubkey: FortressMasterPublicKey
+  pinnedMasterPubkey: FortressMasterPublicKey,
+  nowMs = Date.now()
 ): void {
   // Fortress-id coherence across the whole chain.
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
@@ -281,15 +301,45 @@ export function verifyCertChain(
   }
 
   // Walk the upper hop: principal → master.
-  verifyPrincipalCertificate(principalCert, pinnedMasterPubkey);
+  verifyPrincipalCertificate(principalCert, pinnedMasterPubkey, nowMs);
+
+  // Migration-safe node expiry: legacy node certs with no expires_at remain
+  // non-expiring, but any present expiry is signed below and enforced here.
+  if (cert.certificate_version !== undefined) {
+    if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} has unsupported certificate_version ${cert.certificate_version}`
+      );
+    }
+    if (!cert.expires_at) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} has certificate_version without expires_at`
+      );
+    }
+  }
+  if (cert.expires_at) {
+    if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} missing certificate_version ${NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING}`
+      );
+    }
+    const expiresMs = Date.parse(cert.expires_at);
+    if (Number.isNaN(expiresMs) || expiresMs < nowMs) {
+      throw new MeshChainError(
+        `node cert ${cert.node_id} expired at ${cert.expires_at}`
+      );
+    }
+  }
 
   // Walk the lower hop: node → principal.
   const body = {
+    certificate_version: cert.certificate_version,
     node_id: cert.node_id,
     node_pubkey: cert.node_pubkey,
     node_mode: cert.node_mode,
     fortress_id: cert.fortress_id,
     joined_at: cert.joined_at,
+    expires_at: cert.expires_at,
     capabilities: cert.capabilities,
     parent_chain: cert.parent_chain,
     tee_attestation_hash: cert.tee_attestation_hash,
@@ -330,6 +380,135 @@ export function verifyCertChain(
  */
 export function v01VisibleCapabilities(cert: NodeIdentityCertificate): number {
   return cert.capabilities & V01_ALLOWED_CAPABILITY_MASK;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Root-rotation certificate (rotate-root --renew, Slice 3a)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * The exact canonical body the OLD master signs and a verifier reconstructs.
+ * Signature-bearing fields are excluded. Field set + ordering is the FROZEN wire
+ * surface for the cert (Slice 3b joiner-adopt verifies against this).
+ */
+function rotationCertSignedBody(
+  cert: Pick<
+    FederationRootRotationCertificate,
+    "kind" | "fortress_id" | "old_master_pubkey" | "new_master" | "rotation_serial" | "rotated_at"
+  >,
+) {
+  return {
+    kind: cert.kind,
+    fortress_id: cert.fortress_id,
+    old_master_pubkey: cert.old_master_pubkey,
+    new_master: {
+      public_key: cert.new_master.public_key,
+      fortress_id: cert.new_master.fortress_id,
+      created_at: cert.new_master.created_at,
+    },
+    rotation_serial: cert.rotation_serial,
+    rotated_at: cert.rotated_at,
+  };
+}
+
+/**
+ * Sign a federation root-rotation certificate with the OLD master private key.
+ *
+ * Renewal-path adoption artifact: K1 attests that K2 (`new_master`) succeeds it
+ * under the SAME stable fortress_id at a strictly-monotonic `rotation_serial`.
+ * The caller MUST zero `old_master_private_key` after return (constraint 6). The
+ * returned cert is PUBLIC (an old-key signature over a public key).
+ */
+export function signFederationRootRotationCertificate(params: {
+  fortress_id: string;
+  old_master_pubkey: string;
+  new_master: FortressMasterPublicKey;
+  old_master_private_key: Uint8Array;
+  rotation_serial: number;
+  rotated_at?: string;
+}): FederationRootRotationCertificate {
+  if (!Number.isInteger(params.rotation_serial) || params.rotation_serial < 1) {
+    throw new MeshChainError(
+      "rotation_serial must be a positive integer (a renewal always advances the serial)",
+    );
+  }
+  if (params.new_master.fortress_id !== params.fortress_id) {
+    throw new MeshChainError(
+      "rotation cert new_master.fortress_id must equal the stable fortress_id (renewal preserves identity)",
+    );
+  }
+  const body = rotationCertSignedBody({
+    kind: FEDERATION_ROOT_ROTATION_KIND,
+    fortress_id: params.fortress_id,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master: params.new_master,
+    rotation_serial: params.rotation_serial,
+    rotated_at: params.rotated_at ?? new Date().toISOString(),
+  });
+  const sig = ed25519.sign(canonicalizeToBytes(body), params.old_master_private_key);
+  return {
+    ...body,
+    old_master_signature: toBase64url(sig),
+  };
+}
+
+/**
+ * Verify a federation root-rotation certificate against the master a verifier
+ * CURRENTLY pins (the OLD master K1). Throws MeshChainError on any failure.
+ *
+ * Hard checks (Slice 3a / 3b safety):
+ *   - kind is the rotation domain tag (no shape confusion);
+ *   - the cert names the pinned (old) master as the signer and the SAME
+ *     fortress_id (fortress identity is preserved across renewal);
+ *   - the new master carries that same fortress_id;
+ *   - the signature verifies under the pinned OLD master public key;
+ *   - if `minSerial` is supplied (the serial the verifier has already adopted),
+ *     the cert's serial MUST strictly advance it (replay / rollback rejected).
+ */
+export function verifyFederationRootRotationCertificate(
+  cert: FederationRootRotationCertificate,
+  pinnedOldMaster: FortressMasterPublicKey,
+  opts: { minSerial?: number } = {},
+): void {
+  if (cert.kind !== FEDERATION_ROOT_ROTATION_KIND) {
+    throw new MeshChainError(
+      `rotation cert kind=${String(cert.kind)} is not ${FEDERATION_ROOT_ROTATION_KIND}`,
+    );
+  }
+  if (cert.fortress_id !== pinnedOldMaster.fortress_id) {
+    throw new MeshChainError(
+      `rotation cert fortress_id=${cert.fortress_id} does not match the pinned master fortress_id=${pinnedOldMaster.fortress_id} (fortress identity is preserved across renewal)`,
+    );
+  }
+  if (cert.old_master_pubkey !== pinnedOldMaster.public_key) {
+    throw new MeshChainError(
+      "rotation cert old_master_pubkey does not match the master this verifier currently pins",
+    );
+  }
+  if (cert.new_master.fortress_id !== pinnedOldMaster.fortress_id) {
+    throw new MeshChainError(
+      "rotation cert new_master.fortress_id does not match the stable fortress_id",
+    );
+  }
+  if (!Number.isInteger(cert.rotation_serial) || cert.rotation_serial < 1) {
+    throw new MeshChainError("rotation cert rotation_serial must be a positive integer");
+  }
+  if (opts.minSerial !== undefined && cert.rotation_serial <= opts.minSerial) {
+    throw new MeshChainError(
+      `rotation cert rotation_serial=${cert.rotation_serial} does not advance the adopted serial ${opts.minSerial} (stale / replayed rotation rejected)`,
+    );
+  }
+  const body = rotationCertSignedBody(cert);
+  const ok = ed25519.verify(
+    fromBase64url(cert.old_master_signature),
+    canonicalizeToBytes(body),
+    fromBase64url(pinnedOldMaster.public_key),
+  );
+  if (!ok) {
+    throw new MeshChainError(
+      "rotation cert signature does not verify under the pinned (old) fortress-master",
+    );
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

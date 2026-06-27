@@ -154,6 +154,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
     const verified = await verifyExitBundle(bundleDir);
     expect(verified.passed).toBe(true);
     expect(verified.reputation?.bundle_signature_valid).toBe(true);
+    expect(verified.reputation?.completeness).toBe("verified");
     expect(verified.reputation?.verified_attestations).toBe(1);
     expect(verified.audit?.individual_signatures_verified).toBe(false);
     expect(verified.unsupported_artifacts.join("\n")).toContain(

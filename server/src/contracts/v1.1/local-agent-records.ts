@@ -30,15 +30,18 @@ import type { HubAgentStatus } from "./constants.js";
  * <path>` path and surface as `generic_mcp`. When a dedicated LangGraph
  * adapter ships, add `langgraph` here in the same PR.
  */
-export type LocalHarnessKind =
-  | "openclaw"
-  | "hermes"
-  | "claude_code"
-  | "cursor"
-  | "cline"
-  | "mastra"
-  | "generic_mcp"
-  | "other";
+export const LOCAL_HARNESS_KINDS = [
+  "openclaw",
+  "hermes",
+  "claude_code",
+  "cursor",
+  "cline",
+  "mastra",
+  "generic_mcp",
+  "other",
+] as const;
+
+export type LocalHarnessKind = (typeof LOCAL_HARNESS_KINDS)[number];
 
 /**
  * Provider category for the underlying model. Distinct from the privacy

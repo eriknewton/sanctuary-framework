@@ -52,7 +52,8 @@ const WRITER_PRIVATE_KEY = new Uint8Array([
   0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
   0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
 ]);
-const STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
+const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
+const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
 const ANCHORS_KEY = "state-envelope-version-anchors-v1";
 
 function fixture(name: string): Fixture {
@@ -73,8 +74,13 @@ function canonicalize(value: unknown): unknown {
 }
 
 function signingBytes(envelope: StateEntry["envelope"]): Uint8Array {
+  const schemaVersion = envelope?.metadata.schema_version ?? 2;
+  const domain =
+    schemaVersion <= 2
+      ? LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN
+      : `${STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX}${schemaVersion}\n`;
   return stringToBytes(
-    STATE_ENVELOPE_SIGNING_DOMAIN + JSON.stringify(canonicalize(envelope))
+    domain + JSON.stringify(canonicalize(envelope))
   );
 }
 

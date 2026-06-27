@@ -3,9 +3,10 @@
  *
  * PR 2a public surface: lifecycle wrapper, IPC client, manifest publisher,
  * audit consumer, approval stub, installer plan helper, firewall detection,
- * curated-allowlist data. PR 2b adds the daemon-process supervisor and
- * binds the actual Linux UDS transport on top of the IPC client; PR 5
- * replaces the approval stub with the menubar UI.
+ * curated-allowlist data. The Linux daemon launcher + UDS transport + audit
+ * drain pull-loop (the "PR 2b" piece) and the opt-in producer-signed activation
+ * gate (C4) bind the real Linux path on top of the IPC client; PR 5 replaces
+ * the approval stub with the menubar UI.
  *
  * Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 4-8).
  */
@@ -22,3 +23,6 @@ export * from "./lifecycle.js";
 export * from "./macos-flow-events.js";
 export * from "./macos-ipc-listener.js";
 export * from "./macos-daemon.js";
+export * from "./linux-daemon.js";
+export * from "./linux-audit-drain.js";
+export * from "./linux-activation-gate.js";

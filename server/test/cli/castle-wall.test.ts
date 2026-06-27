@@ -17,6 +17,7 @@ import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import {
   parseCastleWallArgs,
+  runDaemon,
   runProvisionPin,
   runRePin,
   runAuditDump,
@@ -26,6 +27,7 @@ import {
   runStatus,
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
+import { LINUX_PRODUCER_SIGNED_ACTIVATION_ENV } from "../../src/castle-wall/runtime/linux-activation-gate.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
@@ -76,7 +78,7 @@ describe("castle-wall CLI verbs", () => {
     const { fortressPath, recoveryKey } = await makeFortress();
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const code = await runProvisionPin({
+    const code = await runProvisionPin([], {
       out,
       err,
       env: {
@@ -108,7 +110,7 @@ describe("castle-wall CLI verbs", () => {
 
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const code = await runProvisionPin({
+    const code = await runProvisionPin([], {
       out,
       err,
       env: {
@@ -123,6 +125,50 @@ describe("castle-wall CLI verbs", () => {
     expect(Buffer.compare(after, existing)).toBe(0);
     expect(out.text()).toContain(fingerprint(existing));
     expect(out.text()).toContain("Pinned key already provisioned");
+  });
+
+  it("provision-pin honors the --fortress flag over a stale SANCTUARY_STORAGE_PATH", async () => {
+    // Regression for the 2026-06-24 stock-CLI drill: provision-pin DROPPED its
+    // subcommand-level `--fortress` arg and read SANCTUARY_STORAGE_PATH only, so
+    // `castle-wall provision-pin --fortress <good>` loaded the custody envelope
+    // from a DIFFERENT (stale) fortress and failed with "custody envelope exists
+    // but has an unsupported shape or version" - while federation/identity verbs
+    // against the SAME --fortress path worked. The flag must win, like every
+    // other custody verb.
+    const { fortressPath, recoveryKey } = await makeFortress();
+
+    // A DIFFERENT directory pointed at by SANCTUARY_STORAGE_PATH that holds a
+    // malformed (unsupported v:2) custody envelope - the exact thing the reader
+    // refuses. provision-pin must NOT read this one.
+    const staleStoragePath = await mkdtemp(join(tmpdir(), "sanctuary-cw-stale-"));
+    tempDirs.push(staleStoragePath);
+    const staleStorage = new FilesystemStorage(join(staleStoragePath, "state"));
+    await staleStorage.write(
+      "_meta",
+      "custody-envelope",
+      stringToBytes(
+        JSON.stringify({ v: 2, install_mode: "interactive", wraps: [], mac: "x" }),
+      ),
+    );
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runProvisionPin(["--fortress", fortressPath], {
+      out,
+      err,
+      env: {
+        // Stale path that, if (wrongly) honored, throws "unsupported shape".
+        SANCTUARY_STORAGE_PATH: staleStoragePath,
+        SANCTUARY_RECOVERY_KEY: recoveryKey,
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("unsupported shape");
+    // The pin must be written into the FLAG-named fortress, not the stale path.
+    const pub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+    expect(pub.length).toBe(32);
+    expect(out.text().trim()).toBe(fingerprint(pub));
   });
 
   it("status with pinned key", async () => {
@@ -241,6 +287,48 @@ describe("castle-wall CLI verbs", () => {
       expect(code).toBe(0);
       expect(out.text()).toContain("Content filter: enabled");
       expect(calls).toEqual([[hostAppPath, "--headless", "status"]]);
+    });
+
+    it("labels the dead-man lease as a broadcast distinct from live filter state", async () => {
+      const { fortressPath, hostAppPath } = await makeDarwinFixture();
+      await writeFile(
+        join(fortressPath, "castle-wall-lease.json"),
+        JSON.stringify(
+          {
+            armed: false,
+            ttl_seconds: null,
+            heartbeat_interval_seconds: 5,
+            updated_at: "2026-06-26T08:00:00.000Z",
+            source: "castle-wall-cli",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      const out = new CaptureStream();
+      const { invoke } = statusInvoker({
+        stdout:
+          JSON.stringify({ ok: true, action: "status", state: "enabled" }) +
+          "\n",
+        exitCode: 0,
+      });
+
+      const code = await runStatus({
+        out,
+        env: { SANCTUARY_STORAGE_PATH: fortressPath },
+        platform: "darwin",
+        execSyncFn: () =>
+          "com.sanctuary.castle-wall [activated enabled] (state: enabled)",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("Content filter: enabled");
+      expect(out.text()).toContain(
+        "Dead-man lease broadcast: disarmed; content-filter=enabled; ttl=none (--no-ttl); heartbeat=5s; updated=2026-06-26T08:00:00.000Z",
+      );
+      expect(out.text()).not.toContain("Dead-man lease: disarmed");
     });
 
     it("reports the filter disabled (sysext installed but not filtering)", async () => {
@@ -844,7 +932,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     await seedBrokenChain(fortressPath, masterKey);
 
@@ -877,7 +965,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     await seedBrokenChain(fortressPath, masterKey);
 
@@ -917,7 +1005,7 @@ describe("castle-wall audit-chain operator override", () => {
       SANCTUARY_RECOVERY_KEY: recoveryKey,
     };
     expect(
-      await runProvisionPin({ out: new CaptureStream(), err: new CaptureStream(), env }),
+      await runProvisionPin([], { out: new CaptureStream(), err: new CaptureStream(), env }),
     ).toBe(0);
     // No seedBrokenChain: the chain is clean.
 
@@ -1419,5 +1507,73 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     expect(out.text()).toContain(
       `Global pin (enforcement anchor): ${fingerprint(helper.pub)}`,
     );
+  });
+
+  // ── FIX 3 (codex HIGH): the daemon entrypoint ROUTES opt-in Linux to the
+  //    producer-signed gate, and everything else to the macOS/channel path. ──
+  describe("runDaemon routing (FIX 3)", () => {
+    it("Linux WITHOUT the opt-in flag stays macOS-only (routes to the channel/macOS path, refuses Linux)", async () => {
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: { SANCTUARY_STORAGE_PATH: "/nonexistent/fortress" }, // no opt-in flag
+        platform: "linux",
+      });
+      expect(code).toBe(1);
+      // The default (non-opt-in) Linux posture: unsupported, pointed at the flag.
+      expect(err.text()).toMatch(/macOS-only by default/);
+      expect(err.text()).toMatch(/SANCTUARY_CASTLE_LINUX_PRODUCER_SIGNED=1/);
+    });
+
+    it("Linux WITH the opt-in flag routes PAST the macOS-only guard into the producer-signed path", async () => {
+      const { fortressPath } = await makeFortress();
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      // Opted in on Linux: must NOT print the macOS-only refusal. With no pinned
+      // key provisioned it fails at pin resolution (a Linux-path failure), which
+      // proves it routed past the guard rather than bailing as macOS-only.
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
+        },
+        platform: "linux",
+      });
+      expect(code).toBe(1);
+      expect(err.text()).not.toMatch(/macOS-only/);
+      // It reached the Linux-capable daemon flow (pin / credential resolution).
+      expect(err.text()).toMatch(/No pinned key found|Refusing to start|fail-closed/i);
+    });
+
+    it("macOS keeps the existing macOS daemon path (never the Linux gate)", async () => {
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      // Even with the (Linux-only) flag set, darwin must NOT route to the Linux
+      // gate. With no pinned key it fails at the macOS pin read, not at a Linux
+      // producer-signed error.
+      const code = await runDaemon([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: "/nonexistent/fortress",
+          [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
+        },
+        platform: "darwin",
+      });
+      expect(code).toBe(1);
+      // The macOS path: it did NOT bail as "macOS-only" and did NOT enter the
+      // Linux producer-signed gate. The specific downstream failure (pin read /
+      // passphrase / establishMaster) depends on host Keychain state, so we
+      // assert the ROUTING (no Linux-gate involvement), not the exact failure.
+      expect(err.text()).not.toMatch(/macOS-only/);
+      expect(err.text()).not.toMatch(/Linux producer-signed/);
+      expect(err.text()).not.toMatch(/fail-closed.*not armed/i);
+      // It reached the real macOS daemon flow (a pin / credential failure).
+      expect(err.text()).toMatch(/No pinned key found|Refusing to start/i);
+    });
   });
 });

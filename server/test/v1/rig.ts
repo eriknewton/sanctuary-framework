@@ -59,6 +59,13 @@ export function stubIdentityManager(publicKey: Uint8Array): IdentityManager {
 
 export async function startRig(opts?: {
   withOperatorIdentity?: boolean;
+  /**
+   * Resolve the daemon's operator identity to THIS public key instead of the
+   * suite-wide {@link OPERATOR}. Used by the CLI session-gap test, where the
+   * verb signs with a real seeded-fortress operator key the daemon must accept.
+   * Implies `withOperatorIdentity`.
+   */
+  operatorPublicKey?: Uint8Array;
 }): Promise<TestRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
@@ -88,9 +95,11 @@ export async function startRig(opts?: {
     } as never,
     baseline: { load: async () => {}, save: async () => {} } as never,
     auditLog,
-    ...(opts?.withOperatorIdentity
-      ? { identityManager: stubIdentityManager(OPERATOR.publicKey) }
-      : {}),
+    ...(opts?.operatorPublicKey
+      ? { identityManager: stubIdentityManager(opts.operatorPublicKey) }
+      : opts?.withOperatorIdentity
+        ? { identityManager: stubIdentityManager(OPERATOR.publicKey) }
+        : {}),
   });
 
   await dashboard.start();

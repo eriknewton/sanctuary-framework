@@ -465,6 +465,17 @@ export function generateDashboardHTML(options: {
       gap: 16px;
     }
 
+    .operator-cloud-disclosure {
+      display: none;
+      border: 1px solid var(--amber);
+      background-color: rgba(210, 153, 34, 0.08);
+      color: var(--text-primary);
+      border-radius: 6px;
+      padding: 12px 14px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
     .layer-card {
       background-color: var(--surface);
       border: 1px solid var(--border);
@@ -1490,6 +1501,8 @@ export function generateDashboardHTML(options: {
         </div>
       </div>
 
+      <div id="operator-cloud-disclosure" class="operator-cloud-disclosure"></div>
+
       <!-- Row 2: Info Cards -->
       <div class="info-cards">
         <div class="info-card">
@@ -2008,6 +2021,23 @@ export function generateDashboardHTML(options: {
       if (score < 40) badge.classList.add('inactive');
 
       updateLayerCards(data);
+      updateOperatorCloudDisclosure(data.federation);
+    }
+
+    function updateOperatorCloudDisclosure(federation) {
+      const el = document.getElementById('operator-cloud-disclosure');
+      if (!el) return;
+      const boundary = federation?.trust_boundary;
+      if (!boundary || !boundary.operator_cloud_nodes) {
+        el.style.display = 'none';
+        el.textContent = '';
+        return;
+      }
+      const label = boundary.provider_in_trust_boundary
+        ? 'provider in trust boundary, not TEE'
+        : 'local operator host';
+      el.textContent = label + ': ' + (boundary.disclosure || '');
+      el.style.display = 'block';
     }
 
     function updateLayerCards(data) {

@@ -26,6 +26,61 @@ export const CASTLE_WALL_AUDIT_PROVENANCE_KEY = "cw_source" as const;
 export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
   "castle_wall_audit_consumer" as const;
 
+/**
+ * Audit operation name for the periodic Castle Wall daemon LIVENESS heartbeat
+ * (observability Slice 2). The daemon appends an `l1` audit entry under this
+ * operation on an audit-cadence interval (~30-60s), stamped with the same
+ * `cw_source` provenance marker and producer-signature basis that enforcement
+ * evidence uses, so the reader can tell an alive-but-idle wall from one that
+ * silently died in a quiet window.
+ *
+ * HONESTY: a heartbeat proves the daemon process is ALIVE, NOT that it
+ * adjudicated a real flow. It is deliberately kept OUT of
+ * `CASTLE_WALL_ENFORCEMENT_OPERATIONS` so it can NEVER earn the green
+ * `armed`/`active` light on its own (green stays gated on
+ * `egress_allowed`/`egress_blocked`/`operator_decision`). It only moves the
+ * ABSENCE-of-evidence case from `unknown` toward an honest dead-vs-idle split.
+ *
+ * This is a NEW at-rest audit operation string (documented per the
+ * frozen-surface rule); it is not a wire message type and does not alter any
+ * existing display string.
+ */
+export const CASTLE_WALL_HEARTBEAT_OPERATION = "castle_wall_heartbeat" as const;
+
+/**
+ * Audit operation name for an INTENTIONAL arm-lease stand-down (observability
+ * Slice 2 false-RED fix). The daemon appends an `l1` audit entry under this
+ * operation when `onArmLeaseRevoke` stands the wall down (the operator revoked
+ * the arm lease), stamped with the same `cw_source` provenance marker the
+ * heartbeat carries.
+ *
+ * WHY IT EXISTS: a clean operator stop (`filter_stopped`) and an arm-lease
+ * revoke both stop the liveness heartbeat. With NO recorded reason, that
+ * heartbeat-then-silent pattern is indistinguishable from a daemon that was
+ * KILLED mid-flight, so the silent-death reader (`feature-health.ts`) would
+ * raise a false-RED `dead_no_heartbeat` alarm for the whole digest window. A
+ * clean stop already files `filter_stopped`; a lease revoke filed NOTHING, so
+ * this op gives the revoke path the same recognizable "stood down on purpose"
+ * signal. Only a GENUINE silent death (process killed / sysext unbound before
+ * it could announce) now leaves no stand-down signal at all.
+ *
+ * TRUST BASIS (read this before treating it as an alarm-suppressor): this is a
+ * DIRECT channel-basis audit append (marker only, no producer signature),
+ * EXACTLY like the heartbeat itself. An in-process writer that can forge a
+ * channel-basis heartbeat can already suppress the silent-death alarm into
+ * `unknown`; a forged stand-down marker is no more powerful (the reader only
+ * lets it relabel `fault` -> a non-green `unknown`, NEVER green). It is gated
+ * read-side with `livenessEntryCounts`, the SAME gate the heartbeat uses, so it
+ * introduces NO weaker trust basis than the alarm it relabels (see
+ * `principal-policy/feature-health.ts`).
+ *
+ * This is a NEW at-rest audit operation string (documented per the
+ * frozen-surface rule); it is not a wire message type and does not alter any
+ * existing display string.
+ */
+export const CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION =
+  "arm_lease_revoked" as const;
+
 /** Ed25519 signature scheme tag used in manifest envelopes (matches federation v0.1). */
 export const CASTLE_WALL_SIGNATURE_SCHEME_V1 = "ed25519-v1" as const;
 

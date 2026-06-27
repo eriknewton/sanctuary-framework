@@ -72,6 +72,9 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "application/did+json; charset=utf-8",
   "identity.sanctuaryprotocol.ai",
   "privacy-filter-tier-2",
+  // federation rotate-root rotation-certificate kind tag (Slice 3a; the joiner
+  // adopt side in 3b verifies this exact wire value):
+  "federation-root-rotation",
 
   // --- public TS export symbols (root index.ts surface) ---
   "L1Status",
@@ -122,6 +125,13 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "audit-rotation-anchor",
   "identity-encryption",
   "bridge-commitments",
+  "federation-trust-root",
+  "federation-joiner-trust-root",
+  "federation-bootstrap-nonce-spent-set",
+  "federation-operator-cloud-provision-claim-set",
+  "federation-sync-state",
+  "operator-cloud-joined-node",
+  "federation-rotate-root-journal-mac",
   "custody-envelope-mac",
   "custody-sentinel",
   "state-meta-mac",
@@ -149,6 +159,22 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "principal-policy-unified-inbox-operator-prefs-v1",
   "principal-policy-unified-inbox-retention-policy-v1",
 
+  // --- post-quantum (hybrid Ed25519+ML-DSA-65) signing-suite + cert-version
+  // literals (the at-rest/on-wire PQC trap). These tag the bundle/domain and
+  // the v2 hybrid fortress-master/principal-cert/node-cert/root-rotation
+  // surfaces. Changing a byte breaks verify of existing hybrid certs and
+  // decrypt/verify of existing v2 fortresses, and it fails SILENTLY
+  // (fresh-install tests still pass). See crypto-suite-registry.ts +
+  // mesh/trust-root-hybrid.ts. A vocabulary/reorg sweep must NEVER touch these.
+  "sanctuary.signature-bundle.v1",
+  "sanctuary.signed-surface.v1",
+  "ed25519+ml-dsa-v1",
+  "ml-dsa-65-v1",
+  "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.node-cert.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.root-rotation.v2.hybrid-ed25519-ml-dsa-65",
+
   // --- persisted at-rest keys / namespaces (renaming orphans on-disk state) ---
   "SANCTUARY_EXIT_BUNDLE_V1",
   "_composition",
@@ -166,6 +192,10 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "_query_anonymity_tier_b",
   "_query_anonymity_reverse_map",
   "_facade/hidden",
+  // federation rotate-root at-rest keys (Slice 3a; renaming orphans an
+  // in-progress rotation's staged record / journal):
+  "trust-root-v1-next",
+  "rotate-root-journal",
 
   // --- frozen versioned HTTP / served route paths ---
   "/v1/agents/protect",
