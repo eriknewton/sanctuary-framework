@@ -1149,6 +1149,40 @@ export function renderPostureHomeHTML(): string {
       : "This machine is not in good standing and is shown untrusted.";
   }
 
+  // Fleet-wide sync-health rollup (A1). LIVENESS only: it reports how many
+  // machines are currently in touch, NEVER a trust claim. It uses the muted reach
+  // vocabulary (not a green/red trust pill) so a reachable-but-revoked node can
+  // never read as "all well." Honest when nothing has ever synced.
+  function fleetSyncHealthLine(h) {
+    if (!h) return "";
+    var parts = [];
+    if (h.reachable) parts.push(esc(h.reachable) + " in touch");
+    if (h.stale) parts.push(esc(h.stale) + " no recent sync");
+    if (h.never) parts.push(esc(h.never) + " never synced");
+    var summary = parts.length ? parts.join(" · ") : "no sync activity yet";
+    var frontier = h.oldest_last_sync
+      ? " · oldest sync " + esc(h.oldest_last_sync)
+      : "";
+    return '<div class="evidence">Fleet reach (liveness, not trust): ' +
+      summary + frontier + "</div>";
+  }
+
+  // Signed-policy-distribution status (A2). The marquee includes "distribute a
+  // signed operator policy to all machines," but that rail is not yet built. Tell
+  // the operator the honest truth: it is on the roadmap and NOT yet available.
+  // NEVER render a fabricated "distributed" state. Amber, never green.
+  function fleetPolicyDistributionLine(pd) {
+    if (!pd || pd.available !== true) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">not yet available</span> &nbsp;' +
+        "Signed policy distribution to the fleet is on the roadmap. " +
+        "Today you distribute trust (admit / revoke / rotate); " +
+        "pushing a signed operator policy fleet-wide is not yet built.</div>";
+    }
+    // Reserved for when the real rail lands; today this branch is unreachable.
+    return "";
+  }
+
   function renderFleet(roster) {
     var section = document.getElementById("fleet-section");
     var el = document.getElementById("fleet");
@@ -1173,7 +1207,9 @@ export function renderPostureHomeHTML(): string {
       '<div class="evidence">Fleet ' + (roster.enabled ? "on" : "off") +
       " · this machine <code>" + esc(roster.node_id) + "</code>" +
       " · fortress <code>" + esc(roster.fortress_id) + "</code>" +
-      " · eviction serial " + esc(roster.eviction_serial) + "</div>";
+      " · eviction serial " + esc(roster.eviction_serial) + "</div>" +
+      fleetSyncHealthLine(roster.sync_health) +
+      fleetPolicyDistributionLine(roster.policy_distribution);
     var nodes = roster.nodes || [];
     if (!nodes.length) {
       el.innerHTML = head +
