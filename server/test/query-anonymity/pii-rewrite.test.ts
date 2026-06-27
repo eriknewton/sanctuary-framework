@@ -59,6 +59,8 @@ import {
   PII_REWRITE_API_PREFIX,
   handlePiiRewriteRoute,
   emitPiiRewriteAudit,
+  effectiveTierBEnabled,
+  TIER_B_INACTIVE_REASON,
 } from "../../src/query-anonymity/pii-rewrite-routes.js";
 
 const FORTRESS_A = "fortress_a";
@@ -587,6 +589,89 @@ describe("Rho-2 HTTP routes", () => {
     }
   });
 
+  it("GET config surfaces the true (inactive) effective Tier B state", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: {
+          effective_tier_b_enabled: boolean;
+          inactive_reason: string | null;
+        };
+      };
+      expect(body.data.effective_tier_b_enabled).toBe(false);
+      expect(body.data.inactive_reason).toBe(TIER_B_INACTIVE_REASON);
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH config does NOT report effective_tier_b_enabled=true while inactive (response body)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          consented_to_trade_off: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: {
+          config: { enabled: boolean };
+          effective_tier_b_enabled: boolean;
+          inactive_reason: string | null;
+        };
+      };
+      // The operator's preference is persisted...
+      expect(body.data.config.enabled).toBe(true);
+      // ...but the surface must NOT claim the protection is active.
+      expect(body.data.effective_tier_b_enabled).toBe(false);
+      expect(body.data.inactive_reason).toBe(TIER_B_INACTIVE_REASON);
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH config audit event reports the true (inactive) effective state, not the inert toggle", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: true,
+          smart_mode_enabled: true,
+          consented_to_trade_off: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const updated = audit.entries.find(
+        (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED,
+      );
+      expect(updated).toBeDefined();
+      // Stored preference is recorded honestly...
+      expect(updated?.details?.["enabled"]).toBe(true);
+      expect(updated?.details?.["smart_mode_enabled"]).toBe(true);
+      // ...but the EFFECTIVE state is false (no redactor wired), and the
+      // reason is recorded. The old code emitted
+      // `enabled || smart_mode_enabled` (would be true) here.
+      expect(updated?.details?.["effective_tier_b_enabled"]).toBe(false);
+      expect(updated?.details?.["inactive_reason"]).toBe(
+        TIER_B_INACTIVE_REASON,
+      );
+    } finally {
+      await close();
+    }
+  });
+
   it("POST /api/query-anonymity/pii/rewrite previews regex-only redaction", async () => {
     const rig = makeRig();
     const { base, close } = await makeServer(rig);
@@ -644,6 +729,34 @@ describe("Rho-2 audit emission helper", () => {
     expect(
       (entry?.details?.["redaction_counts"] as Record<string, number>).email,
     ).toBe(1);
+  });
+});
+
+describe("Rho-2 Tier B honesty (never-overclaim)", () => {
+  it("explainer carries a not-yet-active notice", () => {
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("not yet active");
+  });
+
+  it("explainer no longer asserts an active 'never crosses the outbound boundary' protection", () => {
+    // The present-tense overclaim ("Your original text never crosses
+    // the outbound boundary") must be gone; any boundary language must
+    // be future-tense/conditional. Guard against the exact prior copy.
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
+      "Your original text never crosses the outbound boundary",
+    );
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain("never crosses");
+  });
+
+  it("explainer describes the protection in the future tense, not as currently-on", () => {
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("once active");
+    // No present-tense active-protection claim at the top.
+    expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
+      "scrubs personal information from your queries\nbefore they reach",
+    );
+  });
+
+  it("effectiveTierBEnabled() is false until the redactor is wired", () => {
+    expect(effectiveTierBEnabled()).toBe(false);
   });
 });
 

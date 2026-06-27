@@ -118,19 +118,39 @@ export const PII_REWRITE_LLM_SURFACE: Surface = "privacy-filter-tier-2";
  * this verbatim so the operator reads the same text whether they're
  * in the CLI, the dashboard, or a downstream consumer. Length-capped
  * because dashboards have small footers.
+ *
+ * Honesty (never-overclaim rule): this copy MUST NOT assert an active
+ * protection the live path does not yet perform. The PII rewriter is
+ * not wired into the production substrate-selector path (the deferred
+ * Rho-2.5 boot-wiring), so live queries are NOT scrubbed before they
+ * reach the substrate in this build. The explainer therefore leads
+ * with a not-yet-active notice and describes the protection in the
+ * future tense until the live wiring lands. See `feature-health.ts`
+ * (the `privacy_strips` row reads amber/unconfirmed for the same
+ * reason) and the DEBT note in `pii-rewrite-routes.ts`.
  */
 export const PII_TRADE_OFF_EXPLAINER = [
-  "Tier B PII rewrite scrubs personal information from your queries",
-  "before they reach the LLM substrate (Claude, GPT, local model).",
+  "Tier B PII rewrite is designed to scrub personal information from",
+  "your queries before they reach the LLM substrate (Claude, GPT,",
+  "local model).",
   "",
-  "What it protects:",
+  "Note: automatic scrubbing of live queries is not yet active in",
+  "this build. Turning Tier B on records your preference and consent,",
+  "but it does NOT rewrite queries before they reach the substrate",
+  "yet. The preview below shows what WILL be removed once live",
+  "scrubbing ships; until then, treat this as off for protection",
+  "purposes. The always-on privacy step that DOES fire on every call",
+  "is the separate Tier A header strip.",
+  "",
+  "What it will protect (once active):",
   "  - Emails, phone numbers, SSNs, IPs, credit cards, street",
-  "    addresses, and obvious name patterns get replaced with",
+  "    addresses, and obvious name patterns will be replaced with",
   "    placeholders before the call.",
-  "  - The substrate receives only the rewritten text. Your original",
-  "    text never crosses the outbound boundary.",
+  "  - The substrate will receive only the rewritten text, so your",
+  "    original text will not cross the outbound boundary once live",
+  "    scrubbing is wired in.",
   "",
-  "What it costs:",
+  "What it costs (once active):",
   "  - Substrates work less well when they cannot see the real",
   "    values. A query like 'email Alex about the rent' becomes",
   "    'email [NAME_0] about the rent', and the response loses",
@@ -141,8 +161,9 @@ export const PII_TRADE_OFF_EXPLAINER = [
   "    ships in iteration-14; until then, the placeholder shows",
   "    through.",
   "",
-  "This is OFF by default. Turn it on per-fortress (every query) or",
-  "per-query (one shot). You can turn it off again at any time.",
+  "This is OFF by default. You can record consent and your preference",
+  "now; live scrubbing engages once the boot-wiring follow-up lands.",
+  "You can turn it off again at any time.",
 ].join("\n");
 
 // ── Regex first-pass ─────────────────────────────────────────────────
