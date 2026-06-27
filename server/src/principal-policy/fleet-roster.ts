@@ -94,6 +94,58 @@ export interface FleetRosterNode {
   last_seen: string;
 }
 
+/**
+ * Fleet-wide sync-health rollup (Marquee A1).
+ *
+ * This is a LIVENESS rollup over the per-node `reach` axis the presenter already
+ * computes; it is NOT a trust signal and never an input to any trust verdict. It
+ * answers the operator's "is my whole fleet currently in touch?" question at a
+ * glance, derived ONLY from data already on the per-node view, so it cannot
+ * launder a revoked node into looking healthy: a `revoked` node with a `recent`
+ * reach still counts as `reachable` here AND stays `revoked` in the trust summary.
+ * The two axes stay separate by construction.
+ *
+ * `oldest_last_sync` is the earliest `last_sync_received_at` across nodes that
+ * have ever synced (null when no node has ever synced), so the operator can see
+ * the staleness frontier without scanning every row.
+ */
+export interface FleetSyncHealth {
+  /** Nodes whose last sync was inside the freshness window. */
+  reachable: number;
+  /** Nodes that have synced before but not inside the freshness window. */
+  stale: number;
+  /** Nodes that have never been heard from. */
+  never: number;
+  /**
+   * The earliest `last_sync_received_at` across nodes that have EVER synced, or
+   * null when no node has ever synced. The staleness frontier of the fleet.
+   */
+  oldest_last_sync: string | null;
+  /** The freshness window (ms) the `reachable`/`stale` split was computed with. */
+  freshness_window_ms: number;
+}
+
+/**
+ * Honest signed-policy-distribution status (Marquee A2).
+ *
+ * The marquee experience includes "distribute a signed operator policy to all of
+ * them," but that RAIL is not yet built in the federation layer (there is no
+ * operator-signed policy-bundle event kind, no per-node applied-policy version,
+ * no distribution path). Rather than silently omit the capability or fabricate a
+ * "distributed" state, the console states the honest truth: the capability is on
+ * the roadmap and NOT yet available. This is honest-absence product copy, never a
+ * green claim. When the real rail lands, `available` flips to true and per-node
+ * applied-policy state replaces this placeholder.
+ */
+export interface FleetPolicyDistribution {
+  /**
+   * Always `false` today: signed operator policy distribution to the fleet is not
+   * yet built. The console renders an honest "coming, not yet available" line, not
+   * a fabricated distributed state. NEVER green while this is false.
+   */
+  available: false;
+}
+
 /** The full fleet roster the console renders. */
 export interface FleetRoster {
   /**
@@ -126,6 +178,18 @@ export interface FleetRoster {
     /** Nodes whose trust could not be evaluated (fail-closed to untrusted). */
     untrusted: number;
   };
+  /**
+   * Fleet-wide sync-health rollup (A1). Liveness only, never a trust input; see
+   * `FleetSyncHealth`. Present whenever the roster is `available`.
+   */
+  sync_health: FleetSyncHealth;
+  /**
+   * Honest signed-policy-distribution status (A2). Today always
+   * `{ available: false }`: the distribution rail is not yet built, and the
+   * console says so rather than omitting or fabricating it. See
+   * `FleetPolicyDistribution`.
+   */
+  policy_distribution: FleetPolicyDistribution;
 }
 
 /**
@@ -145,6 +209,50 @@ function classifyReach(
   const receivedMs = Date.parse(receivedAt);
   if (Number.isNaN(receivedMs)) return "never";
   return now - receivedMs <= freshnessWindowMs ? "recent" : "stale";
+}
+
+/**
+ * Build the fleet-wide sync-health rollup (A1) from the already-classified
+ * presenter rows. Pure over the rows: it counts the per-node `reach` axis and
+ * finds the staleness frontier (`oldest_last_sync`). Liveness only; it touches no
+ * trust field and so cannot affect any trust verdict. A node with an unparseable
+ * `last_sync_received_at` is treated as never-synced for the frontier (it already
+ * classified as `never` in `classifyReach`, which uses the same parse guard), so
+ * the two stay consistent and a malformed timestamp can never masquerade as the
+ * oldest real sync.
+ */
+function buildSyncHealth(
+  rows: FleetRosterNode[],
+  freshnessWindowMs: number,
+): FleetSyncHealth {
+  let reachable = 0;
+  let stale = 0;
+  let never = 0;
+  let oldestMs: number | null = null;
+  let oldestIso: string | null = null;
+
+  for (const row of rows) {
+    if (row.reach === "recent") reachable += 1;
+    else if (row.reach === "stale") stale += 1;
+    else never += 1;
+
+    const iso = row.last_sync_received_at;
+    if (iso === null) continue;
+    const ms = Date.parse(iso);
+    if (Number.isNaN(ms)) continue;
+    if (oldestMs === null || ms < oldestMs) {
+      oldestMs = ms;
+      oldestIso = iso;
+    }
+  }
+
+  return {
+    reachable,
+    stale,
+    never,
+    oldest_last_sync: oldestIso,
+    freshness_window_ms: freshnessWindowMs,
+  };
 }
 
 /**
@@ -214,6 +322,16 @@ export function buildFleetRoster(
       eviction_serial: 0,
       nodes: [],
       summary: { total: 0, admitted: 0, revoked: 0, untrusted: 0 },
+      // Honest zeros for an absent fleet: no nodes => no reach, and the
+      // distribution rail is unbuilt regardless of provisioning.
+      sync_health: {
+        reachable: 0,
+        stale: 0,
+        never: 0,
+        oldest_last_sync: null,
+        freshness_window_ms: freshnessWindowMs,
+      },
+      policy_distribution: { available: false },
     };
   }
 
@@ -251,6 +369,10 @@ export function buildFleetRoster(
     eviction_serial: evictionSerial,
     nodes,
     summary,
+    sync_health: buildSyncHealth(nodes, freshnessWindowMs),
+    // A2: the signed-policy-distribution rail is not yet built. State the honest
+    // absence; never fabricate a distributed state.
+    policy_distribution: { available: false },
   };
 }
 
