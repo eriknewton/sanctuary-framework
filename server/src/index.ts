@@ -106,6 +106,7 @@ import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
+import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
 import {
   establishMaster,
@@ -1427,6 +1428,16 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
+  // 16b-read. ERC-8004 Identity OFFLINE verifier (read side). Fully local:
+  // verifies a presented record's signature/shape with NO outbound surface and
+  // no on-chain read. On-chain registry confirmation is a deferred follow-up
+  // (must reuse Verascore's real ERC-8004 ABI), not shipped here.
+  const { tools: erc8004ResolveTools } = createErc8004ResolveTools({
+    auditLog,
+    identityId: aggregatorIdentityId,
+    fortressId: fortressIdForAggregator,
+  });
+
   const { tools: agentNativeTools } = createAgentNativeCooperativeTools({
     identityManager,
     namespaceRegistry,
@@ -1506,6 +1517,7 @@ export async function createSanctuaryServer(options?: {
     sdwMemoryProvenanceTool,
     ...complianceTools,
     ...erc8004Tools,
+    ...erc8004ResolveTools,
     ...agentNativeTools,
     ...distressTools,
     manifestTool,
