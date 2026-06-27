@@ -2,9 +2,18 @@ import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import { ed25519 } from "@noble/curves/ed25519";
 
+import { fromBase64url, toBase64url } from "../../src/core/encoding.js";
+import {
+  ML_DSA_65_COMPONENT_ALG,
+  ML_DSA_65_SIGNATURE_BYTES,
+} from "../../src/core/crypto-suite-registry.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { generateNodeKeypair } from "../../src/mesh/lifecycle/join-approver.js";
+import {
+  mintHybridFederationMaterial,
+  zeroHybridMaterialSecrets,
+} from "../../src/mesh/federation-trust-root-store.js";
 import {
   issuePrincipalCertificate,
   issueNodeIdentityCertificate,
@@ -25,15 +34,19 @@ import {
   acceptFederationEventsFailClosed,
   FEDERATION_NODE_EVICTION_EVENT_KIND,
   FEDERATION_NODE_EVICTION_EVENT_VERSION,
+  FEDERATION_ROOT_REVOCATION_EVENT_KIND,
   FEDERATION_SYNC_WIRE_VERSION,
   federationOperatorAuthorityOrigin,
   foldFederationNodeEvictionEvent,
   normalizeFederationNodeCertificateRenewalConfig,
   renewNodeIdentityCertificateIfDue,
   shouldRenewNodeCertificate,
+  signFederationRootRevocationPayloadHybrid,
   signFederationNodeEvictionPayload,
   startFederationNodeCertificateAutoRenewal,
+  verifyFederationRootRevocationEvent,
   type FederationNodeEvictionPayload,
+  type FederationRevocationLogEvent,
 } from "../../src/v1/federation-revocation.js";
 import {
   assembleJoinRequest,
@@ -952,6 +965,108 @@ describe("/v1 federation expiry and renewal", () => {
     captured?.();
     expect(ticks).toBeGreaterThanOrEqual(2);
     handle.stop();
+  });
+});
+
+describe("/v1 federation root revocation hybrid verification", () => {
+  it("rejects a structurally valid hybrid bundle with a corrupted ML-DSA signature", async () => {
+    const materials = makeFederationMaterials();
+    const principalPrivateKey = materials.context.getIssuingPrincipalPrivateKey();
+    const hybrid = await mintHybridFederationMaterial({
+      fortressId: materials.fortressId,
+      nodeId: materials.context.nodeId,
+      principalId: materials.context.issuingPrincipalCert.principal_id,
+    });
+    try {
+      const revokedHybrid = {
+        ed25519: {
+          key_ref: hybrid.pinned_master.public_keys.ed25519.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ed25519.public_key,
+        },
+        ml_dsa_65: {
+          key_ref: hybrid.pinned_master.public_keys.ml_dsa_65.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ml_dsa_65.public_key,
+        },
+      };
+      const payload = await signFederationRootRevocationPayloadHybrid({
+        fortressId: materials.fortressId,
+        revokedMasterPubkey: "old-root-k1",
+        revokedHybrid,
+        effectiveAt: "2026-06-20T12:00:00.000Z",
+        revocationSerial: 1,
+        operatorPrincipalId: materials.context.issuingPrincipalCert.principal_id,
+        newClassicalPrincipalPrivateKey: principalPrivateKey,
+        newHybridPrincipalPrivateKeys: hybrid.issuing_principal_private_keys,
+      });
+      const eventForPayload = (
+        eventPayload: Record<string, unknown>,
+      ): FederationRevocationLogEvent => {
+        const origin = federationOperatorAuthorityOrigin(materials.fortressId);
+        const withoutHash = {
+          event_id: `${origin}:1`,
+          origin_node_id: origin,
+          sequence: 1,
+          occurred_at: "2026-06-20T12:00:00.000Z",
+          kind: FEDERATION_ROOT_REVOCATION_EVENT_KIND,
+          payload: eventPayload,
+          previous_hash: null,
+        };
+        return {
+          ...withoutHash,
+          event_hash: federationEventHash(withoutHash),
+        };
+      };
+
+      const valid = await verifyFederationRootRevocationEvent({
+        event: eventForPayload({ ...payload }),
+        fortressId: materials.fortressId,
+        pinnedMaster: materials.context.pinnedMasterPubkey,
+        operatorPrincipalCert: materials.context.issuingPrincipalCert,
+        operatorHybridPrincipalPublicKeys:
+          hybrid.issuing_principal_cert.principal_public_keys,
+        highestRevocationSerial: 0,
+      });
+      expect(valid.ok).toBe(true);
+
+      const bundle = payload.operator_signature_bundle;
+      expect(bundle).toBeDefined();
+      if (bundle === undefined) throw new Error("expected hybrid bundle");
+      const components = bundle.components.map((component) => ({ ...component }));
+      const mlDsaIndex = components.findIndex(
+        (component) => component.alg === ML_DSA_65_COMPONENT_ALG,
+      );
+      expect(mlDsaIndex).toBe(1);
+      const mlDsaSignature = fromBase64url(components[mlDsaIndex]!.sig);
+      expect(mlDsaSignature.length).toBe(ML_DSA_65_SIGNATURE_BYTES);
+      mlDsaSignature[0] ^= 0x01;
+      components[mlDsaIndex] = {
+        ...components[mlDsaIndex]!,
+        sig: toBase64url(mlDsaSignature),
+      };
+
+      const rejected = await verifyFederationRootRevocationEvent({
+        event: eventForPayload({
+          ...payload,
+          operator_signature_bundle: {
+            ...bundle,
+            components,
+          },
+        }),
+        fortressId: materials.fortressId,
+        pinnedMaster: materials.context.pinnedMasterPubkey,
+        operatorPrincipalCert: materials.context.issuingPrincipalCert,
+        operatorHybridPrincipalPublicKeys:
+          hybrid.issuing_principal_cert.principal_public_keys,
+        highestRevocationSerial: 0,
+      });
+      expect(rejected.ok).toBe(false);
+      if (!rejected.ok) {
+        expect(rejected.reason).toBe("operator_signature_bundle_invalid");
+      }
+    } finally {
+      principalPrivateKey.fill(0);
+      zeroHybridMaterialSecrets(hybrid);
+    }
   });
 });
 

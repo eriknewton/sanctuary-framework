@@ -64,6 +64,7 @@ import {
   persistUserProvidedPassphrase,
   isOsKeyringLocation,
   PassphraseUnreadableError,
+  PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import {
@@ -84,6 +85,7 @@ import {
 import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { SANCTUARY_VERSION } from "../config.js";
+import { recordWrappedHarnessRegistration } from "../workload-lifecycle/index.js";
 import {
   formatFortressPathWritableError,
   preflightFortressPathWritable,
@@ -300,6 +302,52 @@ function resolveSanctuaryCommand(options: WrapOptions): {
   };
 }
 
+/**
+ * Validate a `--dev-dist <path>` before it is written into the harness config
+ * (Finding 4, 2026-06-25). The dogfood path registers `node <path>` as the
+ * `sanctuary` MCP command; a typo'd or non-existent path produces a wrap that
+ * "verifies" (the JSON check only requires a non-empty command string) but
+ * whose harness entry silently fails at MCP spawn time, with no wrap-time
+ * signal. Fail loudly at wrap time instead: the file must exist and end in
+ * `.js`. Throws {@link DevDistInvalidError} with an actionable message.
+ */
+export class DevDistInvalidError extends Error {
+  readonly devDist: string;
+  constructor(devDist: string, reason: string) {
+    super(
+      `--dev-dist path is invalid: ${reason}\n` +
+        `  path: ${devDist}\n` +
+        `  --dev-dist must point at a built Sanctuary entrypoint .js file ` +
+        `(e.g. dist/index.js). It is registered as 'node <path>' for the ` +
+        `sanctuary MCP entry; a missing path would fail silently at spawn time.`
+    );
+    this.name = "DevDistInvalidError";
+    this.devDist = devDist;
+  }
+}
+
+export async function validateDevDist(devDist: string): Promise<void> {
+  const resolved = resolvePath(devDist);
+  if (!resolved.endsWith(".js")) {
+    throw new DevDistInvalidError(devDist, "path does not end in '.js'");
+  }
+  try {
+    await access(resolved);
+  } catch {
+    throw new DevDistInvalidError(devDist, "no such file");
+  }
+  // Reject a directory masquerading as the entrypoint.
+  try {
+    const st = await lstat(resolved);
+    if (!st.isFile()) {
+      throw new DevDistInvalidError(devDist, "path is not a regular file");
+    }
+  } catch (err) {
+    if (err instanceof DevDistInvalidError) throw err;
+    throw new DevDistInvalidError(devDist, "could not stat the path");
+  }
+}
+
 /** Operator-facing one-liner for what the YAML injection did / would do. */
 function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
   const preserved =
@@ -458,6 +506,23 @@ export async function runWrap(
   if (options.unwrap) {
     await unwrap(options.dryRun === true);
     return;
+  }
+
+  // Finding 4 (2026-06-25): validate --dev-dist BEFORE anything is previewed or
+  // written. The dry-run reporter previews the exact 'node <path>' harness
+  // entry this would write, so a typo'd path must fail the dry run too, not
+  // just the real wrap. Fail loudly here rather than at deferred MCP spawn time.
+  if (options.devDist !== undefined) {
+    try {
+      await validateDevDist(options.devDist);
+    } catch (err) {
+      if (err instanceof DevDistInvalidError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary wrap: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
   }
 
   // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
@@ -701,6 +766,16 @@ export async function runWrap(
         );
       }
     } catch (err) {
+      if (err instanceof PassphraseKeyringUnreachableError) {
+        // Locked / unreachable OS keyring (error 36 / no D-Bus): fail closed
+        // with the actionable unlock message. Sanctuary did NOT regenerate or
+        // overwrite the stored passphrase, so retrying after unlocking the
+        // keyring recovers cleanly.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Keyring Locked`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
       if (err instanceof PassphraseUnreadableError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`\n  Sanctuary: Passphrase Unreadable`);
@@ -769,7 +844,7 @@ export async function runWrap(
     // time (sysext refuses connection) rather than as a wrap-startup abort.
     // First-integration discipline: do no harm to the wrap critical path.
     try {
-      const pinResult = await runProvisionPin({
+      const pinResult = await runProvisionPin([], {
         out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
         err: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
         env: {
@@ -1128,6 +1203,10 @@ export async function runWrap(
   // config is already rewritten and operational; a missing dashboard
   // record is a UX degradation, not a security one). The error is
   // surfaced on stderr so operators can re-run later if needed.
+  const localAgentRecord = buildLocalAgentRecord({
+    storagePath,
+    platform: agentConfig.platform,
+  });
   try {
     // The host tenant registry must live under the *resolved* storage root,
     // not the hardcoded ~/.sanctuary default. When SANCTUARY_STORAGE_PATH is
@@ -1149,13 +1228,7 @@ export async function runWrap(
   }
 
   try {
-    upsertPersistedLocalAgent(
-      storagePath,
-      buildLocalAgentRecord({
-        storagePath,
-        platform: agentConfig.platform,
-      }),
-    );
+    upsertPersistedLocalAgent(storagePath, localAgentRecord);
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -1227,6 +1300,11 @@ export async function runWrap(
         // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
         const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        await bestEffortRecordWrapWorkloadRegistration({
+          auditLog: ndAuditLog,
+          storagePath,
+          record: localAgentRecord,
+        });
         // Best-effort: daemon failure does not block identity bootstrap.
         // See parallel block below (line ~939) for full rationale.
         try {
@@ -1347,6 +1425,11 @@ export async function runWrap(
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      await bestEffortRecordWrapWorkloadRegistration({
+        auditLog: wrapAuditLog,
+        storagePath,
+        record: localAgentRecord,
+      });
 
       // HIGH never-overclaim fix (honesty/dashboard-rollup seam #2): resolve the
       // pinned producer key over the SAME canonical storage path the wrap-auto
@@ -1700,8 +1783,13 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const heroPrefix = info.castleWallArmed === true
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
+  // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
+  // wrap, not "Full". "Full" is a superlative reserved for observed/verified
+  // state (as Castle Wall and Sentinels already are); printing "Charter Full /
+  // Heralds Full" unconditionally (even under --no-dashboard, even when nothing
+  // was exercised) was the same overclaim the load-bearing-layer fix removed.
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
@@ -1783,7 +1871,7 @@ export function formatWrapSuccessNoDashboard(
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter Full / Heralds Full.`,
+    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
@@ -2190,6 +2278,36 @@ function buildLocalAgentRecord(input: {
       can_change_template: true,
     },
   };
+}
+
+async function recordWrapWorkloadRegistration(input: {
+  auditLog: AuditLog;
+  storagePath: string;
+  record: LocalAgentRecord;
+}): Promise<void> {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  await recordWrappedHarnessRegistration({
+    auditLog: input.auditLog,
+    fortressId,
+    agentId: input.record.agent_id,
+  });
+}
+
+async function bestEffortRecordWrapWorkloadRegistration(input: {
+  auditLog: AuditLog;
+  storagePath: string;
+  record: LocalAgentRecord;
+}): Promise<void> {
+  try {
+    await recordWrapWorkloadRegistration(input);
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: workload-lifecycle registration not recorded ` +
+        `(${(err as Error).message}). ` +
+        `Wrap is otherwise complete; re-run \`sanctuary wrap\` to retry after fixing the audit log.`,
+    );
+  }
 }
 
 function countUpstreamTools(servers: UpstreamServer[]): number {

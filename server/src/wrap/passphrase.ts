@@ -30,6 +30,12 @@ import { sha256 } from "@noble/hashes/sha256";
 import { resolveStoragePath, DEFAULT_STORAGE_DIR } from "../paths.js";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
+import type { ExecResult } from "./exec-result.js";
+import {
+  classifyDarwinFailure,
+  classifyLinuxFailure,
+  type KeychainReadStatus,
+} from "./keychain-custody.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -126,17 +132,77 @@ export class PassphraseUnreadableError extends Error {
   }
 }
 
+/**
+ * Raised when the OS keyring is reachable-but-LOCKED (or not interactive in
+ * this session) so the stored passphrase cannot be read: typically a locked
+ * macOS login Keychain over SSH (error 36 / errSecInteractionNotAllowed) or a
+ * Linux Secret Service with no D-Bus session bus / a refused collection.
+ *
+ * This is a HARD fail-closed, not a fall-through. The bug it closes
+ * (fortress-key-root-cause-2026-06-23 class, live in the wrap path): a locked
+ * keyring used to read as "passphrase absent", so wrap generated a NEW
+ * passphrase and wrote it with `add-generic-password -U`, CLOBBERING the
+ * existing entry and stranding the fortress. We now refuse to generate or
+ * overwrite when the keyring is merely unreachable: the original stored
+ * passphrase is untouched, and the operator is told to unlock and retry.
+ *
+ * The message names NO secret material (CLAUDE.md #6): it carries the keyring
+ * location and remediation only, never the passphrase or any key bytes.
+ */
+export class PassphraseKeyringUnreachableError extends Error {
+  readonly location: string;
+  readonly detail: string;
+  constructor(location: string, detail: string) {
+    // Double-quoted concatenation (not template literals) on purpose: the
+    // structure guard's comment-stripper mis-tracks backtick balance when a
+    // new backtick template message sits next to the escaped-backtick message
+    // above, which made downstream JSDoc em-dashes leak into the code scan.
+    super(
+      "Sanctuary: the OS keyring (" + location + ") is LOCKED or not " +
+        "reachable in this session, so your stored passphrase could not be " +
+        "read (" + detail + ").\n\n" +
+        "Sanctuary did NOT modify your stored passphrase and did NOT generate " +
+        "a new one (doing so would overwrite and strand your existing " +
+        "custody).\n\n" +
+        "To continue:\n" +
+        "  - Run from a desktop session and unlock the keyring via its GUI\n" +
+        "    (Keychain Access on macOS; Seahorse / KWallet / your Secret " +
+        "Service keyring on Linux), then retry; or\n" +
+        "  - Provide the passphrase explicitly for this run:\n" +
+        "      SANCTUARY_PASSPHRASE=<your fortress passphrase> sanctuary " +
+        "wrap ...\n\n" +
+        "This is common over SSH or right after a reboot, when the login " +
+        "keyring is still locked."
+    );
+    this.name = "PassphraseKeyringUnreachableError";
+    this.location = location;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Three-state outcome of reading the passphrase from an OS keyring. Mirrors the
+ * keychain-custody.ts {@link KeychainReadStatus} contract so both paths agree
+ * on what "unreachable" means (locked / error 36 / no D-Bus), but carries the
+ * passphrase string when found rather than raw key bytes.
+ */
+type KeyringReadResult =
+  | { status: "found"; value: string }
+  | { status: "not-found" }
+  | { status: "unreachable"; detail: string };
+
 /** Outcome of reading the fallback passphrase file. */
 type FallbackReadResult =
   | { status: "ok"; value: string; legacy: boolean }
   | { status: "not-found" }
   | { status: "unreadable"; reason: string };
 
-export interface ExecResult {
-  stdout: string;
-  stderr: string;
-  code: number | null;
-}
+// `ExecResult` now lives in the leaf module exec-result.ts so passphrase.ts and
+// keychain-custody.ts can share it without an import cycle (passphrase.ts also
+// imports the failure classifiers from keychain-custody.ts). Re-exported here
+// to preserve the public surface: tests import { ExecResult } from
+// "./passphrase.js".
+export type { ExecResult } from "./exec-result.js";
 
 // ── Public API ──────────────────────────────────────────────────────
 
@@ -160,32 +226,19 @@ export async function getOrCreatePassphrase(
   const legacyService = legacyKeychainServiceFor(storagePath, home);
 
   // 1. Try the OS keyring (current 16-hex name, then legacy 12-hex fallback).
-  if (plat === "darwin") {
-    const fromKc = await readFromKeychain(exec, service);
-    if (fromKc) {
-      return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
-    }
-    // Legacy fallback: try the old 12-hex service name for pre-v1.2.3 entries.
-    if (legacyService !== service) {
-      const fromLegacy = await readFromKeychain(exec, legacyService);
-      if (fromLegacy) {
-        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
-      }
-    }
-  } else if (plat === "linux") {
-    const fromSs = await readFromSecretService(exec, service);
-    if (fromSs) {
-      return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
-    }
-    if (legacyService !== service) {
-      const fromLegacy = await readFromSecretService(exec, legacyService);
-      if (fromLegacy) {
-        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
-      }
-    }
-  }
+  const fromKeyring = await readPassphraseFromKeyring(
+    exec,
+    plat,
+    service,
+    legacyService
+  );
+  if (fromKeyring.status === "found") return fromKeyring.result;
 
-  // 2. Try fallback file.
+  // 2. Try the encrypted fallback file. This is a NON-DESTRUCTIVE read and is
+  //    safe even when the keyring was unreachable: an existing user-supplied
+  //    fallback value is a legitimate custody source (the documented F3 Linux
+  //    no-Secret-Service path). We try it BEFORE failing closed so a locked
+  //    keyring does not block a fortress that has a usable fallback file.
   const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
   if (fromFile.status === "ok") {
@@ -202,8 +255,23 @@ export async function getOrCreatePassphrase(
     throw new PassphraseUnreadableError(fallback, fromFile.reason);
   }
 
-  // 3. Generate and store (only reachable when no prior passphrase exists).
-  //    Writes always go to the new 16-hex service name.
+  // 3. HARD FAIL-CLOSED: the keyring was LOCKED / unreachable (macOS error 36 /
+  //    no D-Bus) AND there is no fallback custody. The ONLY remaining action
+  //    would be to generate a NEW passphrase and write it with `-U`, which on
+  //    a re-wrap CLOBBERS the (likely present but unreadable) keyring entry and
+  //    strands the fortress (fortress-key-root-cause-2026-06-23 class). Refuse:
+  //    tell the operator to unlock the keyring and retry; the stored passphrase
+  //    is left untouched.
+  if (fromKeyring.status === "unreachable") {
+    throw new PassphraseKeyringUnreachableError(
+      fromKeyring.location,
+      fromKeyring.detail
+    );
+  }
+
+  // 4. Generate and store (only reachable when no prior passphrase exists and
+  //    the keyring was genuinely reachable-but-empty). Writes always go to the
+  //    new 16-hex service name.
   const value = generatePassphrase();
   if (plat === "darwin") {
     const ok = await writeToKeychain(value, exec, service);
@@ -251,29 +319,16 @@ export async function readStoredPassphrase(
   const exec = opts.exec ?? defaultExec;
   const derive = opts.deriveMachineKey ?? deriveMachineKey;
 
-  if (plat === "darwin") {
-    const fromKc = await readFromKeychain(exec, service);
-    if (fromKc) {
-      return { value: fromKc, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
-    }
-    if (legacyService !== service) {
-      const fromLegacy = await readFromKeychain(exec, legacyService);
-      if (fromLegacy) {
-        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_MACOS };
-      }
-    }
-  } else if (plat === "linux") {
-    const fromSs = await readFromSecretService(exec, service);
-    if (fromSs) {
-      return { value: fromSs, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
-    }
-    if (legacyService !== service) {
-      const fromLegacy = await readFromSecretService(exec, legacyService);
-      if (fromLegacy) {
-        return { value: fromLegacy, source: "keychain", location: OS_KEYRING_LOCATION_LINUX };
-      }
-    }
-  }
+  // Same precedence as getOrCreatePassphrase: keyring, then the non-destructive
+  // fallback file, then fail closed on an unreachable keyring (so a locked
+  // keyring with no fallback custody is reported, never silently "absent").
+  const fromKeyring = await readPassphraseFromKeyring(
+    exec,
+    plat,
+    service,
+    legacyService
+  );
+  if (fromKeyring.status === "found") return fromKeyring.result;
 
   const fallback = fallbackFilePath(home, storagePath);
   const fromFile = await readFromFallbackFile(fallback, home, derive);
@@ -291,7 +346,91 @@ export async function readStoredPassphrase(
     throw new PassphraseUnreadableError(fallback, fromFile.reason);
   }
 
+  // Keyring locked / unreachable and no fallback custody: fail closed rather
+  // than report a misleading "no passphrase stored" (which a caller might act
+  // on by regenerating and clobbering the locked entry).
+  if (fromKeyring.status === "unreachable") {
+    throw new PassphraseKeyringUnreachableError(
+      fromKeyring.location,
+      fromKeyring.detail
+    );
+  }
+
   return null;
+}
+
+/**
+ * Outcome of probing the OS keyring for the passphrase across the current and
+ * legacy service names.
+ *  - "found":       a value was read; return it.
+ *  - "not-found":   the keyring is reachable and reports no item; the caller
+ *                   proceeds to the fallback file / first-wrap generation.
+ *  - "unreachable": the keyring is locked / not reachable in this session
+ *                   (macOS error 36, no D-Bus, etc.). The caller may still read
+ *                   an existing encrypted fallback file (a non-destructive
+ *                   recovery), but it must NEVER generate a new passphrase and
+ *                   `-U`-overwrite, which would clobber the (likely present but
+ *                   unreadable) keyring entry. When no fallback custody exists,
+ *                   the caller fails closed with PassphraseKeyringUnreachableError.
+ */
+type KeyringLookup =
+  | { status: "found"; result: PassphraseResult }
+  | { status: "not-found" }
+  | { status: "unreachable"; location: string; detail: string };
+
+/**
+ * Read the passphrase from the OS keyring (current service name, then the legacy
+ * fallback). Returns a {@link KeyringLookup} the caller acts on: an
+ * "unreachable" keyring (locked / error 36 / no D-Bus) is reported, NOT thrown
+ * here, so the caller can still read a non-destructive encrypted fallback file
+ * before deciding to fail closed. The one thing the caller must never do on
+ * "unreachable" is generate + `-U`-overwrite (the clobber bug); that decision
+ * lives in the caller, which knows whether a fallback custody source exists.
+ */
+async function readPassphraseFromKeyring(
+  exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
+  plat: NodeJS.Platform,
+  service: string,
+  legacyService: string
+): Promise<KeyringLookup> {
+  let read: (svc: string) => Promise<KeyringReadResult>;
+  let location: string;
+  if (plat === "darwin") {
+    read = (svc) => readFromKeychain(exec, svc);
+    location = OS_KEYRING_LOCATION_MACOS;
+  } else if (plat === "linux") {
+    read = (svc) => readFromSecretService(exec, svc);
+    location = OS_KEYRING_LOCATION_LINUX;
+  } else {
+    return { status: "not-found" };
+  }
+
+  const primary = await read(service);
+  if (primary.status === "found") {
+    return {
+      status: "found",
+      result: { value: primary.value, source: "keychain", location },
+    };
+  }
+  if (primary.status === "unreachable") {
+    return { status: "unreachable", location, detail: primary.detail };
+  }
+
+  // Legacy fallback: try the old 12-hex service name for pre-v1.2.3 entries.
+  if (legacyService !== service) {
+    const legacy = await read(legacyService);
+    if (legacy.status === "found") {
+      return {
+        status: "found",
+        result: { value: legacy.value, source: "keychain", location },
+      };
+    }
+    if (legacy.status === "unreachable") {
+      return { status: "unreachable", location, detail: legacy.detail };
+    }
+  }
+
+  return { status: "not-found" };
 }
 
 /**
@@ -349,21 +488,54 @@ export function generatePassphrase(): string {
 
 // ── Keychain (macOS) ────────────────────────────────────────────────
 
+/**
+ * Read the passphrase from the macOS Keychain, classifying the outcome into
+ * found / not-found / unreachable. REUSES the keychain-custody.ts
+ * {@link classifyDarwinFailure} classifier so a locked login keychain (exit 36
+ * / errSecInteractionNotAllowed, the SSH / fresh-reboot case) reads as
+ * "unreachable" and never as "not-found" (the latter is what let the caller
+ * silently regenerate + `-U`-clobber the existing entry).
+ *
+ * A spawn failure (the `security` binary missing) is treated as "not-found":
+ * on real macOS `security` always exists, and a platform without it should
+ * fall through to the fallback file exactly as before, not hard-fail.
+ */
 async function readFromKeychain(
   exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
   service: string = KEYCHAIN_SERVICE_DEFAULT
-): Promise<string | null> {
+): Promise<KeyringReadResult> {
+  let result: ExecResult;
   try {
-    const result = await exec(
+    result = await exec(
       "security",
       ["find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", service, "-w"]
     );
-    if (result.code !== 0) return null;
-    const value = result.stdout.trim();
-    return value.length > 0 ? value : null;
   } catch {
-    return null;
+    // Binary missing / spawn error: not reachable here, but on macOS this does
+    // not happen. Fall through to the fallback file rather than hard-failing.
+    return { status: "not-found" };
   }
+  if (result.code === 0) {
+    const value = result.stdout.trim();
+    return value.length > 0
+      ? { status: "found", value }
+      : { status: "not-found" };
+  }
+  const classified = classifyDarwinFailure(result);
+  return toKeyringReadResult(classified.status, classified.detail);
+}
+
+/** Map a keychain-custody classification onto the passphrase read result. */
+function toKeyringReadResult(
+  status: KeychainReadStatus,
+  detail: string | undefined
+): KeyringReadResult {
+  if (status === "unreachable") {
+    return { status: "unreachable", detail: detail ?? "keyring unreachable" };
+  }
+  // "found" cannot occur here (the classifiers only run on a non-zero exit);
+  // any non-unreachable classification is treated as a genuine miss.
+  return { status: "not-found" };
 }
 
 /**
@@ -484,27 +656,47 @@ export function legacyKeychainServiceFor(
 // never silently succeed. Here, "fail = try the next path" is the safe
 // behavior because the fallback file is itself authenticated encryption.
 
+/**
+ * Read the passphrase from the Linux Secret Service, classifying the outcome
+ * into found / not-found / unreachable. REUSES the keychain-custody.ts
+ * {@link classifyLinuxFailure} classifier so a locked collection / no-D-Bus
+ * session reads as "unreachable" (hard fail-closed) and a clean empty result
+ * reads as "not-found".
+ *
+ * A spawn failure (`secret-tool` not installed) is treated as "not-found": the
+ * documented Linux degradation path falls through to the encrypted fallback
+ * file when no Secret Service client is present, and that behavior is
+ * preserved: only a reachable-but-locked keyring is a hard fail.
+ */
 async function readFromSecretService(
   exec: (cmd: string, args: string[], input?: string) => Promise<ExecResult>,
   service: string = KEYCHAIN_SERVICE_DEFAULT
-): Promise<string | null> {
+): Promise<KeyringReadResult> {
+  let result: ExecResult;
   try {
-    const result = await exec("secret-tool", [
+    result = await exec("secret-tool", [
       "lookup",
       "service",
       service,
       "account",
       KEYCHAIN_ACCOUNT,
     ]);
-    if (result.code !== 0) return null;
+  } catch {
+    // secret-tool not installed: fall through to the fallback file (the
+    // documented no-Secret-Service degradation), not a hard fail.
+    return { status: "not-found" };
+  }
+  if (result.code === 0) {
     // secret-tool lookup does NOT append a trailing newline to the value
     // (unlike `security -w`); trim defensively in case a future version
     // changes that, and to tolerate keyring backends that wrap the value.
     const value = result.stdout.replace(/\r?\n$/, "");
-    return value.length > 0 ? value : null;
-  } catch {
-    return null;
+    return value.length > 0
+      ? { status: "found", value }
+      : { status: "not-found" };
   }
+  const classified = classifyLinuxFailure(result);
+  return toKeyringReadResult(classified.status, classified.detail);
 }
 
 async function writeToSecretService(

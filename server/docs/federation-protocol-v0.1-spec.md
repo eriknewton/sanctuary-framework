@@ -248,6 +248,14 @@ Two libp2p surfaces:
 
 **Transport encryption.** libp2p Noise (XX pattern) handshake, peer-id pinned to the per-node Ed25519 public key. Per-node certificates verified after Noise handshake and before any application-layer message exchange.
 
+> **Implementation note (Federation P1, shipped surface).** The shipped cross-machine sync path is the HTTP `/v1/federation/sync/peer` route, NOT the libp2p design above. As of Federation P1 it is **pre-session and node-cert-authenticated**: a remote operator's machine reaches it over a plain network connection with **no `Authorization` header and no shared operator login**. The only trust decision is the cryptographic sync envelope (the peer's node certificate must chain to this fortress's pinned master).
+>
+> **Confidentiality is NOT provided by this route.** The signed envelope gives **integrity and authenticity, not confidentiality**. The default listener is plain HTTP, so the federation events and the node roster cross the wire **in cleartext**. The route does not terminate TLS. A pre-session `/sync/peer` deployment therefore **requires a confidential composed transport**: Tailscale, WireGuard, or a TLS-terminating reverse proxy in front of the listener. This is the 06-24 federation decision: the control plane (trust roots, custody, rotation, revocation, the signed log) is ours; the confidential transport is composed by the operator and is out of scope for this route.
+>
+> A dedicated rate-limit bucket fronts this route, with no loopback exemption (a tunneled peer can present as loopback), IPv6 /64 aggregation, and a global concurrent crypto-verify ceiling. Every rejection (federation off or unprovisioned, malformed or oversized body, envelope verification failure) collapses to a single generic `403` on the wire so a probing peer learns nothing about membership or enabled-state; the precise reason is recorded only in the audit log.
+>
+> **Known follow-up (deferred, Federation P1).** The rate-limit bucket and the concurrent-verify ceiling bound CPU spent on crypto verification, but they do NOT bound a slow-loris socket-exhaustion attack: there is currently no listener read/idle timeout and no max-connection bound (the body reader has no read timeout, and the server uses Node's default request timeout). Adding a listener read/idle timeout plus a max-connection bound is a known follow-up; it is deferred here because it touches shared server-listener configuration rather than this route alone.
+
 ### 4.2 Event envelope
 
 Every federation message is a **signed event**:

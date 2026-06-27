@@ -62,12 +62,18 @@ import {
 } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import {
   runWrap,
   type DashboardStarter,
   type RunWrapDeps,
   type WrapOptions,
 } from "../../src/wrap/cli.js";
+import { establishWrapCustody } from "../../src/wrap/custody-flow.js";
+import {
+  WORKLOAD_LIFECYCLE_OPS,
+  WorkloadRegistry,
+} from "../../src/workload-lifecycle/index.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import { randomBytes } from "node:crypto";
@@ -389,7 +395,49 @@ describe("runWrap persists a LocalAgentRecord (Finding Z)", () => {
     return { claudeCode: true, noOpen: true, ...extra };
   }
 
-  it("first wrap creates state/_hub/local-agents.json with one record (mode 0600)", async () => {
+  async function workloadAuditLog(): Promise<AuditLog> {
+    const custody = await establishWrapCustody({
+      storagePath: storagePath(),
+      passphrase: "fixture-passphrase-z",
+      interactive: false,
+    });
+    return new AuditLog(
+      new FilesystemStorage(join(storagePath(), "state")),
+      custody.masterKey,
+    );
+  }
+
+  async function expectRecordedWorkloadRegistration(
+    persisted: LocalAgentRecord,
+  ): Promise<void> {
+    const auditLog = await workloadAuditLog();
+    const registered = await auditLog.query({
+      operation_type: WORKLOAD_LIFECYCLE_OPS.REGISTERED,
+    });
+    expect(registered.entries).toHaveLength(1);
+    expect(registered.entries[0]!.identity_id).toBe(
+      fortressIdFromStoragePath(storagePath()),
+    );
+    expect(registered.entries[0]!.details).toMatchObject({
+      workload_id: persisted.agent_id,
+      instance_id: persisted.agent_id,
+      workload_class: "wrapped-agent-harness",
+      consent_ref: null,
+      consent_status: "absent",
+      state_disposition: "running",
+      manufactured_preference_caveat: true,
+    });
+
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    expect(registry.get(persisted.agent_id)).toMatchObject({
+      workload_id: persisted.agent_id,
+      state: "registered",
+      consent_status: "absent",
+      consent_ref: null,
+    });
+  }
+
+  it("first wrap creates state/_hub/local-agents.json and records a lifecycle declaration", async () => {
     await installFixture(".claude.json", "flat-mcp.json");
     await runWrap(options(), deps());
 
@@ -406,6 +454,16 @@ describe("runWrap persists a LocalAgentRecord (Finding Z)", () => {
     expect(persisted[0]!.status).toBe("active");
     expect(persisted[0]!.capabilities.can_unwrap).toBe(true);
     expect(persisted[0]!.capabilities.can_pause).toBe(false);
+    await expectRecordedWorkloadRegistration(persisted[0]!);
+  });
+
+  it("no-dashboard wrap records the harness as a declared workload in the audit chain", async () => {
+    await installFixture(".claude.json", "flat-mcp.json");
+    await runWrap(options({ noDashboard: true }), deps());
+
+    const [persisted] = readPersistedLocalAgents(storagePath());
+    expect(persisted).toBeDefined();
+    await expectRecordedWorkloadRegistration(persisted!);
   });
 
   it("second wrap of a different harness against the same fortress appends a second record", async () => {

@@ -79,6 +79,25 @@ describe("supervisor request handler", () => {
     expect(launcher.launches).toBe(0);
   });
 
+  it("rejects a decodable-but-malformed key (valid key + junk char) WITHOUT launching (codex S1 R8)", async () => {
+    // `AQIDBA!` decodes to the real bytes [1,2,3,4] under lenient base64 but
+    // fails the strict round-trip. The handler must reject (bad_request) and not
+    // launch; internally it zeroes the materialized bytes before returning so no
+    // (possibly master-equivalent) key lingers on a rejected protect.
+    const { handle, launcher } = makeHandler();
+    const valid = toBase64url(new Uint8Array([1, 2, 3, 4])); // "AQIDBA"
+    const resp = await handle({
+      kind: "protect",
+      agent_id: "a1",
+      harness: "claude_code",
+      config_path: "/allowed/a.json",
+      transient_key_b64: `${valid}!`,
+    });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.reason).toBe("bad_request");
+    expect(launcher.launches).toBe(0);
+  });
+
   it("status returns the live roster", async () => {
     const { handle } = makeHandler();
     await handle({

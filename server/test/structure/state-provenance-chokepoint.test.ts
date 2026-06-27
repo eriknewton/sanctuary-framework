@@ -150,6 +150,12 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
       reason:
         "operator-cloud provision-claim single-use replay-protection metadata (the claim set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
     },
+    {
+      path: "server/src/v1/federation-sync-state-store.ts",
+      context: "storage.write(",
+      reason:
+        "federation peer-sync security state (Federation 3/3b P0): per-sender accepted high-water + outbound high-water + folded revocation projection, written to the frozen internal _federation namespace under its own AES-GCM purpose key; derived anti-replay/revocation metadata, not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
+    },
   ];
   return allowed.some(
     (item) =>

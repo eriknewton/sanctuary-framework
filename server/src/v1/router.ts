@@ -42,8 +42,10 @@ import {
 import {
   handleFederationRequest,
   handleFederationCeremony,
+  handleFederationNodeCertAuth,
   isFederationPath,
   isFederationCeremonyPath,
+  isFederationNodeCertAuthPath,
   type V1FederationDeps,
 } from "./federation.js";
 
@@ -166,6 +168,28 @@ export async function handleV1Request(
   // must never fall through to legacy /api routing.
   if (ctx.federation && method === "POST" && isFederationCeremonyPath(url.pathname)) {
     return handleFederationCeremony(ctx.federation, req, res, url, method);
+  }
+
+  // ── Federation peer sync (NODE_CERT_AUTHENTICATED class) ────────────
+  // Federation P1: `/v1/federation/sync/peer` is reached BEFORE the session
+  // gate, with NO `Authorization` header and NO operator login. The sole trust
+  // decision is the cryptographic sync-envelope verification inside the handler
+  // (the peer's node cert must chain to THIS fortress's pinned master); the
+  // session that used to front this route only gated network access. Only POST is
+  // in the class; a non-POST (or a future in-class path with no handler yet)
+  // returns false and FALLS THROUGH to the session gate below (never to legacy
+  // /api routing) so an unhandled in-class route fails closed (401/404), exactly
+  // like a non-POST ceremony request. This must run before the session gate so a
+  // remote operator's machine can reach it without a session.
+  if (
+    ctx.federation &&
+    method === "POST" &&
+    isFederationNodeCertAuthPath(url.pathname)
+  ) {
+    if (await handleFederationNodeCertAuth(ctx.federation, req, res, url, method)) {
+      return true;
+    }
+    // In-class but unhandled: fall through to the session gate (fail closed).
   }
 
   // ── GET /v1/status: PUBLIC minimal without credentials ──────────────

@@ -83,6 +83,12 @@ import {
   QUERY_ANONYMITY_AUDIT_OPS,
   createAnonymizedFetch,
 } from "../query-anonymity/header-strip.js";
+import {
+  DISARMED_TIER3_CONFIG,
+  TIER3_AUDIT_OPS,
+  createTunneledFetch,
+  type Tier3TransportConfig,
+} from "../query-anonymity/tier3-transport.js";
 import { resolveHybridChoice, validateHybridRules } from "./substrates/hybrid/per-surface-router.js";
 import type { HybridRoutingRules } from "./types.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -168,6 +174,17 @@ export interface SelectorConfig {
    * network calls.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Tier 3a (WP-V1.x-QUERY-LAYER-ANONYMITY) network-path anonymity
+   * transport config. Defaults to disarmed: Tier 3 is opt-in and a no-op
+   * for operators who have not enabled it, so behavior and latency are
+   * unchanged. When armed, the two-hop egress-proxy tunnel is composed
+   * BENEATH the Tier 1 anonymized fetch (see selector constructor), so the
+   * wrapped fetch remains the sole outbound channel that Castle Wall
+   * governs (AC-1). Slice 1 delivers IP-decoupling / path-linkage removal
+   * (Property 1) only.
+   */
+  tier3?: Tier3TransportConfig;
 }
 
 export class SubstrateSelector {
@@ -199,8 +216,37 @@ export class SubstrateSelector {
     // undici-defaults defeat, and emits a `query_anonymity_headers_
     // stripped` audit event with the per-call removed-header summary.
     // Bypass would require editing this constructor.
+    //
+    // Tier 3a (WP-V1.x-QUERY-LAYER-ANONYMITY network path, Slice 1): the
+    // two-hop egress-proxy tunnel is composed BENEATH the anonymized fetch
+    // so the substrate clients still receive a single wrapped fetch that is
+    // the sole outbound channel Castle Wall governs (AC-1). When the Tier 3
+    // config is disarmed (the default), `createTunneledFetch` returns the
+    // base fetch unchanged, so there is zero behavioral/latency change.
+    // When armed, the tunnel routes the request through the relay→egress
+    // chain and fails closed if the anonymous path is unavailable (it never
+    // silently connects direct). Order matters: anonymize(tunnel(base)).
     const baseFetch = cfg.fetchImpl ?? globalThis.fetch;
-    this.fetchImpl = createAnonymizedFetch(baseFetch, (event) => {
+    const tunneledFetch = createTunneledFetch(
+      baseFetch,
+      cfg.tier3 ?? DISARMED_TIER3_CONFIG,
+      (event) => {
+        void this.auditLog.append(
+          "l2",
+          event.op,
+          this.identityId,
+          {
+            destination_host: event.destinationHost,
+            mode: event.mode,
+            posture: event.posture,
+            dialer_label: event.dialerLabel,
+            egress_ip: event.egressIp,
+          },
+          event.op === TIER3_AUDIT_OPS.FAIL_CLOSED ? "failure" : "success",
+        );
+      },
+    );
+    this.fetchImpl = createAnonymizedFetch(tunneledFetch, (event) => {
       void this.auditLog.append(
         "l2",
         QUERY_ANONYMITY_AUDIT_OPS.HEADERS_STRIPPED,

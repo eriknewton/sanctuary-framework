@@ -24,6 +24,15 @@ export {
 } from "./erc8004-identity-signer.js";
 
 export {
+  resolveErc8004Identity,
+  createErc8004ResolveTools,
+  ERC8004_RESOLVE_AUDIT_OPS,
+  type Erc8004ResolveResult,
+  type Erc8004ResolveDeps,
+  type Erc8004ResolveToolsOptions,
+} from "./erc8004-resolve.js";
+
+export {
   signAp2Mandate,
   verifyAp2Mandate,
   deriveAp2Key,

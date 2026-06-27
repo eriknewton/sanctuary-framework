@@ -53,10 +53,13 @@ export interface SupervisionSpec {
   config_path: string;
   /**
    * The transient master key (raw bytes). The launcher hands it to the child's
-   * enforcement chain; the supervisor zeroes its own copy after a successful
-   * launch (it is retained per-spec only to support restart-on-crash under
-   * Tier A, which keeps the resident-master window bounded to the agent
-   * lifetime by design — review H2).
+   * enforcement chain. Residency (honest — codex S1): on a SUCCESSFUL launch the
+   * supervisor RETAINS this raw key in `entry.spec` for the agent lifetime to
+   * support restart-on-crash under Tier A (the resident-master window is bounded
+   * to the agent lifetime by design — review H2); it is zeroed on
+   * unprotect/shutdown/burst-park. On a FAILED/refused/timed-out/superseded
+   * launch it is zeroed immediately. It is NOT zeroed "after a successful
+   * launch" — that would defeat crash-restart.
    */
   transientKey: Uint8Array;
 }
@@ -196,29 +199,49 @@ export class Supervisor {
    * rotation is in flight (M3).
    */
   async protect(spec: SupervisionSpec): Promise<ProtectResult> {
-    // Resource-level idempotent no-op for an already-up agent (M2). Checked
-    // synchronously (no await) so it cannot interleave with a launch.
+    // ORDER MATTERS (codex S1 R7-H1): the in-flight reservation check MUST come
+    // BEFORE the "already protecting/running" resource-level no-op. `runProtect`
+    // synchronously sets entry.base = "protecting" before its first await, so a
+    // concurrent duplicate that checked the entry FIRST would see "protecting"
+    // and return a premature `already-protected` success — WITHOUT awaiting the
+    // real launch outcome. If that launch then failed, the duplicate would have
+    // received a FALSE success. Coalescing onto the in-flight promise first
+    // makes the duplicate inherit the winner's ACTUAL result (success OR
+    // failure). Both checks are reached synchronously (no await) before any
+    // entry mutation, so two concurrent protects can never both reach a launch.
+    const inflight = this.inflightProtect.get(spec.agent_id);
+    if (inflight) {
+      // A launch is in flight for this agent. The duplicate did not launch; its
+      // key copy is zeroed (the winner's spec carries the live key). It awaits
+      // and returns the winner's real outcome — a failed launch propagates as a
+      // failure here too (no false success), a successful one as the no-op ack.
+      this.zero(spec.transientKey);
+      const result = await inflight;
+      if (result.ok) return { ok: true, kind: "already-protected", agent_id: spec.agent_id };
+      return result;
+    }
+
+    // No launch in flight. Resource-level idempotent no-op for an agent that is
+    // genuinely already up (M2): a SEPARATE, later protect of a running/
+    // protecting agent (whose prior launch fully settled) is a no-op ack, never
+    // a second launch. Checked synchronously so it cannot interleave.
     const existing = this.agents.get(spec.agent_id);
     if (existing && (existing.base === "protecting" || existing.base === "running")) {
       this.zero(spec.transientKey);
       return { ok: true, kind: "already-protected", agent_id: spec.agent_id };
     }
 
-    // Codex H1: synchronously coalesce a CONCURRENT duplicate for the same
-    // agent_id onto the in-flight launch — two concurrent protects can never
-    // both reach `startChild`. The duplicate awaits the same result; its key
-    // copy is zeroed (the winner's spec carries the live key).
-    const inflight = this.inflightProtect.get(spec.agent_id);
-    if (inflight) {
-      this.zero(spec.transientKey);
-      const result = await inflight;
-      // The duplicate did not launch; report the resource-level no-op shape so
-      // the caller never double-counts a launch.
-      if (result.ok) return { ok: true, kind: "already-protected", agent_id: spec.agent_id };
-      return result;
-    }
-
-    const promise = this.runProtect(spec);
+    // Reserve the in-flight slot in the SAME synchronous turn as runProtect's
+    // body (codex S1 R9). Precise mechanics (honest — do not over-claim): the
+    // thunk `(async () => this.runProtect(spec))()` invokes runProtect's
+    // synchronous prefix (which sets entry.base="protecting" + agents.set) up to
+    // its first await, THEN the next line registers the promise. Both the entry
+    // mutation AND the inflight reservation therefore become visible within one
+    // uninterrupted synchronous turn, before any await yields control — so a
+    // concurrent protect() for the same agent_id cannot interleave until BOTH
+    // are set, and (per the ordered checks above) it coalesces onto the inflight
+    // promise. The concurrent-duplicate-fails test pins the concrete invariant.
+    const promise = (async () => this.runProtect(spec))();
     this.inflightProtect.set(spec.agent_id, promise);
     try {
       return await promise;

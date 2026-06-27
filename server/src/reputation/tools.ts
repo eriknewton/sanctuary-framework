@@ -11,7 +11,13 @@ import {
   ReputationBundleVerificationError,
   ReputationStore,
   type InteractionOutcome,
+  type StoredAttestation,
 } from "./reputation-store.js";
+import {
+  BRIDGE_METRIC_POLICY,
+  BridgeAttestationMetricValidationError,
+  isConcordiaBridgeReputationContext,
+} from "./bridge-metrics.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { AuditLog } from "../operational/audit-log.js";
@@ -69,6 +75,100 @@ function verascoreLayerFromStatus(
         description: `Configured, unverified (no runtime evidence): ${evidence}`,
       };
   }
+}
+
+type BridgeMetricPolicyDisclosure = {
+  policy: typeof BRIDGE_METRIC_POLICY;
+  status:
+    | "policy_rated"
+    | "mixed_policy_and_legacy"
+    | "legacy_unbounded_metrics"
+    | "unverified_policy_claims"
+    | "mixed_policy_and_unverified"
+    | "no_bridge_metric_evidence";
+  policy_rated_attestations: number;
+  legacy_unbounded_attestations: number;
+  unverified_policy_claim_attestations: number;
+  note: string;
+};
+
+function filterAttestationsByTimeRange(
+  attestations: StoredAttestation[],
+  timeRange?: { start: string; end: string }
+): StoredAttestation[] {
+  if (!timeRange) return attestations;
+  const start = new Date(timeRange.start).getTime();
+  const end = new Date(timeRange.end).getTime();
+  return attestations.filter((a) => {
+    const timestamp = new Date(a.attestation.data.timestamp).getTime();
+    return timestamp >= start && timestamp <= end;
+  });
+}
+
+async function bridgeMetricPolicyDisclosure(options: {
+  reputationStore: ReputationStore;
+  attestations: StoredAttestation[];
+  requestedMetrics?: string[];
+  includeEmptyBridgeContext?: boolean;
+}): Promise<BridgeMetricPolicyDisclosure | undefined> {
+  const requestedMetricSet =
+    options.requestedMetrics !== undefined
+      ? new Set(options.requestedMetrics)
+      : undefined;
+  const bridgeMetricAttestations = options.attestations.filter((a) => {
+    const data = a.attestation.data;
+    if (!isConcordiaBridgeReputationContext(data.context)) return false;
+    if (!requestedMetricSet) return Object.keys(data.metrics).length > 0;
+    return Array.from(requestedMetricSet).some(
+      (metric) => data.metrics[metric] !== undefined
+    );
+  });
+
+  if (
+    bridgeMetricAttestations.length === 0 &&
+    options.includeEmptyBridgeContext !== true
+  ) {
+    return undefined;
+  }
+
+  let policyRatedBridgeCount = 0;
+  let legacyBridgeCount = 0;
+  let unverifiedPolicyClaimCount = 0;
+  for (const attestation of bridgeMetricAttestations) {
+    const status =
+      await options.reputationStore.classifyBridgeMetricEvidence(attestation);
+    if (status === "policy_rated") {
+      policyRatedBridgeCount++;
+    } else if (status === "legacy_unbounded_metrics") {
+      legacyBridgeCount++;
+    } else if (status === "unverified_policy_claim") {
+      unverifiedPolicyClaimCount++;
+    }
+  }
+
+  const unsafeBridgeCount = legacyBridgeCount + unverifiedPolicyClaimCount;
+  return {
+    policy: BRIDGE_METRIC_POLICY,
+    status:
+      bridgeMetricAttestations.length === 0
+        ? "no_bridge_metric_evidence"
+        : policyRatedBridgeCount > 0 && unsafeBridgeCount === 0
+          ? "policy_rated"
+          : policyRatedBridgeCount > 0 && legacyBridgeCount > 0
+            ? "mixed_policy_and_legacy"
+            : policyRatedBridgeCount > 0 && unverifiedPolicyClaimCount > 0
+              ? "mixed_policy_and_unverified"
+              : unverifiedPolicyClaimCount > 0
+                ? "unverified_policy_claims"
+                : "legacy_unbounded_metrics",
+    policy_rated_attestations: policyRatedBridgeCount,
+    legacy_unbounded_attestations: legacyBridgeCount,
+    unverified_policy_claim_attestations: unverifiedPolicyClaimCount,
+    note:
+      unsafeBridgeCount > 0
+        ? "Legacy or unverified bridge metric claims are excluded from aggregate metric calculations and are not privacy-rated policy evidence."
+        : "Only bridge metrics carrying the current metric_policy and matching local bridge commitment provenance are privacy-rated policy evidence.",
+  };
 }
 
 export function createReputationTools(
@@ -153,6 +253,13 @@ export function createReputationTools(
 
         const outcome = args.outcome as InteractionOutcome;
         const context = (args.context as string) ?? "general";
+        if (isConcordiaBridgeReputationContext(context)) {
+          return toolResult({
+            error:
+              "Concordia bridge reputation must be recorded with bridge_attest " +
+              "so metric buckets are derived from a verified bridge commitment.",
+          });
+        }
 
         // Resolve sovereignty tier for the counterparty
         const counterpartyDid = args.counterparty_did as string;
@@ -161,16 +268,24 @@ export function createReputationTools(
         );
         const tierMeta = resolveTierByDid(counterpartyDid, hsResults, hasSanctuaryIdentity);
 
-        const stored = await reputationStore.record(
-          args.interaction_id as string,
-          counterpartyDid,
-          outcome,
-          context,
-          identity,
-          identityEncryptionKey,
-          args.counterparty_attestation as string | undefined,
-          tierMeta.sovereignty_tier
-        );
+        let stored;
+        try {
+          stored = await reputationStore.record(
+            args.interaction_id as string,
+            counterpartyDid,
+            outcome,
+            context,
+            identity,
+            identityEncryptionKey,
+            args.counterparty_attestation as string | undefined,
+            tierMeta.sovereignty_tier
+          );
+        } catch (err) {
+          if (err instanceof BridgeAttestationMetricValidationError) {
+            return toolResult({ error: err.message });
+          }
+          throw err;
+        }
 
         await auditLog.appendCritical({
           layer: "l4",
@@ -232,13 +347,30 @@ export function createReputationTools(
         },
       },
       handler: async (args) => {
+        const context = args.context as string | undefined;
+        const timeRange = args.time_range as
+          | { start: string; end: string }
+          | undefined;
+        const metrics = args.metrics as string[] | undefined;
+        const counterpartyDid = args.counterparty_did as string | undefined;
         const summary = await reputationStore.query({
-          context: args.context as string | undefined,
-          time_range: args.time_range as
-            | { start: string; end: string }
-            | undefined,
-          metrics: args.metrics as string[] | undefined,
-          counterparty_did: args.counterparty_did as string | undefined,
+          context,
+          time_range: timeRange,
+          metrics,
+          counterparty_did: counterpartyDid,
+        });
+        const scopedAttestations = filterAttestationsByTimeRange(
+          await reputationStore.loadAllForTierScoring({
+            context,
+            counterparty_did: counterpartyDid,
+          }),
+          timeRange
+        );
+        const bridgeMetricPolicy = await bridgeMetricPolicyDisclosure({
+          reputationStore,
+          attestations: scopedAttestations,
+          requestedMetrics: metrics,
+          includeEmptyBridgeContext: context === "concordia-bridge",
         });
 
         void auditLog.append("l4", "reputation_query", "system", {
@@ -248,6 +380,9 @@ export function createReputationTools(
 
         return toolResult({
           summary,
+          ...(bridgeMetricPolicy
+            ? { bridge_metric_policy: bridgeMetricPolicy }
+            : {}),
           // SEC-ADD-03: Tag response as containing counterparty-generated attestation data
           _content_trust: "external",
         });
@@ -343,7 +478,8 @@ export function createReputationTools(
         "By default, import requires a signed completeness manifest, recomputes it before any write, and verifies all attestation signatures. " +
         "Manifest, count, checksum, signature, or newer-schema mismatches are rejected without crediting any attestations. " +
         "The verification proves the bundle body still matches the export scope; it does not prove a complete lifetime history. " +
-        "Manifestless legacy bundles are rejected unless allow_unverified_legacy is true, and that import result is flagged unverified-completeness-legacy-bundle.",
+        "Manifestless legacy bundles are rejected unless allow_unverified_legacy is true, and that import result is flagged unverified-completeness-legacy-bundle. " +
+        "Policy-rated concordia-bridge attestations also require matching local bridge commitments; untagged legacy bridge metrics are rejected.",
       inputSchema: {
         type: "object",
         properties: {
@@ -478,9 +614,11 @@ export function createReputationTools(
         required: ["metric"],
       },
       handler: async (args) => {
+        const metric = args.metric as string;
         const summary = await reputationStore.query({
           context: args.context as string | undefined,
           counterparty_did: args.counterparty_did as string | undefined,
+          metrics: [metric],
         });
 
         // Get the raw attestations for tier-aware scoring
@@ -490,23 +628,29 @@ export function createReputationTools(
           counterparty_did: args.counterparty_did as string | undefined,
         });
 
-        const metric = args.metric as string;
-
         // Build tiered attestations for scoring
-        const tieredAttestations: TieredAttestation[] = allAttestations
+        const scoringAttestations =
+          await reputationStore.redactUnsafeBridgeMetrics(allAttestations);
+        const tieredAttestations: TieredAttestation[] = scoringAttestations
           .filter((a) => a.attestation.data.metrics[metric] !== undefined)
           .map((a) => ({
             value: a.attestation.data.metrics[metric]!,
             tier: (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier,
           }));
 
-        const weightedScore = computeWeightedScore(tieredAttestations);
+        const weightedScore = computeWeightedScore(tieredAttestations) ?? 0;
 
         // Compute tier distribution
         const tiers = allAttestations.map(
           (a) => (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier
         );
         const dist = tierDistribution(tiers);
+        const bridgeMetricPolicy = await bridgeMetricPolicyDisclosure({
+          reputationStore,
+          attestations: allAttestations,
+          requestedMetrics: [metric],
+          includeEmptyBridgeContext: args.context === "concordia-bridge",
+        });
 
         void auditLog.append("l4", "reputation_query_weighted", "system", {
           metric,
@@ -521,6 +665,7 @@ export function createReputationTools(
           tier_distribution: dist,
           tier_weights: TIER_WEIGHTS,
           unweighted_summary: summary,
+          ...(bridgeMetricPolicy ? { bridge_metric_policy: bridgeMetricPolicy } : {}),
         });
       },
     },

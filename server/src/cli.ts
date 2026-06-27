@@ -142,15 +142,17 @@ async function main(): Promise<void> {
     const { parseInitArgs, runInit, printInitHelp } = await import(
       "./wrap/init.js"
     );
-    const opts = parseInitArgs(args.slice(1));
-    if (opts.helpRequested) {
-      printInitHelp();
-      process.exit(0);
-    }
     try {
+      const opts = parseInitArgs(args.slice(1));
+      if (opts.helpRequested) {
+        printInitHelp();
+        process.exit(0);
+      }
       await runInit(opts);
       process.exit(0);
-    } catch {
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand; print only the error message, never any recovery-key material.
+      console.error(`\n  Sanctuary init failed: ${formatCliError(err)}\n`);
       process.exit(1);
     }
   }
@@ -993,7 +995,7 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
 
   if (command === "provision-pin") {
     const { runProvisionPin } = await import("./cli/castle-wall.js");
-    return runProvisionPin();
+    return runProvisionPin(args.slice(1));
   }
 
   if (command === "status") {
@@ -1084,6 +1086,8 @@ function printCastleWallHelp(): void {
 
   Subcommands:
     provision-pin    Generate and pin the local Castle Wall keypair.
+                     --fortress <path>  Target a specific fortress (defaults to
+                                        SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH).
     status           Show pinned-key fingerprint and sysext status.
     enable           Arm the content filter headlessly (macOS; SSH-safe after the one-time GUI consent).
                      Refuses without a reachable policy daemon; --force overrides.
@@ -1211,6 +1215,15 @@ function drainAndExit(code: number): void {
   }
   process.exitCode = code;
   process.stdout.write("", () => process.exit(code));
+}
+
+function formatCliError(err: unknown): string {
+  if (err instanceof Error) {
+    const name =
+      err.name && err.name !== "Error" ? `${err.name}: ` : "";
+    return `${name}${err.message}`;
+  }
+  return String(err);
 }
 
 main().catch((err) => {

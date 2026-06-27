@@ -86,7 +86,7 @@
 9	server/docs/federation-v0.1-hard-gate-walkthrough.md
 13	server/docs/keychain-schema.md
 15	server/docs/multi-tenancy.md
-14	server/docs/query-anonymity-tiers.md
+12	server/docs/query-anonymity-tiers.md
 8	server/docs/test-concurrency-discipline.md
 8	server/docs/test-port-discipline.md
 3	server/docs/transparency-checkpoints.md
@@ -205,7 +205,6 @@
 1	server/src/policy-engine/null-policy.ts
 4	server/src/principal-policy/approval-channel.ts
 47	server/src/principal-policy/dashboard-html.ts
-10	server/src/principal-policy/dashboard.ts
 5	server/src/principal-policy/gate.ts
 2	server/src/principal-policy/loader.ts
 3	server/src/principal-policy/posture-home-html.ts
@@ -232,7 +231,6 @@
 1	server/src/substrate/manifest.ts
 1	server/src/substrate/strict-json.ts
 2	server/src/substrate/verdict.ts
-3	server/src/supervisor/spawn-launcher.ts
 2	server/src/supervisor/supervisor.ts
 12	server/src/system-prompt-generator.ts
 2	server/src/templates/cli.ts
@@ -242,7 +240,7 @@
 3	server/src/transparency/verify.ts
 1	server/src/update-check.ts
 6	server/src/v1/agents.ts
-9	server/src/v1/federation.ts
+4	server/src/v1/federation.ts
 1	server/src/v1/operator-signed.ts
 10	server/src/workload-lifecycle/host-attestation.ts
 8	server/src/workload-lifecycle/payload.ts
