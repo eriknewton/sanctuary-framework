@@ -1,9 +1,9 @@
 /**
- * Sovereignty Posture Dashboard — Phase 1 home HTML.
+ * Sovereignty Posture Dashboard - Phase 1 home HTML.
  *
  * A single self-contained page that renders the posture board: the banner, the
  * agent grid (wrapped + detected-unwrapped amber cards), the approvals inbox,
- * "today's story," anomaly findings, and the Castle Wall panel — with a
+ * "today's story," anomaly findings, and the Castle Wall panel - with a
  * persistent data-custody footer. CISO-first ordering: security and
  * data-sovereignty affordances lead; agent-welfare content is deliberately
  * absent from Home (it lives in the agent drill-down's secondary section).
@@ -21,7 +21,7 @@
  * The page authenticates via the same loopback/bearer model as the rest of the
  * dashboard. Every tile drills to evidence: counts link into the audit feed,
  * the wall panel exposes its evidence basis, reach links to the per-agent
- * reach endpoint. "Never fake green" is enforced in the renderer — the banner
+ * reach endpoint. "Never fake green" is enforced in the renderer - the banner
  * shows ARMED green only when `arm_state === "armed"`; `unknown` is amber and
  * `degraded` is red.
  *
@@ -103,7 +103,7 @@ export function featureHealthPill(status: FeatureHealthStatus): {
  * envelope MAC, anti-rollback epoch, pinned-key non-extraction) live under the
  * transient master at boot and are not re-derivable from the dashboard's
  * request-time view. So `unconfirmed` is amber (the honest default), `damaged`
- * is red (earned by fresh negative evidence), and there is no green branch — a
+ * is red (earned by fresh negative evidence), and there is no green branch - a
  * future edit that introduced one would fail a test.
  *
  * The client-side `custodyPill` below embeds the exact same mapping (the page is
@@ -132,7 +132,7 @@ export function renderPostureHomeHTML(): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sanctuary — Sovereignty Posture</title>
+<title>Sanctuary - Sovereignty Posture</title>
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
@@ -229,7 +229,7 @@ export function renderPostureHomeHTML(): string {
 </head>
 <body>
 <header>
-  <h1>Sanctuary — Sovereignty Posture</h1>
+  <h1>Sanctuary - Sovereignty Posture</h1>
   <div class="sub" id="origin">Loading…</div>
   <div class="conn" id="conn">
     <span class="dot"></span>
@@ -1167,20 +1167,44 @@ export function renderPostureHomeHTML(): string {
       summary + frontier + "</div>";
   }
 
-  // Signed-policy-distribution status (A2). The marquee includes "distribute a
-  // signed operator policy to all machines," but that rail is not yet built. Tell
-  // the operator the honest truth: it is on the roadmap and NOT yet available.
-  // NEVER render a fabricated "distributed" state. Amber, never green.
+  // Signed-policy-distribution status (A2). Custody-state distribution only:
+  // hash/version markers from verified signed bundles, never raw policy
+  // contents. Unknown is never green.
   function fleetPolicyDistributionLine(pd) {
     if (!pd || pd.available !== true) {
       return '<div class="evidence">' +
-        '<span class="pill amber">not yet available</span> &nbsp;' +
-        "Signed policy distribution to the fleet is on the roadmap. " +
-        "Today you distribute trust (admit / revoke / rotate); " +
-        "pushing a signed operator policy fleet-wide is not yet built.</div>";
+        '<span class="pill amber">unknown</span> &nbsp;' +
+        "Signed policy state is unavailable for this fleet.</div>";
     }
-    // Reserved for when the real rail lands; today this branch is unreachable.
-    return "";
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">unknown</span> &nbsp;' +
+        "No signed operator policy bundle is known yet. " +
+        "Nodes remain unknown until an operator policy hash is pushed.</div>";
+    }
+    return '<div class="evidence">' +
+      '<span class="pill amber">policy v' + esc(policy.version) + "</span> &nbsp;" +
+      "Signed operator policy hash " + esc(policy.hash) +
+      " · " + esc(summary.in_sync) + " in sync" +
+      " · " + esc(summary.drifted) + " drifted" +
+      " · " + esc(summary.unknown) + " unknown</div>";
+  }
+
+  function fleetPolicyPill(state) {
+    if (state === "in_sync") return '<span class="pill green">policy in sync</span>';
+    if (state === "drifted") return '<span class="pill red">policy drifted</span>';
+    return '<span class="pill amber">policy unknown</span>';
+  }
+
+  function fleetPolicyEvidence(policy) {
+    if (!policy || policy.drift_state === "unknown") {
+      return "policy version unknown";
+    }
+    var base = "policy v" + policy.version;
+    if (policy.applied_at) base += " applied " + policy.applied_at;
+    return base;
   }
 
   function renderFleet(roster) {
@@ -1222,11 +1246,13 @@ export function renderPostureHomeHTML(): string {
         : "";
       return '<div class="story-line">' +
         fleetTrustPill(n.trust_state) + " &nbsp;" +
+        fleetPolicyPill(n.policy && n.policy.drift_state) + " &nbsp;" +
         "<code>" + esc(n.node_id) + "</code>" +
         (n.label ? " (" + esc(n.label) + ")" : "") +
         " &nbsp;" + fleetReachLabel(n.reach) +
         '<div class="evidence">' + esc(fleetTrustWhy(n)) +
         " · mode " + esc(n.node_mode) + modeNote +
+        " · " + esc(fleetPolicyEvidence(n.policy)) +
         (n.last_sync_received_at
           ? " · last sync " + esc(n.last_sync_received_at)
           : " · no sync received") +
@@ -1263,7 +1289,7 @@ export function renderPostureHomeHTML(): string {
             : " (channel-authenticated + tamper-evident chain; per-producer signing not available on this reader)") +
           "</div>"
         : "") +
-      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present — arm-state read may be incomplete.</div>');
+      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present - arm-state read may be incomplete.</div>');
   }
 
   // ── Render the whole board from one honest home payload ─────────────────

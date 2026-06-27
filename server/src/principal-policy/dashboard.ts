@@ -128,6 +128,12 @@ import {
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
 import {
+  FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+  foldFederationPolicyBundleEvent as foldVerifiedFederationPolicyBundleEvent,
+  type FederationAppliedPolicyVersion,
+  type FederationPolicyProjection,
+} from "../v1/federation-policy-bundle.js";
+import {
   FederationSyncStateStore,
   type FederationSyncStateSnapshot,
 } from "../v1/federation-sync-state-store.js";
@@ -335,7 +341,46 @@ interface FederationDashboardState {
   eventLog: FederationEvent[];
   revoked: Set<string>;
   evictionMaxSerial: number;
+  operatorPolicy: FederationAppliedPolicyVersion | null;
+  appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
   nodes: Map<string, FederationNodeView>;
+}
+
+function newerAppliedPolicy(
+  base: FederationAppliedPolicyVersion | null,
+  next: FederationAppliedPolicyVersion | null,
+): FederationAppliedPolicyVersion | null {
+  if (!base) return next ? { ...next } : null;
+  if (!next) return { ...base };
+  return next.version > base.version ? { ...next } : { ...base };
+}
+
+function mergeAppliedPolicyVersions(
+  base: Map<string, FederationAppliedPolicyVersion>,
+  next: Map<string, FederationAppliedPolicyVersion>,
+): Map<string, FederationAppliedPolicyVersion> {
+  const merged = new Map<string, FederationAppliedPolicyVersion>(
+    [...base].map(([nodeId, marker]) => [nodeId, { ...marker }]),
+  );
+  for (const [nodeId, marker] of next) {
+    const prior = merged.get(nodeId);
+    if (!prior || marker.version > prior.version) {
+      merged.set(nodeId, { ...marker });
+    }
+  }
+  return merged;
+}
+
+function appliedPolicyMarkerToNodeView(
+  marker: FederationAppliedPolicyVersion,
+): FederationNodeView["applied_policy"] {
+  return {
+    version: marker.version,
+    hash: marker.hash,
+    hash_algorithm: marker.hash_algorithm,
+    applied_at: marker.applied_at,
+    source_event_id: marker.source_event_id,
+  };
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
@@ -494,6 +539,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     eventLog: [],
     revoked: new Set<string>(),
     evictionMaxSerial: 0,
+    operatorPolicy: null,
+    appliedPolicyVersions: new Map<string, FederationAppliedPolicyVersion>(),
     nodes: new Map<string, FederationNodeView>(),
   };
   private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
@@ -1252,6 +1299,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       fleetRoster: () =>
         buildFleetRoster(this.buildV1FederationDeps(), {
           evictionSerial: this._federationState.evictionMaxSerial,
+          operatorPolicy: this._federationState.operatorPolicy,
         }),
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
@@ -1704,6 +1752,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...this._federationState,
         revoked: new Set<string>(),
         evictionMaxSerial: 0,
+        operatorPolicy: null,
+        appliedPolicyVersions: new Map<string, FederationAppliedPolicyVersion>(),
       };
       return;
     }
@@ -1818,6 +1868,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationHighestRevocationSerial,
       snapshot.highestRevocationSerial,
     );
+    this._federationState = {
+      ...this._federationState,
+      operatorPolicy: newerAppliedPolicy(
+        this._federationState.operatorPolicy,
+        snapshot.operatorPolicy,
+      ),
+      appliedPolicyVersions: mergeAppliedPolicyVersions(
+        this._federationState.appliedPolicyVersions,
+        snapshot.appliedPolicyVersions,
+      ),
+    };
+    this.projectAppliedPoliciesOntoRoster();
   }
 
   /**
@@ -1847,6 +1909,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       highestEvictionSerial: this._federationState.evictionMaxSerial,
       revokedRootPubkeys: new Set(this._federationRevokedRoots),
       highestRevocationSerial: this._federationHighestRevocationSerial,
+      operatorPolicy: this._federationState.operatorPolicy
+        ? { ...this._federationState.operatorPolicy }
+        : null,
+      appliedPolicyVersions: new Map(
+        [...this._federationState.appliedPolicyVersions].map(([nodeId, marker]) => [
+          nodeId,
+          { ...marker },
+        ]),
+      ),
     };
   }
 
@@ -1912,6 +1983,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // refuse to append on empty/untrusted revocation memory.
         this.assertFederationSyncStateAvailable();
         const before = this._federationState.evictionMaxSerial;
+        const beforePolicyVersion = this._federationState.operatorPolicy?.version ?? 0;
         const result = this.appendFederationEvents(events, options);
         // Persist ONLY when an operator-authority eviction advanced the durable
         // revocation projection. On a persist failure THROW so the handler
@@ -1924,7 +1996,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // revocation to disk; the worst case is the SAME pre-existing
         // forgotten-on-restart window this slice otherwise closes, never a
         // silent un-revoke.
-        if (this._federationState.evictionMaxSerial > before) {
+        if (
+          this._federationState.evictionMaxSerial > before ||
+          (this._federationState.operatorPolicy?.version ?? 0) > beforePolicyVersion
+        ) {
           await this.persistFederationSyncState();
         }
         return result;
@@ -2045,13 +2120,33 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return this._federationState.revoked.has(nodeId);
   }
 
+  private projectAppliedPoliciesOntoRoster(): void {
+    if (this._federationState.appliedPolicyVersions.size === 0) return;
+    const nextNodes = new Map(this._federationState.nodes);
+    for (const [nodeId, marker] of this._federationState.appliedPolicyVersions) {
+      const existing = nextNodes.get(nodeId);
+      if (!existing) continue;
+      nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
+        applied_policy: appliedPolicyMarkerToNodeView(marker),
+      }));
+    }
+    this._federationState = {
+      ...this._federationState,
+      nodes: nextNodes,
+    };
+  }
+
   private reprojectFederationRevocations(ctx: FederationContext): void {
     const projection = {
       revokedNodeIds: new Set<string>(),
       highestEvictionSerial: 0,
     };
     const events = this._federationState.eventLog
-      .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
+      .filter(
+        (event) =>
+          event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND &&
+          isFederationOperatorAuthorityEvent(event, ctx.fortressId),
+      )
       .sort((a, b) => a.sequence - b.sequence);
     for (const event of events) {
       const folded = foldAcceptedFederationNodeEvictionEvent({
@@ -2088,10 +2183,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return { ok: true };
   }
 
+  private foldFederationPolicyBundleEvent(
+    event: FederationEvent,
+    projection: FederationPolicyProjection,
+  ): { ok: true } | { ok: false; reason: string } {
+    const ctx = this._federationContext;
+    if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
+    const folded = foldVerifiedFederationPolicyBundleEvent({
+      event,
+      projection,
+      fortressId: ctx.fortressId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+      applyingNodeId: ctx.nodeId,
+    });
+    if (!folded.ok) return { ok: false, reason: folded.reason };
+    return { ok: true };
+  }
+
   private upsertFederationNode(
     nodeId: string,
-    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync" | "applied_policy">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
+      applied_policy?: Partial<FederationNodeView["applied_policy"]>;
     },
   ): FederationNodeView {
     const nextNodes = new Map(this._federationState.nodes);
@@ -2107,8 +2221,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private buildFederationNodeUpsert(
     nodes: Map<string, FederationNodeView>,
     nodeId: string,
-    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync" | "applied_policy">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
+      applied_policy?: Partial<FederationNodeView["applied_policy"]>;
     },
   ): FederationNodeView {
     const now = new Date().toISOString();
@@ -2126,6 +2241,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         received_at: update?.last_sync?.received_at ?? existing?.last_sync.received_at ?? null,
         sent_at: update?.last_sync?.sent_at ?? existing?.last_sync.sent_at ?? null,
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
+      },
+      applied_policy: {
+        version: update?.applied_policy?.version ?? existing?.applied_policy.version ?? null,
+        hash: update?.applied_policy?.hash ?? existing?.applied_policy.hash ?? null,
+        hash_algorithm:
+          update?.applied_policy?.hash_algorithm ??
+          existing?.applied_policy.hash_algorithm ??
+          null,
+        applied_at:
+          update?.applied_policy?.applied_at ??
+          existing?.applied_policy.applied_at ??
+          null,
+        source_event_id:
+          update?.applied_policy?.source_event_id ??
+          existing?.applied_policy.source_event_id ??
+          null,
       },
     };
   }
@@ -2267,6 +2398,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       revokedNodeIds: new Set(currentState.revoked),
       highestEvictionSerial: currentState.evictionMaxSerial,
     };
+    const policyProjection: FederationPolicyProjection = {
+      current: currentState.operatorPolicy
+        ? { ...currentState.operatorPolicy }
+        : null,
+      appliedByNode: new Map(
+        [...currentState.appliedPolicyVersions].map(([nodeId, marker]) => [
+          nodeId,
+          { ...marker },
+        ]),
+      ),
+    };
     const byNode = new Map<string, FederationEvent[]>();
     for (const event of events) {
       const list = byNode.get(event.origin_node_id) ?? [];
@@ -2300,27 +2442,44 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const operatorAuthorityOrigin =
           ctx === null ? null : federationOperatorAuthorityOrigin(ctx.fortressId);
         const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+        const isPolicyBundleKind =
+          event.kind === FEDERATION_POLICY_BUNDLE_EVENT_KIND;
         const isAuthorityOrigin =
           operatorAuthorityOrigin !== null &&
           event.origin_node_id === operatorAuthorityOrigin;
-        if (isEvictionKind || isAuthorityOrigin) {
-          if (
-            ctx === null ||
-            !isFederationOperatorAuthorityEvent(event, ctx.fortressId)
-          ) {
-            rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
+        if (isEvictionKind || isPolicyBundleKind || isAuthorityOrigin) {
+          if (ctx === null || !isFederationOperatorAuthorityEvent(event, ctx.fortressId)) {
+            rejected.push({ event_id: event.event_id, reason: "operator_authority_invalid" });
             continue;
           }
-          const folded = this.foldFederationEvictionEvent(event, evictionProjection);
-          if (!folded.ok) {
-            rejected.push({ event_id: event.event_id, reason: folded.reason });
-            continue;
+          if (isEvictionKind) {
+            const folded = this.foldFederationEvictionEvent(event, evictionProjection);
+            if (!folded.ok) {
+              rejected.push({ event_id: event.event_id, reason: folded.reason });
+              continue;
+            }
+          } else if (isPolicyBundleKind) {
+            const folded = this.foldFederationPolicyBundleEvent(
+              event,
+              policyProjection,
+            );
+            if (!folded.ok) {
+              rejected.push({ event_id: event.event_id, reason: folded.reason });
+              continue;
+            }
           }
         }
         nextEventLog.push(event);
         knownEventIds.add(event.event_id);
         accepted.push(event);
         last = event;
+        if (isPolicyBundleKind && ctx !== null && policyProjection.current) {
+          nextNodes.set(ctx.nodeId, this.buildFederationNodeUpsert(nextNodes, ctx.nodeId, {
+            attestation_status: "verified",
+            node_mode: ctx.nodeMode ?? "local",
+            applied_policy: appliedPolicyMarkerToNodeView(policyProjection.current),
+          }));
+        }
         if (!isAuthorityOrigin) {
           nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
             attestation_status: "verified",
@@ -2339,6 +2498,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         eventLog: nextEventLog,
         revoked: evictionProjection.revokedNodeIds,
         evictionMaxSerial: evictionProjection.highestEvictionSerial,
+        operatorPolicy: policyProjection.current,
+        appliedPolicyVersions: policyProjection.appliedByNode,
         nodes: nextNodes,
       },
     };

@@ -1,5 +1,5 @@
 /**
- * Fleet Console Slice 1 — fleet-roster presenter unit tests.
+ * Fleet Console Slice 1 - fleet-roster presenter unit tests.
  *
  * These pin the trust model the console renders, against the SAME contract the
  * federation control-plane enforces (AGENTS.md constraints 4/5/6):
@@ -7,7 +7,7 @@
  *   - Trust is the federation layer's verdict (`isNodeRevoked`), never
  *     re-derived from a `/v1/nodes` response field.
  *   - An UNEVALUABLE node (revocation state throws) renders `untrusted`,
- *     fail-closed — never amber, never silently admitted.
+ *     fail-closed - never amber, never silently admitted.
  *   - A revoked node renders `revoked`.
  *   - No key material appears on the roster shape.
  *   - An unprovisioned fortress has an honest absent roster, never a fabricated
@@ -74,6 +74,13 @@ function nodeView(
       sent_at: "2026-06-24T11:59:00.000Z",
       last_sequence: 3,
     },
+    applied_policy: overrides?.applied_policy ?? {
+      version: null,
+      hash: null,
+      hash_algorithm: null,
+      applied_at: null,
+      source_event_id: null,
+    },
   };
 }
 
@@ -113,7 +120,7 @@ function deps(opts: {
   };
 }
 
-describe("buildFleetRoster — trust verdict is the federation layer's, fail-closed", () => {
+describe("buildFleetRoster - trust verdict is the federation layer's, fail-closed", () => {
   it("presents a 2-node fleet as all admitted when none are revoked", () => {
     const roster = buildFleetRoster(
       deps({
@@ -242,7 +249,7 @@ describe("buildFleetRoster — trust verdict is the federation layer's, fail-clo
   });
 });
 
-describe("buildFleetRoster — reach is liveness telemetry, separate from trust", () => {
+describe("buildFleetRoster - reach is liveness telemetry, separate from trust", () => {
   it("classifies a recent sync as reachable, never a trust signal", () => {
     const recent = new Date(NOW - 60_000).toISOString();
     const roster = buildFleetRoster(
@@ -290,7 +297,7 @@ describe("buildFleetRoster — reach is liveness telemetry, separate from trust"
   });
 });
 
-describe("buildFleetRoster — fleet sync-health rollup (A1, liveness not trust)", () => {
+describe("buildFleetRoster - fleet sync-health rollup (A1, liveness not trust)", () => {
   const recentIso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
 
   it("rolls up reachable/stale/never counts from the per-node reach axis", () => {
@@ -417,26 +424,105 @@ describe("buildFleetRoster — fleet sync-health rollup (A1, liveness not trust)
   });
 });
 
-describe("buildFleetRoster — signed-policy-distribution status (A2, honest absence)", () => {
-  it("reports policy distribution as not-yet-available (never a fabricated distributed state)", () => {
+describe("buildFleetRoster - signed-policy-distribution status (A2, custody state)", () => {
+  const operatorPolicy = {
+    version: 7,
+    hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    hash_algorithm: "sha256-base64url" as const,
+    applied_at: "2026-06-24T11:58:00.000Z",
+    source_event_id: "operator:fortress:test:7",
+  };
+
+  it("marks nodes with no applied marker as unknown, never in sync", () => {
     const roster = buildFleetRoster(
       deps({ nodes: [nodeView("node-1")], isNodeRevoked: () => false }),
-      { now: () => NOW },
+      { now: () => NOW, operatorPolicy },
     );
-    // The rail is unbuilt: the console states honest absence, never green.
-    expect(roster.policy_distribution).toEqual({ available: false });
+    expect(roster.policy_distribution.available).toBe(true);
+    expect(roster.policy_distribution.operator_policy?.version).toBe(7);
+    expect(roster.policy_distribution.summary).toEqual({
+      in_sync: 0,
+      drifted: 0,
+      unknown: 1,
+    });
+    expect(roster.nodes[0]!.policy.drift_state).toBe("unknown");
   });
 
-  it("reports honest absence on an unprovisioned fortress too", () => {
+  it("marks exact hash/version matches as in sync and mismatches as drifted", () => {
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("fresh", {
+            applied_policy: {
+              version: 7,
+              hash: operatorPolicy.hash,
+              hash_algorithm: "sha256-base64url",
+              applied_at: "2026-06-24T11:59:00.000Z",
+              source_event_id: operatorPolicy.source_event_id,
+            },
+          }),
+          nodeView("old", {
+            applied_policy: {
+              version: 6,
+              hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              hash_algorithm: "sha256-base64url",
+              applied_at: "2026-06-24T11:00:00.000Z",
+              source_event_id: "operator:fortress:test:6",
+            },
+          }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW, operatorPolicy },
+    );
+    const byId = Object.fromEntries(roster.nodes.map((n) => [n.node_id, n]));
+    expect(byId["fresh"]!.policy.drift_state).toBe("in_sync");
+    expect(byId["old"]!.policy.drift_state).toBe("drifted");
+    expect(roster.policy_distribution.summary).toEqual({
+      in_sync: 1,
+      drifted: 1,
+      unknown: 0,
+    });
+  });
+
+  it("does not fabricate an in-sync state when no operator policy is known", () => {
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("node-1", {
+            applied_policy: {
+              version: 7,
+              hash: operatorPolicy.hash,
+              hash_algorithm: "sha256-base64url",
+              applied_at: "2026-06-24T11:59:00.000Z",
+              source_event_id: operatorPolicy.source_event_id,
+            },
+          }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      { now: () => NOW },
+    );
+    expect(roster.policy_distribution.available).toBe(true);
+    expect(roster.policy_distribution.operator_policy).toBeNull();
+    expect(roster.nodes[0]!.policy.drift_state).toBe("unknown");
+    expect(roster.policy_distribution.summary.unknown).toBe(1);
+  });
+
+  it("reports policy state unavailable on an unprovisioned fortress", () => {
     const roster = buildFleetRoster(
       deps({ context: null, nodes: [], isNodeRevoked: () => false }),
       { now: () => NOW },
     );
-    expect(roster.policy_distribution).toEqual({ available: false });
+    expect(roster.policy_distribution).toEqual({
+      available: false,
+      operator_policy: null,
+      summary: { in_sync: 0, drifted: 0, unknown: 0 },
+    });
   });
 });
 
-describe("buildFleetRoster — no key material on the roster shape", () => {
+describe("buildFleetRoster - no key material on the roster shape", () => {
   it("emits only public identifiers and posture metadata", () => {
     const roster = buildFleetRoster(
       deps({ nodes: [nodeView("node-1")], isNodeRevoked: () => false }),
@@ -455,6 +541,7 @@ describe("buildFleetRoster — no key material on the roster shape", () => {
         "last_sync_received_at",
         "node_id",
         "node_mode",
+        "policy",
         "provider_in_trust_boundary",
         "reach",
         "trust_evaluable",

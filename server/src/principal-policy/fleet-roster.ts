@@ -1,5 +1,5 @@
 /**
- * Fleet Console Slice 1 — the federation-backed fleet-roster presenter.
+ * Fleet Console Slice 1 - the federation-backed fleet-roster presenter.
  *
  * This is a THIN read-only presenter over the proven federation control-plane.
  * It composes on the `/v1` read seam (`V1FederationDeps`) and adds NO new trust
@@ -13,8 +13,8 @@
  * the same hard constraints as the federation layer it presents):
  *
  *  - Trust is the federation layer's verdict, not ours (constraint 4). We call
- *    `deps.isNodeRevoked(node_id)` — the SAME grow-only projection every sync
- *    path routes through — and present its answer. We do not infer "trusted"
+ *    `deps.isNodeRevoked(node_id)` - the SAME grow-only projection every sync
+ *    path routes through - and present its answer. We do not infer "trusted"
  *    from `attestation_status: "verified"` or any other response field.
  *
  *  - Fail closed on an unevaluable node (constraint 5). If `isNodeRevoked`
@@ -33,7 +33,7 @@
  *    shell over a fortress that has no federation.
  *
  * The rotation serial is the operator-signed monotonic eviction serial from the
- * federation status posture — the same serial that orders revocation events in
+ * federation status posture - the same serial that orders revocation events in
  * the signed log. It is surfaced as fleet-wide context (the operator can see the
  * fleet has advanced to serial N), not re-derived per node.
  */
@@ -42,15 +42,16 @@ import type {
   FederationNodeView,
   V1FederationDeps,
 } from "../v1/federation.js";
+import type { FederationAppliedPolicyVersion } from "../v1/federation-policy-bundle.js";
 
 /**
  * The trust state the console renders per machine. This is the operator-facing
  * vocabulary; it maps 1:1 to a federation verdict and never to a response shape.
  *
- *  - `admitted`   — the federation layer evaluated the node and it is NOT in the
+ *  - `admitted`   - the federation layer evaluated the node and it is NOT in the
  *                   grow-only revoked set. Green.
- *  - `revoked`    — the node is in the operator-signed revoked set. Red.
- *  - `untrusted`  — the node's revocation state could not be evaluated
+ *  - `revoked`    - the node is in the operator-signed revoked set. Red.
+ *  - `untrusted`  - the node's revocation state could not be evaluated
  *                   (fail-closed). Red. NEVER amber, never silently admitted.
  */
 export type FleetNodeTrustState = "admitted" | "revoked" | "untrusted";
@@ -62,11 +63,32 @@ export type FleetNodeTrustState = "admitted" | "revoked" | "untrusted";
  * node may show `never` until it first syncs. The console keeps the two axes
  * separate so reach can never launder a node into looking trusted.
  *
- *  - `recent`  — a sync was received from this node inside the freshness window.
- *  - `stale`   — a sync was seen, but not inside the freshness window.
- *  - `never`   — no sync has ever been received from this node.
+ *  - `recent`  - a sync was received from this node inside the freshness window.
+ *  - `stale`   - a sync was seen, but not inside the freshness window.
+ *  - `never`   - no sync has ever been received from this node.
  */
 export type FleetNodeReach = "recent" | "stale" | "never";
+
+/**
+ * Per-node signed operator-policy drift. Unknown is deliberately separate from
+ * in-sync and must never render green: when the operator version or node marker
+ * is missing, the console cannot prove the node applied the current bundle.
+ */
+export type FleetPolicyDriftState = "in_sync" | "drifted" | "unknown";
+
+/** Policy version marker as the console presents it. No raw policy contents. */
+export interface FleetPolicyMarker {
+  version: number | null;
+  hash: string | null;
+  hash_algorithm: string | null;
+  applied_at: string | null;
+  source_event_id: string | null;
+}
+
+/** Per-node signed policy state plus the computed drift verdict. */
+export interface FleetNodePolicyStatus extends FleetPolicyMarker {
+  drift_state: FleetPolicyDriftState;
+}
 
 /** One machine as the console presents it. Read-only; no key material. */
 export interface FleetRosterNode {
@@ -90,6 +112,8 @@ export interface FleetRosterNode {
   provider_in_trust_boundary: boolean;
   /** Last time a sync was received from this node, or null if never. */
   last_sync_received_at: string | null;
+  /** Signed operator-policy marker and drift verdict. No raw policy contents. */
+  policy: FleetNodePolicyStatus;
   first_seen: string;
   last_seen: string;
 }
@@ -126,24 +150,24 @@ export interface FleetSyncHealth {
 }
 
 /**
- * Honest signed-policy-distribution status (Marquee A2).
+ * Signed-policy-distribution status (Marquee A2).
  *
- * The marquee experience includes "distribute a signed operator policy to all of
- * them," but that RAIL is not yet built in the federation layer (there is no
- * operator-signed policy-bundle event kind, no per-node applied-policy version,
- * no distribution path). Rather than silently omit the capability or fabricate a
- * "distributed" state, the console states the honest truth: the capability is on
- * the roadmap and NOT yet available. This is honest-absence product copy, never a
- * green claim. When the real rail lands, `available` flips to true and per-node
- * applied-policy state replaces this placeholder.
+ * This is custody-state distribution, not portable audit evidence. The console
+ * shows the operator-signed policy hash/version currently known to this node and
+ * each node's applied marker. It never carries raw policy contents, policy
+ * secrets, or private keys. Unknown is never counted as in-sync.
  */
 export interface FleetPolicyDistribution {
-  /**
-   * Always `false` today: signed operator policy distribution to the fleet is not
-   * yet built. The console renders an honest "coming, not yet available" line, not
-   * a fabricated distributed state. NEVER green while this is false.
-   */
-  available: false;
+  /** True when the federation presenter can evaluate signed-policy state. */
+  available: boolean;
+  /** Current operator-signed policy marker known to this node, or null. */
+  operator_policy: FleetPolicyMarker | null;
+  /** Per-node rollup. Unknown is not in-sync and must not render green. */
+  summary: {
+    in_sync: number;
+    drifted: number;
+    unknown: number;
+  };
 }
 
 /** The full fleet roster the console renders. */
@@ -184,10 +208,8 @@ export interface FleetRoster {
    */
   sync_health: FleetSyncHealth;
   /**
-   * Honest signed-policy-distribution status (A2). Today always
-   * `{ available: false }`: the distribution rail is not yet built, and the
-   * console says so rather than omitting or fabricating it. See
-   * `FleetPolicyDistribution`.
+   * Signed-policy-distribution status (A2). Custody-state distribution only;
+   * no raw policy contents and no audit-evidence parity claim.
    */
   policy_distribution: FleetPolicyDistribution;
 }
@@ -255,6 +277,78 @@ function buildSyncHealth(
   };
 }
 
+function markerFromAppliedPolicy(
+  marker: FederationAppliedPolicyVersion | null | undefined,
+): FleetPolicyMarker | null {
+  if (!marker) return null;
+  return {
+    version: marker.version,
+    hash: marker.hash,
+    hash_algorithm: marker.hash_algorithm,
+    applied_at: marker.applied_at,
+    source_event_id: marker.source_event_id,
+  };
+}
+
+function markerFromNode(node: FederationNodeView): FleetPolicyMarker {
+  return {
+    version: node.applied_policy.version,
+    hash: node.applied_policy.hash,
+    hash_algorithm: node.applied_policy.hash_algorithm,
+    applied_at: node.applied_policy.applied_at,
+    source_event_id: node.applied_policy.source_event_id,
+  };
+}
+
+function classifyPolicyDrift(
+  nodePolicy: FleetPolicyMarker,
+  operatorPolicy: FleetPolicyMarker | null,
+): FleetPolicyDriftState {
+  if (operatorPolicy === null) return "unknown";
+  if (
+    nodePolicy.version === null ||
+    nodePolicy.hash === null ||
+    nodePolicy.hash_algorithm === null
+  ) {
+    return "unknown";
+  }
+  if (
+    nodePolicy.version === operatorPolicy.version &&
+    nodePolicy.hash === operatorPolicy.hash &&
+    nodePolicy.hash_algorithm === operatorPolicy.hash_algorithm
+  ) {
+    return "in_sync";
+  }
+  return "drifted";
+}
+
+function buildPolicyStatus(
+  node: FederationNodeView,
+  operatorPolicy: FleetPolicyMarker | null,
+): FleetNodePolicyStatus {
+  const marker = markerFromNode(node);
+  return {
+    ...marker,
+    drift_state: classifyPolicyDrift(marker, operatorPolicy),
+  };
+}
+
+function buildPolicyDistribution(
+  nodes: FleetRosterNode[],
+  operatorPolicy: FleetPolicyMarker | null,
+  available: boolean,
+): FleetPolicyDistribution {
+  return {
+    available,
+    operator_policy: operatorPolicy,
+    summary: {
+      in_sync: nodes.filter((n) => n.policy.drift_state === "in_sync").length,
+      drifted: nodes.filter((n) => n.policy.drift_state === "drifted").length,
+      unknown: nodes.filter((n) => n.policy.drift_state === "unknown").length,
+    },
+  };
+}
+
 /**
  * Resolve the federation trust verdict for ONE node, fail-closed.
  *
@@ -303,6 +397,11 @@ export function buildFleetRoster(
      * from the issuer-side root-rotation serial, which is not surfaced here.
      */
     evictionSerial?: number;
+    /**
+     * Current operator-signed policy hash/version known to this node. Supplied
+     * by the dashboard's verified event projection, not re-derived here.
+     */
+    operatorPolicy?: FederationAppliedPolicyVersion | null;
   },
 ): FleetRoster {
   const now = options?.now?.() ?? Date.now();
@@ -310,6 +409,7 @@ export function buildFleetRoster(
     options?.freshnessWindowMs ?? FLEET_REACH_FRESHNESS_WINDOW_MS;
 
   const ctx = deps.getContext();
+  const operatorPolicy = markerFromAppliedPolicy(options?.operatorPolicy);
 
   // Honest absence: an unprovisioned fortress has no fleet. Do not fabricate a
   // green "all admitted" roster over a fortress with no federation root.
@@ -331,7 +431,7 @@ export function buildFleetRoster(
         oldest_last_sync: null,
         freshness_window_ms: freshnessWindowMs,
       },
-      policy_distribution: { available: false },
+      policy_distribution: buildPolicyDistribution([], null, false),
     };
   }
 
@@ -349,6 +449,7 @@ export function buildFleetRoster(
       node_mode: node.node_mode,
       provider_in_trust_boundary: node.trust_boundary.provider_in_trust_boundary,
       last_sync_received_at: node.last_sync.received_at,
+      policy: buildPolicyStatus(node, operatorPolicy),
       first_seen: node.first_seen,
       last_seen: node.last_seen,
     };
@@ -370,9 +471,7 @@ export function buildFleetRoster(
     nodes,
     summary,
     sync_health: buildSyncHealth(nodes, freshnessWindowMs),
-    // A2: the signed-policy-distribution rail is not yet built. State the honest
-    // absence; never fabricate a distributed state.
-    policy_distribution: { available: false },
+    policy_distribution: buildPolicyDistribution(nodes, operatorPolicy, true),
   };
 }
 
