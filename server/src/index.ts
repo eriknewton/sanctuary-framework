@@ -1428,19 +1428,14 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
-  // 16b-read. ERC-8004 Identity resolve (read side). Offline-only by default:
-  // verifies a presented record's signature/shape with NO outbound surface.
-  // An on-chain registry confirmation happens ONLY when the operator supplies
-  // a registry RPC endpoint via SANCTUARY_ERC8004_RPC_URL (default-off); that
-  // read is SSRF-guarded and never auto-egresses without the endpoint set.
-  const erc8004RpcEndpoint = process.env.SANCTUARY_ERC8004_RPC_URL;
+  // 16b-read. ERC-8004 Identity OFFLINE verifier (read side). Fully local:
+  // verifies a presented record's signature/shape with NO outbound surface and
+  // no on-chain read. On-chain registry confirmation is a deferred follow-up
+  // (must reuse Verascore's real ERC-8004 ABI), not shipped here.
   const { tools: erc8004ResolveTools } = createErc8004ResolveTools({
     auditLog,
     identityId: aggregatorIdentityId,
     fortressId: fortressIdForAggregator,
-    ...(erc8004RpcEndpoint && erc8004RpcEndpoint.trim().length > 0
-      ? { rpcEndpoint: erc8004RpcEndpoint.trim() }
-      : {}),
   });
 
   const { tools: agentNativeTools } = createAgentNativeCooperativeTools({

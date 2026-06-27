@@ -1,20 +1,18 @@
 /**
- * Key 17 -- ERC-8004 Identity resolve (read side) tests.
+ * Key 17 -- ERC-8004 Identity OFFLINE verifier (read side) tests.
  *
- * Covers: positive offline verify, tampered-record reject (fail closed),
- * malformed-record reject, no-endpoint offline-only path, the no-egress
- * guarantee when no endpoint is configured, the SSRF block for a private RPC
- * endpoint, and the on-chain confirm/mismatch paths through an injected fetch.
- * The resolver reuses the existing signer's verify path and the existing
- * `key-17:erc8004-identity:v1` scheme; it defines no new crypto label.
+ * Covers: positive offline verify, no-key-leak, tampered-record reject (fail
+ * closed), tampered-signature reject, malformed/non-object/non-integer reject,
+ * and the tool wiring. The verifier reuses the existing signer's verify path and
+ * the existing `key-17:erc8004-identity:v1` scheme; it defines no new crypto
+ * label and makes no outbound request (there is no RPC surface to test).
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   resolveErc8004Identity,
   createErc8004ResolveTools,
   ERC8004_RESOLVE_AUDIT_OPS,
-  type ResolveFetch,
 } from "../../src/key-17/erc8004-resolve.js";
 import {
   signErc8004Registration,
@@ -66,7 +64,7 @@ function baseDeps(audit = createMockAuditLog()) {
 // ── Offline verification ─────────────────────────────────────────────
 
 describe("resolveErc8004Identity: offline verification", () => {
-  it("resolves a well-formed signed record as valid (offline-only)", async () => {
+  it("resolves a well-formed signed record as valid (offline)", async () => {
     const audit = createMockAuditLog();
     const signed = makeSignedRecord();
 
@@ -81,8 +79,6 @@ describe("resolveErc8004Identity: offline verification", () => {
       nonce: signed.nonce,
       timestamp: signed.timestamp,
     });
-    // Offline-only: no registry confirmation field at all.
-    expect(result.registry_confirmed).toBeUndefined();
     expect(
       audit.entries.some(
         (e) => e.op === ERC8004_RESOLVE_AUDIT_OPS.RESOLVED_VALID,
@@ -154,160 +150,10 @@ describe("resolveErc8004Identity: offline verification", () => {
   });
 });
 
-// ── No-egress guarantee ──────────────────────────────────────────────
-
-describe("resolveErc8004Identity: egress discipline", () => {
-  it("makes NO outbound request when no endpoint is configured", async () => {
-    const fetchSpy = vi.fn();
-    const signed = makeSignedRecord();
-    const result = await resolveErc8004Identity(
-      { ...baseDeps(), resolveFetch: fetchSpy as unknown as ResolveFetch },
-      signed,
-    );
-    expect(result.valid).toBe(true);
-    // The injected fetch must never be called with no endpoint set.
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it("makes NO outbound request when the record is invalid even if an endpoint is set", async () => {
-    const fetchSpy = vi.fn();
-    const signed = makeSignedRecord();
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(),
-        rpcEndpoint: "http://10.0.0.5:8545",
-        allowPrivateRpc: true,
-        resolveFetch: fetchSpy as unknown as ResolveFetch,
-      },
-      { ...signed, identity: "did:agent:tampered" },
-    );
-    expect(result.valid).toBe(false);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it("blocks a loopback RPC endpoint via the SSRF guard, no fetch", async () => {
-    const fetchSpy = vi.fn();
-    const audit = createMockAuditLog();
-    const signed = makeSignedRecord();
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(audit),
-        rpcEndpoint: "http://127.0.0.1:8545",
-        resolveFetch: fetchSpy as unknown as ResolveFetch,
-      },
-      signed,
-    );
-    // Offline check still passed; the registry claim is fail-closed (false).
-    expect(result.valid).toBe(true);
-    expect(result.registry_confirmed).toBe(false);
-    expect(result.registry_note).toContain("rejected");
-    expect(fetchSpy).not.toHaveBeenCalled();
-    expect(
-      audit.entries.some(
-        (e) => e.op === ERC8004_RESOLVE_AUDIT_OPS.RPC_BLOCKED,
-      ),
-    ).toBe(true);
-  });
-});
-
-// ── On-chain confirmation through injected fetch ─────────────────────
-
-describe("resolveErc8004Identity: on-chain confirmation", () => {
-  it("confirms when the registry returns the matching owner address", async () => {
-    const signed = makeSignedRecord();
-    // ABI-encode the signer address as the last 32-byte word.
-    const addrHex = signed.signer_address.replace(/^0x/, "").toLowerCase();
-    const word = "0".repeat(24) + addrHex;
-    const okFetch: ResolveFetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ jsonrpc: "2.0", id: "x", result: "0x" + word }),
-    }));
-
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(),
-        rpcEndpoint: "http://10.0.0.5:8545",
-        allowPrivateRpc: true,
-        resolveFetch: okFetch,
-      },
-      signed,
-    );
-
-    expect(result.valid).toBe(true);
-    expect(result.registry_confirmed).toBe(true);
-    expect(okFetch).toHaveBeenCalledTimes(1);
-  });
-
-  it("does NOT confirm when the registry owner differs from the signer", async () => {
-    const signed = makeSignedRecord();
-    const otherWord = "0".repeat(24) + "a".repeat(40);
-    const mismatchFetch: ResolveFetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ result: "0x" + otherWord }),
-    }));
-
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(),
-        rpcEndpoint: "http://10.0.0.5:8545",
-        allowPrivateRpc: true,
-        resolveFetch: mismatchFetch,
-      },
-      signed,
-    );
-
-    expect(result.valid).toBe(true);
-    expect(result.registry_confirmed).toBe(false);
-    expect(result.registry_note).toContain("does not match");
-  });
-
-  it("does NOT confirm (fail closed) when the registry read errors", async () => {
-    const signed = makeSignedRecord();
-    const errFetch: ResolveFetch = vi.fn(async () => {
-      throw new Error("network down");
-    });
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(),
-        rpcEndpoint: "http://10.0.0.5:8545",
-        allowPrivateRpc: true,
-        resolveFetch: errFetch,
-      },
-      signed,
-    );
-    expect(result.valid).toBe(true);
-    expect(result.registry_confirmed).toBe(false);
-    expect(result.registry_note).toContain("failed");
-  });
-
-  it("does NOT confirm when the registry returns a non-200 status", async () => {
-    const signed = makeSignedRecord();
-    const badStatus: ResolveFetch = vi.fn(async () => ({
-      ok: false,
-      status: 503,
-      json: async () => ({}),
-    }));
-    const result = await resolveErc8004Identity(
-      {
-        ...baseDeps(),
-        rpcEndpoint: "http://10.0.0.5:8545",
-        allowPrivateRpc: true,
-        resolveFetch: badStatus,
-      },
-      signed,
-    );
-    expect(result.valid).toBe(true);
-    expect(result.registry_confirmed).toBe(false);
-    expect(result.registry_note).toContain("503");
-  });
-});
-
 // ── MCP tool wiring ──────────────────────────────────────────────────
 
 describe("createErc8004ResolveTools", () => {
-  it("registers a read-class resolve tool with an accurate description", () => {
+  it("registers a read-class verify tool with an accurate description", () => {
     const { tools } = createErc8004ResolveTools({
       auditLog: createMockAuditLog() as unknown as Parameters<
         typeof createErc8004ResolveTools
@@ -321,6 +167,8 @@ describe("createErc8004ResolveTools", () => {
     expect(tool.tool_class).toBe("read");
     expect(tool.description).toContain("OFFLINE");
     expect(tool.description.toLowerCase()).toContain("read-only");
+    // The description must not overclaim an on-chain/registry-owner check.
+    expect(tool.description).toContain("does NOT prove");
   });
 
   it("the tool handler verifies a presented record end to end (offline)", async () => {
