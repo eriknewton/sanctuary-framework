@@ -159,6 +159,22 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "principal-policy-unified-inbox-operator-prefs-v1",
   "principal-policy-unified-inbox-retention-policy-v1",
 
+  // --- post-quantum (hybrid Ed25519+ML-DSA-65) signing-suite + cert-version
+  // literals (the at-rest/on-wire PQC trap). These tag the bundle/domain and
+  // the v2 hybrid fortress-master/principal-cert/node-cert/root-rotation
+  // surfaces. Changing a byte breaks verify of existing hybrid certs and
+  // decrypt/verify of existing v2 fortresses, and it fails SILENTLY
+  // (fresh-install tests still pass). See crypto-suite-registry.ts +
+  // mesh/trust-root-hybrid.ts. A vocabulary/reorg sweep must NEVER touch these.
+  "sanctuary.signature-bundle.v1",
+  "sanctuary.signed-surface.v1",
+  "ed25519+ml-dsa-v1",
+  "ml-dsa-65-v1",
+  "sanctuary.fortress-master.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.principal-cert.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.node-cert.v2.hybrid-ed25519-ml-dsa-65",
+  "sanctuary.root-rotation.v2.hybrid-ed25519-ml-dsa-65",
+
   // --- persisted at-rest keys / namespaces (renaming orphans on-disk state) ---
   "SANCTUARY_EXIT_BUNDLE_V1",
   "_composition",
