@@ -20,6 +20,26 @@
  *           consented_to_trade_off?: boolean }
  *       Refuses (409 consent_required) if asking for enabled=true
  *       without consent_to_trade_off=true in the merged result.
+ *       Honesty: the response and the audit event report
+ *       `effective_tier_b_enabled: false` with an `inactive_reason`
+ *       while no redactor is wired into the production substrate path
+ *       (see DEBT below). The operator's `enabled` preference is still
+ *       persisted; it just does not produce live scrubbing yet, and
+ *       the surface must not claim otherwise (never-overclaim rule).
+ *
+ * DEBT (real-feature follow-up, Erik-reviewed): wire the PII rewriter
+ *   into the live path so the toggle actually scrubs. Concretely:
+ *   (1) build the redactor via `buildPrivacyTier2Redactor` and install
+ *       it on the production `SubstrateSelector` (constructed in
+ *       `server/src/index.ts` ~:922) via `installRedactor`, replacing
+ *       the default passthrough `IDENTITY_REDACTOR`;
+ *   (2) pass `queryAnonymityConfig` (the Tier B enabled/smart-mode
+ *       flags from `PiiConfigStore`) into the chat service so the
+ *       smart-mode rewrite path is read at invocation time.
+ *   Until BOTH land, `effectiveTierBEnabled()` below stays `false` and
+ *   the `feature-health.ts` `privacy_strips` row stays amber. This PR
+ *   is copy + config-response truthfulness only; it does NOT change
+ *   what reaches the substrate.
  *
  *   GET /api/query-anonymity/pii/trade-off
  *       Returns the plain-English trade-off explainer. The dashboard
@@ -61,6 +81,31 @@ export const PII_REWRITE_API_PREFIX = "/api/query-anonymity/pii";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_PREVIEW_TEXT_BYTES = 16 * 1024;
+
+/**
+ * Honesty constant: the PII rewriter is not wired into the production
+ * substrate path in this build, so toggling Tier B on does NOT scrub
+ * live queries yet. The PATCH /config response and audit event report
+ * this reason alongside `effective_tier_b_enabled: false` so the
+ * operator's view matches reality. Flip `EFFECTIVE_TIER_B_ENABLED` (or
+ * derive it from a real wiring signal) only when the live redactor /
+ * smart-mode path is installed; see the DEBT note in this module's
+ * header.
+ */
+export const TIER_B_INACTIVE_REASON = "redactor not wired in this build";
+
+/**
+ * Whether the operator's Tier B preference actually produces live
+ * scrubbing. Hard-coded `false` until the production substrate-selector
+ * is constructed with a real redactor (`installRedactor` /
+ * `buildPrivacyTier2Redactor`) AND the chat service is passed the
+ * query-anonymity config; until then a toggled-on flag is inert. Kept
+ * as a single helper so the response body and the audit event derive
+ * the truth from the same place.
+ */
+export function effectiveTierBEnabled(): boolean {
+  return false;
+}
 
 export interface PiiRewriteRouterDeps {
   authConfig: AuthConfig;
@@ -145,7 +190,18 @@ export async function handlePiiRewriteRoute(
       const now = (deps.now ?? (() => new Date()))();
       const config =
         (await deps.store.get()) ?? defaultPiiRewriteConfig(() => now);
-      writeJSON(res, 200, { ok: true, data: { config } });
+      // Honesty: surface the true effective state on read too, so the
+      // toggle UI reflects that a stored `enabled` preference is inert
+      // until the live scrubbing path is wired in.
+      const effectiveTierB = effectiveTierBEnabled();
+      writeJSON(res, 200, {
+        ok: true,
+        data: {
+          config,
+          effective_tier_b_enabled: effectiveTierB,
+          inactive_reason: effectiveTierB ? null : TIER_B_INACTIVE_REASON,
+        },
+      });
       return true;
     }
 
@@ -179,17 +235,26 @@ export async function handlePiiRewriteRoute(
         return true;
       }
       try {
-        const updated = await deps.store.patch(patch);
+        const { config: updated, consentJustRecorded } =
+          await deps.store.patch(patch);
+        // Honesty (never-overclaim rule): the operator's preference is
+        // persisted (`updated.enabled` / `updated.smart_mode_enabled`),
+        // but Tier B does NOT scrub live queries until the production
+        // redactor + smart-mode wiring lands. The effective state is
+        // derived from a single source (`effectiveTierBEnabled`) so the
+        // audit event and the HTTP response can never disagree, and so
+        // the surface never reports `effective_tier_b_enabled: true`
+        // for a path that performs no scrubbing. See the DEBT note in
+        // this module's header.
+        const effectiveTierB = effectiveTierBEnabled();
+        const inactiveReason = effectiveTierB ? null : TIER_B_INACTIVE_REASON;
         // Audit emission: consent first, then config-updated. The
-        // consent op fires only on the transition false -> true (i.e.
-        // when the patch supplied true AND the existing was false).
-        // `patch` stamps consented_at on that transition; we use that
-        // as the signal.
-        if (
-          patch.consented_to_trade_off === true &&
-          updated.consented_at !== undefined &&
-          updated.consented_at === updated.updated_at
-        ) {
+        // consent op fires only on the false -> true consent
+        // transition, signalled EXPLICITLY by the store (derived from
+        // state, not from comparing two independently-sampled
+        // timestamps). This is deterministic regardless of how the
+        // wall clock samples, closing the audit-completeness race.
+        if (consentJustRecorded) {
           void deps.auditLog.append(
             "l2",
             PII_REWRITE_AUDIT_OPS.CONSENT_RECORDED,
@@ -208,13 +273,26 @@ export async function handlePiiRewriteRoute(
             fortress_id: deps.fortressId,
             enabled: updated.enabled,
             smart_mode_enabled: updated.smart_mode_enabled,
-            effective_tier_b_enabled:
-              updated.enabled || updated.smart_mode_enabled,
+            // True effective state: false while no redactor is wired.
+            // NOT `updated.enabled || updated.smart_mode_enabled` (that
+            // overclaimed an inert toggle as an active protection).
+            effective_tier_b_enabled: effectiveTierB,
+            inactive_reason: inactiveReason,
             consented_to_trade_off: updated.consented_to_trade_off,
             updated_at: updated.updated_at,
           },
         );
-        writeJSON(res, 200, { ok: true, data: { config: updated } });
+        writeJSON(res, 200, {
+          ok: true,
+          data: {
+            config: updated,
+            // Surface the true effective state to the operator so the
+            // toggle UI cannot claim active scrubbing the path does not
+            // perform.
+            effective_tier_b_enabled: effectiveTierB,
+            inactive_reason: inactiveReason,
+          },
+        });
       } catch (err) {
         if (err instanceof PiiConsentRequired) {
           writeJSON(res, 409, { ok: false, error: err.code });

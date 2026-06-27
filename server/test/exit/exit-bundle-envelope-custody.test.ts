@@ -334,7 +334,14 @@ describe("exit bundle under custody-envelope fortresses", () => {
     const artifactPath = join(bundleDir, "artifacts", "encrypted_state.json");
     const artifact = await readEncryptedStateArtifact(bundleDir);
     const wrap = artifact.source_custody!.wraps[0]!;
-    wrap.payload.ct = wrap.payload.ct.slice(0, -2) + "AA";
+    // Deterministic tamper: flip the FIRST base64url char (it carries the top
+    // 6 bits of byte 0, so any change mutates the decrypted ciphertext). The
+    // old `slice(0,-2) + "AA"` was a no-op whenever the last 2 chars were
+    // already "AA" (base64 tail-bit alignment made that ~1/N flaky on CI), so
+    // the tamper occasionally left ct unchanged and verification passed.
+    const originalCt = wrap.payload.ct;
+    wrap.payload.ct = (originalCt[0] === "A" ? "B" : "A") + originalCt.slice(1);
+    expect(wrap.payload.ct).not.toBe(originalCt); // guarantee the tamper bit
     await writeFile(artifactPath, JSON.stringify(artifact, null, 2) + "\n");
 
     const verification = await verifyExitBundle(bundleDir);

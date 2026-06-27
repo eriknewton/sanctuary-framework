@@ -44,6 +44,15 @@ function makeExec(): {
     args: string[],
     input?: string
   ): Promise<ExecResult> => {
+    // Linux Secret Service: this mock models a host with NO usable Secret
+    // Service (these tests exercise the fallback-file path). A `lookup` is a
+    // clean MISS: exit 1 with EMPTY stderr, which the three-state keyring
+    // classifier reads as not-found (NOT a locked/unreachable keyring), so
+    // callers fall through to the encrypted fallback file. A `store` FAILS.
+    if (cmd === "secret-tool") {
+      if (args[0] === "lookup") return { stdout: "", stderr: "", code: 1 };
+      return { stdout: "", stderr: "no secret service", code: 1 };
+    }
     if (cmd !== "security") return { stdout: "", stderr: "unknown", code: 1 };
     if (args[0] === "find-generic-password") {
       const value = stored.get(keyFor(args));

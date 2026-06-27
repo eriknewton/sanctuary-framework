@@ -62,7 +62,12 @@ export type UnifiedInboxSourceClass =
   | "privacy_event"
   | "budget_warning"
   | "recovery_prompt"
-  | "agent_error";
+  | "agent_error"
+  // A genuine security-feature fault raised by the feature-health observability
+  // layer (the 3 ratified fault classes only: castle_wall_fault /
+  // feature_silently_off / plugin_failure_surge). See `feature-fault-raise.ts`.
+  // Display-only / read-derived: it feeds NOTHING back into enforcement.
+  | "feature_fault";
 
 export type UnifiedInboxSeverity = "info" | "warn" | "alert" | "critical";
 export type UnifiedInboxEntryState =
@@ -250,6 +255,24 @@ export interface AgentErrorIngest {
   error_class: string;
   agent_still_active: boolean;
   repeated_in_24h?: boolean;
+  observed_at: string;
+}
+
+/**
+ * A security-feature fault raised by the feature-health observability layer. The
+ * caller (`feature-fault-raise.ts`) has already derived the fault, escaped and
+ * length-bounded the body, and computed a stable per-fault `source_event_id` so
+ * a persistent fault dedups to one notification per window. The bridge treats
+ * this exactly like any other producer: dedup, audit, emit. It NEVER feeds
+ * enforcement.
+ */
+export interface FeatureFaultIngest {
+  /** Stable per-fault dedup key, e.g. `castle_wall_fault|castle_wall_egress`. */
+  source_event_id: string;
+  /** Pre-classified by the raise layer (critical for a wall fault / silent-off). */
+  severity: UnifiedInboxSeverity;
+  /** Inert, escaped, length-bounded body built by the raise layer. */
+  summary: string;
   observed_at: string;
 }
 
@@ -448,6 +471,23 @@ export class UnifiedInboxBridge {
       summary,
       observed_at: input.observed_at,
       agent_id: input.agent_id,
+    });
+  }
+
+  /**
+   * Ingest a security-feature fault from the feature-health observability layer.
+   * The summary is already inert + length-bounded by the raise layer; the bridge
+   * re-truncates to the inbox cap as defense-in-depth. Dedups on
+   * `(feature_fault, source_event_id)` so a persistent fault raises one entry per
+   * window, not one per evaluation cycle.
+   */
+  ingestFeatureFault(input: FeatureFaultIngest): UnifiedInboxEntry | null {
+    return this.ingest({
+      source_class: "feature_fault",
+      source_event_id: input.source_event_id,
+      severity: input.severity,
+      summary: input.summary,
+      observed_at: input.observed_at,
     });
   }
 

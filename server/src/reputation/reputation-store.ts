@@ -29,6 +29,16 @@ import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type { SovereigntyTier } from "./tiers.js";
 import { hashToString } from "../core/hashing.js";
+import { verifyBridgeCommitment } from "../bridge/bridge.js";
+import type { BridgeCommitment, ConcordiaOutcome } from "../bridge/types.js";
+import {
+  BRIDGE_METRIC_POLICY,
+  BridgeAttestationMetricValidationError,
+  assertImportableBridgeAttestationMetrics,
+  assertRecordableBridgeAttestationMetrics,
+  bridgeCountBucket,
+  isConcordiaBridgeReputationContext,
+} from "./bridge-metrics.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -37,6 +47,7 @@ export interface InteractionOutcome {
   type: "transaction" | "negotiation" | "service" | "dispute" | "custom";
   result: "completed" | "partial" | "failed" | "disputed";
   metrics?: Record<string, number>;
+  metric_policy?: string;
 }
 
 /** A signed attestation of an interaction */
@@ -50,6 +61,7 @@ export interface Attestation {
     outcome_type: string;
     outcome_result: string;
     metrics: Record<string, number>;
+    metric_policy?: string;
     context: string;
     timestamp: string;
     /** Sovereignty tier of the signer at time of recording */
@@ -106,6 +118,12 @@ export interface ReputationAttestationSummary {
   /** Count of attestations per context label */
   context_breakdown: Record<string, number>;
 }
+
+export type BridgeMetricEvidenceStatus =
+  | "none"
+  | "policy_rated"
+  | "legacy_unbounded_metrics"
+  | "unverified_policy_claim";
 
 // ── Back-compat alias (L1-L4 rename PR-3) ───────────────────────────────
 // The layer-numbered name stays exported so downstream imports keep working.
@@ -323,6 +341,53 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isBridgeCommitmentRecord(value: unknown): value is BridgeCommitment {
+  return (
+    isRecord(value) &&
+    typeof value.bridge_commitment_id === "string" &&
+    typeof value.session_id === "string" &&
+    typeof value.sha256_commitment === "string" &&
+    typeof value.blinding_factor === "string" &&
+    typeof value.committer_did === "string" &&
+    typeof value.signature === "string" &&
+    typeof value.committed_at === "string" &&
+    value.bridge_version === "sanctuary-concordia-bridge-v1"
+  );
+}
+
+function isConcordiaOutcomeRecord(value: unknown): value is ConcordiaOutcome {
+  return (
+    isRecord(value) &&
+    typeof value.session_id === "string" &&
+    value.protocol_version === "concordia-v1" &&
+    typeof value.proposer_did === "string" &&
+    typeof value.acceptor_did === "string" &&
+    isRecord(value.terms) &&
+    typeof value.terms_hash === "string" &&
+    typeof value.rounds === "number" &&
+    Number.isInteger(value.rounds) &&
+    value.rounds >= 1 &&
+    value.rounds <= 64 &&
+    typeof value.accepted_at === "string"
+  );
+}
+
+function withAttestationMetrics(
+  stored: StoredAttestation,
+  metrics: Record<string, number>
+): StoredAttestation {
+  return {
+    ...stored,
+    attestation: {
+      ...stored.attestation,
+      data: {
+        ...stored.attestation.data,
+        metrics,
+      },
+    },
+  };
+}
+
 function assertSupportedReputationBundleShape(
   bundle: unknown
 ): asserts bundle is ReputationBundle {
@@ -435,6 +500,12 @@ export class ReputationStore {
   ): Promise<StoredAttestation> {
     const attestationId = `att-${Date.now()}-${toBase64url(randomBytes(8))}`;
     const now = new Date().toISOString();
+    const metrics = isConcordiaBridgeReputationContext(context)
+      ? assertRecordableBridgeAttestationMetrics(
+          outcome.metrics,
+          outcome.metric_policy
+        )
+      : outcome.metrics ?? {};
 
     // Build the attestation data
     const attestationData: Attestation["data"] = {
@@ -443,11 +514,17 @@ export class ReputationStore {
       counterparty_did: counterpartyDid,
       outcome_type: outcome.type,
       outcome_result: outcome.result,
-      metrics: outcome.metrics ?? {},
+      metrics,
+      ...(outcome.metric_policy !== undefined
+        ? { metric_policy: outcome.metric_policy }
+        : {}),
       context,
       timestamp: now,
       sovereignty_tier: sovereigntyTier,
     };
+    await this.assertPolicyRatedBridgeAttestationHasLocalCommitment(
+      attestationData
+    );
 
     // Sign the attestation data
     const dataBytes = stringToBytes(JSON.stringify(attestationData));
@@ -482,6 +559,171 @@ export class ReputationStore {
     );
 
     return stored;
+  }
+
+  /**
+   * Find a single existing attestation matching an interaction identity tuple.
+   * Used for idempotency / replay-resistance at the recording boundary (e.g.
+   * the bridge's attest path) so a party cannot RE-ATTEST the SAME negotiation:
+   * matching on the full identifying tuple (interaction id == Concordia
+   * session_id, participant/signer DID, counterparty DID, and context) collapses
+   * repeated bridge_attest calls on one session into a single recorded
+   * attestation. Distinct parties, or the same party in a different context or
+   * interaction, are NOT deduped. Returns the FIRST match by stable
+   * attestation_id ordering for determinism.
+   *
+   * SCOPE (do not overclaim): this closes the same-negotiation / same-session
+   * replay only. It does NOT prevent a party from minting MULTIPLE distinct
+   * commitments for one real negotiation, because the interaction_id is the
+   * caller-supplied Concordia session_id and the bridge does not verify a
+   * session_receipt anchor here. So choosing a fresh session_id per call still
+   * lets one real negotiation self-inflate the tallies N-fold. That broader
+   * self-inflation is NOT closed by this dedup and is a known scoring-engine /
+   * collusion concern (the bridge cannot prove a Concordia session is unique or
+   * real without a verified session_receipt). See findExistingAttestationForDedup
+   * for the fail-closed variant the bridge actually calls.
+   */
+  async findExistingAttestation(criteria: {
+    interaction_id: string;
+    participant_did: string;
+    counterparty_did: string;
+    context: string;
+  }): Promise<StoredAttestation | null> {
+    const result = await this.findExistingAttestationForDedup(criteria);
+    return result.match;
+  }
+
+  /**
+   * Fail-closed dedup scan for the attest boundary.
+   *
+   * Unlike loadAllPaginated / query / loadAll (which deliberately SKIP a
+   * storage.list error or a corrupted entry so aggregate reads degrade
+   * gracefully), the dedup path must fail CLOSED: if a pre-existing matching
+   * attestation happens to be the entry that cannot be listed/read/decrypted,
+   * a silent skip would let the caller record a SECOND attestation under a
+   * transient error (a double-count). So this scan reports `scanComplete:false`
+   * whenever the namespace listing throws OR any per-entry load/decrypt fails,
+   * and the caller (bridge_attest) must DENY the attest rather than risk a
+   * duplicate.
+   *
+   * Returns `{ match, scanComplete }`:
+   * - `match`: the first matching attestation by stable id ordering, or null.
+   * - `scanComplete`: false if the scan could not reliably confirm uniqueness
+   *   (a list error, or any entry that failed to load/decrypt during the scan).
+   *
+   * Scoped to dedup ONLY; other callers keep skip-corrupted aggregate reads.
+   */
+  async findExistingAttestationForDedup(criteria: {
+    interaction_id: string;
+    participant_did: string;
+    counterparty_did: string;
+    context: string;
+  }): Promise<{ match: StoredAttestation | null; scanComplete: boolean }> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_reputation");
+    } catch {
+      // Cannot enumerate the namespace, so cannot confirm uniqueness: fail closed.
+      return { match: null, scanComplete: false };
+    }
+
+    let match: StoredAttestation | null = null;
+    let scanComplete = true;
+
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_reputation", meta.key);
+      } catch {
+        // A read error on an entry we needed to inspect: cannot confirm the
+        // pre-existing attestation is not THIS entry. Fail closed.
+        scanComplete = false;
+        continue;
+      }
+      if (!raw) continue;
+
+      let stored: StoredAttestation;
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, this.encryptionKey);
+        stored = JSON.parse(bytesToString(decrypted));
+      } catch {
+        // A corrupted / undecryptable entry might BE the pre-existing match;
+        // we cannot rule it out, so the scan is incomplete. Fail closed.
+        scanComplete = false;
+        continue;
+      }
+
+      const d = stored.attestation.data;
+      if (
+        d.interaction_id === criteria.interaction_id &&
+        d.participant_did === criteria.participant_did &&
+        d.counterparty_did === criteria.counterparty_did &&
+        d.context === criteria.context
+      ) {
+        if (
+          match === null ||
+          stored.attestation.attestation_id < match.attestation.attestation_id
+        ) {
+          match = stored;
+        }
+      }
+    }
+
+    return { match, scanComplete };
+  }
+
+  async classifyBridgeMetricEvidence(
+    stored: StoredAttestation
+  ): Promise<BridgeMetricEvidenceStatus> {
+    const data = stored.attestation.data;
+    if (!isConcordiaBridgeReputationContext(data.context)) {
+      return "none";
+    }
+    if (Object.keys(data.metrics).length === 0) {
+      return "none";
+    }
+    if (data.metric_policy === BRIDGE_METRIC_POLICY) {
+      return (await this.hasLocalBridgeCommitmentForAttestation(data))
+        ? "policy_rated"
+        : "unverified_policy_claim";
+    }
+    return data.metric_policy === undefined
+      ? "legacy_unbounded_metrics"
+      : "unverified_policy_claim";
+  }
+
+  async redactUnsafeBridgeMetrics(
+    attestations: StoredAttestation[]
+  ): Promise<StoredAttestation[]> {
+    const redacted: StoredAttestation[] = [];
+    for (const stored of attestations) {
+      const status = await this.classifyBridgeMetricEvidence(stored);
+      redacted.push(
+        status === "legacy_unbounded_metrics" ||
+          status === "unverified_policy_claim"
+          ? withAttestationMetrics(stored, {})
+          : stored
+      );
+    }
+    return redacted;
+  }
+
+  private async filterExportableBridgeAttestations(
+    attestations: StoredAttestation[]
+  ): Promise<StoredAttestation[]> {
+    const exportable: StoredAttestation[] = [];
+    for (const stored of attestations) {
+      const status = await this.classifyBridgeMetricEvidence(stored);
+      if (
+        status === "legacy_unbounded_metrics" ||
+        status === "unverified_policy_claim"
+      ) {
+        continue;
+      }
+      exportable.push(stored);
+    }
+    return exportable;
   }
 
   /**
@@ -531,6 +773,7 @@ export class ReputationStore {
     const end = timestamps.length > 0
       ? new Date(Math.max(...timestamps)).toISOString()
       : new Date().toISOString();
+    const aggregateInput = await this.redactUnsafeBridgeMetrics(filtered);
 
     return {
       total_interactions: filtered.length,
@@ -548,7 +791,7 @@ export class ReputationStore {
       ).length,
       contexts,
       time_range: { start, end },
-      aggregate_metrics: aggregateMetrics(filtered, options.metrics),
+      aggregate_metrics: aggregateMetrics(aggregateInput, options.metrics),
     };
   }
 
@@ -566,7 +809,8 @@ export class ReputationStore {
       all = all.filter((a) => a.attestation.data.context === context);
     }
 
-    const attestations = all.map((a) => a.attestation);
+    const exportable = await this.filterExportableBridgeAttestations(all);
+    const attestations = exportable.map((a) => a.attestation);
     const exportedAt = new Date().toISOString();
     const completenessManifest = buildReputationCompletenessManifest(
       exportedAt,
@@ -621,7 +865,7 @@ export class ReputationStore {
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
     await enforceCustodyFloor(this.storage, "reputation_import", this.masterKey);
 
-    const verification = this.verifyBundle(
+    const verification = await this.verifyBundleForImport(
       bundle,
       publicKeys,
       options
@@ -662,8 +906,9 @@ export class ReputationStore {
 
   /**
    * Verify a reputation bundle without writing imported attestations.
-   * This is the exact semantic verification that importBundle uses after
-   * its custody gate and before the first _reputation write.
+   * This portable check covers bundle completeness, signatures, and metric
+   * shape. Local storage-dependent gates, such as policy-rated bridge
+   * commitment provenance, are covered by verifyBundleForImport.
    */
   verifyBundle(
     bundle: ReputationBundle,
@@ -698,6 +943,17 @@ export class ReputationStore {
       );
     }
 
+    const metricVerification = this.inspectBridgeAttestationMetrics(bundle);
+    if (metricVerification.invalid > 0) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle contains concordia-bridge attestations with " +
+          "invalid behavioral metrics: " +
+          metricVerification.errors.join(" "),
+        metricVerification.invalid,
+        0
+      );
+    }
+
     return {
       invalid,
       unverifiable,
@@ -706,6 +962,241 @@ export class ReputationStore {
       ),
       completeness_verification: completenessVerification,
     };
+  }
+
+  /**
+   * Verify a reputation bundle using the same storage-dependent semantic gates
+   * that importBundle applies before the first _reputation write.
+   */
+  async verifyBundleForImport(
+    bundle: ReputationBundle,
+    publicKeys: Map<string, Uint8Array>,
+    options: {
+      allowUnverifiedLegacy?: boolean;
+      allowUnverifiableAttestations?: boolean;
+    } = {}
+  ): Promise<{
+    invalid: number;
+    unverifiable: number;
+    contexts: string[];
+    completeness_verification: ReputationBundleCompletenessVerification;
+  }> {
+    const verification = this.verifyBundle(bundle, publicKeys, options);
+    await this.assertImportablePolicyRatedBridgeAttestationsHaveLocalCommitments(
+      bundle.attestations
+    );
+    return verification;
+  }
+
+  private inspectBridgeAttestationMetrics(
+    bundle: ReputationBundle
+  ): { invalid: number; errors: string[] } {
+    let invalid = 0;
+    const errors: string[] = [];
+
+    for (const attestation of bundle.attestations) {
+      if (!isConcordiaBridgeReputationContext(attestation.data.context)) {
+        continue;
+      }
+
+      try {
+        assertImportableBridgeAttestationMetrics(
+          attestation.data.metrics,
+          attestation.data.metric_policy
+        );
+      } catch (err) {
+        invalid++;
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Bridge attestation metrics rejected.";
+        errors.push(
+          `attestation ${attestation.attestation_id}: ${message}`
+        );
+      }
+    }
+
+    return { invalid, errors };
+  }
+
+  private async assertImportablePolicyRatedBridgeAttestationsHaveLocalCommitments(
+    attestations: Attestation[]
+  ): Promise<void> {
+    const missingProvenance: string[] = [];
+    for (const attestation of attestations) {
+      const data = attestation.data;
+      if (
+        !isConcordiaBridgeReputationContext(data.context) ||
+        data.metric_policy !== BRIDGE_METRIC_POLICY
+      ) {
+        continue;
+      }
+
+      const hasCommitment =
+        await this.hasLocalBridgeCommitmentForAttestation(data);
+      if (!hasCommitment) {
+        missingProvenance.push(attestation.attestation_id);
+      }
+    }
+
+    if (missingProvenance.length > 0) {
+      throw new ReputationBundleVerificationError(
+        "Reputation bundle contains policy-rated concordia-bridge attestations " +
+          "without matching local bridge commitments: " +
+          missingProvenance.join(", "),
+        missingProvenance.length,
+        0
+      );
+    }
+  }
+
+  private async assertPolicyRatedBridgeAttestationHasLocalCommitment(
+    data: Attestation["data"]
+  ): Promise<void> {
+    if (
+      !isConcordiaBridgeReputationContext(data.context) ||
+      data.metric_policy !== BRIDGE_METRIC_POLICY
+    ) {
+      return;
+    }
+
+    const hasCommitment = await this.hasLocalBridgeCommitmentForAttestation(data);
+    if (!hasCommitment) {
+      throw new BridgeAttestationMetricValidationError(
+        "Policy-rated concordia-bridge attestations require a matching local " +
+          "bridge commitment; use bridge_commit followed by bridge_attest."
+      );
+    }
+  }
+
+  private async hasLocalBridgeCommitmentForAttestation(
+    data: Attestation["data"]
+  ): Promise<boolean> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_bridge");
+    } catch {
+      return false;
+    }
+
+    const bridgeEncryptionKey = derivePurposeKey(
+      this.masterKey,
+      "bridge-commitments"
+    );
+
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_bridge", meta.key);
+      } catch {
+        return false;
+      }
+      if (!raw) continue;
+
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, bridgeEncryptionKey);
+        const bridgeRecord = JSON.parse(bytesToString(decrypted)) as unknown;
+        if (!isRecord(bridgeRecord)) {
+          continue;
+        }
+        if (await this.bridgeRecordMatchesPolicyAttestation(bridgeRecord, data)) {
+          return true;
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  private async bridgeRecordMatchesPolicyAttestation(
+    bridgeRecord: Record<string, unknown>,
+    data: Attestation["data"]
+  ): Promise<boolean> {
+    const commitment = bridgeRecord.commitment;
+    const outcome = bridgeRecord.outcome;
+    if (
+      !isBridgeCommitmentRecord(commitment) ||
+      !isConcordiaOutcomeRecord(outcome)
+    ) {
+      return false;
+    }
+
+    if (
+      data.metrics.negotiation_round_bucket !==
+        bridgeCountBucket(outcome.rounds)
+    ) {
+      return false;
+    }
+
+    const participants = new Set([outcome.proposer_did, outcome.acceptor_did]);
+    if (
+      commitment.session_id !== data.interaction_id ||
+      outcome.session_id !== data.interaction_id ||
+      !participants.has(commitment.committer_did) ||
+      !participants.has(data.participant_did) ||
+      !participants.has(data.counterparty_did) ||
+      data.participant_did === data.counterparty_did
+    ) {
+      return false;
+    }
+
+    const committerPublicKey = await this.findIdentityPublicKeyByDid(
+      commitment.committer_did
+    );
+    if (!committerPublicKey) {
+      return false;
+    }
+
+    try {
+      return verifyBridgeCommitment(
+        commitment,
+        outcome,
+        committerPublicKey
+      ).valid;
+    } catch {
+      return false;
+    }
+  }
+
+  private async findIdentityPublicKeyByDid(
+    did: string
+  ): Promise<Uint8Array | null> {
+    let entries: Array<{ key: string }>;
+    try {
+      entries = await this.storage.list("_identities");
+    } catch {
+      return null;
+    }
+
+    const identityEncryptionKey = derivePurposeKey(
+      this.masterKey,
+      "identity-encryption"
+    );
+    for (const meta of entries) {
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read("_identities", meta.key);
+      } catch {
+        return null;
+      }
+      if (!raw) continue;
+
+      try {
+        const encrypted: EncryptedPayload = JSON.parse(bytesToString(raw));
+        const decrypted = decrypt(encrypted, identityEncryptionKey);
+        const identity = JSON.parse(bytesToString(decrypted)) as StoredIdentity;
+        if (identity.did === did) {
+          return fromBase64url(identity.public_key);
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
   }
 
   private verifyBundleCompleteness(
@@ -791,6 +1282,11 @@ export class ReputationStore {
     let invalid = 0;
     let unverifiable = 0;
     for (const attestation of bundle.attestations) {
+      if (attestation.signer !== attestation.data.participant_did) {
+        invalid++;
+        continue;
+      }
+
       const signerKey = publicKeys.get(attestation.signer);
       if (!signerKey) {
         unverifiable++;

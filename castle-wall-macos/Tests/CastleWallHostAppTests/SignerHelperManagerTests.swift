@@ -8,6 +8,7 @@
 
 import XCTest
 import ServiceManagement
+import CastleWallIPC
 @testable import CastleWallHostApp
 
 final class SignerHelperManagerTests: XCTestCase {
@@ -26,6 +27,77 @@ final class SignerHelperManagerTests: XCTestCase {
         XCTAssertFalse(SignerHelperManager.shouldAutoArm(helperEnabled: false, pinPresent: false))
     }
 
+    func testPinPresentRequiresRootCustodyAndValidKey() {
+        let path = "/protected/castle-pinned-pubkey.bin"
+        let custody = FileCustody(probe: { probePath in
+            switch probePath {
+            case "/protected":
+                return FileFacts(exists: true, uid: 0, mode: 0o755)
+            case path:
+                return FileFacts(exists: true, uid: 0, mode: 0o644)
+            default:
+                return FileFacts(exists: false, uid: -1, mode: 0)
+            }
+        })
+
+        XCTAssertTrue(
+            SignerHelperManager.validPinPresent(
+                path: path,
+                custody: custody,
+                loadPinnedPublicKey: { url in
+                    XCTAssertEqual(url.path, path)
+                    return Data(repeating: 1, count: 32)
+                }
+            )
+        )
+    }
+
+    func testPinPresentRejectsOperatorOwnedPin() {
+        let path = "/protected/castle-pinned-pubkey.bin"
+        let custody = FileCustody(probe: { probePath in
+            switch probePath {
+            case "/protected":
+                return FileFacts(exists: true, uid: 0, mode: 0o755)
+            case path:
+                return FileFacts(exists: true, uid: 501, mode: 0o644)
+            default:
+                return FileFacts(exists: false, uid: -1, mode: 0)
+            }
+        })
+
+        XCTAssertFalse(
+            SignerHelperManager.validPinPresent(
+                path: path,
+                custody: custody,
+                loadPinnedPublicKey: { _ in Data(repeating: 1, count: 32) }
+            )
+        )
+    }
+
+    func testPinPresentRejectsMalformedKey() {
+        let path = "/protected/castle-pinned-pubkey.bin"
+        let custody = FileCustody(probe: { probePath in
+            switch probePath {
+            case "/protected":
+                return FileFacts(exists: true, uid: 0, mode: 0o755)
+            case path:
+                return FileFacts(exists: true, uid: 0, mode: 0o644)
+            default:
+                return FileFacts(exists: false, uid: -1, mode: 0)
+            }
+        })
+
+        XCTAssertFalse(
+            SignerHelperManager.validPinPresent(
+                path: path,
+                custody: custody,
+                loadPinnedPublicKey: { _ in
+                    throw AuthError.pinnedKeyLength(expected: 32, actual: 4)
+                }
+            )
+        )
+    }
+
     func testPlistNameMatchesHelperIdentifier() {
         XCTAssertEqual(
             SignerHelperManager.plistName,
@@ -33,11 +105,11 @@ final class SignerHelperManagerTests: XCTestCase {
         )
     }
 
-    // MARK: - stateAfterRegister (FIX-1: benign first-run EPERM throw)
+    // MARK: - stateAfterRegister (benign first-run EPERM throw)
 
     /// The whole drill blocker: a daemon's first `register()` throws
     /// `SMAppServiceErrorDomain Code=1 "Operation not permitted"` while still
-    /// landing the helper in BTM as `.requiresApproval`. The status wins — this
+    /// landing the helper in BTM as `.requiresApproval`. The status wins - this
     /// must map to `.requiresApproval`, NOT `.error`.
     func testRegisterThrowsEPERMButStatusRequiresApprovalIsNotError() {
         let eperm = NSError(
@@ -60,7 +132,7 @@ final class SignerHelperManagerTests: XCTestCase {
     }
 
     /// A throw paired with a status that never advanced past `.notRegistered` is
-    /// a genuine failure — surface it as `.error` with the thrown message.
+    /// a genuine failure - surface it as `.error` with the thrown message.
     func testRegisterThrowsAndStatusNotRegisteredIsError() {
         let boom = NSError(
             domain: "SomeOtherDomain",
@@ -80,7 +152,56 @@ final class SignerHelperManagerTests: XCTestCase {
         )
     }
 
-    // MARK: - isProtectionActive (FIX-3: green state gated on real readiness)
+    // MARK: - shouldKeepPolling (post-register settle loop)
+
+    /// Immediately after `register()`, BTM may still report `.notRegistered`
+    /// for a beat before flipping to `.requiresApproval`. The
+    /// settle loop must keep polling through that window.
+    func testKeepsPollingWhileNotRegisteredAndAttemptsRemain() {
+        XCTAssertTrue(
+            SignerHelperManager.shouldKeepPolling(status: .notRegistered, attempt: 0, maxAttempts: 10)
+        )
+        XCTAssertTrue(
+            SignerHelperManager.shouldKeepPolling(status: .notRegistered, attempt: 9, maxAttempts: 10)
+        )
+        XCTAssertTrue(
+            SignerHelperManager.shouldKeepPolling(status: .notFound, attempt: 0, maxAttempts: 10)
+        )
+    }
+
+    /// `.requiresApproval` and `.enabled` are terminal - settle immediately so
+    /// the approval banner renders without waiting out the poll budget.
+    func testStopsPollingOnTerminalStatuses() {
+        XCTAssertFalse(
+            SignerHelperManager.shouldKeepPolling(status: .requiresApproval, attempt: 0, maxAttempts: 10)
+        )
+        XCTAssertFalse(
+            SignerHelperManager.shouldKeepPolling(status: .enabled, attempt: 0, maxAttempts: 10)
+        )
+    }
+
+    /// The poll budget is bounded: once attempts are exhausted the loop settles
+    /// on whatever BTM reports (the UI then shows the retry affordance).
+    func testStopsPollingWhenAttemptsExhausted() {
+        XCTAssertFalse(
+            SignerHelperManager.shouldKeepPolling(status: .notRegistered, attempt: 10, maxAttempts: 10)
+        )
+        XCTAssertFalse(
+            SignerHelperManager.shouldKeepPolling(status: .notFound, attempt: 11, maxAttempts: 10)
+        )
+    }
+
+    /// The poll budget covers a realistic BTM settle window (~3s) without
+    /// being effectively unbounded.
+    func testPollBudgetIsAFewSeconds() {
+        let totalNanoseconds =
+            UInt64(SignerHelperManager.postRegisterMaxAttempts) *
+            SignerHelperManager.postRegisterPollInterval
+        XCTAssertGreaterThanOrEqual(totalNanoseconds, 1_000_000_000)
+        XCTAssertLessThanOrEqual(totalNanoseconds, 10_000_000_000)
+    }
+
+    // MARK: - isProtectionActive (green state gated on real readiness)
 
     /// "Protection Active" must be false whenever the helper is not ready, even
     /// if the sysext is activated and the filter is toggled on (the drill defect:

@@ -359,6 +359,29 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       // OPERATOR_CLOUD_CLAIM_STORE_HKDF_INFO (asserted in master-rotation.test).
       "federation-bootstrap-nonce-spent-set",
       "federation-operator-cloud-provision-claim-set",
+      // Durable peer-sync security state (Federation 3/3b P0): per-sender
+      // accepted high-water + outbound high-water + folded revocation
+      // projection, persisted under _federation by the sync-state store. Same
+      // no-AAD derivePurposeKey blob, so the no-AAD candidate re-wraps it.
+      // Without this label a fortress that ever persisted sync-state would
+      // strand it and rotateMaster would abort. MUST equal
+      // FEDERATION_SYNC_STATE_STORE_HKDF_INFO (asserted in master-rotation.test).
+      "federation-sync-state",
+      // Operator Cloud (Slice 3 boot-wire): the cloud node's at-rest joined-node
+      // record (non-issuer scoped-custody runtime state), persisted under
+      // _federation by the operator-cloud joined-node store. Same no-AAD
+      // derivePurposeKey blob, so the no-AAD candidate re-wraps it. Without this
+      // label a fortress that ever joined as an operator_cloud node would strand
+      // its joined-node record and rotateMaster would abort. MUST equal
+      // OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO (asserted in master-rotation.test).
+      "operator-cloud-joined-node",
+      // Durable server-issued challenge spent-set for the pre-session
+      // federation node-cert reissue endpoint (Slice 3c-2). Same no-AAD
+      // derivePurposeKey blob; without this label a fortress that accepted a
+      // reissue proof would strand the replay set on custody master rotation.
+      // MUST equal FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO (asserted in
+      // master-rotation.test).
+      "federation-reissue-node-cert-challenge-set",
     ],
   },
   _fortress_mode: {

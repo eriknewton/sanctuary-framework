@@ -1,5 +1,5 @@
 {
-  "tool_count": 95,
+  "tool_count": 96,
   "tools": [
     {
       "name": "identity_create",
@@ -1234,7 +1234,32 @@
           },
           "metrics": {
             "type": "object",
-            "description": "Optional metrics (e.g., rounds, response_time_ms, terms_complexity)"
+            "additionalProperties": false,
+            "description": "Optional self-declared bridge behavioral inputs. Sanctuary does not independently verify these declarations; it bounds and buckets them before storage under metric_policy \"concordia-bridge-behavioral-v1\". Raw deal terms, raw magnitudes, legacy exact metric names, and unknown keys are rejected.",
+            "properties": {
+              "declared_offers_made": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+                "description": "Self-declared offer count, integer 1..64. Stored only as declared_offers_made_bucket, not the exact count."
+              },
+              "declared_concession": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Self-declared concession ratio from 0 to 1. Stored only as declared_concession_bucket (0..10), not the exact ratio."
+              },
+              "declared_reasoning_provided": {
+                "type": "boolean",
+                "description": "Self-declared whether reasoning was provided. Stored as declared_reasoning_provided 0 or 1."
+              },
+              "declared_response_time_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3600000,
+                "description": "Self-declared response latency in milliseconds, integer 0..3600000. Stored only as declared_response_time_bucket, not exact milliseconds."
+              }
+            }
           },
           "identity_id": {
             "type": "string",
@@ -1924,6 +1949,21 @@
           "chain_id",
           "agent_id",
           "nonce"
+        ]
+      }
+    },
+    {
+      "name": "sanctuary/resolve_erc8004_identity",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "record": {
+            "type": "object",
+            "description": "The presented ERC-8004 identity record to verify, including identity, registry, chain_id, nonce, timestamp, signature, signer_address, and public_key as produced by the signer."
+          }
+        },
+        "required": [
+          "record"
         ]
       }
     },

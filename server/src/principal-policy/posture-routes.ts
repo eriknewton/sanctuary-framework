@@ -640,6 +640,9 @@ async function buildFeatureHealth(
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
       originMachine: deps.originMachine,
+      // Surface the per-plugin attribution rows on the operator posture surface.
+      // Read-only projection over the same audit read; never enforcement-bearing.
+      includePluginRows: true,
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()

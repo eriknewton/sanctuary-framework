@@ -219,8 +219,28 @@ export interface ExitAuditReceiptsArtifact {
   recovery_semantics: "archive_only";
   normal_audit_query_continuity: false;
   individual_entry_signatures: false;
+  /**
+   * True when the audit population (`total`) exceeded the export cap and the
+   * oldest entries were dropped from `entries`. Honesty marker: without it,
+   * `total` (full population) silently disagrees with `entries.length`
+   * (the capped slice), overclaiming the artifact's completeness. Absent
+   * (implicitly false) when the whole population fit under the cap.
+   */
+  truncated?: boolean;
+  /**
+   * How many of the oldest entries were omitted by the export cap
+   * (`total - entries.length`). Present only when `truncated` is true.
+   */
+  omitted_count?: number;
   entries: AuditEntry[];
 }
+
+/**
+ * Hard cap on the number of audit receipts carried in an exit bundle. The
+ * `query` slice keeps the most-recent entries; anything older than the cap is
+ * omitted and disclosed via the `truncated`/`omitted_count` honesty marker.
+ */
+export const EXIT_AUDIT_RECEIPTS_EXPORT_CAP = 100_000;
 
 export interface ExitCommitmentsArtifact {
   format: "SANCTUARY_EXIT_COMMITMENTS_V1";
@@ -332,6 +352,15 @@ export interface ExportExitBundleOptions {
    * ownership partition was deliberately not applied.
    */
   unpartitionedLegacyExport?: boolean;
+  /**
+   * Override the audit-receipts export cap (default
+   * `EXIT_AUDIT_RECEIPTS_EXPORT_CAP` = 100k). When the audit population
+   * exceeds the cap, the oldest receipts are omitted and the omission is
+   * disclosed via the artifact's `truncated`/`omitted_count` marker plus an
+   * export warning. Primarily a test/operability knob; production exports use
+   * the default cap.
+   */
+  auditReceiptsExportCap?: number;
 }
 
 export interface ExportExitBundleResult {
@@ -361,6 +390,13 @@ export interface ExportExitBundleResult {
     excluded_unstamped: number;
     excluded_unsealed: number;
   };
+  /**
+   * Operator-facing, non-fatal advisories raised during export. Currently
+   * carries the audit-receipts truncation notice when the audit population
+   * exceeded the export cap (the oldest entries were omitted). Absent when the
+   * export raised no warnings.
+   */
+  warnings?: string[];
 }
 
 export interface ImportExitBundleOptions {
@@ -676,7 +712,14 @@ async function exportEncryptedState(
       exported_at: new Date().toISOString(),
       key_source: opts.keySource ?? "unknown",
       ownership_partitioned: opts.memoryClassPartition !== undefined,
-      source_key_derivation: await readSourceKeyParams(opts.storage),
+      // Only emit the source KDF profile (Argon2id salt + cost) when there is
+      // re-keyable state. An empty/zero-state bundle has nothing to re-key, so
+      // leaking the fortress salt + cost profile for it is gratuitous - gate it
+      // symmetrically with `source_custody` (which is already entries-gated via
+      // `minted`).
+      ...(entries.length > 0
+        ? { source_key_derivation: await readSourceKeyParams(opts.storage) }
+        : {}),
       ...(minted !== undefined ? { source_custody: minted.custody } : {}),
       namespaces: [...new Set(entries.map((entry) => entry.namespace))].sort(),
       total_keys: entries.length,
@@ -748,19 +791,33 @@ function exportPolicySet(
 }
 
 async function exportAuditReceipts(
-  auditLog: AuditLog
-): Promise<ExitAuditReceiptsArtifact> {
+  auditLog: AuditLog,
+  cap: number = EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+): Promise<{ artifact: ExitAuditReceiptsArtifact; warning?: string }> {
   await auditLog.flush();
-  const result = await auditLog.query({ limit: 100_000 });
-  return {
+  const result = await auditLog.query({ limit: cap });
+  // `total` is the full post-filter population; `entries` is the most-recent
+  // `cap`-sized slice. When the population exceeds the cap the oldest entries
+  // are dropped - mark it honestly so the artifact's `total` does not silently
+  // overclaim completeness against `entries.length` (NEVER #5: no silent
+  // degrade; the flagship "you control your data" pillar).
+  const omitted = result.total - result.entries.length;
+  const truncated = omitted > 0;
+  const artifact: ExitAuditReceiptsArtifact = {
     format: "SANCTUARY_AUDIT_RECEIPTS_V1",
     exported_at: new Date().toISOString(),
     total: result.total,
     recovery_semantics: "archive_only",
     normal_audit_query_continuity: false,
     individual_entry_signatures: false,
+    ...(truncated ? { truncated: true, omitted_count: omitted } : {}),
     entries: result.entries,
   };
+  const warning = truncated
+    ? `audit export carried ${result.entries.length} of ${result.total} ` +
+      `entries; the oldest ${omitted} were omitted by the ${cap}-entry export cap`
+    : undefined;
+  return { artifact, ...(warning !== undefined ? { warning } : {}) };
 }
 
 async function exportCommitments(
@@ -871,6 +928,7 @@ export async function exportExitBundle(
   const identityEncryptionKey = derivePurposeKey(opts.masterKey, "identity-encryption");
 
   const artifacts: ExitBundleArtifactEntry[] = [];
+  const exportWarnings: string[] = [];
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
@@ -896,11 +954,18 @@ export async function exportExitBundle(
       "policy_set"
     )
   );
+  const auditReceiptsExport = await exportAuditReceipts(
+    opts.auditLog,
+    opts.auditReceiptsExportCap ?? EXIT_AUDIT_RECEIPTS_EXPORT_CAP
+  );
+  if (auditReceiptsExport.warning !== undefined) {
+    exportWarnings.push(auditReceiptsExport.warning);
+  }
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/audit_receipts.json`,
-      await exportAuditReceipts(opts.auditLog),
+      auditReceiptsExport.artifact,
       "audit_receipts"
     )
   );
@@ -1006,6 +1071,22 @@ export async function exportExitBundle(
       },
     );
   }
+  // Honesty marker also lands in the audit trail when the export cap dropped
+  // the oldest receipts, so the truncation is recorded where the operator
+  // queries it, not just in the carried artifact.
+  if (auditReceiptsExport.warning !== undefined) {
+    void opts.auditLog.append(
+      "l1",
+      "exit_bundle_audit_receipts_truncated",
+      identity.identity_id,
+      {
+        approval_id: exportApprovalAuditId,
+        carried: auditReceiptsExport.artifact.entries.length,
+        total: auditReceiptsExport.artifact.total,
+        omitted_count: auditReceiptsExport.artifact.omitted_count ?? 0,
+      },
+    );
+  }
   await opts.auditLog.flush();
 
   const statePartitionSummary =
@@ -1027,6 +1108,7 @@ export async function exportExitBundle(
     ...(statePartitionSummary !== undefined
       ? { state_partition: statePartitionSummary }
       : {}),
+    ...(exportWarnings.length > 0 ? { warnings: exportWarnings } : {}),
   };
 }
 
@@ -2002,6 +2084,17 @@ export async function importExitBundle(
   // source_custody) must roll back the artifacts staged above, exactly like
   // a re-key failure - otherwise a refused import leaves staged state behind.
   let sourceMasterKey: Uint8Array | null = null;
+  // Provenance for the finally-block zeroing: we MUST zero key material the
+  // import path itself derived/unwrapped (deriveMasterKey /
+  // unwrapMasterFromWraps / decodeSourceRecoveryKey are import-owned), but we
+  // MUST NOT zero a caller-supplied `opts.sourceMasterKey` - that buffer is
+  // owned by the programmatic caller (hub fortress-scope endpoint / SDK /
+  // tests), which may reuse it after import returns. Zeroing it here is a
+  // silent use-after-zero that corrupts the caller's master key. When
+  // `opts.sourceMasterKey` is supplied, resolveSourceMasterKey returns that
+  // exact buffer by reference, so we own the key only when no caller key was
+  // passed.
+  const ownsSourceKey = !opts.sourceMasterKey;
   let stateRekeyStarted = false;
   try {
     if (identityArtifact) {
@@ -2121,6 +2214,21 @@ export async function importExitBundle(
             skipped_unknown_kid: 0,
             conflicts: 0,
           };
+    // M2-slice (warn): the destination `stateStore.write` mints a fresh
+    // `written_at` and a fresh monotonic `ver` - both are bound into the
+    // signed envelope, so they cannot be back-stamped to the source values
+    // without a signed-envelope schema change (deliberately out of scope; the
+    // absolute-`expires_at` redesign is a flagged Erik decision). Surface the
+    // reset honestly so the operator knows relative TTLs were renewed from the
+    // import time and source versions were not preserved.
+    if (stateResult.status === "rekeyed" && stateResult.imported_keys > 0) {
+      importWarnings.push(
+        `re-keyed state entries were re-stamped at import time: their ` +
+          `written_at and version were reset to the import, so relative ` +
+          `ttl_seconds are renewed from now (source TTL remaining and source ` +
+          `version are not preserved across re-key).`
+      );
+    }
     void opts.auditLog.append("l1", "exit_bundle_import_activate", manifest.body.identity_binding.identity_id, {
       import_id: importId,
       manifest_version: manifest.body.manifest_version,
@@ -2181,7 +2289,12 @@ export async function importExitBundle(
       { cause: err }
     );
   } finally {
-    if (sourceMasterKey instanceof Uint8Array) {
+    // Zero ONLY key material the import path derived/unwrapped itself
+    // (deriveMasterKey / unwrapMasterFromWraps / decodeSourceRecoveryKey).
+    // A caller-supplied `opts.sourceMasterKey` is returned by reference and
+    // owned by the caller; zeroing it would be a silent use-after-zero of the
+    // caller's master key. See `ownsSourceKey` above.
+    if (ownsSourceKey && sourceMasterKey instanceof Uint8Array) {
       sourceMasterKey.fill(0);
     }
   }
