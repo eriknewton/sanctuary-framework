@@ -67,7 +67,7 @@ function parseArgs(args: string[]): ComplianceCliOptions {
 
   if (args[0] !== "eu-ai-act") {
     throw new Error(
-      `Unknown compliance subcommand: "${args[0]}". Only "eu-ai-act" is supported in v1.`
+      `Unknown compliance subcommand: "${args[0]}". Supported: "eu-ai-act", "nist-ai-rmf".`
     );
   }
 
@@ -236,6 +236,16 @@ function defaultOutputDir(): string {
  * dispatcher in `src/cli.ts` when `args[0] === "compliance"`.
  */
 export async function runCompliance(args: string[]): Promise<void> {
+  // Route the NIST AI RMF crosswalk subcommand before EU-specific
+  // parsing. The crosswalk is a pure data -> Markdown transform and
+  // does NOT spin up a Sanctuary server (no keychain touch), so it is
+  // dispatched separately from the EU bundle generator path.
+  if (args[0] === "nist-ai-rmf") {
+    const { runNistAiRmf } = await import("../nist_ai_rmf/cli.js");
+    await runNistAiRmf(args.slice(1));
+    return;
+  }
+
   let opts: ComplianceCliOptions;
   try {
     opts = parseArgs(args);
