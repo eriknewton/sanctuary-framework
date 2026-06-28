@@ -173,6 +173,28 @@ describe("C1: Remote Operator Console", () => {
         { headers: { Authorization: "Bearer test-secret-token" } }
       );
       expect(authedResp.status).toBe(200);
+
+      // REGRESSION (CORS scope): cross-origin reflection is health-ONLY. A
+      // protected route MUST NOT reflect a foreign same-port Origin, even on a
+      // remote bind and even when the request is authenticated. (The earlier
+      // bug reflected the Origin in the handleRequest prelude, so it leaked onto
+      // every route; reflection now lives only in the /api/health handler.)
+      const crossOriginProtected = await requestNoKeepAlive(
+        `http://127.0.0.1:${port}/api/status`,
+        {
+          headers: {
+            Authorization: "Bearer test-secret-token",
+            Origin: "https://100.64.0.9:3501",
+          },
+        }
+      );
+      expect(crossOriginProtected.status).toBe(200);
+      expect(
+        crossOriginProtected.headers["access-control-allow-origin"]
+      ).not.toBe("https://100.64.0.9:3501");
+      expect(
+        crossOriginProtected.headers["access-control-allow-credentials"]
+      ).toBeUndefined();
     });
   });
 

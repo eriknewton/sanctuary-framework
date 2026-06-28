@@ -3115,28 +3115,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const method = req.method ?? "GET";
 
     // CORS headers - restrict to same-origin; the dashboard is served by this server.
-    // C1: when bound to a non-loopback or wildcard interface, the browser's
-    // Origin will use the IP/hostname it connected to, which may differ from
-    // config.host (e.g. config.host=0.0.0.0 but browser sees 100.x.y.z).
-    // For authenticated requests from non-loopback origins, reflect the
-    // Origin since the auth layer already gates access.
+    // CORS: reflect ONLY the exact same-origin (the dashboard serves its own
+    // UI). Cross-origin reflection for the remote fleet-switcher health probe
+    // is scoped to the UNAUTHENTICATED /api/health handler ONLY, which sets its
+    // own Access-Control-Allow-Origin (and never Access-Control-Allow-Credentials).
+    // SECURITY: no authenticated/protected route must ever carry cross-origin
+    // reflection. The earlier remote-bind same-port reflection lived in this
+    // prelude and therefore leaked onto every downstream route (protected reads,
+    // mutating POSTs, approval decisions) on a remote bind; it has been removed.
+    // Without Access-Control-Allow-Credentials this was not a credentialed-read
+    // takeover, but route-wide reflection is exactly the latent hole that turns
+    // into one the day a credentials header is added. Health-only is the contract.
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
     if (origin === selfOrigin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
-    } else if (origin && this.isRemoteBinding()) {
-      // C1: for non-loopback bindings, the browser may connect via a
-      // different IP/hostname than config.host. Auth gates access, so
-      // reflecting the origin for same-port requests is safe.
-      try {
-        const originUrl = new URL(origin);
-        if (originUrl.port === String(this.config.port) || (!originUrl.port && this.config.port === (this.useTLS ? 443 : 80))) {
-          res.setHeader("Access-Control-Allow-Origin", origin);
-        }
-      } catch {
-        // Invalid origin - no CORS header
-      }
     }
     // When no origin header (same-origin requests), no CORS header needed
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
