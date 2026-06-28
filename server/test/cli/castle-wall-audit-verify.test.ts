@@ -19,6 +19,13 @@
  *   - a forged/tampered entry (claims producer_signed, signature does not match
  *     the canonical body) is REJECTED (rejected=1) and a tamper WARNING is
  *     emitted - the core forgery-rejection property.
+ *   - a GENUINE signed tuple RELABELED under a different top-level operation
+ *     (signature re-verifies, but the signed body attests a different op) is
+ *     REJECTED, not verified - the operation-binding guard, parity with the
+ *     posture / feature-health green-light surfaces.
+ *   - DUPLICATED genuine entries (one real tuple re-appended N times) collapse to
+ *     a single verified count, with the extras surfaced as `duplicates` - the
+ *     replay-dedup guard, parity with the sibling surfaces.
  *   - with NO published producer key, the verb reports the honest
  *     channel-authenticated floor and makes no per-producer claim (channel>0,
  *     verified=0), never faking a verified count.
@@ -283,7 +290,140 @@ describe("castle-wall audit-verify", () => {
       err: errStream,
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
-    expect(errStream.text()).toContain("FAILED re-verification");
+    expect(errStream.text()).toContain("did NOT count as verified");
+  });
+
+  /**
+   * Persist a GENUINE producer-signed tuple directly via `AuditLog.append`,
+   * letting the caller choose the top-level `operation` the entry is FILED under
+   * independently of the operation the signature actually attests to. This is the
+   * in-process replay/relabel capability the reader must defend against: the
+   * signature re-verifies, but the top-level operation can be chosen freely by an
+   * actor holding the AuditLog handle. Returns the published producer public key.
+   */
+  async function seedSignedTupleUnderOperation(
+    fortressPath: string,
+    masterKey: Uint8Array,
+    privateKey: Uint8Array,
+    signedDecision: "allow" | "drop",
+    fileUnderOperation: "egress_allowed" | "egress_blocked",
+    seq: number,
+  ): Promise<void> {
+    const notification = notificationFor(signedDecision, new Date().toISOString());
+    const producer = signedProducerFor(notification, privateKey, seq);
+    const auditLog = new AuditLog(
+      new FilesystemStorage(join(fortressPath, "state")),
+      masterKey,
+      { integrityMode: "lenient" },
+    );
+    await auditLog.append(
+      "l1",
+      fileUnderOperation,
+      notification.agent.id,
+      {
+        decision: notification.decision,
+        seq,
+        prior_sha256_hex: null,
+        source: "macos_extension",
+        [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: producer.signature_b64url,
+        [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: producer.key_id,
+        [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: producer.event_canonical_json,
+        [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: producer.captured_at_unix_ms,
+        [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+      },
+      signedDecision === "allow" ? "success" : "failure",
+    );
+    await auditLog.flush();
+  }
+
+  it("REJECTS a genuine signed tuple RELABELED under a different top-level operation (not verified)", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKey = ed25519.getPublicKey(privateKey);
+    // The signature attests to an "allow" (egress_approved -> egress_allowed),
+    // but the entry is FILED under egress_blocked to manufacture a fake block.
+    // The signature re-verifies, so a reader that only checks the signature would
+    // wrongly count this as a verified BLOCK.
+    await seedSignedTupleUnderOperation(
+      fortressPath,
+      masterKey,
+      privateKey,
+      "allow",
+      "egress_blocked",
+      7,
+    );
+    await publishProducerKey(fortressPath, publicKey);
+
+    const out = new CaptureStream();
+    const errStream = new CaptureStream();
+    const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
+      out,
+      err: errStream,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    const report = JSON.parse(out.text().trim());
+    // The relabeled tuple must NOT inflate the verified count: it is a rejection.
+    expect(report.verified).toBe(0);
+    expect(report.rejected).toBe(1);
+    expect(report.rejected_samples).toHaveLength(1);
+    expect(report.rejected_samples[0].reason).toContain("operation mismatch");
+
+    // Human run names the relabel rejection honestly.
+    const humanErr = new CaptureStream();
+    await runAuditVerify(["--fortress", fortressPath], {
+      out: new CaptureStream(),
+      err: humanErr,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(humanErr.text()).toContain("operation mismatch");
+  });
+
+  it("does NOT let duplicated genuine entries inflate the verified count", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKey = ed25519.getPublicKey(privateKey);
+    // Build ONE genuine signed block tuple (seq 3) and persist THREE identical
+    // copies. Each re-verifies identically; without dedup all three would read as
+    // distinct verified enforcement events. They must collapse to ONE.
+    const notification = notificationFor("drop", new Date().toISOString());
+    const producer = signedProducerFor(notification, privateKey, 3);
+    const auditLog = new AuditLog(
+      new FilesystemStorage(join(fortressPath, "state")),
+      masterKey,
+      { integrityMode: "lenient" },
+    );
+    const dupDetails = {
+      decision: "drop",
+      seq: 3,
+      prior_sha256_hex: null,
+      source: "macos_extension",
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: producer.signature_b64url,
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: producer.key_id,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: producer.event_canonical_json,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: producer.captured_at_unix_ms,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    };
+    for (let i = 0; i < 3; i++) {
+      await auditLog.append("l1", "egress_blocked", notification.agent.id, { ...dupDetails }, "failure");
+    }
+    await auditLog.flush();
+    await publishProducerKey(fortressPath, publicKey);
+
+    const out = new CaptureStream();
+    const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
+      out,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    const report = JSON.parse(out.text().trim());
+    expect(report.enforcement_entries).toBe(3);
+    // One genuine event -> verified counts ONCE; the two replays are duplicates.
+    expect(report.verified).toBe(1);
+    expect(report.duplicates).toBe(2);
+    expect(report.rejected).toBe(0);
   });
 
   it("reports the honest channel-authenticated floor when no producer key is published", async () => {
