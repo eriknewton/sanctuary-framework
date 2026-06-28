@@ -12,7 +12,7 @@
  * Before Slice L1, an in-process TS module already holding the `AuditLog`
  * reference could append an `l1 egress_blocked` entry stamped with the
  * `cw_source` provenance marker, and it would hash-chain cleanly and render
- * the dashboard green — without the wall having done anything. The marker is a
+ * the dashboard green, without the wall having done anything. The marker is a
  * plain string; nothing stops a co-located module from writing it.
  *
  * A producer signature cannot be forged that way: the signing key lives only
@@ -58,7 +58,7 @@ const ENCODER = new TextEncoder();
  * `castle-wall-daemon/src/config.rs`, whose default `policy/egress` segment this
  * mirrors). Both the audit CONSUMER and the read-side posture/feature-health
  * READERS resolve the pinned key through this SINGLE constant so they can never
- * diverge onto different bases — "a reader must never read with a weaker basis
+ * diverge onto different bases: "a reader must never read with a weaker basis
  * than the consumer wrote with" (Slice P).
  */
 export const CASTLE_WALL_PRODUCER_PUBKEY_RELPATH = "policy/egress/audit-producer.pub";
@@ -95,7 +95,7 @@ export const CASTLE_WALL_POLICY_DIR_RELPATH = "policy/egress";
 
 /**
  * The daemon-launch argv that BINDS the Linux daemon's key-publish location to
- * the fortress storage path the in-process TS server reads from — closing the
+ * the fortress storage path the in-process TS server reads from, closing the
  * daemon↔TS path divergence (codex HIGH #2). Without this the daemon's default
  * `/var/lib/sanctuary/<id>/...` publish path and the TS `<storage_path>/...`
  * read path differ, so the TS side sees `absent` while the daemon signs and the
@@ -123,15 +123,15 @@ export function producerKeyDaemonLaunchArgs(storagePath: string): string[] {
 
 /**
  * Outcome of attempting to load the fortress's pinned producer key from the
- * canonical path. The three states are kept DISTINCT on purpose — collapsing
+ * canonical path. The three states are kept DISTINCT on purpose: collapsing
  * "absent" and "unreadable" into a single `null` is exactly the fail-open the
  * Slice P contract forbids:
  *
- *   - `present`  — a valid 32-byte key was loaded. Both sides activate the
+ *   - `present`  - a valid 32-byte key was loaded. Both sides activate the
  *     producer-signed close.
- *   - `absent`   — no key file exists (ENOENT). The honest macOS / pre-provision
+ *   - `absent`   - no key file exists (ENOENT). The honest macOS / pre-provision
  *     floor: both sides stay on the channel-authenticity basis. NOT a failure.
- *   - `unreadable` — a key file EXISTS but could not be loaded (wrong length,
+ *   - `unreadable` - a key file EXISTS but could not be loaded (wrong length,
  *     permission error, malformed). A key is EXPECTED here, so silently
  *     dropping to the channel basis would let a reader run a weaker basis than a
  *     key-bearing consumer. The caller MUST fail honestly (surface
@@ -151,7 +151,7 @@ export interface ProducerKeyLoadOptions {
 /**
  * Load the fortress's pinned producer key through the single canonical path,
  * distinguishing absent (channel basis is honest) from present-but-unreadable
- * (a key is expected — fail honestly). This is the SAFE-activation primitive
+ * (a key is expected; fail honestly). This is the SAFE-activation primitive
  * Slice P wires into both the consumer and the readers: an `absent` result is
  * the only one that legitimately yields the channel basis.
  *
@@ -191,7 +191,7 @@ async function loadProducerKeyFromPath(pubKeyPath: string): Promise<ProducerKeyL
       return { status: "absent" };
     }
     // The file exists but we could not read it (EACCES, EISDIR, ...). A key is
-    // expected — do not pretend it is absent.
+    // expected; do not pretend it is absent.
     return {
       status: "unreadable",
       reason: `producer_key_unreadable: ${
@@ -220,7 +220,7 @@ export function toBase64url(bytes: Uint8Array): string {
  * Load the daemon's published audit-producer public key from disk and return
  * it as base64url-no-pad. The file holds 32 raw Ed25519 verifying-key bytes
  * (the daemon writes it world-readable at `<policy_dir>/audit-producer.pub`).
- * Throws if the file is missing or not exactly 32 bytes — a caller that wants
+ * Throws if the file is missing or not exactly 32 bytes; a caller that wants
  * L1 enforcement MUST get a valid key or fail, never silently degrade.
  */
 export async function loadPinnedProducerKeyB64url(
@@ -303,7 +303,7 @@ export type ProducerSignatureVerdict =
  *
  * FAIL CLOSED: any missing field, length mismatch, key-id mismatch, malformed
  * encoding, or signature-verification failure returns `{ ok: false }`. A
- * thrown exception inside `@noble` is caught and converted to a failure — it
+ * thrown exception inside `@noble` is caught and converted to a failure; it
  * is never allowed to surface as an accept.
  *
  * @param pinnedProducerKeyB64url the TOFU-pinned producer public key
