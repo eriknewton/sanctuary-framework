@@ -38,6 +38,27 @@ type FleetHarness = {
   summaryEl: { textContent: string };
 };
 
+type BannerHarness = {
+  renderBanner: (
+    home: {
+      origin_machine: string;
+      federation?: {
+        available: boolean;
+        enabled: boolean;
+        fleet_node_count: number;
+      };
+      protection_requested_count: number;
+      enforcement_confirmed_count: number;
+      castle_wall: { arm_state: string };
+      digest: { chain_verified: boolean };
+    },
+    approvalState: { rows: unknown[] },
+    anomalies: unknown[],
+  ) => void;
+  originEl: { textContent: string };
+  bannerEl: { innerHTML: string };
+};
+
 function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
   const html = renderPostureHomeHTML();
   const escStart = html.indexOf("function esc(s)");
@@ -188,6 +209,44 @@ function fleetHarness(): FleetHarness {
     "renderFleet"
   >;
   return { ...helpers, fleetEl, section, summaryEl };
+}
+
+function bannerHarness(): BannerHarness {
+  const html = renderPostureHomeHTML();
+  const escStart = html.indexOf("function esc(s)");
+  const escEnd = html.indexOf('  // "Never fake green": ARMED');
+  const wallStart = html.indexOf("function wallPill(state)");
+  const wallEnd = html.indexOf("  // \"Never fake green\" for the agent grid");
+  const bannerStart = html.indexOf("function renderBanner(home");
+  const bannerEnd = html.indexOf("function renderAgents(home)");
+  expect(escStart).toBeGreaterThan(-1);
+  expect(escEnd).toBeGreaterThan(escStart);
+  expect(wallStart).toBeGreaterThan(-1);
+  expect(wallEnd).toBeGreaterThan(wallStart);
+  expect(bannerStart).toBeGreaterThan(-1);
+  expect(bannerEnd).toBeGreaterThan(bannerStart);
+
+  const originEl = { textContent: "" };
+  const bannerEl = { innerHTML: "" };
+  const document = {
+    getElementById(id: string) {
+      if (id === "origin") return originEl;
+      if (id === "banner") return bannerEl;
+      return null;
+    },
+  };
+  const source =
+    html.slice(escStart, escEnd) +
+    "\n" +
+    html.slice(wallStart, wallEnd) +
+    "\n" +
+    html.slice(bannerStart, bannerEnd) +
+    "\nreturn { renderBanner: renderBanner };";
+  const helpers = new Function("document", source)(document) as Pick<
+    BannerHarness,
+    "renderBanner"
+  >;
+  return { ...helpers, originEl, bannerEl };
 }
 
 /**
@@ -878,6 +937,54 @@ describe("posture home - Recognition panel (P5) impartiality", () => {
 });
 
 describe("posture home - Fleet panel (Slice 1) honesty", () => {
+  it("renders the banner as federated when the home payload reports a live fleet", () => {
+    const { renderBanner, originEl } = bannerHarness();
+    renderBanner(
+      {
+        origin_machine: "home-mac",
+        federation: {
+          available: true,
+          enabled: true,
+          fleet_node_count: 3,
+        },
+        protection_requested_count: 0,
+        enforcement_confirmed_count: 0,
+        castle_wall: { arm_state: "armed" },
+        digest: { chain_verified: true },
+      },
+      { rows: [] },
+      [],
+    );
+
+    expect(originEl.textContent).toBe("Machine: home-mac · federation: 3 machines");
+    expect(originEl.textContent).not.toContain("federation off");
+    expect(originEl.textContent).not.toContain("single-machine view");
+  });
+
+  it("keeps the single-machine banner only when no federation fleet is available", () => {
+    const { renderBanner, originEl } = bannerHarness();
+    renderBanner(
+      {
+        origin_machine: "solo-mac",
+        federation: {
+          available: false,
+          enabled: false,
+          fleet_node_count: 0,
+        },
+        protection_requested_count: 0,
+        enforcement_confirmed_count: 0,
+        castle_wall: { arm_state: "unknown" },
+        digest: { chain_verified: true },
+      },
+      { rows: [] },
+      [],
+    );
+
+    expect(originEl.textContent).toBe(
+      "Machine: solo-mac · single-machine view (federation off)",
+    );
+  });
+
   it("ships the fleet section hidden by default (absent until federation says otherwise)", () => {
     const html = renderPostureHomeHTML();
     // The section exists in the shell but is display:none until the gated fetch

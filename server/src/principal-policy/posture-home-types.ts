@@ -40,6 +40,17 @@ import type { QueryPrivacySection } from "./posture-query-privacy.js";
 export interface PostureHome {
   origin_machine: string;
   /**
+   * Factual federation summary for the banner. This is not the full roster and
+   * never creates a fleet claim by itself: `available:false` means there is no
+   * provisioned fleet to present, while `available:true` mirrors the same
+   * federation-backed roster the Fleet panel renders.
+   */
+  federation: {
+    available: boolean;
+    enabled: boolean;
+    fleet_node_count: number;
+  };
+  /**
    * Whether this dashboard mount has the posture SSE live-refresh registry
    * wired. False on folded wrap-auto mounts that intentionally omit the stream;
    * the client must keep polling there instead of opening a doomed EventSource.

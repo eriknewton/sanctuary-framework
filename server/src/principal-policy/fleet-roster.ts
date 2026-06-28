@@ -313,6 +313,13 @@ function classifyPolicyDrift(
     return "unknown";
   }
   if (
+    operatorPolicy.version === null ||
+    operatorPolicy.hash === null ||
+    operatorPolicy.hash_algorithm === null
+  ) {
+    return "unknown";
+  }
+  if (
     nodePolicy.version === operatorPolicy.version &&
     nodePolicy.hash === operatorPolicy.hash &&
     nodePolicy.hash_algorithm === operatorPolicy.hash_algorithm
