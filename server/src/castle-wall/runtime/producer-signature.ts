@@ -63,6 +63,17 @@ const ENCODER = new TextEncoder();
  */
 export const CASTLE_WALL_PRODUCER_PUBKEY_RELPATH = "policy/egress/audit-producer.pub";
 
+/** Host-wide macOS custody directory owned by the root helper. */
+export const CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR =
+  "/Library/Application Support/Sanctuary";
+
+/**
+ * Host-wide macOS audit-producer public key. The root helper publishes this
+ * file; macOS readers prefer it over the fortress-relative Linux path.
+ */
+export const CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH =
+  `${CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR}/castle-audit-producer.pub`;
+
 /**
  * Resolve the absolute path to the published audit-producer public key for a
  * fortress rooted at `storagePath`. The daemon must be launched with its
@@ -131,17 +142,41 @@ export type ProducerKeyLoad =
   | { status: "absent" }
   | { status: "unreadable"; reason: string };
 
+/** Platform/path override hooks for tests and non-default macOS helper layouts. */
+export interface ProducerKeyLoadOptions {
+  platform?: NodeJS.Platform;
+  macosProducerPubKeyPath?: string;
+}
+
 /**
  * Load the fortress's pinned producer key through the single canonical path,
  * distinguishing absent (channel basis is honest) from present-but-unreadable
  * (a key is expected — fail honestly). This is the SAFE-activation primitive
  * Slice P wires into both the consumer and the readers: an `absent` result is
  * the only one that legitimately yields the channel basis.
+ *
+ * macOS exception: the root helper publishes the audit-producer key host-wide
+ * at `/Library/Application Support/Sanctuary/castle-audit-producer.pub`, not
+ * only under one fortress storage path. On darwin, prefer that host-wide key;
+ * fall back to the fortress-relative key only when the host-wide file is
+ * absent. Present-but-unreadable remains fail-honest and does not fall back.
  */
 export async function loadFortressProducerKey(
-  storagePath: string
+  storagePath: string,
+  options: ProducerKeyLoadOptions = {},
 ): Promise<ProducerKeyLoad> {
-  const pubKeyPath = resolveProducerPubKeyPath(storagePath);
+  const platform = options.platform ?? process.platform;
+  if (platform === "darwin") {
+    const macosLoad = await loadProducerKeyFromPath(
+      options.macosProducerPubKeyPath ??
+        CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
+    );
+    if (macosLoad.status !== "absent") return macosLoad;
+  }
+  return loadProducerKeyFromPath(resolveProducerPubKeyPath(storagePath));
+}
+
+async function loadProducerKeyFromPath(pubKeyPath: string): Promise<ProducerKeyLoad> {
   let bytes: Uint8Array;
   try {
     bytes = new Uint8Array(await readFile(pubKeyPath));

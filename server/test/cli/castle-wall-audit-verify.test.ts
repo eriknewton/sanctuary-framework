@@ -215,6 +215,7 @@ describe("castle-wall audit-verify", () => {
     const out = new CaptureStream();
     const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
       out,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(0);
@@ -225,6 +226,30 @@ describe("castle-wall audit-verify", () => {
     expect(report.verified).toBe(1);
     expect(report.rejected).toBe(0);
     expect(report.channel_authenticated).toBe(0);
+  });
+
+  it("on darwin resolves the host-wide audit-producer key when the fortress key is absent", async () => {
+    const { fortressPath, masterKey, recoveryKey } = await makeFortress();
+    const publicKey = await seedGenuineSignedEntry(fortressPath, masterKey);
+    const hostDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-host-key-"));
+    tempDirs.push(hostDir);
+    const hostKeyPath = join(hostDir, "castle-audit-producer.pub");
+    await writeFile(hostKeyPath, publicKey);
+
+    const out = new CaptureStream();
+    const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
+      out,
+      platform: "darwin",
+      auditProducerPublicKeyPath: hostKeyPath,
+      env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+
+    expect(code).toBe(0);
+    const report = JSON.parse(out.text().trim());
+    expect(report.producer_key_present).toBe(true);
+    expect(report.reader_basis).toBe("per_producer_reverified");
+    expect(report.verified).toBe(1);
+    expect(report.rejected).toBe(0);
   });
 
   it("REJECTS a forged entry that claims producer_signed but has a bad signature", async () => {
@@ -272,6 +297,7 @@ describe("castle-wall audit-verify", () => {
     const out = new CaptureStream();
     const jsonCode = await runAuditVerify(["--fortress", fortressPath, "--json"], {
       out,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     // Still exit 0 - this is a diagnostic; a tamper finding is REPORTED, not
@@ -288,6 +314,7 @@ describe("castle-wall audit-verify", () => {
     await runAuditVerify(["--fortress", fortressPath], {
       out: humanOut,
       err: errStream,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(errStream.text()).toContain("did NOT count as verified");
@@ -360,6 +387,7 @@ describe("castle-wall audit-verify", () => {
     const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
       out,
       err: errStream,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(0);
@@ -375,6 +403,7 @@ describe("castle-wall audit-verify", () => {
     await runAuditVerify(["--fortress", fortressPath], {
       out: new CaptureStream(),
       err: humanErr,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(humanErr.text()).toContain("operation mismatch");
@@ -415,6 +444,7 @@ describe("castle-wall audit-verify", () => {
     const out = new CaptureStream();
     const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
       out,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(0);
@@ -447,6 +477,7 @@ describe("castle-wall audit-verify", () => {
     const out = new CaptureStream();
     const code = await runAuditVerify(["--fortress", fortressPath, "--json"], {
       out,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(0);
@@ -468,6 +499,7 @@ describe("castle-wall audit-verify", () => {
     const errStream = new CaptureStream();
     const code = await runAuditVerify(["--fortress", fortressPath], {
       err: errStream,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(1);
@@ -482,6 +514,7 @@ describe("castle-wall audit-verify", () => {
     const out = new CaptureStream();
     const code = await runAuditVerify(["--fortress", fortressPath], {
       out,
+      platform: "linux",
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
     expect(code).toBe(0);

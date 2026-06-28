@@ -226,6 +226,7 @@ describe("producer-key production wiring — DashboardApprovalChannel snapshot",
         timeout_seconds: 300,
         auth_token: authToken,
         auto_open: false,
+        producer_key_load_options: { platform: "linux" },
       });
       dac.setDependencies({
         policy: DEFAULT_POLICY,
@@ -260,7 +261,7 @@ describe("producer-key production wiring — DashboardApprovalChannel snapshot",
     // The exact resolution `ensureProducerKeyLoaded` performs: the live channel
     // reads THIS pinned key off disk through the single-source loader, so the
     // re-verification basis matches what the daemon wrote with.
-    const load = await loadFortressProducerKey(tempDir);
+    const load = await loadFortressProducerKey(tempDir, { platform: "linux" });
     expect(load.status).toBe("present");
     if (load.status === "present") expect(load.keyB64url).toBe(toBase64url(daemonPub));
   });
@@ -285,7 +286,7 @@ describe("producer-key production wiring — DashboardApprovalChannel snapshot",
     const snap = await bootSnapshot(appendGenuine);
     const overall = snap.overall as { light: string; status: string };
     expect(overall.light).not.toBe("green");
-    const load = await loadFortressProducerKey(tempDir);
+    const load = await loadFortressProducerKey(tempDir, { platform: "linux" });
     expect(load.status).toBe("unreadable");
   });
 });
@@ -320,7 +321,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
     // Resolve the producer-key state over the SAME storage path the wrap-auto
     // caller uses (loadFortressProducerKey), then map it into the options
     // exactly as wrap/cli.ts now does.
-    const load = await loadFortressProducerKey(tempDir);
+    const load = await loadFortressProducerKey(tempDir, { platform: "linux" });
 
     handle = await startDashboard({
       port: 0,

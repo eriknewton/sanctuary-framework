@@ -26,7 +26,11 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
-import { resolveProducerPubKeyPath } from "./producer-signature.js";
+import {
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
+  CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR,
+  resolveProducerPubKeyPath,
+} from "./producer-signature.js";
 import {
   isCustodyFsError,
   readFileCustody,
@@ -49,10 +53,10 @@ import {
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
-const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
+const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR;
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
 const CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH =
-  `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/castle-audit-producer.pub`;
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH;
 
 /**
  * Signing handle used by the daemon. B2: the production default routes both
