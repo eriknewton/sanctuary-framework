@@ -17,7 +17,12 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { generateKeypair } from "../../src/core/identity.js";
 import { CAP_STANDARD_FORTRESS_NODE } from "../../src/mesh/constants.js";
-import { issueNodeIdentityCertificate } from "../../src/mesh/trust-root.js";
+import {
+  generateFortressMaster,
+  issueNodeIdentityCertificate,
+  issuePrincipalCertificate,
+  verifyCertChain,
+} from "../../src/mesh/trust-root.js";
 import {
   mintFederationTrustRootRecord,
   type FederationTrustRootRecord,
@@ -28,12 +33,24 @@ import {
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
   FederationJoinerTrustRootStore,
   FederationJoinerTrustRootStoreError,
+  adoptFederationJoinerCompromiseRoot,
   loadFederationJoinerTrustRoot,
   persistFederationJoinerTrustRoot,
+  signFederationJoinerCompromiseRootAdoptionAttestation,
   validateJoinerRecord,
+  type FederationJoinerCompromiseRootAdoptionAttestation,
   type FederationJoinerTrustRootAuditEvent,
   type FederationJoinerTrustRootRecord,
 } from "../../src/mesh/federation-joiner-trust-root-store.js";
+import {
+  signFederationRootRevocationPayload,
+  type FederationRootRevocationPayload,
+} from "../../src/v1/federation-revocation.js";
+import type {
+  FortressMasterPublicKey,
+  NodeIdentityCertificate,
+  PrincipalCertificate,
+} from "../../src/mesh/types.js";
 
 async function testMasterKey(storage: MemoryStorage): Promise<Uint8Array> {
   const { masterKey } = await establishMaster({
@@ -94,6 +111,80 @@ function buildJoinerRecord(opts?: {
     node.privateKey.fill(0);
     principalPrivate.fill(0);
     masterPrivate.fill(0);
+  }
+}
+
+function buildCompromiseAdoptionArtifact(opts: {
+  current: FederationJoinerTrustRootRecord;
+  currentIssuingPrincipalPrivateKey: Uint8Array;
+  revocationSerial?: number;
+}): {
+  newPinnedMaster: FortressMasterPublicKey;
+  newIssuingPrincipalCert: PrincipalCertificate;
+  reissuedLocalNodeCert: NodeIdentityCertificate;
+  rootRevocation: FederationRootRevocationPayload;
+  adoptionAttestation: FederationJoinerCompromiseRootAdoptionAttestation;
+  newIssuingPrincipalPrivateKey: Uint8Array;
+} {
+  const k2 = generateFortressMaster();
+  const principal = generateKeypair();
+  const nodePubkey = fromBase64url(opts.current.local_node_cert.node_pubkey);
+  const newPinnedMaster = {
+    ...k2.public,
+    fortress_id: opts.current.fortress_id,
+  };
+  try {
+    const newIssuingPrincipalCert = issuePrincipalCertificate({
+      principal_id: opts.current.issuing_principal_cert.principal_id,
+      principal_pubkey: principal.publicKey,
+      role: "root",
+      fortress_id: opts.current.fortress_id,
+      master_private_key: k2.private_key,
+    });
+    const reissuedLocalNodeCert = issueNodeIdentityCertificate({
+      node_id: opts.current.node_id,
+      node_pubkey: nodePubkey,
+      node_mode: opts.current.local_node_cert.node_mode,
+      fortress_id: opts.current.fortress_id,
+      capabilities: opts.current.local_node_cert.capabilities,
+      parent_chain: {
+        fortress_master_pubkey: newPinnedMaster.public_key,
+        principal_id: newIssuingPrincipalCert.principal_id,
+        principal_pubkey: newIssuingPrincipalCert.principal_pubkey,
+      },
+      principal_private_key: principal.privateKey,
+      master_private_key: k2.private_key,
+    });
+    const rootRevocation = signFederationRootRevocationPayload({
+      fortressId: opts.current.fortress_id,
+      revokedMasterPubkey: opts.current.pinned_master_pubkey.public_key,
+      effectiveAt: new Date().toISOString(),
+      revocationSerial: opts.revocationSerial ?? 1,
+      operatorPrincipalId: newIssuingPrincipalCert.principal_id,
+      operatorPrincipalPrivateKey: principal.privateKey,
+    });
+    const adoptionAttestation =
+      signFederationJoinerCompromiseRootAdoptionAttestation({
+        current: opts.current,
+        newPinnedMasterPubkey: newPinnedMaster,
+        newIssuingPrincipalCert,
+        reissuedLocalNodeCert,
+        rootRevocation,
+        currentIssuingPrincipalPrivateKey:
+          opts.currentIssuingPrincipalPrivateKey,
+      });
+    return {
+      newPinnedMaster,
+      newIssuingPrincipalCert,
+      reissuedLocalNodeCert,
+      rootRevocation,
+      adoptionAttestation,
+      newIssuingPrincipalPrivateKey: Uint8Array.from(principal.privateKey),
+    };
+  } finally {
+    k2.private_key.fill(0);
+    principal.privateKey.fill(0);
+    nodePubkey.fill(0);
   }
 }
 
@@ -345,6 +436,296 @@ describe("FederationJoinerTrustRootStore", () => {
       fortress_id: "some-other-fortress",
     };
     expect(() => validateJoinerRecord(tampered)).toThrow(/fortress_id/);
+  });
+
+  it("3c-2 adopts a valid compromise rotation only after K2 revocation + K2 reissued node cert verify", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+    const artifact = buildCompromiseAdoptionArtifact({
+      current: record,
+      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+    });
+
+    const adopted = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: artifact.newPinnedMaster,
+      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
+      rootRevocation: artifact.rootRevocation,
+      adoptionAttestation: artifact.adoptionAttestation,
+    });
+
+    expect(adopted.adopted).toBe(true);
+    if (!adopted.adopted) throw new Error("expected adoption");
+    expect(adopted.previousPinnedMaster.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(adopted.pinnedMaster.public_key).toBe(
+      artifact.newPinnedMaster.public_key,
+    );
+    expect(adopted.revocationSerial).toBe(1);
+    expect(adopted.context.revokedRootPubkeys.has(record.pinned_master_pubkey.public_key)).toBe(true);
+    expect(adopted.context.highestRevocationSerial).toBe(1);
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      artifact.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.local_node_cert.parent_chain.fortress_master_pubkey).toBe(
+      artifact.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.revoked_root_pubkeys?.has(record.pinned_master_pubkey.public_key)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(1);
+    verifyCertChain(
+      loaded!.record.local_node_cert,
+      loaded!.record.issuing_principal_cert,
+      loaded!.record.pinned_master_pubkey,
+    );
+    artifact.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("3c-2 rejects a forged compromise artifact and holds the old trust anchor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+    const artifact = buildCompromiseAdoptionArtifact({
+      current: record,
+      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+    });
+    const forgedSignature = fromBase64url(
+      artifact.rootRevocation.operator_signature,
+    );
+    forgedSignature[0] ^= 1;
+    const forgedRevocation = {
+      ...artifact.rootRevocation,
+      operator_signature: toBase64url(forgedSignature),
+    };
+    forgedSignature.fill(0);
+    const forgedAttestation =
+      signFederationJoinerCompromiseRootAdoptionAttestation({
+        current: record,
+        newPinnedMasterPubkey: artifact.newPinnedMaster,
+        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+        reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
+        rootRevocation: forgedRevocation,
+        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+      });
+
+    const rejected = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: artifact.newPinnedMaster,
+      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
+      rootRevocation: forgedRevocation,
+      adoptionAttestation: forgedAttestation,
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "root_revocation_invalid",
+        detail: "operator_signature_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.highest_revocation_serial).toBe(0);
+    artifact.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("3c-2 rejects a self-minted attacker root without the pinned old-principal attestation", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+    const artifact = buildCompromiseAdoptionArtifact({
+      current: record,
+      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+    });
+    const attacker = generateKeypair();
+    const attackerAttestation =
+      signFederationJoinerCompromiseRootAdoptionAttestation({
+        current: record,
+        newPinnedMasterPubkey: artifact.newPinnedMaster,
+        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+        reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
+        rootRevocation: artifact.rootRevocation,
+        currentIssuingPrincipalPrivateKey: attacker.privateKey,
+      });
+
+    const rejected = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: artifact.newPinnedMaster,
+      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: artifact.reissuedLocalNodeCert,
+      rootRevocation: artifact.rootRevocation,
+      adoptionAttestation: attackerAttestation,
+    });
+    attacker.privateKey.fill(0);
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "old_principal_attestation_invalid",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    artifact.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("3c-2 rejects a rolled-back compromise serial and keeps the already-adopted K2 anchor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+    const firstArtifact = buildCompromiseAdoptionArtifact({
+      current: record,
+      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+      revocationSerial: 2,
+    });
+    const first = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: firstArtifact.newPinnedMaster,
+      newIssuingPrincipalCert: firstArtifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: firstArtifact.reissuedLocalNodeCert,
+      rootRevocation: firstArtifact.rootRevocation,
+      adoptionAttestation: firstArtifact.adoptionAttestation,
+    });
+    expect(first.adopted).toBe(true);
+    const afterFirst = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    const rollbackArtifact = buildCompromiseAdoptionArtifact({
+      current: afterFirst!.record,
+      currentIssuingPrincipalPrivateKey:
+        firstArtifact.newIssuingPrincipalPrivateKey,
+      revocationSerial: 2,
+    });
+
+    const rejected = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: rollbackArtifact.newPinnedMaster,
+      newIssuingPrincipalCert: rollbackArtifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: rollbackArtifact.reissuedLocalNodeCert,
+      rootRevocation: rollbackArtifact.rootRevocation,
+      adoptionAttestation: rollbackArtifact.adoptionAttestation,
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "revocation_serial_replay",
+        revocationSerial: 2,
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      firstArtifact.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.highest_revocation_serial).toBe(2);
+    firstArtifact.newIssuingPrincipalPrivateKey.fill(0);
+    rollbackArtifact.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("3c-2 does not strand on an unverifiable K2 node cert: old trust remains and state is surfaced", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+    const artifact = buildCompromiseAdoptionArtifact({
+      current: record,
+      currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+    });
+    const wrongNode = generateKeypair();
+    const badReissuedCert = {
+      ...artifact.reissuedLocalNodeCert,
+      node_pubkey: toBase64url(wrongNode.publicKey),
+    };
+    const badNodeAttestation =
+      signFederationJoinerCompromiseRootAdoptionAttestation({
+        current: record,
+        newPinnedMasterPubkey: artifact.newPinnedMaster,
+        newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+        reissuedLocalNodeCert: badReissuedCert,
+        rootRevocation: artifact.rootRevocation,
+        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+      });
+
+    const rejected = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: artifact.newPinnedMaster,
+      newIssuingPrincipalCert: artifact.newIssuingPrincipalCert,
+      reissuedLocalNodeCert: badReissuedCert,
+      rootRevocation: artifact.rootRevocation,
+      adoptionAttestation: badNodeAttestation,
+    });
+    wrongNode.privateKey.fill(0);
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "reissued_node_identity_mismatch",
+      }),
+    );
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.local_node_cert.parent_chain.fortress_master_pubkey).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    artifact.newIssuingPrincipalPrivateKey.fill(0);
   });
 });
 

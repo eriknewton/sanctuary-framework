@@ -179,6 +179,15 @@ export interface FederationBaseContext {
   isNodeRevoked(nodeId: string): boolean;
   /** Operator-tunable renewal policy for new/renewed node certs. */
   nodeCertificateRenewal?: FederationNodeCertificateRenewalConfig;
+  /**
+   * Additive joiner adoption state (3c-2): roots this node has already accepted
+   * as revoked plus the monotonic revocation serial floor. Issuer contexts get
+   * the same information from the durable sync-state projection; joiner contexts
+   * can carry it from their custody record so boot preserves compromise-adoption
+   * state without issuer authority.
+   */
+  revokedRootPubkeys?: Set<string>;
+  highestRevocationSerial?: number;
 }
 
 export interface FederationIssuerContext extends FederationBaseContext {
