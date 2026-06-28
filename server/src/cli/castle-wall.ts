@@ -47,6 +47,8 @@ import {
 } from "../castle-wall/runtime/producer-signature.js";
 import {
   reverifyEntryProducerSignature,
+  signedCanonicalOperation,
+  producerSignedDedupKey,
   type EntryReverifyBasis,
 } from "../principal-policy/producer-reverify.js";
 import {
@@ -1970,6 +1972,13 @@ interface AuditVerifyTally {
   verified: number;
   rejected: number;
   channel: number;
+  /**
+   * Verified-but-duplicate entries: a genuine signed tuple (same seq|signature)
+   * re-appended N times. The first copy is counted as `verified`; each extra
+   * copy lands here and does NOT inflate `verified`, so N copies of one real
+   * enforcement event never read as N distinct verified events.
+   */
+  duplicates: number;
 }
 
 /** Map a re-verification basis into the tally bucket it contributes to. */
@@ -1982,6 +1991,38 @@ function tallyBucketForBasis(basis: EntryReverifyBasis): keyof AuditVerifyTally 
     case "channel_authenticated":
       return "channel";
   }
+}
+
+/**
+ * Map from the daemon's SIGNED WAL `operation` vocabulary to the read-side
+ * `entry.operation` `audit-verify` scopes to. Mirrors `SIGNED_WAL_OP_TO_ENTRY_OP`
+ * in `posture.ts` and `SIGNED_WAL_OP_TO_FEATURE_OP` in `feature-health.ts`. Only
+ * the two flow-verdict operations matter here (the verb already filters to
+ * `egress_allowed` / `egress_blocked`); a signed `egress_pending` body can never
+ * match either, so a paused-decision tuple cannot be relabeled into a verdict.
+ */
+const AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP: Readonly<Record<string, string>> =
+  Object.freeze({
+    egress_approved: "egress_allowed",
+    egress_blocked: "egress_blocked",
+  });
+
+/**
+ * True iff a re-verified producer-signed entry's SIGNED canonical body attests
+ * to the same read-side operation the entry is filed under (parity with the
+ * posture / feature-health green-light surfaces). Fail closed on any parse
+ * failure / unknown signed op / mismatch: a verified signature over one
+ * operation must NOT count toward a DIFFERENT operation's verified tally, so a
+ * genuine signed tuple cannot be relabeled under a different top-level operation
+ * to inflate or mis-slice the verified count.
+ */
+function auditVerifySignedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const signedOp = signedCanonicalOperation(details);
+  if (signedOp === null) return false;
+  return AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] === entryOperation;
 }
 
 /**
@@ -2040,7 +2081,15 @@ async function resolveAuditVerifyProducerKey(
  *
  * It reuses `reverifyEntryProducerSignature()` - the exact same fail-closed
  * gate the posture/feature-health readers run - so the CLI cannot diverge from
- * the live posture surface.
+ * the live posture surface. Beyond the signature check it applies the SAME two
+ * guards those green-light surfaces apply, so a re-verifiable signature alone
+ * does not inflate the count: (1) OPERATION BINDING - the signed canonical
+ * body's operation must map to the entry's top-level operation, so a genuine
+ * signed tuple relabeled under a different operation is REJECTED, not verified;
+ * and (2) DEDUP on `seq|signature` - a genuine tuple copied N times counts once
+ * (the extras are surfaced as `duplicates`, never as distinct verified events).
+ * Without these, an in-process actor holding the AuditLog handle could replay a
+ * genuine signed tuple - relabeled and/or duplicated - to mis-slice the count.
  *
  * Honest no-key floor: when no producer key is published (macOS pre-Slice-M,
  * pre-provision Linux), the verb reports every enforcement entry on the
@@ -2093,21 +2142,70 @@ export async function runAuditVerify(
         entry.operation === "egress_blocked",
     );
 
-    const tally: AuditVerifyTally = { verified: 0, rejected: 0, channel: 0 };
+    const tally: AuditVerifyTally = {
+      verified: 0,
+      rejected: 0,
+      channel: 0,
+      duplicates: 0,
+    };
     const rejectedSamples: Array<{
       timestamp: string;
       operation: string;
+      reason: string;
     }> = [];
+    // Dedup verified producer-signed entries on `seq|signature` so a genuine
+    // tuple copied N times counts once. Mirrors the posture / feature-health
+    // green-light surfaces, which already dedup the same way.
+    const seenSignedKeys = new Set<string>();
     for (const entry of evidenceEntries) {
+      const details = entry.details ?? {};
       const result = reverifyEntryProducerSignature(
-        entry.details ?? {},
+        details,
         pinnedProducerKeyB64url,
       );
+      // A signature that re-verifies is necessary but not sufficient to count as
+      // a distinct verified enforcement event: apply the same operation-binding
+      // and dedup guards the sibling green-light surfaces apply, so an in-process
+      // actor cannot replay a genuine signed tuple relabeled under a different
+      // top-level operation, nor duplicated N times, to inflate the verified
+      // tally.
+      if (result.basis === "producer_signed_verified") {
+        // (1) Operation binding: the signed canonical body's operation is
+        // authoritative, not the forgeable top-level `entry.operation`. A
+        // mismatch is a relabel attack: count it as REJECTED, not verified.
+        if (!auditVerifySignedOperationMatchesEntry(details, entry.operation)) {
+          tally.rejected += 1;
+          if (rejectedSamples.length < 20) {
+            rejectedSamples.push({
+              timestamp: entry.timestamp,
+              operation: entry.operation,
+              reason: "operation mismatch (signed body attests a different operation)",
+            });
+          }
+          continue;
+        }
+        // (2) Dedup: a genuine tuple copied N times re-verifies identically.
+        // Count the first copy as verified; surface the extras as duplicates so
+        // they do not read as distinct verified enforcement events. A
+        // null/absent dedup key cannot be trusted to be unique, so treat it as a
+        // duplicate beyond the first un-keyed entry would be unsound. Instead it
+        // simply cannot dedup, so it counts as verified (the inputs that make it
+        // verified already required seq+sig present in re-verification).
+        const dedupKey = producerSignedDedupKey(details);
+        if (dedupKey !== null && seenSignedKeys.has(dedupKey)) {
+          tally.duplicates += 1;
+          continue;
+        }
+        if (dedupKey !== null) seenSignedKeys.add(dedupKey);
+        tally.verified += 1;
+        continue;
+      }
       tally[tallyBucketForBasis(result.basis)] += 1;
       if (result.basis === "producer_signed_rejected" && rejectedSamples.length < 20) {
         rejectedSamples.push({
           timestamp: entry.timestamp,
           operation: entry.operation,
+          reason: "signature failed re-verification against the pinned key",
         });
       }
     }
@@ -2128,6 +2226,9 @@ export async function runAuditVerify(
           verified: tally.verified,
           rejected: tally.rejected,
           channel_authenticated: tally.channel,
+          // Verified-but-duplicate copies of a genuine signed tuple. Surfaced
+          // separately so N copies of one real event never inflate `verified`.
+          duplicates: tally.duplicates,
           rejected_samples: rejectedSamples,
         }) + "\n",
       );
@@ -2155,17 +2256,30 @@ export async function runAuditVerify(
     write(out, `  producer_signed_verified : ${tally.verified}\n`);
     write(out, `  producer_signed_rejected : ${tally.rejected}\n`);
     write(out, `  channel_authenticated    : ${tally.channel}\n`);
+    if (tally.duplicates > 0) {
+      write(
+        out,
+        `  duplicates (not counted)  : ${tally.duplicates}\n` +
+          "    (genuine signed tuples re-appended; the first copy counts as\n" +
+          "     verified, the rest are NOT distinct enforcement events.)\n",
+      );
+    }
     if (tally.rejected > 0) {
       write(
         err,
         `WARNING: ${tally.rejected} enforcement entr${
           tally.rejected === 1 ? "y" : "ies"
-        } CLAIMED producer_signed but FAILED re-verification against the pinned key.\n` +
-          "  This is a forgery / tamper signal: an entry stamped the producer-signed\n" +
-          "  basis but carries no valid signature over the pinned producer key.\n",
+        } CLAIMED producer_signed but did NOT count as verified.\n` +
+          "  This is a forgery / tamper signal: either the signature failed to\n" +
+          "  re-verify against the pinned producer key, or it re-verified but the\n" +
+          "  signed body attests a DIFFERENT operation than the entry was filed\n" +
+          "  under (a relabel / staple attack). Neither counts as a verified event.\n",
       );
       for (const sample of rejectedSamples) {
-        write(err, `    rejected: ${sample.timestamp} ${sample.operation}\n`);
+        write(
+          err,
+          `    rejected: ${sample.timestamp} ${sample.operation} (${sample.reason})\n`,
+        );
       }
     }
     return 0;
