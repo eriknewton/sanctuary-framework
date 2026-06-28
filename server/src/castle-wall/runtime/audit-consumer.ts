@@ -601,6 +601,27 @@ export class AuditConsumer {
     if (typeof eventSeq === "number" && eventSeq !== envelope.producer.seq) {
       return { kind: "rejected", reason: "producer_signature_seq_mismatch" };
     }
+    const signedDetails =
+      parsed.body.details !== null &&
+      typeof parsed.body.details === "object" &&
+      !Array.isArray(parsed.body.details)
+        ? (parsed.body.details as Record<string, unknown>)
+        : {};
+    if (
+      Object.prototype.hasOwnProperty.call(signedDetails, "seq") &&
+      signedDetails.seq !== envelope.producer.seq
+    ) {
+      return { kind: "rejected", reason: "producer_signed_body_seq_mismatch" };
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(signedDetails, "prior_sha256_hex") &&
+      signedDetails.prior_sha256_hex !== envelope.event.details.prior_sha256_hex
+    ) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_prior_hash_mismatch",
+      };
+    }
     // Freshness gate (anti-replay across process restart). The signature is
     // authentic, but a captured PAST signed frame could be replayed after a
     // restart resets the in-memory seq watermark. Reject events whose bound

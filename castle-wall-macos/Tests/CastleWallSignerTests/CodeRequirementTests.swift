@@ -27,6 +27,15 @@ final class CodeRequirementTests: XCTestCase {
         XCTAssertTrue(req.contains(SignerConstants.signerClientIdentifier))
     }
 
+    func testAuditProducerRequirementPinsExtensionIdentifierNotSignerClient() {
+        let req = CodeRequirement.castleWallExtensionRequirement()
+        XCTAssertTrue(req.contains("anchor apple generic"))
+        XCTAssertTrue(req.contains(SignerConstants.teamID))
+        XCTAssertTrue(req.contains(SignerConstants.castleWallExtensionIdentifier))
+        XCTAssertFalse(req.contains(SignerConstants.signerClientIdentifier))
+        XCTAssertNotNil(CodeRequirement.makeRequirement(req))
+    }
+
     func testRequirementCompilesToSecRequirement() {
         let req = CodeRequirement.signerClientRequirement()
         XCTAssertNotNil(
