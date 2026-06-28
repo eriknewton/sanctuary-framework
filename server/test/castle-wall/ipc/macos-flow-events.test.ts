@@ -21,6 +21,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import type {
   AuditEmitNotification,
@@ -29,6 +30,7 @@ import type {
   ManifestSubscribeRequest,
   ManifestUpdatedNotification,
 } from "../../../src/castle-wall/ipc/messages.js";
+import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import {
   MacOSFlowEventConsumer,
   validateFlowDecisionRecorded,
@@ -38,11 +40,16 @@ import {
   type MacOSManifestProvider,
   type MacOSSubscriber,
 } from "../../../src/castle-wall/runtime/index.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
 } from "../../../src/castle-wall/constants.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
@@ -84,6 +91,12 @@ function makeAuditSink(): { sink: AuditSink; entries: FakeAuditEntry[]; flushes:
       return flushes;
     },
   };
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function makeApprovalQueue(): {
@@ -163,6 +176,8 @@ function buildConsumer(args?: {
   rules?: AllowlistRule[];
   signature?: string | null;
   defaultApprovalTimeoutSeconds?: number;
+  pinnedProducerKeyB64url?: string | null;
+  now?: () => number;
 }) {
   const auditSinkBundle = makeAuditSink();
   const queueBundle = makeApprovalQueue();
@@ -175,8 +190,57 @@ function buildConsumer(args?: {
     approvalQueue: queueBundle.queue,
     auditSink: auditSinkBundle.sink,
     defaultApprovalTimeoutSeconds: args?.defaultApprovalTimeoutSeconds ?? 30,
+    pinnedProducerKeyB64url: args?.pinnedProducerKeyB64url ?? null,
+    ...(args?.now ? { now: args.now } : {}),
   });
   return { consumer, auditSinkBundle, queueBundle, manifestProvider };
+}
+
+function signedMacOSProducerFor(
+  notification: FlowDecisionRecordedNotification,
+  privateKey: Uint8Array,
+  opts?: { seq?: number; priorSha256Hex?: string | null; capturedAtUnixMs?: number }
+): NonNullable<FlowDecisionRecordedNotification["producer"]> {
+  const seq = opts?.seq ?? 0;
+  const capturedAtUnixMs = opts?.capturedAtUnixMs ?? Date.parse(notification.recorded_at);
+  const operation =
+    notification.decision === "allow" ? "egress_approved" : "egress_blocked";
+  const result = notification.decision === "allow" ? "success" : "blocked";
+  const details: Record<string, unknown> = {
+    agent_id: notification.agent.id,
+    agent_template: notification.agent.template,
+    dest_ip: notification.destination.ip,
+    dest_port: notification.destination.port,
+    dest_protocol: notification.destination.protocol,
+    decision: notification.decision,
+    prior_sha256_hex: opts?.priorSha256Hex ?? null,
+    rule_id: notification.matched_rule_id ?? null,
+    seq,
+    source: "macos_extension",
+  };
+  if (notification.destination.host !== null) {
+    details.dest_host = notification.destination.host;
+  }
+  const eventCanonicalJson = canonicalize({
+    timestamp: notification.recorded_at,
+    layer: "l1",
+    operation,
+    identity_id: notification.agent.id,
+    result,
+    details,
+  });
+  const signature = ed25519.sign(
+    producerSigningBytes(eventCanonicalJson, capturedAtUnixMs, seq),
+    privateKey,
+  );
+  return {
+    event_canonical_json: eventCanonicalJson,
+    captured_at_unix_ms: capturedAtUnixMs,
+    seq,
+    prior_sha256_hex: opts?.priorSha256Hex ?? null,
+    signature_b64url: toBase64url(signature),
+    key_id: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  };
 }
 
 describe("MacOSFlowEventConsumer : manifest subscribe + broadcast", () => {
@@ -322,6 +386,122 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
+  });
+
+  it("accepts a producer-signed macOS allow verdict when the audit-producer key is pinned", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const capturedAtUnixMs = 1_760_000_000_000;
+    const { consumer, auditSinkBundle } = buildConsumer({
+      pinnedProducerKeyB64url: publicKeyB64url,
+      now: () => capturedAtUnixMs + 1000,
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00.000Z",
+    };
+    notification.producer = signedMacOSProducerFor(notification, privateKey, {
+      capturedAtUnixMs,
+    });
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    const entry = auditSinkBundle.entries.find((e) => e.operation === "egress_allowed");
+    expect(entry).toBeDefined();
+    expect(entry?.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
+      CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    );
+    expect(entry?.details?.[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]).toBe(
+      notification.producer.signature_b64url,
+    );
+    expect(entry?.details?.dest_host).toBe("api.anthropic.com");
+    expect(entry?.details?.rule_id).toBe("rule-anthropic");
+    expect(entry?.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(consumer.getStats().decisionsRecorded).toBe(1);
+    expect(consumer.getStats().decisionsRejected).toBe(0);
+  });
+
+  it("rejects an unsigned macOS verdict when an audit-producer key is pinned", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const { consumer, auditSinkBundle } = buildConsumer({
+      pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(privateKey)),
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00.000Z",
+    };
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    expect(
+      auditSinkBundle.entries.some((entry) => entry.operation === "egress_allowed"),
+    ).toBe(false);
+    expect(consumer.getStats().decisionsRecorded).toBe(0);
+    expect(consumer.getStats().decisionsRejected).toBe(1);
+  });
+
+  it("rejects a producer-signed macOS verdict when the unsigned prior hash is tampered", async () => {
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const capturedAtUnixMs = 1_760_000_000_000;
+    const { consumer, auditSinkBundle } = buildConsumer({
+      pinnedProducerKeyB64url: toBase64url(ed25519.getPublicKey(privateKey)),
+      now: () => capturedAtUnixMs + 1000,
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: "agent-7", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00.000Z",
+    };
+    notification.producer = signedMacOSProducerFor(notification, privateKey, {
+      capturedAtUnixMs,
+      priorSha256Hex: "0".repeat(64),
+    });
+    notification.producer = {
+      ...notification.producer,
+      prior_sha256_hex: "f".repeat(64),
+    };
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    expect(
+      auditSinkBundle.entries.some((entry) => entry.operation === "egress_allowed"),
+    ).toBe(false);
+    expect(consumer.getStats().decisionsRecorded).toBe(0);
+    expect(consumer.getStats().decisionsRejected).toBe(1);
   });
 
   it("translates drop with null matched_rule_id to egress_blocked audit event", async () => {

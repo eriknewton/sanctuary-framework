@@ -34,6 +34,21 @@ import CastleWallIPC
 
 final class ExtensionDispatcherTests: XCTestCase {
 
+    final class ImmediateAuditProducerSigner: AuditProducerSigning {
+        let privateKey: Curve25519.Signing.PrivateKey
+
+        init(privateKey: Curve25519.Signing.PrivateKey) {
+            self.privateKey = privateKey
+        }
+
+        func signAuditProducerPayload(
+            _ payload: Data,
+            reply: @escaping (Data?, String?) -> Void
+        ) {
+            reply(try? privateKey.signature(for: payload), nil)
+        }
+    }
+
     // MARK: - Helpers
 
     func makeFlow(
@@ -402,5 +417,49 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(body.expiresInSeconds, 45)
         XCTAssertEqual(body.agent.id, flow.agentId)
         XCTAssertEqual(body.destination.host, flow.destinationHost)
+    }
+
+    func test_auditProducerChain_signsAllowVerdictWithDomainSeparatedBytes() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain()
+        let flow = makeFlow()
+        let recordedAt = Date(timeIntervalSince1970: 1_760_000_000)
+        let exp = expectation(description: "signed verdict")
+        var signedMessage: IpcMessage?
+        var signedError: AuditProducerSigningError?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: flow,
+            recordedAt: recordedAt,
+            signer: signer
+        ) { result in
+            switch result {
+            case .success(let message):
+                signedMessage = message
+            case .failure(let error):
+                signedError = error
+            }
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1)
+
+        XCTAssertNil(signedError)
+        guard case .flowDecisionRecorded(let body)? = signedMessage else {
+            return XCTFail("expected signed flowDecisionRecorded")
+        }
+        let producer = try XCTUnwrap(body.producer)
+        XCTAssertEqual(producer.seq, 0)
+        XCTAssertNil(producer.priorSha256Hex)
+        XCTAssertEqual(producer.keyId, AuditProducerSigningConstants.keyId)
+        let signature = try Base64URL.decode(producer.signatureB64url)
+        let payload = Data(
+            "\(AuditProducerSigningConstants.domainPrefix)\(producer.eventCanonicalJson)\n\(producer.capturedAtUnixMs)\n\(producer.seq)".utf8
+        )
+        XCTAssertTrue(
+            privateKey.publicKey.isValidSignature(signature, for: payload),
+            "signature must verify over the exact domain-separated producer bytes"
+        )
     }
 }

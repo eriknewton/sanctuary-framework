@@ -161,6 +161,22 @@ export interface AuditEmitNotification {
   event: CastleWallAuditEvent;
 }
 
+/** Per-event producer signature carried by a macOS extension verdict. */
+export interface AuditProducerSignatureNotification {
+  /** Exact canonical JSON body the extension signed. */
+  event_canonical_json: string;
+  /** Capture timestamp bound into the signature. */
+  captured_at_unix_ms: number;
+  /** Monotonic extension-side sequence bound into the signature. */
+  seq: number;
+  /** Prior CastleWallAuditEvent canonical hash, or null for genesis. */
+  prior_sha256_hex: string | null;
+  /** base64url-no-pad of the 64-byte Ed25519 producer signature. */
+  signature_b64url: string;
+  /** Key id selecting the pinned producer public key. */
+  key_id: string;
+}
+
 /** Aggregate metric batch (per scope-lock section 8 Option D metric path). */
 export interface AuditEmitMetricBatchNotification {
   type: "audit_emit_metric_batch";
@@ -327,6 +343,7 @@ export interface FlowDecisionRecordedNotification {
   agent: IpcAgentAttribution;
   matched_rule_id?: string | null;
   recorded_at: string;
+  producer?: AuditProducerSignatureNotification | null;
 }
 
 /**

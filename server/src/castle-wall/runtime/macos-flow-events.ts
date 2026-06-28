@@ -32,8 +32,10 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../constants.js";
+import { buildAuditEvent } from "../audit/builder.js";
 import type {
   AuditEmitNotification,
+  AuditProducerSignatureNotification,
   FlowDecisionRecordedNotification,
   FlowPendingApprovalNotification,
   IpcAgentAttribution,
@@ -41,7 +43,12 @@ import type {
   ManifestSubscribeRequest,
   ManifestUpdatedNotification,
 } from "../ipc/messages.js";
-import type { AuditSink } from "./audit-consumer.js";
+import {
+  AuditChainError,
+  AuditConsumer,
+  type AuditSink,
+  type CriticalEventEnvelope,
+} from "./audit-consumer.js";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -104,6 +111,14 @@ export interface MacOSFlowEventConsumerInput {
    * can override.
    */
   defaultApprovalTimeoutSeconds: number;
+  /**
+   * Optional macOS audit-producer public key. When present, flow verdicts MUST
+   * carry the extension-side producer tuple and pass the same fail-closed
+   * re-verification gate Linux uses. When absent, macOS stays on the honest
+   * channel-authenticated floor.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  now?: () => number;
 }
 
 /**
@@ -117,6 +132,7 @@ export class MacOSFlowEventConsumer {
   private readonly approvalQueue: MacOSApprovalQueue;
   private readonly auditSink: AuditSink;
   private readonly defaultApprovalTimeoutSeconds: number;
+  private readonly producerAuditConsumer: AuditConsumer | null;
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
@@ -133,6 +149,14 @@ export class MacOSFlowEventConsumer {
     this.approvalQueue = input.approvalQueue;
     this.auditSink = input.auditSink;
     this.defaultApprovalTimeoutSeconds = input.defaultApprovalTimeoutSeconds;
+    this.producerAuditConsumer =
+      typeof input.pinnedProducerKeyB64url === "string" &&
+      input.pinnedProducerKeyB64url.length > 0
+        ? new AuditConsumer(input.auditSink, undefined, {
+            pinnedProducerKeyB64url: input.pinnedProducerKeyB64url,
+            ...(input.now ? { now: input.now } : {}),
+          })
+        : null;
   }
 
   /** Add a subscriber. The runtime calls this when an IPC connection finishes the handshake. */
@@ -224,6 +248,19 @@ export class MacOSFlowEventConsumer {
     }
     const eventType =
       notification.decision === "allow" ? "egress_allowed" : "egress_blocked";
+    if (this.producerAuditConsumer !== null) {
+      try {
+        await this.producerAuditConsumer.ingestCritical(
+          buildProducerSignedEnvelope(notification, eventType)
+        );
+        this.stats.decisionsRecorded += 1;
+      } catch (err) {
+        this.stats.decisionsRejected += 1;
+        if (err instanceof AuditChainError) return;
+        throw err;
+      }
+      return;
+    }
     // OPERATOR ATTRIBUTION (#381): the matched rule id is written into the
     // stored audit entry so the operator -- who owns the policy -- can attribute
     // each flow to the specific rule that decided it (a specific allow/deny rule
@@ -348,6 +385,63 @@ export class MacOSFlowEventConsumer {
   getStats(): MacOSFlowEventStats {
     return { ...this.stats };
   }
+}
+
+function buildProducerSignedEnvelope(
+  notification: FlowDecisionRecordedNotification,
+  eventType: "egress_allowed" | "egress_blocked"
+): CriticalEventEnvelope {
+  const producer = normalizeProducerSignature(notification.producer);
+  const event = buildAuditEvent({
+    timestamp: notification.recorded_at,
+    fortress_id: notification.agent.id,
+    event_type: eventType,
+    agent: notification.agent,
+    destination: notification.destination,
+    decision: null,
+    rule_id: notification.matched_rule_id ?? null,
+    details: producer
+      ? {
+          seq: producer.seq,
+          prior_sha256_hex: producer.prior_sha256_hex,
+        }
+      : {},
+  });
+  return {
+    event,
+    ack: async () => {},
+    ...(producer
+      ? {
+          producer: {
+            eventCanonicalJson: producer.event_canonical_json,
+            capturedAtUnixMs: producer.captured_at_unix_ms,
+            seq: producer.seq,
+            signatureB64url: producer.signature_b64url,
+            keyId: producer.key_id,
+          },
+        }
+      : {}),
+  };
+}
+
+function normalizeProducerSignature(
+  producer: FlowDecisionRecordedNotification["producer"]
+): AuditProducerSignatureNotification | null {
+  if (producer === null || producer === undefined) return null;
+  if (
+    typeof producer.event_canonical_json !== "string" ||
+    typeof producer.captured_at_unix_ms !== "number" ||
+    typeof producer.seq !== "number" ||
+    !(
+      typeof producer.prior_sha256_hex === "string" ||
+      producer.prior_sha256_hex === null
+    ) ||
+    typeof producer.signature_b64url !== "string" ||
+    typeof producer.key_id !== "string"
+  ) {
+    return null;
+  }
+  return producer;
 }
 
 /**

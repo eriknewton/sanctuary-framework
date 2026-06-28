@@ -69,6 +69,8 @@ public final class ExtensionDispatcher {
     private let manifestStore: ManifestStore
     private let flowCache: FlowCache
     private let sendErrorHandler: SendErrorHandler
+    private let auditProducerSigner: AuditProducerSigning?
+    private let auditProducerChain: AuditProducerChain
 
     private let stateQueue = DispatchQueue(
         label: "ai.sanctuaryprotocol.castle-wall.extension-dispatcher.state"
@@ -94,12 +96,16 @@ public final class ExtensionDispatcher {
     public init(
         engine: FlowEvaluatorEngine,
         ipcClient: IPCClient,
+        auditProducerSigner: AuditProducerSigning? = XpcAuditProducerSigner(),
+        auditProducerChain: AuditProducerChain = AuditProducerChain(),
         sendErrorHandler: @escaping SendErrorHandler = ExtensionDispatcher.defaultSendErrorHandler
     ) {
         self.engine = engine
         self.ipcClient = ipcClient
         self.manifestStore = engine.manifestStore
         self.flowCache = engine.flowCache
+        self.auditProducerSigner = auditProducerSigner
+        self.auditProducerChain = auditProducerChain
         self.sendErrorHandler = sendErrorHandler
     }
 
@@ -215,6 +221,24 @@ public final class ExtensionDispatcher {
 
         switch outcome {
         case .allow, .drop:
+            if let auditProducerSigner {
+                auditProducerChain.buildSignedFlowDecision(
+                    outcome: outcome,
+                    flow: flow,
+                    signer: auditProducerSigner
+                ) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success(let message):
+                        self.ipcClient.send(message, onError: self.handleSendError)
+                    case .failure(let error):
+                        CastleWallLog.ipc.notice(
+                            "audit producer signing failed; dropping signed verdict notification reason=\(String(describing: error))"
+                        )
+                    }
+                }
+                return
+            }
             guard let message = IPCBridgeNotifications.buildFlowDecisionRecorded(
                 outcome: outcome,
                 flow: flow

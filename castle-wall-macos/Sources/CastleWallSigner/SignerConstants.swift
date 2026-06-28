@@ -26,6 +26,13 @@ public enum SignerConstants {
     public static let signerClientIdentifier =
         "ai.sanctuaryprotocol.macos.castle-wall.signer-client"
 
+    /// Designated code-signing identifier of the Network/System Extension
+    /// bundle. The audit-producer signing service accepts this binary, not the
+    /// generic signer-client shim, so the TypeScript daemon cannot ask the shim
+    /// to mint per-flow audit evidence.
+    public static let castleWallExtensionIdentifier =
+        "ai.sanctuaryprotocol.macos.castle-wall"
+
     /// Launchd label / bundle identifier of the root helper itself. Used as the
     /// SMAppService plist name and the helper's own designated identifier.
     public static let signerHelperIdentifier =
@@ -35,6 +42,11 @@ public enum SignerConstants {
     /// match the `MachServices` key in the helper LaunchDaemon plist.
     public static let machServiceName =
         "ai.sanctuaryprotocol.macos.castle-wall.signer"
+
+    /// Dedicated Mach service for per-flow audit-producer signatures. It uses a
+    /// distinct key and caller requirement from the manifest/nonce signer.
+    public static let auditProducerMachServiceName =
+        "ai.sanctuaryprotocol.macos.castle-wall.audit-producer"
 
     /// Root-owned protected directory that holds the trust anchor (pin) and the
     /// helper's private signing key. Created + owned by the helper (root:wheel).
@@ -50,6 +62,14 @@ public enum SignerConstants {
     /// Never leaves the helper process; never read by the Node daemon.
     public static let signerPrivateKeyFilename = "castle-signer-privkey.bin"
 
+    /// Public trust-anchor file for the macOS extension audit-producer key.
+    /// Written root:wheel 0644 by the helper; read by the daemon/readers.
+    public static let auditProducerPublicKeyFilename = "castle-audit-producer.pub"
+
+    /// Private audit-producer key, root:wheel 0600 and only reachable through
+    /// the extension-pinned audit-producer Mach service.
+    public static let auditProducerPrivateKeyFilename = "castle-audit-producer.key"
+
     /// Absolute path to the public pin file.
     public static var pinnedPublicKeyPath: String {
         "\(protectedDirectory)/\(pinnedPublicKeyFilename)"
@@ -60,11 +80,22 @@ public enum SignerConstants {
         "\(protectedDirectory)/\(signerPrivateKeyFilename)"
     }
 
+    /// Absolute path to the macOS audit-producer public key.
+    public static var auditProducerPublicKeyPath: String {
+        "\(protectedDirectory)/\(auditProducerPublicKeyFilename)"
+    }
+
+    /// Absolute path to the macOS audit-producer private key.
+    public static var auditProducerPrivateKeyPath: String {
+        "\(protectedDirectory)/\(auditProducerPrivateKeyFilename)"
+    }
+
     /// Purpose labels carried over XPC for the audit trail ONLY. The helper
     /// signs opaque bytes regardless of purpose; it never parses the payload
     /// (§4.3 — no manifest awareness in the helper).
     public enum SignPurpose {
         public static let manifest = "manifest"
         public static let nonce = "nonce"
+        public static let auditProducer = "audit-producer"
     }
 }
