@@ -889,6 +889,7 @@ export async function createSanctuaryServer(options?: {
       auth_token: authToken,
       tls: config.dashboard.tls,
       auto_open: config.dashboard.auto_open,
+      allow_plaintext_remote: config.dashboard.allow_plaintext_remote,
     });
     dashboard.setDependencies({
       policy,

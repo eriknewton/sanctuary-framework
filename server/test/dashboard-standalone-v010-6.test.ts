@@ -164,6 +164,21 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
     ).toBe(true);
   });
 
+  it("C1 Finding 4: status bar carries a clickable Fleet Switcher link to /fleet", () => {
+    const html = generateDashboardHTML({
+      timeoutSeconds: 60,
+      serverVersion: "0.10.6-test",
+      loopbackAutoAuth: true,
+    } as Parameters<typeof generateDashboardHTML>[0]);
+    // A real anchor to /fleet, discoverable without typing the URL.
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    expect(html).toContain("Fleet");
+    // It sits in the status bar so an operator sees it on landing.
+    const barMatch = html.match(/<div class="status-bar-right">[\s\S]*?<\/div>\s*<\/div>/);
+    expect(barMatch).toBeTruthy();
+    expect(barMatch![0]).toContain('href="/fleet"');
+  });
+
   it("initialize() does NOT redirect on loopback boot (auth gate lets init proceed)", async () => {
     // End-to-end shape: generate HTML with loopbackAutoAuth=true, then
     // execute the gate logic in a tiny evaluator that stubs the browser

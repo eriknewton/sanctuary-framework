@@ -120,6 +120,11 @@ export interface StandaloneDashboardOptions {
    */
   recoveryOut?: string;
   /**
+   * Allow plaintext HTTP on non-loopback dashboard bindings. Default comes
+   * from config.dashboard.allow_plaintext_remote, which defaults to false.
+   */
+  allowPlaintextRemote?: boolean;
+  /**
    * Optional tenant-discovery scope override for tests. Production callers
    * leave this undefined so discovery still scans the real ~/.sanctuary root.
    */
@@ -466,6 +471,8 @@ export async function startStandaloneDashboard(
     auth_token: authToken,
     tls: config.dashboard.tls,
     auto_open: config.dashboard.auto_open ?? true, // Default to auto-open in standalone mode
+    allow_plaintext_remote:
+      options.allowPlaintextRemote ?? config.dashboard.allow_plaintext_remote,
   });
   dashboard.setStandaloneMode(true);
 

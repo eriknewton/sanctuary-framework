@@ -421,6 +421,23 @@ export function generateDashboardHTML(options: {
       font-weight: 500;
     }
 
+    .fleet-link {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--blue, #58a6ff);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+
+    .fleet-link:hover {
+      border-color: var(--blue, #58a6ff);
+    }
+
     .status-dot {
       width: 8px;
       height: 8px;
@@ -1448,6 +1465,7 @@ export function generateDashboardHTML(options: {
     </div>
 
     <div class="status-bar-right">
+      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
       <div class="status-item">
         <strong id="protections-count">—</strong>
         <span>Protections</span>
@@ -3152,6 +3170,304 @@ export function generateDashboardHTML(options: {
 
     // Start
     initialize();
+  </script>
+</body>
+</html>`;
+}
+
+// ── Fleet Switcher HTML (C1) ────────────────────────────────────────
+
+export function generateFleetSwitcherHTML(options: {
+  serverVersion: string;
+  protocol: string;
+  currentHost: string;
+  currentPort: number;
+}): string {
+  const { serverVersion, protocol, currentHost, currentPort } = options;
+  const currentEndpoint = `${protocol}://${currentHost}:${currentPort}`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sanctuary Fleet Switcher</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --green: #3fb950;
+      --amber: #d29922;
+      --red: #f85149;
+      --blue: #58a6ff;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 20px; font-weight: 600; }
+    .header .version { color: var(--text-secondary); font-size: 13px; }
+    .back-link {
+      color: var(--blue);
+      text-decoration: none;
+      font-size: 14px;
+      margin-left: auto;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    .add-form {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 8px;
+      align-items: end;
+    }
+    .add-form .field { flex: 1; }
+    .add-form label {
+      display: block;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+    .add-form input {
+      width: 100%;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-size: 14px;
+    }
+    .add-form input:focus { outline: none; border-color: var(--blue); }
+    .add-form button {
+      padding: 8px 16px;
+      background: var(--blue);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .add-form button:hover { opacity: 0.9; }
+
+    .machine-list { display: flex; flex-direction: column; gap: 8px; }
+    .machine-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .machine-card.current { border-color: var(--green); }
+    .machine-card .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--text-secondary);
+      flex-shrink: 0;
+    }
+    .machine-card .status-dot.online { background: var(--green); }
+    .machine-card .status-dot.offline { background: var(--red); }
+    .machine-card .status-dot.checking { background: var(--amber); }
+    .machine-card .info { flex: 1; }
+    .machine-card .name { font-weight: 600; font-size: 15px; }
+    .machine-card .url {
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-family: monospace;
+    }
+    .machine-card .current-badge {
+      font-size: 11px;
+      background: var(--green);
+      color: #000;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-weight: 600;
+    }
+    .machine-card .actions { display: flex; gap: 8px; }
+    .machine-card .btn-open {
+      padding: 6px 14px;
+      background: var(--blue);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .machine-card .btn-open:hover { opacity: 0.9; }
+    .machine-card .btn-remove {
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--red);
+      border: 1px solid var(--red);
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .machine-card .btn-remove:hover { background: rgba(248,81,73,0.1); }
+    .empty-state {
+      text-align: center;
+      color: var(--text-secondary);
+      padding: 40px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Fleet Switcher</h1>
+    <span class="version">v${serverVersion}</span>
+    <a href="/" class="back-link">Back to Dashboard</a>
+  </div>
+
+  <div class="add-form">
+    <div class="field">
+      <label for="machine-name">Name</label>
+      <input id="machine-name" type="text" placeholder="e.g. Mini1, Cloud-GPU, Dev-Box" />
+    </div>
+    <div class="field" style="flex:2">
+      <label for="machine-url">Dashboard URL</label>
+      <input id="machine-url" type="text" placeholder="e.g. https://100.64.0.5:3501" />
+    </div>
+    <button onclick="addMachine()">Add Machine</button>
+  </div>
+
+  <div id="machine-list" class="machine-list"></div>
+
+  <script>
+    const STORAGE_KEY = 'sanctuary_fleet_machines';
+    const CURRENT_ENDPOINT = ${JSON.stringify(currentEndpoint)};
+
+    function loadMachines() {
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+      } catch { return []; }
+    }
+
+    function saveMachines(machines) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(machines));
+    }
+
+    function addMachine() {
+      const nameEl = document.getElementById('machine-name');
+      const urlEl = document.getElementById('machine-url');
+      const name = nameEl.value.trim();
+      let url = urlEl.value.trim();
+      if (!name || !url) return;
+
+      // Normalize: strip trailing slash
+      url = url.replace(/\\/+$/, '');
+
+      const machines = loadMachines();
+      // Prevent duplicates by URL
+      if (machines.some(m => m.url === url)) {
+        alert('A machine with this URL already exists.');
+        return;
+      }
+      machines.push({ name, url, added: new Date().toISOString() });
+      saveMachines(machines);
+      nameEl.value = '';
+      urlEl.value = '';
+      render();
+    }
+
+    function removeMachine(url) {
+      const machines = loadMachines().filter(m => m.url !== url);
+      saveMachines(machines);
+      render();
+    }
+
+    async function checkHealth(url) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        const resp = await fetch(url + '/api/health', { signal: controller.signal });
+        clearTimeout(timeout);
+        const data = await resp.json();
+        return data.ok === true ? 'online' : 'offline';
+      } catch {
+        return 'offline';
+      }
+    }
+
+    function render() {
+      const machines = loadMachines();
+      const list = document.getElementById('machine-list');
+
+      if (machines.length === 0) {
+        list.innerHTML = '<div class="empty-state">No machines saved. Add a machine above to get started.</div>';
+        return;
+      }
+
+      list.innerHTML = machines.map(m => {
+        const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
+        return \`
+          <div class="machine-card \${isCurrent ? 'current' : ''}" data-url="\${m.url}">
+            <div class="status-dot checking" id="dot-\${btoa(m.url).replace(/=/g,'')}"></div>
+            <div class="info">
+              <div class="name">\${escapeHtml(m.name)}\${isCurrent ? ' <span class="current-badge">CURRENT</span>' : ''}</div>
+              <div class="url">\${escapeHtml(m.url)}</div>
+            </div>
+            <div class="actions">
+              <a href="\${m.url}" class="btn-open">Open Console</a>
+              <button class="btn-remove" onclick="removeMachine('\${escapeHtml(m.url)}')">Remove</button>
+            </div>
+          </div>
+        \`;
+      }).join('');
+
+      // Check health for each machine
+      machines.forEach(async (m) => {
+        const dotId = 'dot-' + btoa(m.url).replace(/=/g,'');
+        const dot = document.getElementById(dotId);
+        if (!dot) return;
+        const status = await checkHealth(m.url);
+        dot.className = 'status-dot ' + status;
+      });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Auto-add current machine if not in list
+    (function autoAddCurrent() {
+      const machines = loadMachines();
+      const origin = location.origin;
+      if (!machines.some(m => m.url === origin)) {
+        const hostname = location.hostname;
+        const name = hostname === '127.0.0.1' || hostname === 'localhost'
+          ? 'This machine (local)'
+          : hostname;
+        machines.push({ name, url: origin, added: new Date().toISOString() });
+        saveMachines(machines);
+      }
+    })();
+
+    render();
   </script>
 </body>
 </html>`;

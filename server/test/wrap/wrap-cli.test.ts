@@ -647,6 +647,43 @@ describe("runWrap — v0.10.0 WP1 multi-tenancy env vars", () => {
     expect(seen.port).toBe(3507);
   });
 
+  it("persists allow plaintext remote from the wrap flag into harness env", async () => {
+    let capturedEnv: Record<string, string> | undefined;
+    const rewriteConfig = vi.fn(
+      async (_agentConfig, command: string, args: string[], env?: Record<string, string>) => {
+        capturedEnv = env;
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mcp: {
+              servers: {
+                sanctuary: { command, args, env },
+              },
+            },
+          }),
+          "utf-8"
+        );
+        return configPath;
+      }
+    );
+
+    await runWrap(
+      { wrap: configPath, noOpen: true, allowPlaintextRemote: true },
+      {
+        startDashboard: capturingDashboardStarter({}),
+        openBrowser: async () => {},
+        resolvePassphrase: async () => ({
+          value: "gen",
+          location: "macOS Keychain",
+          source: "generated",
+        }),
+        rewriteConfig,
+      }
+    );
+
+    expect(capturedEnv?.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
+  });
+
   it("prefers an explicit --port over SANCTUARY_DASHBOARD_PORT", async () => {
     process.env.SANCTUARY_DASHBOARD_PORT = "3507";
 

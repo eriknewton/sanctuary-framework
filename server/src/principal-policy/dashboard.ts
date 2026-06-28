@@ -47,7 +47,7 @@ import { gatherReputationEvidence } from "../shr/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { RecognitionReputationEvidence } from "./posture.js";
-import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
+import { generateDashboardHTML, generateLoginHTML, generateFleetSwitcherHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
@@ -206,6 +206,13 @@ export interface DashboardConfig {
   };
   /** Auto-open the dashboard in the default browser on startup. Default: true for localhost. */
   auto_open?: boolean;
+  /**
+   * C1: Allow plaintext HTTP on non-loopback interfaces. Default: false.
+   * When false (default), non-loopback binding requires TLS. Set to true
+   * ONLY for tailnet or other encrypted-transport environments where the
+   * network layer already provides encryption.
+   */
+  allow_plaintext_remote?: boolean;
 }
 
 interface PendingRequest {
@@ -328,6 +335,7 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/dashboard" ||
     path === "/v1.0" ||
     path === "/fortress" ||
+    path === "/fleet" ||
     path === "/events" ||
     path === POSTURE_HOME_PATH ||
     // The posture SSE live-refresh stream is a single long-lived connection per
@@ -1423,14 +1431,59 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * to the existing v1.1 / legacy dispatch ladder.
    */
   private dispatchRootPosture(
+    req: IncomingMessage,
     res: ServerResponse,
     url: URL,
     method: string,
   ): boolean {
+    // The SPA view routes whose static shell fetches its data client-side from
+    // checkAuth-gated JSON routes: the posture shell (`/`, `/posture`) and the
+    // v1.1 dashboard SPA aliases (`/dashboard`, `/v1.1`).
+    const isPostureShellPath =
+      url.pathname === "/" || url.pathname === POSTURE_HOME_PATH;
+    const isV11SpaAlias =
+      url.pathname === "/dashboard" ||
+      url.pathname === "/v1.1" ||
+      url.pathname === "/v1.1/";
+    if (method !== "GET" || (!isPostureShellPath && !isV11SpaAlias)) {
+      return false;
+    }
+
+    // C1 remote login affordance: these shells are STATIC pages that fetch
+    // `/api/posture/*` (and the v1.1 hub API) client-side for every byte of
+    // data, and those JSON routes stay behind checkAuth.
+    //
+    // On a LOOPBACK bind the static shell is served tokenless BY DESIGN (the
+    // `/` == `/posture` one-surface contract): a local operator either has
+    // loopback auto-auth after a terminal unlock, or pastes a token into the
+    // shell's own client-side flow, so `/` must keep serving the shell. That
+    // local contract is left exactly as-is.
+    //
+    // On a REMOTE (non-loopback) bind there is NO loopback auto-auth, so an
+    // unauthenticated browser's every data fetch 401s and the shell renders
+    // empty with NO way to enter a token (the drill defect). So ONLY for a
+    // remote binding, when an auth token is required AND this caller is not yet
+    // authenticated, serve the login page (the SAME page `/v1.0` already serves
+    // for its unauthenticated branch) so the operator gets a token box. This is
+    // purely a presentation affordance: it adds NO new auth path and weakens
+    // nothing - the data routes still require a valid token; this only OFFERS
+    // the login box instead of a blank shell. An already-authenticated remote
+    // caller (`isAuthenticated` true: bearer/session/cookie) falls through to
+    // the shell.
     if (
-      method !== "GET" ||
-      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+      this.isRemoteBinding() &&
+      this.authToken &&
+      !this.isAuthenticated(req, url)
     ) {
+      this.serveLoginPage(res);
+      return true;
+    }
+
+    // Authenticated (or no-auth) case: only the posture shell is owned here.
+    // The v1.1 SPA aliases keep their existing v1.1 HTML handler - fall through
+    // to dispatchV11 unchanged so authenticated `/dashboard` + `/v1.1` behavior
+    // does not change.
+    if (!isPostureShellPath) {
       return false;
     }
     res.writeHead(200, {
@@ -2607,6 +2660,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * C1: is this dashboard binding to a non-loopback interface?
+   */
+  private isRemoteBinding(): boolean {
+    const h = this.config.host;
+    return h !== "127.0.0.1" && h !== "::1" && h !== "localhost";
+  }
+
+  /**
    * Slice 2 (single-owner): set true when `start()` was asked to treat
    * EADDRINUSE as a benign "another owner holds the port" outcome and the
    * bind failed with EADDRINUSE. The supervised boot path checks this and
@@ -2632,6 +2693,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   prints the loud operator banner and rejects.
    */
   async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
+    // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
+    // over the wire is a credential-theft vector. The operator can opt
+    // out via allow_plaintext_remote for tailnet/VPN environments where
+    // the network layer already encrypts.
+    if (this.isRemoteBinding() && !this.useTLS && !this.config.allow_plaintext_remote) {
+      throw new Error(
+        `Sanctuary Dashboard: refusing to start on non-loopback interface ` +
+        `${this.config.host} without TLS.\n\n` +
+        `  Approve/deny decisions over plaintext HTTP expose the auth token\n` +
+        `  and operator decisions to network observers.\n\n` +
+        `  Options:\n` +
+        `    1. Configure TLS: set dashboard.tls.cert_path + dashboard.tls.key_path\n` +
+        `       (for Tailscale: tailscale cert <hostname>)\n` +
+        `    2. Set dashboard.allow_plaintext_remote: true if the network\n` +
+        `       layer already encrypts (e.g. Tailscale, WireGuard)\n` +
+        `    3. Bind to 127.0.0.1 (localhost only)\n`
+      );
+    }
+
+    // C1: enforce auth token for non-loopback bindings. Without a token,
+    // anyone who can reach the interface can approve/deny agent operations.
+    if (this.isRemoteBinding() && !this.authToken) {
+      this.authToken = randomBytes(32).toString("hex");
+      process.stderr.write(
+        `\n  C1: Non-loopback binding requires authentication.\n` +
+        `  Auto-generated auth token (use this to connect from remote machines).\n\n`
+      );
+    }
+
     const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
 
     let server;
@@ -3131,7 +3221,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers - restrict to same-origin; the dashboard is served by this server
+    // CORS headers - restrict to same-origin; the dashboard is served by this server.
+    // CORS: reflect ONLY the exact same-origin (the dashboard serves its own
+    // UI). Cross-origin reflection for the remote fleet-switcher health probe
+    // is scoped to the UNAUTHENTICATED /api/health handler ONLY, which sets its
+    // own Access-Control-Allow-Origin (and never Access-Control-Allow-Credentials).
+    // SECURITY: no authenticated/protected route must ever carry cross-origin
+    // reflection. The earlier remote-bind same-port reflection lived in this
+    // prelude and therefore leaked onto every downstream route (protected reads,
+    // mutating POSTs, approval decisions) on a remote bind; it has been removed.
+    // Without Access-Control-Allow-Credentials this was not a credentialed-read
+    // takeover, but route-wide reflection is exactly the latent hole that turns
+    // into one the day a credentials header is added. Health-only is the contract.
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
@@ -3196,7 +3297,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
     // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
     // the posture JSON API included) fall through untouched.
-    if (this.dispatchRootPosture(res, url, method)) return;
+    if (this.dispatchRootPosture(req, res, url, method)) return;
 
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
@@ -3476,10 +3577,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `{ ok, mode }` shape is the only contract the CLI health probe + external
     // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
-      res.writeHead(200, {
+      // C1 cross-host fleet probe: the `/fleet` switcher is served by ONE host
+      // and health-probes the others with `fetch(<remote>/api/health)`. The
+      // browser's same-origin policy blocks the response body unless the remote
+      // sends `Access-Control-Allow-Origin`, so without this header a reachable
+      // remote shows offline (red dot) in the switcher.
+      //
+      // SCOPE (security): this permissive ACAO is added ONLY to this endpoint,
+      // which is the UNAUTHENTICATED, O(1) liveness probe - it returns only
+      // `{ ok, mode, instance, since }` (no secrets, no posture, no auth state),
+      // so a cross-origin reader learns nothing it could not learn by connecting
+      // directly. We reflect the request Origin (falling back to `*`) but NEVER
+      // set `Access-Control-Allow-Credentials` here, so no cookie/bearer is ever
+      // sent or honored cross-origin (the reflected-origin + credentials combo
+      // is the CORS account-takeover pattern, and it is deliberately avoided).
+      // No authenticated/protected route carries cross-origin reflection; they
+      // keep the same-origin/same-port contract set in handleRequest().
+      const healthHeaders: Record<string, string> = {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
-      });
+        "Access-Control-Allow-Origin": req.headers.origin ?? "*",
+      };
+      res.writeHead(200, healthHeaders);
       // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
       // `since` restart-detection signal. NO `ready`/`supervisor` here -
       // those would be a co-resident-agent oracle on this unauthenticated
@@ -3659,7 +3778,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     try {
-      if (method === "GET" && url.pathname === "/fortress") {
+      if (method === "GET" && url.pathname === "/fleet") {
+        this.serveFleetSwitcher(res);
+      } else if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
         // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
@@ -3762,9 +3883,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     const sessionId = this.createSession();
     const ttlSeconds = Math.floor(this.sessionTTLMs / 1000);
+    // SameSite=Lax (not Strict): the Fleet Switcher is served by ONE host but
+    // its "Open Console" links navigate the SAME TAB to a DIFFERENT host's
+    // dashboard root. Under SameSite=Strict the browser withholds the session
+    // cookie on that cross-site top-level navigation, so a remote console the
+    // operator already authenticated re-prompts for the token on every visit
+    // even while the session is still valid (the C1 re-auth defect). Lax sends
+    // the cookie on top-level GET navigations (the Open Console click, a typed
+    // URL, a reload) so a still-valid session is reused without re-prompting.
+    //
+    // This does NOT weaken auth: Lax still withholds the cookie on cross-site
+    // SUBREQUESTS and cross-site POSTs, so the approval-decision routes
+    // (POST /api/approve/:id, /api/deny/:id) remain CSRF-safe — a cross-origin
+    // page cannot drive a state-changing decision off this cookie. A request
+    // with no valid token AND no valid session still gets the login page / 401
+    // (isAuthenticated / checkAuth are unchanged); only a genuinely-valid,
+    // unexpired session is reused. The TTL is unchanged — we reuse the existing
+    // session, we do not lengthen it.
     res.writeHead(200, {
       "Content-Type": "application/json",
-      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`,
+      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Lax; Max-Age=${ttlSeconds}`,
     });
     res.end(JSON.stringify({
       session_id: sessionId,
@@ -4511,6 +4649,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
+  }
+
+  // ── Fleet Switcher (C1) ─────────────────────────────────────────────
+
+  /**
+   * C1: Serve the fleet switcher page. Client-side localStorage manages
+   * the saved list of machine endpoints; no server-side state.
+   */
+  private serveFleetSwitcher(res: ServerResponse): void {
+    const protocol = this.useTLS ? "https" : "http";
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(generateFleetSwitcherHTML({
+      serverVersion: PKG_VERSION,
+      protocol,
+      currentHost: this.config.host,
+      currentPort: this.config.port,
+    }));
   }
 
   // ── SSE Broadcasting ────────────────────────────────────────────────

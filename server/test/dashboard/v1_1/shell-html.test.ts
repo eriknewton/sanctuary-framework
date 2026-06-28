@@ -98,6 +98,16 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(topbarMatch![0]).toContain('data-pill="deployment"');
   });
 
+  it("renders a clickable Fleet Switcher link to /fleet in the topbar (C1 Finding 4)", () => {
+    const html = renderDashboardV11Html({});
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    expect(html).toContain("Fleet Switcher");
+    // The affordance lives in the topbar so an operator lands on it.
+    const topbarMatch = html.match(/<header class="topbar">[\s\S]*?<\/header>/);
+    expect(topbarMatch).toBeTruthy();
+    expect(topbarMatch![0]).toContain('href="/fleet"');
+  });
+
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {
     const html = renderDashboardV11Html({});
     // Read the package.json version directly to compare against the default.

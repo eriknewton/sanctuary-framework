@@ -1103,3 +1103,19 @@ describe("posture home - Fleet panel (Slice 1) honesty", () => {
     expect(fleetEl.innerHTML).not.toContain("policy in sync");
   });
 });
+
+describe("posture home — Fleet Switcher nav affordance (C1 Finding 4)", () => {
+  it("renders a clickable link to /fleet in the page header", () => {
+    const html = renderPostureHomeHTML();
+    // A real anchor whose href is /fleet (discoverable without typing the URL).
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    // The affordance is labelled so an operator recognises it.
+    expect(html).toContain("Fleet Switcher");
+    // It lives in the header, not buried below the fold.
+    const headerStart = html.indexOf("<header>");
+    const headerEnd = html.indexOf("</header>");
+    expect(headerStart).toBeGreaterThan(-1);
+    expect(headerEnd).toBeGreaterThan(headerStart);
+    expect(html.slice(headerStart, headerEnd)).toContain('href="/fleet"');
+  });
+});

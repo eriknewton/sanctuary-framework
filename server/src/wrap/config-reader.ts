@@ -1171,7 +1171,7 @@ export async function rewriteConfigForWrap(
   }
 
   // If no explicit env was passed, inherit env vars from the existing sanctuary entry,
-  // then fall back to process.env for the three critical vars.
+  // then fall back to process.env for the critical vars.
   let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv;
   if (!resolvedEnv) {
     const existingSanctuary = existingServers.sanctuary as Record<string, unknown> | undefined;
@@ -1180,12 +1180,13 @@ export async function rewriteConfigForWrap(
       if (extracted) resolvedEnv = extracted;
     }
   }
-  // Ensure the three critical env vars survive the rewrite even when
+  // Ensure the critical env vars survive the rewrite even when
   // neither the caller nor the existing config provided them.
   const CRITICAL_VARS = [
     "SANCTUARY_PASSPHRASE",
     "SANCTUARY_DASHBOARD_AUTH_TOKEN",
     "SANCTUARY_DASHBOARD_ENABLED",
+    "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
   ] as const;
   for (const key of CRITICAL_VARS) {
     if (process.env[key] && (!resolvedEnv || !resolvedEnv[key])) {

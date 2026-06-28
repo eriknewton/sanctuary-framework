@@ -576,7 +576,11 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(401);
     });
 
-    it("sets the dashboard login cookie SameSite=Strict", async () => {
+    it("sets the dashboard login cookie SameSite=Lax", async () => {
+      // C1 re-auth fix: Lax (not Strict) so a cross-host Fleet "Open Console"
+      // top-level navigation carries a still-valid session and does NOT
+      // re-prompt. Lax still withholds the cookie on cross-site POSTs, so the
+      // approval-decision routes stay CSRF-safe.
       const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
         method: "POST",
         headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
@@ -584,7 +588,8 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const cookie = res.headers.get("set-cookie") ?? "";
       expect(cookie).toContain("sanctuary_session=");
-      expect(cookie).toContain("SameSite=Strict");
+      expect(cookie).toContain("SameSite=Lax");
+      expect(cookie).not.toContain("SameSite=Strict");
     });
 
     it("rejects long-lived token in query parameter (SEC-012)", async () => {
@@ -640,7 +645,7 @@ describe("Principal Dashboard", () => {
         headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
       });
       expect(exchangeRes.status).toBe(200);
-      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Strict");
+      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Lax");
       const { session_id } = await exchangeRes.json();
       const session = encodeURIComponent(session_id);
 
@@ -784,6 +789,126 @@ describe("Principal Dashboard", () => {
       expect(text).toContain("event: init");
 
       await reader.cancel();
+    });
+  });
+
+  // ── C1 Finding 5: remote console reuses a valid session, no re-prompt ──
+  //
+  // The Open Console fix navigates the SAME TAB to a remote host's posture
+  // root. On a REMOTE bind (non-loopback host) `dispatchRootPosture` serves the
+  // login page when the caller is unauthenticated, so an operator gets a token
+  // box instead of a blank shell. The defect this group pins: a return visit
+  // bearing a STILL-VALID `sanctuary_session` cookie must NOT re-prompt — the
+  // session must be reused. The HARD constraint: a caller with NO token AND no
+  // valid session must STILL get the login page. Auth is never weakened.
+  describe("Remote console reuses a valid session cookie (Finding 5)", () => {
+    const AUTH_TOKEN = "remote-operator-token-9876";
+    let remoteDashboard: DashboardApprovalChannel;
+    let remotePort: number;
+
+    beforeEach(async () => {
+      await bindWithRetry(async () => {
+        remotePort = randomTestPort();
+        // host "0.0.0.0" -> isRemoteBinding() true (non-loopback), so the
+        // dispatchRootPosture login-gate path is exercised. 0.0.0.0 still
+        // listens on loopback, so the test fetches via 127.0.0.1. Plaintext
+        // is allowed for the test (the network-layer encryption carve-out).
+        remoteDashboard = new DashboardApprovalChannel({
+          port: remotePort,
+          host: "0.0.0.0",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+          allow_plaintext_remote: true,
+        });
+        await remoteDashboard.start();
+      });
+    });
+
+    afterEach(async () => {
+      await remoteDashboard.stop();
+    });
+
+    it("serves the LOGIN page at / when no token and no session are present", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`);
+      expect(res.status).toBe(200);
+      // Login page markers (token box + Open Dashboard button), NOT the shell.
+      expect(res.body).toContain('id="auth-token"');
+      expect(res.body).toContain("Open Dashboard");
+      expect(res.body).not.toContain("Sovereignty Posture");
+    });
+
+    it("serves the DASHBOARD shell at / when a VALID session cookie is presented (no re-prompt)", async () => {
+      // Mint a real session the same way the login flow does.
+      const exchange = await fetch(`http://127.0.0.1:${remotePort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchange.status).toBe(200);
+      const setCookie = exchange.headers.get("set-cookie") ?? "";
+      expect(setCookie).toContain("sanctuary_session=");
+      // Lax (the Finding 5 fix) so the cross-host top-level navigation carries it.
+      expect(setCookie).toContain("SameSite=Lax");
+      const sessionId = (await exchange.json()).session_id as string;
+
+      // Return visit on a fresh load: the browser sends only the cookie.
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`, {
+        headers: { Cookie: `sanctuary_session=${sessionId}` },
+      });
+      expect(res.status).toBe(200);
+      // The posture shell, NOT the login page: no re-prompt.
+      expect(res.body).toContain("Sovereignty Posture");
+      expect(res.body).not.toContain('id="auth-token"');
+    });
+
+    it("still serves the LOGIN page at / for an INVALID/expired session cookie (auth not weakened)", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`, {
+        headers: { Cookie: "sanctuary_session=not-a-real-session-id" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('id="auth-token"');
+      expect(res.body).not.toContain("Sovereignty Posture");
+    });
+
+    it("still 401s the data routes without a token or valid session (auth not weakened)", async () => {
+      const res = await fetch(`http://127.0.0.1:${remotePort}/api/status`);
+      expect(res.status).toBe(401);
+    });
+  });
+
+  // ── C1 Finding 5: loopback root behavior is unchanged ──────────────
+  describe("Loopback posture root is unchanged by the Finding 5 fix", () => {
+    const AUTH_TOKEN = "loopback-operator-token-5555";
+    let loopbackDashboard: DashboardApprovalChannel;
+    let loopbackPort: number;
+
+    beforeEach(async () => {
+      await bindWithRetry(async () => {
+        loopbackPort = randomTestPort();
+        loopbackDashboard = new DashboardApprovalChannel({
+          port: loopbackPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+        });
+        // Loopback auto-auth ON (the local-operator-after-terminal-unlock case).
+        loopbackDashboard.setAutoAuthLocalhost(true);
+        await loopbackDashboard.start();
+      });
+    });
+
+    afterEach(async () => {
+      await loopbackDashboard.stop();
+    });
+
+    it("serves the posture shell tokenless on loopback (no login gate, no re-prompt)", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${loopbackPort}/`);
+      expect(res.status).toBe(200);
+      // The one-surface contract: loopback root is the shell, never the login
+      // page. The Finding 5 cookie change must not regress this.
+      expect(res.body).toContain("Sovereignty Posture");
+      expect(res.body).not.toContain('id="auth-token"');
     });
   });
 

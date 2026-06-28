@@ -534,6 +534,8 @@ Commands:
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--dashboard") {
       process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+    } else if (args[i] === "--allow-plaintext-remote") {
+      process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
     } else if (args[i] === "--passphrase" && args[i + 1]) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -600,6 +602,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let tenant: string | undefined;
   let noConfirm = false;
   let recoveryOut: string | undefined;
+  let allowPlaintextRemote = false;
   let allowPark = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -619,6 +622,8 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       tenant = args[++i];
     } else if (args[i] === "--no-confirm") {
       noConfirm = true;
+    } else if (args[i] === "--allow-plaintext-remote") {
+      allowPlaintextRemote = true;
     } else if (args[i] === "--recovery-out" && args[i + 1]) {
       recoveryOut = args[++i];
     } else if (args[i] === "--allow-park") {
@@ -673,6 +678,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     host,
     ...(tenant !== undefined ? { tenant } : {}),
     ...(recoveryOut !== undefined ? { recoveryOut } : {}),
+    ...(allowPlaintextRemote ? { allowPlaintextRemote } : {}),
     noConfirm,
     allowPark,
   });
@@ -855,6 +861,8 @@ Environment variables:
   SANCTUARY_DASHBOARD_ENABLED       "true" to enable dashboard
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+  SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE
+                                      "true" allows plaintext remote dashboard
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
@@ -896,6 +904,9 @@ Options:
                        On a first-run mint, write the plaintext recovery key to
                        this exact path OUTSIDE the fortress directory (durable
                        off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
+  --allow-plaintext-remote
+                       Allow plaintext HTTP on non-loopback dashboard bindings
+                       when a separate network layer already encrypts transport.
   --allow-park         Park (do not exit) on a locked-no-credential start
                        instead of failing loudly: bind the listener, report
                        readiness "locked", serve the in-process unlock door,
@@ -912,6 +923,8 @@ Environment variables:
   SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"
+  SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE
+                                      "true" allows plaintext remote dashboard
   SANCTUARY_MULTI_DASHBOARD         "true" to auto-enable multi-agent mode
   SANCTUARY_MULTI_DASHBOARD_PORT    Multi-agent dashboard port (default: 3500)
   SANCTUARY_AGENTS_EXTRA_PATHS      Colon-separated extra tenant storage paths
