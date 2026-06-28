@@ -129,6 +129,35 @@ export interface StandaloneDashboardOptions {
    * leave this undefined so discovery still scans the real ~/.sanctuary root.
    */
   discoveryOptions?: DiscoveryOptions;
+  /**
+   * Slice 2 (park-not-exit): opt-in. When true AND a wrapped fortress exists
+   * but NO credential was supplied by any source (option / env / keychain /
+   * fallback-file), the dashboard boots PARKED instead of throwing: the HTTP
+   * listener binds, `/api/health` answers, `/api/readiness` reports
+   * `ready:"locked"`, the unlock door (`POST /api/unlock`) is live, and NO
+   * protected state is constructed or served. The operator unlocks once
+   * in-process (no restart) and the read surface lights up.
+   *
+   * Default OFF. Set ONLY by the supervised LaunchAgent path so an interactive
+   * `sanctuary dashboard` keeps failing loudly with the remediation hint and a
+   * human is never silently dropped into a parked-but-looks-fine state.
+   *
+   * Also makes EADDRINUSE a benign single-owner stand-down (clean exit 0)
+   * rather than a fatal throw, so KeepAlive does not churn-restart when the
+   * LaunchAgent already owns the port.
+   */
+  allowPark?: boolean;
+  /**
+   * TEST-ONLY. Injected fault that fires inside `wireUnlockedDeps` AFTER every
+   * master-key-derived dependency has been constructed/loaded/saved but BEFORE
+   * any of them is attached to the dashboard channel. Throwing from this hook
+   * simulates a post-`establishMaster` wiring failure (e.g. a malformed
+   * baseline) so a test can assert the atomic-wiring invariant: a failed unlock
+   * leaves the dashboard CLEANLY PARKED (no deps attached, `/api/readiness`
+   * `locked`, `/api/audit-log` empty, loopback auto-auth off). Production
+   * callers never set this; it has no effect when undefined.
+   */
+  __testFaultAfterLoads?: () => void | Promise<void>;
 }
 
 /**
@@ -311,7 +340,14 @@ export async function startStandaloneDashboard(
     );
   }
 
-  let custody: EstablishMasterResult;
+  // Slice 2 (park-not-exit): does a wrapped fortress already exist on disk?
+  // Park is allowed ONLY when there is a real envelope to unlock LATER (not on
+  // a first run, which keeps today's warn/refuse behavior). Checked before the
+  // establishMaster attempt so we can distinguish "credential missing for an
+  // existing fortress" (park-eligible) from "first run, nothing here".
+  const envelopeExists = (await readCustodyEnvelope(storage)) !== null;
+
+  let custody: EstablishMasterResult | null;
   try {
     custody = await establishMaster({
       storage,
@@ -334,6 +370,10 @@ export async function startStandaloneDashboard(
     // diagnostics in the error: the per-tenant Keychain service name and the
     // canonical schema doc, never a bare SANCTUARY_PASSPHRASE=<your-passphrase>
     // hint (misleading on multi-tenant hosts).
+    //
+    // NOTE: a supplied-but-wrong credential is NEVER park-eligible. Park is
+    // strictly "a wrapped fortress is here, I do not hold the key yet"; a wrong
+    // key is an operator error that must surface loudly, parked or not.
     if (
       (err instanceof CustodyUnlockError ||
         err instanceof CustodyMigrationRefusedError) &&
@@ -350,41 +390,240 @@ export async function startStandaloneDashboard(
         { cause: err }
       );
     }
-    // Re-shape credential-missing failures with an ACTIONABLE diagnostic
-    // (element 2): which factors are enrolled, whether the OS keyring is locked
-    // vs the item missing (element 3), the GUI-unlock step, and the literal
-    // SANCTUARY_RECOVERY_KEY recovery command - plus the dashboard's tenant
-    // discovery hints (v0.10.4 behavior). Never prints an on-disk key location.
-    if (err instanceof CustodyUnlockError && !passphrase && !envRecoveryKey) {
-      const factors = await readEnrolledFactors(storage);
-      let keychainReachability: "found" | "not-found" | "unreachable" | undefined;
-      if (factors.hasKeychainFactor) {
-        try {
-          const probe = await probeKeychainCustodyKey(config.storage_path);
-          keychainReachability = probe.status;
-        } catch {
-          keychainReachability = undefined;
+    // Credential-missing for an EXISTING fortress. Slice 2: if park is enabled
+    // (supervised LaunchAgent path) boot PARKED instead of throwing (the
+    // KeepAlive crash-loop fix). Otherwise keep the ACTIONABLE diagnostic:
+    // enrolled factors, OS keyring reachability, GUI-unlock steps, recovery
+    // command, and tenant discovery hints. Never prints an on-disk key location.
+    if (
+      err instanceof CustodyUnlockError &&
+      !passphrase &&
+      !envRecoveryKey
+    ) {
+      if (options.allowPark && envelopeExists) {
+        // custody stays null -> fall through to the park boot below.
+        custody = null;
+      } else {
+        const factors = await readEnrolledFactors(storage);
+        let keychainReachability: "found" | "not-found" | "unreachable" | undefined;
+        if (factors.hasKeychainFactor) {
+          try {
+            const probe = await probeKeychainCustodyKey(config.storage_path);
+            keychainReachability = probe.status;
+          } catch {
+            keychainReachability = undefined;
+          }
         }
+        const actionable = buildActionableUnlockMessage({
+          ...factors,
+          ...(keychainReachability !== undefined ? { keychainReachability } : {}),
+          storagePathHint: config.storage_path,
+          keychainServiceHint: keychainServiceFor(config.storage_path, homedir()),
+        });
+        const otherTenants = await discoverableSubTenants(
+          config.storage_path,
+          options.discoveryOptions,
+        );
+        throw new Error(
+          `Sanctuary Dashboard:\n${actionable}\n\n` +
+          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+          `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
+          { cause: err }
+        );
       }
-      const actionable = buildActionableUnlockMessage({
-        ...factors,
-        ...(keychainReachability !== undefined ? { keychainReachability } : {}),
-        storagePathHint: config.storage_path,
-        keychainServiceHint: keychainServiceFor(config.storage_path, homedir()),
-      });
-      const otherTenants = await discoverableSubTenants(
-        config.storage_path,
-        options.discoveryOptions,
-      );
-      throw new Error(
-        `Sanctuary Dashboard:\n${actionable}\n\n` +
-        (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
-        `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
-        { cause: err }
-      );
+    } else {
+      throw err;
+    }
+  }
+
+  // 6. Load principal policy (NO master key needed, safe in park too). This
+  // is the one non-encrypted dep park constructs so the approval-channel
+  // config (timeouts) is valid and the unlock/login UI can serve (Q1).
+  let policy: PrincipalPolicy;
+  try {
+    policy = await loadPrincipalPolicy(config.storage_path);
+  } catch (err) {
+    if (err instanceof MalformedPrincipalPolicyError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\nSanctuary cannot start.\n${err.message}\n`);
+      process.exit(1);
     }
     throw err;
   }
+
+  // 7. Resolve dashboard config (no master key needed).
+  const dashboardPort = options.port ?? config.dashboard.port;
+  const dashboardHost = options.host ?? config.dashboard.host;
+
+  let authToken = config.dashboard.auth_token;
+  if (authToken === "auto") {
+    const { randomBytes } = await import("node:crypto");
+    authToken = randomBytes(32).toString("hex");
+  }
+
+  // 8. Create the dashboard channel. Constructed BEFORE the master-key-derived
+  // deps so the SAME instance can be used by both the unlocked boot path and
+  // the parked boot path (which attaches the unlocked deps later, in-process).
+  const dashboard = new DashboardApprovalChannel({
+    port: dashboardPort,
+    host: dashboardHost,
+    timeout_seconds: policy.approval_channel.timeout_seconds,
+    auth_token: authToken,
+    tls: config.dashboard.tls,
+    auto_open: config.dashboard.auto_open ?? true, // Default to auto-open in standalone mode
+    allow_plaintext_remote:
+      options.allowPlaintextRemote ?? config.dashboard.allow_plaintext_remote,
+  });
+  dashboard.setStandaloneMode(true);
+
+  // ── Slice 2: PARK BOOT (no master key) ──────────────────────────────────
+  // A wrapped fortress is present but we hold no credential. Bind the listener,
+  // serve the honest locked surface, register the in-process unlock door, and
+  // STAY UP (no exit -> no KeepAlive crash-loop). NO master-key-derived deps
+  // are constructed: no audit log, no identity manager, no baseline, no hub.
+  // `/api/readiness` reports `ready:"locked"` for free (identityManager is
+  // absent); every protected route hits its existing fail-closed empty path.
+  if (custody === null) {
+    dashboard.setParked(true);
+    // Single-shot guard: serialize concurrent unlock attempts so a successful
+    // unlock wires the deps EXACTLY once even if two authenticated requests
+    // race (loopback bypasses the rate limit). The first attempt to reach a
+    // verified master wins; later attempts that arrive while one is in flight
+    // (or after success) are rejected without re-wiring.
+    let unlockInFlightOrDone = false;
+    dashboard.setUnlockHandler(async (credential) => {
+      if (unlockInFlightOrDone) return false;
+      unlockInFlightOrDone = true;
+      // Re-run the SAME establishMaster the boot path runs, just deferred to
+      // unlock time. No new derivation, no weaker KDF, no fallback credential.
+      // A wrong credential throws (or returns a non-unlocking master that fails
+      // the envelope MAC verify) and is reported as a generic failure by the
+      // endpoint; the process stays parked.
+      let unlockCustody: EstablishMasterResult;
+      try {
+        unlockCustody = await establishMaster({
+          storage,
+          ...("passphrase" in credential
+            ? { passphrase: credential.passphrase }
+            : { recoveryKey: credential.recoveryKey }),
+          storagePathHint: config.storage_path,
+        });
+      } catch {
+        // Wrong credential / unverifiable envelope: stay parked, fail closed.
+        // Release the single-shot guard so the operator can retry with the
+        // correct credential.
+        unlockInFlightOrDone = false;
+        return false;
+      }
+      // Wire the unlocked deps onto the already-running dashboard. After this
+      // returns, `/api/readiness` flips to `serving` (identity manager set).
+      try {
+        await wireUnlockedDeps({
+          dashboard,
+          custody: unlockCustody,
+          storage,
+          config,
+          policy,
+          options,
+          dashboardHost,
+          dashboardPort,
+          // On the deferred-unlock path the operator authenticated the unlock
+          // over the wire; treat the supplied passphrase as the unlock source
+          // for the loopback auto-auth decision the same way the boot path does.
+          passphrase: "passphrase" in credential ? credential.passphrase : undefined,
+          passphraseSource: "passphrase" in credential ? "option" : null,
+        });
+      } catch {
+        // The credential WAS valid but dependency wiring failed (e.g. a
+        // malformed baseline). Stay parked, release the guard for a retry, and
+        // fail closed generically rather than serving a half-wired surface.
+        unlockInFlightOrDone = false;
+        return false;
+      }
+      dashboard.setParked(false);
+      return true;
+    });
+
+    await dashboard.start({ exitCleanOnAddrInUse: true });
+    if (dashboard.addrInUse()) {
+      // Single-owner: another instance already holds the port. Exit 0 so
+      // KeepAlive treats this as a successful run (no churn). The owning
+      // process serves the dashboard.
+      return dashboard;
+    }
+
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand.
+    console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode, PARKED)`);
+    console.error(`Storage: ${config.storage_path}`);
+    console.error(`State: LOCKED (awaiting operator unlock; no master key held).`);
+    console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+    console.error(
+      `The read surface is dark until you unlock. The process will stay up\n` +
+      `(parked) across restarts; it does NOT auto-unlock.`,
+    );
+    return dashboard;
+  }
+
+  // ── Unlocked boot path (credential present): wire the master deps now ────
+  await wireUnlockedDeps({
+    dashboard,
+    custody,
+    storage,
+    config,
+    policy,
+    options,
+    dashboardHost,
+    dashboardPort,
+    passphrase,
+    passphraseSource,
+  });
+
+  await dashboard.start({ exitCleanOnAddrInUse: !!options.allowPark });
+  if (options.allowPark && dashboard.addrInUse()) {
+    // Single-owner on the supervised unlocked path too: stand down cleanly.
+    return dashboard;
+  }
+  return dashboard;
+}
+
+/**
+ * Slice 2 (park-not-exit): build and attach all MASTER-KEY-DERIVED dependencies
+ * to an already-constructed dashboard channel. Extracted verbatim from the
+ * original `startStandaloneDashboard` post-master block so BOTH the
+ * boot-with-credential path AND the in-process unlock-later path run the
+ * IDENTICAL wiring. No custody logic lives here beyond the recovery-key
+ * disclosure / custody-audit that the boot path already performed; this is a
+ * mechanical move, not new custody behavior.
+ *
+ * After this resolves, the dashboard holds the identity manager (so
+ * `/api/readiness` reports `serving`), the audit log, baseline, hub/v1.1
+ * bindings, task service, distress inbox, and loopback auto-auth: exactly the
+ * unlocked surface.
+ */
+async function wireUnlockedDeps(args: {
+  dashboard: DashboardApprovalChannel;
+  custody: EstablishMasterResult;
+  storage: FilesystemStorage;
+  config: Awaited<ReturnType<typeof loadConfig>>;
+  policy: PrincipalPolicy;
+  options: StandaloneDashboardOptions;
+  dashboardHost: string;
+  dashboardPort: number;
+  passphrase: string | undefined;
+  passphraseSource: "option" | "env" | "keychain" | "fallback-file" | null;
+}): Promise<void> {
+  const {
+    dashboard,
+    custody,
+    storage,
+    config,
+    policy,
+    options,
+    dashboardHost,
+    dashboardPort,
+    passphrase,
+    passphraseSource,
+  } = args;
   const masterKey = custody.masterKey;
 
   // Durable off-host escrow for a freshly minted recovery key (the core fix).
@@ -512,42 +751,9 @@ export async function startStandaloneDashboard(
     throw err;
   }
 
-  // 6. Load principal policy and baseline
-  let policy: PrincipalPolicy;
-  try {
-    policy = await loadPrincipalPolicy(config.storage_path);
-  } catch (err) {
-    if (err instanceof MalformedPrincipalPolicyError) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\nSanctuary cannot start.\n${err.message}\n`);
-      process.exit(1);
-    }
-    throw err;
-  }
+  // 6. Baseline (master-key-derived; policy already loaded by the caller).
   const baseline = new BaselineTracker(storage, masterKey);
   await baseline.load();
-
-  // 7. Resolve dashboard config
-  const dashboardPort = options.port ?? config.dashboard.port;
-  const dashboardHost = options.host ?? config.dashboard.host;
-
-  let authToken = config.dashboard.auth_token;
-  if (authToken === "auto") {
-    const { randomBytes } = await import("node:crypto");
-    authToken = randomBytes(32).toString("hex");
-  }
-
-  // 8. Create and start the dashboard
-  const dashboard = new DashboardApprovalChannel({
-    port: dashboardPort,
-    host: dashboardHost,
-    timeout_seconds: policy.approval_channel.timeout_seconds,
-    auth_token: authToken,
-    tls: config.dashboard.tls,
-    auto_open: config.dashboard.auto_open ?? true, // Default to auto-open in standalone mode
-    allow_plaintext_remote:
-      options.allowPlaintextRemote ?? config.dashboard.allow_plaintext_remote,
-  });
 
   // 9. Initialize IdentityManager (reads existing identities from encrypted storage)
   const identityManager = new IdentityManager(storage, masterKey);
@@ -564,7 +770,25 @@ export async function startStandaloneDashboard(
   const profileStore = new SovereigntyProfileStore(storage, masterKey);
   await profileStore.load();
 
-  dashboard.setDependencies({
+  // ── ATOMIC WIRING (custody fail-open fix) ────────────────────────────────
+  // Slice 2 invariant: a parked dashboard holds NO master-key-derived deps and
+  // serves NO protected state. The in-process unlock path therefore must be
+  // all-or-nothing: if ANY load/save/construct below throws AFTER we have
+  // attached even one dep, the dashboard would be HALF-UNLOCKED (it would lie
+  // that it is parked via isParked() while `/api/readiness` serves and the
+  // identity/audit/sovereignty routes hand back REAL decrypted state, and (if
+  // the throw landed after the auto-auth attach) a co-resident loopback agent
+  // could read it without the token). To make a failed unlock provably leave
+  // the dashboard CLEANLY PARKED, every throwing await (construct, load, save,
+  // writeTenantRuntime) runs FIRST, into local variables; the dashboard channel
+  // is mutated ONLY in the synchronous, non-throwing ATTACH TAIL at the very
+  // end. A failure anywhere above the tail throws BEFORE a single attach, so
+  // nothing is attached and the dashboard stays parked. The caller's unlock
+  // handler then fails closed (401) and releases its single-shot guard so a
+  // legitimate retry still works.
+  //
+  // Build the dependency bundle as a local value; do NOT attach it yet.
+  const deps = {
     policy,
     baseline,
     auditLog,
@@ -579,8 +803,8 @@ export async function startStandaloneDashboard(
     // not silently degrade the committed-receipt count / reputation row to
     // the audit-event lower bound when composition is enabled.
     storage,
-  });
-  dashboard.setStandaloneMode(true);
+  } as const;
+  // (setStandaloneMode(true) is already called on the channel by the caller.)
 
   // Federation Slice 3a: a federation rotate-root journal means the signing
   // master is mid-rotation. A half-rotated root must NEVER serve (fail closed):
@@ -794,7 +1018,10 @@ export async function startStandaloneDashboard(
     policy,
     config,
   });
-  dashboard.setV11Bindings(v11Bindings);
+  // NOTE: v11Bindings is attached in the synchronous ATTACH TAIL below, not
+  // here; see the ATOMIC WIRING note. setTaskService (next block) mutates the
+  // LOCAL hubService inside v11Bindings, not the dashboard channel, so it is
+  // safe to run before the tail.
 
   // v1.3 cycle 2: wire TaskService into the hub so `sanctuary task`
   // CLI commands (which hit /api/hub/tasks/*) work in standalone mode.
@@ -840,9 +1067,11 @@ export async function startStandaloneDashboard(
     dashboardHost === "127.0.0.1" ||
     dashboardHost === "::1" ||
     dashboardHost === "localhost";
-  if (hostIsLoopback && loadResult.loaded > 0) {
-    dashboard.setAutoAuthLocalhost(true);
-  }
+  // Decide the auto-auth posture now, but DO NOT attach it here; attaching
+  // loopback auto-auth before the remaining throwing awaits (distress load,
+  // writeTenantRuntime) is exactly the fail-open the atomic-wiring fix closes.
+  // It is applied in the synchronous ATTACH TAIL below.
+  const enableLoopbackAutoAuth = hostIsLoopback && loadResult.loaded > 0;
 
   // HABEAS PORT local distress lane. The standalone dashboard is the
   // long-lived operator process on the machine (launchd/systemd), so it is
@@ -858,8 +1087,61 @@ export async function startStandaloneDashboard(
   // distress lane (stderr + audit, emitted server-side) is never affected.
   const distressInbox = new DistressInbox(storage, masterKey);
   await distressInbox.load();
-  dashboard.setDistressInbox(distressInbox);
+  // distressInbox is attached in the synchronous ATTACH TAIL below (not here):
+  // the writeTenantRuntime await further down can still throw, and attaching
+  // the inbox before it would re-open the half-unlocked window.
 
+  // NOTE: dashboard.start() is owned by the CALLER (startStandaloneDashboard /
+  // the unlock handler). On the unlock-later path the listener is ALREADY bound
+  // (parked), so this wiring just attaches the unlocked deps to the running
+  // server. On the unlocked-boot path the caller starts immediately after.
+
+  // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
+  // aggregator. Best-effort, cleaned up on graceful shutdown.
+  // This is the LAST throwing await before the synchronous ATTACH TAIL: if it
+  // throws, NOTHING has been attached and the dashboard stays cleanly parked.
+  await writeTenantRuntime(config.storage_path, {
+    version: SANCTUARY_VERSION,
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    dashboard_host: dashboardHost,
+    dashboard_port: dashboardPort,
+    ...(typeof config.webhook?.callback_port === "number"
+      ? {
+          webhook_callback_port: config.webhook.callback_port,
+          webhook_callback_host: config.webhook.callback_host,
+        }
+      : {}),
+    mode: "standalone",
+  });
+
+  // Test-only fault injection (never set by production callers). Fires here:
+  // after every construct/load/save has SUCCEEDED but BEFORE any attach, so a
+  // test can prove the atomic-wiring invariant: a post-establishMaster wiring
+  // failure leaves the dashboard fully parked (no deps attached, auto-auth off).
+  if (options.__testFaultAfterLoads) {
+    await options.__testFaultAfterLoads();
+  }
+
+  // ── ATTACH TAIL (synchronous, non-throwing) ──────────────────────────────
+  // Every throwing await is above this line. From here on we only mutate the
+  // dashboard channel with the fully-constructed, fully-loaded local values.
+  // If control reaches this point the unlock is committed; there is no longer
+  // any half-unlocked window. Order within the tail is irrelevant for safety
+  // (none of these throw), but mirrors the historical sequence for clarity.
+  dashboard.setDependencies(deps);
+  dashboard.setV11Bindings(v11Bindings);
+  dashboard.setDistressInbox(distressInbox);
+  if (enableLoopbackAutoAuth) {
+    dashboard.setAutoAuthLocalhost(true);
+  }
+  // ── end ATTACH TAIL ──────────────────────────────────────────────────────
+
+  // HABEAS PORT local distress listener: best-effort background service started
+  // AFTER the attach tail. It does not attach to the dashboard (the inbox is the
+  // attach, done above) and never throws out, so it cannot re-open a
+  // half-unlocked window. A bad secret mode or port conflict logs and leaves the
+  // dashboard fully unlocked; the in-process distress lane is unaffected.
   let distressListener: DistressListener | undefined;
   try {
     const localSecret = await loadOrCreateLocalListenerSecret(config.storage_path);
@@ -887,24 +1169,6 @@ export async function startStandaloneDashboard(
     distressListener = undefined;
   }
 
-  await dashboard.start();
-
-  // Advertise this tenant's dashboard to `sanctuary agents` + multi-agent
-  // aggregator. Best-effort, cleaned up on graceful shutdown.
-  await writeTenantRuntime(config.storage_path, {
-    version: SANCTUARY_VERSION,
-    pid: process.pid,
-    started_at: new Date().toISOString(),
-    dashboard_host: dashboardHost,
-    dashboard_port: dashboardPort,
-    ...(typeof config.webhook?.callback_port === "number"
-      ? {
-          webhook_callback_port: config.webhook.callback_port,
-          webhook_callback_host: config.webhook.callback_host,
-        }
-      : {}),
-    mode: "standalone",
-  });
   const clearRuntime = () => {
     clearTenantRuntime(config.storage_path).catch(() => {});
     distressListener?.stop().catch(() => {});
@@ -980,6 +1244,4 @@ export async function startStandaloneDashboard(
   };
   process.on("SIGINT", saveBaseline);
   process.on("SIGTERM", saveBaseline);
-
-  return dashboard;
 }
