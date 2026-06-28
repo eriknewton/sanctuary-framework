@@ -691,22 +691,22 @@ export function validateConfig(config: SanctuaryConfig): void {
 
   if (typeof config.erc8004.registry_confirmation.rpc_url !== "string") {
     valueErrors.push(
-      `Invalid config value: erc8004.registry_confirmation.rpc_url = "${String(config.erc8004.registry_confirmation.rpc_url)}". ` +
-      `Use an http(s) JSON-RPC endpoint URL or an empty string.`
+      `Invalid config value: erc8004.registry_confirmation.rpc_url must be a string ` +
+      `(an http(s) JSON-RPC endpoint URL or an empty string). Value redacted (it may embed a provider API key).`
     );
   } else if (config.erc8004.registry_confirmation.rpc_url !== "") {
     try {
       const parsed = new URL(config.erc8004.registry_confirmation.rpc_url);
       if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
         valueErrors.push(
-          `Invalid config value: erc8004.registry_confirmation.rpc_url = "${config.erc8004.registry_confirmation.rpc_url}". ` +
-          `Use an http(s) JSON-RPC endpoint URL.`
+          `Invalid config value: erc8004.registry_confirmation.rpc_url must use the http(s) scheme ` +
+          `(value redacted; it may embed a provider API key).`
         );
       }
     } catch {
       valueErrors.push(
-        `Invalid config value: erc8004.registry_confirmation.rpc_url = "${config.erc8004.registry_confirmation.rpc_url}". ` +
-        `Use an http(s) JSON-RPC endpoint URL.`
+        `Invalid config value: erc8004.registry_confirmation.rpc_url is not a valid URL ` +
+        `(value redacted; it may embed a provider API key). Use an http(s) JSON-RPC endpoint URL.`
       );
     }
   }
