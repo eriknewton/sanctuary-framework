@@ -2821,7 +2821,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     res: ServerResponse,
     opts?: { requireToken?: boolean },
   ): boolean {
-    if (!this.authToken) return true; // Auth disabled
+    if (!this.authToken) {
+      if (!opts?.requireToken) return true; // Auth disabled for normal routes
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - use Authorization: Bearer header or a valid session" }));
+      return false;
+    }
 
     // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment.
     //

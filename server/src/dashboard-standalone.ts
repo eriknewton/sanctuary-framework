@@ -451,9 +451,15 @@ export async function startStandaloneDashboard(
   const dashboardHost = options.host ?? config.dashboard.host;
 
   let authToken = config.dashboard.auth_token;
-  if (authToken === "auto") {
+  let generatedParkAuthToken: string | null = null;
+  if (authToken === "auto" || (options.allowPark && !authToken)) {
+    const shouldSurfaceForPark = options.allowPark === true;
     const { randomBytes } = await import("node:crypto");
     authToken = randomBytes(32).toString("hex");
+    // `--allow-park` can boot a locked listener with POST /api/unlock live
+    // before loopback auto-auth can exist. Mint only on that park-capable path
+    // so plain interactive loopback dashboards keep their no-token UX.
+    if (shouldSurfaceForPark) generatedParkAuthToken = authToken;
   }
 
   // 8. Create the dashboard channel. Constructed BEFORE the master-key-derived
@@ -545,6 +551,10 @@ export async function startStandaloneDashboard(
       return dashboard;
     }
 
+    if (generatedParkAuthToken) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand.
+      console.error(`Operator unlock token: ${generatedParkAuthToken}`);
+    }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand.
     console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode, PARKED)`);
     console.error(`Storage: ${config.storage_path}`);
@@ -575,6 +585,10 @@ export async function startStandaloneDashboard(
   if (options.allowPark && dashboard.addrInUse()) {
     // Single-owner on the supervised unlocked path too: stand down cleanly.
     return dashboard;
+  }
+  if (generatedParkAuthToken) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand.
+    console.error(`Operator unlock token: ${generatedParkAuthToken}`);
   }
   return dashboard;
 }

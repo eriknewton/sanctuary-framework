@@ -5,8 +5,13 @@
  * and timeout behavior.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  request as httpRequest,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import {
   DashboardApprovalChannel,
   ipv6Slash64Prefix,
@@ -67,9 +72,54 @@ async function requestNoKeepAlive(
   });
 }
 
+type CheckAuthHarness = {
+  checkAuth: (
+    req: IncomingMessage,
+    url: URL,
+    res: ServerResponse,
+    opts?: { requireToken?: boolean },
+  ) => boolean;
+};
+
+function mockRequest(remoteAddress: string, authorization?: string): IncomingMessage {
+  return {
+    headers: authorization ? { authorization } : {},
+    socket: { remoteAddress },
+  } as unknown as IncomingMessage;
+}
+
+function mockResponse(): {
+  res: ServerResponse;
+  writeHead: ReturnType<typeof vi.fn>;
+  end: ReturnType<typeof vi.fn>;
+} {
+  const writeHead = vi.fn();
+  const end = vi.fn();
+  return {
+    writeHead,
+    end,
+    res: { writeHead, end } as unknown as ServerResponse,
+  };
+}
+
 describe("Principal Dashboard", () => {
   let dashboard: DashboardApprovalChannel;
   let port: number;
+
+  async function restartDashboardWithAuthToken(authToken: string): Promise<void> {
+    await dashboard.stop();
+    await bindWithRetry(async () => {
+      port = randomTestPort();
+      dashboard = new DashboardApprovalChannel({
+        port,
+        host: "127.0.0.1",
+        timeout_seconds: 30,
+        auto_deny: true,
+        auth_token: authToken,
+      });
+      await dashboard.start();
+    });
+  }
 
   beforeEach(async () => {
     // Sigma-6: bindWithRetry retries on EADDRINUSE so this suite stops
@@ -176,6 +226,13 @@ describe("Principal Dashboard", () => {
   // ── Approval Flow ────────────────────────────────────────────────────
 
   describe("Approval Flow", () => {
+    const OPERATOR_TOKEN = "approval-flow-operator-token";
+    const authHeaders = { Authorization: `Bearer ${OPERATOR_TOKEN}` };
+
+    beforeEach(async () => {
+      await restartDashboardWithAuthToken(OPERATOR_TOKEN);
+    });
+
     const makeRequest = (): ApprovalRequest => ({
       operation: "state_export",
       tier: 1,
@@ -192,7 +249,9 @@ describe("Principal Dashboard", () => {
       expect(dashboard.pendingCount).toBe(1);
 
       // Get the pending list to find the ID
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+        headers: authHeaders,
+      });
       const pending = await listRes.json();
       expect(pending).toHaveLength(1);
       expect(pending[0].operation).toBe("state_export");
@@ -200,7 +259,7 @@ describe("Principal Dashboard", () => {
       // Approve
       const approveRes = await fetch(
         `http://127.0.0.1:${port}/api/approve/${pending[0].id}`,
-        { method: "POST" }
+        { method: "POST", headers: authHeaders }
       );
       expect(approveRes.status).toBe(200);
 
@@ -215,13 +274,15 @@ describe("Principal Dashboard", () => {
       const request = makeRequest();
       const approvalPromise = dashboard.requestApproval(request);
 
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+        headers: authHeaders,
+      });
       const pending = await listRes.json();
       expect(pending).toHaveLength(1);
 
       const denyRes = await fetch(
         `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
-        { method: "POST" }
+        { method: "POST", headers: authHeaders }
       );
       expect(denyRes.status).toBe(200);
 
@@ -233,7 +294,7 @@ describe("Principal Dashboard", () => {
     it("returns 404 for non-existent request ID", async () => {
       const res = await requestNoKeepAlive(
         `http://127.0.0.1:${port}/api/approve/nonexistent`,
-        { method: "POST" }
+        { method: "POST", headers: authHeaders }
       );
       expect(res.status).toBe(404);
     });
@@ -277,13 +338,21 @@ describe("Principal Dashboard", () => {
       expect(dashboard.pendingCount).toBe(2);
 
       // Get pending list
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+        headers: authHeaders,
+      });
       const pending = await listRes.json();
       expect(pending).toHaveLength(2);
 
       // Approve first, deny second
-      await fetch(`http://127.0.0.1:${port}/api/approve/${pending[0].id}`, { method: "POST" });
-      await fetch(`http://127.0.0.1:${port}/api/deny/${pending[1].id}`, { method: "POST" });
+      await fetch(`http://127.0.0.1:${port}/api/approve/${pending[0].id}`, {
+        method: "POST",
+        headers: authHeaders,
+      });
+      await fetch(`http://127.0.0.1:${port}/api/deny/${pending[1].id}`, {
+        method: "POST",
+        headers: authHeaders,
+      });
 
       const [r1, r2] = await Promise.all([p1, p2]);
       // Order depends on which ID maps to which request
@@ -960,6 +1029,35 @@ describe("Principal Dashboard", () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/status`);
       expect(res.status).toBe(200);
     });
+
+    it("keeps no-token normal-route behavior but fails closed when requireToken is set", () => {
+      const checkAuth = (dashboard as unknown as CheckAuthHarness).checkAuth.bind(
+        dashboard,
+      );
+      const normal = mockResponse();
+      expect(
+        checkAuth(
+          mockRequest("192.0.2.10"),
+          new URL("http://remote.example/api/status"),
+          normal.res,
+        ),
+      ).toBe(true);
+      expect(normal.writeHead).not.toHaveBeenCalled();
+
+      const required = mockResponse();
+      expect(
+        checkAuth(
+          mockRequest("192.0.2.10"),
+          new URL("http://remote.example/api/unlock"),
+          required.res,
+          { requireToken: true },
+        ),
+      ).toBe(false);
+      expect(required.writeHead).toHaveBeenCalledWith(401, {
+        "Content-Type": "application/json",
+      });
+      expect(required.end).toHaveBeenCalled();
+    });
   });
 
   // ── Rate Limiting ────────────────────────────────────────────────────
@@ -1187,8 +1285,14 @@ describe("Principal Dashboard", () => {
     });
 
     it("root-flip does NOT regress the approval-channel routes", async () => {
+      const operatorToken = "root-flip-operator-token";
+      const authHeaders = { Authorization: `Bearer ${operatorToken}` };
+      await restartDashboardWithAuthToken(operatorToken);
+
       // /api/pending still answers (the pending-approvals inbox source).
-      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
+      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+        headers: authHeaders,
+      });
       expect(pendingRes.status).toBe(200);
       expect(await pendingRes.json()).toEqual([]);
 
@@ -1202,12 +1306,14 @@ describe("Principal Dashboard", () => {
         timestamp: new Date().toISOString(),
       });
       const approveList = await (
-        await fetch(`http://127.0.0.1:${port}/api/pending`)
+        await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        })
       ).json();
       expect(approveList).toHaveLength(1);
       const approveRes = await fetch(
         `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
-        { method: "POST" },
+        { method: "POST", headers: authHeaders },
       );
       expect(approveRes.status).toBe(200);
       expect((await approvePromise).decision).toBe("approve");
@@ -1221,12 +1327,14 @@ describe("Principal Dashboard", () => {
         timestamp: new Date().toISOString(),
       });
       const denyList = await (
-        await fetch(`http://127.0.0.1:${port}/api/pending`)
+        await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        })
       ).json();
       expect(denyList).toHaveLength(1);
       const denyRes = await fetch(
         `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
-        { method: "POST" },
+        { method: "POST", headers: authHeaders },
       );
       expect(denyRes.status).toBe(200);
       expect((await denyPromise).decision).toBe("deny");

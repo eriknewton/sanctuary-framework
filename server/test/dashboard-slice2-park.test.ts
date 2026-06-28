@@ -19,7 +19,7 @@
  * parks (the supervised LaunchAgent scenario). No mocks of custody.
  */
 
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import {
@@ -72,6 +72,25 @@ async function startOnFreePort(
     const dashboard = await startStandaloneDashboard({ ...options, port });
     return { dashboard, port };
   });
+}
+
+async function captureConsoleError<T>(fn: () => Promise<T>): Promise<{ result: T; output: string }> {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    const result = await fn();
+    return { result, output: lines.join("\n") };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+function extractOperatorUnlockToken(output: string): string {
+  const match = /Operator unlock token:\s*([0-9a-f]{64})/.exec(output);
+  expect(match, "parked dashboard must print the generated operator unlock token").not.toBeNull();
+  return match![1]!;
 }
 
 describe("Slice 2: park-not-exit (server lifecycle)", () => {
@@ -155,6 +174,63 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
     const data = await res.json();
     const entries = Array.isArray(data) ? data : (data.entries ?? []);
     expect(entries.length).toBe(0);
+  });
+
+  it("default loopback --allow-park with no configured token rejects tokenless POST /api/unlock (fail closed)", async () => {
+    await seedWrappedFortress(storagePath);
+
+    const { result } = await captureConsoleError(() =>
+      startOnFreePort({ host: "127.0.0.1", allowPark: true }),
+    );
+    dashboard = result.dashboard;
+
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/unlock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: PASSPHRASE }),
+    });
+    expect(res.status).toBe(401);
+    expect(dashboard.isParked()).toBe(true);
+  });
+
+  it("default loopback --allow-park prints an operator token that reaches the unlock handler", async () => {
+    await seedWrappedFortress(storagePath);
+
+    const { result, output } = await captureConsoleError(() =>
+      startOnFreePort({ host: "127.0.0.1", allowPark: true }),
+    );
+    dashboard = result.dashboard;
+    const operatorToken = extractOperatorUnlockToken(output);
+
+    const unlock = await fetch(`http://127.0.0.1:${result.port}/api/unlock`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${operatorToken}`,
+      },
+      body: JSON.stringify({ passphrase: PASSPHRASE }),
+    });
+    expect(unlock.status).toBe(200);
+    expect((await unlock.json()).unlocked).toBe(true);
+    expect(dashboard.isParked()).toBe(false);
+  });
+
+  it("co-resident loopback auto-auth still cannot reach /api/unlock without the operator token", async () => {
+    await seedWrappedFortress(storagePath);
+
+    const { result } = await captureConsoleError(() =>
+      startOnFreePort({ host: "127.0.0.1", allowPark: true }),
+    );
+    dashboard = result.dashboard;
+    dashboard.setAutoAuthLocalhost(true);
+
+    const res = await fetch(`http://127.0.0.1:${result.port}/api/unlock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: PASSPHRASE }),
+    });
+    expect(res.status).toBe(401);
+    expect(dashboard.isParked()).toBe(true);
   });
 
   it("rejects a TOKENLESS unlock POST EVEN on loopback (custody carve-out)", async () => {
@@ -404,6 +480,20 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
     await expect(
       startOnFreePort({ host: "127.0.0.1" /* allowPark omitted */ }),
     ).rejects.toThrow(/cannot unlock this fortress|valid credential/i);
+  });
+
+  it("interactive non-park loopback dashboard still serves normal routes without a token", async () => {
+    await seedWrappedFortress(storagePath);
+
+    const result = await startOnFreePort({
+      host: "127.0.0.1",
+      passphrase: PASSPHRASE,
+    });
+    dashboard = result.dashboard;
+
+    const readiness = await fetch(`http://127.0.0.1:${result.port}/api/readiness`);
+    expect(readiness.status).toBe(200);
+    expect((await readiness.json()).ready).toBe("serving");
   });
 });
 
