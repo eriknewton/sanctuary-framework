@@ -1170,26 +1170,41 @@ export function renderPostureHomeHTML(): string {
   // Signed-policy-distribution status (A2). Custody-state distribution only:
   // hash/version markers from verified signed bundles, never raw policy
   // contents. Unknown is never green.
+  function fleetPolicySummaryText(pd) {
+    if (!pd || pd.available !== true) return "policy unknown";
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
+      return "no operator policy";
+    }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
+    return "operator policy v" + policy.version +
+      " · " + summary.in_sync + " of " + total + " nodes in sync" +
+      " / " + summary.drifted + " drifted" +
+      " / " + summary.unknown + " unknown";
+  }
+
   function fleetPolicyDistributionLine(pd) {
     if (!pd || pd.available !== true) {
       return '<div class="evidence">' +
-        '<span class="pill amber">unknown</span> &nbsp;' +
-        "Signed policy state is unavailable for this fleet.</div>";
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
+        "Policy distribution status cannot be evaluated for this fleet.</div>";
     }
     var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
     var policy = pd.operator_policy;
-    if (!policy || policy.version == null || !policy.hash) {
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
       return '<div class="evidence">' +
-        '<span class="pill amber">unknown</span> &nbsp;' +
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
         "No signed operator policy bundle is known yet. " +
-        "Nodes remain unknown until an operator policy hash is pushed.</div>";
+        "Nodes render policy drift as unknown until an operator policy hash is distributed.</div>";
     }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
     return '<div class="evidence">' +
-      '<span class="pill amber">policy v' + esc(policy.version) + "</span> &nbsp;" +
-      "Signed operator policy hash " + esc(policy.hash) +
-      " · " + esc(summary.in_sync) + " in sync" +
-      " · " + esc(summary.drifted) + " drifted" +
-      " · " + esc(summary.unknown) + " unknown</div>";
+      '<span class="pill">operator policy v' + esc(policy.version) + "</span> &nbsp;" +
+      esc(summary.in_sync) + " of " + esc(total) + " nodes in sync" +
+      " / " + esc(summary.drifted) + " drifted" +
+      " / " + esc(summary.unknown) + " unknown" +
+      " · hash " + esc(policy.hash_algorithm) + ":" + esc(policy.hash) + "</div>";
   }
 
   function fleetPolicyPill(state) {
@@ -1199,10 +1214,15 @@ export function renderPostureHomeHTML(): string {
   }
 
   function fleetPolicyEvidence(policy) {
-    if (!policy || policy.drift_state === "unknown") {
-      return "policy version unknown";
+    if (!policy || policy.version == null) {
+      return "applied policy unknown";
     }
-    var base = "policy v" + policy.version;
+    var base = "applied policy v" + policy.version;
+    if (policy.hash && policy.hash_algorithm) {
+      base += " hash " + policy.hash_algorithm + ":" + policy.hash;
+    } else {
+      base += " hash unknown";
+    }
     if (policy.applied_at) base += " applied " + policy.applied_at;
     return base;
   }
@@ -1225,6 +1245,7 @@ export function renderPostureHomeHTML(): string {
       if (s.admitted) parts.push(esc(s.admitted) + " admitted");
       if (s.revoked) parts.push(esc(s.revoked) + " revoked");
       if (s.untrusted) parts.push(esc(s.untrusted) + " untrusted");
+      parts.push(fleetPolicySummaryText(roster.policy_distribution));
       summaryEl.textContent = parts.join(" · ");
     }
     var head =
