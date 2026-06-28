@@ -108,7 +108,10 @@ describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
   let home: string;
   let defaultRoot: string;
   let tenantDir: string;
-  let appendSpy: ReturnType<typeof vi.spyOn>;
+  // The agents-config write path is fail-closed on the critical audit, so it
+  // uses appendCritical (not the best-effort append). The write is refused if
+  // the critical audit cannot be persisted.
+  let appendCriticalSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), "sanctuary-agents-cfg-audit-"));
@@ -116,15 +119,17 @@ describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
     await mkdir(defaultRoot, { recursive: true, mode: 0o700 });
     tenantDir = await makeTenant(defaultRoot, "tenant-audit");
     await writeMinimalPolicy(tenantDir);
-    appendSpy = vi.spyOn(AuditLog.prototype, "append").mockImplementation(() => {});
+    appendCriticalSpy = vi
+      .spyOn(AuditLog.prototype, "appendCritical")
+      .mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
-    appendSpy.mockRestore();
+    appendCriticalSpy.mockRestore();
     await rm(home, { recursive: true, force: true });
   });
 
-  it("agents config writes an audit entry on successful config change", async () => {
+  it("agents config writes a critical audit entry on successful config change", async () => {
     const out = new StringWritable();
     const err = new StringWritable();
     const code = await runAgentsCommand({
@@ -138,13 +143,16 @@ describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
 
     expect(code).toBe(0);
     expect(out.text).toContain("approval_redirect=on");
-    expect(appendSpy).toHaveBeenCalledWith(
-      "l2",
-      "agents.config",
-      expect.stringContaining("fortress:"),
+    expect(appendCriticalSpy).toHaveBeenCalledWith(
       expect.objectContaining({
-        tenant: "tenant-audit",
-        approval_redirect: expect.objectContaining({ enabled: true }),
+        layer: "l2",
+        operation: "agents.config",
+        identity_id: expect.stringContaining("fortress:"),
+        result: "success",
+        details: expect.objectContaining({
+          tenant: "tenant-audit",
+          approval_redirect: expect.objectContaining({ enabled: true }),
+        }),
       }),
     );
   });
