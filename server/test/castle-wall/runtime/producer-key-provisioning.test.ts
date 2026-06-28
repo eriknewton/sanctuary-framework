@@ -41,6 +41,7 @@ import {
   producerKeyDaemonLaunchArgs,
   producerSigningBytes,
   CASTLE_WALL_PRODUCER_PUBKEY_RELPATH,
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
 } from "../../../src/castle-wall/runtime/producer-signature.js";
 import { startCastleWall } from "../../../src/castle-wall/runtime/lifecycle.js";
 import { buildCastleWallPosture } from "../../../src/principal-policy/posture.js";
@@ -59,6 +60,7 @@ import {
 const FORTRESS = "fortress:test";
 const NOW = 1_750_000_000_000;
 const FRESH_TS = NOW - 1000;
+const LINUX_PRODUCER_KEY_LOAD = { platform: "linux" as const };
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -248,12 +250,15 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
     expect(CASTLE_WALL_PRODUCER_PUBKEY_RELPATH).toBe(
       "policy/egress/audit-producer.pub",
     );
+    expect(CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH).toBe(
+      "/Library/Application Support/Sanctuary/castle-audit-producer.pub",
+    );
   });
 
   it("status=present for a 32-byte published key", async () => {
     const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("present");
     if (load.status === "present") {
       expect(load.keyB64url).toBe(toBase64url(pub));
@@ -261,7 +266,7 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
   });
 
   it("status=absent when no key file exists (the ONLY channel-basis path)", async () => {
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("absent");
   });
 
@@ -269,8 +274,41 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
     const dir = join(tmp, "policy", "egress");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "audit-producer.pub"), Buffer.from([1, 2, 3]));
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("unreadable");
+  });
+
+  it("on darwin prefers the host-wide audit-producer key published by the root helper", async () => {
+    const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
+    const hostDir = join(tmp, "host-wide");
+    const hostPath = join(hostDir, "castle-audit-producer.pub");
+    await mkdir(hostDir, { recursive: true });
+    await writeFile(hostPath, Buffer.from(pub));
+
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: hostPath,
+    });
+
+    expect(load.status).toBe("present");
+    if (load.status === "present") {
+      expect(load.keyB64url).toBe(toBase64url(pub));
+    }
+  });
+
+  it("on darwin falls back to the fortress key only when the host-wide key is absent", async () => {
+    const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
+    await publishPubKey(tmp, pub);
+
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: join(tmp, "missing", "castle-audit-producer.pub"),
+    });
+
+    expect(load.status).toBe("present");
+    if (load.status === "present") {
+      expect(load.keyB64url).toBe(toBase64url(pub));
+    }
   });
 
   it("daemon-launch args BIND the daemon publish path to the TS read path (codex HIGH #2)", () => {
@@ -291,7 +329,10 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
   it("ACTIVATES: key present → consumer ENFORCES producer signatures", async () => {
     const pub = ed25519.getPublicKey(ed25519.utils.randomPrivateKey());
     await publishPubKey(tmp, pub);
-    const handle = await startToRunning({ fortressStoragePath: tmp });
+    const handle = await startToRunning({
+      fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+    });
     expect(handle.state()).toBe("running");
     // The load-bearing assertion: the consumer resolved the published key and is
     // enforcing per-producer signatures (the L1 close is ACTIVE), not key-null.
@@ -303,14 +344,20 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     const dir = join(tmp, "policy", "egress");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "audit-producer.pub"), Buffer.from([9, 9, 9]));
-    await expect(startNoHandshake({ fortressStoragePath: tmp })).rejects.toThrow(
-      /expected but unreadable/,
-    );
+    await expect(
+      startNoHandshake({
+        fortressStoragePath: tmp,
+        producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+      }),
+    ).rejects.toThrow(/expected but unreadable/);
   });
 
   it("absent key → consumer stays on the channel basis (macOS / pre-provision floor)", async () => {
     // No key file published → absent → channel basis, NOT a refusal.
-    const handle = await startToRunning({ fortressStoragePath: tmp });
+    const handle = await startToRunning({
+      fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
+    });
     expect(handle.state()).toBe("running");
     expect(handle.audit().isProducerSignatureEnforced()).toBe(false);
     await handle.stop();
@@ -327,6 +374,7 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     await expect(
       startNoHandshake({
         fortressStoragePath: tmp,
+        producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
         pinnedProducerKeyB64url: pubB64,
       }),
     ).rejects.toThrow(/not both/);
@@ -339,6 +387,7 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
     await publishPubKey(tmp, pub);
     const handle = await startToRunning({
       fortressStoragePath: tmp,
+      producerKeyLoadOptions: LINUX_PRODUCER_KEY_LOAD,
       pinnedProducerKeyB64url: null,
     });
     expect(handle.state()).toBe("running");
@@ -362,7 +411,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     expect(load.status).toBe("present");
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
@@ -383,7 +432,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
     const log = newLog();
@@ -402,7 +451,10 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
 
   it("(3) macOS / no-key path: a channel-basis event still arms (floor preserved)", async () => {
     // No key file published → absent → channel basis.
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, {
+      platform: "darwin",
+      macosProducerPubKeyPath: join(tmp, "missing", "castle-audit-producer.pub"),
+    });
     expect(load.status).toBe("absent");
     const log = newLog();
     // A genuine signed entry still arms on the channel basis when no key is set
@@ -442,7 +494,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const newPriv = ed25519.utils.randomPrivateKey();
     const newPub = ed25519.getPublicKey(newPriv);
     await publishPubKey(tmp, newPub);
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, LINUX_PRODUCER_KEY_LOAD);
     const keyB64 = load.status === "present" ? load.keyB64url : null;
 
     const log = newLog();

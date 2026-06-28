@@ -50,7 +50,7 @@ import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schem
 import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
 import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
 import {
-  resolveProducerPubKeyPath,
+  loadFortressProducerKey,
   loadPinnedProducerKeyB64url,
 } from "../castle-wall/runtime/producer-signature.js";
 import {
@@ -198,9 +198,9 @@ export interface CastleWallCommandContext {
   ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
   /**
    * Override the macOS audit-producer public-key path threaded into the daemon
-   * (Slice M). Tests point it at a temp key; an operator may set it via
-   * `SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY` for a non-default helper layout.
-   * When unset the daemon uses its built-in
+   * and macOS reader verification (Slice M). Tests point it at a temp key; an
+   * operator may set it via `SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY` for a
+   * non-default helper layout. When unset the daemon/readers use their built-in
    * `/Library/Application Support/Sanctuary/castle-audit-producer.pub` default.
    */
   auditProducerPublicKeyPath?: string;
@@ -2304,11 +2304,15 @@ function auditVerifySignedOperationMatchesEntry(
  * Path resolution (single source of truth - never invents a weaker basis):
  *   1. an explicit `--producer-pub-key <path>` override (tests / non-default
  *      layouts), else
- *   2. the fortress publish path `resolveProducerPubKeyPath(fortressPath)` =
+ *   2. on macOS, the root-helper-published host-wide key at
+ *      `/Library/Application Support/Sanctuary/castle-audit-producer.pub`,
+ *      falling back to the fortress path only when the host-wide key is absent,
+ *      else
+ *   3. the fortress publish path `resolveProducerPubKeyPath(fortressPath)` =
  *      `<fortress>/policy/egress/audit-producer.pub`, which is exactly where the
- *      macOS/Linux daemon republishes the key the audit CONSUMER pinned, so the
- *      reader can never diverge onto a different key than the one writes were
- *      gated against.
+ *      Linux daemon publishes the key the audit CONSUMER pinned, so the reader
+ *      can never diverge onto a different key than the one writes were gated
+ *      against.
  *
  * A MISSING key file (ENOENT) is the honest no-key floor: the reader returns
  * `null` and reports every entry on the channel basis - it never fabricates a
@@ -2319,8 +2323,21 @@ function auditVerifySignedOperationMatchesEntry(
 async function resolveAuditVerifyProducerKey(
   fortressPath: string,
   explicitPath: string | undefined,
+  opts: {
+    platform?: NodeJS.Platform;
+    macosProducerPubKeyPath?: string;
+  } = {},
 ): Promise<string | null> {
-  const pubKeyPath = explicitPath ?? resolveProducerPubKeyPath(fortressPath);
+  if (explicitPath === undefined) {
+    const load = await loadFortressProducerKey(fortressPath, {
+      platform: opts.platform,
+      macosProducerPubKeyPath: opts.macosProducerPubKeyPath,
+    });
+    if (load.status === "present") return load.keyB64url;
+    if (load.status === "absent") return null;
+    throw new Error(load.reason);
+  }
+  const pubKeyPath = explicitPath;
   try {
     return await loadPinnedProducerKeyB64url(pubKeyPath);
   } catch (error) {
@@ -2391,6 +2408,10 @@ export async function runAuditVerify(
     const pinnedProducerKeyB64url = await resolveAuditVerifyProducerKey(
       fortressPath,
       parsed.producerPubKey,
+      {
+        platform: ctx.platform ?? process.platform,
+        macosProducerPubKeyPath: ctx.auditProducerPublicKeyPath,
+      },
     );
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));

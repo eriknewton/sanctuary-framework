@@ -28,6 +28,7 @@ import { platform } from "node:os";
 import {
   loadFortressProducerKey,
   type ProducerKeyLoad,
+  type ProducerKeyLoadOptions,
 } from "../castle-wall/runtime/producer-signature.js";
 import {
   loadBrokerProducerKey,
@@ -258,6 +259,8 @@ export interface DashboardConfig {
    * network layer already provides encryption.
    */
   allow_plaintext_remote?: boolean;
+  /** Optional producer-key loader overrides. Tests pin platform/path here. */
+  producer_key_load_options?: ProducerKeyLoadOptions;
 }
 
 interface PendingRequest {
@@ -1951,7 +1954,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
     let load: ProducerKeyLoad;
     try {
-      load = await loadFortressProducerKey(storagePath);
+      load = await loadFortressProducerKey(
+        storagePath,
+        this.config.producer_key_load_options,
+      );
     } catch {
       // Defensive: loadFortressProducerKey already converts I/O failures into a
       // status, but never let an unexpected throw reach the request path.

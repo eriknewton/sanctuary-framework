@@ -270,7 +270,9 @@ export async function activateLinuxProducerSignedCastleWall(
   // not-armed. (`unreadable` already throws below via `startCastleWall`; this adds
   // the missing `absent` case so all three loads are handled honestly:
   // present→enforce, unreadable→throw, absent→throw - none silently channel.)
-  const keyLoad = await loadFortressProducerKey(input.fortressStoragePath);
+  const keyLoad = await loadFortressProducerKey(input.fortressStoragePath, {
+    platform: "linux",
+  });
   if (keyLoad.status !== "present") {
     const reason: RuntimeLinuxActivationError["reason"] =
       keyLoad.status === "absent"
@@ -309,6 +311,7 @@ export async function activateLinuxProducerSignedCastleWall(
       key: input.key,
       auditSink: input.auditSink,
       fortressStoragePath: input.fortressStoragePath,
+      producerKeyLoadOptions: { platform: "linux" },
     });
   } catch (err) {
     // Best-effort close the transport we opened before failing closed.

@@ -758,7 +758,7 @@ describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED ev
     const { loadFortressProducerKey } = await import(
       "../../../src/castle-wall/runtime/producer-signature.js"
     );
-    const load = await loadFortressProducerKey(tmp);
+    const load = await loadFortressProducerKey(tmp, { platform: "linux" });
     expect(load.status).toBe("present");
     if (load.status !== "present") return;
     const consumer = new AuditConsumer(auditLog, undefined, {
