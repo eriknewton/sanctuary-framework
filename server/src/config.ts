@@ -177,6 +177,7 @@ export type ConfigDowngradeReason =
   | "state_key_protection_downgrade"
   | "execution_attestation_disabled"
   | "dashboard_tls_disabled"
+  | "dashboard_plaintext_remote_enabled"
   | "dashboard_auth_disabled"
   | "webhook_gate_disabled"
   | "privacy_filter_disabled"
@@ -211,6 +212,13 @@ export interface ConfigSecurityPosture {
   execution_attestation: boolean;
   dashboard_tls_configured: boolean;
   dashboard_auth_configured: boolean;
+  /**
+   * Whether plaintext HTTP is permitted on non-loopback dashboard bindings.
+   * Flipping this false -> true is a security downgrade (it allows the operator
+   * console to serve unencrypted traffic on a routable interface), so the
+   * posture tracks it and the comparator gates it.
+   */
+  dashboard_allow_plaintext_remote: boolean;
   webhook_enabled: boolean;
   privacy_filter_mode: SanctuaryConfig["privacy_filter"]["mode"];
   privacy_filter_fail_mode: SanctuaryConfig["privacy_filter"]["fail_mode"];
@@ -960,6 +968,18 @@ export function detectConfigDowngrades(
     });
   }
 
+  if (
+    previous.dashboard.allow_plaintext_remote !== true &&
+    next.dashboard.allow_plaintext_remote === true
+  ) {
+    downgrades.push({
+      field: "dashboard.allow_plaintext_remote",
+      reason: "dashboard_plaintext_remote_enabled",
+      previous: previous.dashboard.allow_plaintext_remote ?? false,
+      next: next.dashboard.allow_plaintext_remote,
+    });
+  }
+
   if (hasDashboardAuth(previous) && !hasDashboardAuth(next)) {
     downgrades.push({
       field: "dashboard.auth_token",
@@ -1012,6 +1032,8 @@ export function securityPostureFromConfig(
     execution_attestation: config.execution.attestation,
     dashboard_tls_configured: hasDashboardTls(config),
     dashboard_auth_configured: hasDashboardAuth(config),
+    dashboard_allow_plaintext_remote:
+      config.dashboard?.allow_plaintext_remote === true,
     webhook_enabled: config.webhook.enabled,
     privacy_filter_mode: config.privacy_filter.mode,
     privacy_filter_fail_mode: config.privacy_filter.fail_mode,
@@ -1033,6 +1055,7 @@ export function configFromSecurityPosture(
   config.execution.attestation = posture.execution_attestation;
   config.dashboard = {
     ...config.dashboard,
+    allow_plaintext_remote: posture.dashboard_allow_plaintext_remote,
     ...(posture.dashboard_auth_configured ? { auth_token: "configured" } : {}),
     ...(posture.dashboard_tls_configured
       ? { tls: { cert_path: "configured", key_path: "configured" } }

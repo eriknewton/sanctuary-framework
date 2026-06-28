@@ -82,8 +82,17 @@ export const CONFIG_BASELINE_META_KEY = "config-security-baseline-v1";
 /** Envelope marker. A record missing this marker is bare/legacy/forged. */
 const CONFIG_BASELINE_MARKER = "__sanctuary_config_security_baseline_v1";
 
-/** Schema version of the authenticated baseline record. */
-const CONFIG_BASELINE_SCHEMA_VERSION = 1 as const;
+/**
+ * Schema version of the authenticated baseline record.
+ *
+ * v1 -> v2 (#805 review fix): the posture now tracks
+ * `dashboard_allow_plaintext_remote`. A v1 record lacks that field, so it
+ * cannot be authenticated as v2 — but an operator who upgraded the binary is
+ * NOT an attacker, so a recognized OLDER schema reseeds (fresh sealed baseline
+ * under the same master-key MAC) rather than bricking the boot. An UNKNOWN
+ * (future/forged, schema > current) version still fails closed.
+ */
+const CONFIG_BASELINE_SCHEMA_VERSION = 2 as const;
 
 /**
  * HKDF purpose label for the baseline MAC key. ADDITIVE — never reuse or alter
@@ -158,6 +167,7 @@ function parsePosture(value: unknown): ConfigSecurityPosture | null {
     typeof p.execution_attestation !== "boolean" ||
     typeof p.dashboard_tls_configured !== "boolean" ||
     typeof p.dashboard_auth_configured !== "boolean" ||
+    typeof p.dashboard_allow_plaintext_remote !== "boolean" ||
     typeof p.webhook_enabled !== "boolean" ||
     !isPrivacyFilterMode(p.privacy_filter_mode) ||
     !isPrivacyFailMode(p.privacy_filter_fail_mode)
@@ -170,6 +180,7 @@ function parsePosture(value: unknown): ConfigSecurityPosture | null {
     execution_attestation: p.execution_attestation,
     dashboard_tls_configured: p.dashboard_tls_configured,
     dashboard_auth_configured: p.dashboard_auth_configured,
+    dashboard_allow_plaintext_remote: p.dashboard_allow_plaintext_remote,
     webhook_enabled: p.webhook_enabled,
     privacy_filter_mode: p.privacy_filter_mode,
     privacy_filter_fail_mode: p.privacy_filter_fail_mode,
@@ -179,19 +190,25 @@ function parsePosture(value: unknown): ConfigSecurityPosture | null {
 /** Outcome of loading the persisted baseline. */
 type BaselineLoad =
   | { status: "absent" }
+  | { status: "reseed" }
   | { status: "authenticated"; posture: ConfigSecurityPosture };
 // "invalid" is not a return value: it always THROWS (fail-closed) so a caller
 // can never accidentally treat an unauthenticated record as absent and reseed.
+// "reseed" is returned ONLY for a recognized older schema version (a binary
+// upgrade, not an attack); the caller writes a fresh sealed baseline. It is
+// reached BEFORE the MAC check, so it never trusts an old record's posture.
 
 /**
  * Read and AUTHENTICATE the persisted baseline.
  *   - absent                       -> { status: "absent" } (genuine first run).
+ *   - recognized OLDER schema      -> { status: "reseed" } (binary upgrade; the
+ *     caller writes a fresh sealed baseline rather than bricking the boot).
  *   - present + marker + valid MAC -> { status: "authenticated", posture }.
  *   - present + anything else      -> THROW configBaselineInvalidError
- *     (tampered MAC, stripped marker, unparseable, schema mismatch). We NEVER
- *     re-MAC or trust a bare/invalid record: doing so would let a filesystem
- *     adversary bypass authentication by stripping the marker and rewriting the
- *     posture.
+ *     (tampered MAC, stripped marker, unparseable, unknown/future schema). We
+ *     NEVER re-MAC or trust a bare/invalid record: doing so would let a
+ *     filesystem adversary bypass authentication by stripping the marker and
+ *     rewriting the posture.
  */
 async function loadAuthenticatedBaseline(
   storage: StorageBackend,
@@ -239,10 +256,24 @@ async function loadAuthenticatedBaseline(
     throw configBaselineInvalidError("baseline envelope is malformed");
   }
   const body = data as Record<string, unknown>;
-  if (
-    body.schema_version !== CONFIG_BASELINE_SCHEMA_VERSION ||
-    typeof body.observed_at !== "string"
-  ) {
+  if (typeof body.observed_at !== "string") {
+    throw configBaselineInvalidError("unsupported baseline schema");
+  }
+  // Schema migration vs. tamper. A recognized OLDER schema (an operator who
+  // upgraded the binary) is not an attack: signal a reseed so the caller writes
+  // a fresh sealed baseline under the current schema. A v1 record can never
+  // authenticate as v2 (the MAC covers schema_version), so this does NOT weaken
+  // the gate — the master-key MAC still gates who may seed. An UNKNOWN/FUTURE
+  // schema (version > current, or a non-integer) is forged/tampered: fail closed.
+  if (body.schema_version !== CONFIG_BASELINE_SCHEMA_VERSION) {
+    if (
+      typeof body.schema_version === "number" &&
+      Number.isInteger(body.schema_version) &&
+      body.schema_version >= 1 &&
+      body.schema_version < CONFIG_BASELINE_SCHEMA_VERSION
+    ) {
+      return { status: "reseed" };
+    }
     throw configBaselineInvalidError("unsupported baseline schema");
   }
   const posture = parsePosture(body.posture);
@@ -308,9 +339,12 @@ export async function writeAuthenticatedConfigBaseline(
 /** What the boot cross-check did (for the audit trail / tests). */
 export type ConfigBaselineCrossCheck =
   | { kind: "seeded" }
+  | { kind: "reseeded" }
   | { kind: "advanced" };
 // "downgrade" and "invalid" are NOT return values: both THROW so boot is
-// refused (fail-closed). A throw is the gate.
+// refused (fail-closed). A throw is the gate. "reseeded" is a schema migration
+// (recognized older schema -> fresh sealed baseline), distinct from a genuine
+// first-run "seeded" so the audit trail records why a new baseline was minted.
 
 /**
  * Boot step "5rc": authenticate the persisted config-security baseline against
@@ -322,6 +356,9 @@ export type ConfigBaselineCrossCheck =
  *   - no downgrade        -> advance the baseline (re-MAC, fresh observed_at);
  *                            returns { kind: "advanced" }.
  *   - genuine first run   -> seed the baseline; returns { kind: "seeded" }.
+ *   - older schema (binary upgrade) -> reseed under the current schema; returns
+ *                            { kind: "reseeded" }. NOT a brick: the master-key
+ *                            MAC still gates who may mint the new baseline.
  *
  * Unlike the anti-rollback cross-check (which never refuses boot), this gate
  * MUST refuse: a config downgrade is an operator-policy weakening, and starting
@@ -340,6 +377,14 @@ export async function crossCheckConfigBaseline(args: {
     // Genuine first run: no prior posture exists to downgrade FROM. Seed it.
     await writeAuthenticatedConfigBaseline(storage, master, config);
     return { kind: "seeded" };
+  }
+
+  if (loaded.status === "reseed") {
+    // Recognized older schema (the operator upgraded the binary). There is no
+    // v2 posture to downgrade FROM, and the prior v1 record's posture is not
+    // trusted (it never passed the v2 MAC check). Mint a fresh sealed baseline.
+    await writeAuthenticatedConfigBaseline(storage, master, config);
+    return { kind: "reseeded" };
   }
 
   // Authenticated baseline present: compare and gate. `configFromSecurityPosture`

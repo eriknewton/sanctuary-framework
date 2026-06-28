@@ -27,6 +27,8 @@ import { stringToBytes, bytesToString } from "../../src/core/encoding.js";
 import {
   defaultConfig,
   detectConfigDowngrades,
+  securityPostureFromConfig,
+  configFromSecurityPosture,
   ConfigDowngradeError,
   type SanctuaryConfig,
 } from "../../src/config.js";
@@ -193,6 +195,80 @@ describe("config-security baseline (custody-MAC downgrade gate)", () => {
     ).rejects.toBeInstanceOf(ConfigDowngradeError);
   });
 
+  it("RESEEDS (not bricks) on a recognized older schema (v1 under v2)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // A v1-schema record: marker present, but schema_version 1 and a v1 posture
+    // (no dashboard_allow_plaintext_remote field). Its MAC is irrelevant: the
+    // schema check fires BEFORE authentication, so the record is never trusted.
+    await storage.write(
+      NAMESPACE,
+      CONFIG_BASELINE_META_KEY,
+      stringToBytes(
+        JSON.stringify({
+          __sanctuary_config_security_baseline_v1: true,
+          data: {
+            schema_version: 1,
+            observed_at: "2026-01-01T00:00:00.000Z",
+            posture: {
+              config_version: "1.0.0",
+              state_key_protection: "passphrase",
+              execution_attestation: true,
+              dashboard_tls_configured: true,
+              dashboard_auth_configured: true,
+              webhook_enabled: true,
+              privacy_filter_mode: "local",
+              privacy_filter_fail_mode: "closed",
+            },
+          },
+          mac: "stale-v1-mac-not-checked",
+        })
+      )
+    );
+
+    // An operator who upgraded the binary is not an attacker: reseed, do not brick.
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(outcome.kind).toBe("reseeded");
+
+    // The fresh sealed baseline is a v2 record under the current master key, so
+    // a second boot now authenticates and advances (no longer a migration).
+    const envelope = await readEnvelope(storage);
+    expect(envelope.__sanctuary_config_security_baseline_v1).toBe(true);
+    expect((envelope.data as Record<string, unknown>).schema_version).toBe(2);
+
+    const second = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(second.kind).toBe("advanced");
+  });
+
+  it("fails closed on an UNKNOWN/FUTURE schema (version > current)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await storage.write(
+      NAMESPACE,
+      CONFIG_BASELINE_META_KEY,
+      stringToBytes(
+        JSON.stringify({
+          __sanctuary_config_security_baseline_v1: true,
+          data: { schema_version: 99, observed_at: "now", posture: {} },
+          mac: "x",
+        })
+      )
+    );
+
+    await expect(
+      crossCheckConfigBaseline({ storage, master, config: strongConfig() })
+    ).rejects.toBeInstanceOf(ConfigDowngradeError);
+  });
+
   it("rejects a baseline minted under a different master key (MAC key binding)", async () => {
     const storage = new MemoryStorage();
     const masterA = generateRandomKey();
@@ -276,5 +352,57 @@ describe("detectConfigDowngrades comparator (reused #791 logic)", () => {
     );
     expect(authDown?.previous).toBe("configured");
     expect(JSON.stringify(authDown)).not.toContain("secret-token");
+  });
+
+  it("flags dashboard.allow_plaintext_remote false -> true (and nothing on no-change / true -> false)", () => {
+    // false -> true is a downgrade: it permits plaintext HTTP on a routable
+    // (non-loopback) dashboard binding.
+    const base = strongConfig();
+    base.dashboard.allow_plaintext_remote = false;
+    const enabled = strongConfig();
+    enabled.dashboard.allow_plaintext_remote = true;
+    expect(
+      detectConfigDowngrades(base, enabled).map((d) => d.reason)
+    ).toContain("dashboard_plaintext_remote_enabled");
+
+    // No change (true -> true, false -> false) is not a downgrade.
+    expect(
+      detectConfigDowngrades(enabled, structuredClone(enabled)).map(
+        (d) => d.reason
+      )
+    ).not.toContain("dashboard_plaintext_remote_enabled");
+    expect(
+      detectConfigDowngrades(base, structuredClone(base)).map((d) => d.reason)
+    ).not.toContain("dashboard_plaintext_remote_enabled");
+
+    // true -> false is a HARDENING, never flagged.
+    expect(
+      detectConfigDowngrades(enabled, base).map((d) => d.reason)
+    ).not.toContain("dashboard_plaintext_remote_enabled");
+
+    // An undefined previous (treated as false) -> true is still a downgrade.
+    const undef = strongConfig();
+    delete undef.dashboard.allow_plaintext_remote;
+    expect(
+      detectConfigDowngrades(undef, enabled).map((d) => d.reason)
+    ).toContain("dashboard_plaintext_remote_enabled");
+  });
+
+  it("posture round-trip preserves dashboard_allow_plaintext_remote", () => {
+    for (const flag of [true, false]) {
+      const config = strongConfig();
+      config.dashboard.allow_plaintext_remote = flag;
+
+      const posture = securityPostureFromConfig(config);
+      expect(posture.dashboard_allow_plaintext_remote).toBe(flag);
+
+      // Round-trip through the comparison config and back must preserve it, so
+      // the boot comparator sees the stored value (not a default).
+      const rebuilt = configFromSecurityPosture(posture);
+      expect(rebuilt.dashboard.allow_plaintext_remote).toBe(flag);
+      expect(
+        securityPostureFromConfig(rebuilt).dashboard_allow_plaintext_remote
+      ).toBe(flag);
+    }
   });
 });
