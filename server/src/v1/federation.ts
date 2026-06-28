@@ -1164,7 +1164,9 @@ async function handleSync(
     node_id,
     events: parsedEvents,
   };
-  if (cursor !== undefined && parsedCursor) signedPayload.cursor = parsedCursor;
+  if (cursor !== undefined && cursor !== null && parsedCursor) {
+    signedPayload.cursor = parsedCursor;
+  }
   if (typeof idempotency_key === "string") signedPayload.idempotency_key = idempotency_key;
 
   if (!verifyOperator(deps, action, signedPayload, operator_signature)) {
