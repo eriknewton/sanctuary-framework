@@ -154,7 +154,7 @@ export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boo
 }
 
 function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
-  if (!deps.authToken) return true;
+  if (!deps.authToken) return false;
   const token = extractToken(req, url);
   return token !== null && constantTimeEquals(token, deps.authToken);
 }
@@ -369,7 +369,10 @@ export async function handleRequest(
 
   // ── Auth (all routes) ───────────────────────────────────────────────
   const isFoldedReadAuxiliary =
-    method === "GET" && (path === "/api/status" || path === "/api/pending");
+    method === "GET" &&
+    (path === "/api/status" ||
+      path === "/api/pending" ||
+      path === "/api/stream");
   const authorized = isFoldedReadAuxiliary
     ? isAuthorizedForRead(deps, req, url)
     : isAuthorized(deps, req, url);
@@ -426,7 +429,7 @@ export async function handleRequest(
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")
   ) {
     const snapshot = await getProtectionSnapshot(deps.sources);
-    const html = renderDashboardHTML({ snapshot, authToken: deps.authToken });
+    const html = renderDashboardHTML({ snapshot });
     writeText(res, 200, html, "text/html; charset=utf-8");
     return true;
   }

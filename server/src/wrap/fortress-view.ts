@@ -493,6 +493,7 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     // ── State ───────────────────────────────────────────────────────
     const API_BASE = window.location.origin;
     const SESSION_TOKEN = sessionStorage.getItem('sanctuary_session') || '';
+    let AUTH_TOKEN = sessionStorage.getItem('authToken') || '';
     const MAX_FEED_ITEMS = 50;
 
     let feedItems = [];
@@ -507,6 +508,34 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     // 'unknown' (unproven, amber) | 'not_installed' (amber) | 'unavailable'
     // (posture endpoint unreachable/erroring, treated as unknown, amber).
     let wallArmState = 'unknown';
+
+    function operatorAuthHeaders(extra) {
+      const headers = Object.assign({}, extra || {});
+      if (AUTH_TOKEN) {
+        headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;
+      }
+      return headers;
+    }
+
+    function promptForOperatorToken() {
+      const entered = window.prompt('Operator token required for this action.');
+      if (!entered || !entered.trim()) return false;
+      AUTH_TOKEN = entered.trim();
+      sessionStorage.setItem('authToken', AUTH_TOKEN);
+      return true;
+    }
+
+    async function strictMutationFetch(path, init) {
+      const request = init || {};
+      const send = () => fetch(API_BASE + path, Object.assign({}, request, {
+        headers: operatorAuthHeaders(request.headers),
+      }));
+      let response = await send();
+      if (response.status === 401 && promptForOperatorToken()) {
+        response = await send();
+      }
+      return response;
+    }
 
     // ── SSE Connection ──────────────────────────────────────────────
     function connectSSE() {
@@ -653,11 +682,14 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
     async function handleApproval(id, approved) {
       const endpoint = approved ? '/api/approve/' : '/api/deny/';
       try {
-        await fetch(API_BASE + endpoint + id, {
+        const response = await strictMutationFetch(endpoint + encodeURIComponent(id), {
           method: 'POST',
-          headers: SESSION_TOKEN ? { 'Authorization': 'Bearer ' + SESSION_TOKEN } : {},
         });
-        removePendingApproval(id);
+        if (response.ok) {
+          removePendingApproval(id);
+        } else {
+          console.error('Approval action failed:', response.status);
+        }
       } catch (err) {
         console.error('Approval action failed:', err);
       }

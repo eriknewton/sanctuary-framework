@@ -255,12 +255,14 @@ describe("renderDashboardHTML", () => {
     expect(html).toContain("\"server_version\":\"0.9.0-test\"");
   });
 
-  it("injects the auth token into the client bootstrap when provided", () => {
+  it("does not inject the auth token into the client bootstrap when provided", () => {
     const html = renderDashboardHTML({
       snapshot: makeSnapshot(),
       authToken: "tok-abc",
     });
-    expect(html).toContain('AUTH_TOKEN = "tok-abc"');
+    expect(html).not.toContain("tok-abc");
+    expect(html).toContain('sessionStorage.getItem("authToken")');
+    expect(html).toContain("promptForOperatorToken");
   });
 
   it("does not construct long-lived token URLs for API calls or SSE", () => {

@@ -35,20 +35,20 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(html).not.toContain('data-route="recovery"');
   });
 
-  it("embeds dashboard config as a JSON script tag, not a sensitive token in markup", () => {
+  it("embeds dashboard config as a JSON script tag without serializing the bearer", () => {
     const html = renderDashboardV11Html({
       authToken: "session-token-xyz",
       identityId: "operator-001",
       fortressId: "fortress-001",
     });
-    // Auth token may be embedded for the inline client to use, but never
-    // appears in localStorage write paths.
+    expect(html).not.toContain("session-token-xyz");
     expect(html).not.toContain("localStorage");
     // Sovereignty preference is in-memory; sidebar collapse goes to
     // sessionStorage only. Confirm via the embedded client script.
     const client = getClientScript();
     expect(client).not.toContain("localStorage");
     expect(client).toContain("sessionStorage");
+    expect(client).toContain('sessionStorage.getItem("authToken")');
   });
 
   it("uses short-lived sessions, not long-lived token URLs, for SSE", () => {

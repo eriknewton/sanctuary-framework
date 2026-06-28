@@ -116,9 +116,18 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(401);
   });
 
-  it("rejects approve/deny when no approval handler is configured", async () => {
+  it("rejects approve/deny when no operator token is configured", async () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/api/approvals/abc/allow`, { method: "POST" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects approve/deny when no approval handler is configured", async () => {
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
+    });
     expect(res.status).toBe(503);
   });
 
@@ -126,13 +135,21 @@ describe("Dashboard HTTP API", () => {
     const allowed: string[] = [];
     const denied: string[] = [];
     handle = await startForTest({
+      authToken: "secret-xyz",
       approvals: {
         allow: async (id: string) => { allowed.push(id); return true; },
         deny: async (id: string) => { denied.push(id); return true; },
       },
     });
-    const a = await fetch(`${handle.url}/api/approvals/abc/allow`, { method: "POST" });
-    const d = await fetch(`${handle.url}/api/approvals/xyz/deny`, { method: "POST" });
+    const auth = { Authorization: "Bearer secret-xyz" };
+    const a = await fetch(`${handle.url}/api/approvals/abc/allow`, {
+      method: "POST",
+      headers: auth,
+    });
+    const d = await fetch(`${handle.url}/api/approvals/xyz/deny`, {
+      method: "POST",
+      headers: auth,
+    });
     expect(a.status).toBe(200);
     expect(d.status).toBe(200);
     expect(allowed).toEqual(["abc"]);
@@ -313,6 +330,7 @@ describe("Dashboard HTTP API", () => {
     const leakyMessage =
       "ENOENT: /Users/eriknewton/secret/path/.sanctuary/state at innerHandler";
     handle = await startForTest({
+      authToken: "secret-xyz",
       approvals: {
         allow: async () => {
           throw new Error(leakyMessage);
@@ -322,6 +340,7 @@ describe("Dashboard HTTP API", () => {
     });
     const res = await fetch(`${handle.url}/api/approvals/abc/allow`, {
       method: "POST",
+      headers: { Authorization: "Bearer secret-xyz" },
     });
     expect(res.status).toBe(500);
     const raw = await res.text();

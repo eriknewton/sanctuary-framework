@@ -2015,6 +2015,35 @@ export function generateDashboardHTML(options: {
       }
     }
 
+    function currentOperatorToken() {
+      return sessionStorage.getItem('authToken') || AUTH_TOKEN;
+    }
+
+    function promptForOperatorToken() {
+      const entered = (window.prompt('Operator token required for this action.') || '').trim();
+      if (!entered) return false;
+      sessionStorage.setItem('authToken', entered);
+      return true;
+    }
+
+    async function strictMutationFetch(endpoint, init) {
+      const request = init || {};
+      const send = () => {
+        const headers = Object.assign({}, request.headers || {});
+        const token = currentOperatorToken();
+        if (token) {
+          headers['Authorization'] = 'Bearer ' + token;
+        }
+        return fetch(API_BASE + endpoint, Object.assign({}, request, { headers: headers }));
+      };
+
+      let response = await send();
+      if (response.status === 401 && promptForOperatorToken()) {
+        response = await send();
+      }
+      return response;
+    }
+
     function redirectToLogin() {
       sessionStorage.removeItem('authToken');
       window.location.href = '/';
@@ -2789,19 +2818,13 @@ export function generateDashboardHTML(options: {
       payload[feature] = { enabled: enabled };
 
       try {
-        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        const response = await strictMutationFetch('/api/sovereignty-profile', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(payload),
         });
-
-        if (response.status === 401) {
-          redirectToLogin();
-          return;
-        }
 
         if (response.ok) {
           const data = await response.json();
@@ -2857,10 +2880,9 @@ export function generateDashboardHTML(options: {
     document.querySelectorAll('#config-injection_detection .sensitivity-option').forEach(function(btn) {
       btn.addEventListener('click', async function() {
         const sensitivity = this.getAttribute('data-sensitivity');
-        const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+        const response = await strictMutationFetch('/api/sovereignty-profile', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ injection_detection: { sensitivity: sensitivity } }),
@@ -2882,10 +2904,9 @@ export function generateDashboardHTML(options: {
     // Context gating policy selector handler
     document.getElementById('config-context-policy').addEventListener('change', async function() {
       const policyId = this.value;
-      const response = await fetch(API_BASE + '/api/sovereignty-profile', {
+      const response = await strictMutationFetch('/api/sovereignty-profile', {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer ' + AUTH_TOKEN,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ context_gating: { policy_id: policyId } }),
@@ -3024,10 +3045,9 @@ export function generateDashboardHTML(options: {
       current.push(serverConfig);
 
       try {
-        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+        const resp = await strictMutationFetch('/api/proxy/servers', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ upstream_servers: current }),
@@ -3049,10 +3069,9 @@ export function generateDashboardHTML(options: {
       const updated = proxyServers.filter(s => s.name !== serverName);
 
       try {
-        const resp = await fetch(API_BASE + '/api/proxy/servers', {
+        const resp = await strictMutationFetch('/api/proxy/servers', {
           method: 'POST',
           headers: {
-            'Authorization': 'Bearer ' + AUTH_TOKEN,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ upstream_servers: updated }),

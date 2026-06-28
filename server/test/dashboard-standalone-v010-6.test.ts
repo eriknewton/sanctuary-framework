@@ -466,4 +466,27 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
       });
     });
   });
+
+  describe("legacy dashboard strict profile/proxy mutations use the operator bearer", () => {
+    const html = generateDashboardHTML({
+      timeoutSeconds: 60,
+      serverVersion: "strict-mutation-test",
+      loopbackAutoAuth: true,
+    } as Parameters<typeof generateDashboardHTML>[0]);
+
+    it("routes strict POST clients through the prompt-and-retry helper", () => {
+      expect(html).toContain("async function strictMutationFetch(endpoint, init)");
+      expect(html).toContain("function promptForOperatorToken()");
+      expect(html).toContain("if (response.status === 401 && promptForOperatorToken())");
+      expect(html).toContain("headers['Authorization'] = 'Bearer ' + token;");
+
+      const profilePosts = html.match(/strictMutationFetch\('\/api\/sovereignty-profile', \{\s*method: 'POST'/g) ?? [];
+      const proxyPosts = html.match(/strictMutationFetch\('\/api\/proxy\/servers', \{\s*method: 'POST'/g) ?? [];
+      expect(profilePosts.length, "profile mutations must use strictMutationFetch").toBeGreaterThanOrEqual(3);
+      expect(proxyPosts.length, "proxy mutations must use strictMutationFetch").toBeGreaterThanOrEqual(2);
+
+      expect(html).not.toMatch(/fetch\(API_BASE \+ '\/api\/sovereignty-profile', \{\s*method: 'POST'/);
+      expect(html).not.toMatch(/fetch\(API_BASE \+ '\/api\/proxy\/servers', \{\s*method: 'POST'/);
+    });
+  });
 });

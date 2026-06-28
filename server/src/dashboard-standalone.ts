@@ -22,6 +22,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
@@ -456,9 +457,10 @@ export async function startStandaloneDashboard(
   const dashboardHost = options.host ?? config.dashboard.host;
 
   let authToken = config.dashboard.auth_token;
-  if (authToken === "auto") {
-    const { randomBytes } = await import("node:crypto");
+  let generatedParkAuthToken = false;
+  if (authToken === "auto" || (options.allowPark && !authToken)) {
     authToken = randomBytes(32).toString("hex");
+    generatedParkAuthToken = true;
   }
 
   // 8. Create the dashboard channel. Constructed BEFORE the master-key-derived
@@ -557,6 +559,11 @@ export async function startStandaloneDashboard(
     console.error(`Storage: ${config.storage_path}`);
     console.error(`State: LOCKED (awaiting operator unlock; no master key held).`);
     console.error(`Listening: http://${dashboardHost}:${dashboardPort}`);
+    if (generatedParkAuthToken && authToken) {
+      // SAFETY: stderr is the operator-facing CLI channel for this generated unlock token.
+      console.error(`Operator token: ${authToken}`);
+    }
+    // SAFETY: stderr is the operator-facing CLI channel for parked-start guidance.
     console.error(
       `The read surface is dark until you unlock. The process will stay up\n` +
       `(parked) across restarts; it does NOT auto-unlock.`,
