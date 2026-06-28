@@ -704,6 +704,74 @@ describe("Fortress endpoints authorization (Test 8)", () => {
   });
 });
 
+describe("Fortress custody endpoints require bearer under loopback auto-auth", () => {
+  let rig: TestRig;
+  beforeEach(async () => {
+    rig = await startRig({
+      agentIds: ["agent-alpha"],
+      authConfig: { loopbackAutoAuth: true, authToken: "operator-token" },
+    });
+  });
+  afterEach(async () => rig.stop());
+
+  it("rejects tokenless loopback POSTs to canonical fortress custody routes", async () => {
+    for (const path of [
+      `${HUB_API_PREFIX}/fortress/lockdown`,
+      `${HUB_API_PREFIX}/fortress/exit-bundle/export`,
+    ]) {
+      const res = await fetch(`${rig.url}${path}`, { method: "POST" });
+      expect(res.status).toBe(401);
+    }
+    expect(rig.fortressExportCalls).toBe(0);
+  });
+
+  it("rejects session or cookie without bearer on fortress custody routes", async () => {
+    const lockdown = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/lockdown?session=short-lived`,
+      {
+        method: "POST",
+        headers: { Cookie: "sanctuary_session=short-lived" },
+      },
+    );
+    expect(lockdown.status).toBe(401);
+
+    const exported = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/exit-bundle/export?session=short-lived`,
+      {
+        method: "POST",
+        headers: { Cookie: "sanctuary_session=short-lived" },
+      },
+    );
+    expect(exported.status).toBe(401);
+    expect(rig.fortressExportCalls).toBe(0);
+  });
+
+  it("accepts the valid bearer and reaches both fortress custody handlers", async () => {
+    const lockdown = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/lockdown`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(lockdown.status).toBe(202);
+
+    const exported = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/fortress/exit-bundle/export`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(exported.status).toBe(202);
+    expect(rig.fortressExportCalls).toBe(0);
+  });
+
+  it("also rejects tokenless loopback POSTs to the /agents/all fortress aliases", async () => {
+    for (const path of [
+      `${HUB_API_PREFIX}/agents/all/lockdown`,
+      `${HUB_API_PREFIX}/agents/all/exit-bundle/export`,
+    ]) {
+      const res = await fetch(`${rig.url}${path}`, { method: "POST" });
+      expect(res.status).toBe(401);
+    }
+  });
+});
+
 describe("Fortress endpoints sentinel /agents/all alias (Test 9)", () => {
   let rig: TestRig;
   beforeEach(async () => {

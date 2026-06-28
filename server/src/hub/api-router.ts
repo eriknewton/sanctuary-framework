@@ -274,6 +274,30 @@ function isHubApprovalDecisionPath(path: string): boolean {
   return match !== null && HUB_APPROVAL_DECISION_ACTIONS.has(match.action);
 }
 
+function isHubCustodyMutationPath(method: string, path: string): boolean {
+  if (method !== "POST") return false;
+  if (isHubApprovalDecisionPath(path)) return true;
+  if (
+    path === HUB_ROUTES.FORTRESS_LOCKDOWN ||
+    path === HUB_ROUTES.FORTRESS_EXIT_BUNDLE_EXPORT
+  ) {
+    return true;
+  }
+
+  const agentMatch = matchAgentRoute(path);
+  if (!agentMatch || agentMatch.remainder === null) return false;
+
+  if (
+    agentMatch.agentId === HUB_FORTRESS_AGENT_ID_SENTINEL &&
+    (agentMatch.remainder === "lockdown" ||
+      agentMatch.remainder === "exit-bundle/export")
+  ) {
+    return true;
+  }
+
+  return isHubAgentControlAction(agentMatch.remainder);
+}
+
 function isHubAgentControlAction(
   value: string,
 ): value is HubAgentControlAction {
@@ -313,19 +337,18 @@ export async function handleHubRoute(
   // Auth gate: first middleware on every matched route. Reuses console
   // auth middleware verbatim. No new auth path.
   //
-  // SECURITY (loopback-no-autoauth-for-approvals): `POST /api/hub/inbox/
-  // :id/approve` and `.../deny` resolve a pending approval (a Tier-1
-  // human-approval decision). They must ALWAYS require the operator
-  // bearer token, even on loopback with auto-auth on, so a co-resident
-  // agent sharing loopback cannot self-approve. Other hub routes
-  // (read-only lists, inbox dismiss, task/agent dispatch) keep loopback
-  // auto-auth. `requireToken` only suppresses the loopback shortcut;
-  // token validation is unchanged.
-  const isApprovalDecision =
-    method === "POST" && isHubApprovalDecisionPath(path);
+  // SECURITY (loopback-no-autoauth-for-custody): custody mutations must
+  // ALWAYS require the operator bearer token, even on loopback with auto-auth
+  // on, so a co-resident agent sharing loopback cannot trigger its own
+  // custody-changing route. The strict subset is hub approval decisions,
+  // fortress lockdown/export, and agent-control POSTs. Other hub routes
+  // (read-only lists, inbox dismiss, task dispatch, policy/template binds)
+  // keep the existing loopback auto-auth contract. `requireToken` only
+  // suppresses the loopback shortcut; token validation is unchanged.
+  const requiresOperatorBearer = isHubCustodyMutationPath(method, path);
   const checkAuth = authMiddleware(
     deps.authConfig,
-    isApprovalDecision ? { requireToken: true } : undefined,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
   );
   if (!checkAuth(req, res, url)) return true;
 
@@ -771,7 +794,8 @@ export async function handleHubRoute(
   } catch (err) {
     handleError(res, err, {
       operation: `${method} ${path}`,
-      suppressPublicDetail: isApprovalDecision,
+      suppressPublicDetail:
+        method === "POST" && isHubApprovalDecisionPath(path),
     });
     return true;
   }
