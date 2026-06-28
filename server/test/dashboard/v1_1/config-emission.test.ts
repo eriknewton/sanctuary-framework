@@ -37,7 +37,7 @@ describe("v1.1 dashboard config emission (Finding Y regression)", () => {
     expect(() => JSON.parse(inner)).not.toThrow();
   });
 
-  it("parsed config carries the five expected keys with original values", () => {
+  it("parsed config carries non-secret values and never serializes the bearer", () => {
     const html = renderDashboardV11Html({
       authToken: "tkn-abc-123",
       hubApiBase: "/api/hub",
@@ -47,11 +47,12 @@ describe("v1.1 dashboard config emission (Finding Y regression)", () => {
     });
     const inner = extractConfigBlock(html);
     const parsed = JSON.parse(inner) as Record<string, string>;
-    expect(parsed.authToken).toBe("tkn-abc-123");
+    expect(parsed.authToken).toBe("");
     expect(parsed.hubApiBase).toBe("/api/hub");
     expect(parsed.streamUrl).toBe("/api/stream");
     expect(parsed.identityId).toBe("operator-007");
     expect(parsed.fortressId).toBe("fortress-007");
+    expect(inner).not.toContain("tkn-abc-123");
   });
 
   it("config block contains literal quote characters, not HTML entities (locks in fix)", () => {

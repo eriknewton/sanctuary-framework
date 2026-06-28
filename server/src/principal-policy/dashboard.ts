@@ -491,11 +491,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *
    * SCOPE LIMIT (loopback-no-autoauth-for-approvals): this unlock covers
    * read-only and local-dashboard convenience routes ONLY. It does NOT
-   * cover the human-approval ACTION. Every state-changing approval-
-   * decision route always requires the operator bearer token (or a valid
-   * session) regardless of origin, even on loopback with auto-auth
-   * enabled. The covered decision routes are:
+   * cover the human-approval ACTION or operator-state mutation. Every
+   * state-changing decision/mutation route always requires the operator
+   * bearer token regardless of origin, even on loopback with auto-auth
+   * enabled. The covered routes include:
    *   - POST `/api/approve/:id`, POST `/api/deny/:id` (legacy dashboard)
+   *   - POST `/api/unlock`, `/api/sovereignty-profile`, `/api/proxy/servers`
    *   - POST `/api/hub/inbox/:id/{approve,deny}` (v1.1 hub inbox)
    *   - POST `/api/approval-inbox/:id/{approve,deny}` (cross-harness)
    *   - POST `/api/inbox/unified/:id/resolve` (unified inbox)
@@ -1078,7 +1079,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // so the operator's browser works and a tokenless non-browser caller is
     // 401'd. checkAuth writes the 401 itself when it fails.
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
-    if (!this.checkAuth(req, url, res)) return true;
+    if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
     return handleDistressRoute({ inbox: this.distressInbox }, req, res);
   }
 
@@ -2896,12 +2897,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // ── Authentication ──────────────────────────────────────────────────
 
   /**
-   * Verify bearer token authentication.
+   * Verify dashboard authentication.
    *
    * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
    * header - never in URL query strings. For SSE and page loads that cannot
    * set headers, a short-lived session token (obtained via POST /auth/session)
-   * is accepted via ?session= query parameter.
+   * is accepted via ?session= query parameter only when the caller explicitly
+   * opts into session auth.
+   *
+   * `requireToken` is the Tier-1/state-mutation chokepoint: it fails closed
+   * when no token is configured and accepts only a valid operator bearer. It
+   * never accepts loopback auto-auth, ?session=, or sanctuary_session cookies.
    *
    * Returns true if auth passes, false if blocked (response already sent).
    */
@@ -2909,21 +2915,32 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     req: IncomingMessage,
     url: URL,
     res: ServerResponse,
-    opts?: { requireToken?: boolean },
+    opts?: { requireToken?: boolean; allowSession?: boolean },
   ): boolean {
-    if (!this.authToken) return true; // Auth disabled
+    const deny = (): false => {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return false;
+    };
 
-    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment.
-    //
-    // SCOPE LIMIT (loopback-no-autoauth-for-approvals): `requireToken`
-    // suppresses this shortcut so a state-changing approval decision
-    // (POST /api/approve/:id, /api/deny/:id) always requires the operator
-    // bearer token (or a valid session), even on loopback with auto-auth
-    // on. The co-resident agent shares loopback, so origin is not a proxy
-    // for operator identity for a Tier-1 release. Header/session/cookie
-    // validation below is unchanged.
+    const authHeader = req.headers.authorization;
+    const parts = authHeader?.split(" ");
+    const hasValidBearer =
+      !!this.authToken &&
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken);
+
+    if (opts?.requireToken) {
+      return hasValidBearer || deny();
+    }
+
+    if (!this.authToken) return true; // Auth disabled for non-strict routes.
+
+    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
+    // routes return above before this shortcut, so loopback can never release
+    // a Tier-1 decision or mutate operator state by network position alone.
     if (
-      !opts?.requireToken &&
       this._autoAuthLocalhost &&
       this.isLoopbackRequest(req)
     ) {
@@ -2931,29 +2948,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // Check Authorization: Bearer <token> header (primary auth method)
-    const authHeader = req.headers.authorization;
-    if (authHeader) {
-      const parts = authHeader.split(" ");
-      if (
-        parts.length === 2 &&
-        parts[0] === "Bearer" &&
-        constantTimeEquals(parts[1]!, this.authToken)
-      ) {
+    if (hasValidBearer) {
+      return true;
+    }
+
+    // SEC-012: Check ?session= query parameter for short-lived session tokens.
+    // This replaces the old ?token= query parameter that exposed the long-lived
+    // token, but only safe read/SSE routes opt into this branch.
+    if (opts?.allowSession) {
+      const sessionId = url.searchParams.get("session");
+      if (sessionId && this.validateSession(sessionId)) {
         return true;
       }
-    }
 
-    // SEC-012: Check ?session= query parameter for short-lived session tokens
-    // This replaces the old ?token= query parameter that exposed the long-lived token
-    const sessionId = url.searchParams.get("session");
-    if (sessionId && this.validateSession(sessionId)) {
-      return true;
-    }
-
-    // Check sanctuary_session cookie (set by login page flow)
-    const cookieSession = this.parseCookie(req, "sanctuary_session");
-    if (cookieSession && this.validateSession(cookieSession)) {
-      return true;
+      // Check sanctuary_session cookie (set by login page flow)
+      const cookieSession = this.parseCookie(req, "sanctuary_session");
+      if (cookieSession && this.validateSession(cookieSession)) {
+        return true;
+      }
     }
 
     // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
@@ -2961,9 +2973,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // For GET / requests from browsers, serve login page instead of JSON 401
     // (checked in handleRequest before checkAuth is called for this path)
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized - use Authorization: Bearer header or a valid session" }));
-    return false;
+    return deny();
   }
 
   /**
@@ -3632,7 +3642,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // "unwired".)
     if (method === "GET" && url.pathname === "/api/readiness") {
       if (!this.checkRateLimit(req, res, "general")) return;
-      if (!this.checkAuth(req, url, res)) return;
+      if (!this.checkAuth(req, url, res, { allowSession: true })) return;
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
@@ -3702,22 +3712,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Authenticate all other non-OPTIONS requests.
     //
-    // SECURITY (loopback-no-autoauth-for-approvals): the legacy approval
-    // DECISION routes (POST /api/approve/:id, POST /api/deny/:id) release
-    // a Tier-1 op, so they always require the operator token even on
-    // loopback with auto-auth on - a co-resident agent sharing loopback
-    // must not be able to self-approve. All other legacy routes keep the
-    // loopback auto-auth convenience.
-    const isLegacyApprovalDecision =
+    // SECURITY: legacy decision/state-mutation routes require the operator
+    // bearer token even on loopback. A co-resident agent sharing loopback must
+    // not be able to release Tier-1 approvals or mutate operator configuration
+    // with a short-lived session, cookie, or mere network position.
+    const isLegacyStrictMutation =
       method === "POST" &&
       (url.pathname.startsWith("/api/approve/") ||
-        url.pathname.startsWith("/api/deny/"));
+        url.pathname.startsWith("/api/deny/") ||
+        url.pathname === "/api/sovereignty-profile" ||
+        url.pathname === "/api/proxy/servers");
     if (
       !this.checkAuth(
         req,
         url,
         res,
-        isLegacyApprovalDecision ? { requireToken: true } : undefined,
+        isLegacyStrictMutation ? { requireToken: true } : { allowSession: true },
       )
     )
       return;

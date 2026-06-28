@@ -10,8 +10,7 @@
  * - One `render*` function per route/region; all consume the same in-memory
  *   `state` object.
  * - State is module-local. NEVER persisted to localStorage. The sidebar
- *   collapse flag is the one allowed sessionStorage entry per the binding
- *   addendum acceptance criterion 10.
+ *   collapse flag and operator-entered bearer token use sessionStorage only.
  *
  * NO localStorage anywhere. NO operator-typed direct chat command at v1.1
  * (free text routes to the concierge as a UI-side suggestion engine).
@@ -47,7 +46,7 @@ const HUB = config.hubApiBase || "/api/hub";
 const AUTO_TRIGGER = "/api/auto-trigger";
 const INBOX_PREFS = "/api/inbox/unified/prefs";
 const STREAM = config.streamUrl || "/api/stream";
-const TOKEN = config.authToken || "";
+let TOKEN = config.authToken || sessionStorage.getItem("authToken") || "";
 const SANCTUARY_VERSION = config.sanctuaryVersion || "";
 const SESSION_KEY = "sanctuary-v11-sidebar";
 
@@ -170,6 +169,14 @@ function shortTime(iso) {
   return month + " " + day + ", " + hh + ":" + mm;
 }
 
+function promptForOperatorToken() {
+  const entered = window.prompt("Operator token required for this action.");
+  if (!entered || !entered.trim()) return false;
+  TOKEN = entered.trim();
+  sessionStorage.setItem("authToken", TOKEN);
+  return true;
+}
+
 async function api(path, opts) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
@@ -200,7 +207,11 @@ async function api(path, opts) {
   if (method === "GET") {
     url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
-  const res = await fetch(url, init);
+  let res = await fetch(url, init);
+  if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
+    init.headers["Authorization"] = "Bearer " + TOKEN;
+    res = await fetch(url, init);
+  }
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
   if (!res.ok) {

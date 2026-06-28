@@ -215,7 +215,6 @@ export async function dispatchV11Request(
         identityId: bindings.identityId,
         fortressId: bindings.fortressId,
         ...(bindings.storagePath ? { tenantName: tenantNameFromStoragePath(bindings.storagePath) } : {}),
-        ...(authToken !== undefined ? { authToken } : {}),
       },
       req,
       res,

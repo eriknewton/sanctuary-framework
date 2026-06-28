@@ -665,8 +665,17 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 <script>
 (() => {
   const INITIAL_SNAPSHOT = ${initialSnapshot};
-  const AUTH_TOKEN = ${options.authToken ? JSON.stringify(options.authToken) : "null"};
-  const AUTH_HEADER = AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
+  let AUTH_TOKEN = sessionStorage.getItem("authToken") || "";
+  function authHeader() {
+    return AUTH_TOKEN ? { "Authorization": "Bearer " + AUTH_TOKEN } : {};
+  }
+  function promptForOperatorToken() {
+    const entered = window.prompt("Operator token required for this action.");
+    if (!entered || !entered.trim()) return false;
+    AUTH_TOKEN = entered.trim();
+    sessionStorage.setItem("authToken", AUTH_TOKEN);
+    return true;
+  }
 
   let snapshot = INITIAL_SNAPSHOT;
 
@@ -796,9 +805,14 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         const action = btn.dataset.action;
         btn.disabled = true;
         try {
-          await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
-            method: "POST", headers: AUTH_HEADER
+          let response = await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
+            method: "POST", headers: authHeader()
           });
+          if (response.status === 401 && promptForOperatorToken()) {
+            response = await fetch("/api/approvals/" + encodeURIComponent(id) + "/" + action, {
+              method: "POST", headers: authHeader()
+            });
+          }
         } catch {}
         await refreshSnapshot();
       });
@@ -817,7 +831,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 
   async function refreshSnapshot() {
     try {
-      const res = await fetch("/api/snapshot", { headers: AUTH_HEADER });
+      const res = await fetch("/api/snapshot", { headers: authHeader() });
       if (!res.ok) return;
       const snap = await res.json();
       renderAll(snap);
@@ -826,7 +840,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
 
   async function createSessionQuery() {
     if (!AUTH_TOKEN) return "";
-    const res = await fetch("/auth/session", { method: "POST", headers: AUTH_HEADER });
+    const res = await fetch("/auth/session", { method: "POST", headers: authHeader() });
     if (!res.ok) throw new Error("session_exchange_failed");
     const body = await res.json();
     if (!body || !body.session_id || body.session_id === "no-auth") return "";

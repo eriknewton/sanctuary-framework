@@ -19,7 +19,7 @@
  * parks (the supervised LaunchAgent scenario). No mocks of custody.
  */
 
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { startStandaloneDashboard } from "../src/dashboard-standalone.js";
 import { DashboardApprovalChannel } from "../src/principal-policy/dashboard.js";
 import {
@@ -121,6 +121,40 @@ describe("Slice 2: park-not-exit (server lifecycle)", () => {
     expect(healthBody.ok).toBe(true);
     expect(healthBody).toHaveProperty("instance");
     expect(healthBody).toHaveProperty("since");
+  });
+
+  it("--allow-park auto-generates and stderr-surfaces an operator token for unlock", async () => {
+    await seedWrappedFortress(storagePath);
+    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await startOnFreePort({ host: "127.0.0.1", allowPark: true });
+      dashboard = result.dashboard;
+      const output = stderr.mock.calls.map((call) => call.join(" ")).join("\n");
+      const tokenMatch = output.match(/Operator token: ([a-f0-9]{64})/);
+      expect(tokenMatch).not.toBeNull();
+      const token = tokenMatch![1]!;
+
+      const tokenless = await fetch(`http://127.0.0.1:${result.port}/api/unlock`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passphrase: PASSPHRASE }),
+      });
+      expect(tokenless.status).toBe(401);
+
+      const unlock = await fetch(`http://127.0.0.1:${result.port}/api/unlock`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ passphrase: PASSPHRASE }),
+      });
+      expect(unlock.status).toBe(200);
+      expect((await unlock.json()).unlocked).toBe(true);
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it("reports readiness ready:'locked' while parked (no master key, no identity manager)", async () => {

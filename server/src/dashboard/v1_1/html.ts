@@ -1325,7 +1325,10 @@ function escHtml(value: unknown): string {
 export function renderDashboardV11Html(
   options: DashboardV11HtmlOptions = {},
 ): string {
-  const authToken = options.authToken ?? "";
+  // The operator bearer must never be serialized into the HTML body. The
+  // client reads an operator-entered token from sessionStorage when needed.
+  void options.authToken;
+  const authToken = "";
   const hubApiBase = options.hubApiBase ?? "/api/hub";
   const streamUrl = options.streamUrl ?? "/api/stream";
   const identityId = options.identityId ?? "operator";
