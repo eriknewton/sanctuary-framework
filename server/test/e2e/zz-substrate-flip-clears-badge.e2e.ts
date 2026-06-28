@@ -61,6 +61,19 @@ test.describe("Finding ZZ: substrate flip clears recent-failures expansion in SP
     // failure so the expansion renders on first paint. Pick phi-4-mini
     // for the local target so it matches the stubbed Ollama
     // `phi4-mini:latest` (rc.6 tag-asymmetry exercise).
+    // Present the operator bearer the way production does: the
+    // operator-entered token lives in sessionStorage and `client.ts`
+    // attaches it to every fetch as `Authorization: Bearer <token>`. The
+    // substrate flip is a state MUTATION (it rebinds model routing and
+    // persists config), so the hardened hub gate (#800/#801, #806
+    // default-deny on mutation) requires the bearer even on loopback.
+    // `addInitScript` runs before any page script, so `TOKEN` is read
+    // from sessionStorage on SPA module load. GET reads keep loopback
+    // auto-auth, so we do not weaken the gate to make the test pass.
+    await page.addInitScript((token) => {
+      window.sessionStorage.setItem("authToken", token);
+    }, dashboard.authToken);
+
     await dashboard.selector.setPerSurfaceChoice("concierge", "venice");
     await dashboard.selector.setLocalModelPick("concierge", "phi-4-mini");
     dashboard.selector.recordRecentFailureForTest(
@@ -173,6 +186,14 @@ test.describe("Finding ZZ: substrate flip clears recent-failures expansion in SP
     page,
     dashboard,
   }) => {
+    // Present the operator bearer the way production does (see Scenario
+    // A): the bulk-flip "Apply to all surfaces" POST is a state mutation,
+    // so the hardened gate requires the bearer the SPA attaches from
+    // sessionStorage.
+    await page.addInitScript((token) => {
+      window.sessionStorage.setItem("authToken", token);
+    }, dashboard.authToken);
+
     await dashboard.selector.setPerSurfaceChoice("concierge", "venice");
     await dashboard.selector.setPerSurfaceChoice("sentinel-scoring", "venice");
     dashboard.selector.recordRecentFailureForTest(
