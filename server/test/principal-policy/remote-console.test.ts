@@ -152,6 +152,21 @@ describe("C1: Remote Operator Console", () => {
       );
       expect(loopbackResp.status).toBe(200);
 
+      // FIX 1: a cross-host browser fleet probe (different Origin) must be able
+      // to read /api/health, so the response carries an ACAO header reflecting
+      // the request Origin, and NEVER credentialed cross-origin access.
+      const crossOriginProbe = await requestNoKeepAlive(
+        `http://127.0.0.1:${port}/api/health`,
+        { headers: { Origin: "https://100.64.0.9:3501" } }
+      );
+      expect(crossOriginProbe.status).toBe(200);
+      expect(crossOriginProbe.headers["access-control-allow-origin"]).toBe(
+        "https://100.64.0.9:3501"
+      );
+      expect(
+        crossOriginProbe.headers["access-control-allow-credentials"]
+      ).toBeUndefined();
+
       // Authenticated request should pass
       const authedResp = await requestNoKeepAlive(
         `http://127.0.0.1:${port}/api/status`,
@@ -179,6 +194,28 @@ describe("C1: Remote Operator Console", () => {
       expect(resp.body).toContain("Fleet Switcher");
       expect(resp.body).toContain("sanctuary_fleet_machines");
       expect(resp.body).toContain("addMachine");
+    });
+
+    it("FIX 2: the Open Console link is a same-tab navigation, not a popup-blockable new-tab link", async () => {
+      let port: number = 0;
+      await bindWithRetry(async () => {
+        port = randomTestPort();
+        dashboard = new DashboardApprovalChannel({
+          port,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+        });
+        await dashboard.start();
+      });
+
+      const resp = await requestNoKeepAlive(`http://127.0.0.1:${port}/fleet`);
+      expect(resp.status).toBe(200);
+      // Open Console must remain an obvious, accessible anchor...
+      expect(resp.body).toContain('class="btn-open">Open Console</a>');
+      // ...but a plain same-tab navigation: no target="_blank" that the
+      // browser blocked as a popup in the drill.
+      expect(resp.body).toContain('<a href="${m.url}" class="btn-open">');
+      expect(resp.body).not.toContain('target="_blank"');
     });
 
     it("fleet page is exempt from rate limiting (view route)", async () => {

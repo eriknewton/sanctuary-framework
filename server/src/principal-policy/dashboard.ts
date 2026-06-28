@@ -1361,14 +1361,59 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * to the existing v1.1 / legacy dispatch ladder.
    */
   private dispatchRootPosture(
+    req: IncomingMessage,
     res: ServerResponse,
     url: URL,
     method: string,
   ): boolean {
+    // The SPA view routes whose static shell fetches its data client-side from
+    // checkAuth-gated JSON routes: the posture shell (`/`, `/posture`) and the
+    // v1.1 dashboard SPA aliases (`/dashboard`, `/v1.1`).
+    const isPostureShellPath =
+      url.pathname === "/" || url.pathname === POSTURE_HOME_PATH;
+    const isV11SpaAlias =
+      url.pathname === "/dashboard" ||
+      url.pathname === "/v1.1" ||
+      url.pathname === "/v1.1/";
+    if (method !== "GET" || (!isPostureShellPath && !isV11SpaAlias)) {
+      return false;
+    }
+
+    // C1 remote login affordance: these shells are STATIC pages that fetch
+    // `/api/posture/*` (and the v1.1 hub API) client-side for every byte of
+    // data, and those JSON routes stay behind checkAuth.
+    //
+    // On a LOOPBACK bind the static shell is served tokenless BY DESIGN (the
+    // `/` == `/posture` one-surface contract): a local operator either has
+    // loopback auto-auth after a terminal unlock, or pastes a token into the
+    // shell's own client-side flow, so `/` must keep serving the shell. That
+    // local contract is left exactly as-is.
+    //
+    // On a REMOTE (non-loopback) bind there is NO loopback auto-auth, so an
+    // unauthenticated browser's every data fetch 401s and the shell renders
+    // empty with NO way to enter a token (the drill defect). So ONLY for a
+    // remote binding, when an auth token is required AND this caller is not yet
+    // authenticated, serve the login page (the SAME page `/v1.0` already serves
+    // for its unauthenticated branch) so the operator gets a token box. This is
+    // purely a presentation affordance: it adds NO new auth path and weakens
+    // nothing - the data routes still require a valid token; this only OFFERS
+    // the login box instead of a blank shell. An already-authenticated remote
+    // caller (`isAuthenticated` true: bearer/session/cookie) falls through to
+    // the shell.
     if (
-      method !== "GET" ||
-      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+      this.isRemoteBinding() &&
+      this.authToken &&
+      !this.isAuthenticated(req, url)
     ) {
+      this.serveLoginPage(res);
+      return true;
+    }
+
+    // Authenticated (or no-auth) case: only the posture shell is owned here.
+    // The v1.1 SPA aliases keep their existing v1.1 HTML handler - fall through
+    // to dispatchV11 unchanged so authenticated `/dashboard` + `/v1.1` behavior
+    // does not change.
+    if (!isPostureShellPath) {
       return false;
     }
     res.writeHead(200, {
@@ -3151,7 +3196,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
     // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
     // the posture JSON API included) fall through untouched.
-    if (this.dispatchRootPosture(res, url, method)) return;
+    if (this.dispatchRootPosture(req, res, url, method)) return;
 
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
@@ -3431,10 +3476,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `{ ok, mode }` shape is the only contract the CLI health probe + external
     // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
-      res.writeHead(200, {
+      // C1 cross-host fleet probe: the `/fleet` switcher is served by ONE host
+      // and health-probes the others with `fetch(<remote>/api/health)`. The
+      // browser's same-origin policy blocks the response body unless the remote
+      // sends `Access-Control-Allow-Origin`, so without this header a reachable
+      // remote shows offline (red dot) in the switcher.
+      //
+      // SCOPE (security): this permissive ACAO is added ONLY to this endpoint,
+      // which is the UNAUTHENTICATED, O(1) liveness probe - it returns only
+      // `{ ok, mode, instance, since }` (no secrets, no posture, no auth state),
+      // so a cross-origin reader learns nothing it could not learn by connecting
+      // directly. We reflect the request Origin (falling back to `*`) but NEVER
+      // set `Access-Control-Allow-Credentials` here, so no cookie/bearer is ever
+      // sent or honored cross-origin (the reflected-origin + credentials combo
+      // is the CORS account-takeover pattern, and it is deliberately avoided).
+      // No authenticated/protected route carries cross-origin reflection; they
+      // keep the same-origin/same-port contract set in handleRequest().
+      const healthHeaders: Record<string, string> = {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
-      });
+        "Access-Control-Allow-Origin": req.headers.origin ?? "*",
+      };
+      res.writeHead(200, healthHeaders);
       // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
       // `since` restart-detection signal. NO `ready`/`supervisor` here -
       // those would be a co-resident-agent oracle on this unauthenticated

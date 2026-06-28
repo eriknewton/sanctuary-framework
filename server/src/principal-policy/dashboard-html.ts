@@ -3412,7 +3412,7 @@ export function generateFleetSwitcherHTML(options: {
               <div class="url">\${escapeHtml(m.url)}</div>
             </div>
             <div class="actions">
-              <a href="\${m.url}" target="_blank" rel="noopener" class="btn-open">Open Console</a>
+              <a href="\${m.url}" class="btn-open">Open Console</a>
               <button class="btn-remove" onclick="removeMachine('\${escapeHtml(m.url)}')">Remove</button>
             </div>
           </div>
