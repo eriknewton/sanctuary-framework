@@ -158,6 +158,24 @@ describe("Fortress View", () => {
     expect(html).toContain("/api/deny/");
   });
 
+  it("approval decisions use the operator bearer and only clear pending after server success", () => {
+    const html = generateFortressViewHTML({
+      serverVersion: "0.7.0",
+      upstreamServerCount: 1,
+    });
+
+    expect(html).toContain("let AUTH_TOKEN = sessionStorage.getItem('authToken') || '';");
+    expect(html).toContain("function promptForOperatorToken()");
+    expect(html).toContain("async function strictMutationFetch(path, init)");
+    expect(html).toContain("headers['Authorization'] = 'Bearer ' + AUTH_TOKEN;");
+    expect(html).toContain("if (response.status === 401 && promptForOperatorToken())");
+    expect(html).toMatch(
+      /const response = await strictMutationFetch\(endpoint \+ encodeURIComponent\(id\), \{\s*method: 'POST',\s*\}\);\s*if \(response\.ok\) \{\s*removePendingApproval\(id\);/
+    );
+
+    expect(html).not.toMatch(/await fetch\(API_BASE \+ endpoint \+ id[\s\S]{0,220}removePendingApproval\(id\);/);
+  });
+
   it("escapes HTML in version string", () => {
     const html = generateFortressViewHTML({
       serverVersion: "<script>alert(1)</script>",
