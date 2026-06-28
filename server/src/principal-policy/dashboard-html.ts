@@ -421,6 +421,23 @@ export function generateDashboardHTML(options: {
       font-weight: 500;
     }
 
+    .fleet-link {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--blue, #58a6ff);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      white-space: nowrap;
+    }
+
+    .fleet-link:hover {
+      border-color: var(--blue, #58a6ff);
+    }
+
     .status-dot {
       width: 8px;
       height: 8px;
@@ -1448,6 +1465,7 @@ export function generateDashboardHTML(options: {
     </div>
 
     <div class="status-bar-right">
+      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
       <div class="status-item">
         <strong id="protections-count">—</strong>
         <span>Protections</span>

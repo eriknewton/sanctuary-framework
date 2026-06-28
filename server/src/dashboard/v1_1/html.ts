@@ -155,6 +155,8 @@ body {
 .topbar { grid-area: topbar; display: flex; align-items: center; gap: var(--space-3); padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--surface); }
 .topbar .brand { font-family: var(--serif); font-size: var(--text-md); }
 .topbar .pills { display: flex; gap: 6px; flex: 1; }
+.topbar .fleet-link { font-size: var(--text-xs); color: var(--accent, #58a6ff); text-decoration: none; padding: 4px 10px; border: 1px solid var(--rule); border-radius: 6px; white-space: nowrap; }
+.topbar .fleet-link:hover { border-color: var(--accent, #58a6ff); }
 .pill {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 8px; border-radius: 12px; font-size: var(--text-xs);
@@ -1382,6 +1384,7 @@ export function renderDashboardV11Html(
         <span class="pill" data-pill="mode">mode: solo</span>
         <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
       </div>
+      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
       <button class="btn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
         <span class="icon-moon">${THEME_ICON_MOON}</span>
         <span class="icon-sun">${THEME_ICON_SUN}</span>

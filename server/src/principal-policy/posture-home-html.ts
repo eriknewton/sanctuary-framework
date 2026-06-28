@@ -145,8 +145,16 @@ export function renderPostureHomeHTML(): string {
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
   header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  .header-row { display: flex; align-items: flex-start; gap: 16px; }
+  .header-row .header-titles { flex: 1; min-width: 0; }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
   .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .fleet-link {
+    flex: none; align-self: center; color: var(--accent); font-size: 13px;
+    padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); white-space: nowrap;
+  }
+  .fleet-link:hover { border-color: var(--accent); text-decoration: none; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
   .banner {
     display: flex; flex-wrap: wrap; gap: 14px; padding: 16px;
@@ -229,12 +237,17 @@ export function renderPostureHomeHTML(): string {
 </head>
 <body>
 <header>
-  <h1>Sanctuary - Sovereignty Posture</h1>
-  <div class="sub" id="origin">Loading…</div>
-  <div class="conn" id="conn">
-    <span class="dot"></span>
-    <span id="conn-label">Connecting…</span>
-    <span class="updated" id="conn-updated"></span>
+  <div class="header-row">
+    <div class="header-titles">
+      <h1>Sanctuary - Sovereignty Posture</h1>
+      <div class="sub" id="origin">Loading…</div>
+      <div class="conn" id="conn">
+        <span class="dot"></span>
+        <span id="conn-label">Connecting…</span>
+        <span class="updated" id="conn-updated"></span>
+      </div>
+    </div>
+    <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
   </div>
 </header>
 <main>

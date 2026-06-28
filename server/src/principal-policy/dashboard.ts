@@ -3753,9 +3753,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     const sessionId = this.createSession();
     const ttlSeconds = Math.floor(this.sessionTTLMs / 1000);
+    // SameSite=Lax (not Strict): the Fleet Switcher is served by ONE host but
+    // its "Open Console" links navigate the SAME TAB to a DIFFERENT host's
+    // dashboard root. Under SameSite=Strict the browser withholds the session
+    // cookie on that cross-site top-level navigation, so a remote console the
+    // operator already authenticated re-prompts for the token on every visit
+    // even while the session is still valid (the C1 re-auth defect). Lax sends
+    // the cookie on top-level GET navigations (the Open Console click, a typed
+    // URL, a reload) so a still-valid session is reused without re-prompting.
+    //
+    // This does NOT weaken auth: Lax still withholds the cookie on cross-site
+    // SUBREQUESTS and cross-site POSTs, so the approval-decision routes
+    // (POST /api/approve/:id, /api/deny/:id) remain CSRF-safe — a cross-origin
+    // page cannot drive a state-changing decision off this cookie. A request
+    // with no valid token AND no valid session still gets the login page / 401
+    // (isAuthenticated / checkAuth are unchanged); only a genuinely-valid,
+    // unexpired session is reused. The TTL is unchanged — we reuse the existing
+    // session, we do not lengthen it.
     res.writeHead(200, {
       "Content-Type": "application/json",
-      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`,
+      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Lax; Max-Age=${ttlSeconds}`,
     });
     res.end(JSON.stringify({
       session_id: sessionId,
