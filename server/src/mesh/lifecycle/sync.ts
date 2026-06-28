@@ -2,7 +2,7 @@
  * Sync protocol (§3.2 + §3.5 delta) and Q6 agent-state-transfer.
  *
  * Sync rides the v0.1 `sync_request` / `sync_response` event types over
- * unicast direct streams. v0.1 ships a basic synchronous request/response —
+ * unicast direct streams. v0.1 ships a basic synchronous request/response -
  * the libp2p adapter (Follow-up #2) wires the actual transport; here we
  * provide the per-side handlers and a contract that the orchestrator wires
  * into its router.
@@ -26,7 +26,9 @@ import type {
   LocatorTableStore,
   NodeLifecycleEventLog,
   PolicyBundleStore,
+  PolicyBundleUpsertResult,
 } from "./local-state.js";
+import type { PolicyUpdatePayload, SignedEvent } from "../types.js";
 import type {
   SyncRequestPayload,
   SyncResponsePayload,
@@ -40,8 +42,12 @@ export interface SyncResponderState {
   policy_bundle: PolicyBundleStore;
   locator_table: LocatorTableStore;
   lifecycle_log: NodeLifecycleEventLog;
-  /** Canonical audit log — present only on the canonical-audit node. */
+  /** Canonical audit log - present only on the canonical-audit node. */
   audit_log?: CanonicalAuditLog;
+  on_policy_update?: (
+    evt: SignedEvent<PolicyUpdatePayload>,
+    result: PolicyBundleUpsertResult
+  ) => void;
 }
 
 export function buildSyncResponse(
@@ -51,7 +57,7 @@ export function buildSyncResponse(
   if (request.kind === "agent_state_transfer") {
     // The agent-state-transfer payload itself is added by a higher-level
     // call site (which holds the snapshot bytes + the wrapping key). The
-    // base sync response for this kind is structurally empty — the snapshot
+    // base sync response for this kind is structurally empty - the snapshot
     // attaches as `agent_state_wrapped` via a separate code path so this
     // pure function stays free of crypto state.
     return { kind: "agent_state_transfer" };
@@ -94,14 +100,14 @@ export function buildSyncResponse(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Q6 — agent-state-transfer wrapping
+// Q6 - agent-state-transfer wrapping
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
  * Derive the symmetric key under which an agent snapshot is wrapped during
  * migration (Q6). Both the source node (which encrypts) and the destination
  * node (which decrypts) derive this same key from the fortress-master secret
- * + the migration tuple — no transport-layer key exchange, no round-trip.
+ * + the migration tuple - no transport-layer key exchange, no round-trip.
  */
 export function deriveAgentStateTransferKey(params: {
   fortress_master_secret: Uint8Array;
@@ -124,7 +130,7 @@ export function deriveAgentStateTransferKey(params: {
 
 /**
  * Wrap a fortress-store snapshot for migration. The snapshot bytes are opaque to
- * federation — produced by the store's existing snapshot format (no schema
+ * federation - produced by the store's existing snapshot format (no schema
  * change required for Q6).
  */
 export function wrapAgentSnapshot(params: {
@@ -171,6 +177,7 @@ export function unwrapAgentSnapshot(params: {
 export interface ApplySyncResult {
   policy_applied: number;
   policy_older: number;
+  policy_rejected: number;
   locator_applied: number;
   locator_older: number;
   locator_conflicts: number;
@@ -190,6 +197,7 @@ export function applySyncResponse(
   const result: ApplySyncResult = {
     policy_applied: 0,
     policy_older: 0,
+    policy_rejected: 0,
     locator_applied: 0,
     locator_older: 0,
     locator_conflicts: 0,
@@ -199,8 +207,10 @@ export function applySyncResponse(
 
   for (const evt of response.policy_updates ?? []) {
     const r = state.policy_bundle.upsert(evt);
+    state.on_policy_update?.(evt, r);
     if (r === "applied") result.policy_applied++;
-    else result.policy_older++;
+    else if (r === "policy_version_replay") result.policy_older++;
+    else result.policy_rejected++;
   }
   for (const evt of response.locator_updates ?? []) {
     const r = state.locator_table.upsert(evt);

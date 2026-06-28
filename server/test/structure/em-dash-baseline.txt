@@ -175,7 +175,6 @@
 1	server/src/intelligence/substrates/local.ts
 9	server/src/mesh/audit-batch.ts
 4	server/src/mesh/envelope.ts
-10	server/src/mesh/failure-modes/detector.ts
 1	server/src/mesh/guardian/errors.ts
 1	server/src/mesh/guardian/guardian-roster.ts
 5	server/src/mesh/guardian/master-rotation.ts
@@ -185,7 +184,6 @@
 1	server/src/mesh/lifecycle/bootstrap-token.ts
 3	server/src/mesh/lifecycle/counters.ts
 13	server/src/mesh/lifecycle/file-stores.ts
-12	server/src/mesh/lifecycle/mesh-node.ts
 2	server/src/mesh/lifecycle/node-key-binding.ts
 2	server/src/mesh/recovery-flows/canonical-audit-promotion.ts
 2	server/src/mesh/recovery-flows/device-recovery.ts
@@ -206,7 +204,6 @@
 4	server/src/principal-policy/approval-channel.ts
 47	server/src/principal-policy/dashboard-html.ts
 5	server/src/principal-policy/gate.ts
-2	server/src/principal-policy/loader.ts
 2	server/src/principal-policy/tools.ts
 1	server/src/principal-policy/webhook.ts
 2	server/src/proxy/client-manager.ts

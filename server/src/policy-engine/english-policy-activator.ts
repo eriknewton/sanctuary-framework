@@ -58,7 +58,12 @@ import type {
   PrincipalPolicy,
   Tier2Config,
 } from "../principal-policy/types.js";
-import { enforceForcedTiers } from "../principal-policy/loader.js";
+import {
+  assertNoPrincipalPolicyDowngrade,
+  enforceForcedTiers,
+  PrincipalPolicyDowngradeError,
+  type PrincipalPolicyDowngrade,
+} from "../principal-policy/loader.js";
 import type {
   CompiledPolicy,
   CompiledPolicyRule,
@@ -110,11 +115,13 @@ export type ActivationFailure =
   | "policy_conflict_force_required"
   | "already_activated"
   | "invalid_rule"
+  | "policy_posture_downgrade_refused"
   | "policy_io_failed";
 
 export type RevocationFailure =
   | "draft_not_found"
   | "not_activated"
+  | "policy_posture_downgrade_refused"
   | "policy_io_failed";
 
 export type ActivationOutcome =
@@ -124,16 +131,23 @@ export type ActivationOutcome =
       reason: ActivationFailure;
       message: string;
       conflicts?: PolicyConflict[];
+      downgrades?: PrincipalPolicyDowngrade[];
     };
 
 export type RevocationOutcome =
   | { ok: true; updated_policy: PrincipalPolicy; record: PolicyDraftRecord }
-  | { ok: false; reason: RevocationFailure; message: string };
+  | {
+      ok: false;
+      reason: RevocationFailure;
+      message: string;
+      downgrades?: PrincipalPolicyDowngrade[];
+    };
 
 export const ENGLISH_POLICY_ACTIVATION_AUDIT_OPS = {
   ACTIVATED: "english_policy_activated",
   REVOKED: "english_policy_revoked",
   ACTIVATION_REFUSED: "english_policy_activation_refused",
+  POLICY_WRITE_REFUSED: "english_policy_write_refused",
   CONFLICT_DETECTED: "policy_conflict_detected",
   CONFLICT_ACKNOWLEDGED: "policy_conflict_acknowledged",
   FORCE_CONFLICT_USED: "policy_force_conflict_used",
@@ -260,6 +274,12 @@ export interface ActivateOptions {
   conflicts_acknowledged?: PolicyConflict[];
   force_conflict_ids?: string[];
 }
+
+type ActivatorPolicyWritePhase = "activate" | "revoke";
+
+type ActivatorPolicyWriteResult =
+  | { ok: true }
+  | { ok: false; downgrades: PrincipalPolicyDowngrade[] };
 
 export class EnglishPolicyActivator {
   private readonly store: PolicyActivationStore;
@@ -395,9 +415,9 @@ export class EnglishPolicyActivator {
       }
     }
     const preHash = canonicalPolicyHash(prePolicy);
-    let updatedPolicy: PrincipalPolicy;
+    let structuralPolicy: PrincipalPolicy;
     try {
-      updatedPolicy = applyRule(prePolicy, draft.compiled_rule);
+      structuralPolicy = applyRuleStructural(prePolicy, draft.compiled_rule);
     } catch (err) {
       return {
         ok: false,
@@ -405,9 +425,26 @@ export class EnglishPolicyActivator {
         message: err instanceof Error ? err.message : String(err),
       };
     }
+    const updatedPolicy = enforceForcedTiers(structuralPolicy);
 
     try {
-      await this.writePolicy(updatedPolicy);
+      const writeResult = await this.writePolicyWithDowngradeGate({
+        previousPolicy: prePolicy,
+        candidatePolicy: structuralPolicy,
+        policyToWrite: updatedPolicy,
+        draftId: draft.draft_id,
+        operatorId,
+        phase: "activate",
+      });
+      if (!writeResult.ok) {
+        const reason: ActivationFailure = "policy_posture_downgrade_refused";
+        return {
+          ok: false,
+          reason,
+          message: "policy activation would weaken the Principal Policy posture",
+          downgrades: writeResult.downgrades,
+        };
+      }
     } catch (err) {
       return {
         ok: false,
@@ -513,7 +550,21 @@ export class EnglishPolicyActivator {
       };
     }
     try {
-      await this.writePolicy(updatedPolicy);
+      const writeResult = await this.writePolicyWithDowngradeGate({
+        previousPolicy: prePolicy,
+        policyToWrite: updatedPolicy,
+        draftId: existing.draft.draft_id,
+        operatorId,
+        phase: "revoke",
+      });
+      if (!writeResult.ok) {
+        return {
+          ok: false,
+          reason: "policy_posture_downgrade_refused",
+          message: "policy revocation would weaken the Principal Policy posture",
+          downgrades: writeResult.downgrades,
+        };
+      }
     } catch (err) {
       return {
         ok: false,
@@ -591,6 +642,46 @@ export class EnglishPolicyActivator {
       status: "pending",
       fortress_id: this.fortressId,
     };
+  }
+
+  private async writePolicyWithDowngradeGate(params: {
+    previousPolicy: PrincipalPolicy;
+    candidatePolicy?: PrincipalPolicy;
+    policyToWrite: PrincipalPolicy;
+    draftId: string;
+    operatorId: string;
+    phase: ActivatorPolicyWritePhase;
+  }): Promise<ActivatorPolicyWriteResult> {
+    const candidates =
+      params.candidatePolicy === undefined
+        ? [params.policyToWrite]
+        : [params.candidatePolicy, params.policyToWrite];
+    for (const candidate of candidates) {
+      try {
+        assertNoPrincipalPolicyDowngrade(params.previousPolicy, candidate);
+      } catch (err) {
+        if (!(err instanceof PrincipalPolicyDowngradeError)) {
+          throw err;
+        }
+        await this.auditLog.append(
+          "l2",
+          ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED,
+          params.operatorId,
+          {
+            draft_id: params.draftId,
+            phase: params.phase,
+            reason: "policy_posture_downgrade_refused",
+            downgrade_fields: err.downgrades.map((d) => d.field),
+            downgrade_reasons: err.downgrades.map((d) => d.reason),
+            fortress_id: this.fortressId,
+          },
+          "failure",
+        );
+        return { ok: false, downgrades: err.downgrades };
+      }
+    }
+    await this.writePolicy(params.policyToWrite);
+    return { ok: true };
   }
 }
 

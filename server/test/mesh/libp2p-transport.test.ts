@@ -1,5 +1,5 @@
 /**
- * Sanctuary Federation Protocol v0.1 — libp2p Wire Adapter Tests.
+ * Sanctuary Federation Protocol v0.1 - libp2p Wire Adapter Tests.
  *
  * Real-shape tests for the WP-MVP-3 Follow-up #2 libp2p transport.
  *
@@ -100,7 +100,7 @@ function bootFortress() {
 
 /**
  * Boot a libp2p transport listening on an ephemeral loopback TCP port.
- * Uses a test-scoped node_id + fresh Ed25519 keypair — no fortress-master
+ * Uses a test-scoped node_id + fresh Ed25519 keypair - no fortress-master
  * / cert chain needed because these tests exercise the transport only
  * (the application-layer signature work is covered by the mesh foundation
  * tests in PR #29 / #30 / #31).
@@ -141,7 +141,7 @@ async function bootLoopback(params: {
   transport.setOwnNodeId(node_id);
   toBeStopped.push(transport);
 
-  // Mint a stub NodeIdentityCertificate for the test — not signed against
+  // Mint a stub NodeIdentityCertificate for the test - not signed against
   // any fortress-master here because the transport doesn't verify the cert,
   // only carries it as `node_pubkey` for peer-id derivation.
   const cert: NodeIdentityCertificate = {
@@ -193,7 +193,7 @@ async function waitFor(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Peer-id derivation — Sanctuary seed → libp2p peer-id
+// Peer-id derivation - Sanctuary seed → libp2p peer-id
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("libp2p-transport: peer-id derivation", () => {
@@ -281,7 +281,7 @@ describe("libp2p-transport: two-node handshake + peer-id pinning", () => {
     //     `dialProtocol(peerIdFromPubkey(K_A.pub), UNICAST_PROTOCOL)`
     //     with the attacker's multiaddr pre-seeded in peerStore.
     //   - libp2p attempts the handshake, sees peer presents K_D.pub,
-    //     and refuses the protocol negotiation — the unicast throws.
+    //     and refuses the protocol negotiation - the unicast throws.
     //
     // This is the real impersonation protection: peer-id-pinned dial
     // ensures the client only talks to the holder of the cert's private key.
@@ -320,7 +320,7 @@ describe("libp2p-transport: two-node handshake + peer-id pinning", () => {
       client.transport.unicast("A", JSON.stringify({ kind: "ping" }))
     ).rejects.toThrow();
 
-    // And for good measure — the client's peerStore still doesn't have a
+    // And for good measure - the client's peerStore still doesn't have a
     // confirmed connection to A.
     const clientPeers = client.transport
       ._libp2p()
@@ -334,7 +334,7 @@ describe("libp2p-transport: two-node handshake + peer-id pinning", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Gossipsub fan-out — 3-node mesh + tamper-replay rejection
+// Gossipsub fan-out - 3-node mesh + tamper-replay rejection
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("libp2p-transport: gossipsub fan-out + tamper-replay rejection", () => {
@@ -355,7 +355,7 @@ describe("libp2p-transport: gossipsub fan-out + tamper-replay rejection", () => 
       static_peers: [multiaddrOf(nodeA.transport), multiaddrOf(nodeB.transport)],
     });
 
-    // Wait for the gossipsub mesh to converge — all three subscribed to
+    // Wait for the gossipsub mesh to converge - all three subscribed to
     // the fortress topic, each having at least one peer.
     await waitFor(async () => {
       return (
@@ -379,6 +379,8 @@ describe("libp2p-transport: gossipsub fan-out + tamper-replay rejection", () => 
     const payload: PolicyUpdatePayload = {
       agent_id: "agent-001",
       policy_version: 1,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "dGVzdA==",
     };
     const evt = packSignedEvent<PolicyUpdatePayload>({
@@ -448,7 +450,7 @@ describe("libp2p-transport: gossipsub fan-out + tamper-replay rejection", () => 
         nodeA.keypair.publicKey
       )
     ).toBe(true);
-    // Silence unused imports — verifySignedEvent is available for chain-
+    // Silence unused imports - verifySignedEvent is available for chain-
     // of-trust tests elsewhere.
     void verifySignedEvent;
     void ctx;
@@ -605,7 +607,7 @@ describe("libp2p-transport: direct-stream unicast", () => {
     expect(parsed.kind).toBe("agent_state_transfer");
 
     // Destination derives the SAME key deterministically from (master,
-    // src, dst, agent, locator_version) and unwraps — byte-for-byte
+    // src, dst, agent, locator_version) and unwraps - byte-for-byte
     // identical plaintext.
     const recovered = unwrapAgentSnapshot({
       wrapped: parsed.wrapped,
@@ -617,7 +619,7 @@ describe("libp2p-transport: direct-stream unicast", () => {
     });
     expect(recovered).toEqual(snapshot);
 
-    // AAD substitution — wrong destination_node_id — MUST fail.
+    // AAD substitution - wrong destination_node_id - MUST fail.
     expect(() =>
       unwrapAgentSnapshot({
         wrapped: parsed.wrapped,
@@ -634,7 +636,7 @@ describe("libp2p-transport: direct-stream unicast", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// FileNodeKeyStore + FileCounterStore — persistence across restart
+// FileNodeKeyStore + FileCounterStore - persistence across restart
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("libp2p-transport: FileNodeKeyStore persistence", () => {
@@ -655,7 +657,7 @@ describe("libp2p-transport: FileNodeKeyStore persistence", () => {
 
       await store.save(nodeId, wrapped);
 
-      // Fresh instance — no memory carry-over, loads from disk only.
+      // Fresh instance - no memory carry-over, loads from disk only.
       const store2 = new FileNodeKeyStore(tmpdir);
       const loaded = await store2.load(nodeId);
       expect(loaded).not.toBeNull();
@@ -718,7 +720,7 @@ describe("libp2p-transport: FileCounterStore persistence", () => {
       expect(c1.next("audit_batch_seq")).toBe(2);
       expect(c1.peek("audit_batch_seq")).toBe(3);
 
-      // Simulate process death + restart — fresh instance, same directory.
+      // Simulate process death + restart - fresh instance, same directory.
       const c2 = new FileCounterStore(tmpdir, "nodeX");
       await c2.init();
       expect(c2.peek("audit_batch_seq")).toBe(3);
@@ -773,7 +775,7 @@ describe("libp2p-transport: FileCounterStore persistence", () => {
 // ═══════════════════════════════════════════════════════════════════════
 // FileCounterStore.init() fails CLOSED on a present-but-invalid persisted
 // counter (§8.3 rollback canary). A silently-skipped entry would resolve via
-// `?? 0` and RESTART at 0 — the exact rollback the counter exists to detect.
+// `?? 0` and RESTART at 0 - the exact rollback the counter exists to detect.
 // Only a genuinely absent store (ENOENT) is a legitimate clean first boot.
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -897,7 +899,7 @@ describe("libp2p-transport: FileCounterStore.init() fail-closed", () => {
     }
   });
 
-  it("throws on a present-but-empty store ({}) — not a clean first boot", async () => {
+  it("throws on a present-but-empty store ({}) - not a clean first boot", async () => {
     const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
     try {
       // A genuine persisted store always carries at least one counter; an empty
@@ -940,7 +942,7 @@ describe("libp2p-transport: FileCounterStore.init() fail-closed", () => {
     const tmpdir = await fs.mkdtemp(path.join(os.tmpdir(), "sanct-counters-"));
     try {
       // A bogus key carrying a value while real counters default to 0 is itself
-      // a silent reset — must halt the boot, not load-and-ignore.
+      // a silent reset - must halt the boot, not load-and-ignore.
       await writeCounterFile(
         tmpdir,
         "nodeUnknownKey",

@@ -1,16 +1,16 @@
 /**
- * Sanctuary Federation Protocol v0.1 — Failure-Mode Operator Surfaces Tests
+ * Sanctuary Federation Protocol v0.1 - Failure-Mode Operator Surfaces Tests
  *
  * WP-MVP-3 Follow-up #3 spawn-prompt acceptance criteria covered here:
- *   1 — All five §8 failure modes have a named detection loop + named
+ *   1 - All five §8 failure modes have a named detection loop + named
  *       operator-surface handler + at least one passing regression test.
- *   2 — Rollback detection reuses PR #29's envelope+audit-batch primitives
+ *   2 - Rollback detection reuses PR #29's envelope+audit-batch primitives
  *       (no second implementation).
- *   7 — Mesh Health dashboard panel renders via existing SSE /events
- *       channel — every state transition produces an observable SSE event.
- *   8 — Every usage event emitted carries `event_class` from the PR #33 enum.
- *   9 — Every signed emission carries `signature_scheme: 'ed25519-v1'`.
- *  11 — Non-dependency: no Concordia / Verascore imports.
+ *   7 - Mesh Health dashboard panel renders via existing SSE /events
+ *       channel - every state transition produces an observable SSE event.
+ *   8 - Every usage event emitted carries `event_class` from the PR #33 enum.
+ *   9 - Every signed emission carries `signature_scheme: 'ed25519-v1'`.
+ *  11 - Non-dependency: no Concordia / Verascore imports.
  *
  * Mesh Health bridge: structural-typing test against an in-memory broadcast
  * target that mirrors `SovereigntyDashboard`'s mesh-broadcast methods. The
@@ -163,7 +163,7 @@ async function makeFixture(opts: { canonicalAuditNodeId?: string } = {}): Promis
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §8.1 Node offline — 3 missed heartbeats
+// §8.1 Node offline - 3 missed heartbeats
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("§8.1 offline detection", () => {
@@ -204,13 +204,13 @@ describe("§8.1 offline detection", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// §8.2 Compromised — multi-signal aggregator
+// §8.2 Compromised - multi-signal aggregator
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("§8.2 compromised detection", () => {
   it("flags a node whose envelope monotonic_seq goes non-monotonic", async () => {
     const f = await makeFixture();
-    // First heartbeat — establish baseline.
+    // First heartbeat - establish baseline.
     f.node.onHeartbeatReceived({
       emitter_node: "node-2",
       monotonic_seq: 5,
@@ -218,7 +218,7 @@ describe("§8.2 compromised detection", () => {
       audit_seq: 0,
       advertised_state: "active",
     });
-    // Second heartbeat with seq <= prior — rollback canary.
+    // Second heartbeat with seq <= prior - rollback canary.
     f.node.onHeartbeatReceived({
       emitter_node: "node-2",
       monotonic_seq: 3,
@@ -251,7 +251,7 @@ describe("§8.2 compromised detection", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// §8.3 Rollback — operator surface consumes PR #29 errors
+// §8.3 Rollback - operator surface consumes PR #29 errors
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("§8.3 rollback operator surface", () => {
@@ -317,7 +317,7 @@ describe("§8.3 rollback operator surface", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// §8.4 Split-brain — locator + policy conflict surfaces
+// §8.4 Split-brain - locator + policy conflict surfaces
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("§8.4 split-brain conflict resolution", () => {
@@ -338,6 +338,8 @@ describe("§8.4 split-brain conflict resolution", () => {
         payload: {
           agent_id: "agent-x",
           policy_version: version,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
           policy_blob: "{}",
           parent_version: 1,
         },
@@ -493,7 +495,7 @@ describe("DMswitch trigger broadcast + receipt", () => {
       "received"
     );
     expect(f.detector.isDmswitchUnlocked()).toBe(true);
-    // sentinel_alert was emitted via the alerts module — implicit by virtue of
+    // sentinel_alert was emitted via the alerts module - implicit by virtue of
     // detector publishing the alert. Direct assertion on the alerts list:
     const dmAlerts = f.alerts.filter((a) =>
       String(a.detail.signal).includes("dmswitch_triggered")
@@ -503,10 +505,10 @@ describe("DMswitch trigger broadcast + receipt", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Spawn-prompt acceptance #7 — Mesh Health dashboard SSE
+// Spawn-prompt acceptance #7 - Mesh Health dashboard SSE
 // ═══════════════════════════════════════════════════════════════════════
 
-describe("FailureModeDashboardBridge — Mesh Health via existing SSE channel", () => {
+describe("FailureModeDashboardBridge - Mesh Health via existing SSE channel", () => {
   it("forwards every alert + every snapshot through the broadcast target", async () => {
     const f = await makeFixture();
     const broadcasts: Array<{ kind: string; payload: unknown }> = [];
@@ -562,7 +564,7 @@ describe("FailureModeDashboardBridge — Mesh Health via existing SSE channel", 
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Spawn-prompt acceptance #8 — event_class enum coverage
+// Spawn-prompt acceptance #8 - event_class enum coverage
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("event_class enum coverage on every emission path", () => {
@@ -621,7 +623,7 @@ describe("event_class enum coverage on every emission path", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// Spawn-prompt acceptance #2 — rollback uses PR #29 primitives, no second impl
+// Spawn-prompt acceptance #2 - rollback uses PR #29 primitives, no second impl
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("rollback detection reuses PR #29 envelope+audit-batch primitives", () => {

@@ -1,5 +1,5 @@
 /**
- * MeshNode — the federation lifecycle state machine.
+ * MeshNode - the federation lifecycle state machine.
  *
  * Owns the join / sync / heartbeat-emit / leave / rejoin / revoke / bootstrap
  * flows for a single node. Wires together every other lifecycle module:
@@ -83,6 +83,8 @@ import {
   LocatorTableStore,
   NodeLifecycleEventLog,
   PolicyBundleStore,
+  type PolicyBundleAuditEvent,
+  type PolicyBundleUpsertResult,
 } from "./local-state.js";
 import { NodeRoster } from "./node-roster.js";
 import { InMemoryCounterStore } from "./counters.js";
@@ -141,7 +143,7 @@ export class MeshNode {
   private fortressMasterSecret: Uint8Array;
 
   private readonly roster = new NodeRoster();
-  private readonly policyBundle = new PolicyBundleStore();
+  private readonly policyBundle: PolicyBundleStore;
   private readonly locatorTable = new LocatorTableStore();
   private readonly lifecycleLog = new NodeLifecycleEventLog();
   private readonly principalRoster = new Map<string, PrincipalCertificate>();
@@ -157,15 +159,16 @@ export class MeshNode {
   private oldestPendingEntryAt: number | null = null;
   private receivedLog: ReceivedEventLog[] = [];
 
-  /** Callback hooks — Follow-up #3 (failure-mode operator surfaces) wires these. */
+  /** Callback hooks - Follow-up #3 (failure-mode operator surfaces) wires these. */
   onLifecycleEvent: (
     evt: SignedEvent<NodeLifecyclePayload>,
     kind: "received" | "emitted"
   ) => void = () => {};
   onPolicyUpdate: (
     evt: SignedEvent<PolicyUpdatePayload>,
-    result: "applied" | "older"
+    result: PolicyBundleUpsertResult
   ) => void = () => {};
+  onPolicyBundleRejected: (event: PolicyBundleAuditEvent) => void = () => {};
   onLocatorUpdate: (
     evt: SignedEvent<LocatorUpdatePayload>,
     result: "applied" | "older" | "conflict"
@@ -183,7 +186,7 @@ export class MeshNode {
   }) => void = () => {};
   /** Follow-up #3: surfaces envelope verification failures (signature mismatch,
    *  unknown emitter, cross-operator isolation violation). Same purpose as
-   *  onAuditBatchRejected — convert silent drop to observable alarm. */
+   *  onAuditBatchRejected - convert silent drop to observable alarm. */
   onEnvelopeRejected: (info: {
     error: Error;
     event_type: string;
@@ -217,6 +220,9 @@ export class MeshNode {
     this.counters = deps.counters ?? new InMemoryCounterStore();
     this.fortressMasterSecret = deps.fortress_master_secret;
     this.guardianRoster = config.pinned_guardian_roster ?? null;
+    this.policyBundle = new PolicyBundleStore({
+      onAuditEvent: (event) => this.onPolicyBundleRejected(event),
+    });
     this.auditBuffer = new AuditBuffer({
       audit_batch_interval_ms: config.audit_batch_interval_ms,
       audit_batch_max_entries: config.audit_batch_max_entries,
@@ -225,7 +231,7 @@ export class MeshNode {
       this.canonicalAudit = new CanonicalAuditLog();
     }
 
-    // Subscribe to broadcast traffic — verify, then dispatch through the router.
+    // Subscribe to broadcast traffic - verify, then dispatch through the router.
     this.transport.subscribe((evt, _wireBytes) => {
       void this.handleIncomingBroadcast(evt);
     });
@@ -240,7 +246,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // BOOTSTRAP — first node (§3.7)
+  // BOOTSTRAP - first node (§3.7)
   // ═════════════════════════════════════════════════════════════════════
 
   /**
@@ -376,7 +382,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // JOIN — non-first node (§3.1)
+  // JOIN - non-first node (§3.1)
   // ═════════════════════════════════════════════════════════════════════
 
   /**
@@ -522,7 +528,7 @@ export class MeshNode {
     if (!proofOk) {
       return {
         approved: false,
-        denial_reason: "hkdf_salt_proof failed — token holder lacks master-derived transport key",
+        denial_reason: "hkdf_salt_proof failed - token holder lacks master-derived transport key",
       };
     }
 
@@ -543,7 +549,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // BOOT FROM PERSISTED STATE — rejoin / restart (§3.5)
+  // BOOT FROM PERSISTED STATE - rejoin / restart (§3.5)
   // ═════════════════════════════════════════════════════════════════════
 
   /**
@@ -589,7 +595,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // PEER ADMISSION — observed `node_join` event from a peer
+  // PEER ADMISSION - observed `node_join` event from a peer
   // ═════════════════════════════════════════════════════════════════════
 
   /**
@@ -682,7 +688,7 @@ export class MeshNode {
 
   /**
    * Operator-initiated revocation of a peer node. Caller MUST be authorized
-   * to issue this — gated through the principal-policy gate at the console.
+   * to issue this - gated through the principal-policy gate at the console.
    * v0.1 mesh enforces the cryptographic invariants; the policy-gating
    * decision is the console thread's concern.
    */
@@ -719,7 +725,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // POLICY + LOCATOR — emit (§5.1, §6.3)
+  // POLICY + LOCATOR - emit (§5.1, §6.3)
   // ═════════════════════════════════════════════════════════════════════
 
   async publishPolicyUpdate(params: {
@@ -740,6 +746,9 @@ export class MeshNode {
     });
     const result = this.policyBundle.upsert(evt);
     this.onPolicyUpdate(evt, result);
+    if (result !== "applied") {
+      throw new MeshError(`policy_update rejected before publish: ${result}`);
+    }
     await this.transport.broadcast(evt);
     return evt;
   }
@@ -768,7 +777,7 @@ export class MeshNode {
   }
 
   // ═════════════════════════════════════════════════════════════════════
-  // AUDIT — push entry into local buffer (§5.2)
+  // AUDIT - push entry into local buffer (§5.2)
   // ═════════════════════════════════════════════════════════════════════
 
   pushAuditEntry(params: {
@@ -886,7 +895,7 @@ export class MeshNode {
   /**
    * Server-side sync handler. Returns a (synchronous) response payload that
    * the caller broadcasts back via unicast. Pure function over the local
-   * stores — the transport layer wires the round-trip.
+   * stores - the transport layer wires the round-trip.
    */
   handleSyncRequest(payload: SyncRequestPayload): SyncResponsePayload {
     return buildSyncResponse(payload, {
@@ -948,6 +957,8 @@ export class MeshNode {
       locator_table: this.locatorTable,
       lifecycle_log: this.lifecycleLog,
       audit_log: this.canonicalAudit,
+      on_policy_update: (evt, updateResult) =>
+        this.onPolicyUpdate(evt, updateResult),
     });
     void result; // observability hooks left for Follow-up #3
   }
@@ -983,7 +994,7 @@ export class MeshNode {
    * subkeys under the new master). This method installs the result on this
    * node and emits the audit-continuity boundary entry.
    *
-   * NOT a wire-level message — this is the local cascade hook that the
+   * NOT a wire-level message - this is the local cascade hook that the
    * `master_rotation` SignedEvent dispatch path calls into. Idempotent on
    * (rotated_at, new_master_pubkey): if the rotation has already been applied,
    * subsequent calls return without effect.
@@ -1000,7 +1011,7 @@ export class MeshNode {
     if (
       payload.new_master_pubkey.public_key === this.config.pinned_master_pubkey.public_key
     ) {
-      // Already installed — idempotent return.
+      // Already installed - idempotent return.
       const noop = sealAuditEntry({
         emitter_node: this.config.node_id,
         emitter_agent: "system",
@@ -1036,11 +1047,11 @@ export class MeshNode {
       new_root_principal_cert
     );
     this.certificate = re_issued_self_cert;
-    // Replace own roster cert (keeps presence + heartbeat history intact —
+    // Replace own roster cert (keeps presence + heartbeat history intact -
     // see NodeRoster.add cert-rotation path).
     this.roster.add(re_issued_self_cert);
 
-    // Audit-continuity boundary entry — the operator-visible record of the
+    // Audit-continuity boundary entry - the operator-visible record of the
     // rotation. Verifiers walking the audit log encounter this and pivot from
     // pre-rotation pubkey lookups to post-rotation lookups.
     const boundaryPayload = {
@@ -1166,7 +1177,7 @@ export class MeshNode {
   private requireKeyed(): void {
     if (!this.nodePrivateKey || !this.certificate) {
       throw new MeshError(
-        `node ${this.config.node_id} has no in-memory private key — call bootstrapFirstNode / prepareJoinRequest+approve / bootFromPersistedState first`
+        `node ${this.config.node_id} has no in-memory private key - call bootstrapFirstNode / prepareJoinRequest+approve / bootFromPersistedState first`
       );
     }
   }
