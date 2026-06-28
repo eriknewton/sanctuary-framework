@@ -901,13 +901,14 @@ function buildReach(
 export type { PostureHome };
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
-  const [castleWall, digest, unwrapped, featureHealth, custodyExit] =
+  const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
       buildWallPosture(deps),
       buildDigest(deps),
       buildUnwrapped(deps),
       buildFeatureHealth(deps),
       buildCustodyExit(deps),
+      buildFederationSummary(deps),
     ]);
   // Derive the honest agent rows from the roster ALONE. Deliberately not passed
   // the wall posture: there is no path by which the machine-level arm-state can
@@ -928,6 +929,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const queryPrivacy = await buildQueryPrivacy(deps, featureHealth);
   return {
     origin_machine: deps.originMachine,
+    federation,
     stream_available: deps.streamRegistry !== undefined,
     castle_wall: castleWall,
     digest,
@@ -938,6 +940,20 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
     protection_requested_count: protectionRequestedCount,
     enforcement_confirmed_count: enforcementConfirmedCount,
     agents,
+  };
+}
+
+async function buildFederationSummary(
+  deps: PostureRouteDeps,
+): Promise<PostureHome["federation"]> {
+  if (!deps.fleetRoster) {
+    return { available: false, enabled: false, fleet_node_count: 0 };
+  }
+  const roster = await buildFleet(deps);
+  return {
+    available: roster.available,
+    enabled: roster.enabled,
+    fleet_node_count: roster.summary.total,
   };
 }
 

@@ -57,6 +57,8 @@ const ALLOWLIST: ReadonlyArray<string> = [
   "Archive",
   "CHANGELOG.md",
   "CLAUDE.md",
+  "CODEX_BANNER_SUMMARY.md",
+  "CODEX_BANNER_VERDICT.md",
   "CODE_OF_CONDUCT.md",
   "CONTRIBUTING.md",
   "GOVERNANCE.md",

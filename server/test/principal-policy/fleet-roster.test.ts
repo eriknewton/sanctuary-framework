@@ -509,6 +509,42 @@ describe("buildFleetRoster - signed-policy-distribution status (A2, custody stat
     expect(roster.policy_distribution.summary.unknown).toBe(1);
   });
 
+  it("treats null operator policy marker fields as unknown, never in sync", () => {
+    const roster = buildFleetRoster(
+      deps({
+        nodes: [
+          nodeView("node-1", {
+            applied_policy: {
+              version: null,
+              hash: null,
+              hash_algorithm: null,
+              applied_at: null,
+              source_event_id: null,
+            } as never,
+          }),
+        ],
+        isNodeRevoked: () => false,
+      }),
+      {
+        now: () => NOW,
+        operatorPolicy: {
+          version: null,
+          hash: null,
+          hash_algorithm: null,
+          applied_at: null,
+          source_event_id: null,
+        } as never,
+      },
+    );
+
+    expect(roster.nodes[0]!.policy.drift_state).toBe("unknown");
+    expect(roster.policy_distribution.summary).toEqual({
+      in_sync: 0,
+      drifted: 0,
+      unknown: 1,
+    });
+  });
+
   it("reports policy state unavailable on an unprovisioned fortress", () => {
     const roster = buildFleetRoster(
       deps({ context: null, nodes: [], isNodeRevoked: () => false }),

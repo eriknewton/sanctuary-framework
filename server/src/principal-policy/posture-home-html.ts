@@ -755,13 +755,13 @@ export function renderPostureHomeHTML(): string {
   function loadRecognitionOnce() { loadRecognition(0); }
 
   // ── Fleet roster (Fleet Console Slice 1) ────────────────────────────────
-  // A separate, federation-gated fetch (NOT on the home payload, so a fortress
-  // with no federation never receives any roster data). A 200 with
-  // available:true reveals the panel; a 404 (federation not wired) or
-  // available:false (not provisioned) keeps it hidden (honest absence), never a
-  // fabricated roster. Unlike Recognition, the fleet is RE-POLLED on a cadence so
-  // a revocation (a machine going from admitted -> revoked, or an unevaluable
-  // machine flipping to untrusted) shows up live on the board without a reload.
+  // A separate, federation-gated fetch for the full roster (the home payload
+  // carries only the tiny banner summary). A 200 with available:true reveals the
+  // panel; a 404 (federation not wired) or available:false (not provisioned)
+  // keeps it hidden (honest absence), never a fabricated roster. Unlike
+  // Recognition, the fleet is RE-POLLED on a cadence so a revocation (a machine
+  // going from admitted -> revoked, or an unevaluable machine flipping to
+  // untrusted) shows up live on the board without a reload.
   var FLEET_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
   var FLEET_REFRESH_MS = 15000;
   var fleetRefreshTimer = null;
@@ -856,8 +856,20 @@ export function renderPostureHomeHTML(): string {
   function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
     var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
+    var federation = home && home.federation;
+    var originText = "Machine: " + home.origin_machine;
+    if (federation && federation.available) {
+      var fleetCount = Number(federation.fleet_node_count || 0);
+      if (federation.enabled) {
+        originText += " · federation: " + fleetCount + " machines";
+      } else {
+        originText += " · federation provisioned, disabled · " + fleetCount + " machines";
+      }
+    } else {
+      originText += " · single-machine view (federation off)";
+    }
     document.getElementById("origin").textContent =
-      "Machine: " + home.origin_machine + " · single-machine view (federation off)";
+      originText;
     document.getElementById("banner").innerHTML =
       // Honest split (#634): "protection requested" is policy intent; "enforcement
       // confirmed" is the observed-live count. Reporting only a flat "protected"
