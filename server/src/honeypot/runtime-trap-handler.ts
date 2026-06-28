@@ -325,7 +325,22 @@ export async function handleHoneypotRoute(
   ) {
     return false;
   }
-  const checkAuth = authMiddleware(deps.authConfig);
+  // SECURITY (#800 follow-on, operational mutations): the honeypot
+  // management mutations (POST /compile, POST /deploy, DELETE /traps/:id)
+  // compile and deploy or remove deception traps. They must require the
+  // operator bearer even on loopback with `--auto-auth-localhost`, so a
+  // co-resident agent sharing the loopback interface cannot deploy or tear
+  // down traps tokenless (an agent that could disarm the honeypots
+  // watching it defeats the detection surface). The GET reads (traps /
+  // tool-traps / credential-traps / findings) keep loopback auto-auth.
+  // `requireToken` only suppresses the loopback shortcut; token validation
+  // is unchanged. Fail-closed: with no token configured, a mutating
+  // request is rejected, never allowed.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {

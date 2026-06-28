@@ -644,10 +644,24 @@ describe("Hub inbox: loopback auto-auth does not gate approve/deny", () => {
     expect(res.status).toBe(200);
   });
 
-  it("still allows tokenless inbox DISMISS under loopback auto-auth (housekeeping, not a decision)", async () => {
+  // #800 follow-on (operational-mutation chokepoint): inbox DISMISS is an
+  // operational mutation (it changes operator-visible inbox state), so it
+  // now requires the operator bearer even on loopback - the prior
+  // "housekeeping stays tokenless" carve-out is retired in favor of a
+  // fail-closed bias on every inbox mutation. A tokenless loopback dismiss
+  // is rejected; the dismiss with the operator bearer succeeds.
+  it("rejects a tokenless loopback inbox DISMISS (401) even with auto-auth on", async () => {
     const res = await fetch(
       `${rig.url}${HUB_API_PREFIX}/inbox/egress-1/dismiss`,
       { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts inbox DISMISS WITH the valid operator token (200)", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/inbox/egress-1/dismiss`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
     );
     expect(res.status).toBe(200);
   });

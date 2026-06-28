@@ -307,6 +307,52 @@ function isHubCustodyMutationPath(method: string, path: string): boolean {
   return isHubAgentControlAction(agentMatch.remainder);
 }
 
+/**
+ * Operational (fleet-state) mutations on the hub that are NOT custody
+ * decisions but still change persisted operator-visible state: task
+ * control (create/update/assign/cancel) and inbox housekeeping
+ * (dismiss). They were previously left on loopback auto-auth, so a
+ * co-resident agent sharing the loopback interface could create or
+ * re-route tasks, or dismiss inbox items, without the operator bearer.
+ * They now ride the SAME strict chokepoint as the custody mutations:
+ * the operator bearer is required even on loopback. This is the #800
+ * follow-on for operational-mutation routes.
+ *
+ * Kept in lockstep with the dispatch table below (`matchTaskRoute`,
+ * `matchInboxRoute`) so the auth gate cannot drift from routing.
+ * Reads (GET list/detail) and the read-style concierge query keep
+ * loopback auto-auth. Approval DECISIONS (approve/deny) and the fortress
+ * custody routes are classified by `isHubCustodyMutationPath`, not here.
+ */
+function isHubOperationalMutationPath(method: string, path: string): boolean {
+  // All inbox mutations are POSTs (`approve` / `deny` / `dismiss`). The
+  // approval decisions are already strict via `isHubCustodyMutationPath`;
+  // gating the whole inbox-action surface here adds `dismiss` (and fails
+  // closed for any future action) without weakening the decision gate.
+  if (method === "POST" && matchInboxRoute(path) !== null) {
+    return true;
+  }
+
+  // Task control. `POST /tasks` creates; `PATCH /tasks/:id` changes
+  // status; `POST /tasks/:id/assign` re-routes; `POST /tasks/:id/cancel`
+  // cancels. All mutate fleet task state.
+  if (method === "POST" && path === `${HUB_API_PREFIX}/tasks`) {
+    return true;
+  }
+  const taskMatch = matchTaskRoute(path);
+  if (taskMatch) {
+    if (method === "PATCH" && taskMatch.action === null) return true;
+    if (
+      method === "POST" &&
+      (taskMatch.action === "assign" || taskMatch.action === "cancel")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isHubAgentControlAction(
   value: string,
 ): value is HubAgentControlAction {
@@ -351,10 +397,20 @@ export async function handleHubRoute(
   // on, so a co-resident agent sharing loopback cannot trigger its own
   // custody-changing route. The strict subset is hub approval decisions,
   // fortress lockdown/export, and agent-control POSTs. Other hub routes
-  // (read-only lists, inbox dismiss, task dispatch, policy/template binds)
+  // (read-only lists, read-style concierge query, policy/template binds)
   // keep the existing loopback auto-auth contract. `requireToken` only
   // suppresses the loopback shortcut; token validation is unchanged.
-  const requiresOperatorBearer = isHubCustodyMutationPath(method, path);
+  //
+  // SECURITY (#800 follow-on, operational mutations): operational
+  // fleet-state mutations (task control, inbox dismiss) ALSO require the
+  // operator bearer even on loopback, so a co-resident agent cannot
+  // create/re-route tasks or dismiss inbox items tokenless. They ride the
+  // same strict gate but are NOT custody decisions, so they do NOT
+  // suppress public error detail (that suppression stays scoped to the
+  // approval-decision custody routes below).
+  const requiresOperatorBearer =
+    isHubCustodyMutationPath(method, path) ||
+    isHubOperationalMutationPath(method, path);
   const checkAuth = authMiddleware(
     deps.authConfig,
     requiresOperatorBearer ? { requireToken: true } : undefined,

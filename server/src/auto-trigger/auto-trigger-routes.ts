@@ -218,7 +218,22 @@ export async function handleAutoTriggerRoute(
     return false;
   }
 
-  const checkAuth = authMiddleware(deps.authConfig);
+  // SECURITY (#800 follow-on, operational mutations): the auto-trigger
+  // mutations (PATCH rule thresholds, POST promote/demote, POST
+  // accept/reject recommendation, POST cancel pending) change the
+  // autonomous-action engine's configuration and can cancel a pending
+  // Tier-1-bound action. They must require the operator bearer even on
+  // loopback with `--auto-auth-localhost`, so a co-resident agent sharing
+  // the loopback interface cannot retune its own auto-trigger rungs or
+  // cancel a pending action tokenless. The GET reads (rules /
+  // recommendations / detail) keep loopback auto-auth. `requireToken` only
+  // suppresses the loopback shortcut; token validation is unchanged.
+  // Fail-closed: with no token configured, a mutating request is rejected.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {
