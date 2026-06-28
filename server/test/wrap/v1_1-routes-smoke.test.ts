@@ -218,6 +218,38 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(typeof body.origin_machine).toBe("string");
   });
 
+  it("did:web compromised rotation requires bearer despite loopback auto-auth", async () => {
+    const tokenless = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised`,
+      { method: "POST" },
+    );
+    expect(tokenless.status).toBe(401);
+
+    const sessionOnly = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised?session=short-lived`,
+      {
+        method: "POST",
+        headers: { Cookie: "sanctuary_session=short-lived" },
+      },
+    );
+    expect(sessionOnly.status).toBe(401);
+
+    const bearer = await fetch(
+      `${rig.baseUrl}/api/hub/recognition/did-web/rotate-compromised`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${rig.authToken}` },
+      },
+    );
+    expect(bearer.status).toBe(200);
+    const body = (await bearer.json()) as {
+      ok: boolean;
+      data: { configured: boolean };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.data.configured).toBe(false);
+  });
+
   it("setV11Bindings(null) detaches the v1.1 routes; /v1.1 falls through legacy gate", async () => {
     // The wrap-auto dashboard's legacy api.ts:handleRequest auth-gates
     // every path that isn't a v1.1 dispatch hit. Detaching the v1.1

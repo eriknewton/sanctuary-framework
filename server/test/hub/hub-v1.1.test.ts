@@ -1065,6 +1065,96 @@ describe("Hub agent control endpoints (Test 4)", () => {
   });
 });
 
+describe("Hub agent-control custody routes require bearer under loopback auto-auth", () => {
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig({
+      authConfig: { loopbackAutoAuth: true, authToken: "operator-token" },
+    });
+  });
+  afterEach(async () => rig.stop());
+
+  it("rejects a tokenless loopback agent-control POST before the handler runs", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/pause`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(401);
+    expect(rig.controller.calls).toEqual([]);
+  });
+
+  it("rejects session or cookie without bearer on agent-control POSTs", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/restart?session=short-lived`,
+      {
+        method: "POST",
+        headers: { Cookie: "sanctuary_session=short-lived" },
+      },
+    );
+    expect(res.status).toBe(401);
+    expect(rig.controller.calls).toEqual([]);
+  });
+
+  it("accepts the valid bearer and reaches the agent-control handler", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/pause`,
+      { method: "POST", headers: withAuth({}, rig.authToken) },
+    );
+    expect(res.status).toBe(200);
+    expect(rig.controller.calls.map((c) => c.action)).toEqual(["pause"]);
+  });
+
+  it("keeps loopback auto-auth for non-custody read routes", async () => {
+    const res = await fetch(`${rig.url}${HUB_API_PREFIX}/agents`);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("Hub policy/template bind custody routes require bearer under loopback auto-auth", () => {
+  // bindAgentPolicy / bindAgentChannelTemplate enqueue Tier-1 `policy_change`
+  // approvals; a co-resident loopback caller must not enqueue them tokenless.
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig({
+      authConfig: { loopbackAutoAuth: true, authToken: "operator-token" },
+    });
+  });
+  afterEach(async () => rig.stop());
+
+  it("rejects a tokenless loopback agent policy-bind POST before the handler runs", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/policy`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a tokenless loopback agent template-bind POST before the handler runs", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/template`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects session/cookie without bearer on a policy-bind POST", async () => {
+    const res = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/agents/agent-alpha/policy?session=short-lived`,
+      {
+        method: "POST",
+        headers: {
+          Cookie: "sanctuary_session=short-lived",
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("Hub activity feed pagination (Test 5)", () => {
   let rig: TestRig;
 

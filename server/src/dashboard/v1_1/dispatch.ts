@@ -81,8 +81,16 @@ async function handleRecognitionDidWebRoute(
     loopbackAutoAuth: inputs.loopbackAutoAuth,
     ...(inputs.authToken !== undefined ? { authToken: inputs.authToken } : {}),
   };
+  const requiresOperatorBearer =
+    method === "POST" &&
+    url.pathname === "/api/hub/recognition/did-web/rotate-compromised";
   try {
-    enforceAuth(authConfig, req, url);
+    enforceAuth(
+      authConfig,
+      req,
+      url,
+      requiresOperatorBearer ? { requireToken: true } : undefined,
+    );
   } catch {
     writeJSON(res, 401, { ok: false, error: "unauthorized" });
     return true;
