@@ -295,6 +295,15 @@ function isHubCustodyMutationPath(method: string, path: string): boolean {
     return true;
   }
 
+  // Tier-1 `policy_change` custody mutations: binding an agent's policy or
+  // channel template enqueues a Tier-1 approval (operation_category
+  // "policy_change" in hub-service `bindAgentPolicy`/`bindAgentChannelTemplate`).
+  // A co-resident loopback caller must not enqueue these without the operator
+  // bearer, so they ride the strict chokepoint alongside the control actions.
+  if (agentMatch.remainder === "policy" || agentMatch.remainder === "template") {
+    return true;
+  }
+
   return isHubAgentControlAction(agentMatch.remainder);
 }
 
