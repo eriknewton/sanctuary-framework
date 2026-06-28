@@ -25,6 +25,7 @@ import {
 } from "../../src/mesh/trust-root.js";
 import {
   mintFederationTrustRootRecord,
+  mintHybridFederationMaterial,
   type FederationTrustRootRecord,
 } from "../../src/mesh/federation-trust-root-store.js";
 import {
@@ -44,6 +45,7 @@ import {
 } from "../../src/mesh/federation-joiner-trust-root-store.js";
 import {
   signFederationRootRevocationPayload,
+  signFederationRootRevocationPayloadHybrid,
   type FederationRootRevocationPayload,
 } from "../../src/v1/federation-revocation.js";
 import type {
@@ -726,6 +728,137 @@ describe("FederationJoinerTrustRootStore", () => {
       record.pinned_master_pubkey.public_key,
     );
     artifact.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  // DEBT (#802 review follow-up): HYBRID (PQC, ML-DSA) compromise-root adoption is
+  // NOT yet supported on the joiner side. verifyJoinerCompromiseRootAdoption calls
+  // verifyFederationRootRevocationEvent WITHOUT operatorHybridPrincipalPublicKeys
+  // (federation-joiner-trust-root-store.ts ~line 661), so a revocation carrying a
+  // revoked_hybrid / ML-DSA bundle hits the hybrid-bundle gate in
+  // federation-revocation.ts (~line 1034) and returns operator_signature_bundle_invalid.
+  // That is FAIL-CLOSED (safe): a hybrid fleet cannot yet re-secure a joiner via this
+  // path, but it can NEVER silently adopt an unverified hybrid root. This test PINS the
+  // fail-closed reject so a future change cannot flip it to fail-OPEN. The follow-on
+  // slice that adds real hybrid support (thread the hybrid principal pubkeys through +
+  // bind them in the adoption attestation body + add accept/reject hybrid tests) MUST
+  // update this expectation deliberately, not by accident.
+  it("3c-2 rejects a HYBRID-root adoption FAIL-CLOSED (no hybrid joiner support yet)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+    });
+
+    // Build a real K2 classical anchor (master + issuing principal) so the
+    // classical leg of the hybrid revocation, and the new principal chain, both
+    // VERIFY. The adoption then fails ONLY at the hybrid-bundle gate, which is the
+    // exact gap we are documenting (not at an earlier classical check).
+    const k2 = generateFortressMaster();
+    const k2Principal = generateKeypair();
+    const newPinnedMaster: FortressMasterPublicKey = {
+      ...k2.public,
+      fortress_id: record.fortress_id,
+    };
+    const newIssuingPrincipalCert = issuePrincipalCertificate({
+      principal_id: record.issuing_principal_cert.principal_id,
+      principal_pubkey: k2Principal.publicKey,
+      role: "root",
+      fortress_id: record.fortress_id,
+      master_private_key: k2.private_key,
+    });
+    const nodePubkey = fromBase64url(record.local_node_cert.node_pubkey);
+    const reissuedLocalNodeCert = issueNodeIdentityCertificate({
+      node_id: record.node_id,
+      node_pubkey: nodePubkey,
+      node_mode: record.local_node_cert.node_mode,
+      fortress_id: record.fortress_id,
+      capabilities: record.local_node_cert.capabilities,
+      parent_chain: {
+        fortress_master_pubkey: newPinnedMaster.public_key,
+        principal_id: newIssuingPrincipalCert.principal_id,
+        principal_pubkey: newIssuingPrincipalCert.principal_pubkey,
+      },
+      principal_private_key: k2Principal.privateKey,
+      master_private_key: k2.private_key,
+    });
+
+    // A separately-minted hybrid material supplies a well-formed revoked_hybrid
+    // binding plus the hybrid principal keys that sign the both-must-pass bundle.
+    const hybrid = await mintHybridFederationMaterial({
+      fortressId: record.fortress_id,
+      nodeId: record.node_id,
+      principalId: newIssuingPrincipalCert.principal_id,
+    });
+
+    const rootRevocation = await signFederationRootRevocationPayloadHybrid({
+      fortressId: record.fortress_id,
+      revokedMasterPubkey: record.pinned_master_pubkey.public_key,
+      revokedHybrid: {
+        ed25519: {
+          key_ref: hybrid.pinned_master.public_keys.ed25519.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ed25519.public_key,
+        },
+        ml_dsa_65: {
+          key_ref: hybrid.pinned_master.public_keys.ml_dsa_65.key_ref,
+          public_key: hybrid.pinned_master.public_keys.ml_dsa_65.public_key,
+        },
+      },
+      effectiveAt: new Date().toISOString(),
+      revocationSerial: 1,
+      operatorPrincipalId: newIssuingPrincipalCert.principal_id,
+      // Classical leg signed by the K2 classical principal so the existing
+      // classical verify path ACCEPTS it (the gap is purely the missing hybrid
+      // pubkeys downstream, not a classical-signature failure).
+      newClassicalPrincipalPrivateKey: k2Principal.privateKey,
+      newHybridPrincipalPrivateKeys: hybrid.issuing_principal_private_keys,
+    });
+
+    const adoptionAttestation =
+      signFederationJoinerCompromiseRootAdoptionAttestation({
+        current: record,
+        newPinnedMasterPubkey: newPinnedMaster,
+        newIssuingPrincipalCert,
+        reissuedLocalNodeCert,
+        rootRevocation,
+        currentIssuingPrincipalPrivateKey: home.issuing_principal_private_key,
+      });
+
+    const rejected = await adoptFederationJoinerCompromiseRoot({
+      storage,
+      masterKey,
+      newPinnedMasterPubkey: newPinnedMaster,
+      newIssuingPrincipalCert,
+      reissuedLocalNodeCert,
+      rootRevocation,
+      adoptionAttestation,
+    });
+    k2.private_key.fill(0);
+    k2Principal.privateKey.fill(0);
+    nodePubkey.fill(0);
+
+    // FAIL-CLOSED: the classical leg verifies, then the hybrid-bundle gate trips
+    // because the joiner adoption path supplies no operatorHybridPrincipalPublicKeys.
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "root_revocation_invalid",
+        detail: "operator_signature_bundle_invalid",
+        revocationSerial: 1,
+      }),
+    );
+    // The joiner HOLDS the old trust anchor: nothing adopted, no serial advance.
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    expect(loaded?.record.highest_revocation_serial ?? 0).toBe(0);
   });
 });
 

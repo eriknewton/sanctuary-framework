@@ -645,6 +645,19 @@ async function verifyJoinerCompromiseRootAdoption(input: {
     previous_hash: null,
     event_hash: "adoption-verify-only",
   };
+  // DEBT (#802 review follow-up): HYBRID (PQC, ML-DSA) compromise-root adoption is
+  // NOT yet supported on this joiner path. We do NOT pass
+  // operatorHybridPrincipalPublicKeys, so a revocation carrying a revoked_hybrid /
+  // ML-DSA bundle hits the hybrid-bundle gate in verifyFederationRootRevocationEvent
+  // (federation-revocation.ts ~line 1034: revoked_hybrid present but no operator
+  // hybrid pubkeys => "operator_signature_bundle_invalid") and is REJECTED here as
+  // reason "root_revocation_invalid". This is FAIL-CLOSED and intentional: a hybrid
+  // fleet cannot yet re-secure a joiner via this path, but it can NEVER adopt an
+  // unverified hybrid root. Pinned by the "rejects a HYBRID-root adoption FAIL-CLOSED"
+  // test in federation-joiner-trust-root-store.test.ts. Follow-on slice to add real
+  // hybrid support: (1) thread the new K2 hybrid principal public keys into this
+  // verify call, (2) bind them in the adoption attestation body so the old principal
+  // co-signs the hybrid anchor too, (3) add accept + tamper-reject hybrid tests.
   const verified = await verifyFederationRootRevocationEvent({
     event,
     fortressId: current.fortress_id,
