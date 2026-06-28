@@ -145,6 +145,20 @@ export interface SanctuaryConfig {
     auto_publish_handshakes: boolean;
   };
 
+  /** ERC-8004 registry-read integration. Optional and default-off. */
+  erc8004: {
+    registry_confirmation: {
+      /** When false, resolve_erc8004_identity stays fully offline. */
+      enabled: boolean;
+      /** Operator-configured JSON-RPC endpoint. Empty means no RPC read. */
+      rpc_url: string;
+      /** Chain to read against. Defaults to Ethereum mainnet (1). */
+      chain_id: number;
+      /** RPC request timeout in milliseconds. */
+      timeout_ms: number;
+    };
+  };
+
   privacy_filter: {
     mode: "local" | "opf" | "off";
     fail_mode: "closed" | "fallback";
@@ -204,6 +218,14 @@ export function defaultConfig(): SanctuaryConfig {
       auto_publish_to_verascore: true,
       // DELTA-04: default OFF for privacy. Enable explicitly per deployment.
       auto_publish_handshakes: false,
+    },
+    erc8004: {
+      registry_confirmation: {
+        enabled: false,
+        rpc_url: "",
+        chain_id: 1,
+        timeout_ms: 10_000,
+      },
     },
     privacy_filter: {
       mode: "local",
@@ -388,6 +410,26 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
     config.verascore.auto_publish_handshakes = false;
+  }
+  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "true") {
+    config.erc8004.registry_confirmation.enabled = true;
+  }
+  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "false") {
+    config.erc8004.registry_confirmation.enabled = false;
+  }
+  if (process.env.SANCTUARY_ERC8004_RPC_URL) {
+    config.erc8004.registry_confirmation.rpc_url =
+      process.env.SANCTUARY_ERC8004_RPC_URL;
+  }
+  if (process.env.SANCTUARY_ERC8004_CHAIN_ID) {
+    config.erc8004.registry_confirmation.chain_id = strictParseIntEnv(
+      process.env.SANCTUARY_ERC8004_CHAIN_ID,
+    );
+  }
+  if (process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS) {
+    config.erc8004.registry_confirmation.timeout_ms = strictParseIntEnv(
+      process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS,
+    );
   }
   if (process.env.SANCTUARY_PRIVACY_FILTER) {
     config.privacy_filter.mode = process.env.SANCTUARY_PRIVACY_FILTER as "local" | "opf" | "off";
@@ -638,6 +680,57 @@ export function validateConfig(config: SanctuaryConfig): void {
     );
   }
 
+  if (
+    typeof config.erc8004.registry_confirmation.enabled !== "boolean"
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.enabled = "${String(config.erc8004.registry_confirmation.enabled)}". ` +
+      `Use true or false.`
+    );
+  }
+
+  if (typeof config.erc8004.registry_confirmation.rpc_url !== "string") {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.rpc_url = "${String(config.erc8004.registry_confirmation.rpc_url)}". ` +
+      `Use an http(s) JSON-RPC endpoint URL or an empty string.`
+    );
+  } else if (config.erc8004.registry_confirmation.rpc_url !== "") {
+    try {
+      const parsed = new URL(config.erc8004.registry_confirmation.rpc_url);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        valueErrors.push(
+          `Invalid config value: erc8004.registry_confirmation.rpc_url = "${config.erc8004.registry_confirmation.rpc_url}". ` +
+          `Use an http(s) JSON-RPC endpoint URL.`
+        );
+      }
+    } catch {
+      valueErrors.push(
+        `Invalid config value: erc8004.registry_confirmation.rpc_url = "${config.erc8004.registry_confirmation.rpc_url}". ` +
+        `Use an http(s) JSON-RPC endpoint URL.`
+      );
+    }
+  }
+
+  if (
+    !Number.isInteger(config.erc8004.registry_confirmation.chain_id) ||
+    config.erc8004.registry_confirmation.chain_id < 1
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.chain_id = "${config.erc8004.registry_confirmation.chain_id}". ` +
+      `Use a positive integer chain id.`
+    );
+  }
+
+  if (
+    !Number.isInteger(config.erc8004.registry_confirmation.timeout_ms) ||
+    config.erc8004.registry_confirmation.timeout_ms < 100
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.timeout_ms = "${config.erc8004.registry_confirmation.timeout_ms}". ` +
+      `Use an integer timeout of at least 100 ms.`
+    );
+  }
+
   // Feature/schema errors take precedence: a config that references an
   // unimplemented feature (or has a malformed shape) is a genuine schema
   // mismatch and the loader quarantines it. A value typo alongside a feature
@@ -701,6 +794,7 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
     "dashboard",
     "webhook",
     "verascore",
+    "erc8004",
     "privacy_filter",
   ];
   for (const k of requiredObjectKeys) {
@@ -711,6 +805,22 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
         }`
       );
     }
+  }
+  const erc8004 = c.erc8004 as Record<string, unknown>;
+  if (
+    typeof erc8004.registry_confirmation !== "object" ||
+    erc8004.registry_confirmation === null ||
+    Array.isArray(erc8004.registry_confirmation)
+  ) {
+    throw new Error(
+      `Sanctuary config field "erc8004.registry_confirmation" must be an object; got ${
+        erc8004.registry_confirmation === null
+          ? "null"
+          : Array.isArray(erc8004.registry_confirmation)
+            ? "array"
+            : typeof erc8004.registry_confirmation
+      }`
+    );
   }
   if (typeof c.version !== "string") {
     throw new Error(`Sanctuary config field "version" must be a string`);
