@@ -186,31 +186,65 @@ describe("/v1/nodes + /v1/federation/sync", () => {
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
-  it("verifies operator-signed sync payloads with and without a cursor", async () => {
+  it("accepts operator-signed sync payloads with no cursor key", async () => {
     const token = await openDurableSession(rig);
     await enable(token);
 
-    const cursorless = makeEvent({
+    const event = makeEvent({
       nodeId: "linux-1",
       sequence: 1,
       previousHash: null,
     });
-    const cursorlessPayload = currentSyncPayload({
+    const payload = currentSyncPayload({
       node_id: "linux-1",
-      events: [cursorless],
+      events: [event],
       idempotency_key: "cursorless-sync",
     });
-    expect("cursor" in cursorlessPayload).toBe(false);
+    expect("cursor" in payload).toBe(false);
 
-    const cursorlessRes = await sync(
+    const res = await sync(
       token,
-      operatorSigned("/v1/federation/sync", cursorlessPayload),
+      operatorSigned("/v1/federation/sync", payload),
     );
-    expect(cursorlessRes.status).toBe(200);
-    expect(((await cursorlessRes.json()) as { accepted: string[] }).accepted).toEqual([
-      cursorless.event_id,
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { accepted: string[] }).accepted).toEqual([
+      event.event_id,
     ]);
     expect((await latestSyncAudit("linux-1")).result).toBe("success");
+  });
+
+  it("accepts cursor null when the operator signed the cursorless payload", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+
+    const event = makeEvent({
+      nodeId: "linux-null",
+      sequence: 1,
+      previousHash: null,
+    });
+    const signedPayload = currentSyncPayload({
+      node_id: "linux-null",
+      events: [event],
+      idempotency_key: "null-cursor-sync",
+    });
+    expect("cursor" in signedPayload).toBe(false);
+    const body = {
+      ...operatorSigned("/v1/federation/sync", signedPayload),
+      cursor: null,
+    };
+
+    const res = await sync(token, body);
+
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { accepted: string[] }).accepted).toEqual([
+      event.event_id,
+    ]);
+    expect((await latestSyncAudit("linux-null")).result).toBe("success");
+  });
+
+  it("accepts operator-signed sync payloads with a real cursor object", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
 
     const withCursor = makeEvent({
       nodeId: "linux-2",
@@ -237,6 +271,26 @@ describe("/v1/nodes + /v1/federation/sync", () => {
       withCursor.event_id,
     ]);
     expect((await latestSyncAudit("linux-2")).result).toBe("success");
+  });
+
+  it("rejects malformed cursors before operator-signature verification", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+    const event = makeEvent({ nodeId: "linux-1", sequence: 1, previousHash: null });
+    const payload = currentSyncPayload({
+      node_id: "linux-1",
+      events: [event],
+      cursor: "not-an-object",
+      idempotency_key: "malformed-cursor",
+    });
+
+    const res = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", payload),
+    );
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "bad request" });
   });
 
   it("uses a peer-sync-specific JSON body cap for certificate-bearing envelopes, with no body-size oracle", async () => {
