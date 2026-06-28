@@ -104,7 +104,20 @@ export async function handleSentinelRoute(
     return false;
   }
 
-  const checkAuth = authMiddleware(deps.authConfig);
+  // SECURITY (#800 follow-on, operational mutations): the sentinel
+  // subscribe (POST) / unsubscribe (DELETE) routes mutate the dispatcher's
+  // subscribed-sentinel set. They must require the operator bearer even on
+  // loopback with `--auto-auth-localhost`, so a co-resident agent sharing
+  // the loopback interface cannot subscribe/unsubscribe sentinels
+  // tokenless. The GET reads (catalog / subscribed / findings) keep
+  // loopback auto-auth. `requireToken` only suppresses the loopback
+  // shortcut; token validation is unchanged. Fail-closed: with no token
+  // configured, a mutating request is rejected, never allowed.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   const dispatcher = deps.dispatcher;

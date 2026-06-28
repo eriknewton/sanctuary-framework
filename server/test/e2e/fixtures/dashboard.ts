@@ -37,6 +37,17 @@ export interface DashboardHarness {
   selector: SubstrateSelector;
   auditLog: AuditLog;
   bindings: V11Bindings;
+  /**
+   * The operator bearer token the harness configures on the server. The
+   * SPA presents this as `Authorization: Bearer <token>` for any mutating
+   * (non-GET) hub/intelligence route, mirroring the production #800/#801
+   * mechanism where the operator-entered token lives in `sessionStorage`
+   * and `client.ts` attaches it to every fetch. Tests seed it into the
+   * browser via `page.addInitScript` before the SPA boots so the same
+   * code path that field operators hit is exercised. GET reads still use
+   * loopback auto-auth, so read-only tests need not present it.
+   */
+  authToken: string;
   stop: () => Promise<void>;
 }
 
@@ -54,6 +65,12 @@ export interface DashboardHarnessOptions {
 
 const IDENTITY = "operator-e2e";
 const FORTRESS = "fortress-e2e";
+
+// A fixed, harness-local operator bearer. The value is irrelevant to the
+// auth check (constant-time string compare against the configured token);
+// it only needs to match what the SPA presents. Kept stable so a test can
+// assert against it if needed.
+const OPERATOR_TOKEN = "e2e-operator-bearer-token";
 
 async function startHarness(opts: DashboardHarnessOptions = {}): Promise<DashboardHarness> {
   const storage = new MemoryStorage();
@@ -81,7 +98,12 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
       try {
         const url = new URL(req.url ?? "/", `http://127.0.0.1`);
         const handled = await dispatchV11Request(
-          { bindings, loopbackAutoAuth: true },
+          // Configure the operator bearer AND keep loopback auto-auth on,
+          // matching production with `--auto-auth-localhost`: GET reads
+          // (status / config) auto-auth on loopback, but mutating
+          // (non-GET) routes set `requireToken` and so demand the bearer
+          // the SPA presents from sessionStorage (the #800/#801 path).
+          { bindings, authToken: OPERATOR_TOKEN, loopbackAutoAuth: true },
           req,
           res,
           url,
@@ -111,6 +133,7 @@ async function startHarness(opts: DashboardHarnessOptions = {}): Promise<Dashboa
     selector,
     auditLog,
     bindings,
+    authToken: OPERATOR_TOKEN,
     // Force-close active connections before close. The SPA opens an
     // EventSource on /api/stream that Chromium keeps open across page
     // navigations; server.close alone waits indefinitely on that

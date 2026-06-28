@@ -612,11 +612,16 @@ describe("WP-V1.3-5 Pi-2 management routes: persistence", () => {
     for (const close of closers.splice(0)) await close();
   });
 
+  // #800 follow-on: deploy (POST) / undeploy (DELETE) require the operator
+  // bearer even under loopback auto-auth. Rig configured WITH a token;
+  // mutation calls present it.
+  const HTTP_AUTH_TOKEN = "operator-token-honeypot-pi2";
+
   async function bootServer(rig: Rig): Promise<{ base: string }> {
     const server: Server = createServer(async (req, res) => {
       const handled = await handleHoneypotRoute(
         {
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: { loopbackAutoAuth: true, authToken: HTTP_AUTH_TOKEN },
           registry: rig.registry,
           findingStore: rig.findingStore,
           auditLog: rig.auditLog,
@@ -645,7 +650,10 @@ describe("WP-V1.3-5 Pi-2 management routes: persistence", () => {
     const spec = mkFsSpec({ trap_id: "fs-deploy-persist" });
     const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${HTTP_AUTH_TOKEN}`,
+      },
       body: JSON.stringify({ spec }),
     });
     expect(res.status).toBe(200);
@@ -670,7 +678,10 @@ describe("WP-V1.3-5 Pi-2 management routes: persistence", () => {
     rig.registry.deploy(spec);
     const res = await fetch(
       `${base}${HONEYPOT_API_PREFIX}/traps/fs-undeploy`,
-      { method: "DELETE" },
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${HTTP_AUTH_TOKEN}` },
+      },
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {

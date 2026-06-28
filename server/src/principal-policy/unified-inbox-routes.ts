@@ -138,17 +138,6 @@ function matchEntryPath(path: string): {
 }
 
 /**
- * True when `path` targets `POST :id/resolve` - the operator's
- * resolution of an approval entry (a Tier-1 approval decision). Reuses
- * `matchEntryPath` so it stays in lockstep with the dispatcher's route
- * parsing.
- */
-function isApprovalResolvePath(path: string): boolean {
-  const match = matchEntryPath(path);
-  return match !== null && match.action === "resolve";
-}
-
-/**
  * Route handler. Returns true when served (including 4xx/5xx);
  * returns false to let the caller continue routing.
  */
@@ -171,20 +160,24 @@ export async function handleUnifiedInboxRoute(
     return false;
   }
 
-  // SECURITY (loopback-no-autoauth-for-approvals): `POST :id/resolve`
-  // records the operator's resolution of an approval entry - a Tier-1
-  // approval decision. It must ALWAYS require the operator bearer token,
-  // even on loopback with `--auto-auth-localhost` on, so a co-resident
-  // agent sharing loopback cannot self-resolve its own approval. Other
-  // routes (list, get, archive/dismiss/snooze/delete inbox housekeeping,
-  // retention, prefs) keep loopback auto-auth for local-dashboard
-  // convenience. `requireToken` suppresses only the loopback shortcut;
-  // token validation is unchanged.
-  const isApprovalDecision =
-    method === "POST" && isApprovalResolvePath(path);
+  // SECURITY (loopback-no-autoauth-for-approvals + #800 follow-on
+  // operational mutations): `POST :id/resolve` records the operator's
+  // resolution of an approval entry - a Tier-1 approval decision - and
+  // ALWAYS required the operator bearer. The #800 follow-on extends the
+  // same strict gate to EVERY inbox mutation: PUT prefs, the entry
+  // housekeeping actions (archive / dismiss / snooze / unsnooze / delete),
+  // PATCH retention policy, and POST batch. All of these mutate
+  // operator-visible inbox state, so a co-resident agent sharing the
+  // loopback interface must not perform them tokenless even with
+  // `--auto-auth-localhost` on. Reads (GET list / get / stream / retention
+  // / prefs) keep loopback auto-auth for local-dashboard convenience.
+  // `requireToken` suppresses only the loopback shortcut; token validation
+  // is unchanged. Fail-closed: with no token configured, a mutating
+  // request is rejected, never allowed.
+  const requiresOperatorBearer = method !== "GET";
   const checkAuth = authMiddleware(
     deps.authConfig,
-    isApprovalDecision ? { requireToken: true } : undefined,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
   );
   if (!checkAuth(req, res, url)) return true;
 
