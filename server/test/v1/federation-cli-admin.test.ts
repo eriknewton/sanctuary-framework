@@ -485,6 +485,7 @@ approval_channel:
 
     expect(code).toBe(0);
     expect(captured).toHaveLength(2);
+    expect("cursor" in captured[1]!.body).toBe(false);
     expect(captured[1]!.body.idempotency_key).toBe("idem-policy-1");
     const printed = JSON.parse(out.get()) as {
       policy_pushed: boolean;

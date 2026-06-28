@@ -186,6 +186,59 @@ describe("/v1/nodes + /v1/federation/sync", () => {
     expect(await res.json()).toEqual({ error: "forbidden" });
   });
 
+  it("verifies operator-signed sync payloads with and without a cursor", async () => {
+    const token = await openDurableSession(rig);
+    await enable(token);
+
+    const cursorless = makeEvent({
+      nodeId: "linux-1",
+      sequence: 1,
+      previousHash: null,
+    });
+    const cursorlessPayload = currentSyncPayload({
+      node_id: "linux-1",
+      events: [cursorless],
+      idempotency_key: "cursorless-sync",
+    });
+    expect("cursor" in cursorlessPayload).toBe(false);
+
+    const cursorlessRes = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", cursorlessPayload),
+    );
+    expect(cursorlessRes.status).toBe(200);
+    expect(((await cursorlessRes.json()) as { accepted: string[] }).accepted).toEqual([
+      cursorless.event_id,
+    ]);
+    expect((await latestSyncAudit("linux-1")).result).toBe("success");
+
+    const withCursor = makeEvent({
+      nodeId: "linux-2",
+      sequence: 1,
+      previousHash: null,
+    });
+    const withCursorPayload = currentSyncPayload({
+      node_id: "linux-2",
+      events: [withCursor],
+      cursor: { node_id: "linux-2", after_sequence: 0 },
+      idempotency_key: "with-cursor-sync",
+    });
+    expect(withCursorPayload.cursor).toEqual({
+      node_id: "linux-2",
+      after_sequence: 0,
+    });
+
+    const withCursorRes = await sync(
+      token,
+      operatorSigned("/v1/federation/sync", withCursorPayload),
+    );
+    expect(withCursorRes.status).toBe(200);
+    expect(((await withCursorRes.json()) as { accepted: string[] }).accepted).toEqual([
+      withCursor.event_id,
+    ]);
+    expect((await latestSyncAudit("linux-2")).result).toBe("success");
+  });
+
   it("uses a peer-sync-specific JSON body cap for certificate-bearing envelopes, with no body-size oracle", async () => {
     // Federation P1: /sync/peer is pre-session and node-cert-authenticated. The
     // peer-specific body cap still rejects oversized envelopes (so cert-bearing
