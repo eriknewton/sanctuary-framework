@@ -1,5 +1,5 @@
 /**
- * Sanctuary Federation Protocol v0.1 — Types
+ * Sanctuary Federation Protocol v0.1 - Types
  *
  * Every wire-shape defined by the spec, plus the internal trust-root types.
  *
@@ -44,7 +44,7 @@ export interface FortressMasterPublicKey {
  * Spec: §2.1, §2.3, Key 14 multi-principal.
  */
 export interface PrincipalCertificate {
-  /** Opaque principal identifier — unique within the fortress. */
+  /** Opaque principal identifier - unique within the fortress. */
   principal_id: string;
   /** Base64url-encoded Ed25519 public key. */
   principal_pubkey: string;
@@ -114,7 +114,7 @@ export interface NodeIdentityCertificate {
   };
   /** TEE attestation hash for sovereign_tee nodes; null for others at v0.1. */
   tee_attestation_hash?: string;
-  /** Signature by the issuing principal's private key over canonicalize(this — signature fields). */
+  /** Signature by the issuing principal's private key over canonicalize(this - signature fields). */
   principal_signature: string;
   /**
    * Optional fortress-master signature over the same canonical body. Present for
@@ -124,9 +124,9 @@ export interface NodeIdentityCertificate {
   master_signature?: string;
 
   // ── v1.x reservation slots (§10.4) ────────────────────────────────────
-  /** RESERVED — delegated grants this node honors (v1.x MSP). Empty at v0.1. */
+  /** RESERVED - delegated grants this node honors (v1.x MSP). Empty at v0.1. */
   delegated_grants?: unknown[];
-  /** RESERVED — TCB attestation lineage history (v1.x deeper attestation). Empty at v0.1. */
+  /** RESERVED - TCB attestation lineage history (v1.x deeper attestation). Empty at v0.1. */
   attestation_lineage_chain?: unknown[];
 }
 
@@ -282,7 +282,7 @@ export interface NodeIdentityCertificateV2Hybrid {
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Extension envelope — the v1.x forward-compat hinge (§10.1).
+ * Extension envelope - the v1.x forward-compat hinge (§10.1).
  *
  * v0.1 emitters MUST leave this empty. v0.1 receivers MUST ignore unknown keys.
  * Reserved keys are enumerated in constants.RESERVED_EXTENSION_ENVELOPE_KEYS.
@@ -290,7 +290,7 @@ export interface NodeIdentityCertificateV2Hybrid {
 export type ExtensionEnvelope = Record<string, unknown>;
 
 /**
- * Signed event. Every federation message — broadcast or unicast, v0.1 or v1.x —
+ * Signed event. Every federation message - broadcast or unicast, v0.1 or v1.x -
  * uses this envelope.
  *
  * Spec: §4.2.
@@ -305,7 +305,7 @@ export interface SignedEvent<Payload = unknown> {
   /** Node originating this event. */
   emitter_node: string;
   /**
-   * Principal attribution — identifies the human/agent principal that authored.
+   * Principal attribution - identifies the human/agent principal that authored.
    * "system" is reserved for node-internal events (heartbeat, etc.).
    */
   emitter_principal: string;
@@ -321,7 +321,7 @@ export interface SignedEvent<Payload = unknown> {
   emitted_at: string;
   /** Per-emitter monotonic counter. Rollback detector (§8.3). */
   monotonic_seq: number;
-  /** Forward-compat slot — empty at v0.1. */
+  /** Forward-compat slot - empty at v0.1. */
   extension_envelope: ExtensionEnvelope;
   /** Ed25519 signature by the emitting node's per-node key. */
   node_signature: string;
@@ -348,7 +348,11 @@ export interface HeartbeatPayload {
 export interface PolicyUpdatePayload {
   agent_id: string;
   policy_version: number;
-  /** Opaque policy blob — structure is WP-MVP-5's concern. */
+  /** ISO timestamp from which this policy bundle may be accepted. */
+  valid_from: string;
+  /** ISO timestamp after which this policy bundle must be rejected. */
+  valid_until: string;
+  /** Opaque policy blob - structure is WP-MVP-5's concern. */
   policy_blob: string;
   /** Optional prior version pointer for conflict detection. */
   parent_version?: number;
@@ -364,7 +368,7 @@ export interface LocatorUpdatePayload {
   hosting_principal: string;
 }
 
-/** node_lifecycle payloads — one of several, discriminated by event_type. */
+/** node_lifecycle payloads - one of several, discriminated by event_type. */
 export type NodeLifecyclePayload =
   | NodeJoinPayload
   | NodeLeavePayload
@@ -414,7 +418,7 @@ export interface MasterRotationPayload {
 export interface ReceiptReplicatePayload {
   receipt_id: string;
   originating_agent_id: string;
-  /** Opaque signed receipt bytes — Concordia attestation shape, verified independently. */
+  /** Opaque signed receipt bytes - Concordia attestation shape, verified independently. */
   receipt_bytes: string;
 }
 
@@ -423,10 +427,10 @@ export interface ReceiptReplicatePayload {
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Audit entry — the atom stored in the canonical audit log.
+ * Audit entry - the atom stored in the canonical audit log.
  *
  * Spec §5.3. Note `signature_scheme` is MANDATORY at v1.0 even though only one
- * value is valid — the crypto-agility hinge for post-quantum migration at v1.x.
+ * value is valid - the crypto-agility hinge for post-quantum migration at v1.x.
  */
 export interface AuditEntry {
   entry_id: string;
@@ -443,7 +447,7 @@ export interface AuditEntry {
 }
 
 /**
- * Audit batch — sealed every 5 seconds or every 256 entries per §5.2.
+ * Audit batch - sealed every 5 seconds or every 256 entries per §5.2.
  *
  * Two rollback canaries:
  * - `prev_batch_hash` chains batches per-emitter; a break means replay.
@@ -454,14 +458,14 @@ export interface AuditBatch {
   emitter_node: string;
   /** Per-emitter monotonic batch counter. */
   batch_seq: number;
-  /** SHA-256 of the canonicalize(prev_batch) — empty string for the first batch. */
+  /** SHA-256 of the canonicalize(prev_batch) - empty string for the first batch. */
   prev_batch_hash: string;
   entries: AuditEntry[];
   /**
    * HMAC over canonicalize({batch_id, batch_seq, prev_batch_hash}) using
    * node_audit_chain_key (HKDF-derived from fortress-master per §2.2).
    * Proves the emitter was provisioned with the correct master-derived chain key
-   * — a stolen per-node signing key alone cannot forge this proof.
+   * - a stolen per-node signing key alone cannot forge this proof.
    */
   hkdf_chain_proof: string;
   /** Ed25519 signature over canonicalize(batch minus signature) by per-node key. */

@@ -188,13 +188,14 @@ function writeGenericActivationFailure(
   res: ServerResponse,
   status: number,
   draftId: string,
+  auditOperation: string = ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
 ): void {
   writeJSON(res, status, {
     ok: false,
     error: "activation_refused",
     data: {
       audit_ref: auditRef(
-        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
+        auditOperation,
         draftId,
       ),
     },
@@ -205,13 +206,14 @@ function writeGenericRevocationFailure(
   res: ServerResponse,
   status: number,
   draftId: string,
+  auditOperation: string = ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
 ): void {
   writeJSON(res, status, {
     ok: false,
     error: "revocation_refused",
     data: {
       audit_ref: auditRef(
-        ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
+        auditOperation,
         draftId,
       ),
     },
@@ -437,7 +439,14 @@ export async function handleEnglishPolicyRoute(
                 : outcome.reason === "invalid_rule"
                   ? 400
                   : 500;
-        writeGenericActivationFailure(res, status, activateMatch.draftId);
+        writeGenericActivationFailure(
+          res,
+          status,
+          activateMatch.draftId,
+          outcome.reason === "policy_posture_downgrade_refused"
+            ? ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED
+            : ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.ACTIVATION_REFUSED,
+        );
         return true;
       }
       writeJSON(res, 200, {
@@ -525,8 +534,17 @@ export async function handleEnglishPolicyRoute(
               ? 404
               : outcome.reason === "not_activated"
                 ? 409
+                : outcome.reason === "policy_posture_downgrade_refused"
+                  ? 409
                 : 500;
-          writeGenericRevocationFailure(res, status, detailMatch.draftId);
+          writeGenericRevocationFailure(
+            res,
+            status,
+            detailMatch.draftId,
+            outcome.reason === "policy_posture_downgrade_refused"
+              ? ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.POLICY_WRITE_REFUSED
+              : ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.REVOKED,
+          );
           return true;
         }
         writeJSON(res, 200, {

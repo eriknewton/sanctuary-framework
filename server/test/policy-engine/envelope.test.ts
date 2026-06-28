@@ -1,5 +1,5 @@
 /**
- * Envelope round-trip — compile → pack → verify → decode.
+ * Envelope round-trip - compile → pack → verify → decode.
  *
  * Uses real trust-root + real keys from the WP-MVP-3 mesh fixture. No crypto
  * mocked. The SignedEvent<PolicyUpdatePayload> is built with packSignedEvent
@@ -35,7 +35,7 @@ function compiledFor(fortress_id: string, policy_version = 1) {
   });
 }
 
-describe("policy-engine/envelope — pack + unpack round-trip", () => {
+describe("policy-engine/envelope - pack + unpack round-trip", () => {
   it("packs a policy_update event and verifies end-to-end", () => {
     const f = buildFortress();
     const compiled = compiledFor(f.master.public.fortress_id);
@@ -50,6 +50,10 @@ describe("policy-engine/envelope — pack + unpack round-trip", () => {
     expect(evt.event_type).toBe("policy_update");
     expect(evt.payload.agent_id).toBe("researcher");
     expect(evt.payload.policy_version).toBe(1);
+    expect(evt.payload.valid_from).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(Date.parse(evt.payload.valid_until)).toBeGreaterThan(
+      Date.parse(evt.payload.valid_from),
+    );
 
     const result = unpackPolicyUpdate({
       event: evt,
