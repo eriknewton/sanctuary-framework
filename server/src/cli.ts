@@ -600,6 +600,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   let tenant: string | undefined;
   let noConfirm = false;
   let recoveryOut: string | undefined;
+  let allowPark = false;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--passphrase" && args[i + 1]) {
@@ -620,6 +621,13 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
       noConfirm = true;
     } else if (args[i] === "--recovery-out" && args[i + 1]) {
       recoveryOut = args[++i];
+    } else if (args[i] === "--allow-park") {
+      // Slice 2 (park-not-exit): opt-in. Set by the supervised LaunchAgent so
+      // a locked-no-credential start boots PARKED (listener up, readiness
+      // "locked", unlock door live) instead of throwing and crash-looping
+      // under KeepAlive. Interactive `sanctuary dashboard` omits this and keeps
+      // its loud remediation behavior.
+      allowPark = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printDashboardHelp();
       process.exit(0);
@@ -666,6 +674,7 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
     ...(tenant !== undefined ? { tenant } : {}),
     ...(recoveryOut !== undefined ? { recoveryOut } : {}),
     noConfirm,
+    allowPark,
   });
 
   // Keep the process alive. The HTTP server is listening.
@@ -887,6 +896,12 @@ Options:
                        On a first-run mint, write the plaintext recovery key to
                        this exact path OUTSIDE the fortress directory (durable
                        off-host escrow). Also honors SANCTUARY_RECOVERY_OUT.
+  --allow-park         Park (do not exit) on a locked-no-credential start
+                       instead of failing loudly: bind the listener, report
+                       readiness "locked", serve the in-process unlock door,
+                       and stay up. Intended for the supervised LaunchAgent so
+                       KeepAlive does not crash-loop a locked fortress. The
+                       process does NOT auto-unlock; an operator unlocks once.
   --help, -h           Show this help
 
 Environment variables:

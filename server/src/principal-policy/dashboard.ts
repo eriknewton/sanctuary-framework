@@ -216,6 +216,17 @@ interface PendingRequest {
   created_at: string;
 }
 
+/**
+ * Slice 2 (park-not-exit): the credential an operator presents to the
+ * in-process unlock endpoint to lift a parked dashboard out of "locked" and
+ * into "serving". Exactly one of `passphrase` / `recoveryKey` is supplied; the
+ * unlock handler forwards it to `establishMaster` unchanged. NEVER persisted,
+ * NEVER logged, NEVER echoed back.
+ */
+export type UnlockCredential =
+  | { passphrase: string }
+  | { recoveryKey: string };
+
 type SSEClient = ServerResponse;
 
 // ── Dashboard Approval Channel ──────────────────────────────────────────
@@ -524,6 +535,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private supervisorBridge: SupervisorBridge | null = null;
 
   /**
+   * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
+   * key under the supervised LaunchAgent path (`--allow-park`). A parked
+   * dashboard binds the listener, answers `/api/health` (`ok:true`), reports
+   * `/api/readiness` `ready:"locked"` (the identity manager is absent), serves
+   * the unlock door, and serves NO protected state (no master-key-derived deps
+   * are constructed). It is flipped to false by a successful in-process unlock.
+   * Internal only: the wire contract for readiness stays exactly Slice 1b's
+   * `ready:"locked"` whether parked or merely deps-detached.
+   */
+  private _parked = false;
+
+  /**
+   * Slice 2 (park-not-exit): the in-process unlock handler. Set by the
+   * standalone boot path (`setUnlockHandler`) when park is enabled. Given an
+   * operator-supplied credential, it re-runs the SAME `establishMaster` the
+   * boot path runs and wires the unlocked deps through `setDependencies` etc.
+   * Returns `true` on a successful unlock (readiness flips to `serving`),
+   * `false` on a credential that fails to unlock the fortress (the process
+   * stays parked, fail-closed). It NEVER reveals which rule/tier failed
+   * (invariant 7) and NEVER weakens establishMaster.
+   *
+   * CUSTODY: the unlock endpoint that calls this requires the operator bearer
+   * token EVEN ON LOOPBACK (the strictest option, like the approval-decision
+   * routes) so a co-resident agent sharing the loopback interface cannot
+   * self-unlock the fortress. See `handleUnlockRequest`.
+   */
+  private unlockHandler: ((credential: UnlockCredential) => Promise<boolean>) | null = null;
+
+  /**
    * Federation PR-A3 state. `_federationContext` carries the fortress
    * materials (master secret accessor, principal cert + key, pinned master
    * pubkey) the join ceremony needs; it is bound out of band by the console/
@@ -739,6 +779,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setStandaloneMode(standalone: boolean): void {
     this._standaloneMode = standalone;
+  }
+
+  /**
+   * Slice 2 (park-not-exit): mark whether this dashboard is parked (booted
+   * without a master key under the supervised LaunchAgent). Internal flag;
+   * does not change the readiness wire contract (`ready` is still derived from
+   * the presence of the identity manager). Cleared by a successful unlock.
+   */
+  setParked(parked: boolean): void {
+    this._parked = parked;
+  }
+
+  /** Slice 2: is this dashboard currently parked (locked, awaiting unlock)? */
+  isParked(): boolean {
+    return this._parked;
+  }
+
+  /**
+   * Slice 2 (park-not-exit): register the in-process unlock handler. The
+   * standalone boot path supplies a closure that re-runs `establishMaster`
+   * with an operator-supplied credential and wires the unlocked deps. Once
+   * set, `POST /api/unlock` is live. The endpoint REQUIRES the operator bearer
+   * token even on loopback (custody carve-out); see `handleUnlockRequest`.
+   *
+   * Pass `null` to detach (tests / after a successful unlock if desired).
+   */
+  setUnlockHandler(
+    handler: ((credential: UnlockCredential) => Promise<boolean>) | null,
+  ): void {
+    this.unlockHandler = handler;
   }
 
   /**
@@ -2537,9 +2607,31 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Start the HTTP(S) server for the dashboard.
+   * Slice 2 (single-owner): set true when `start()` was asked to treat
+   * EADDRINUSE as a benign "another owner holds the port" outcome and the
+   * bind failed with EADDRINUSE. The supervised boot path checks this and
+   * exits 0 (so launchd KeepAlive treats it as a successful run, never a
+   * crash that churns the restart loop). Never set on the interactive path,
+   * which keeps the loud operator message and a real reject/throw.
    */
-  async start(): Promise<void> {
+  private _addrInUse = false;
+
+  /** Slice 2: did the last `start()` lose the single-owner race (EADDRINUSE)? */
+  addrInUse(): boolean {
+    return this._addrInUse;
+  }
+
+  /**
+   * Start the HTTP(S) server for the dashboard.
+   *
+   * @param opts.exitCleanOnAddrInUse Slice 2 single-owner guard. When true
+   *   (the supervised LaunchAgent path), an EADDRINUSE bind failure RESOLVES
+   *   cleanly and sets {@link addrInUse} instead of rejecting, so the caller
+   *   can exit 0 and KeepAlive treats it as a successful run (no churn). When
+   *   false/omitted (interactive `sanctuary dashboard`), EADDRINUSE still
+   *   prints the loud operator banner and rejects.
+   */
+  async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
     const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
 
     let server;
@@ -2589,6 +2681,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") {
           const port = this.config.port;
+          // Slice 2 single-owner: on the supervised path, another owner already
+          // holds the port (the LaunchAgent process, or a prior in-app spawn).
+          // This is NOT a crash; resolve cleanly so the boot path can exit 0
+          // and KeepAlive treats it as a successful run (no restart churn,
+          // never a tight loop). At most one listener survives; EADDRINUSE
+          // loses, quietly.
+          if (opts?.exitCleanOnAddrInUse) {
+            this._addrInUse = true;
+            process.stderr.write(
+              `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
+                `instance; standing down (single-owner).\n\n`,
+            );
+            resolve();
+            return;
+          }
           process.stderr.write(
             `\n  ╔══════════════════════════════════════════════════════════════╗\n` +
             `  ║  Port ${port} is already in use.                              ║\n` +
@@ -3420,6 +3527,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
+    // Slice 2 (park-not-exit): in-process unlock door. POST /api/unlock takes
+    // an operator credential, re-runs establishMaster, and (on success) wires
+    // the unlocked deps so readiness flips locked -> serving with NO restart.
+    //
+    // CUSTODY CARVE-OUT (the new attack surface): this is the strictest auth
+    // option. It REQUIRES the operator bearer token EVEN ON LOOPBACK
+    // (`requireToken: true`), exactly like the Tier-1 approval-decision routes.
+    // A co-resident agent sharing the loopback interface holds no proxy for
+    // operator identity, so loopback auto-auth is explicitly suppressed here:
+    // the agent cannot self-unlock the fortress by POSTing a guessed/known
+    // credential from localhost. It is registered in the `decisions` rate-limit
+    // class, but note that `checkRateLimit` short-circuits `return true` for
+    // loopback callers (operator-local tooling must never 429), so loopback
+    // unlock attempts are NOT actually rate-limited; the rate limit only bites
+    // remote callers. Credential brute-force on loopback is instead bounded by
+    // the deliberately-slow Argon2id KDF inside establishMaster (each attempt
+    // pays the full key-derivation cost), and the operator bearer token is
+    // STILL required even on loopback (the custody carve-out above). It returns
+    // GENERIC errors (no oracle about which rule/tier failed; invariant 7) and
+    // serves NO protected state until a CORRECT unlock. It NEVER auto-generates
+    // a weaker credential and NEVER weakens establishMaster (the handler calls
+    // the same establishMaster the boot path calls).
+    if (method === "POST" && url.pathname === "/api/unlock") {
+      if (!this.checkRateLimit(req, res, "decisions")) return;
+      if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+      this.handleUnlockRequest(req, res);
+      return;
+    }
+
     // SEC-012: Session exchange does its own auth (header-only) - let it through before checkAuth
     if (method === "POST" && url.pathname === "/auth/session") {
       if (!this.checkRateLimit(req, res, "general")) return;
@@ -3634,6 +3770,110 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       session_id: sessionId,
       expires_in_seconds: ttlSeconds,
     }));
+  }
+
+  /**
+   * Slice 2 (park-not-exit): handle the authenticated in-process unlock POST.
+   * Auth + rate limit are enforced by the caller (operator token required even
+   * on loopback). This method validates the body, forwards the credential to
+   * the registered unlock handler (which re-runs establishMaster + wires the
+   * unlocked deps), and returns a GENERIC result.
+   *
+   * Fail-closed posture:
+   *   - No unlock handler registered (park not enabled): 404 generic.
+   *   - Already unlocked: 409 generic (idempotent guard; the read surface is
+   *     already serving, nothing to do).
+   *   - Malformed / oversized body: 400 generic.
+   *   - Wrong credential: 401 generic "unlock failed". NO oracle about which
+   *     rule/tier failed (invariant 7); the process STAYS parked.
+   *   - Success: 200 `{ unlocked: true }`; readiness has already flipped to
+   *     "serving" inside the handler.
+   */
+  private handleUnlockRequest(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.unlockHandler) {
+      // Park not enabled on this dashboard: no unlock door exists. Generic 404
+      // so the absence of the door is not itself a state oracle.
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+    if (!this._parked) {
+      // Already unlocked (or never parked): nothing to do. Generic 409.
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Already unlocked" }));
+      return;
+    }
+
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // Size limit: 8KB is ample for a passphrase / recovery key.
+      if (body.length > 8192) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      let credential: UnlockCredential;
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        const passphrase = parsed.passphrase;
+        const recoveryKey = parsed.recovery_key ?? parsed.recoveryKey;
+        if (typeof passphrase === "string" && passphrase.length > 0) {
+          credential = { passphrase };
+        } else if (typeof recoveryKey === "string" && recoveryKey.length > 0) {
+          credential = { recoveryKey };
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Provide a passphrase or recovery_key",
+            }),
+          );
+          return;
+        }
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+
+      // Re-check the handler/park state inside the async tail: a concurrent
+      // unlock could have flipped us out of parked while the body streamed.
+      if (!this.unlockHandler || !this._parked) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Already unlocked" }));
+        return;
+      }
+
+      let unlocked: boolean;
+      try {
+        unlocked = await this.unlockHandler(credential);
+      } catch {
+        // A handler-internal failure (wrong-key throw, wiring error) must not
+        // leak detail and must leave the process parked. Generic failure.
+        unlocked = false;
+      }
+
+      if (unlocked) {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ unlocked: true }));
+        return;
+      }
+      // Generic, no oracle: the process stays parked, fail-closed.
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ error: "Unlock failed" }));
+    });
   }
 
   private serveLoginPage(res: ServerResponse): void {
