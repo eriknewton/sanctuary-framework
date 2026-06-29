@@ -27,6 +27,8 @@ import {
   evaluateRollback,
   evaluateAndEnforceRollback,
   restoreAttest,
+  readBaselineEstablishedLatch,
+  raiseBaselineEstablishedLatch,
   EPOCH_WITNESS_META_KEY,
   ROLLBACK_FREEZE_META_KEY,
   type WitnessObservation,
@@ -127,6 +129,90 @@ describe("epoch witness", () => {
     );
     const read = await readEpochWitness(storage, master);
     if (read.status === "valid") expect(read.data.epoch).toBe(2);
+  });
+});
+
+describe("baseline-established latch (DEBT-1 close-out)", () => {
+  it("an untrusted (absent) witness reports established=false + witnessUntrusted", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(false);
+    expect(latch.witnessUntrusted).toBe(true);
+  });
+
+  it("raise sets the latch + schema floor and is MAC-bound (carried through read)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBe(3);
+    expect(latch.witnessUntrusted).toBeUndefined();
+    // The latch fields are covered by the witness MAC: a witness keyed by a
+    // DIFFERENT master must not authenticate (so the latch cannot be read).
+    const other = generateRandomKey();
+    expect((await readBaselineEstablishedLatch(storage, other)).witnessUntrusted).toBe(
+      true
+    );
+  });
+
+  it("the schema floor is monotonic: a lower raise never lowers it", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    await raiseBaselineEstablishedLatch(storage, master, 2); // attempt to lower
+    expect((await readBaselineEstablishedLatch(storage, master)).sealedSchema).toBe(
+      3
+    );
+  });
+
+  it("a non-force witness write never DROPS an already-set latch", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    // A plain epoch advance (no latch field) must preserve the latch + floor.
+    await writeEpochWitness(storage, master, {
+      epoch: 1,
+      epoch_id: "rot-1",
+      witnessed_at: "t",
+    });
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBe(3);
+  });
+
+  it("coexists with the epoch floor: raising the latch preserves the epoch", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await writeEpochWitness(storage, master, {
+      epoch: 4,
+      epoch_id: "rot-4",
+      witnessed_at: "t",
+    });
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const read = await readEpochWitness(storage, master);
+    expect(read.status).toBe("valid");
+    if (read.status === "valid") {
+      expect(read.data.epoch).toBe(4);
+      expect(read.data.baseline_established).toBe(true);
+      expect(read.data.baseline_schema).toBe(3);
+    }
+  });
+
+  it("rejects a witness whose baseline_schema field is wrong-typed (forged)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+    await raiseBaselineEstablishedLatch(storage, master, 3);
+    const raw = await storage.read("_meta", EPOCH_WITNESS_META_KEY);
+    const obj = JSON.parse(bytesToString(raw!)) as Record<string, unknown>;
+    (obj.data as Record<string, unknown>).baseline_schema = "not-a-number";
+    await storage.write(
+      "_meta",
+      EPOCH_WITNESS_META_KEY,
+      stringToBytes(JSON.stringify(obj))
+    );
+    expect((await readEpochWitness(storage, master)).status).toBe("invalid");
   });
 });
 

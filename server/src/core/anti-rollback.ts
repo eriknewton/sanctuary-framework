@@ -186,6 +186,38 @@ export interface EpochWitnessData {
   /** Last rotation_id, or a creation nonce at epoch 0. Advisory provenance. */
   epoch_id: string;
   witnessed_at: string;
+  /**
+   * Monotonic "a config-security baseline has been established" latch (DEBT-1
+   * close-out for the #805/#791 config-downgrade gate). Once a fortress has
+   * sealed a config-security baseline (`core/config-baseline.ts`), this is
+   * raised to `true` in the master-MAC'd witness and NEVER lowered. It lets the
+   * config gate detect the DELETION (or older-schema reseed) of the
+   * single-deletable baseline record as a rollback: a missing/reseed baseline
+   * on a fortress whose witness says one was established is a downgrade-replay
+   * attempt, not a genuine first run. ADDITIVE: absent reads as `false`
+   * (pre-DEBT-1 / legacy witnesses), bound into the witness MAC because the MAC
+   * covers `canonicalJson(data)`. The latch lives in the epoch-witness record,
+   * a SEPARATE deletable location from the config-baseline record, so laundering
+   * the deletion requires the attacker to ALSO delete the master-MAC'd witness;
+   * on a fortress that has done real work the rotation/head-anchor splice
+   * witnesses independently expose that (see the deletion-of-both residual on
+   * `readBaselineEstablishedLatch`).
+   */
+  baseline_established?: boolean;
+  /**
+   * Monotonic floor on the HIGHEST config-baseline schema version this fortress
+   * has ever sealed (DEBT-1, the reseed leg). It distinguishes a legitimate
+   * forward schema UPGRADE reseed from a backward DOWNGRADE reseed attack:
+   *  - legit upgrade: the running binary seals a HIGHER schema than this floor →
+   *    the floor advances, reseed allowed.
+   *  - downgrade-reseed attack: an attacker presents an OLDER-schema record on a
+   *    fortress whose floor already recorded a higher sealed schema → the
+   *    presented schema is BELOW the floor → fail closed.
+   * Like `baseline_established` it is ADDITIVE (absent reads as "no floor",
+   * legacy/pre-DEBT-1), never lowered, and bound into the witness MAC. It is set
+   * together with the establishment latch.
+   */
+  baseline_schema?: number;
 }
 
 function epochWitnessMac(master: Uint8Array, data: EpochWitnessData): Uint8Array {
@@ -250,6 +282,16 @@ export async function readEpochWitness(
     data.epoch < 0 ||
     typeof data.epoch_id !== "string" ||
     typeof data.witnessed_at !== "string" ||
+    // `baseline_established` / `baseline_schema` are additive: a record either
+    // omits them (legacy) or carries an explicit boolean / non-negative integer.
+    // Any other type is a forged/garbled record → fail the MAC path (invalid),
+    // never silently coerce.
+    (data.baseline_established !== undefined &&
+      typeof data.baseline_established !== "boolean") ||
+    (data.baseline_schema !== undefined &&
+      (typeof data.baseline_schema !== "number" ||
+        !Number.isSafeInteger(data.baseline_schema) ||
+        data.baseline_schema < 0)) ||
     typeof mac !== "string"
   ) {
     return { status: "invalid" };
@@ -258,6 +300,17 @@ export async function readEpochWitness(
     epoch: data.epoch,
     epoch_id: data.epoch_id,
     witnessed_at: data.witnessed_at,
+    // Carry the latch fields through so the recomputed MAC covers exactly the
+    // bytes that were signed. Omitting a field that WAS set computes the wrong
+    // MAC and rejects a legitimate witness; attaching a field a legacy record
+    // never had ALSO changes the canonical bytes, so only attach when the key
+    // is actually present.
+    ...(data.baseline_established !== undefined
+      ? { baseline_established: data.baseline_established }
+      : {}),
+    ...(data.baseline_schema !== undefined
+      ? { baseline_schema: data.baseline_schema }
+      : {}),
   };
   let provided: Uint8Array;
   try {
@@ -288,6 +341,7 @@ export async function writeEpochWitness(
   data: EpochWitnessData,
   opts?: { force?: boolean }
 ): Promise<void> {
+  let toWrite = data;
   if (!opts?.force) {
     const current = await readEpochWitness(storage, master);
     if (current.status === "valid" && data.epoch < current.data.epoch) {
@@ -297,17 +351,147 @@ export async function writeEpochWitness(
           "attestation. Use `sanctuary restore-attest`."
       );
     }
+    // The `baseline_established` latch and the `baseline_schema` floor are
+    // monotonic too: a non-force write must never DROP an already-set latch nor
+    // LOWER the sealed-schema floor (either would launder a baseline deletion /
+    // downgrade by re-stamping the witness). Carry them forward unless the caller
+    // is explicitly raising them. `force` (restore-attest) preserves them via its
+    // own read, so it is excluded here.
+    if (current.status === "valid") {
+      if (current.data.baseline_established === true && data.baseline_established !== true) {
+        toWrite = { ...toWrite, baseline_established: true };
+      }
+      const priorSchema = current.data.baseline_schema;
+      if (
+        typeof priorSchema === "number" &&
+        (typeof toWrite.baseline_schema !== "number" ||
+          toWrite.baseline_schema < priorSchema)
+      ) {
+        toWrite = { ...toWrite, baseline_schema: priorSchema };
+      }
+    }
   }
   const record = {
     [EPOCH_WITNESS_MARKER]: true,
-    data,
-    mac: toBase64url(epochWitnessMac(master, data)),
+    data: toWrite,
+    mac: toBase64url(epochWitnessMac(master, toWrite)),
   };
   await storage.write(
     "_meta",
     EPOCH_WITNESS_META_KEY,
     stringToBytes(JSON.stringify(record))
   );
+}
+
+// ── Config-baseline establishment latch (DEBT-1 close-out) ──────────────────
+
+/**
+ * Read the boot-anchored "a config-security baseline was established" latch from
+ * the master-MAC'd epoch witness. The config-downgrade gate
+ * (`core/config-baseline.ts`) consults this to tell a GENUINE first run (no
+ * baseline ever) apart from a DELETION/older-schema REPLAY (a baseline existed,
+ * its single deletable record is now gone or downgraded). It threads the
+ * config-baseline residual through the SAME witness the custody anti-rollback
+ * floor already uses (no parallel mechanism, no new freeze path).
+ *
+ * Verdicts:
+ *  - `{ established: true, sealedSchema }`: the authenticated witness latch is
+ *    set; a fortress that has sealed a baseline before, at highest schema
+ *    `sealedSchema` (undefined for a pre-schema-floor latch). A subsequent boot
+ *    whose config-baseline record is absent is a deletion-replay → fail closed;
+ *    a reseed presenting a schema BELOW `sealedSchema` is a downgrade-reseed →
+ *    fail closed; a reseed at a schema AT-OR-ABOVE `sealedSchema` is a legit
+ *    forward upgrade → allowed.
+ *  - `{ established: false }`: the witness authenticates and the latch is
+ *    unset (genuine never-seeded fortress, or a legacy pre-DEBT-1 witness).
+ *  - `{ established: false, witnessUntrusted: true }`: NO authenticated witness
+ *    exists (absent or tampered). The caller MUST NOT read this as "no baseline
+ *    was ever established"; it composes this with the OTHER surviving witnesses
+ *    (rotation epoch record / audit head anchor) exactly as the boot detector
+ *    does, so deleting the witness to erase the latch does not launder a
+ *    deletion on a fortress that has done real work.
+ *
+ * HONEST RESIDUAL (do not over-claim): the ONLY way to fully erase the latch is
+ * to delete BOTH the config-baseline record AND the master-MAC'd epoch witness.
+ * On a fortress that has rotated or audited, that joint deletion is itself a
+ * detected rollback (the rotation/head-anchor witnesses regress), but on a
+ * brand-new fortress that booted once and never rotated/audited, a joint
+ * deletion of both records is indistinguishable from a genuine first run. That
+ * is the same irreducible full-wipe residual the module documents for Stage 1
+ * (a self-consistent full-tree restore), bounded only by Stage 2/4. The latch
+ * raises the attacker's cost from "delete one plaintext-shaped record" to
+ * "delete the master-MAC'd witness too," which the splice witnesses then expose
+ * on any fortress with real history.
+ */
+export async function readBaselineEstablishedLatch(
+  storage: StorageBackend,
+  master: Uint8Array
+): Promise<{
+  established: boolean;
+  sealedSchema?: number;
+  witnessUntrusted?: boolean;
+}> {
+  const witness = await readEpochWitness(storage, master);
+  if (witness.status === "valid") {
+    const established = witness.data.baseline_established === true;
+    return {
+      established,
+      ...(established && typeof witness.data.baseline_schema === "number"
+        ? { sealedSchema: witness.data.baseline_schema }
+        : {}),
+    };
+  }
+  // absent (deleted/never-written) OR invalid (tampered). Either way there is no
+  // trustworthy latch to read; surface that so the caller composes the other
+  // witnesses rather than treating it as a clean "never established".
+  return { established: false, witnessUntrusted: true };
+}
+
+/**
+ * Raise the monotonic baseline-established latch AND advance the sealed-schema
+ * floor on the epoch witness. Called by the config gate every time it seals a
+ * baseline (first run, reseed, or a clean authenticated advance), passing the
+ * schema version it just sealed, so both the latch and the schema floor track
+ * forward without a rotation.
+ *
+ * It preserves the current epoch/epoch_id (it raises the latch, it does not
+ * touch the rollback floor) and routes through `writeEpochWitness`, whose
+ * monotonic guards keep the epoch non-decreasing and never lower the latch or
+ * the schema floor. When NO authenticated witness exists yet (genuine first run,
+ * before any rotation), it establishes a fresh epoch-0 witness carrying the
+ * latch, so a fortress that has sealed a baseline always has a witness saying
+ * so. Idempotent: a no-op when the latch is already set at an equal-or-higher
+ * schema floor.
+ */
+export async function raiseBaselineEstablishedLatch(
+  storage: StorageBackend,
+  master: Uint8Array,
+  sealedSchema: number,
+  now: () => Date = () => new Date()
+): Promise<void> {
+  const witness = await readEpochWitness(storage, master);
+  if (
+    witness.status === "valid" &&
+    witness.data.baseline_established === true &&
+    typeof witness.data.baseline_schema === "number" &&
+    witness.data.baseline_schema >= sealedSchema
+  ) {
+    return; // already raised at this schema or higher (monotonic), nothing to do
+  }
+  const base: EpochWitnessData =
+    witness.status === "valid"
+      ? witness.data
+      : { epoch: 0, epoch_id: "epoch-0-creation", witnessed_at: now().toISOString() };
+  const priorSchema =
+    witness.status === "valid" && typeof witness.data.baseline_schema === "number"
+      ? witness.data.baseline_schema
+      : -1;
+  await writeEpochWitness(storage, master, {
+    ...base,
+    baseline_established: true,
+    baseline_schema: Math.max(priorSchema, sealedSchema),
+    witnessed_at: now().toISOString(),
+  });
 }
 
 // ── Rollback-freeze marker ──────────────────────────────────────────────────
@@ -946,6 +1130,16 @@ export async function restoreAttest(args: {
     ...(priorFreeze.data ? { priorFreeze: priorFreeze.data } : {}),
   });
 
+  // Preserve the baseline-established latch across the force re-baseline: the
+  // operator is attesting to a custody EPOCH restore, not un-establishing a
+  // config baseline that genuinely existed. (`force` skips writeEpochWitness's
+  // monotonic latch-preserve, so carry it explicitly.) A wrong-master caller
+  // reads the witness as "invalid" → `established: false` here, which is the
+  // safe direction: it does not re-assert a latch it cannot authenticate.
+  const priorLatch = await readBaselineEstablishedLatch(
+    args.storage,
+    args.master
+  );
   // Force-write the witness to the attested epoch (this is the one place a
   // LOWER epoch is legitimate — the operator is asserting the restore is real).
   // A caller WITHOUT the current master writes a witness keyed to its own wrong
@@ -958,6 +1152,10 @@ export async function restoreAttest(args: {
       epoch: args.currentEpoch,
       epoch_id: args.epochId,
       witnessed_at: now().toISOString(),
+      ...(priorLatch.established ? { baseline_established: true } : {}),
+      ...(priorLatch.established && typeof priorLatch.sealedSchema === "number"
+        ? { baseline_schema: priorLatch.sealedSchema }
+        : {}),
     },
     { force: true }
   );
