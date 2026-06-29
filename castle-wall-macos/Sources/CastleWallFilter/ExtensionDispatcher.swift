@@ -87,6 +87,20 @@ public final class ExtensionDispatcher {
     private var providerUnboundAuditSent = false
     private var connectedFortressId: String?
     private var unboundTimer: DispatchSourceTimer?
+    /// True once `start()` has been invoked at least once. Gates the
+    /// lazy-reconnect path in `notifyVerdict`: a dispatcher that has never
+    /// been started (the pristine `.disconnected` state used by unit tests
+    /// and by a not-yet-bootstrapped provider) must NOT spin up a connection
+    /// attempt from the verdict callback; it only retries a channel that was
+    /// previously brought up and has since degraded.
+    private var hasEverStarted = false
+    /// Greppable prefix for the Slice-M audit-emission drop-path probes.
+    /// The signed-host engage drill runs
+    /// `log stream --predicate 'process == "CastleWallExtension"'` and greps
+    /// this prefix to learn EXACTLY which of the three drop paths fired when
+    /// no per-flow `producer_signed` audit entry reaches the daemon consumer.
+    /// Never log key material, signatures, or raw destination payloads here.
+    private static let auditDropLogPrefix = "[slice-m-audit-drop]"
 
     private static let initialRetryDelaySeconds: TimeInterval = 1.0
     private static let maxRetryDelaySeconds: TimeInterval = 30.0
@@ -156,6 +170,7 @@ public final class ExtensionDispatcher {
 
         stateQueue.sync {
             isStopping = false
+            hasEverStarted = true
         }
         installClientListenersIfNeeded()
 
@@ -214,42 +229,140 @@ public final class ExtensionDispatcher {
     ) {
         let state = connectionState
         guard state == .connected else {
+            // DROP-PATH 2 (disconnected-dispatcher). The audit-reporting
+            // channel is not connected, so the per-flow verdict cannot be
+            // emitted. Log the ACTUAL connection-state discriminator so the
+            // drill can tell a genuinely-down channel apart from a not-yet-
+            // bound one. Then attempt a lazy (re)connect so a verdict that
+            // fires after the daemon comes up rebinds the channel instead of
+            // dropping forever (the leading 06-26/06-28 hypothesis: the
+            // extension activated before the audit channel existed and never
+            // rebound). The current verdict is still dropped (fail-closed,
+            // never blocks the framework callback); the NEXT verdict after a
+            // successful rebind emits normally.
+            CastleWallLog.lifecycle.error(
+                "\(Self.auditDropLogPrefix) path=disconnected-dispatcher connection_state=\(String(describing: state)) outcome=\(Self.outcomeLabel(outcome)) decision: dropping per-flow audit emission, attempting lazy rebind"
+            )
             recordDroppedVerdict(state: state)
+            maybeLazyReconnect(reason: "verdict-while-\(String(describing: state))")
             return
         }
         maybeEmitProviderUnboundAudit(trigger: "verdict")
 
         switch outcome {
         case .allow, .drop:
-            if let auditProducerSigner {
-                auditProducerChain.buildSignedFlowDecision(
+            guard let auditProducerSigner else {
+                // DROP-PATH 1 (nil-signer / nil-dispatcher). In production the
+                // FilterProvider ALWAYS constructs the dispatcher with a real
+                // `XpcAuditProducerSigner`, so this branch firing means the
+                // signer was never assigned. A pinned-key consumer must reject
+                // unsigned enforcement evidence, so we DROP rather than fall
+                // back to an unsigned emit (hard security invariant). The
+                // unsigned builder below exists ONLY for the no-signer unit
+                // tests; it must never be reached on a signing-extension build.
+                CastleWallLog.lifecycle.error(
+                    "\(Self.auditDropLogPrefix) path=nil-signer reason=audit-producer-signer-not-assigned outcome=\(Self.outcomeLabel(outcome)) decision: dropping per-flow audit emission (no unsigned fallback)"
+                )
+                guard let message = IPCBridgeNotifications.buildFlowDecisionRecorded(
                     outcome: outcome,
-                    flow: flow,
-                    signer: auditProducerSigner
-                ) { [weak self] result in
-                    guard let self else { return }
-                    switch result {
-                    case .success(let message):
-                        self.ipcClient.send(message, onError: self.handleSendError)
-                    case .failure(let error):
-                        CastleWallLog.ipc.notice(
-                            "audit producer signing failed; dropping signed verdict notification reason=\(String(describing: error))"
-                        )
-                    }
+                    flow: flow
+                ) else {
+                    return
                 }
+                ipcClient.send(message, onError: handleSendError)
                 return
             }
-            guard let message = IPCBridgeNotifications.buildFlowDecisionRecorded(
+            auditProducerChain.buildSignedFlowDecision(
                 outcome: outcome,
-                flow: flow
-            ) else {
-                return
+                flow: flow,
+                signer: auditProducerSigner
+            ) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let message):
+                    self.ipcClient.send(message, onError: self.handleSendError)
+                case .failure(let error):
+                    // DROP-PATH 3 (audit-producer signing failure). The XPC
+                    // call to the root helper's audit-producer Mach service
+                    // failed (helper unreachable, key not yet provisioned, or
+                    // the sign call errored). Dropping on a GENUINE signing
+                    // failure is CORRECT fail-closed behavior: a pinned-key
+                    // consumer must reject unsigned evidence, so we never
+                    // synthesize an unsigned emit. The fix is to make signing
+                    // SUCCEED, not to bypass it; now the drop is LOGGED with
+                    // the underlying error so the drill sees this path fire.
+                    CastleWallLog.lifecycle.error(
+                        "\(Self.auditDropLogPrefix) path=signing-failure reason=\(Self.signingErrorLabel(error)) outcome=\(Self.outcomeLabel(outcome)) decision: dropping per-flow audit emission (fail-closed, no unsigned fallback)"
+                    )
+                }
             }
-            ipcClient.send(message, onError: handleSendError)
         case .uncertain:
             let message = IPCBridgeNotifications.buildFlowPendingApproval(flow: flow)
             ipcClient.send(message, onError: handleSendError)
         }
+    }
+
+    /// Human-readable outcome label for the drop-path probes. Carries only
+    /// the verdict class (allow / drop / uncertain) and the matched-rule id,
+    /// never destination payloads or key material.
+    private static func outcomeLabel(_ outcome: EvaluationOutcome) -> String {
+        switch outcome {
+        case .allow(let ruleId):
+            return "allow rule_id=\(ruleId)"
+        case .drop(let ruleId):
+            return "drop rule_id=\(ruleId ?? "none")"
+        case .uncertain:
+            return "uncertain"
+        }
+    }
+
+    /// Compact, key-material-free label for an audit-producer signing error,
+    /// so the drill can distinguish "helper unreachable" from "empty
+    /// signature" from "canonicalization failed" without dumping a payload.
+    private static func signingErrorLabel(_ error: AuditProducerSigningError) -> String {
+        switch error {
+        case .unsupportedOutcome:
+            return "unsupported-outcome"
+        case .canonicalizationFailed:
+            return "canonicalization-failed"
+        case .signerUnavailable(let detail):
+            return "signer-unavailable(\(detail))"
+        case .emptySignature:
+            return "empty-signature"
+        }
+    }
+
+    /// If the channel was previously brought up (`start()` has run) but is now
+    /// degraded (`retrying` / `deadChannel`), kick a reconnect attempt so a
+    /// verdict that arrives after the daemon comes up rebinds the audit
+    /// channel rather than dropping forever. Never fires from the pristine
+    /// `.disconnected` state (a never-started dispatcher), so unit tests that
+    /// drive `notifyVerdict` without `start()` keep their `.disconnected`
+    /// invariant, and a not-yet-bootstrapped provider does not race its own
+    /// bootstrap. Idempotent: `scheduleReconnect` cancels any pending timer
+    /// and `attemptStartAndSubscribe` guards on `socketFD`/`isStopping`.
+    private func maybeLazyReconnect(reason: String) {
+        let shouldReconnect: Bool = stateQueue.sync {
+            guard hasEverStarted, !isStopping else { return false }
+            switch connectionStateValue {
+            case .deadChannel, .retrying:
+                // Collapse any in-flight exponential backoff so the rebind is
+                // prompt: a verdict is live demand for the audit channel, so we
+                // do not want it waiting out a 30s retry window.
+                retryDelaySeconds = Self.initialRetryDelaySeconds
+                return true
+            case .disconnected, .handshaking, .connected:
+                // `.disconnected` here means never-started or cleanly stopped;
+                // `.handshaking` means an attempt is already in flight;
+                // `.connected` is handled by the caller's happy path.
+                return false
+            }
+        }
+        guard shouldReconnect else { return }
+        CastleWallLog.lifecycle.notice(
+            "\(Self.auditDropLogPrefix) lazy-rebind requested; reason=\(reason)"
+        )
+        scheduleReconnect(reason: "lazy-rebind (\(reason))")
     }
 
     // MARK: - Inbound (called by the IPCClient listener)
