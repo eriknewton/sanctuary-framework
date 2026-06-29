@@ -1,5 +1,7 @@
 # SPRINT_CONTRACT.md — SEC-003: Canonical JSON Divergence (Cross-Repo)
 
+> Historical record - 2026-03-28 SEC-003 security-review sprint. Point-in-time artifact; not current state.
+
 **Sprint Date:** 2026-03-28
 **Finding ID:** SEC-003
 **Repos:** Sanctuary (TypeScript) + Concordia (Python)

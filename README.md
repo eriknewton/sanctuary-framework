@@ -305,7 +305,7 @@ Sanctuary installs the substrate sovereignty used to come with. Architecturally 
 
 **Today:** Ed25519 signing, Argon2id passphrase unlock, and per-purpose HKDF subkeys. **Crypto-agility:** every audit entry embeds a scheme identifier so hybrid post-quantum signing (Ed25519 + ML-DSA / FIPS 204) can land without breaking historical receipts. Hardware-backed secure elements are on the roadmap.
 
-**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 54-module index of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+**Working on the code?** The TypeScript server has an orientation map at [`server/src/README.md`](server/src/README.md) - a 55-module index of what each module owns, the confusable-name disambiguations, and the frozen surfaces a refactor must never change. Start there, then see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 

@@ -1,5 +1,7 @@
 # Known Issues
 
+> Historical snapshot - March 2026 security-review sprint. Kept as a point-in-time record, NOT a live issue tracker. Current security posture and open items are tracked via the roadmap/state tooling, not this file.
+
 This file summarizes open items tracked from the security review conducted in March 2026.
 All items are logged in detail in `REMEDIATION_PLAN.md` on the `security-review` branch.
 
