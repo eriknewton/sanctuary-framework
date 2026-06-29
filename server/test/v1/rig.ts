@@ -20,6 +20,7 @@ import type { IdentityManager } from "../../src/cognitive/tools.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { signOperatorAttestation } from "../../src/v1/operator-attestation.js";
 import { toBase64url, fromBase64url } from "../../src/core/encoding.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 /** One operator identity reused across the suite (the daemon resolves this). */
 export const OPERATOR = (() => {
@@ -34,10 +35,6 @@ export interface TestRig {
   authToken: string;
   auditLog: AuditLog;
   stop: () => Promise<void>;
-}
-
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
 }
 
 /** Minimal IdentityManager exposing only what the /v1 routes read. */
@@ -71,7 +68,7 @@ export async function startRig(opts?: {
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
   const authToken = `v1-test-${randomBytes(8).toString("hex")}`;
-  const port = pickPort();
+  const port = await getFreePort();
 
   const dashboard = new DashboardApprovalChannel({
     port,

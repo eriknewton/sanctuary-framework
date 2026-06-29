@@ -63,6 +63,7 @@ import {
   issuerContextWithApprover,
   makeMultiNodeStranger,
 } from "./federation-real-join.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 interface Daemon {
   dashboard: DashboardApprovalChannel;
@@ -72,17 +73,13 @@ interface Daemon {
 
 const running: Daemon[] = [];
 
-function pickPort(): number {
-  return 31000 + Math.floor(Math.random() * 20000);
-}
-
 async function startDaemon(
   context: FederationContext,
   opts?: { enable?: boolean },
 ): Promise<Daemon> {
   const storage = new MemoryStorage();
   const auditLog = new AuditLog(storage, randomBytes(32));
-  const port = pickPort();
+  const port = await getFreePort();
   const dashboard = new DashboardApprovalChannel({
     port,
     host: "127.0.0.1",
