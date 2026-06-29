@@ -182,6 +182,10 @@ export type ConfigDowngradeReason =
   | "webhook_gate_disabled"
   | "privacy_filter_disabled"
   | "privacy_fail_mode_downgrade"
+  | "privacy_filter_command_changed"
+  | "disclosure_default_policy_loosened"
+  | "verascore_autopublish_enabled"
+  | "erc8004_confirmation_enabled"
   | "config_baseline_invalid";
 
 export interface ConfigDowngrade {
@@ -222,6 +226,34 @@ export interface ConfigSecurityPosture {
   webhook_enabled: boolean;
   privacy_filter_mode: SanctuaryConfig["privacy_filter"]["mode"];
   privacy_filter_fail_mode: SanctuaryConfig["privacy_filter"]["fail_mode"];
+  /**
+   * The configured privacy-filter executable path. Tracked because, while a
+   * filtering mode is active ("local"/"opf"), silently REPOINTING this command
+   * (e.g. to a no-op binary) disables filtering without ever flipping `mode`
+   * to "off", a covert downgrade the mode check alone would miss. The
+   * comparator flags any CHANGE to this string while the previous mode was a
+   * filtering mode.
+   */
+  privacy_filter_command: string;
+  /**
+   * The disclosure default policy. `withhold-all` is strictly stronger than
+   * `minimum-necessary`; loosening it (withhold-all -> minimum-necessary)
+   * exposes more by default, so the comparator gates the loosening direction.
+   */
+  disclosure_default_policy: SanctuaryConfig["disclosure"]["default_policy"];
+  /**
+   * Whether handshake attestations auto-publish to Verascore. Flipping either
+   * auto-publish flag false -> true increases external egress of
+   * reputation/handshake data, so the posture tracks both as one OR'd signal
+   * and the comparator gates false -> true.
+   */
+  verascore_auto_publish: boolean;
+  /**
+   * Whether ERC-8004 on-chain registry confirmation is enabled. Default-off;
+   * flipping false -> true opens an external JSON-RPC egress path, so the
+   * comparator gates the enabling direction.
+   */
+  erc8004_confirmation_enabled: boolean;
 }
 
 /** Default configuration */
@@ -1019,6 +1051,70 @@ export function detectConfigDowngrades(
     });
   }
 
+  // Privacy-filter command repoint while filtering is active. If the previous
+  // mode was a filtering mode (not "off") and the command path changed, the
+  // operator's filter may have been silently swapped for a no-op binary while
+  // `mode` still reads as filtering (a covert disable the mode check misses).
+  // We treat ANY change to the command while the previous mode was filtering as
+  // a potential downgrade. The command path is not a secret (it is an
+  // executable name/path, never a credential), so it is safe to record.
+  if (
+    previous.privacy_filter.mode !== "off" &&
+    previous.privacy_filter.command !== next.privacy_filter.command
+  ) {
+    downgrades.push({
+      field: "privacy_filter.command",
+      reason: "privacy_filter_command_changed",
+      previous: previous.privacy_filter.command,
+      next: next.privacy_filter.command,
+    });
+  }
+
+  // Disclosure default policy loosening. `withhold-all` is strictly stronger
+  // than `minimum-necessary`; dropping from a stronger to a weaker default
+  // discloses more by default. Flag any loosening (rank decrease).
+  if (
+    disclosureDefaultPolicyRank(next.disclosure.default_policy) <
+    disclosureDefaultPolicyRank(previous.disclosure.default_policy)
+  ) {
+    downgrades.push({
+      field: "disclosure.default_policy",
+      reason: "disclosure_default_policy_loosened",
+      previous: previous.disclosure.default_policy,
+      next: next.disclosure.default_policy,
+    });
+  }
+
+  // Verascore auto-publish enablement increases external egress of
+  // reputation/handshake data. Either flag flipping false -> true is a
+  // downgrade (more data leaves the host by default).
+  if (
+    !verascoreAutoPublishEnabled(previous) &&
+    verascoreAutoPublishEnabled(next)
+  ) {
+    downgrades.push({
+      field: "verascore.auto_publish",
+      reason: "verascore_autopublish_enabled",
+      previous: verascoreAutoPublishEnabled(previous),
+      next: verascoreAutoPublishEnabled(next),
+    });
+  }
+
+  // ERC-8004 registry confirmation enablement opens an external JSON-RPC
+  // egress path that is default-off; flipping it on is a posture-weakening
+  // increase in external network reach.
+  if (
+    !previous.erc8004.registry_confirmation.enabled &&
+    next.erc8004.registry_confirmation.enabled
+  ) {
+    downgrades.push({
+      field: "erc8004.registry_confirmation.enabled",
+      reason: "erc8004_confirmation_enabled",
+      previous: previous.erc8004.registry_confirmation.enabled,
+      next: next.erc8004.registry_confirmation.enabled,
+    });
+  }
+
   return downgrades;
 }
 
@@ -1037,6 +1133,10 @@ export function securityPostureFromConfig(
     webhook_enabled: config.webhook.enabled,
     privacy_filter_mode: config.privacy_filter.mode,
     privacy_filter_fail_mode: config.privacy_filter.fail_mode,
+    privacy_filter_command: config.privacy_filter.command,
+    disclosure_default_policy: config.disclosure.default_policy,
+    verascore_auto_publish: verascoreAutoPublishEnabled(config),
+    erc8004_confirmation_enabled: config.erc8004.registry_confirmation.enabled,
   };
 }
 
@@ -1064,6 +1164,15 @@ export function configFromSecurityPosture(
   config.webhook.enabled = posture.webhook_enabled;
   config.privacy_filter.mode = posture.privacy_filter_mode;
   config.privacy_filter.fail_mode = posture.privacy_filter_fail_mode;
+  config.privacy_filter.command = posture.privacy_filter_command;
+  config.disclosure.default_policy = posture.disclosure_default_policy;
+  // `verascore_auto_publish` is the OR of the two auto-publish flags. Project
+  // it back onto `auto_publish_to_verascore` (handshakes left false); the OR
+  // reconstructs the same posture value the comparator compares against.
+  config.verascore.auto_publish_to_verascore = posture.verascore_auto_publish;
+  config.verascore.auto_publish_handshakes = false;
+  config.erc8004.registry_confirmation.enabled =
+    posture.erc8004_confirmation_enabled;
   return config;
 }
 
@@ -1120,6 +1229,30 @@ function keyProtectionRank(
     case "hardware-key":
       return 2;
   }
+}
+
+/**
+ * Strength ordering for `disclosure.default_policy`. Higher rank = stronger
+ * (discloses less by default). `withhold-all` is the strongest; dropping to a
+ * lower rank is a loosening the comparator gates.
+ */
+function disclosureDefaultPolicyRank(
+  value: SanctuaryConfig["disclosure"]["default_policy"]
+): number {
+  switch (value) {
+    case "minimum-necessary":
+      return 0;
+    case "withhold-all":
+      return 1;
+  }
+}
+
+/** True when either Verascore auto-publish flag is on (external egress of attestations). */
+function verascoreAutoPublishEnabled(config: SanctuaryConfig): boolean {
+  return (
+    config.verascore.auto_publish_to_verascore === true ||
+    config.verascore.auto_publish_handshakes === true
+  );
 }
 
 type ParsedVersion = readonly [number, number, number];

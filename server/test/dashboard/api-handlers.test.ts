@@ -305,6 +305,47 @@ describe("Dashboard API", () => {
       expect(body.stream_available).toBe(false);
     });
 
+    it("rejects tokenless POST /api/templates/:name/init (operator bearer required)", async () => {
+      // SECURITY (templates-init-operator-bearer): template init authors and
+      // Ed25519-signs a governance policy event, a custody-class mutation. It
+      // must require the operator bearer token, exactly like the approval POST,
+      // and must not be reachable without it (a co-resident wrapped agent shares
+      // loopback with the operator).
+      const res = mockRes();
+      const isAgentWrapped = vi.fn(async () => true);
+      const deps = makeDeps({ isAgentWrapped });
+      const req = mockReq({
+        url: "/api/templates/some-template/init",
+        method: "POST",
+        // No Authorization header.
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+      // The gate fires BEFORE any template work / orphan check.
+      expect(isAgentWrapped).not.toHaveBeenCalled();
+    });
+
+    it("lets POST /api/templates/:name/init past the gate with the operator bearer", async () => {
+      // With the operator bearer present, auth passes and the route proceeds to
+      // its own validation (an unknown template name yields template_not_found,
+      // proving the request got past the auth gate rather than being rejected as
+      // unauthorized).
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({
+        url: "/api/templates/definitely-not-a-real-template/init",
+        method: "POST",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      // Past the gate: not a 401. An unknown template is a 404 from the route.
+      expect(res._status).not.toBe(401);
+      expect(res._status).toBe(404);
+      expect(JSON.parse(res._body).error).toBe("template_not_found");
+    });
+
     it("returns 503 for approvals when no handlers", async () => {
       const res = mockRes();
       const deps = makeDeps({ approvals: undefined });

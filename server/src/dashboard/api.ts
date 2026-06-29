@@ -513,8 +513,21 @@ export async function handleRequest(
   }
 
   // ── Template init (POST) ───────────────────────────────────────────
+  // SECURITY (templates-init-operator-bearer): template init AUTHORS and
+  // Ed25519-SIGNS a governance policy event for an agent, a custody-class
+  // mutation, the same trust level as an approval decision. It MUST require
+  // the operator bearer token (fail-closed: no token configured => reject),
+  // matching the `/api/approvals/:id/:action` gate above. The shared
+  // `isAuthorized` gate at the top of this handler fail-OPENS when no token
+  // is configured and honors loopback auto-auth, neither of which is
+  // acceptable for a mutation: a co-resident wrapped agent shares loopback
+  // with the operator, so loopback origin is NOT operator identity.
   const initMatch = /^\/api\/templates\/([^/]+)\/init$/.exec(path);
   if (method === "POST" && initMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const name = decodeURIComponent(initMatch[1]!);
     try {
       // Validate template exists

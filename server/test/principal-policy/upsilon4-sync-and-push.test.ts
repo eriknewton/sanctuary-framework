@@ -516,4 +516,31 @@ describe("WP-V1.3-10 Upsilon-4 HTTP routes", () => {
       await close();
     }
   });
+
+  it("default-deny-on-mutation: an unknown non-GET path requires the operator bearer even on loopback", async () => {
+    // The auth gate is default-deny on any non-GET method, not an allowlist of
+    // the current approve/deny actions. A future (or unknown) non-GET route is
+    // therefore gated automatically: with loopbackAutoAuth on and NO token
+    // configured, a GET succeeds via the loopback shortcut but a POST to a
+    // never-defined non-GET path must still be refused (requireToken suppresses
+    // the loopback shortcut). This is the regression that locks the shape in.
+    const { aggregator } = makeAggregator();
+    const { base, close } = await makeServer(aggregator);
+    try {
+      // GET on the surface succeeds on loopback (read-only convenience).
+      const getRes = await fetch(`${base}${APPROVAL_INBOX_API_PREFIX}/revision`);
+      expect(getRes.status).toBe(200);
+
+      // A non-GET request to an unknown path on the surface is gated: loopback
+      // does NOT grant operator identity for a mutation, so it is 401 (refused
+      // at the auth gate) rather than reaching the dispatch table as a 404.
+      const postRes = await fetch(
+        `${base}${APPROVAL_INBOX_API_PREFIX}/some-future-mutation`,
+        { method: "POST" },
+      );
+      expect(postRes.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
 });

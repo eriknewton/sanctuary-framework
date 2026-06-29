@@ -195,7 +195,7 @@ describe("config-security baseline (custody-MAC downgrade gate)", () => {
     ).rejects.toBeInstanceOf(ConfigDowngradeError);
   });
 
-  it("RESEEDS (not bricks) on a recognized older schema (v1 under v2)", async () => {
+  it("RESEEDS (not bricks) on a recognized older schema (v1 under current)", async () => {
     const storage = new MemoryStorage();
     const master = generateRandomKey();
 
@@ -235,11 +235,67 @@ describe("config-security baseline (custody-MAC downgrade gate)", () => {
     });
     expect(outcome.kind).toBe("reseeded");
 
-    // The fresh sealed baseline is a v2 record under the current master key, so
-    // a second boot now authenticates and advances (no longer a migration).
+    // The fresh sealed baseline is a current-schema record under the current
+    // master key, so a second boot now authenticates and advances (no longer a
+    // migration).
     const envelope = await readEnvelope(storage);
     expect(envelope.__sanctuary_config_security_baseline_v1).toBe(true);
-    expect((envelope.data as Record<string, unknown>).schema_version).toBe(2);
+    expect((envelope.data as Record<string, unknown>).schema_version).toBe(3);
+
+    const second = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(second.kind).toBe("advanced");
+  });
+
+  it("RESEEDS (not bricks) on a v2 record under v3 (binary upgrade adds posture fields)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // A v2-schema record: marker present, schema_version 2, and a v2 posture
+    // (has dashboard_allow_plaintext_remote, but lacks the v3 fields:
+    // privacy_filter_command, disclosure_default_policy, verascore_auto_publish,
+    // erc8004_confirmation_enabled). An operator who upgraded the binary is not
+    // an attacker, so v2 reseeds under v3 rather than bricking the boot.
+    await storage.write(
+      NAMESPACE,
+      CONFIG_BASELINE_META_KEY,
+      stringToBytes(
+        JSON.stringify({
+          __sanctuary_config_security_baseline_v1: true,
+          data: {
+            schema_version: 2,
+            observed_at: "2026-02-01T00:00:00.000Z",
+            posture: {
+              config_version: "1.4.0",
+              state_key_protection: "passphrase",
+              execution_attestation: true,
+              dashboard_tls_configured: true,
+              dashboard_auth_configured: true,
+              dashboard_allow_plaintext_remote: false,
+              webhook_enabled: true,
+              privacy_filter_mode: "local",
+              privacy_filter_fail_mode: "closed",
+            },
+          },
+          mac: "stale-v2-mac-not-checked",
+        })
+      )
+    );
+
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(outcome.kind).toBe("reseeded");
+
+    // The fresh sealed baseline is a v3 record under the current master key, so
+    // a second boot now authenticates and advances (no longer a migration).
+    const envelope = await readEnvelope(storage);
+    expect((envelope.data as Record<string, unknown>).schema_version).toBe(3);
 
     const second = await crossCheckConfigBaseline({
       storage,
@@ -386,6 +442,131 @@ describe("detectConfigDowngrades comparator (reused #791 logic)", () => {
     expect(
       detectConfigDowngrades(undef, enabled).map((d) => d.reason)
     ).toContain("dashboard_plaintext_remote_enabled");
+  });
+
+  it("flags a privacy_filter.command change while filtering is active (and not when mode is off / unchanged)", () => {
+    // Repointing the filter executable while mode stays a filtering mode is a
+    // covert disable (e.g. swap to a no-op binary) the mode check alone misses.
+    const base = strongConfig();
+    base.privacy_filter.mode = "opf";
+    base.privacy_filter.command = "opf";
+    const repointed = strongConfig();
+    repointed.privacy_filter.mode = "opf";
+    repointed.privacy_filter.command = "/tmp/noop";
+    expect(
+      detectConfigDowngrades(base, repointed).map((d) => d.reason)
+    ).toContain("privacy_filter_command_changed");
+
+    // No change to the command -> not flagged.
+    expect(
+      detectConfigDowngrades(base, structuredClone(base)).map((d) => d.reason)
+    ).not.toContain("privacy_filter_command_changed");
+
+    // Previous mode "off" -> a command change is not a downgrade (filtering was
+    // already disabled; the command is inert).
+    const offBase = strongConfig();
+    offBase.privacy_filter.mode = "off";
+    offBase.privacy_filter.command = "opf";
+    const offRepointed = strongConfig();
+    offRepointed.privacy_filter.mode = "off";
+    offRepointed.privacy_filter.command = "/tmp/noop";
+    expect(
+      detectConfigDowngrades(offBase, offRepointed).map((d) => d.reason)
+    ).not.toContain("privacy_filter_command_changed");
+  });
+
+  it("flags disclosure.default_policy loosening (withhold-all -> minimum-necessary) and not the hardening direction", () => {
+    const strong = strongConfig();
+    strong.disclosure.default_policy = "withhold-all";
+    const loosened = strongConfig();
+    loosened.disclosure.default_policy = "minimum-necessary";
+    expect(
+      detectConfigDowngrades(strong, loosened).map((d) => d.reason)
+    ).toContain("disclosure_default_policy_loosened");
+
+    // Hardening (minimum-necessary -> withhold-all) is never flagged.
+    expect(
+      detectConfigDowngrades(loosened, strong).map((d) => d.reason)
+    ).not.toContain("disclosure_default_policy_loosened");
+
+    // No change is not flagged.
+    expect(
+      detectConfigDowngrades(strong, structuredClone(strong)).map((d) => d.reason)
+    ).not.toContain("disclosure_default_policy_loosened");
+  });
+
+  it("flags verascore auto-publish false -> true (either flag) and not the disabling direction", () => {
+    const off = strongConfig();
+    off.verascore.auto_publish_to_verascore = false;
+    off.verascore.auto_publish_handshakes = false;
+
+    const onPrimary = structuredClone(off);
+    onPrimary.verascore.auto_publish_to_verascore = true;
+    expect(
+      detectConfigDowngrades(off, onPrimary).map((d) => d.reason)
+    ).toContain("verascore_autopublish_enabled");
+
+    const onHandshakes = structuredClone(off);
+    onHandshakes.verascore.auto_publish_handshakes = true;
+    expect(
+      detectConfigDowngrades(off, onHandshakes).map((d) => d.reason)
+    ).toContain("verascore_autopublish_enabled");
+
+    // Disabling (true -> false) is a hardening, never flagged.
+    expect(
+      detectConfigDowngrades(onPrimary, off).map((d) => d.reason)
+    ).not.toContain("verascore_autopublish_enabled");
+
+    // No change (off -> off) is not flagged.
+    expect(
+      detectConfigDowngrades(off, structuredClone(off)).map((d) => d.reason)
+    ).not.toContain("verascore_autopublish_enabled");
+  });
+
+  it("flags erc8004 registry confirmation false -> true and not the disabling direction", () => {
+    const off = strongConfig();
+    off.erc8004.registry_confirmation.enabled = false;
+    const on = strongConfig();
+    on.erc8004.registry_confirmation.enabled = true;
+    expect(
+      detectConfigDowngrades(off, on).map((d) => d.reason)
+    ).toContain("erc8004_confirmation_enabled");
+
+    // Disabling is a hardening, never flagged.
+    expect(
+      detectConfigDowngrades(on, off).map((d) => d.reason)
+    ).not.toContain("erc8004_confirmation_enabled");
+
+    // No change is not flagged.
+    expect(
+      detectConfigDowngrades(off, structuredClone(off)).map((d) => d.reason)
+    ).not.toContain("erc8004_confirmation_enabled");
+  });
+
+  it("posture round-trips the new v3 fields (command, disclosure policy, verascore, erc8004)", () => {
+    const config = strongConfig();
+    config.privacy_filter.mode = "opf";
+    config.privacy_filter.command = "/opt/opf";
+    config.disclosure.default_policy = "minimum-necessary";
+    config.verascore.auto_publish_to_verascore = false;
+    config.verascore.auto_publish_handshakes = true;
+    config.erc8004.registry_confirmation.enabled = true;
+
+    const posture = securityPostureFromConfig(config);
+    expect(posture.privacy_filter_command).toBe("/opt/opf");
+    expect(posture.disclosure_default_policy).toBe("minimum-necessary");
+    // OR of the two auto-publish flags.
+    expect(posture.verascore_auto_publish).toBe(true);
+    expect(posture.erc8004_confirmation_enabled).toBe(true);
+
+    // Round-trip back through the comparison config preserves the posture so the
+    // boot comparator sees the stored values, never a default.
+    const rebuilt = configFromSecurityPosture(posture);
+    const rebuiltPosture = securityPostureFromConfig(rebuilt);
+    expect(rebuiltPosture.privacy_filter_command).toBe("/opt/opf");
+    expect(rebuiltPosture.disclosure_default_policy).toBe("minimum-necessary");
+    expect(rebuiltPosture.verascore_auto_publish).toBe(true);
+    expect(rebuiltPosture.erc8004_confirmation_enabled).toBe(true);
   });
 
   it("posture round-trip preserves dashboard_allow_plaintext_remote", () => {
