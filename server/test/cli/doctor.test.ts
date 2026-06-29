@@ -28,7 +28,11 @@ describe("sanctuary doctor", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      // maxRetries/retryDelay: a doctor run can leave a brief lingering write
+      // in the fortress dir as it settles; without retries the recursive rm
+      // intermittently races it and throws ENOTEMPTY on shared CI runners. The
+      // retry lets the write finish (Node retries rm on ENOTEMPTY/EBUSY/EPERM).
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
