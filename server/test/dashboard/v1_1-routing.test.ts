@@ -38,7 +38,7 @@ function pickPort(): number {
   return 17000 + Math.floor(Math.random() * 20000);
 }
 
-async function startRig(): Promise<TestRig> {
+async function startRig(options: { host?: string; allowPlaintextRemote?: boolean } = {}): Promise<TestRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
@@ -48,10 +48,11 @@ async function startRig(): Promise<TestRig> {
 
   const dashboard = new DashboardApprovalChannel({
     port,
-    host: "127.0.0.1",
+    host: options.host ?? "127.0.0.1",
     timeout_seconds: 30,
     auth_token: authToken,
     auto_open: false,
+    ...(options.allowPlaintextRemote ? { allow_plaintext_remote: true } : {}),
   });
 
   // Minimal legacy deps so the existing route table doesn't 500 when we
@@ -223,6 +224,33 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
+  });
+
+  it("remote /dashboard gates unauthenticated callers and never serializes the bearer for session-authenticated HTML", async () => {
+    await rig.stop();
+    rig = await startRig({ host: "0.0.0.0", allowPlaintextRemote: true });
+
+    const unauth = await fetch(`${rig.baseUrl}/dashboard`);
+    expect(unauth.status).toBe(200);
+    const login = await unauth.text();
+    expect(login).toContain('id="auth-token"');
+    expect(login).not.toContain(rig.authToken);
+
+    const exchange = await fetch(`${rig.baseUrl}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${rig.authToken}` },
+    });
+    expect(exchange.status).toBe(200);
+    const { session_id } = await exchange.json() as { session_id: string };
+
+    const withSession = await fetch(
+      `${rig.baseUrl}/dashboard?session=${encodeURIComponent(session_id)}`,
+    );
+    expect(withSession.status).toBe(200);
+    const shell = await withSession.text();
+    expect(shell).toContain('id="main"');
+    expect(shell).not.toContain(rig.authToken);
+    expect(shell).toContain('"authToken":""');
   });
 
   it("GET /v1.0 serves the legacy four-panel dashboard (v1.1.7 preserve)", async () => {

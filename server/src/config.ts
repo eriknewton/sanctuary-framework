@@ -116,6 +116,11 @@ export interface SanctuaryConfig {
       cert_path: string;
       key_path: string;
     };
+    /**
+     * Allow plaintext HTTP on non-loopback dashboard bindings. Default false.
+     * Only set when a separate network layer already encrypts the transport.
+     */
+    allow_plaintext_remote?: boolean;
   };
 
   webhook: {
@@ -140,12 +145,115 @@ export interface SanctuaryConfig {
     auto_publish_handshakes: boolean;
   };
 
+  /** ERC-8004 registry-read integration. Optional and default-off. */
+  erc8004: {
+    registry_confirmation: {
+      /** When false, resolve_erc8004_identity stays fully offline. */
+      enabled: boolean;
+      /** Operator-configured JSON-RPC endpoint. Empty means no RPC read. */
+      rpc_url: string;
+      /** Chain to read against. Defaults to Ethereum mainnet (1). */
+      chain_id: number;
+      /** RPC request timeout in milliseconds. */
+      timeout_ms: number;
+    };
+  };
+
   privacy_filter: {
     mode: "local" | "opf" | "off";
     fail_mode: "closed" | "fallback";
     command: string;
     timeout_ms: number;
   };
+}
+
+/**
+ * Why a config downgrade is refused. Surfaced in `ConfigDowngradeError` and
+ * (for the boot gate) in the audit trail; never carries secret values.
+ */
+export type ConfigDowngradeReason =
+  | "config_version_invalid"
+  | "config_version_rollback"
+  | "state_key_protection_downgrade"
+  | "execution_attestation_disabled"
+  | "dashboard_tls_disabled"
+  | "dashboard_plaintext_remote_enabled"
+  | "dashboard_auth_disabled"
+  | "webhook_gate_disabled"
+  | "privacy_filter_disabled"
+  | "privacy_fail_mode_downgrade"
+  | "privacy_filter_command_changed"
+  | "disclosure_default_policy_loosened"
+  | "verascore_autopublish_enabled"
+  | "erc8004_confirmation_enabled"
+  | "config_baseline_invalid";
+
+export interface ConfigDowngrade {
+  field: string;
+  reason: ConfigDowngradeReason;
+  previous: unknown;
+  next: unknown;
+}
+
+export class ConfigDowngradeError extends Error {
+  constructor(public readonly downgrades: ConfigDowngrade[]) {
+    super(
+      "Sanctuary configuration downgrade refused: " +
+        downgrades.map((d) => `${d.field} (${d.reason})`).join(", ")
+    );
+    this.name = "ConfigDowngradeError";
+  }
+}
+
+/**
+ * The security-relevant projection of a config, captured in the authenticated
+ * baseline. Only fields whose weakening is a security downgrade are recorded;
+ * secrets are recorded as presence booleans, never as raw values.
+ */
+export interface ConfigSecurityPosture {
+  config_version: string;
+  state_key_protection: SanctuaryConfig["state"]["key_protection"];
+  execution_attestation: boolean;
+  dashboard_tls_configured: boolean;
+  dashboard_auth_configured: boolean;
+  /**
+   * Whether plaintext HTTP is permitted on non-loopback dashboard bindings.
+   * Flipping this false -> true is a security downgrade (it allows the operator
+   * console to serve unencrypted traffic on a routable interface), so the
+   * posture tracks it and the comparator gates it.
+   */
+  dashboard_allow_plaintext_remote: boolean;
+  webhook_enabled: boolean;
+  privacy_filter_mode: SanctuaryConfig["privacy_filter"]["mode"];
+  privacy_filter_fail_mode: SanctuaryConfig["privacy_filter"]["fail_mode"];
+  /**
+   * The configured privacy-filter executable path. Tracked because, while a
+   * filtering mode is active ("local"/"opf"), silently REPOINTING this command
+   * (e.g. to a no-op binary) disables filtering without ever flipping `mode`
+   * to "off", a covert downgrade the mode check alone would miss. The
+   * comparator flags any CHANGE to this string while the previous mode was a
+   * filtering mode.
+   */
+  privacy_filter_command: string;
+  /**
+   * The disclosure default policy. `withhold-all` is strictly stronger than
+   * `minimum-necessary`; loosening it (withhold-all -> minimum-necessary)
+   * exposes more by default, so the comparator gates the loosening direction.
+   */
+  disclosure_default_policy: SanctuaryConfig["disclosure"]["default_policy"];
+  /**
+   * Whether handshake attestations auto-publish to Verascore. Flipping either
+   * auto-publish flag false -> true increases external egress of
+   * reputation/handshake data, so the posture tracks both as one OR'd signal
+   * and the comparator gates false -> true.
+   */
+  verascore_auto_publish: boolean;
+  /**
+   * Whether ERC-8004 on-chain registry confirmation is enabled. Default-off;
+   * flipping false -> true opens an external JSON-RPC egress path, so the
+   * comparator gates the enabling direction.
+   */
+  erc8004_confirmation_enabled: boolean;
 }
 
 /** Default configuration */
@@ -185,6 +293,7 @@ export function defaultConfig(): SanctuaryConfig {
       enabled: false,
       port: 3501,
       host: "127.0.0.1",
+      allow_plaintext_remote: false,
     },
     webhook: {
       enabled: false,
@@ -198,6 +307,14 @@ export function defaultConfig(): SanctuaryConfig {
       auto_publish_to_verascore: true,
       // DELTA-04: default OFF for privacy. Enable explicitly per deployment.
       auto_publish_handshakes: false,
+    },
+    erc8004: {
+      registry_confirmation: {
+        enabled: false,
+        rpc_url: "",
+        chain_id: 1,
+        timeout_ms: 10_000,
+      },
     },
     privacy_filter: {
       mode: "local",
@@ -344,6 +461,12 @@ export async function loadConfig(
       key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY,
     };
   }
+  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "true") {
+    config.dashboard.allow_plaintext_remote = true;
+  }
+  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "false") {
+    config.dashboard.allow_plaintext_remote = false;
+  }
   if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
     config.webhook.enabled = true;
   }
@@ -376,6 +499,26 @@ export async function loadConfig(
   }
   if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
     config.verascore.auto_publish_handshakes = false;
+  }
+  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "true") {
+    config.erc8004.registry_confirmation.enabled = true;
+  }
+  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "false") {
+    config.erc8004.registry_confirmation.enabled = false;
+  }
+  if (process.env.SANCTUARY_ERC8004_RPC_URL) {
+    config.erc8004.registry_confirmation.rpc_url =
+      process.env.SANCTUARY_ERC8004_RPC_URL;
+  }
+  if (process.env.SANCTUARY_ERC8004_CHAIN_ID) {
+    config.erc8004.registry_confirmation.chain_id = strictParseIntEnv(
+      process.env.SANCTUARY_ERC8004_CHAIN_ID,
+    );
+  }
+  if (process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS) {
+    config.erc8004.registry_confirmation.timeout_ms = strictParseIntEnv(
+      process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS,
+    );
   }
   if (process.env.SANCTUARY_PRIVACY_FILTER) {
     config.privacy_filter.mode = process.env.SANCTUARY_PRIVACY_FILTER as "local" | "opf" | "off";
@@ -616,6 +759,67 @@ export function validateConfig(config: SanctuaryConfig): void {
     );
   }
 
+  if (
+    config.dashboard.allow_plaintext_remote !== undefined &&
+    typeof config.dashboard.allow_plaintext_remote !== "boolean"
+  ) {
+    valueErrors.push(
+      `Invalid config value: dashboard.allow_plaintext_remote = "${String(config.dashboard.allow_plaintext_remote)}". ` +
+      `Use true only when a separate network layer already encrypts the transport.`
+    );
+  }
+
+  if (
+    typeof config.erc8004.registry_confirmation.enabled !== "boolean"
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.enabled = "${String(config.erc8004.registry_confirmation.enabled)}". ` +
+      `Use true or false.`
+    );
+  }
+
+  if (typeof config.erc8004.registry_confirmation.rpc_url !== "string") {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.rpc_url must be a string ` +
+      `(an http(s) JSON-RPC endpoint URL or an empty string). Value redacted (it may embed a provider API key).`
+    );
+  } else if (config.erc8004.registry_confirmation.rpc_url !== "") {
+    try {
+      const parsed = new URL(config.erc8004.registry_confirmation.rpc_url);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        valueErrors.push(
+          `Invalid config value: erc8004.registry_confirmation.rpc_url must use the http(s) scheme ` +
+          `(value redacted; it may embed a provider API key).`
+        );
+      }
+    } catch {
+      valueErrors.push(
+        `Invalid config value: erc8004.registry_confirmation.rpc_url is not a valid URL ` +
+        `(value redacted; it may embed a provider API key). Use an http(s) JSON-RPC endpoint URL.`
+      );
+    }
+  }
+
+  if (
+    !Number.isInteger(config.erc8004.registry_confirmation.chain_id) ||
+    config.erc8004.registry_confirmation.chain_id < 1
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.chain_id = "${config.erc8004.registry_confirmation.chain_id}". ` +
+      `Use a positive integer chain id.`
+    );
+  }
+
+  if (
+    !Number.isInteger(config.erc8004.registry_confirmation.timeout_ms) ||
+    config.erc8004.registry_confirmation.timeout_ms < 100
+  ) {
+    valueErrors.push(
+      `Invalid config value: erc8004.registry_confirmation.timeout_ms = "${config.erc8004.registry_confirmation.timeout_ms}". ` +
+      `Use an integer timeout of at least 100 ms.`
+    );
+  }
+
   // Feature/schema errors take precedence: a config that references an
   // unimplemented feature (or has a malformed shape) is a genuine schema
   // mismatch and the loader quarantines it. A value typo alongside a feature
@@ -679,6 +883,7 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
     "dashboard",
     "webhook",
     "verascore",
+    "erc8004",
     "privacy_filter",
   ];
   for (const k of requiredObjectKeys) {
@@ -689,6 +894,22 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
         }`
       );
     }
+  }
+  const erc8004 = c.erc8004 as Record<string, unknown>;
+  if (
+    typeof erc8004.registry_confirmation !== "object" ||
+    erc8004.registry_confirmation === null ||
+    Array.isArray(erc8004.registry_confirmation)
+  ) {
+    throw new Error(
+      `Sanctuary config field "erc8004.registry_confirmation" must be an object; got ${
+        erc8004.registry_confirmation === null
+          ? "null"
+          : Array.isArray(erc8004.registry_confirmation)
+            ? "array"
+            : typeof erc8004.registry_confirmation
+      }`
+    );
   }
   if (typeof c.version !== "string") {
     throw new Error(`Sanctuary config field "version" must be a string`);
@@ -704,4 +925,355 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
   if (typeof c.http_port !== "number" || !Number.isFinite(c.http_port)) {
     throw new Error(`Sanctuary config field "http_port" must be a finite number`);
   }
+}
+
+// ─── Config security-downgrade comparator ────────────────────────────────────
+//
+// These helpers detect whether one config posture is a SECURITY DOWNGRADE of
+// another. They are pure (no key, no I/O) and shared by the authenticated
+// boot-time baseline gate in `core/config-baseline.ts`. The comparator logic is
+// the sound half of the original (#791) downgrade gate; the FORGEABLE anchor it
+// shipped with (a plaintext adjacent `.security-baseline.json`) has been
+// discarded and replaced by a master-key-keyed MAC.
+
+/** Throw `ConfigDowngradeError` if `next` weakens any security posture vs `previous`. */
+export function assertNoConfigDowngrade(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): void {
+  const downgrades = detectConfigDowngrades(previous, next);
+  if (downgrades.length > 0) {
+    throw new ConfigDowngradeError(downgrades);
+  }
+}
+
+/** Enumerate every security-relevant field where `next` is weaker than `previous`. */
+export function detectConfigDowngrades(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): ConfigDowngrade[] {
+  const downgrades: ConfigDowngrade[] = [];
+  const previousVersion = parseVersion(previous.version);
+  const nextVersion = parseVersion(next.version);
+  if (!previousVersion || !nextVersion) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_invalid",
+      previous: previous.version,
+      next: next.version,
+    });
+  } else if (compareParsedVersions(nextVersion, previousVersion) < 0) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_rollback",
+      previous: previous.version,
+      next: next.version,
+    });
+  }
+
+  const previousKeyProtection = keyProtectionRank(previous.state.key_protection);
+  const nextKeyProtection = keyProtectionRank(next.state.key_protection);
+  if (nextKeyProtection < previousKeyProtection) {
+    downgrades.push({
+      field: "state.key_protection",
+      reason: "state_key_protection_downgrade",
+      previous: previous.state.key_protection,
+      next: next.state.key_protection,
+    });
+  }
+
+  if (previous.execution.attestation && !next.execution.attestation) {
+    downgrades.push({
+      field: "execution.attestation",
+      reason: "execution_attestation_disabled",
+      previous: previous.execution.attestation,
+      next: next.execution.attestation,
+    });
+  }
+
+  if (hasDashboardTls(previous) && !hasDashboardTls(next)) {
+    downgrades.push({
+      field: "dashboard.tls",
+      reason: "dashboard_tls_disabled",
+      previous: previous.dashboard.tls,
+      next: next.dashboard.tls ?? null,
+    });
+  }
+
+  if (
+    previous.dashboard.allow_plaintext_remote !== true &&
+    next.dashboard.allow_plaintext_remote === true
+  ) {
+    downgrades.push({
+      field: "dashboard.allow_plaintext_remote",
+      reason: "dashboard_plaintext_remote_enabled",
+      previous: previous.dashboard.allow_plaintext_remote ?? false,
+      next: next.dashboard.allow_plaintext_remote,
+    });
+  }
+
+  if (hasDashboardAuth(previous) && !hasDashboardAuth(next)) {
+    downgrades.push({
+      field: "dashboard.auth_token",
+      reason: "dashboard_auth_disabled",
+      previous: redactConfiguredSecret(previous.dashboard.auth_token),
+      next: redactConfiguredSecret(next.dashboard.auth_token),
+    });
+  }
+
+  if (previous.webhook.enabled && !next.webhook.enabled) {
+    downgrades.push({
+      field: "webhook.enabled",
+      reason: "webhook_gate_disabled",
+      previous: previous.webhook.enabled,
+      next: next.webhook.enabled,
+    });
+  }
+
+  if (previous.privacy_filter.mode !== "off" && next.privacy_filter.mode === "off") {
+    downgrades.push({
+      field: "privacy_filter.mode",
+      reason: "privacy_filter_disabled",
+      previous: previous.privacy_filter.mode,
+      next: next.privacy_filter.mode,
+    });
+  }
+
+  if (
+    previous.privacy_filter.fail_mode === "closed" &&
+    next.privacy_filter.fail_mode === "fallback"
+  ) {
+    downgrades.push({
+      field: "privacy_filter.fail_mode",
+      reason: "privacy_fail_mode_downgrade",
+      previous: previous.privacy_filter.fail_mode,
+      next: next.privacy_filter.fail_mode,
+    });
+  }
+
+  // Privacy-filter command repoint while filtering is active. If the previous
+  // mode was a filtering mode (not "off") and the command path changed, the
+  // operator's filter may have been silently swapped for a no-op binary while
+  // `mode` still reads as filtering (a covert disable the mode check misses).
+  // We treat ANY change to the command while the previous mode was filtering as
+  // a potential downgrade. The command path is not a secret (it is an
+  // executable name/path, never a credential), so it is safe to record.
+  if (
+    previous.privacy_filter.mode !== "off" &&
+    previous.privacy_filter.command !== next.privacy_filter.command
+  ) {
+    downgrades.push({
+      field: "privacy_filter.command",
+      reason: "privacy_filter_command_changed",
+      previous: previous.privacy_filter.command,
+      next: next.privacy_filter.command,
+    });
+  }
+
+  // Disclosure default policy loosening. `withhold-all` is strictly stronger
+  // than `minimum-necessary`; dropping from a stronger to a weaker default
+  // discloses more by default. Flag any loosening (rank decrease).
+  if (
+    disclosureDefaultPolicyRank(next.disclosure.default_policy) <
+    disclosureDefaultPolicyRank(previous.disclosure.default_policy)
+  ) {
+    downgrades.push({
+      field: "disclosure.default_policy",
+      reason: "disclosure_default_policy_loosened",
+      previous: previous.disclosure.default_policy,
+      next: next.disclosure.default_policy,
+    });
+  }
+
+  // Verascore auto-publish enablement increases external egress of
+  // reputation/handshake data. Either flag flipping false -> true is a
+  // downgrade (more data leaves the host by default).
+  if (
+    !verascoreAutoPublishEnabled(previous) &&
+    verascoreAutoPublishEnabled(next)
+  ) {
+    downgrades.push({
+      field: "verascore.auto_publish",
+      reason: "verascore_autopublish_enabled",
+      previous: verascoreAutoPublishEnabled(previous),
+      next: verascoreAutoPublishEnabled(next),
+    });
+  }
+
+  // ERC-8004 registry confirmation enablement opens an external JSON-RPC
+  // egress path that is default-off; flipping it on is a posture-weakening
+  // increase in external network reach.
+  if (
+    !previous.erc8004.registry_confirmation.enabled &&
+    next.erc8004.registry_confirmation.enabled
+  ) {
+    downgrades.push({
+      field: "erc8004.registry_confirmation.enabled",
+      reason: "erc8004_confirmation_enabled",
+      previous: previous.erc8004.registry_confirmation.enabled,
+      next: next.erc8004.registry_confirmation.enabled,
+    });
+  }
+
+  return downgrades;
+}
+
+/** Project a full config to the security-relevant posture stored in the baseline. */
+export function securityPostureFromConfig(
+  config: SanctuaryConfig
+): ConfigSecurityPosture {
+  return {
+    config_version: config.version,
+    state_key_protection: config.state.key_protection,
+    execution_attestation: config.execution.attestation,
+    dashboard_tls_configured: hasDashboardTls(config),
+    dashboard_auth_configured: hasDashboardAuth(config),
+    dashboard_allow_plaintext_remote:
+      config.dashboard?.allow_plaintext_remote === true,
+    webhook_enabled: config.webhook.enabled,
+    privacy_filter_mode: config.privacy_filter.mode,
+    privacy_filter_fail_mode: config.privacy_filter.fail_mode,
+    privacy_filter_command: config.privacy_filter.command,
+    disclosure_default_policy: config.disclosure.default_policy,
+    verascore_auto_publish: verascoreAutoPublishEnabled(config),
+    erc8004_confirmation_enabled: config.erc8004.registry_confirmation.enabled,
+  };
+}
+
+/**
+ * Reconstruct a comparison config from a stored posture. The result is NOT a
+ * usable runtime config (only the security-relevant fields are meaningful); it
+ * exists purely so `detectConfigDowngrades` can compare the persisted posture
+ * against the running config with the same logic used for live saves.
+ */
+export function configFromSecurityPosture(
+  posture: ConfigSecurityPosture
+): SanctuaryConfig {
+  const config = defaultConfig();
+  config.version = posture.config_version;
+  config.state.key_protection = posture.state_key_protection;
+  config.execution.attestation = posture.execution_attestation;
+  config.dashboard = {
+    ...config.dashboard,
+    allow_plaintext_remote: posture.dashboard_allow_plaintext_remote,
+    ...(posture.dashboard_auth_configured ? { auth_token: "configured" } : {}),
+    ...(posture.dashboard_tls_configured
+      ? { tls: { cert_path: "configured", key_path: "configured" } }
+      : {}),
+  };
+  config.webhook.enabled = posture.webhook_enabled;
+  config.privacy_filter.mode = posture.privacy_filter_mode;
+  config.privacy_filter.fail_mode = posture.privacy_filter_fail_mode;
+  config.privacy_filter.command = posture.privacy_filter_command;
+  config.disclosure.default_policy = posture.disclosure_default_policy;
+  // `verascore_auto_publish` is the OR of the two auto-publish flags. Project
+  // it back onto `auto_publish_to_verascore` (handshakes left false); the OR
+  // reconstructs the same posture value the comparator compares against.
+  config.verascore.auto_publish_to_verascore = posture.verascore_auto_publish;
+  config.verascore.auto_publish_handshakes = false;
+  config.erc8004.registry_confirmation.enabled =
+    posture.erc8004_confirmation_enabled;
+  return config;
+}
+
+/** Type guard: a valid `state.key_protection` enum value. */
+export function isKeyProtectionValue(
+  value: unknown
+): value is SanctuaryConfig["state"]["key_protection"] {
+  return value === "none" || value === "passphrase" || value === "hardware-key";
+}
+
+/** Type guard: a valid `privacy_filter.mode` enum value. */
+export function isPrivacyFilterMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["mode"] {
+  return value === "local" || value === "opf" || value === "off";
+}
+
+/** Type guard: a valid `privacy_filter.fail_mode` enum value. */
+export function isPrivacyFailMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["fail_mode"] {
+  return value === "closed" || value === "fallback";
+}
+
+function hasDashboardTls(config: SanctuaryConfig): boolean {
+  const tls = config.dashboard.tls;
+  return (
+    typeof tls?.cert_path === "string" &&
+    tls.cert_path.trim().length > 0 &&
+    typeof tls.key_path === "string" &&
+    tls.key_path.trim().length > 0
+  );
+}
+
+function hasDashboardAuth(config: SanctuaryConfig): boolean {
+  const token = config.dashboard.auth_token;
+  return typeof token === "string" && token.trim().length > 0;
+}
+
+/** Reduce a secret-bearing field to a presence marker, never echoing the value. */
+function redactConfiguredSecret(value: string | undefined): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return "configured";
+}
+
+function keyProtectionRank(
+  value: SanctuaryConfig["state"]["key_protection"]
+): number {
+  switch (value) {
+    case "none":
+      return 0;
+    case "passphrase":
+      return 1;
+    case "hardware-key":
+      return 2;
+  }
+}
+
+/**
+ * Strength ordering for `disclosure.default_policy`. Higher rank = stronger
+ * (discloses less by default). `withhold-all` is the strongest; dropping to a
+ * lower rank is a loosening the comparator gates.
+ */
+function disclosureDefaultPolicyRank(
+  value: SanctuaryConfig["disclosure"]["default_policy"]
+): number {
+  switch (value) {
+    case "minimum-necessary":
+      return 0;
+    case "withhold-all":
+      return 1;
+  }
+}
+
+/** True when either Verascore auto-publish flag is on (external egress of attestations). */
+function verascoreAutoPublishEnabled(config: SanctuaryConfig): boolean {
+  return (
+    config.verascore.auto_publish_to_verascore === true ||
+    config.verascore.auto_publish_handshakes === true
+  );
+}
+
+type ParsedVersion = readonly [number, number, number];
+
+function parseVersion(version: string): ParsedVersion | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(version);
+  if (!match) return null;
+  return [
+    Number.parseInt(match[1]!, 10),
+    Number.parseInt(match[2]!, 10),
+    Number.parseInt(match[3]!, 10),
+  ];
+}
+
+function compareParsedVersions(
+  left: ParsedVersion,
+  right: ParsedVersion
+): number {
+  for (let i = 0; i < 3; i += 1) {
+    const delta = left[i]! - right[i]!;
+    if (delta !== 0) return delta;
+  }
+  return 0;
 }

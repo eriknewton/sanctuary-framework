@@ -19,7 +19,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Writable } from "node:stream";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,6 +27,7 @@ import {
   runFederationAuthorize,
   runFederationEnableDisable,
   runFederationJoin,
+  runFederationPolicyPush,
   runFederationRevoke,
 } from "../../src/cli/federation.js";
 import { verifyOperatorSignature } from "../../src/v1/operator-signed.js";
@@ -38,7 +39,19 @@ import {
 } from "../util/federation-drill-seed.js";
 import { makeIssuerCompleteResponder } from "./federation-real-join.js";
 import { toBase64url } from "../../src/core/encoding.js";
-import { JoinCeremony } from "../../src/v1/federation.js";
+import {
+  federationEventHash,
+  JoinCeremony,
+  type FederationEvent,
+} from "../../src/v1/federation.js";
+import {
+  FEDERATION_SYNC_WIRE_VERSION,
+} from "../../src/v1/federation-revocation.js";
+import {
+  FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+  FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
+  verifyFederationPolicyBundleEvent,
+} from "../../src/v1/federation-policy-bundle.js";
 import { issuerContextWithApprover } from "./federation-real-join.js";
 
 function capture() {
@@ -63,11 +76,43 @@ const STUB_SESSION_TOKEN = "stub-v1-session-token";
 const stubOpenSession = (async () =>
   ({ token: STUB_SESSION_TOKEN, expiresAt: 0, capabilities: [] })) as never;
 
+function verifyCapturedOperatorSignature(params: {
+  action: string;
+  body: Record<string, unknown>;
+}): boolean {
+  const { operator_signature, ...payload } = params.body;
+  return verifyOperatorSignature({
+    action: params.action,
+    payload,
+    signature: operator_signature as string,
+    operatorPublicKey: issuer.operator.publicKey,
+  });
+}
+
 let fortressPath: string;
 let issuer: SeededIssuerFortress;
 const PASSPHRASE = "slice3b-drill-passphrase";
 
+// Hermeticity guard (de-flake): the admin verbs reach `openOperatorSigner`,
+// which sets the PROCESS-GLOBAL `process.env.SANCTUARY_STORAGE_PATH` so
+// `loadConfig()` targets the `--fortress` override
+// (`src/cli/federation-operator-signing.ts`). vitest runs multiple test files
+// in one worker process, and that env var is shared across them. Without
+// snapshot/restore this file would leak a pointer at its just-rm'd temp
+// fortress into the shared worker, so a SIBLING test that later calls
+// `loadConfig()` without its own `--fortress` reads a dead path and races to
+// the wrong exit code (the non-hermetic CLI-subprocess/host-state flake class).
+// Snapshotting both fortress env keys per test makes this file neither a leaker
+// nor a victim. This is isolation only; no assertion is weakened, and the
+// production verb behavior (it still sets the env to drive `loadConfig`) is
+// untouched. Mirrors the established idiom in
+// `test/cli/top-level-fortress-flag.test.ts`.
+let savedStoragePath: string | undefined;
+let savedFortressPath: string | undefined;
+
 beforeEach(async () => {
+  savedStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  savedFortressPath = process.env.SANCTUARY_FORTRESS_PATH;
   fortressPath = await mkdtemp(join(tmpdir(), "slice3b-"));
   const storage = new FilesystemStorage(join(fortressPath, "state"));
   issuer = await seedFederationIssuerFortress({
@@ -80,6 +125,18 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(fortressPath, { recursive: true, force: true });
+  // Restore the process-global fortress env keys exactly as they were so this
+  // file leaves the shared worker env untouched (no dead-path leak to siblings).
+  if (savedStoragePath === undefined) {
+    delete process.env.SANCTUARY_STORAGE_PATH;
+  } else {
+    process.env.SANCTUARY_STORAGE_PATH = savedStoragePath;
+  }
+  if (savedFortressPath === undefined) {
+    delete process.env.SANCTUARY_FORTRESS_PATH;
+  } else {
+    process.env.SANCTUARY_FORTRESS_PATH = savedFortressPath;
+  }
 });
 
 describe("federation enable/disable -- operator-signed, fail-closed", () => {
@@ -341,6 +398,107 @@ describe("federation revoke -- operator-signed node eviction", () => {
       event_id: "operator:fortress:1",
       eviction_serial: 1,
     });
+  });
+});
+
+describe("federation policy-push -- signed operator policy bundle", () => {
+  it("signs the current policy hash/version and enqueues it through /v1/federation/sync", async () => {
+    const policyYaml = `version: 7
+tier1_always_approve:
+  - state_export
+tier2_anomaly:
+  new_namespace_access: approve
+  new_counterparty: approve
+  frequency_spike_multiplier: 5
+  max_signs_per_minute: 10
+  bulk_read_threshold: 20
+  first_session_policy: approve
+tier3_always_allow:
+  - state_read
+approval_channel:
+  type: stderr
+  timeout_seconds: 120
+`;
+    await writeFile(join(fortressPath, "principal-policy.yaml"), policyYaml, {
+      mode: 0o600,
+    });
+
+    const captured: Array<{ action: string; body: Record<string, unknown> }> = [];
+    const out = capture();
+    const code = await runFederationPolicyPush({
+      argv: [
+        "--fortress-url",
+        "http://127.0.0.1:9",
+        "--fortress",
+        fortressPath,
+        "--idempotency-key",
+        "idem-policy-1",
+      ],
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      out: out.stream,
+      err: capture().stream,
+      openSession: stubOpenSession,
+      request: async (path, init, ctx) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        captured.push({ action: path, body });
+        expect(path).toBe("/v1/federation/sync");
+        expect(ctx?.authToken).toBe(STUB_SESSION_TOKEN);
+        expect(body.wire_version).toBe(FEDERATION_SYNC_WIRE_VERSION);
+        expect(body.node_id).toBe(issuer.trustRoot.record.node_id);
+        expect(verifyCapturedOperatorSignature({ action: path, body })).toBe(true);
+
+        if (captured.length === 1) {
+          expect(body.events).toEqual([]);
+          expect(body.cursor).toEqual({
+            node_id: `operator:${issuer.fortressId}`,
+          });
+          return { accepted: [], rejected: [], events: [] };
+        }
+
+        const events = body.events as FederationEvent[];
+        expect(events).toHaveLength(1);
+        const event = events[0]!;
+        const { event_hash: eventHash, ...withoutHash } = event;
+        expect(eventHash).toBe(federationEventHash(withoutHash));
+        expect(event.kind).toBe(FEDERATION_POLICY_BUNDLE_EVENT_KIND);
+        expect(event.origin_node_id).toBe(`operator:${issuer.fortressId}`);
+        expect(JSON.stringify(event.payload)).not.toContain("tier1_always_approve");
+        expect(JSON.stringify(event.payload)).not.toContain("state_export");
+
+        const verified = verifyFederationPolicyBundleEvent({
+          event,
+          fortressId: issuer.fortressId,
+          pinnedMaster: issuer.pinnedMaster,
+          operatorPrincipalCert: issuer.issuingPrincipalCert,
+          currentPolicyVersion: null,
+        });
+        expect(verified.ok).toBe(true);
+        if (verified.ok) {
+          expect(verified.payload.policy_version).toBe(7);
+          expect(verified.payload.policy_hash_algorithm).toBe(
+            FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM,
+          );
+        }
+        return { accepted: [event.event_id], rejected: [], events: [] };
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(captured).toHaveLength(2);
+    expect("cursor" in captured[1]!.body).toBe(false);
+    expect(captured[1]!.body.idempotency_key).toBe("idem-policy-1");
+    const printed = JSON.parse(out.get()) as {
+      policy_pushed: boolean;
+      policy_version: number;
+      policy_hash: string;
+      hash_algorithm: string;
+      event_id: string;
+    };
+    expect(printed.policy_pushed).toBe(true);
+    expect(printed.policy_version).toBe(7);
+    expect(printed.policy_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(printed.hash_algorithm).toBe(FEDERATION_POLICY_BUNDLE_HASH_ALGORITHM);
+    expect(JSON.stringify(printed)).not.toContain("state_export");
   });
 });
 

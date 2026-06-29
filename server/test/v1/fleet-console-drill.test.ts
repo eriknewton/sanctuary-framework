@@ -1,5 +1,5 @@
 /**
- * Fleet Console Slice 1 — end-to-end in-process drill (LOOPBACK ONLY).
+ * Fleet Console Slice 1 - end-to-end in-process drill (LOOPBACK ONLY).
  *
  * The DONE-WHEN for Slice 1, run through the REAL DashboardApprovalChannel and
  * the REAL federation join + revocation paths (no signed host, no Erik-present
@@ -146,15 +146,13 @@ async function revokeNode(token: string, nodeId: string): Promise<void> {
     ...withoutHash,
     event_hash: federationEventHash(withoutHash),
   };
-  // The server reconstructs its operator-signed payload as
-  // { wire_version, node_id, events, cursor } (parseSyncCursor(undefined) -> {},
-  // which is truthy and gets added), so we must sign the SAME shape including the
-  // empty cursor or the signature will not match (generic 403).
+  // The server reconstructs the operator-signed payload without a cursor when
+  // the request omits it or sends cursor:null. This drill does not need a
+  // cursor, so sign and send the cursorless shape.
   const syncPayload = {
     wire_version: FEDERATION_SYNC_WIRE_VERSION,
     node_id: origin,
     events: [event],
-    cursor: {},
   };
   const res = await fetch(`${rig.baseUrl}/v1/federation/sync`, {
     method: "POST",
@@ -169,7 +167,7 @@ async function revokeNode(token: string, nodeId: string): Promise<void> {
 
 // retry:2 - loopback /v1 federation rig races port/session setup under full-
 // suite parallel load (recurring non-hermetic CI flake class).
-describe("Fleet Console Slice 1 — federation-backed roster drill", { retry: 2 }, () => {
+describe("Fleet Console Slice 1 - federation-backed roster drill", { retry: 2 }, () => {
   it("shows a correct live 2-node roster; revoking node 2 flips it to revoked", async () => {
     const token = await openDurableSession(rig);
     await enableFederation(token);

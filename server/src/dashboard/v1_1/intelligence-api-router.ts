@@ -315,7 +315,23 @@ export async function handleIntelligenceRoute(
   }
 
   // Auth gate fires before any selector method runs.
-  const checkAuth = authMiddleware(deps.authConfig);
+  //
+  // SECURITY (#800 follow-on, operational mutations): the intelligence
+  // mutations (POST /reset, POST surface/all choice, POST preferences,
+  // POST per-surface choice/fallback, POST/DELETE credentials, POST
+  // hybrid-rules) change the model-routing substrate and write provider
+  // API keys. They must require the operator bearer even on loopback with
+  // `--auto-auth-localhost`, so a co-resident agent sharing the loopback
+  // interface cannot retarget its own model routing or plant/clear
+  // credentials tokenless. The GET reads (status / config) keep loopback
+  // auto-auth. `requireToken` only suppresses the loopback shortcut; token
+  // validation is unchanged. Fail-closed: with no token configured, a
+  // mutating request is rejected, never allowed.
+  const requiresOperatorBearer = method !== "GET";
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {

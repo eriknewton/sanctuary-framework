@@ -127,11 +127,11 @@ describe("EU AI Act CLI", () => {
     await runCompliance([
       "eu-ai-act",
       "did:key:test",
-      "--output", "/tmp/test-bundle",
+      "--output", "out/test-bundle",
       "--passphrase", "test-pass",
     ]);
 
-    expect(mkdir).toHaveBeenCalledWith("/tmp/test-bundle", { recursive: true });
+    expect(mkdir).toHaveBeenCalledWith("out/test-bundle", { recursive: true });
     expect(writeFile).toHaveBeenCalled();
     stderrSpy.mockRestore();
   });
@@ -143,7 +143,7 @@ describe("EU AI Act CLI", () => {
     await runCompliance([
       "eu-ai-act",
       "did:key:test",
-      "--output", "/tmp/test-bundle",
+      "--output", "out/test-bundle",
       "--passphrase", "test-pass",
       "--publish-to-verascore",
     ]);

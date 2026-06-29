@@ -313,11 +313,26 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
     }
   });
 
+  // #800 follow-on: the honeypot management mutations (POST /compile,
+  // POST /deploy, DELETE /traps/:id) require the operator bearer even
+  // under loopback auto-auth, so the rig is configured WITH a token and
+  // the mutation calls present it. GET reads stay tokenless.
+  const HTTP_AUTH_TOKEN = "operator-token-honeypot";
+  function bearer(): HeadersInit {
+    return { Authorization: `Bearer ${HTTP_AUTH_TOKEN}` };
+  }
+  function jsonAuth(): HeadersInit {
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${HTTP_AUTH_TOKEN}`,
+    };
+  }
+
   async function makeServer(rig: Rig): Promise<{ base: string; close: () => Promise<void> }> {
     const server: Server = createServer(async (req, res) => {
       const handled = await handleHoneypotRoute(
         {
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: { loopbackAutoAuth: true, authToken: HTTP_AUTH_TOKEN },
           registry: rig.registry,
           findingStore: rig.findingStore,
           auditLog: rig.auditLog,
@@ -343,7 +358,7 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
     try {
       const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/compile`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({ english_text: "honeypot at /admin/secrets" }),
       });
       expect(res.status).toBe(200);
@@ -368,7 +383,7 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
       const spec = mkSpec();
       const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({ spec }),
       });
       expect(res.status).toBe(200);
@@ -436,7 +451,7 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
       try {
         const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ spec: testCase.spec }),
         });
         expect(res.status, testCase.name).toBe(400);
@@ -470,6 +485,7 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
     try {
       const res = await fetch(`${base}${HONEYPOT_API_PREFIX}/traps/trap-1`, {
         method: "DELETE",
+        headers: bearer(),
       });
       expect(res.status).toBe(200);
       expect(rig.registry.list().length).toBe(0);
@@ -504,6 +520,60 @@ describe("WP-V1.3-5 Pi-1 management routes", () => {
       expect(res.status).toBe(401);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  // #800 follow-on (operational-mutation chokepoint): the honeypot
+  // management mutations require the operator bearer even under loopback
+  // auto-auth. A co-resident agent sharing the loopback interface must not
+  // deploy or tear down traps (disarming the deception surface watching
+  // it) tokenless. GET reads stay tokenless under loopback auto-auth.
+  it("rejects tokenless loopback management mutations with 401 (bearer required)", async () => {
+    const rig = await makeRig();
+    rig.registry.deploy(mkSpec());
+    const { base, close } = await makeServer(rig);
+    try {
+      // POST /compile without a bearer -> 401.
+      const compile = await fetch(`${base}${HONEYPOT_API_PREFIX}/compile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ english_text: "honeypot at /admin/secrets" }),
+      });
+      expect(compile.status).toBe(401);
+
+      // POST /deploy without a bearer -> 401, registry unchanged.
+      const deploy = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spec: mkSpec({ trap_id: "trap-2" }) }),
+      });
+      expect(deploy.status).toBe(401);
+      expect(rig.registry.list().length).toBe(1);
+
+      // DELETE /traps/:id without a bearer -> 401, trap not removed.
+      const del = await fetch(`${base}${HONEYPOT_API_PREFIX}/traps/trap-1`, {
+        method: "DELETE",
+      });
+      expect(del.status).toBe(401);
+      expect(rig.registry.list().length).toBe(1);
+
+      // A bad bearer is also rejected.
+      const badBearer = await fetch(`${base}${HONEYPOT_API_PREFIX}/deploy`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer wrong-token",
+        },
+        body: JSON.stringify({ spec: mkSpec({ trap_id: "trap-3" }) }),
+      });
+      expect(badBearer.status).toBe(401);
+      expect(rig.registry.list().length).toBe(1);
+
+      // GET /traps still works tokenless under loopback auto-auth.
+      const list = await fetch(`${base}${HONEYPOT_API_PREFIX}/traps`);
+      expect(list.status).toBe(200);
+    } finally {
+      await close();
     }
   });
 });

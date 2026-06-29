@@ -47,7 +47,7 @@ import { gatherReputationEvidence } from "../shr/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import type { StorageBackend } from "../storage/interface.js";
 import type { RecognitionReputationEvidence } from "./posture.js";
-import { generateDashboardHTML, generateLoginHTML } from "./dashboard-html.js";
+import { generateDashboardHTML, generateLoginHTML, generateFleetSwitcherHTML } from "./dashboard-html.js";
 import { generateFortressViewHTML } from "../wrap/fortress-view.js";
 import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer } from "../sovereignty-profile.js";
 import { generateSystemPrompt } from "../system-prompt-generator.js";
@@ -128,6 +128,12 @@ import {
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
 import {
+  FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+  foldFederationPolicyBundleEvent as foldVerifiedFederationPolicyBundleEvent,
+  type FederationAppliedPolicyVersion,
+  type FederationPolicyProjection,
+} from "../v1/federation-policy-bundle.js";
+import {
   FederationSyncStateStore,
   type FederationSyncStateSnapshot,
 } from "../v1/federation-sync-state-store.js";
@@ -200,6 +206,13 @@ export interface DashboardConfig {
   };
   /** Auto-open the dashboard in the default browser on startup. Default: true for localhost. */
   auto_open?: boolean;
+  /**
+   * C1: Allow plaintext HTTP on non-loopback interfaces. Default: false.
+   * When false (default), non-loopback binding requires TLS. Set to true
+   * ONLY for tailnet or other encrypted-transport environments where the
+   * network layer already provides encryption.
+   */
+  allow_plaintext_remote?: boolean;
 }
 
 interface PendingRequest {
@@ -209,6 +222,17 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   created_at: string;
 }
+
+/**
+ * Slice 2 (park-not-exit): the credential an operator presents to the
+ * in-process unlock endpoint to lift a parked dashboard out of "locked" and
+ * into "serving". Exactly one of `passphrase` / `recoveryKey` is supplied; the
+ * unlock handler forwards it to `establishMaster` unchanged. NEVER persisted,
+ * NEVER logged, NEVER echoed back.
+ */
+export type UnlockCredential =
+  | { passphrase: string }
+  | { recoveryKey: string };
 
 type SSEClient = ServerResponse;
 
@@ -311,6 +335,7 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     path === "/dashboard" ||
     path === "/v1.0" ||
     path === "/fortress" ||
+    path === "/fleet" ||
     path === "/events" ||
     path === POSTURE_HOME_PATH ||
     // The posture SSE live-refresh stream is a single long-lived connection per
@@ -335,7 +360,46 @@ interface FederationDashboardState {
   eventLog: FederationEvent[];
   revoked: Set<string>;
   evictionMaxSerial: number;
+  operatorPolicy: FederationAppliedPolicyVersion | null;
+  appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
   nodes: Map<string, FederationNodeView>;
+}
+
+function newerAppliedPolicy(
+  base: FederationAppliedPolicyVersion | null,
+  next: FederationAppliedPolicyVersion | null,
+): FederationAppliedPolicyVersion | null {
+  if (!base) return next ? { ...next } : null;
+  if (!next) return { ...base };
+  return next.version > base.version ? { ...next } : { ...base };
+}
+
+function mergeAppliedPolicyVersions(
+  base: Map<string, FederationAppliedPolicyVersion>,
+  next: Map<string, FederationAppliedPolicyVersion>,
+): Map<string, FederationAppliedPolicyVersion> {
+  const merged = new Map<string, FederationAppliedPolicyVersion>(
+    [...base].map(([nodeId, marker]) => [nodeId, { ...marker }]),
+  );
+  for (const [nodeId, marker] of next) {
+    const prior = merged.get(nodeId);
+    if (!prior || marker.version > prior.version) {
+      merged.set(nodeId, { ...marker });
+    }
+  }
+  return merged;
+}
+
+function appliedPolicyMarkerToNodeView(
+  marker: FederationAppliedPolicyVersion,
+): FederationNodeView["applied_policy"] {
+  return {
+    version: marker.version,
+    hash: marker.hash,
+    hash_algorithm: marker.hash_algorithm,
+    applied_at: marker.applied_at,
+    source_event_id: marker.source_event_id,
+  };
 }
 
 export class DashboardApprovalChannel implements ApprovalChannel {
@@ -427,11 +491,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *
    * SCOPE LIMIT (loopback-no-autoauth-for-approvals): this unlock covers
    * read-only and local-dashboard convenience routes ONLY. It does NOT
-   * cover the human-approval ACTION. Every state-changing approval-
-   * decision route always requires the operator bearer token (or a valid
-   * session) regardless of origin, even on loopback with auto-auth
-   * enabled. The covered decision routes are:
+   * cover the human-approval ACTION or operator-state mutation. Every
+   * state-changing decision/mutation route always requires the operator
+   * bearer token regardless of origin, even on loopback with auto-auth
+   * enabled. The covered routes include:
    *   - POST `/api/approve/:id`, POST `/api/deny/:id` (legacy dashboard)
+   *   - POST `/api/unlock`, `/api/sovereignty-profile`, `/api/proxy/servers`
    *   - POST `/api/hub/inbox/:id/{approve,deny}` (v1.1 hub inbox)
    *   - POST `/api/approval-inbox/:id/{approve,deny}` (cross-harness)
    *   - POST `/api/inbox/unified/:id/resolve` (unified inbox)
@@ -479,6 +544,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private supervisorBridge: SupervisorBridge | null = null;
 
   /**
+   * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
+   * key under the supervised LaunchAgent path (`--allow-park`). A parked
+   * dashboard binds the listener, answers `/api/health` (`ok:true`), reports
+   * `/api/readiness` `ready:"locked"` (the identity manager is absent), serves
+   * the unlock door, and serves NO protected state (no master-key-derived deps
+   * are constructed). It is flipped to false by a successful in-process unlock.
+   * Internal only: the wire contract for readiness stays exactly Slice 1b's
+   * `ready:"locked"` whether parked or merely deps-detached.
+   */
+  private _parked = false;
+
+  /**
+   * Slice 2 (park-not-exit): the in-process unlock handler. Set by the
+   * standalone boot path (`setUnlockHandler`) when park is enabled. Given an
+   * operator-supplied credential, it re-runs the SAME `establishMaster` the
+   * boot path runs and wires the unlocked deps through `setDependencies` etc.
+   * Returns `true` on a successful unlock (readiness flips to `serving`),
+   * `false` on a credential that fails to unlock the fortress (the process
+   * stays parked, fail-closed). It NEVER reveals which rule/tier failed
+   * (invariant 7) and NEVER weakens establishMaster.
+   *
+   * CUSTODY: the unlock endpoint that calls this requires the operator bearer
+   * token EVEN ON LOOPBACK (the strictest option, like the approval-decision
+   * routes) so a co-resident agent sharing the loopback interface cannot
+   * self-unlock the fortress. See `handleUnlockRequest`.
+   */
+  private unlockHandler: ((credential: UnlockCredential) => Promise<boolean>) | null = null;
+
+  /**
    * Federation PR-A3 state. `_federationContext` carries the fortress
    * materials (master secret accessor, principal cert + key, pinned master
    * pubkey) the join ceremony needs; it is bound out of band by the console/
@@ -494,6 +588,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     eventLog: [],
     revoked: new Set<string>(),
     evictionMaxSerial: 0,
+    operatorPolicy: null,
+    appliedPolicyVersions: new Map<string, FederationAppliedPolicyVersion>(),
     nodes: new Map<string, FederationNodeView>(),
   };
   private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
@@ -692,6 +788,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setStandaloneMode(standalone: boolean): void {
     this._standaloneMode = standalone;
+  }
+
+  /**
+   * Slice 2 (park-not-exit): mark whether this dashboard is parked (booted
+   * without a master key under the supervised LaunchAgent). Internal flag;
+   * does not change the readiness wire contract (`ready` is still derived from
+   * the presence of the identity manager). Cleared by a successful unlock.
+   */
+  setParked(parked: boolean): void {
+    this._parked = parked;
+  }
+
+  /** Slice 2: is this dashboard currently parked (locked, awaiting unlock)? */
+  isParked(): boolean {
+    return this._parked;
+  }
+
+  /**
+   * Slice 2 (park-not-exit): register the in-process unlock handler. The
+   * standalone boot path supplies a closure that re-runs `establishMaster`
+   * with an operator-supplied credential and wires the unlocked deps. Once
+   * set, `POST /api/unlock` is live. The endpoint REQUIRES the operator bearer
+   * token even on loopback (custody carve-out); see `handleUnlockRequest`.
+   *
+   * Pass `null` to detach (tests / after a successful unlock if desired).
+   */
+  setUnlockHandler(
+    handler: ((credential: UnlockCredential) => Promise<boolean>) | null,
+  ): void {
+    this.unlockHandler = handler;
   }
 
   /**
@@ -953,7 +1079,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // so the operator's browser works and a tokenless non-browser caller is
     // 401'd. checkAuth writes the 401 itself when it fails.
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
-    if (!this.checkAuth(req, url, res)) return true;
+    if (!this.checkAuth(req, url, res, { allowSession: true })) return true;
     return handleDistressRoute({ inbox: this.distressInbox }, req, res);
   }
 
@@ -1252,6 +1378,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       fleetRoster: () =>
         buildFleetRoster(this.buildV1FederationDeps(), {
           evictionSerial: this._federationState.evictionMaxSerial,
+          operatorPolicy: this._federationState.operatorPolicy,
         }),
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
@@ -1305,14 +1432,59 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * to the existing v1.1 / legacy dispatch ladder.
    */
   private dispatchRootPosture(
+    req: IncomingMessage,
     res: ServerResponse,
     url: URL,
     method: string,
   ): boolean {
+    // The SPA view routes whose static shell fetches its data client-side from
+    // checkAuth-gated JSON routes: the posture shell (`/`, `/posture`) and the
+    // v1.1 dashboard SPA aliases (`/dashboard`, `/v1.1`).
+    const isPostureShellPath =
+      url.pathname === "/" || url.pathname === POSTURE_HOME_PATH;
+    const isV11SpaAlias =
+      url.pathname === "/dashboard" ||
+      url.pathname === "/v1.1" ||
+      url.pathname === "/v1.1/";
+    if (method !== "GET" || (!isPostureShellPath && !isV11SpaAlias)) {
+      return false;
+    }
+
+    // C1 remote login affordance: these shells are STATIC pages that fetch
+    // `/api/posture/*` (and the v1.1 hub API) client-side for every byte of
+    // data, and those JSON routes stay behind checkAuth.
+    //
+    // On a LOOPBACK bind the static shell is served tokenless BY DESIGN (the
+    // `/` == `/posture` one-surface contract): a local operator either has
+    // loopback auto-auth after a terminal unlock, or pastes a token into the
+    // shell's own client-side flow, so `/` must keep serving the shell. That
+    // local contract is left exactly as-is.
+    //
+    // On a REMOTE (non-loopback) bind there is NO loopback auto-auth, so an
+    // unauthenticated browser's every data fetch 401s and the shell renders
+    // empty with NO way to enter a token (the drill defect). So ONLY for a
+    // remote binding, when an auth token is required AND this caller is not yet
+    // authenticated, serve the login page (the SAME page `/v1.0` already serves
+    // for its unauthenticated branch) so the operator gets a token box. This is
+    // purely a presentation affordance: it adds NO new auth path and weakens
+    // nothing - the data routes still require a valid token; this only OFFERS
+    // the login box instead of a blank shell. An already-authenticated remote
+    // caller (`isAuthenticated` true: bearer/session/cookie) falls through to
+    // the shell.
     if (
-      method !== "GET" ||
-      (url.pathname !== "/" && url.pathname !== POSTURE_HOME_PATH)
+      this.isRemoteBinding() &&
+      this.authToken &&
+      !this.isAuthenticated(req, url)
     ) {
+      this.serveLoginPage(res);
+      return true;
+    }
+
+    // Authenticated (or no-auth) case: only the posture shell is owned here.
+    // The v1.1 SPA aliases keep their existing v1.1 HTML handler - fall through
+    // to dispatchV11 unchanged so authenticated `/dashboard` + `/v1.1` behavior
+    // does not change.
+    if (!isPostureShellPath) {
       return false;
     }
     res.writeHead(200, {
@@ -1704,10 +1876,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...this._federationState,
         revoked: new Set<string>(),
         evictionMaxSerial: 0,
+        operatorPolicy: null,
+        appliedPolicyVersions: new Map<string, FederationAppliedPolicyVersion>(),
       };
       return;
     }
     this.reprojectFederationRevocations(ctx);
+    if (ctx.revokedRootPubkeys instanceof Set) {
+      for (const pubkey of ctx.revokedRootPubkeys) {
+        this._federationRevokedRoots.add(pubkey);
+      }
+    }
+    if (typeof ctx.highestRevocationSerial === "number") {
+      this._federationHighestRevocationSerial = Math.max(
+        this._federationHighestRevocationSerial,
+        ctx.highestRevocationSerial,
+      );
+    }
     ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
     this._federationRenewal = startFederationNodeCertificateAutoRenewal({
       renewNow: () => this.renewLocalFederationNodeCertificate(),
@@ -1818,6 +2003,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationHighestRevocationSerial,
       snapshot.highestRevocationSerial,
     );
+    this._federationState = {
+      ...this._federationState,
+      operatorPolicy: newerAppliedPolicy(
+        this._federationState.operatorPolicy,
+        snapshot.operatorPolicy,
+      ),
+      appliedPolicyVersions: mergeAppliedPolicyVersions(
+        this._federationState.appliedPolicyVersions,
+        snapshot.appliedPolicyVersions,
+      ),
+    };
+    this.projectAppliedPoliciesOntoRoster();
   }
 
   /**
@@ -1847,6 +2044,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       highestEvictionSerial: this._federationState.evictionMaxSerial,
       revokedRootPubkeys: new Set(this._federationRevokedRoots),
       highestRevocationSerial: this._federationHighestRevocationSerial,
+      operatorPolicy: this._federationState.operatorPolicy
+        ? { ...this._federationState.operatorPolicy }
+        : null,
+      appliedPolicyVersions: new Map(
+        [...this._federationState.appliedPolicyVersions].map(([nodeId, marker]) => [
+          nodeId,
+          { ...marker },
+        ]),
+      ),
     };
   }
 
@@ -1912,6 +2118,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // refuse to append on empty/untrusted revocation memory.
         this.assertFederationSyncStateAvailable();
         const before = this._federationState.evictionMaxSerial;
+        const beforePolicyVersion = this._federationState.operatorPolicy?.version ?? 0;
         const result = this.appendFederationEvents(events, options);
         // Persist ONLY when an operator-authority eviction advanced the durable
         // revocation projection. On a persist failure THROW so the handler
@@ -1924,7 +2131,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // revocation to disk; the worst case is the SAME pre-existing
         // forgotten-on-restart window this slice otherwise closes, never a
         // silent un-revoke.
-        if (this._federationState.evictionMaxSerial > before) {
+        if (
+          this._federationState.evictionMaxSerial > before ||
+          (this._federationState.operatorPolicy?.version ?? 0) > beforePolicyVersion
+        ) {
           await this.persistFederationSyncState();
         }
         return result;
@@ -2045,13 +2255,33 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return this._federationState.revoked.has(nodeId);
   }
 
+  private projectAppliedPoliciesOntoRoster(): void {
+    if (this._federationState.appliedPolicyVersions.size === 0) return;
+    const nextNodes = new Map(this._federationState.nodes);
+    for (const [nodeId, marker] of this._federationState.appliedPolicyVersions) {
+      const existing = nextNodes.get(nodeId);
+      if (!existing) continue;
+      nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
+        applied_policy: appliedPolicyMarkerToNodeView(marker),
+      }));
+    }
+    this._federationState = {
+      ...this._federationState,
+      nodes: nextNodes,
+    };
+  }
+
   private reprojectFederationRevocations(ctx: FederationContext): void {
     const projection = {
       revokedNodeIds: new Set<string>(),
       highestEvictionSerial: 0,
     };
     const events = this._federationState.eventLog
-      .filter((event) => isFederationOperatorAuthorityEvent(event, ctx.fortressId))
+      .filter(
+        (event) =>
+          event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND &&
+          isFederationOperatorAuthorityEvent(event, ctx.fortressId),
+      )
       .sort((a, b) => a.sequence - b.sequence);
     for (const event of events) {
       const folded = foldAcceptedFederationNodeEvictionEvent({
@@ -2088,10 +2318,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     return { ok: true };
   }
 
+  private foldFederationPolicyBundleEvent(
+    event: FederationEvent,
+    projection: FederationPolicyProjection,
+  ): { ok: true } | { ok: false; reason: string } {
+    const ctx = this._federationContext;
+    if (ctx === null) return { ok: false, reason: "federation_not_provisioned" };
+    const folded = foldVerifiedFederationPolicyBundleEvent({
+      event,
+      projection,
+      fortressId: ctx.fortressId,
+      pinnedMaster: ctx.pinnedMasterPubkey,
+      operatorPrincipalCert: ctx.issuingPrincipalCert,
+      applyingNodeId: ctx.nodeId,
+    });
+    if (!folded.ok) return { ok: false, reason: folded.reason };
+    return { ok: true };
+  }
+
   private upsertFederationNode(
     nodeId: string,
-    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync" | "applied_policy">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
+      applied_policy?: Partial<FederationNodeView["applied_policy"]>;
     },
   ): FederationNodeView {
     const nextNodes = new Map(this._federationState.nodes);
@@ -2107,8 +2356,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private buildFederationNodeUpsert(
     nodes: Map<string, FederationNodeView>,
     nodeId: string,
-    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync">> & {
+    update?: Partial<Omit<FederationNodeView, "node_id" | "last_sync" | "applied_policy">> & {
       last_sync?: Partial<FederationNodeView["last_sync"]>;
+      applied_policy?: Partial<FederationNodeView["applied_policy"]>;
     },
   ): FederationNodeView {
     const now = new Date().toISOString();
@@ -2126,6 +2376,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         received_at: update?.last_sync?.received_at ?? existing?.last_sync.received_at ?? null,
         sent_at: update?.last_sync?.sent_at ?? existing?.last_sync.sent_at ?? null,
         last_sequence: update?.last_sync?.last_sequence ?? existing?.last_sync.last_sequence ?? 0,
+      },
+      applied_policy: {
+        version: update?.applied_policy?.version ?? existing?.applied_policy.version ?? null,
+        hash: update?.applied_policy?.hash ?? existing?.applied_policy.hash ?? null,
+        hash_algorithm:
+          update?.applied_policy?.hash_algorithm ??
+          existing?.applied_policy.hash_algorithm ??
+          null,
+        applied_at:
+          update?.applied_policy?.applied_at ??
+          existing?.applied_policy.applied_at ??
+          null,
+        source_event_id:
+          update?.applied_policy?.source_event_id ??
+          existing?.applied_policy.source_event_id ??
+          null,
       },
     };
   }
@@ -2267,6 +2533,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       revokedNodeIds: new Set(currentState.revoked),
       highestEvictionSerial: currentState.evictionMaxSerial,
     };
+    const policyProjection: FederationPolicyProjection = {
+      current: currentState.operatorPolicy
+        ? { ...currentState.operatorPolicy }
+        : null,
+      appliedByNode: new Map(
+        [...currentState.appliedPolicyVersions].map(([nodeId, marker]) => [
+          nodeId,
+          { ...marker },
+        ]),
+      ),
+    };
     const byNode = new Map<string, FederationEvent[]>();
     for (const event of events) {
       const list = byNode.get(event.origin_node_id) ?? [];
@@ -2300,27 +2577,44 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         const operatorAuthorityOrigin =
           ctx === null ? null : federationOperatorAuthorityOrigin(ctx.fortressId);
         const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+        const isPolicyBundleKind =
+          event.kind === FEDERATION_POLICY_BUNDLE_EVENT_KIND;
         const isAuthorityOrigin =
           operatorAuthorityOrigin !== null &&
           event.origin_node_id === operatorAuthorityOrigin;
-        if (isEvictionKind || isAuthorityOrigin) {
-          if (
-            ctx === null ||
-            !isFederationOperatorAuthorityEvent(event, ctx.fortressId)
-          ) {
-            rejected.push({ event_id: event.event_id, reason: "eviction_authority_invalid" });
+        if (isEvictionKind || isPolicyBundleKind || isAuthorityOrigin) {
+          if (ctx === null || !isFederationOperatorAuthorityEvent(event, ctx.fortressId)) {
+            rejected.push({ event_id: event.event_id, reason: "operator_authority_invalid" });
             continue;
           }
-          const folded = this.foldFederationEvictionEvent(event, evictionProjection);
-          if (!folded.ok) {
-            rejected.push({ event_id: event.event_id, reason: folded.reason });
-            continue;
+          if (isEvictionKind) {
+            const folded = this.foldFederationEvictionEvent(event, evictionProjection);
+            if (!folded.ok) {
+              rejected.push({ event_id: event.event_id, reason: folded.reason });
+              continue;
+            }
+          } else if (isPolicyBundleKind) {
+            const folded = this.foldFederationPolicyBundleEvent(
+              event,
+              policyProjection,
+            );
+            if (!folded.ok) {
+              rejected.push({ event_id: event.event_id, reason: folded.reason });
+              continue;
+            }
           }
         }
         nextEventLog.push(event);
         knownEventIds.add(event.event_id);
         accepted.push(event);
         last = event;
+        if (isPolicyBundleKind && ctx !== null && policyProjection.current) {
+          nextNodes.set(ctx.nodeId, this.buildFederationNodeUpsert(nextNodes, ctx.nodeId, {
+            attestation_status: "verified",
+            node_mode: ctx.nodeMode ?? "local",
+            applied_policy: appliedPolicyMarkerToNodeView(policyProjection.current),
+          }));
+        }
         if (!isAuthorityOrigin) {
           nextNodes.set(nodeId, this.buildFederationNodeUpsert(nextNodes, nodeId, {
             attestation_status: "verified",
@@ -2339,6 +2633,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         eventLog: nextEventLog,
         revoked: evictionProjection.revokedNodeIds,
         evictionMaxSerial: evictionProjection.highestEvictionSerial,
+        operatorPolicy: policyProjection.current,
+        appliedPolicyVersions: policyProjection.appliedByNode,
         nodes: nextNodes,
       },
     };
@@ -2376,9 +2672,68 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Start the HTTP(S) server for the dashboard.
+   * C1: is this dashboard binding to a non-loopback interface?
    */
-  async start(): Promise<void> {
+  private isRemoteBinding(): boolean {
+    const h = this.config.host;
+    return h !== "127.0.0.1" && h !== "::1" && h !== "localhost";
+  }
+
+  /**
+   * Slice 2 (single-owner): set true when `start()` was asked to treat
+   * EADDRINUSE as a benign "another owner holds the port" outcome and the
+   * bind failed with EADDRINUSE. The supervised boot path checks this and
+   * exits 0 (so launchd KeepAlive treats it as a successful run, never a
+   * crash that churns the restart loop). Never set on the interactive path,
+   * which keeps the loud operator message and a real reject/throw.
+   */
+  private _addrInUse = false;
+
+  /** Slice 2: did the last `start()` lose the single-owner race (EADDRINUSE)? */
+  addrInUse(): boolean {
+    return this._addrInUse;
+  }
+
+  /**
+   * Start the HTTP(S) server for the dashboard.
+   *
+   * @param opts.exitCleanOnAddrInUse Slice 2 single-owner guard. When true
+   *   (the supervised LaunchAgent path), an EADDRINUSE bind failure RESOLVES
+   *   cleanly and sets {@link addrInUse} instead of rejecting, so the caller
+   *   can exit 0 and KeepAlive treats it as a successful run (no churn). When
+   *   false/omitted (interactive `sanctuary dashboard`), EADDRINUSE still
+   *   prints the loud operator banner and rejects.
+   */
+  async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
+    // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
+    // over the wire is a credential-theft vector. The operator can opt
+    // out via allow_plaintext_remote for tailnet/VPN environments where
+    // the network layer already encrypts.
+    if (this.isRemoteBinding() && !this.useTLS && !this.config.allow_plaintext_remote) {
+      throw new Error(
+        `Sanctuary Dashboard: refusing to start on non-loopback interface ` +
+        `${this.config.host} without TLS.\n\n` +
+        `  Approve/deny decisions over plaintext HTTP expose the auth token\n` +
+        `  and operator decisions to network observers.\n\n` +
+        `  Options:\n` +
+        `    1. Configure TLS: set dashboard.tls.cert_path + dashboard.tls.key_path\n` +
+        `       (for Tailscale: tailscale cert <hostname>)\n` +
+        `    2. Set dashboard.allow_plaintext_remote: true if the network\n` +
+        `       layer already encrypts (e.g. Tailscale, WireGuard)\n` +
+        `    3. Bind to 127.0.0.1 (localhost only)\n`
+      );
+    }
+
+    // C1: enforce auth token for non-loopback bindings. Without a token,
+    // anyone who can reach the interface can approve/deny agent operations.
+    if (this.isRemoteBinding() && !this.authToken) {
+      this.authToken = randomBytes(32).toString("hex");
+      process.stderr.write(
+        `\n  C1: Non-loopback binding requires authentication.\n` +
+        `  Auto-generated auth token (use this to connect from remote machines).\n\n`
+      );
+    }
+
     const handler = (req: IncomingMessage, res: ServerResponse) => this.handleRequest(req, res);
 
     let server;
@@ -2428,6 +2783,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       server.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE") {
           const port = this.config.port;
+          // Slice 2 single-owner: on the supervised path, another owner already
+          // holds the port (the LaunchAgent process, or a prior in-app spawn).
+          // This is NOT a crash; resolve cleanly so the boot path can exit 0
+          // and KeepAlive treats it as a successful run (no restart churn,
+          // never a tight loop). At most one listener survives; EADDRINUSE
+          // loses, quietly.
+          if (opts?.exitCleanOnAddrInUse) {
+            this._addrInUse = true;
+            process.stderr.write(
+              `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
+                `instance; standing down (single-owner).\n\n`,
+            );
+            resolve();
+            return;
+          }
           process.stderr.write(
             `\n  ╔══════════════════════════════════════════════════════════════╗\n` +
             `  ║  Port ${port} is already in use.                              ║\n` +
@@ -2538,12 +2908,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   // ── Authentication ──────────────────────────────────────────────────
 
   /**
-   * Verify bearer token authentication.
+   * Verify dashboard authentication.
    *
    * SEC-012: The long-lived auth token is ONLY accepted via the Authorization
    * header - never in URL query strings. For SSE and page loads that cannot
    * set headers, a short-lived session token (obtained via POST /auth/session)
-   * is accepted via ?session= query parameter.
+   * is accepted via ?session= query parameter only when the caller explicitly
+   * opts into session auth.
+   *
+   * `requireToken` is the Tier-1/state-mutation chokepoint: it fails closed
+   * when no token is configured and accepts only a valid operator bearer. It
+   * never accepts loopback auto-auth, ?session=, or sanctuary_session cookies.
    *
    * Returns true if auth passes, false if blocked (response already sent).
    */
@@ -2551,21 +2926,32 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     req: IncomingMessage,
     url: URL,
     res: ServerResponse,
-    opts?: { requireToken?: boolean },
+    opts?: { requireToken?: boolean; allowSession?: boolean },
   ): boolean {
-    if (!this.authToken) return true; // Auth disabled
+    const deny = (): false => {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return false;
+    };
 
-    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment.
-    //
-    // SCOPE LIMIT (loopback-no-autoauth-for-approvals): `requireToken`
-    // suppresses this shortcut so a state-changing approval decision
-    // (POST /api/approve/:id, /api/deny/:id) always requires the operator
-    // bearer token (or a valid session), even on loopback with auto-auth
-    // on. The co-resident agent shares loopback, so origin is not a proxy
-    // for operator identity for a Tier-1 release. Header/session/cookie
-    // validation below is unchanged.
+    const authHeader = req.headers.authorization;
+    const parts = authHeader?.split(" ");
+    const hasValidBearer =
+      !!this.authToken &&
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken);
+
+    if (opts?.requireToken) {
+      return hasValidBearer || deny();
+    }
+
+    if (!this.authToken) return true; // Auth disabled for non-strict routes.
+
+    // v0.10.2: loopback auto-auth - see _autoAuthLocalhost comment. Strict
+    // routes return above before this shortcut, so loopback can never release
+    // a Tier-1 decision or mutate operator state by network position alone.
     if (
-      !opts?.requireToken &&
       this._autoAuthLocalhost &&
       this.isLoopbackRequest(req)
     ) {
@@ -2573,29 +2959,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     // Check Authorization: Bearer <token> header (primary auth method)
-    const authHeader = req.headers.authorization;
-    if (authHeader) {
-      const parts = authHeader.split(" ");
-      if (
-        parts.length === 2 &&
-        parts[0] === "Bearer" &&
-        constantTimeEquals(parts[1]!, this.authToken)
-      ) {
+    if (hasValidBearer) {
+      return true;
+    }
+
+    // SEC-012: Check ?session= query parameter for short-lived session tokens.
+    // This replaces the old ?token= query parameter that exposed the long-lived
+    // token, but only safe read/SSE routes opt into this branch.
+    if (opts?.allowSession) {
+      const sessionId = url.searchParams.get("session");
+      if (sessionId && this.validateSession(sessionId)) {
         return true;
       }
-    }
 
-    // SEC-012: Check ?session= query parameter for short-lived session tokens
-    // This replaces the old ?token= query parameter that exposed the long-lived token
-    const sessionId = url.searchParams.get("session");
-    if (sessionId && this.validateSession(sessionId)) {
-      return true;
-    }
-
-    // Check sanctuary_session cookie (set by login page flow)
-    const cookieSession = this.parseCookie(req, "sanctuary_session");
-    if (cookieSession && this.validateSession(cookieSession)) {
-      return true;
+      // Check sanctuary_session cookie (set by login page flow)
+      const cookieSession = this.parseCookie(req, "sanctuary_session");
+      if (cookieSession && this.validateSession(cookieSession)) {
+        return true;
+      }
     }
 
     // SEC-012: Long-lived token in ?token= query parameter is explicitly REJECTED.
@@ -2603,9 +2984,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // For GET / requests from browsers, serve login page instead of JSON 401
     // (checked in handleRequest before checkAuth is called for this path)
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized - use Authorization: Bearer header or a valid session" }));
-    return false;
+    return deny();
   }
 
   /**
@@ -2863,7 +3242,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     const method = req.method ?? "GET";
 
-    // CORS headers - restrict to same-origin; the dashboard is served by this server
+    // CORS headers - restrict to same-origin; the dashboard is served by this server.
+    // CORS: reflect ONLY the exact same-origin (the dashboard serves its own
+    // UI). Cross-origin reflection for the remote fleet-switcher health probe
+    // is scoped to the UNAUTHENTICATED /api/health handler ONLY, which sets its
+    // own Access-Control-Allow-Origin (and never Access-Control-Allow-Credentials).
+    // SECURITY: no authenticated/protected route must ever carry cross-origin
+    // reflection. The earlier remote-bind same-port reflection lived in this
+    // prelude and therefore leaked onto every downstream route (protected reads,
+    // mutating POSTs, approval decisions) on a remote bind; it has been removed.
+    // Without Access-Control-Allow-Credentials this was not a credentialed-read
+    // takeover, but route-wide reflection is exactly the latent hole that turns
+    // into one the day a credentials header is added. Health-only is the contract.
     const origin = req.headers.origin;
     const protocol = this.useTLS ? "https" : "http";
     const selfOrigin = `${protocol}://${this.config.host}:${this.config.port}`;
@@ -2928,7 +3318,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
     // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
     // the posture JSON API included) fall through untouched.
-    if (this.dispatchRootPosture(res, url, method)) return;
+    if (this.dispatchRootPosture(req, res, url, method)) return;
 
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session
     // ceremony + session-token-gated routes). Owns the entire /v1 prefix
@@ -3208,10 +3598,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // `{ ok, mode }` shape is the only contract the CLI health probe + external
     // monitors key on.
     if (method === "GET" && url.pathname === "/api/health") {
-      res.writeHead(200, {
+      // C1 cross-host fleet probe: the `/fleet` switcher is served by ONE host
+      // and health-probes the others with `fetch(<remote>/api/health)`. The
+      // browser's same-origin policy blocks the response body unless the remote
+      // sends `Access-Control-Allow-Origin`, so without this header a reachable
+      // remote shows offline (red dot) in the switcher.
+      //
+      // SCOPE (security): this permissive ACAO is added ONLY to this endpoint,
+      // which is the UNAUTHENTICATED, O(1) liveness probe - it returns only
+      // `{ ok, mode, instance, since }` (no secrets, no posture, no auth state),
+      // so a cross-origin reader learns nothing it could not learn by connecting
+      // directly. We reflect the request Origin (falling back to `*`) but NEVER
+      // set `Access-Control-Allow-Credentials` here, so no cookie/bearer is ever
+      // sent or honored cross-origin (the reflected-origin + credentials combo
+      // is the CORS account-takeover pattern, and it is deliberately avoided).
+      // No authenticated/protected route carries cross-origin reflection; they
+      // keep the same-origin/same-port contract set in handleRequest().
+      const healthHeaders: Record<string, string> = {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
-      });
+        "Access-Control-Allow-Origin": req.headers.origin ?? "*",
+      };
+      res.writeHead(200, healthHeaders);
       // brief D3: `{ ok, mode }` plus the opaque per-process `instance` +
       // `since` restart-detection signal. NO `ready`/`supervisor` here -
       // those would be a co-resident-agent oracle on this unauthenticated
@@ -3245,7 +3653,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // "unwired".)
     if (method === "GET" && url.pathname === "/api/readiness") {
       if (!this.checkRateLimit(req, res, "general")) return;
-      if (!this.checkAuth(req, url, res)) return;
+      if (!this.checkAuth(req, url, res, { allowSession: true })) return;
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
@@ -3256,6 +3664,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           supervisor: this.supervisorBridge ? "wired" : "unwired",
         }),
       );
+      return;
+    }
+
+    // Slice 2 (park-not-exit): in-process unlock door. POST /api/unlock takes
+    // an operator credential, re-runs establishMaster, and (on success) wires
+    // the unlocked deps so readiness flips locked -> serving with NO restart.
+    //
+    // CUSTODY CARVE-OUT (the new attack surface): this is the strictest auth
+    // option. It REQUIRES the operator bearer token EVEN ON LOOPBACK
+    // (`requireToken: true`), exactly like the Tier-1 approval-decision routes.
+    // A co-resident agent sharing the loopback interface holds no proxy for
+    // operator identity, so loopback auto-auth is explicitly suppressed here:
+    // the agent cannot self-unlock the fortress by POSTing a guessed/known
+    // credential from localhost. It is registered in the `decisions` rate-limit
+    // class, but note that `checkRateLimit` short-circuits `return true` for
+    // loopback callers (operator-local tooling must never 429), so loopback
+    // unlock attempts are NOT actually rate-limited; the rate limit only bites
+    // remote callers. Credential brute-force on loopback is instead bounded by
+    // the deliberately-slow Argon2id KDF inside establishMaster (each attempt
+    // pays the full key-derivation cost), and the operator bearer token is
+    // STILL required even on loopback (the custody carve-out above). It returns
+    // GENERIC errors (no oracle about which rule/tier failed; invariant 7) and
+    // serves NO protected state until a CORRECT unlock. It NEVER auto-generates
+    // a weaker credential and NEVER weakens establishMaster (the handler calls
+    // the same establishMaster the boot path calls).
+    if (method === "POST" && url.pathname === "/api/unlock") {
+      if (!this.checkRateLimit(req, res, "decisions")) return;
+      if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+      this.handleUnlockRequest(req, res);
       return;
     }
 
@@ -3286,22 +3723,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Authenticate all other non-OPTIONS requests.
     //
-    // SECURITY (loopback-no-autoauth-for-approvals): the legacy approval
-    // DECISION routes (POST /api/approve/:id, POST /api/deny/:id) release
-    // a Tier-1 op, so they always require the operator token even on
-    // loopback with auto-auth on - a co-resident agent sharing loopback
-    // must not be able to self-approve. All other legacy routes keep the
-    // loopback auto-auth convenience.
-    const isLegacyApprovalDecision =
+    // SECURITY: legacy decision/state-mutation routes require the operator
+    // bearer token even on loopback. A co-resident agent sharing loopback must
+    // not be able to release Tier-1 approvals or mutate operator configuration
+    // with a short-lived session, cookie, or mere network position.
+    const isLegacyStrictMutation =
       method === "POST" &&
       (url.pathname.startsWith("/api/approve/") ||
-        url.pathname.startsWith("/api/deny/"));
+        url.pathname.startsWith("/api/deny/") ||
+        url.pathname === "/api/sovereignty-profile" ||
+        url.pathname === "/api/proxy/servers");
     if (
       !this.checkAuth(
         req,
         url,
         res,
-        isLegacyApprovalDecision ? { requireToken: true } : undefined,
+        isLegacyStrictMutation ? { requireToken: true } : { allowSession: true },
       )
     )
       return;
@@ -3362,7 +3799,9 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     try {
-      if (method === "GET" && url.pathname === "/fortress") {
+      if (method === "GET" && url.pathname === "/fleet") {
+        this.serveFleetSwitcher(res);
+      } else if (method === "GET" && url.pathname === "/fortress") {
         this.serveFortressView(res);
       } else if (method === "GET" && url.pathname === "/v1.0") {
         // v1.1.7: legacy v1.0 dashboard preserved at /v1.0. Root serves the
@@ -3465,14 +3904,135 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     const sessionId = this.createSession();
     const ttlSeconds = Math.floor(this.sessionTTLMs / 1000);
+    // SameSite=Lax (not Strict): the Fleet Switcher is served by ONE host but
+    // its "Open Console" links navigate the SAME TAB to a DIFFERENT host's
+    // dashboard root. Under SameSite=Strict the browser withholds the session
+    // cookie on that cross-site top-level navigation, so a remote console the
+    // operator already authenticated re-prompts for the token on every visit
+    // even while the session is still valid (the C1 re-auth defect). Lax sends
+    // the cookie on top-level GET navigations (the Open Console click, a typed
+    // URL, a reload) so a still-valid session is reused without re-prompting.
+    //
+    // This does NOT weaken auth: Lax still withholds the cookie on cross-site
+    // SUBREQUESTS and cross-site POSTs, so the approval-decision routes
+    // (POST /api/approve/:id, /api/deny/:id) remain CSRF-safe — a cross-origin
+    // page cannot drive a state-changing decision off this cookie. A request
+    // with no valid token AND no valid session still gets the login page / 401
+    // (isAuthenticated / checkAuth are unchanged); only a genuinely-valid,
+    // unexpired session is reused. The TTL is unchanged — we reuse the existing
+    // session, we do not lengthen it.
     res.writeHead(200, {
       "Content-Type": "application/json",
-      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Strict; Max-Age=${ttlSeconds}`,
+      "Set-Cookie": `sanctuary_session=${sessionId}; Path=/; SameSite=Lax; Max-Age=${ttlSeconds}`,
     });
     res.end(JSON.stringify({
       session_id: sessionId,
       expires_in_seconds: ttlSeconds,
     }));
+  }
+
+  /**
+   * Slice 2 (park-not-exit): handle the authenticated in-process unlock POST.
+   * Auth + rate limit are enforced by the caller (operator token required even
+   * on loopback). This method validates the body, forwards the credential to
+   * the registered unlock handler (which re-runs establishMaster + wires the
+   * unlocked deps), and returns a GENERIC result.
+   *
+   * Fail-closed posture:
+   *   - No unlock handler registered (park not enabled): 404 generic.
+   *   - Already unlocked: 409 generic (idempotent guard; the read surface is
+   *     already serving, nothing to do).
+   *   - Malformed / oversized body: 400 generic.
+   *   - Wrong credential: 401 generic "unlock failed". NO oracle about which
+   *     rule/tier failed (invariant 7); the process STAYS parked.
+   *   - Success: 200 `{ unlocked: true }`; readiness has already flipped to
+   *     "serving" inside the handler.
+   */
+  private handleUnlockRequest(req: IncomingMessage, res: ServerResponse): void {
+    if (!this.unlockHandler) {
+      // Park not enabled on this dashboard: no unlock door exists. Generic 404
+      // so the absence of the door is not itself a state oracle.
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+    if (!this._parked) {
+      // Already unlocked (or never parked): nothing to do. Generic 409.
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Already unlocked" }));
+      return;
+    }
+
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // Size limit: 8KB is ample for a passphrase / recovery key.
+      if (body.length > 8192) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      let credential: UnlockCredential;
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        const passphrase = parsed.passphrase;
+        const recoveryKey = parsed.recovery_key ?? parsed.recoveryKey;
+        if (typeof passphrase === "string" && passphrase.length > 0) {
+          credential = { passphrase };
+        } else if (typeof recoveryKey === "string" && recoveryKey.length > 0) {
+          credential = { recoveryKey };
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Provide a passphrase or recovery_key",
+            }),
+          );
+          return;
+        }
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+
+      // Re-check the handler/park state inside the async tail: a concurrent
+      // unlock could have flipped us out of parked while the body streamed.
+      if (!this.unlockHandler || !this._parked) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Already unlocked" }));
+        return;
+      }
+
+      let unlocked: boolean;
+      try {
+        unlocked = await this.unlockHandler(credential);
+      } catch {
+        // A handler-internal failure (wrong-key throw, wiring error) must not
+        // leak detail and must leave the process parked. Generic failure.
+        unlocked = false;
+      }
+
+      if (unlocked) {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ unlocked: true }));
+        return;
+      }
+      // Generic, no oracle: the process stays parked, fail-closed.
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ error: "Unlock failed" }));
+    });
   }
 
   private serveLoginPage(res: ServerResponse): void {
@@ -4110,6 +4670,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify({ error: "Invalid request" }));
       }
     });
+  }
+
+  // ── Fleet Switcher (C1) ─────────────────────────────────────────────
+
+  /**
+   * C1: Serve the fleet switcher page. Client-side localStorage manages
+   * the saved list of machine endpoints; no server-side state.
+   */
+  private serveFleetSwitcher(res: ServerResponse): void {
+    const protocol = this.useTLS ? "https" : "http";
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(generateFleetSwitcherHTML({
+      serverVersion: PKG_VERSION,
+      protocol,
+      currentHost: this.config.host,
+      currentPort: this.config.port,
+    }));
   }
 
   // ── SSE Broadcasting ────────────────────────────────────────────────

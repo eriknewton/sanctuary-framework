@@ -1,5 +1,5 @@
 /**
- * §12.3 — Policy-update fan-out within 5 seconds of the authoring emit.
+ * §12.3 - Policy-update fan-out within 5 seconds of the authoring emit.
  *
  * Spec: Review/Sanctuary/Federation_Protocol_V0.1_Spec_2026-04-21.md §12.3
  *
@@ -12,12 +12,14 @@
  * emit. It waits until nodes B and C both have the new version in their
  * version vector, then asserts the elapsed is strictly less than the §12.3
  * 5-second budget. `DEFAULTS.POLICY_DISTRIBUTION_DEADLINE_MS` is the single
- * source of truth for the deadline — the constant is what the spec binds.
+ * source of truth for the deadline - the constant is what the spec binds.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DEFAULTS } from "../../../src/mesh/constants.js";
+import { encodePolicyBlob } from "../../../src/policy-engine/canonical-policy.js";
+import type { CompiledPolicy } from "../../../src/policy-engine/types.js";
 
 import { bootThreeModeDrill, type ThreeModeDrillHandle, waitFor } from "./harness.js";
 
@@ -30,7 +32,7 @@ afterEach(async () => {
   }
 });
 
-describe("three-mode-drill §12.3 — policy update fan-out ≤ 5s on loopback", () => {
+describe("three-mode-drill §12.3 - policy update fan-out ≤ 5s on loopback", () => {
   it(
     "policy emitted on node A applies on B and C within POLICY_DISTRIBUTION_DEADLINE_MS",
     async () => {
@@ -38,15 +40,19 @@ describe("three-mode-drill §12.3 — policy update fan-out ≤ 5s on loopback",
       const drill = active;
 
       const agentId = "drill-agent-policy-1";
-      const policyBlob = Buffer.from(
-        JSON.stringify({ drill: "§12.3", rule: "allow_memory_read" })
-      ).toString("base64");
+      const policyBlob = compiledPolicyBlob(
+        agentId,
+        1,
+        drill.fortressId,
+      );
 
       const started = Date.now();
       const evt = await drill.nodeA.publishPolicyUpdate({
         payload: {
           agent_id: agentId,
           policy_version: 1,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
           policy_blob: policyBlob,
         },
         principal_private_key: drill.root_principal_keypair.privateKey,
@@ -79,3 +85,34 @@ describe("three-mode-drill §12.3 — policy update fan-out ≤ 5s on loopback",
     60_000
   );
 });
+
+function compiledPolicyBlob(
+  agentId: string,
+  policyVersion: number,
+  fortressId: string,
+): string {
+  return encodePolicyBlob({
+    schema_version: "0.1",
+    agent_id: agentId,
+    fortress_id: fortressId,
+    policy_version: policyVersion,
+    slots: {
+      memory: { slot: "memory", mode: "deny", grants: [] },
+      credentials: { slot: "credentials", mode: "deny", grants: [] },
+      plans: { slot: "plans", mode: "deny", grants: [] },
+      outputs: { slot: "outputs", mode: "deny", grants: [] },
+    },
+    capabilities: {
+      concordia_commitment_classes: [],
+      honeypot_skill_ids: [],
+      is_sentinel: false,
+    },
+    auto_trigger_ladder: {
+      honeypot_auto_freeze: false,
+      threshold_rule_action: "operator_approved",
+      ml_anomaly_action: "operator_approved",
+    },
+    source_english: "fixture",
+    compiled_at: "2026-06-09T12:00:00.000Z",
+  } satisfies CompiledPolicy);
+}

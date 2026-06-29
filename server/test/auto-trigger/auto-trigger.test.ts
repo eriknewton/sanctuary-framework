@@ -901,6 +901,22 @@ describe("Nu-3: auto-promotion criteria and calibration suggester", () => {
 });
 
 describe("Nu-1: HTTP routes", () => {
+  // #800 follow-on: the auto-trigger mutations (PATCH thresholds, POST
+  // promote/demote/accept/reject/cancel) require the operator bearer even
+  // under loopback auto-auth. The rig is configured WITH a token; mutating
+  // calls present it via `bearer()` / `jsonAuth()`. GET reads stay
+  // tokenless (loopback auto-auth still applies).
+  const HTTP_AUTH_TOKEN = "operator-token-autotrigger";
+  function bearer(): HeadersInit {
+    return { Authorization: `Bearer ${HTTP_AUTH_TOKEN}` };
+  }
+  function jsonAuth(): HeadersInit {
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${HTTP_AUTH_TOKEN}`,
+    };
+  }
+
   async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
     base: string;
     close: () => Promise<void>;
@@ -908,7 +924,10 @@ describe("Nu-1: HTTP routes", () => {
     const server: Server = createServer(async (req, res) => {
       const handled = await handleAutoTriggerRoute(
         {
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: {
+            loopbackAutoAuth: true,
+            authToken: HTTP_AUTH_TOKEN,
+          },
           store: rig.store,
           dispatcher: rig.dispatcher,
           suggester: rig.suggester,
@@ -968,7 +987,7 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r1`,
         {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({
             threshold_overrides: { warn_sigma: 2 },
           }),
@@ -980,7 +999,7 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r1`,
         {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({
             rule_type: "anomaly",
             threshold_overrides: { warn_sigma: 2.5, alert_sigma: 5.0 },
@@ -1008,7 +1027,7 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/promote`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ rule_type: "sentinel" }),
         },
       );
@@ -1017,7 +1036,7 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/promote`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ rule_type: "sentinel" }),
         },
       );
@@ -1027,7 +1046,7 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/promote`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ rule_type: "sentinel" }),
         },
       );
@@ -1035,19 +1054,19 @@ describe("Nu-1: HTTP routes", () => {
       // Demote back to floor.
       await fetch(`${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/demote`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({ rule_type: "sentinel" }),
       });
       await fetch(`${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/demote`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: jsonAuth(),
         body: JSON.stringify({ rule_type: "sentinel" }),
       });
       const floor = await fetch(
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/demote`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ rule_type: "sentinel" }),
         },
       );
@@ -1069,12 +1088,12 @@ describe("Nu-1: HTTP routes", () => {
       await rig.dispatcher.handleFinding(finding, "sentinel");
       const cancelRes = await fetch(
         `${base}${AUTO_TRIGGER_API_PREFIX}/cancel/pending-via-http`,
-        { method: "POST" },
+        { method: "POST", headers: bearer() },
       );
       expect(cancelRes.status).toBe(200);
       const unknown = await fetch(
         `${base}${AUTO_TRIGGER_API_PREFIX}/cancel/never-queued`,
-        { method: "POST" },
+        { method: "POST", headers: bearer() },
       );
       expect(unknown.status).toBe(404);
     } finally {
@@ -1128,7 +1147,7 @@ describe("Nu-1: HTTP routes", () => {
 
       const accept = await fetch(
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/http-rec/accept-recommendation`,
-        { method: "POST" },
+        { method: "POST", headers: bearer() },
       );
       expect(accept.status).toBe(200);
       expect((await rig.store.get("http-rec"))?.current_rung).toBe(2);
@@ -1141,12 +1160,69 @@ describe("Nu-1: HTTP routes", () => {
         `${base}${AUTO_TRIGGER_API_PREFIX}/rules/http-reject/reject-recommendation`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: jsonAuth(),
           body: JSON.stringify({ cooldown_hours: 24 }),
         },
       );
       expect(reject.status).toBe(200);
       expect((await rig.store.get("http-reject"))?.recommendation_suppressed_until).toBeDefined();
+    } finally {
+      await close();
+    }
+  });
+
+  // #800 follow-on (operational-mutation chokepoint): every auto-trigger
+  // mutation requires the operator bearer even on loopback. A co-resident
+  // agent sharing the loopback interface must not retune its own
+  // auto-trigger rungs or cancel a pending action tokenless. GET reads
+  // stay tokenless under loopback auto-auth.
+  it("rejects tokenless loopback mutations with 401 (bearer required); GET reads stay open", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      // PATCH thresholds without a bearer -> 401.
+      const patch = await fetch(`${base}${AUTO_TRIGGER_API_PREFIX}/rules/x`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rule_type: "sentinel" }),
+      });
+      expect(patch.status).toBe(401);
+
+      // POST promote without a bearer -> 401, and the rung is unchanged.
+      const promote = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/promote`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rule_type: "sentinel" }),
+        },
+      );
+      expect(promote.status).toBe(401);
+
+      // POST cancel without a bearer -> 401.
+      const cancel = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/cancel/anything`,
+        { method: "POST" },
+      );
+      expect(cancel.status).toBe(401);
+
+      // A bad bearer is also rejected.
+      const badBearer = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/x/promote`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer wrong-token",
+          },
+          body: JSON.stringify({ rule_type: "sentinel" }),
+        },
+      );
+      expect(badBearer.status).toBe(401);
+
+      // The GET reads still work tokenless under loopback auto-auth.
+      const rules = await fetch(`${base}${AUTO_TRIGGER_API_PREFIX}/rules`);
+      expect(rules.status).toBe(200);
     } finally {
       await close();
     }

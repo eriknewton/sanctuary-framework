@@ -1,9 +1,9 @@
 /**
- * Sovereignty Posture Dashboard — Phase 1 home HTML.
+ * Sovereignty Posture Dashboard - Phase 1 home HTML.
  *
  * A single self-contained page that renders the posture board: the banner, the
  * agent grid (wrapped + detected-unwrapped amber cards), the approvals inbox,
- * "today's story," anomaly findings, and the Castle Wall panel — with a
+ * "today's story," anomaly findings, and the Castle Wall panel - with a
  * persistent data-custody footer. CISO-first ordering: security and
  * data-sovereignty affordances lead; agent-welfare content is deliberately
  * absent from Home (it lives in the agent drill-down's secondary section).
@@ -21,7 +21,7 @@
  * The page authenticates via the same loopback/bearer model as the rest of the
  * dashboard. Every tile drills to evidence: counts link into the audit feed,
  * the wall panel exposes its evidence basis, reach links to the per-agent
- * reach endpoint. "Never fake green" is enforced in the renderer — the banner
+ * reach endpoint. "Never fake green" is enforced in the renderer - the banner
  * shows ARMED green only when `arm_state === "armed"`; `unknown` is amber and
  * `degraded` is red.
  *
@@ -103,7 +103,7 @@ export function featureHealthPill(status: FeatureHealthStatus): {
  * envelope MAC, anti-rollback epoch, pinned-key non-extraction) live under the
  * transient master at boot and are not re-derivable from the dashboard's
  * request-time view. So `unconfirmed` is amber (the honest default), `damaged`
- * is red (earned by fresh negative evidence), and there is no green branch — a
+ * is red (earned by fresh negative evidence), and there is no green branch - a
  * future edit that introduced one would fail a test.
  *
  * The client-side `custodyPill` below embeds the exact same mapping (the page is
@@ -132,7 +132,7 @@ export function renderPostureHomeHTML(): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sanctuary — Sovereignty Posture</title>
+<title>Sanctuary - Sovereignty Posture</title>
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
@@ -145,8 +145,16 @@ export function renderPostureHomeHTML(): string {
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
   header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  .header-row { display: flex; align-items: flex-start; gap: 16px; }
+  .header-row .header-titles { flex: 1; min-width: 0; }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
   .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .fleet-link {
+    flex: none; align-self: center; color: var(--accent); font-size: 13px;
+    padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); white-space: nowrap;
+  }
+  .fleet-link:hover { border-color: var(--accent); text-decoration: none; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
   .banner {
     display: flex; flex-wrap: wrap; gap: 14px; padding: 16px;
@@ -229,12 +237,17 @@ export function renderPostureHomeHTML(): string {
 </head>
 <body>
 <header>
-  <h1>Sanctuary — Sovereignty Posture</h1>
-  <div class="sub" id="origin">Loading…</div>
-  <div class="conn" id="conn">
-    <span class="dot"></span>
-    <span id="conn-label">Connecting…</span>
-    <span class="updated" id="conn-updated"></span>
+  <div class="header-row">
+    <div class="header-titles">
+      <h1>Sanctuary - Sovereignty Posture</h1>
+      <div class="sub" id="origin">Loading…</div>
+      <div class="conn" id="conn">
+        <span class="dot"></span>
+        <span id="conn-label">Connecting…</span>
+        <span class="updated" id="conn-updated"></span>
+      </div>
+    </div>
+    <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
   </div>
 </header>
 <main>
@@ -755,13 +768,13 @@ export function renderPostureHomeHTML(): string {
   function loadRecognitionOnce() { loadRecognition(0); }
 
   // ── Fleet roster (Fleet Console Slice 1) ────────────────────────────────
-  // A separate, federation-gated fetch (NOT on the home payload, so a fortress
-  // with no federation never receives any roster data). A 200 with
-  // available:true reveals the panel; a 404 (federation not wired) or
-  // available:false (not provisioned) keeps it hidden (honest absence), never a
-  // fabricated roster. Unlike Recognition, the fleet is RE-POLLED on a cadence so
-  // a revocation (a machine going from admitted -> revoked, or an unevaluable
-  // machine flipping to untrusted) shows up live on the board without a reload.
+  // A separate, federation-gated fetch for the full roster (the home payload
+  // carries only the tiny banner summary). A 200 with available:true reveals the
+  // panel; a 404 (federation not wired) or available:false (not provisioned)
+  // keeps it hidden (honest absence), never a fabricated roster. Unlike
+  // Recognition, the fleet is RE-POLLED on a cadence so a revocation (a machine
+  // going from admitted -> revoked, or an unevaluable machine flipping to
+  // untrusted) shows up live on the board without a reload.
   var FLEET_RETRY_MS = [1000, 2000, 4000, 8000, 15000, 30000];
   var FLEET_REFRESH_MS = 15000;
   var fleetRefreshTimer = null;
@@ -856,8 +869,20 @@ export function renderPostureHomeHTML(): string {
   function renderBanner(home, approvalState, anomalies) {
     var openAnomalies = (anomalies && anomalies.length) || 0;
     var pendingCount = (approvalState && approvalState.rows && approvalState.rows.length) || 0;
+    var federation = home && home.federation;
+    var originText = "Machine: " + home.origin_machine;
+    if (federation && federation.available) {
+      var fleetCount = Number(federation.fleet_node_count || 0);
+      if (federation.enabled) {
+        originText += " · federation: " + fleetCount + " machines";
+      } else {
+        originText += " · federation provisioned, disabled · " + fleetCount + " machines";
+      }
+    } else {
+      originText += " · single-machine view (federation off)";
+    }
     document.getElementById("origin").textContent =
-      "Machine: " + home.origin_machine + " · single-machine view (federation off)";
+      originText;
     document.getElementById("banner").innerHTML =
       // Honest split (#634): "protection requested" is policy intent; "enforcement
       // confirmed" is the observed-live count. Reporting only a flat "protected"
@@ -1149,6 +1174,84 @@ export function renderPostureHomeHTML(): string {
       : "This machine is not in good standing and is shown untrusted.";
   }
 
+  // Fleet-wide sync-health rollup (A1). LIVENESS only: it reports how many
+  // machines are currently in touch, NEVER a trust claim. It uses the muted reach
+  // vocabulary (not a green/red trust pill) so a reachable-but-revoked node can
+  // never read as "all well." Honest when nothing has ever synced.
+  function fleetSyncHealthLine(h) {
+    if (!h) return "";
+    var parts = [];
+    if (h.reachable) parts.push(esc(h.reachable) + " in touch");
+    if (h.stale) parts.push(esc(h.stale) + " no recent sync");
+    if (h.never) parts.push(esc(h.never) + " never synced");
+    var summary = parts.length ? parts.join(" · ") : "no sync activity yet";
+    var frontier = h.oldest_last_sync
+      ? " · oldest sync " + esc(h.oldest_last_sync)
+      : "";
+    return '<div class="evidence">Fleet reach (liveness, not trust): ' +
+      summary + frontier + "</div>";
+  }
+
+  // Signed-policy-distribution status (A2). Custody-state distribution only:
+  // hash/version markers from verified signed bundles, never raw policy
+  // contents. Unknown is never green.
+  function fleetPolicySummaryText(pd) {
+    if (!pd || pd.available !== true) return "policy unknown";
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
+      return "no operator policy";
+    }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
+    return "operator policy v" + policy.version +
+      " · " + summary.in_sync + " of " + total + " nodes in sync" +
+      " / " + summary.drifted + " drifted" +
+      " / " + summary.unknown + " unknown";
+  }
+
+  function fleetPolicyDistributionLine(pd) {
+    if (!pd || pd.available !== true) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
+        "Policy distribution status cannot be evaluated for this fleet.</div>";
+    }
+    var summary = pd.summary || { in_sync: 0, drifted: 0, unknown: 0 };
+    var policy = pd.operator_policy;
+    if (!policy || policy.version == null || !policy.hash || !policy.hash_algorithm) {
+      return '<div class="evidence">' +
+        '<span class="pill amber">policy unknown</span> &nbsp;' +
+        "No signed operator policy bundle is known yet. " +
+        "Nodes render policy drift as unknown until an operator policy hash is distributed.</div>";
+    }
+    var total = summary.in_sync + summary.drifted + summary.unknown;
+    return '<div class="evidence">' +
+      '<span class="pill">operator policy v' + esc(policy.version) + "</span> &nbsp;" +
+      esc(summary.in_sync) + " of " + esc(total) + " nodes in sync" +
+      " / " + esc(summary.drifted) + " drifted" +
+      " / " + esc(summary.unknown) + " unknown" +
+      " · hash " + esc(policy.hash_algorithm) + ":" + esc(policy.hash) + "</div>";
+  }
+
+  function fleetPolicyPill(state) {
+    if (state === "in_sync") return '<span class="pill green">policy in sync</span>';
+    if (state === "drifted") return '<span class="pill red">policy drifted</span>';
+    return '<span class="pill amber">policy unknown</span>';
+  }
+
+  function fleetPolicyEvidence(policy) {
+    if (!policy || policy.version == null) {
+      return "applied policy unknown";
+    }
+    var base = "applied policy v" + policy.version;
+    if (policy.hash && policy.hash_algorithm) {
+      base += " hash " + policy.hash_algorithm + ":" + policy.hash;
+    } else {
+      base += " hash unknown";
+    }
+    if (policy.applied_at) base += " applied " + policy.applied_at;
+    return base;
+  }
+
   function renderFleet(roster) {
     var section = document.getElementById("fleet-section");
     var el = document.getElementById("fleet");
@@ -1167,13 +1270,16 @@ export function renderPostureHomeHTML(): string {
       if (s.admitted) parts.push(esc(s.admitted) + " admitted");
       if (s.revoked) parts.push(esc(s.revoked) + " revoked");
       if (s.untrusted) parts.push(esc(s.untrusted) + " untrusted");
+      parts.push(fleetPolicySummaryText(roster.policy_distribution));
       summaryEl.textContent = parts.join(" · ");
     }
     var head =
       '<div class="evidence">Fleet ' + (roster.enabled ? "on" : "off") +
       " · this machine <code>" + esc(roster.node_id) + "</code>" +
       " · fortress <code>" + esc(roster.fortress_id) + "</code>" +
-      " · eviction serial " + esc(roster.eviction_serial) + "</div>";
+      " · eviction serial " + esc(roster.eviction_serial) + "</div>" +
+      fleetSyncHealthLine(roster.sync_health) +
+      fleetPolicyDistributionLine(roster.policy_distribution);
     var nodes = roster.nodes || [];
     if (!nodes.length) {
       el.innerHTML = head +
@@ -1186,11 +1292,13 @@ export function renderPostureHomeHTML(): string {
         : "";
       return '<div class="story-line">' +
         fleetTrustPill(n.trust_state) + " &nbsp;" +
+        fleetPolicyPill(n.policy && n.policy.drift_state) + " &nbsp;" +
         "<code>" + esc(n.node_id) + "</code>" +
         (n.label ? " (" + esc(n.label) + ")" : "") +
         " &nbsp;" + fleetReachLabel(n.reach) +
         '<div class="evidence">' + esc(fleetTrustWhy(n)) +
         " · mode " + esc(n.node_mode) + modeNote +
+        " · " + esc(fleetPolicyEvidence(n.policy)) +
         (n.last_sync_received_at
           ? " · last sync " + esc(n.last_sync_received_at)
           : " · no sync received") +
@@ -1227,7 +1335,7 @@ export function renderPostureHomeHTML(): string {
             : " (channel-authenticated + tamper-evident chain; per-producer signing not available on this reader)") +
           "</div>"
         : "") +
-      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present — arm-state read may be incomplete.</div>');
+      (w.audit_integrity_ok ? "" : '<div class="err">Audit integrity finding present - arm-state read may be incomplete.</div>');
   }
 
   // ── Render the whole board from one honest home payload ─────────────────

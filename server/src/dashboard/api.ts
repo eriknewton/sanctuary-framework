@@ -154,7 +154,7 @@ export function isAuthorized(deps: APIDeps, req: IncomingMessage, url: URL): boo
 }
 
 function isAuthorizedWithBearerToken(deps: APIDeps, req: IncomingMessage, url: URL): boolean {
-  if (!deps.authToken) return true;
+  if (!deps.authToken) return false;
   const token = extractToken(req, url);
   return token !== null && constantTimeEquals(token, deps.authToken);
 }
@@ -369,7 +369,10 @@ export async function handleRequest(
 
   // ── Auth (all routes) ───────────────────────────────────────────────
   const isFoldedReadAuxiliary =
-    method === "GET" && (path === "/api/status" || path === "/api/pending");
+    method === "GET" &&
+    (path === "/api/status" ||
+      path === "/api/pending" ||
+      path === "/api/stream");
   const authorized = isFoldedReadAuxiliary
     ? isAuthorizedForRead(deps, req, url)
     : isAuthorized(deps, req, url);
@@ -426,7 +429,7 @@ export async function handleRequest(
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")
   ) {
     const snapshot = await getProtectionSnapshot(deps.sources);
-    const html = renderDashboardHTML({ snapshot, authToken: deps.authToken });
+    const html = renderDashboardHTML({ snapshot });
     writeText(res, 200, html, "text/html; charset=utf-8");
     return true;
   }
@@ -510,8 +513,21 @@ export async function handleRequest(
   }
 
   // ── Template init (POST) ───────────────────────────────────────────
+  // SECURITY (templates-init-operator-bearer): template init AUTHORS and
+  // Ed25519-SIGNS a governance policy event for an agent, a custody-class
+  // mutation, the same trust level as an approval decision. It MUST require
+  // the operator bearer token (fail-closed: no token configured => reject),
+  // matching the `/api/approvals/:id/:action` gate above. The shared
+  // `isAuthorized` gate at the top of this handler fail-OPENS when no token
+  // is configured and honors loopback auto-auth, neither of which is
+  // acceptable for a mutation: a co-resident wrapped agent shares loopback
+  // with the operator, so loopback origin is NOT operator identity.
   const initMatch = /^\/api\/templates\/([^/]+)\/init$/.exec(path);
   if (method === "POST" && initMatch) {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
     const name = decodeURIComponent(initMatch[1]!);
     try {
       // Validate template exists

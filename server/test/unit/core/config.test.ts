@@ -30,6 +30,7 @@ describe("loadConfig", () => {
     delete process.env.SANCTUARY_DASHBOARD_PORT;
     delete process.env.SANCTUARY_DASHBOARD_HOST;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
     delete process.env.SANCTUARY_WEBHOOK_ENABLED;
     delete process.env.SANCTUARY_STORAGE_PATH;
     delete process.env.SANCTUARY_TRANSPORT;
@@ -85,6 +86,39 @@ describe("loadConfig", () => {
       const config = await loadConfig(configFile);
 
       expect(config.dashboard.port).toBe(4000);
+    });
+
+    it("env var SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE overrides file value", async () => {
+      const configFile = join(tempDir, "sanctuary.json");
+      await writeFile(configFile, JSON.stringify({
+        ...defaultConfig(),
+        dashboard: {
+          enabled: true,
+          port: 3501,
+          host: "0.0.0.0",
+          allow_plaintext_remote: false,
+        },
+      }));
+
+      process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
+      const config = await loadConfig(configFile);
+
+      expect(config.dashboard.allow_plaintext_remote).toBe(true);
+    });
+
+    it("rejects non-boolean dashboard.allow_plaintext_remote config values", async () => {
+      const configFile = join(tempDir, "sanctuary.json");
+      await writeFile(configFile, JSON.stringify({
+        ...defaultConfig(),
+        dashboard: {
+          enabled: true,
+          port: 3501,
+          host: "0.0.0.0",
+          allow_plaintext_remote: "false",
+        },
+      }));
+
+      await expect(loadConfig(configFile)).rejects.toThrow(/dashboard\.allow_plaintext_remote/);
     });
 
     it("env var SANCTUARY_WEBHOOK_ENABLED=true overrides file webhook.enabled=false", async () => {

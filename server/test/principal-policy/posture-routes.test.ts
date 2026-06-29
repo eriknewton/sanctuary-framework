@@ -677,11 +677,37 @@ describe("GET /api/posture/fleet — Fleet Console Slice 1 route", () => {
           node_mode: "local",
           provider_in_trust_boundary: false,
           last_sync_received_at: "2026-06-24T11:59:00.000Z",
+          policy: {
+            version: 7,
+            hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hash_algorithm: "sha256-base64url",
+            applied_at: "2026-06-24T11:59:00.000Z",
+            source_event_id: "operator:fortress:test:7",
+            drift_state: "in_sync",
+          },
           first_seen: "2026-06-24T11:00:00.000Z",
           last_seen: "2026-06-24T11:59:00.000Z",
         },
       ],
       summary: { total: 1, admitted: 1, revoked: 0, untrusted: 0 },
+      sync_health: {
+        reachable: 1,
+        stale: 0,
+        never: 0,
+        oldest_last_sync: "2026-06-24T11:59:00.000Z",
+        freshness_window_ms: 300_000,
+      },
+      policy_distribution: {
+        available: true,
+        operator_policy: {
+          version: 7,
+          hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          hash_algorithm: "sha256-base64url",
+          applied_at: "2026-06-24T11:58:00.000Z",
+          source_event_id: "operator:fortress:test:7",
+        },
+        summary: { in_sync: 1, drifted: 0, unknown: 0 },
+      },
     };
   }
 
@@ -708,6 +734,11 @@ describe("GET /api/posture/fleet — Fleet Console Slice 1 route", () => {
       ["node-1", "admitted"],
     ]);
     expect(body.summary).toEqual({ total: 1, admitted: 1, revoked: 0, untrusted: 0 });
+    expect(body.policy_distribution.summary).toEqual({
+      in_sync: 1,
+      drifted: 0,
+      unknown: 0,
+    });
   });
 
   it("503s when the audit log is locked (same fail-closed gate as the other panels)", async () => {

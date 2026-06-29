@@ -141,6 +141,12 @@ export interface WrapOptions {
    * setups starting above 3510.
    */
   port?: number;
+  /**
+   * Persist the plaintext-remote dashboard opt-in into the wrapped harness
+   * environment. The approval channel still refuses by default unless this
+   * reaches the later MCP boot path.
+   */
+  allowPlaintextRemote?: boolean;
   /** Preview changes without writing. */
   dryRun?: boolean;
   /** Suppress auto-open of the browser. */
@@ -270,6 +276,12 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
   }
   if (process.env.SANCTUARY_DASHBOARD_ENABLED) {
     sanctuaryEnv.SANCTUARY_DASHBOARD_ENABLED = process.env.SANCTUARY_DASHBOARD_ENABLED;
+  }
+  if (options.allowPlaintextRemote) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE = "true";
+  } else if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE) {
+    sanctuaryEnv.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE =
+      process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
   }
   if (options.fortress) {
     sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(options.fortress);
@@ -2376,6 +2388,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--dry-run",
   "--no-open",
   "--no-dashboard",
+  "--allow-plaintext-remote",
   "--anchor-transparency",
   "--help",
   "-h",
@@ -2471,6 +2484,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--no-dashboard":
         options.noDashboard = true;
         break;
+      case "--allow-plaintext-remote":
+        options.allowPlaintextRemote = true;
+        break;
       case "--anchor-transparency":
         options.anchorTransparency = true;
         break;
@@ -2533,6 +2549,10 @@ function printWrapHelp(): void {
                        \`sanctuary dashboard\` (or a later wrap) sees the
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
+    --allow-plaintext-remote
+                       Persist SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE=true
+                       into the wrapped harness environment. Use only when a
+                       separate network layer already encrypts transport.
     --anchor-transparency
                        Opt in to transparency anchoring at setup (OFF by
                        default). Publishes a salted hash commitment of each

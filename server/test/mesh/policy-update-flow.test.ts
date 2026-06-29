@@ -1,5 +1,5 @@
 /**
- * Sanctuary Federation Protocol v0.1 — Policy Update Flow (real-shape integration)
+ * Sanctuary Federation Protocol v0.1 - Policy Update Flow (real-shape integration)
  *
  * End-to-end test of one v0.1 message class (policy_update) over the in-memory
  * transport. Exercises: emitter pack → canonical bytes on wire → receiver
@@ -81,7 +81,7 @@ function addNode(f: Fortress, label: string, mode: "local" | "operator_cloud" | 
   return { id, keypair, cert };
 }
 
-describe("mesh — policy_update distributed across three-mode mesh (§12 criterion 3 shape)", () => {
+describe("mesh - policy_update distributed across three-mode mesh (§12 criterion 3 shape)", () => {
   it("policy_update signed on console node is verified + dispatched on two peer nodes", async () => {
     const fortress = buildFortress();
     // Console / canonical-audit node runs in local mode.
@@ -141,6 +141,8 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     const payload: PolicyUpdatePayload = {
       agent_id: "governed-harness-a",
       policy_version: 1,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "compiled-policy-bytes-v1",
     };
     const evt = packSignedEvent<PolicyUpdatePayload>({
@@ -165,6 +167,8 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     const payload2: PolicyUpdatePayload = {
       agent_id: "governed-harness-a",
       policy_version: 2,
+      valid_from: "2026-06-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
       policy_blob: "compiled-policy-bytes-v2",
       parent_version: 1,
     };
@@ -200,7 +204,7 @@ describe("mesh — policy_update distributed across three-mode mesh (§12 criter
     };
 
     // Hand-forge a v1.x-era event in the reserved namespace. (packSignedEvent
-    // refuses to emit it per hard gate, so we build it manually — simulating
+    // refuses to emit it per hard gate, so we build it manually - simulating
     // a v1.x emitter sending into a v0.1 mesh.)
     const { canonicalizeToBytes } = await import(
       "../../src/mesh/canonical-json.js"

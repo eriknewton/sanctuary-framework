@@ -15,6 +15,7 @@
 import { join } from "node:path";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import type {
+  AnomalyAction,
   PrincipalPolicy,
   Tier2Config,
   ApprovalChannelConfig,
@@ -36,11 +37,11 @@ const DEFAULT_CHANNEL: ApprovalChannelConfig = {
   type: "stderr",
   timeout_seconds: 300,
   // SEC-002: auto_deny is not configurable. Timeout always denies.
-  // Field omitted intentionally — all channels hardcode deny on timeout.
+  // Field omitted intentionally - all channels hardcode deny on timeout.
 };
 
 /**
- * Default approval-redirect config. Off by default — preserves the legacy
+ * Default approval-redirect config. Off by default - preserves the legacy
  * one-channel-per-fortress behavior so existing operators see no change
  * until they explicitly opt in.
  */
@@ -65,12 +66,12 @@ const RAW_IDENTITY_SIGN_OPERATION = "identity_sign";
  * - context_gate_set_policy / context_gate_apply_template: policy-adjacent
  *   enforcement mutations must not be silently agent-auto-allowed.
  * - audit_export_siem: bulk-exports decrypted audit events across all
- *   principals, each carrying its policy tier and approve/deny decision — a
+ *   principals, each carrying its policy tier and approve/deny decision - a
  *   policy-inference oracle for the agent (no-read invariant). SIEM forwarding
  *   is an operator function, so it must require operator approval. (CISO MED-1.)
  * - compliance_generate_eu_ai_act_bundle: the generated bundle body embeds the
  *   verbatim Tier-2 anomaly policy (e.g. frequency_spike_multiplier), the
- *   approval-channel timeout, and audit-derived aggregate gate-decision counts —
+ *   approval-channel timeout, and audit-derived aggregate gate-decision counts -
  *   the same policy-inference leak class as audit_export_siem, through a
  *   different door (no-read invariant). It is also a governance conflict of
  *   interest: an agent must not self-generate its own compliance attestation.
@@ -120,7 +121,7 @@ const FORCED_TIER1_OPERATIONS = [
  *
  * Without this on the mutation path, an activated draft could drop a
  * forced-Tier-1 op out of Tier 1 (a tier1_remove_operation) or smuggle one
- * into Tier 3 (a tier3_add_operation) — a silent enforcement downgrade
+ * into Tier 3 (a tier3_add_operation) - a silent enforcement downgrade
  * (Hard Constraint #5: never silently degrade; #7: policy integrity).
  *
  * Behavior, applied to the policy AS GIVEN (does NOT re-merge defaults):
@@ -150,19 +151,255 @@ export function enforceForcedTiers(policy: PrincipalPolicy): PrincipalPolicy {
   };
 }
 
+export type PrincipalPolicyDowngradeReason =
+  | "policy_version_rollback"
+  | "operation_tier_downgrade"
+  | "tier2_action_downgrade"
+  | "tier2_threshold_increase"
+  | "approval_redirect_disabled"
+  | "approval_redirect_mode_downgrade"
+  | "approval_channel_type_changed"
+  | "approval_channel_timeout_increase"
+  | "approval_webhook_target_changed"
+  | "approval_webhook_secret_weakened";
+
+export interface PrincipalPolicyDowngrade {
+  field: string;
+  reason: PrincipalPolicyDowngradeReason;
+  previous: unknown;
+  next: unknown;
+}
+
+export class PrincipalPolicyDowngradeError extends Error {
+  constructor(public readonly downgrades: PrincipalPolicyDowngrade[]) {
+    super(
+      "Principal Policy downgrade refused: " +
+        downgrades
+          .map((d) => `${d.field} (${d.reason})`)
+          .join(", ")
+    );
+    this.name = "PrincipalPolicyDowngradeError";
+  }
+}
+
+export function assertNoPrincipalPolicyDowngrade(
+  previous: PrincipalPolicy,
+  next: PrincipalPolicy
+): void {
+  const downgrades = detectPrincipalPolicyDowngrades(previous, next);
+  if (downgrades.length > 0) {
+    throw new PrincipalPolicyDowngradeError(downgrades);
+  }
+}
+
+export function detectPrincipalPolicyDowngrades(
+  previous: PrincipalPolicy,
+  next: PrincipalPolicy
+): PrincipalPolicyDowngrade[] {
+  const downgrades: PrincipalPolicyDowngrade[] = [];
+  if (next.version < previous.version) {
+    downgrades.push({
+      field: "version",
+      reason: "policy_version_rollback",
+      previous: previous.version,
+      next: next.version,
+    });
+  }
+
+  for (const op of policyOperationUniverse(previous, next)) {
+    const previousTier = operationTier(previous, op);
+    const nextTier = operationTier(next, op);
+    if (nextTier.rank < previousTier.rank) {
+      downgrades.push({
+        field: `operation.${op}`,
+        reason: "operation_tier_downgrade",
+        previous: previousTier.label,
+        next: nextTier.label,
+      });
+    }
+  }
+
+  for (const field of tier2ActionFields) {
+    const previousAction = previous.tier2_anomaly[field];
+    const nextAction = next.tier2_anomaly[field];
+    if (anomalyActionRank(nextAction) < anomalyActionRank(previousAction)) {
+      downgrades.push({
+        field: `tier2_anomaly.${field}`,
+        reason: "tier2_action_downgrade",
+        previous: previousAction,
+        next: nextAction,
+      });
+    }
+  }
+
+  for (const field of tier2ThresholdFields) {
+    const previousThreshold = previous.tier2_anomaly[field];
+    const nextThreshold = next.tier2_anomaly[field];
+    if (nextThreshold > previousThreshold) {
+      downgrades.push({
+        field: `tier2_anomaly.${field}`,
+        reason: "tier2_threshold_increase",
+        previous: previousThreshold,
+        next: nextThreshold,
+      });
+    }
+  }
+
+  if (
+    previous.approval_redirect?.enabled === true &&
+    next.approval_redirect?.enabled !== true
+  ) {
+    downgrades.push({
+      field: "approval_redirect.enabled",
+      reason: "approval_redirect_disabled",
+      previous: true,
+      next: next.approval_redirect?.enabled ?? false,
+    });
+  }
+
+  if (
+    previous.approval_redirect?.enabled === true &&
+    next.approval_redirect?.enabled === true &&
+    previous.approval_redirect.mode === "replace" &&
+    next.approval_redirect.mode !== "replace"
+  ) {
+    downgrades.push({
+      field: "approval_redirect.mode",
+      reason: "approval_redirect_mode_downgrade",
+      previous: previous.approval_redirect.mode,
+      next: next.approval_redirect.mode,
+    });
+  }
+
+  if (previous.approval_channel.type !== next.approval_channel.type) {
+    downgrades.push({
+      field: "approval_channel.type",
+      reason: "approval_channel_type_changed",
+      previous: previous.approval_channel.type,
+      next: next.approval_channel.type,
+    });
+  }
+
+  const previousTimeout = previous.approval_channel.timeout_seconds;
+  const nextTimeout = next.approval_channel.timeout_seconds;
+  if (
+    !Number.isFinite(previousTimeout) ||
+    !Number.isFinite(nextTimeout) ||
+    nextTimeout > previousTimeout
+  ) {
+    downgrades.push({
+      field: "approval_channel.timeout_seconds",
+      reason: "approval_channel_timeout_increase",
+      previous: previousTimeout,
+      next: nextTimeout,
+    });
+  }
+
+  const previousWebhookUrl = normalizedOptionalSecret(
+    previous.approval_channel.webhook_url,
+  );
+  const nextWebhookUrl = normalizedOptionalSecret(
+    next.approval_channel.webhook_url,
+  );
+  if (previousWebhookUrl !== null && nextWebhookUrl !== previousWebhookUrl) {
+    downgrades.push({
+      field: "approval_channel.webhook_url",
+      reason: "approval_webhook_target_changed",
+      previous: "configured",
+      next: nextWebhookUrl === null ? null : "changed",
+    });
+  }
+
+  const previousWebhookSecret = normalizedOptionalSecret(
+    previous.approval_channel.webhook_secret,
+  );
+  const nextWebhookSecret = normalizedOptionalSecret(
+    next.approval_channel.webhook_secret,
+  );
+  if (
+    previousWebhookSecret !== null &&
+    nextWebhookSecret !== previousWebhookSecret
+  ) {
+    downgrades.push({
+      field: "approval_channel.webhook_secret",
+      reason: "approval_webhook_secret_weakened",
+      previous: "configured",
+      next: nextWebhookSecret === null ? null : "changed",
+    });
+  }
+
+  return downgrades;
+}
+
+const tier2ActionFields = [
+  "new_namespace_access",
+  "new_counterparty",
+  "first_session_policy",
+] as const;
+
+const tier2ThresholdFields = [
+  "frequency_spike_multiplier",
+  "max_signs_per_minute",
+  "bulk_read_threshold",
+] as const;
+
+function policyOperationUniverse(
+  previous: PrincipalPolicy,
+  next: PrincipalPolicy
+): string[] {
+  return [
+    ...new Set([
+      ...previous.tier1_always_approve,
+      ...previous.tier3_always_allow,
+      ...next.tier1_always_approve,
+      ...next.tier3_always_allow,
+    ]),
+  ];
+}
+
+function operationTier(
+  policy: PrincipalPolicy,
+  operation: string
+): { rank: number; label: "tier1" | "tier2" | "tier3" } {
+  if (policy.tier3_always_allow.includes(operation)) {
+    return { rank: 1, label: "tier3" };
+  }
+  if (policy.tier1_always_approve.includes(operation)) {
+    return { rank: 3, label: "tier1" };
+  }
+  return { rank: 2, label: "tier2" };
+}
+
+function anomalyActionRank(action: AnomalyAction): number {
+  switch (action) {
+    case "allow":
+      return 1;
+    case "log":
+      return 2;
+    case "approve":
+      return 3;
+  }
+}
+
+function normalizedOptionalSecret(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
 /**
  * HABEAS PORT (agent-side sovereignty, ratified 2026-06-12): operations that
  * MUST always be allowed (Tier 3, audit-only) and may NEVER be gated behind
  * Tier 1 approval. The distress channel is the agent's guaranteed lane to
  * signal "I am in distress"; an approval gate in front of it would let the
  * approval channel (or its absence) silence distress. A policy that lists
- * one of these under tier1_always_approve is REJECTED with a clear error —
- * not silently pruned — so the operator sees the attempted override instead
+ * one of these under tier1_always_approve is REJECTED with a clear error -
+ * not silently pruned - so the operator sees the attempted override instead
  * of believing it took effect.
  */
 export const FORCED_TIER3_OPERATIONS = ["sanctuary_distress"] as const;
 
-/** Default Principal Policy — provides meaningful protection without configuration */
+/** Default Principal Policy - provides meaningful protection without configuration */
 export const DEFAULT_POLICY: PrincipalPolicy = {
   version: 1,
   tier1_always_approve: [
@@ -175,10 +412,10 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_export",
     "bootstrap_provide_guarantee",
     "decommission_certificate",
-    "sovereignty_profile_update", // Changes enforcement behavior — always requires approval
-    "governor_reset", // Clears all runtime governance state — always requires approval
-    "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes — always requires approval
-    "sanctuary_export_identity_bundle", // Exports portable identity — always requires approval
+    "sovereignty_profile_update", // Changes enforcement behavior - always requires approval
+    "governor_reset", // Clears all runtime governance state - always requires approval
+    "sanctuary_bootstrap", // Creates new Ed25519 identity + publishes - always requires approval
+    "sanctuary_export_identity_bundle", // Exports portable identity - always requires approval
     "exit_bundle_export", // Complete portability bundle export. Always requires approval.
     "exit_bundle_import", // External durable-record import. Always requires approval.
     "exit_bundle_import_activate", // Activates imported material. Always requires approval.
@@ -196,8 +433,8 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_policy_status", // Reads Principal Policy status; always requires approval.
     "context_gate_set_policy", // Policy-adjacent enforcement mutation; always requires approval.
     "context_gate_apply_template", // Policy-adjacent enforcement mutation; always requires approval.
-    "audit_export_siem", // Bulk audit export (per-op tier+decision across all principals); operator-only — prevents agent policy-inference (CISO MED-1).
-    "compliance_generate_eu_ai_act_bundle", // Bundle body embeds verbatim Tier-2 thresholds + approval timeout + audit-derived aggregates; operator-only — prevents agent policy-inference + self-attestation (CISO NEW-1).
+    "audit_export_siem", // Bulk audit export (per-op tier+decision across all principals); operator-only - prevents agent policy-inference (CISO MED-1).
+    "compliance_generate_eu_ai_act_bundle", // Bundle body embeds verbatim Tier-2 thresholds + approval timeout + audit-derived aggregates; operator-only - prevents agent policy-inference + self-attestation (CISO NEW-1).
     // WP-MVP-2 Operator Console: federation-node-join requires explicit
     // operator confirmation per Key 8. No auto-approve path. The console's
     // JoinApprover drives this gate via `MeshConsoleClient.makeJoinApprover`.
@@ -280,14 +517,14 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sovereignty_profile_generate_prompt", // Agent needs its own config to generate system prompt
     "governor_status",
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
-    "identity_set_primary", // One-time set, persists via _meta storage — safe at Tier 3
-    "memory_attest", // Read-only audit attestation — records that a memory op happened
+    "identity_set_primary", // One-time set, persists via _meta storage - safe at Tier 3
+    "memory_attest", // Read-only audit attestation - records that a memory op happened
     // compliance_generate_eu_ai_act_bundle re-tiered Tier-3 → Tier-1 (CISO NEW-1):
     // its bundle body emits verbatim Tier-2 thresholds + the approval timeout +
     // audit-derived aggregates, a policy-inference oracle for the agent, and an
     // agent self-generating its own compliance attestation is a conflict of
     // interest. See FORCED_TIER1_OPERATIONS + tier1_always_approve above.
-    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier — stays Tier 3 (no policy thresholds in its output)
+    "compliance_eu_ai_act_annex_iii_classify", // Read-only; rule-based Annex III classifier - stays Tier 3 (no policy thresholds in its output)
     "sanctuary_remember",
     "sanctuary_recall",
     "sanctuary_hide",
@@ -298,7 +535,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_events_read",
     "sanctuary_events_close",
     "sanctuary_audit_search",
-    "sanctuary_distress", // HABEAS PORT: guaranteed distress lane — always allowed, always audited
+    "sanctuary_distress", // HABEAS PORT: guaranteed distress lane - always allowed, always audited
   ],
   approval_channel: DEFAULT_CHANNEL,
   approval_redirect: DEFAULT_APPROVAL_REDIRECT,
@@ -424,14 +661,14 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
 
   // HABEAS PORT: a policy that tries to gate a forced-Tier-3 operation
   // (the distress channel) behind approval is rejected outright with a
-  // clear error. Rejecting — rather than silently pruning — keeps the
+  // clear error. Rejecting - rather than silently pruning - keeps the
   // operator's mental model honest: the override did NOT take effect.
   const rawTier1 = raw.tier1_always_approve as string[];
   for (const op of FORCED_TIER3_OPERATIONS) {
     if (rawTier1.includes(op)) {
       throw new Error(
         `Policy rejected: "${op}" cannot be placed under tier1_always_approve. ` +
-          "It is the reserved habeas distress channel — always allowed, always " +
+          "It is the reserved habeas distress channel - always allowed, always " +
           "audited, never gated. Remove it from tier1_always_approve."
       );
     }
@@ -441,7 +678,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
   // This ensures upgrades automatically include new read-only tools
   // without requiring operators to manually edit their policy file. The
   // forced-Tier invariants (force-add to Tier 1, prune from Tier 3, ensure
-  // forced-Tier-3) are applied by enforceForcedTiers below — the SINGLE
+  // forced-Tier-3) are applied by enforceForcedTiers below - the SINGLE
   // source shared with the policy-mutation path so both can never drift.
   const userTier3 = (raw.tier3_always_allow as string[]) ?? [];
   const mergedTier3Pre = [
@@ -462,7 +699,7 @@ function validatePolicy(raw: Record<string, unknown>): PrincipalPolicy {
         ...((raw.approval_channel as Record<string, unknown>) ?? {}),
       } as ApprovalChannelConfig;
       // SEC-002: Strip auto_deny from user-supplied policy.
-      // Timeout always denies — this is not configurable.
+      // Timeout always denies - this is not configurable.
       delete merged.auto_deny;
       return merged;
     })(),
@@ -498,7 +735,7 @@ function parseApprovalRedirect(raw: unknown): ApprovalRedirectConfig {
   }
   const result: ApprovalRedirectConfig = { enabled, mode };
   // per_agent is reserved for v1.4. Accept and persist if present, but do
-  // not validate per-key shape — v1.x ignores the contents.
+  // not validate per-key shape - v1.x ignores the contents.
   if (obj.per_agent !== undefined && typeof obj.per_agent === "object" && obj.per_agent !== null) {
     result.per_agent = obj.per_agent as Record<string, never>;
   }

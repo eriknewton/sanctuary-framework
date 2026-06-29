@@ -107,17 +107,26 @@ import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
+import {
+  erc8004RpcDestination,
+  type Erc8004RegistryEgressGate,
+} from "./key-17/erc8004-registry-confirm.js";
 import { DefaultPolicyGate } from "./key-17/policy-gate.js";
+import { evaluateEgressGate } from "./policy-engine/egress-gate.js";
+import { buildNullPolicy } from "./policy-engine/null-policy.js";
 import {
   establishMaster,
   checkCastlePinCustody,
   readEnvelopeEpoch,
 } from "./core/master-custody.js";
+import { decrypt } from "./core/encryption.js";
+import { derivePurposeKey } from "./core/key-derivation.js";
 import {
   observeWitnessEpoch,
   evaluateAndEnforceRollback,
   evaluateAndEnforceRekorCounterFloor,
 } from "./core/anti-rollback.js";
+import { crossCheckConfigBaseline } from "./core/config-baseline.js";
 import {
   readCustodyEpochCount,
   probeAuditHeadAnchor,
@@ -335,6 +344,34 @@ export async function createSanctuaryServer(options?: {
         (err instanceof Error ? err.message : String(err))
     );
   }
+
+  // 5rc. Config-security-baseline cross-check (the custody-MAC config-downgrade
+  // gate; replaces #791's forgeable adjacent `.security-baseline.json`). The
+  // baseline is authenticated with a MAC keyed by the master key, so forging it
+  // requires the master key the on-host attacker lacks. This MUST run AFTER the
+  // master key is established (loadConfig at step 1 has no key, so the check
+  // cannot live there); it is adjacent to the 5rb/5rb2 anti-rollback checks.
+  //
+  // Unlike anti-rollback (which never refuses boot), this gate FAILS CLOSED and
+  // REFUSES boot on a detected downgrade OR any baseline authentication anomaly
+  // (tampered MAC, stripped marker, unparseable, schema mismatch). Refusing is
+  // correct here: a weakened/forged security posture is exactly what Sanctuary
+  // invariant #5 forbids us from silently accepting. A genuine first run (no
+  // prior baseline) seeds the current posture (the only accept path).
+  const configBaselineOutcome = await crossCheckConfigBaseline({
+    storage,
+    master: masterKey,
+    config,
+  });
+  await auditLog.appendCritical({
+    layer: "l2",
+    operation: "config_security_baseline_checked",
+    identity_id: fortressIdFromStoragePath(config.storage_path),
+    result: "success",
+    details: {
+      outcome: configBaselineOutcome.kind,
+    },
+  });
 
   // 5pre. Custody audit trail: record envelope creation/migration (never key
   // material — wrap types and install mode only), and surface the dual-path
@@ -889,6 +926,7 @@ export async function createSanctuaryServer(options?: {
       auth_token: authToken,
       tls: config.dashboard.tls,
       auto_open: config.dashboard.auto_open,
+      allow_plaintext_remote: config.dashboard.allow_plaintext_remote,
     });
     dashboard.setDependencies({
       policy,
@@ -1428,14 +1466,85 @@ export async function createSanctuaryServer(options?: {
     fortressId: fortressIdForAggregator,
   });
 
-  // 16b-read. ERC-8004 Identity OFFLINE verifier (read side). Fully local:
-  // verifies a presented record's signature/shape with NO outbound surface and
-  // no on-chain read. On-chain registry confirmation is a deferred follow-up
-  // (must reuse Verascore's real ERC-8004 ABI), not shipped here.
+  const erc8004RegistryEgressGate: Erc8004RegistryEgressGate = (req) => {
+    const registryConfig = config.erc8004.registry_confirmation;
+    const configuredDestination = erc8004RpcDestination(registryConfig.rpc_url);
+    if (!registryConfig.enabled || !configuredDestination) {
+      return {
+        decision: "deny",
+        reason_code: "egress_rpc_not_configured",
+        explanation: "ERC-8004 registry confirmation RPC is not enabled/configured",
+      };
+    }
+    if (req.destination !== configuredDestination) {
+      return {
+        decision: "deny",
+        reason_code: "egress_destination_denied",
+        explanation: "ERC-8004 registry confirmation RPC destination is not allowlisted",
+      };
+    }
+
+    const identity = identityManager.getDefault();
+    if (!identity) {
+      return {
+        decision: "deny",
+        reason_code: "egress_gate_identity_unavailable",
+        explanation: "No primary identity is available to sign the egress gate receipt",
+      };
+    }
+
+    const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+    const nodeSigningKey = decrypt(
+      identity.encrypted_private_key,
+      identityEncryptionKey,
+    );
+    try {
+      const gatePolicy = buildNullPolicy({
+        agent_id: aggregatorIdentityId,
+        fortress_id: fortressIdForAggregator,
+      });
+      gatePolicy.policy_version = 1;
+      gatePolicy.source_english =
+        "ERC-8004 registry confirmation may POST only to the operator-configured RPC destination.";
+      gatePolicy.egress = {
+        allowlist: [{ destination: configuredDestination, methods: ["POST"] }],
+      };
+
+      const gateResult = evaluateEgressGate(
+        {
+          policy: gatePolicy,
+          nodeSigningKey,
+          nodeId: identity.identity_id,
+          fortressId: fortressIdForAggregator,
+        },
+        {
+          agent_id: aggregatorIdentityId,
+          destination: req.destination,
+          method: req.method,
+        },
+      );
+
+      return {
+        decision: gateResult.decision === "allow" ? "allow" : "deny",
+        reason_code: gateResult.reason_code,
+        explanation: gateResult.explanation,
+      };
+    } finally {
+      nodeSigningKey.fill(0);
+      identityEncryptionKey.fill(0);
+    }
+  };
+
+  // 16b-read. ERC-8004 Identity verifier (read side). Default is fully local:
+  // verifies a presented record's signature/shape with NO outbound surface. If
+  // the operator enables registry confirmation and sets an RPC endpoint, it
+  // performs a gated Verascore-derived ownerOf read and reports it separately.
   const { tools: erc8004ResolveTools } = createErc8004ResolveTools({
     auditLog,
     identityId: aggregatorIdentityId,
     fortressId: fortressIdForAggregator,
+    registryConfirmation: config.erc8004.registry_confirmation,
+    egressGate: erc8004RegistryEgressGate,
   });
 
   const { tools: agentNativeTools } = createAgentNativeCooperativeTools({

@@ -91,7 +91,7 @@ const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
  * is world-readable; embedding either of these would leak the master secret
  * to every local user (hard constraint #6 adjacent).
  */
-const FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
 
 export interface ExecFileResult {
   code: number;

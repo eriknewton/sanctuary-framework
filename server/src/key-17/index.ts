@@ -33,6 +33,20 @@ export {
 } from "./erc8004-resolve.js";
 
 export {
+  confirmErc8004RegistryOwner,
+  erc8004IdentityRegistryOwnerOfAbi,
+  erc8004RpcDestination,
+  type Erc8004RegistryConfirmation,
+  type Erc8004RegistryConfirmationConfig,
+  type Erc8004RegistryConfirmationDeps,
+  type Erc8004RegistryConfirmationInput,
+  type Erc8004RegistryEgressDecision,
+  type Erc8004RegistryEgressGate,
+  type Erc8004RegistryEgressRequest,
+  type Erc8004RegistryFetch,
+} from "./erc8004-registry-confirm.js";
+
+export {
   signAp2Mandate,
   verifyAp2Mandate,
   deriveAp2Key,

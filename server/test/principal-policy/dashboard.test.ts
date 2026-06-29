@@ -71,6 +71,40 @@ describe("Principal Dashboard", () => {
   let dashboard: DashboardApprovalChannel;
   let port: number;
 
+  const DECISION_TEST_TOKEN = "decision-test-token-12345";
+
+  async function withDecisionDashboard<T>(
+    run: (rig: {
+      channel: DashboardApprovalChannel;
+      port: number;
+      authHeaders: Record<string, string>;
+    }) => Promise<T>,
+  ): Promise<T> {
+    let channel: DashboardApprovalChannel | undefined;
+    let decisionPort = 0;
+    await bindWithRetry(async () => {
+      decisionPort = randomTestPort();
+      channel = new DashboardApprovalChannel({
+        port: decisionPort,
+        host: "127.0.0.1",
+        timeout_seconds: 30,
+        auto_deny: true,
+        auth_token: DECISION_TEST_TOKEN,
+      });
+      await channel.start();
+    });
+
+    try {
+      return await run({
+        channel: channel!,
+        port: decisionPort,
+        authHeaders: { Authorization: `Bearer ${DECISION_TEST_TOKEN}` },
+      });
+    } finally {
+      await channel?.stop();
+    }
+  }
+
   beforeEach(async () => {
     // Sigma-6: bindWithRetry retries on EADDRINUSE so this suite stops
     // being the recurring port-collision flake offender (9-10 incidents
@@ -185,57 +219,67 @@ describe("Principal Dashboard", () => {
     });
 
     it("creates pending request and resolves on approve", async () => {
-      const request = makeRequest();
+      await withDecisionDashboard(async ({ channel, port, authHeaders }) => {
+        const request = makeRequest();
 
-      // Start approval (don't await — it blocks)
-      const approvalPromise = dashboard.requestApproval(request);
-      expect(dashboard.pendingCount).toBe(1);
+        // Start approval (don't await — it blocks)
+        const approvalPromise = channel.requestApproval(request);
+        expect(channel.pendingCount).toBe(1);
 
-      // Get the pending list to find the ID
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
-      const pending = await listRes.json();
-      expect(pending).toHaveLength(1);
-      expect(pending[0].operation).toBe("state_export");
+        // Get the pending list to find the ID
+        const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        });
+        const pending = await listRes.json();
+        expect(pending).toHaveLength(1);
+        expect(pending[0].operation).toBe("state_export");
 
-      // Approve
-      const approveRes = await fetch(
-        `http://127.0.0.1:${port}/api/approve/${pending[0].id}`,
-        { method: "POST" }
-      );
-      expect(approveRes.status).toBe(200);
+        // Approve
+        const approveRes = await fetch(
+          `http://127.0.0.1:${port}/api/approve/${pending[0].id}`,
+          { method: "POST", headers: authHeaders },
+        );
+        expect(approveRes.status).toBe(200);
 
-      // The approval promise should resolve
-      const response = await approvalPromise;
-      expect(response.decision).toBe("approve");
-      expect(response.decided_by).toBe("human");
-      expect(dashboard.pendingCount).toBe(0);
+        // The approval promise should resolve
+        const response = await approvalPromise;
+        expect(response.decision).toBe("approve");
+        expect(response.decided_by).toBe("human");
+        expect(channel.pendingCount).toBe(0);
+      });
     });
 
     it("creates pending request and resolves on deny", async () => {
-      const request = makeRequest();
-      const approvalPromise = dashboard.requestApproval(request);
+      await withDecisionDashboard(async ({ channel, port, authHeaders }) => {
+        const request = makeRequest();
+        const approvalPromise = channel.requestApproval(request);
 
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
-      const pending = await listRes.json();
-      expect(pending).toHaveLength(1);
+        const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        });
+        const pending = await listRes.json();
+        expect(pending).toHaveLength(1);
 
-      const denyRes = await fetch(
-        `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
-        { method: "POST" }
-      );
-      expect(denyRes.status).toBe(200);
+        const denyRes = await fetch(
+          `http://127.0.0.1:${port}/api/deny/${pending[0].id}`,
+          { method: "POST", headers: authHeaders },
+        );
+        expect(denyRes.status).toBe(200);
 
-      const response = await approvalPromise;
-      expect(response.decision).toBe("deny");
-      expect(response.decided_by).toBe("human");
+        const response = await approvalPromise;
+        expect(response.decision).toBe("deny");
+        expect(response.decided_by).toBe("human");
+      });
     });
 
     it("returns 404 for non-existent request ID", async () => {
-      const res = await requestNoKeepAlive(
-        `http://127.0.0.1:${port}/api/approve/nonexistent`,
-        { method: "POST" }
-      );
-      expect(res.status).toBe(404);
+      await withDecisionDashboard(async ({ port, authHeaders }) => {
+        const res = await requestNoKeepAlive(
+          `http://127.0.0.1:${port}/api/approve/nonexistent`,
+          { method: "POST", headers: authHeaders },
+        );
+        expect(res.status).toBe(404);
+      });
     });
 
     it("auto-denies on timeout when auto_deny is true", async () => {
@@ -269,27 +313,37 @@ describe("Principal Dashboard", () => {
     }, 5000);
 
     it("handles multiple concurrent pending requests", async () => {
-      const req1 = { ...makeRequest(), operation: "state_export" };
-      const req2 = { ...makeRequest(), operation: "identity_rotate" };
+      await withDecisionDashboard(async ({ channel, port, authHeaders }) => {
+        const req1 = { ...makeRequest(), operation: "state_export" };
+        const req2 = { ...makeRequest(), operation: "identity_rotate" };
 
-      const p1 = dashboard.requestApproval(req1);
-      const p2 = dashboard.requestApproval(req2);
-      expect(dashboard.pendingCount).toBe(2);
+        const p1 = channel.requestApproval(req1);
+        const p2 = channel.requestApproval(req2);
+        expect(channel.pendingCount).toBe(2);
 
-      // Get pending list
-      const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
-      const pending = await listRes.json();
-      expect(pending).toHaveLength(2);
+        // Get pending list
+        const listRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        });
+        const pending = await listRes.json();
+        expect(pending).toHaveLength(2);
 
-      // Approve first, deny second
-      await fetch(`http://127.0.0.1:${port}/api/approve/${pending[0].id}`, { method: "POST" });
-      await fetch(`http://127.0.0.1:${port}/api/deny/${pending[1].id}`, { method: "POST" });
+        // Approve first, deny second
+        await fetch(`http://127.0.0.1:${port}/api/approve/${pending[0].id}`, {
+          method: "POST",
+          headers: authHeaders,
+        });
+        await fetch(`http://127.0.0.1:${port}/api/deny/${pending[1].id}`, {
+          method: "POST",
+          headers: authHeaders,
+        });
 
-      const [r1, r2] = await Promise.all([p1, p2]);
-      // Order depends on which ID maps to which request
-      const decisions = [r1.decision, r2.decision].sort();
-      expect(decisions).toEqual(["approve", "deny"]);
-      expect(dashboard.pendingCount).toBe(0);
+        const [r1, r2] = await Promise.all([p1, p2]);
+        // Order depends on which ID maps to which request
+        const decisions = [r1.decision, r2.decision].sort();
+        expect(decisions).toEqual(["approve", "deny"]);
+        expect(channel.pendingCount).toBe(0);
+      });
     });
   });
 
@@ -423,7 +477,7 @@ describe("Principal Dashboard", () => {
       const res = await fetch(`http://127.0.0.1:${authPort}/api/status`);
       expect(res.status).toBe(401);
       const data = await res.json();
-      expect(data.error).toContain("Unauthorized");
+      expect(data.error).toContain("unauthorized");
     });
 
     it("rejects requests with same-length wrong bearer token", async () => {
@@ -576,7 +630,11 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(401);
     });
 
-    it("sets the dashboard login cookie SameSite=Strict", async () => {
+    it("sets the dashboard login cookie SameSite=Lax", async () => {
+      // C1 re-auth fix: Lax (not Strict) so a cross-host Fleet "Open Console"
+      // top-level navigation carries a still-valid session and does NOT
+      // re-prompt. Lax still withholds the cookie on cross-site POSTs, so the
+      // approval-decision routes stay CSRF-safe.
       const res = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
         method: "POST",
         headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
@@ -584,7 +642,8 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       const cookie = res.headers.get("set-cookie") ?? "";
       expect(cookie).toContain("sanctuary_session=");
-      expect(cookie).toContain("SameSite=Strict");
+      expect(cookie).toContain("SameSite=Lax");
+      expect(cookie).not.toContain("SameSite=Strict");
     });
 
     it("rejects long-lived token in query parameter (SEC-012)", async () => {
@@ -610,7 +669,7 @@ describe("Principal Dashboard", () => {
       expect(data.pending_count).toBe(0);
     });
 
-    it("one-click session authenticates posture reads and approval decisions, while invalid sessions stay 401", async () => {
+    it("one-click session authenticates posture reads but not approval decisions, while invalid sessions stay 401", async () => {
       const policy: PrincipalPolicy = {
         version: 1,
         tier1_always_approve: ["state_export"],
@@ -640,7 +699,7 @@ describe("Principal Dashboard", () => {
         headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
       });
       expect(exchangeRes.status).toBe(200);
-      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Strict");
+      expect(exchangeRes.headers.get("set-cookie") ?? "").toContain("SameSite=Lax");
       const { session_id } = await exchangeRes.json();
       const session = encodeURIComponent(session_id);
 
@@ -677,14 +736,194 @@ describe("Principal Dashboard", () => {
       expect(badDecision.status).toBe(401);
       expect(authDashboard.pendingCount).toBe(1);
 
-      const decisionRes = await fetch(
+      const sessionDecisionRes = await fetch(
         `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}?session=${session}`,
         { method: "POST" },
+      );
+      expect(sessionDecisionRes.status).toBe(401);
+      expect(authDashboard.pendingCount).toBe(1);
+
+      const cookieDecisionRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/deny/${pending[0].id}`,
+        {
+          method: "POST",
+          headers: { Cookie: `sanctuary_session=${session_id}` },
+        },
+      );
+      expect(cookieDecisionRes.status).toBe(401);
+      expect(authDashboard.pendingCount).toBe(1);
+
+      const decisionRes = await fetch(
+        `http://127.0.0.1:${authPort}/api/approve/${pending[0].id}`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+        },
       );
       expect(decisionRes.status).toBe(200);
       const decision = await approvalPromise;
       expect(decision.decision).toBe("approve");
       expect(decision.decided_by).toBe("human");
+    });
+
+    it("strict legacy mutations fail closed when no operator token is configured", async () => {
+      let noTokenDashboard: DashboardApprovalChannel | undefined;
+      let noTokenPort = 0;
+      try {
+        await bindWithRetry(async () => {
+          noTokenPort = randomTestPort();
+          noTokenDashboard = new DashboardApprovalChannel({
+            port: noTokenPort,
+            host: "127.0.0.1",
+            timeout_seconds: 2,
+            auto_deny: true,
+          });
+          await noTokenDashboard.start();
+        });
+        noTokenDashboard!.setAutoAuthLocalhost(true);
+        noTokenDashboard!.setUnlockHandler(async () => true);
+
+        const approvalPromise = noTokenDashboard!.requestApproval({
+          operation: "state_export",
+          tier: 1,
+          reason: "No configured token must not fail open",
+          context: {},
+          timestamp: new Date().toISOString(),
+        });
+        void approvalPromise.catch(() => undefined);
+        const pending = await (
+          await fetch(`http://127.0.0.1:${noTokenPort}/api/pending`)
+        ).json();
+        const id = pending[0].id;
+        const cases = [
+          [`/api/unlock`, { passphrase: "irrelevant" }],
+          [`/api/approve/${id}`, null],
+          [`/api/deny/${id}`, null],
+          [`/api/sovereignty-profile`, {}],
+          [`/api/proxy/servers`, { upstream_servers: [] }],
+        ] as const;
+
+        for (const [path, body] of cases) {
+          const res = await fetch(`http://127.0.0.1:${noTokenPort}${path}`, {
+            method: "POST",
+            headers: body === null ? undefined : { "Content-Type": "application/json" },
+            body: body === null ? undefined : JSON.stringify(body),
+          });
+          expect(res.status, path).toBe(401);
+        }
+      } finally {
+        await noTokenDashboard?.stop();
+      }
+    });
+
+    it("strict legacy config mutations reject loopback/session auth and accept a valid bearer", async () => {
+      authDashboard.setAutoAuthLocalhost(true);
+      const exchangeRes = await fetch(`http://127.0.0.1:${authPort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchangeRes.status).toBe(200);
+      const { session_id } = await exchangeRes.json();
+      const routes = [
+        [`/api/sovereignty-profile`, {}],
+        [`/api/proxy/servers`, { upstream_servers: [] }],
+      ] as const;
+
+      for (const [path, body] of routes) {
+        const tokenless = await fetch(`http://127.0.0.1:${authPort}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(tokenless.status, `${path} tokenless`).toBe(401);
+
+        const session = await fetch(
+          `http://127.0.0.1:${authPort}${path}?session=${encodeURIComponent(session_id)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          },
+        );
+        expect(session.status, `${path} session`).toBe(401);
+
+        const cookie = await fetch(`http://127.0.0.1:${authPort}${path}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: `sanctuary_session=${session_id}`,
+          },
+          body: JSON.stringify(body),
+        });
+        expect(cookie.status, `${path} cookie`).toBe(401);
+
+        const bearer = await fetch(`http://127.0.0.1:${authPort}${path}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${AUTH_TOKEN}`,
+          },
+          body: JSON.stringify(body),
+        });
+        expect(bearer.status, `${path} bearer reached handler`).not.toBe(401);
+      }
+    });
+
+    it("strict unlock rejects loopback/session auth and accepts a valid bearer", async () => {
+      await withDecisionDashboard(async ({ channel, port, authHeaders }) => {
+        channel.setAutoAuthLocalhost(true);
+        let calls = 0;
+        channel.setUnlockHandler(async () => {
+          calls += 1;
+          return true;
+        });
+        (channel as unknown as { _parked: boolean })._parked = true;
+        const exchangeRes = await fetch(`http://127.0.0.1:${port}/auth/session`, {
+          method: "POST",
+          headers: authHeaders,
+        });
+        expect(exchangeRes.status).toBe(200);
+        const { session_id } = await exchangeRes.json();
+        const body = JSON.stringify({ passphrase: "secret" });
+
+        const tokenless = await fetch(`http://127.0.0.1:${port}/api/unlock`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+        expect(tokenless.status).toBe(401);
+
+        const session = await fetch(
+          `http://127.0.0.1:${port}/api/unlock?session=${encodeURIComponent(session_id)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          },
+        );
+        expect(session.status).toBe(401);
+
+        const cookie = await fetch(`http://127.0.0.1:${port}/api/unlock`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: `sanctuary_session=${session_id}`,
+          },
+          body,
+        });
+        expect(cookie.status).toBe(401);
+
+        const bearer = await fetch(`http://127.0.0.1:${port}/api/unlock`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...authHeaders,
+          },
+          body,
+        });
+        expect(bearer.status).toBe(200);
+        expect(calls).toBe(1);
+      });
     });
 
     it("serves legacy dashboard HTML at /v1.0 with bearer header (SEC-012)", async () => {
@@ -784,6 +1023,126 @@ describe("Principal Dashboard", () => {
       expect(text).toContain("event: init");
 
       await reader.cancel();
+    });
+  });
+
+  // ── C1 Finding 5: remote console reuses a valid session, no re-prompt ──
+  //
+  // The Open Console fix navigates the SAME TAB to a remote host's posture
+  // root. On a REMOTE bind (non-loopback host) `dispatchRootPosture` serves the
+  // login page when the caller is unauthenticated, so an operator gets a token
+  // box instead of a blank shell. The defect this group pins: a return visit
+  // bearing a STILL-VALID `sanctuary_session` cookie must NOT re-prompt — the
+  // session must be reused. The HARD constraint: a caller with NO token AND no
+  // valid session must STILL get the login page. Auth is never weakened.
+  describe("Remote console reuses a valid session cookie (Finding 5)", () => {
+    const AUTH_TOKEN = "remote-operator-token-9876";
+    let remoteDashboard: DashboardApprovalChannel;
+    let remotePort: number;
+
+    beforeEach(async () => {
+      await bindWithRetry(async () => {
+        remotePort = randomTestPort();
+        // host "0.0.0.0" -> isRemoteBinding() true (non-loopback), so the
+        // dispatchRootPosture login-gate path is exercised. 0.0.0.0 still
+        // listens on loopback, so the test fetches via 127.0.0.1. Plaintext
+        // is allowed for the test (the network-layer encryption carve-out).
+        remoteDashboard = new DashboardApprovalChannel({
+          port: remotePort,
+          host: "0.0.0.0",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+          allow_plaintext_remote: true,
+        });
+        await remoteDashboard.start();
+      });
+    });
+
+    afterEach(async () => {
+      await remoteDashboard.stop();
+    });
+
+    it("serves the LOGIN page at / when no token and no session are present", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`);
+      expect(res.status).toBe(200);
+      // Login page markers (token box + Open Dashboard button), NOT the shell.
+      expect(res.body).toContain('id="auth-token"');
+      expect(res.body).toContain("Open Dashboard");
+      expect(res.body).not.toContain("Sovereignty Posture");
+    });
+
+    it("serves the DASHBOARD shell at / when a VALID session cookie is presented (no re-prompt)", async () => {
+      // Mint a real session the same way the login flow does.
+      const exchange = await fetch(`http://127.0.0.1:${remotePort}/auth/session`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+      });
+      expect(exchange.status).toBe(200);
+      const setCookie = exchange.headers.get("set-cookie") ?? "";
+      expect(setCookie).toContain("sanctuary_session=");
+      // Lax (the Finding 5 fix) so the cross-host top-level navigation carries it.
+      expect(setCookie).toContain("SameSite=Lax");
+      const sessionId = (await exchange.json()).session_id as string;
+
+      // Return visit on a fresh load: the browser sends only the cookie.
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`, {
+        headers: { Cookie: `sanctuary_session=${sessionId}` },
+      });
+      expect(res.status).toBe(200);
+      // The posture shell, NOT the login page: no re-prompt.
+      expect(res.body).toContain("Sovereignty Posture");
+      expect(res.body).not.toContain('id="auth-token"');
+    });
+
+    it("still serves the LOGIN page at / for an INVALID/expired session cookie (auth not weakened)", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${remotePort}/`, {
+        headers: { Cookie: "sanctuary_session=not-a-real-session-id" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('id="auth-token"');
+      expect(res.body).not.toContain("Sovereignty Posture");
+    });
+
+    it("still 401s the data routes without a token or valid session (auth not weakened)", async () => {
+      const res = await fetch(`http://127.0.0.1:${remotePort}/api/status`);
+      expect(res.status).toBe(401);
+    });
+  });
+
+  // ── C1 Finding 5: loopback root behavior is unchanged ──────────────
+  describe("Loopback posture root is unchanged by the Finding 5 fix", () => {
+    const AUTH_TOKEN = "loopback-operator-token-5555";
+    let loopbackDashboard: DashboardApprovalChannel;
+    let loopbackPort: number;
+
+    beforeEach(async () => {
+      await bindWithRetry(async () => {
+        loopbackPort = randomTestPort();
+        loopbackDashboard = new DashboardApprovalChannel({
+          port: loopbackPort,
+          host: "127.0.0.1",
+          timeout_seconds: 2,
+          auto_deny: true,
+          auth_token: AUTH_TOKEN,
+        });
+        // Loopback auto-auth ON (the local-operator-after-terminal-unlock case).
+        loopbackDashboard.setAutoAuthLocalhost(true);
+        await loopbackDashboard.start();
+      });
+    });
+
+    afterEach(async () => {
+      await loopbackDashboard.stop();
+    });
+
+    it("serves the posture shell tokenless on loopback (no login gate, no re-prompt)", async () => {
+      const res = await requestNoKeepAlive(`http://127.0.0.1:${loopbackPort}/`);
+      expect(res.status).toBe(200);
+      // The one-surface contract: loopback root is the shell, never the login
+      // page. The Finding 5 cookie change must not regress this.
+      expect(res.body).toContain("Sovereignty Posture");
+      expect(res.body).not.toContain('id="auth-token"');
     });
   });
 
@@ -1187,49 +1546,57 @@ describe("Principal Dashboard", () => {
     });
 
     it("root-flip does NOT regress the approval-channel routes", async () => {
-      // /api/pending still answers (the pending-approvals inbox source).
-      const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`);
-      expect(pendingRes.status).toBe(200);
-      expect(await pendingRes.json()).toEqual([]);
+      await withDecisionDashboard(async ({ channel, port, authHeaders }) => {
+        // /api/pending still answers (the pending-approvals inbox source).
+        const pendingRes = await fetch(`http://127.0.0.1:${port}/api/pending`, {
+          headers: authHeaders,
+        });
+        expect(pendingRes.status).toBe(200);
+        expect(await pendingRes.json()).toEqual([]);
 
-      // An Approve still round-trips through /api/approve/:id and resolves the
-      // blocked Tier-1 call (the same approval behavior, reached via the board).
-      const approvePromise = dashboard.requestApproval({
-        operation: "state_export",
-        tier: 1,
-        reason: "root-flip approval round-trip",
-        context: { namespace: "test" },
-        timestamp: new Date().toISOString(),
-      });
-      const approveList = await (
-        await fetch(`http://127.0.0.1:${port}/api/pending`)
-      ).json();
-      expect(approveList).toHaveLength(1);
-      const approveRes = await fetch(
-        `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
-        { method: "POST" },
-      );
-      expect(approveRes.status).toBe(200);
-      expect((await approvePromise).decision).toBe("approve");
+        // An Approve still round-trips through /api/approve/:id and resolves the
+        // blocked Tier-1 call (the same approval behavior, reached via the board).
+        const approvePromise = channel.requestApproval({
+          operation: "state_export",
+          tier: 1,
+          reason: "root-flip approval round-trip",
+          context: { namespace: "test" },
+          timestamp: new Date().toISOString(),
+        });
+        const approveList = await (
+          await fetch(`http://127.0.0.1:${port}/api/pending`, {
+            headers: authHeaders,
+          })
+        ).json();
+        expect(approveList).toHaveLength(1);
+        const approveRes = await fetch(
+          `http://127.0.0.1:${port}/api/approve/${approveList[0].id}`,
+          { method: "POST", headers: authHeaders },
+        );
+        expect(approveRes.status).toBe(200);
+        expect((await approvePromise).decision).toBe("approve");
 
-      // A Deny still round-trips through /api/deny/:id.
-      const denyPromise = dashboard.requestApproval({
-        operation: "identity_rotate",
-        tier: 1,
-        reason: "root-flip deny round-trip",
-        context: { namespace: "test" },
-        timestamp: new Date().toISOString(),
+        // A Deny still round-trips through /api/deny/:id.
+        const denyPromise = channel.requestApproval({
+          operation: "identity_rotate",
+          tier: 1,
+          reason: "root-flip deny round-trip",
+          context: { namespace: "test" },
+          timestamp: new Date().toISOString(),
+        });
+        const denyList = await (
+          await fetch(`http://127.0.0.1:${port}/api/pending`, {
+            headers: authHeaders,
+          })
+        ).json();
+        expect(denyList).toHaveLength(1);
+        const denyRes = await fetch(
+          `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
+          { method: "POST", headers: authHeaders },
+        );
+        expect(denyRes.status).toBe(200);
+        expect((await denyPromise).decision).toBe("deny");
       });
-      const denyList = await (
-        await fetch(`http://127.0.0.1:${port}/api/pending`)
-      ).json();
-      expect(denyList).toHaveLength(1);
-      const denyRes = await fetch(
-        `http://127.0.0.1:${port}/api/deny/${denyList[0].id}`,
-        { method: "POST" },
-      );
-      expect(denyRes.status).toBe(200);
-      expect((await denyPromise).decision).toBe("deny");
     });
 
     it("root-flip leaves /v1.0 and unknown routes intact", async () => {

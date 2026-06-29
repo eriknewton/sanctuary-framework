@@ -122,7 +122,10 @@ interface ChatRig {
   stop: () => Promise<void>;
 }
 
-async function startRig(opts: { withChat: boolean }): Promise<ChatRig> {
+async function startRig(opts: {
+  withChat: boolean;
+  loopbackAutoAuth?: boolean;
+}): Promise<ChatRig> {
   const storage = new MemoryStorage();
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
@@ -150,7 +153,10 @@ async function startRig(opts: { withChat: boolean }): Promise<ChatRig> {
   });
 
   const authToken = "test-token";
-  const authConfig: AuthConfig = { loopbackAutoAuth: false, authToken };
+  const authConfig: AuthConfig = {
+    loopbackAutoAuth: opts.loopbackAutoAuth ?? false,
+    authToken,
+  };
 
   const server: Server = createServer(
     async (req: IncomingMessage, res: ServerResponse) => {
@@ -328,5 +334,107 @@ describe("Hub chat routes — capability gating", () => {
     expect(res.status).toBe(422);
     expect(res.body.ok).toBe(false);
     expect(res.body.detail).toContain("operator_chat_not_wired");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// #806 review fix: hub gate is DEFAULT-DENY on mutation.
+//
+// Every non-GET hub route requires the operator bearer even on loopback
+// with `--auto-auth-localhost` on, EXCEPT the small explicit read-style
+// exempt set. The prior allowlist ("enumerate every mutation to gate")
+// missed two mutating routes (DELETE concierge thread, POST concierge
+// send); these tests assert the class is closed — including that an
+// arbitrary/unknown non-GET hub path is denied by default, so a newly
+// added route is gated automatically rather than silently open.
+// ═════════════════════════════════════════════════════════════════════
+describe("Hub default-deny on mutation under loopback auto-auth (#806 review fix)", () => {
+  let rig: ChatRig;
+  beforeEach(async () => {
+    rig = await startRig({ withChat: true, loopbackAutoAuth: true });
+  });
+  afterEach(async () => {
+    await rig.stop();
+  });
+
+  // Class-closing guard: an arbitrary/unknown non-GET hub path must be
+  // REJECTED without a bearer. This is the property the allowlist lacked —
+  // a route nobody enumerated still fails closed. With the bearer the gate
+  // passes and the request reaches routing (404 here, since the path is not
+  // a real route — but crucially NOT 401).
+  it("rejects an unknown non-GET hub path (401) tokenless; bearer passes the gate", async () => {
+    const tokenless = await fetch(
+      `${rig.url}/api/hub/__unknown_mutation__`,
+      { method: "POST" },
+    );
+    expect(tokenless.status).toBe(401);
+
+    const withBearer = await fetch(
+      `${rig.url}/api/hub/__unknown_mutation__`,
+      { method: "POST", headers: { Authorization: `Bearer ${rig.authToken}` } },
+    );
+    // Gate passed -> reaches routing -> 404 (no such route). Not 401.
+    expect(withBearer.status).not.toBe(401);
+    expect(withBearer.status).toBe(404);
+  });
+
+  // HIGH (was missed by the allowlist): DELETE concierge memory thread
+  // permanently deletes operator chat memory.
+  it("rejects a tokenless loopback DELETE /chat/concierge/threads/:id (401)", async () => {
+    const res = await fetch(
+      `${rig.url}/api/hub/chat/concierge/threads/some-thread-id`,
+      { method: "DELETE" },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts DELETE /chat/concierge/threads/:id WITH the operator bearer (gate passes)", async () => {
+    const res = await fetch(
+      `${rig.url}/api/hub/chat/concierge/threads/some-thread-id`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${rig.authToken}` } },
+    );
+    // Gate passed: 200 if the thread existed, 404 if not. Never 401.
+    expect(res.status).not.toBe(401);
+  });
+
+  // MEDIUM (was missed by the allowlist): POST concierge send persists an
+  // operator-role message.
+  it("rejects a tokenless loopback POST /chat/concierge (401)", async () => {
+    const res = await fetch(`${rig.url}/api/hub/chat/concierge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "tokenless send attempt" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts POST /chat/concierge WITH the operator bearer (200)", async () => {
+    const res = await post(rig.url, "/api/hub/chat/concierge", rig.authToken, {
+      message: "authorized send",
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+  });
+
+  // Read-style EXEMPT routes stay reachable tokenless on loopback so the
+  // default-deny inversion does not over-block local convenience reads.
+  it("keeps POST /agents/:id/inspect/open reachable tokenless on loopback (exempt, 200)", async () => {
+    const res = await fetch(
+      `${rig.url}/api/hub/agents/${AGENT_ID}/inspect/open`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("keeps POST /concierge/ask reachable tokenless on loopback (exempt, not 401)", async () => {
+    const res = await fetch(`${rig.url}/api/hub/concierge/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "what is the fleet doing" }),
+    });
+    // Exempt from the bearer gate: the request is NOT rejected at the auth
+    // layer (the concierge query backend is not wired in this rig, so it
+    // surfaces a 422 capability error instead — but never a 401).
+    expect(res.status).not.toBe(401);
   });
 });

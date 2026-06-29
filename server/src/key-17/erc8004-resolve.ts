@@ -1,5 +1,5 @@
 /**
- * Key 17 -- ERC-8004 Identity OFFLINE verifier (read side).
+ * Key 17 -- ERC-8004 Identity verifier (read side).
  *
  * The read counterpart to the ERC-8004 SIGNER (`erc8004-identity-signer.ts` +
  * `erc8004-tools.ts`). Given a presented ERC-8004 agent-identity record, this
@@ -7,25 +7,17 @@
  * existing `key-17:erc8004-identity:v1` signing scheme (it reuses the signer's
  * verify path; it defines NO new crypto label and derives NO key material).
  *
- * This is purely local: it makes NO outbound request and never touches a chain.
- * Resolution is fail-closed: any malformed, unsigned, or tampered record
- * resolves to `valid: false`, never to a soft pass.
+ * Default behavior is purely local: it makes NO outbound request and never
+ * touches a chain. Resolution is fail-closed: any malformed, unsigned, or
+ * tampered record resolves to `valid: false`, never to a soft pass.
  *
  * Trust note (read by an AI agent deciding whether to call the tool):
- * a `valid: true` result proves only that the presented record carries a
- * self-consistent secp256k1 signature recoverable to the embedded
- * `signer_address`. It does NOT prove that `signer_address` is the registered
- * owner of the identity on any chain.
- *
- * DEBT: on-chain registry confirmation (proving the signer is the registry's
- * recorded owner) is a deliberate follow-up, NOT shipped here. When it lands it
- * MUST reuse Verascore's proven ERC-8004 ABI (`ownerOf(uint256)` against the
- * real registry) per the Sanctuary implementation-lane rule (consume the proven
- * spec), routed through the standard SSRF-guarded outbound path. It must NOT
- * reintroduce a hand-rolled call encoder: the prior placeholder emitted a zero
- * selector and ABI-encoded the identity as a dynamic `string`, which a real
- * registry can never satisfy, so any "confirmed" claim it produced would be an
- * overclaim.
+ * `valid: true` always proves the presented record carries a self-consistent
+ * secp256k1 signature recoverable to the embedded `signer_address`. It does
+ * NOT by itself prove that `signer_address` is the registered owner of the
+ * identity on any chain. If, and only if, operator config enables registry
+ * confirmation and the gated ownerOf read succeeds, the result's assurance is
+ * upgraded from `offline_verified` to `registry_confirmed`.
  */
 
 import { randomUUID } from "node:crypto";
@@ -37,6 +29,13 @@ import {
   verifyErc8004Registration,
   type SignedErc8004Registration,
 } from "./erc8004-identity-signer.js";
+import {
+  confirmErc8004RegistryOwner,
+  type Erc8004RegistryConfirmation,
+  type Erc8004RegistryConfirmationConfig,
+  type Erc8004RegistryEgressGate,
+  type Erc8004RegistryFetch,
+} from "./erc8004-registry-confirm.js";
 
 // ── Audit ops ────────────────────────────────────────────────────────
 
@@ -44,6 +43,8 @@ export const ERC8004_RESOLVE_AUDIT_OPS = {
   REQUESTED: "erc8004.resolve.requested",
   RESOLVED_VALID: "erc8004.resolve.valid",
   RESOLVED_INVALID: "erc8004.resolve.invalid",
+  REGISTRY_CONFIRMED: "erc8004.resolve.registry_confirmed",
+  REGISTRY_UNCONFIRMED: "erc8004.resolve.registry_unconfirmed",
 } as const;
 
 /**
@@ -59,9 +60,13 @@ export const ERC8004_RESOLVE_AUDIT_OPS = {
 export interface Erc8004ResolveResult {
   request_id: string;
   valid: boolean;
+  /** `valid` is offline verification; `assurance` says whether registry confirmation upgraded it. */
+  assurance?: "offline_verified" | "registry_confirmed";
   reason?: string;
   /** Recovered/verified signer address (present only when `valid`). */
   signer_address?: string;
+  /** Optional on-chain owner confirmation, default-off and fail-closed. */
+  registry_confirmation?: Erc8004RegistryConfirmation;
   /** Verified, non-sensitive identity fields echoed back for the caller. */
   fields?: {
     identity: string;
@@ -76,6 +81,9 @@ export interface Erc8004ResolveDeps {
   auditLog: AuditLog;
   identityId: string;
   fortressId: string;
+  registryConfirmation?: Erc8004RegistryConfirmationConfig;
+  egressGate?: Erc8004RegistryEgressGate;
+  fetchFn?: Erc8004RegistryFetch;
 }
 
 /**
@@ -215,6 +223,52 @@ export async function resolveErc8004Identity(
     timestamp: signed.timestamp,
   };
 
+  const registryConfirmation = await confirmErc8004RegistryOwner(
+    {
+      config: deps.registryConfirmation ?? {
+        enabled: false,
+        rpc_url: "",
+        chain_id: signed.chain_id,
+        timeout_ms: 10_000,
+      },
+      egressGate: deps.egressGate,
+      fetchFn: deps.fetchFn,
+    },
+    {
+      identity: signed.identity,
+      registry: signed.registry,
+      chain_id: signed.chain_id,
+      signer_address: signed.signer_address,
+    },
+  );
+
+  if (registryConfirmation.status === "confirmed") {
+    await deps.auditLog.append(
+      "l2",
+      ERC8004_RESOLVE_AUDIT_OPS.REGISTRY_CONFIRMED,
+      deps.identityId,
+      {
+        request_id: requestId,
+        registry: signed.registry,
+        chain_id: signed.chain_id,
+        fortress_id: deps.fortressId,
+      },
+    );
+  } else if (registryConfirmation.status === "unconfirmed") {
+    await deps.auditLog.append(
+      "l2",
+      ERC8004_RESOLVE_AUDIT_OPS.REGISTRY_UNCONFIRMED,
+      deps.identityId,
+      {
+        request_id: requestId,
+        registry: signed.registry,
+        chain_id: signed.chain_id,
+        reason: registryConfirmation.reason,
+        fortress_id: deps.fortressId,
+      },
+    );
+  }
+
   await deps.auditLog.append(
     "l2",
     ERC8004_RESOLVE_AUDIT_OPS.RESOLVED_VALID,
@@ -230,7 +284,12 @@ export async function resolveErc8004Identity(
   return {
     request_id: requestId,
     valid: true,
+    assurance:
+      registryConfirmation.status === "confirmed"
+        ? "registry_confirmed"
+        : "offline_verified",
     signer_address: signed.signer_address,
+    registry_confirmation: registryConfirmation,
     fields,
   };
 }
@@ -241,6 +300,9 @@ export interface Erc8004ResolveToolsOptions {
   auditLog: AuditLog;
   identityId: string;
   fortressId: string;
+  registryConfirmation?: Erc8004RegistryConfirmationConfig;
+  egressGate?: Erc8004RegistryEgressGate;
+  fetchFn?: Erc8004RegistryFetch;
 }
 
 export function createErc8004ResolveTools(
@@ -251,13 +313,18 @@ export function createErc8004ResolveTools(
       name: "sanctuary/resolve_erc8004_identity",
       tool_class: "read",
       description:
-        "Verify a presented ERC-8004 agent-identity record OFFLINE. This is a " +
-        "read-only, fully local check: it recomputes the record's signature " +
-        "against the embedded signer address and returns valid/invalid plus " +
-        "the verified identity fields. A valid result proves only that the " +
-        "record carries a self-consistent secp256k1 signature recoverable to " +
-        "its signer_address; it does NOT prove the signer is the registry's " +
-        "recorded owner on any chain. Makes no outbound request. Never returns " +
+        "Verify a presented ERC-8004 agent-identity record. By default this " +
+        "is an offline-only, read-only local check that recomputes the " +
+        "record's signature against the embedded signer address and returns " +
+        "valid/invalid plus the verified identity fields. A valid result is " +
+        "offline-verified only: it proves the record carries a self-consistent " +
+        "secp256k1 signature recoverable to signer_address, not that the signer " +
+        "is the registry owner. If the operator explicitly enables ERC-8004 " +
+        "registry confirmation and configures an RPC endpoint, Sanctuary makes " +
+        "a gated ownerOf(identity) read through the egress gate and returns " +
+        "registry_confirmation plus assurance=registry_confirmed only on an " +
+        "owner match. Unavailable RPC, denied egress, or owner mismatch remains " +
+        "unconfirmed and never becomes a false confirmed claim. Never returns " +
         "key material.",
       inputSchema: {
         type: "object",
@@ -278,6 +345,9 @@ export function createErc8004ResolveTools(
             auditLog: opts.auditLog,
             identityId: opts.identityId,
             fortressId: opts.fortressId,
+            registryConfirmation: opts.registryConfirmation,
+            egressGate: opts.egressGate,
+            fetchFn: opts.fetchFn,
           },
           (args as Record<string, unknown>).record,
         );

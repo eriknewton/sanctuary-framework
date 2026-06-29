@@ -31,7 +31,12 @@ import {
   type TenantDescriptor,
 } from "./discovery.js";
 import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
-import { parsePolicy } from "../../principal-policy/loader.js";
+import {
+  assertNoPrincipalPolicyDowngrade,
+  parsePolicy,
+  PrincipalPolicyDowngradeError,
+} from "../../principal-policy/loader.js";
+import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import { readLockdownStatus } from "../../lockdown/status.js";
 import { AuditLog } from "../../operational/audit-log.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
@@ -477,7 +482,9 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
     return 2;
   }
 
-  const current = await readApprovalRedirectState(tenant);
+  const previousPolicyText = await readPolicyTextForMutation(tenant.storage_path);
+  const previousPolicy = parsePolicy(previousPolicyText);
+  const current = approvalRedirectStateFromPolicy(previousPolicy);
   const next: ApprovalRedirectState = {
     enabled: redirectFlag !== null ? redirectFlag : current.enabled,
     mode:
@@ -486,31 +493,13 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
         : current.mode,
   };
 
-  await writeApprovalRedirectToPolicyFile(tenant.storage_path, next);
-
-  try {
-    const fortressId = fortressIdFromStoragePath(tenant.storage_path);
-    const storage = new FilesystemStorage(`${tenant.storage_path}/state`);
-    let passphrase = ctx.env.SANCTUARY_PASSPHRASE;
-    if (!passphrase) {
-      const stored = await readStoredPassphrase({ storagePath: tenant.storage_path });
-      if (stored) passphrase = stored.value;
-    }
-    if (passphrase) {
-      // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
-      const masterKey = await resolveCliMasterKey(storage, {
-        passphrase,
-        bootstrap: true,
-        storagePathHint: tenant.storage_path,
-      });
-      const auditLog = new AuditLog(storage, masterKey);
-      await auditLog.append("l2", "agents.config", `fortress:${fortressId}`, {
-        tenant: tenant.name,
-        approval_redirect: next,
-        previous: current,
-      });
-    }
-  } catch { /* audit best-effort; do not block config write */ }
+  await writeApprovalRedirectToPolicyFile({
+    storagePath: tenant.storage_path,
+    previousPolicyText,
+    previousPolicy,
+    state: next,
+    audit: () => auditAgentsConfigChange(tenant, ctx, current, next),
+  });
 
   if (hasJsonFlag(argv)) {
     ctx.out.write(
@@ -544,27 +533,98 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
  * from the loader-default shape and writes the new block. The next
  * `sanctuary` boot loads the file as written here.
  */
-async function writeApprovalRedirectToPolicyFile(
-  storagePath: string,
-  state: ApprovalRedirectState,
-): Promise<void> {
+async function writeApprovalRedirectToPolicyFile(params: {
+  storagePath: string;
+  previousPolicyText: string;
+  previousPolicy: PrincipalPolicy;
+  state: ApprovalRedirectState;
+  audit: () => Promise<void>;
+}): Promise<void> {
+  const { storagePath, previousPolicyText, previousPolicy, state, audit } = params;
   const policyPath = join(storagePath, "principal-policy.yaml");
-  let content: string;
+  const block = renderApprovalRedirectBlock(state);
+  const updated = upsertApprovalRedirectBlock(previousPolicyText, block);
+  const nextPolicy = parsePolicy(updated);
+
+  // Gate-2 invariant: this CLI write path must NOT weaken Principal-Policy
+  // posture, mirroring the route gate. Refuse a downgrade before touching disk.
   try {
-    content = await readFile(policyPath, "utf-8");
+    assertNoPrincipalPolicyDowngrade(previousPolicy, nextPolicy);
+  } catch (err) {
+    if (err instanceof PrincipalPolicyDowngradeError) {
+      throw new Error("principal policy update refused", { cause: err });
+    }
+    throw err;
+  }
+  // Fail-closed audit: refuse the write if the critical audit cannot be
+  // persisted. Never silently degrade to a write-without-audit-trail.
+  try {
+    await audit();
+  } catch (err) {
+    throw new Error("principal policy update refused", { cause: err });
+  }
+  await writeFile(policyPath, updated, "utf-8");
+  await chmod(policyPath, 0o600);
+}
+
+async function readPolicyTextForMutation(storagePath: string): Promise<string> {
+  const policyPath = join(storagePath, "principal-policy.yaml");
+  try {
+    return await readFile(policyPath, "utf-8");
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") throw err;
     // Generate a minimal default shape so this command works on a tenant
     // that has been wrapped but not yet booted.
-    content = await defaultPolicyTextForBootstrap();
+    return defaultPolicyTextForBootstrap();
   }
+}
 
-  const block = renderApprovalRedirectBlock(state);
-  const updated = upsertApprovalRedirectBlock(content, block);
+function approvalRedirectStateFromPolicy(
+  policy: PrincipalPolicy,
+): ApprovalRedirectState {
+  const cfg = policy.approval_redirect;
+  if (!cfg) return { enabled: false, mode: "replace" };
+  return {
+    enabled: !!cfg.enabled,
+    mode: cfg.mode === "notify" ? "notify" : "replace",
+  };
+}
 
-  await writeFile(policyPath, updated, "utf-8");
-  await chmod(policyPath, 0o600);
+async function auditAgentsConfigChange(
+  tenant: TenantDescriptor,
+  ctx: ResolvedCtx,
+  previous: ApprovalRedirectState,
+  next: ApprovalRedirectState,
+): Promise<void> {
+  const fortressId = fortressIdFromStoragePath(tenant.storage_path);
+  const storage = new FilesystemStorage(`${tenant.storage_path}/state`);
+  let passphrase = ctx.env.SANCTUARY_PASSPHRASE;
+  if (!passphrase) {
+    const stored = await readStoredPassphrase({ storagePath: tenant.storage_path });
+    if (stored) passphrase = stored.value;
+  }
+  if (!passphrase) {
+    throw new Error("principal policy update refused");
+  }
+  // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
+  const masterKey = await resolveCliMasterKey(storage, {
+    passphrase,
+    bootstrap: true,
+    storagePathHint: tenant.storage_path,
+  });
+  const auditLog = new AuditLog(storage, masterKey);
+  await auditLog.appendCritical({
+    layer: "l2",
+    operation: "agents.config",
+    identity_id: `fortress:${fortressId}`,
+    result: "success",
+    details: {
+      tenant: tenant.name,
+      approval_redirect: next,
+      previous,
+    },
+  });
 }
 
 function renderApprovalRedirectBlock(state: ApprovalRedirectState): string {

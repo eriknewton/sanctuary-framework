@@ -274,6 +274,48 @@ function isHubApprovalDecisionPath(path: string): boolean {
   return match !== null && HUB_APPROVAL_DECISION_ACTIONS.has(match.action);
 }
 
+/**
+ * READ-STYLE EXEMPT SET (default-deny inversion, #806 review fix).
+ *
+ * The hub auth gate is DEFAULT-DENY on mutation: every non-GET hub route
+ * (POST/PUT/PATCH/DELETE) requires the operator bearer, exactly like the
+ * other v1.1 routers (`method !== "GET"`). The prior allowlist approach
+ * ("list every mutation to gate") was miss-prone and DID miss the
+ * concierge-thread DELETE and the concierge SEND. Inverting to default-deny
+ * closes that class: a newly added non-GET route is gated automatically,
+ * no allowlist edit required.
+ *
+ * This set is the SMALL, EXPLICIT exception: non-GET routes that genuinely
+ * neither persist nor mutate fleet/custody state and are intentionally
+ * loopback-readable for local convenience. Membership is a deliberate
+ * security decision, not the default; everything not listed here is gated.
+ *
+ *   - POST /api/hub/concierge/ask  -> hub-service `askConcierge` reads
+ *     fleet context + queries the LLM and returns the answer; it does NOT
+ *     persist a turn (the persisting variant is POST /chat/concierge,
+ *     which is gated). Read-style query, kept loopback-readable.
+ *   - POST /api/hub/agents/:id/inspect/open -> hub-service
+ *     `openAgentInspectPanel` reads recent activity, pending approvals, and
+ *     the policy summary; its only write is an `agent_inspect_panel_opened`
+ *     audit-trail append (observability, no fleet/custody-state mutation).
+ *     Read-style panel open, kept loopback-readable.
+ *
+ * Any OTHER non-GET hub route is gated. Do NOT add a route here unless you
+ * can confirm it neither persists nor mutates nor leaks state.
+ */
+function isHubReadStyleExemptPath(method: string, path: string): boolean {
+  if (method === "POST" && path === `${HUB_API_PREFIX}/concierge/ask`) {
+    return true;
+  }
+  if (method === "POST") {
+    const agentMatch = matchAgentRoute(path);
+    if (agentMatch && agentMatch.remainder === "inspect/open") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isHubAgentControlAction(
   value: string,
 ): value is HubAgentControlAction {
@@ -313,19 +355,30 @@ export async function handleHubRoute(
   // Auth gate: first middleware on every matched route. Reuses console
   // auth middleware verbatim. No new auth path.
   //
-  // SECURITY (loopback-no-autoauth-for-approvals): `POST /api/hub/inbox/
-  // :id/approve` and `.../deny` resolve a pending approval (a Tier-1
-  // human-approval decision). They must ALWAYS require the operator
-  // bearer token, even on loopback with auto-auth on, so a co-resident
-  // agent sharing loopback cannot self-approve. Other hub routes
-  // (read-only lists, inbox dismiss, task/agent dispatch) keep loopback
-  // auto-auth. `requireToken` only suppresses the loopback shortcut;
-  // token validation is unchanged.
-  const isApprovalDecision =
-    method === "POST" && isHubApprovalDecisionPath(path);
+  // SECURITY (default-deny on mutation, #806 review fix): the hub gate is
+  // DEFAULT-DENY for every non-GET (POST/PUT/PATCH/DELETE) route. Such a
+  // route requires the operator bearer even on loopback with
+  // `--auto-auth-localhost` on, so a co-resident AI agent sharing the
+  // loopback interface cannot drive a hub mutation (custody decision,
+  // fleet-state change, persisted write, or destructive delete) by mere
+  // network position. This matches the `method !== "GET"` chokepoint used
+  // by the other v1.1 routers. The prior allowlist ("enumerate every
+  // mutation to gate") was miss-prone and DID miss the concierge-thread
+  // DELETE and the concierge SEND; inverting to default-deny ends that
+  // class: a newly added non-GET route is gated automatically.
+  //
+  // The only exceptions are the small, explicit read-style set
+  // (`isHubReadStyleExemptPath`): non-GET routes confirmed to neither
+  // persist nor mutate fleet/custody state (the read-style concierge query
+  // and the inspect-panel open). GET reads keep loopback auto-auth.
+  // `requireToken` only suppresses the loopback shortcut; token validation
+  // is unchanged. Fail-closed: with no token configured, a gated request is
+  // rejected, never allowed.
+  const requiresOperatorBearer =
+    method !== "GET" && !isHubReadStyleExemptPath(method, path);
   const checkAuth = authMiddleware(
     deps.authConfig,
-    isApprovalDecision ? { requireToken: true } : undefined,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
   );
   if (!checkAuth(req, res, url)) return true;
 
@@ -771,7 +824,8 @@ export async function handleHubRoute(
   } catch (err) {
     handleError(res, err, {
       operation: `${method} ${path}`,
-      suppressPublicDetail: isApprovalDecision,
+      suppressPublicDetail:
+        method === "POST" && isHubApprovalDecisionPath(path),
     });
     return true;
   }

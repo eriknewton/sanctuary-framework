@@ -46,6 +46,11 @@ import type {
   PrincipalCertificate,
 } from "../mesh/types.js";
 import { canonicalJson } from "./operator-signed.js";
+import {
+  FEDERATION_POLICY_BUNDLE_EVENT_KIND,
+  FEDERATION_POLICY_BUNDLE_EVENT_VERSION,
+  parseFederationPolicyBundlePayload,
+} from "./federation-policy-bundle.js";
 
 export const FEDERATION_NODE_EVICTION_EVENT_KIND = "node_eviction" as const;
 export const FEDERATION_NODE_EVICTION_EVENT_VERSION =
@@ -279,7 +284,8 @@ export function isFederationOperatorAuthorityEvent(
 ): boolean {
   return (
     event.origin_node_id === federationOperatorAuthorityOrigin(fortressId) &&
-    event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND
+    (event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND ||
+      event.kind === FEDERATION_POLICY_BUNDLE_EVENT_KIND)
   );
 }
 
@@ -579,16 +585,28 @@ function reservedEventBatchRejection(
   const authorityOrigin = federationOperatorAuthorityOrigin(fortressId);
   for (const event of events) {
     const isEvictionKind = event.kind === FEDERATION_NODE_EVICTION_EVENT_KIND;
+    const isPolicyBundleKind =
+      event.kind === FEDERATION_POLICY_BUNDLE_EVENT_KIND;
+    const isReservedKind = isEvictionKind || isPolicyBundleKind;
     const isAuthorityOrigin = event.origin_node_id === authorityOrigin;
-    if (!isEvictionKind && !isAuthorityOrigin) continue;
-    if (!isEvictionKind || !isAuthorityOrigin) {
-      return "eviction_authority_invalid";
+    if (!isReservedKind && !isAuthorityOrigin) continue;
+    if (!isReservedKind || !isAuthorityOrigin) {
+      return "operator_authority_invalid";
     }
-    if (event.payload.event_version !== FEDERATION_NODE_EVICTION_EVENT_VERSION) {
-      return "unsupported_event_version";
-    }
-    if (parseNodeEvictionPayload(event.payload) === null) {
-      return "malformed_payload";
+    if (isEvictionKind) {
+      if (event.payload.event_version !== FEDERATION_NODE_EVICTION_EVENT_VERSION) {
+        return "unsupported_event_version";
+      }
+      if (parseNodeEvictionPayload(event.payload) === null) {
+        return "malformed_payload";
+      }
+    } else {
+      if (event.payload.event_version !== FEDERATION_POLICY_BUNDLE_EVENT_VERSION) {
+        return "unsupported_event_version";
+      }
+      if (parseFederationPolicyBundlePayload(event.payload) === null) {
+        return "malformed_payload";
+      }
     }
   }
   return null;

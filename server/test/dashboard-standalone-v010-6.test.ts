@@ -164,6 +164,21 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
     ).toBe(true);
   });
 
+  it("C1 Finding 4: status bar carries a clickable Fleet Switcher link to /fleet", () => {
+    const html = generateDashboardHTML({
+      timeoutSeconds: 60,
+      serverVersion: "0.10.6-test",
+      loopbackAutoAuth: true,
+    } as Parameters<typeof generateDashboardHTML>[0]);
+    // A real anchor to /fleet, discoverable without typing the URL.
+    expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
+    expect(html).toContain("Fleet");
+    // It sits in the status bar so an operator sees it on landing.
+    const barMatch = html.match(/<div class="status-bar-right">[\s\S]*?<\/div>\s*<\/div>/);
+    expect(barMatch).toBeTruthy();
+    expect(barMatch![0]).toContain('href="/fleet"');
+  });
+
   it("initialize() does NOT redirect on loopback boot (auth gate lets init proceed)", async () => {
     // End-to-end shape: generate HTML with loopbackAutoAuth=true, then
     // execute the gate logic in a tiny evaluator that stubs the browser
@@ -449,6 +464,29 @@ describe("v0.10.6: dashboard HTML must not reload-loop under loopback auto-auth"
         expect(out.result, "dismissed prompt => no decision (op stays pending)").toBeNull();
         expect(out.storedToken).toBeNull();
       });
+    });
+  });
+
+  describe("legacy dashboard strict profile/proxy mutations use the operator bearer", () => {
+    const html = generateDashboardHTML({
+      timeoutSeconds: 60,
+      serverVersion: "strict-mutation-test",
+      loopbackAutoAuth: true,
+    } as Parameters<typeof generateDashboardHTML>[0]);
+
+    it("routes strict POST clients through the prompt-and-retry helper", () => {
+      expect(html).toContain("async function strictMutationFetch(endpoint, init)");
+      expect(html).toContain("function promptForOperatorToken()");
+      expect(html).toContain("if (response.status === 401 && promptForOperatorToken())");
+      expect(html).toContain("headers['Authorization'] = 'Bearer ' + token;");
+
+      const profilePosts = html.match(/strictMutationFetch\('\/api\/sovereignty-profile', \{\s*method: 'POST'/g) ?? [];
+      const proxyPosts = html.match(/strictMutationFetch\('\/api\/proxy\/servers', \{\s*method: 'POST'/g) ?? [];
+      expect(profilePosts.length, "profile mutations must use strictMutationFetch").toBeGreaterThanOrEqual(3);
+      expect(proxyPosts.length, "proxy mutations must use strictMutationFetch").toBeGreaterThanOrEqual(2);
+
+      expect(html).not.toMatch(/fetch\(API_BASE \+ '\/api\/sovereignty-profile', \{\s*method: 'POST'/);
+      expect(html).not.toMatch(/fetch\(API_BASE \+ '\/api\/proxy\/servers', \{\s*method: 'POST'/);
     });
   });
 });
