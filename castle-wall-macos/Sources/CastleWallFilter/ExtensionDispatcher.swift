@@ -94,6 +94,19 @@ public final class ExtensionDispatcher {
     /// attempt from the verdict callback; it only retries a channel that was
     /// previously brought up and has since degraded.
     private var hasEverStarted = false
+    #if DEBUG
+    /// Test seam (Slice-M layer-1 starvation regression). Counts how many times
+    /// a reconnect has actually been scheduled. The starvation livelock
+    /// (`612f8d99`) reset the pending retry timer on EVERY dropped verdict; the
+    /// `retryTimer == nil` guard in `maybeLazyReconnect` means steady verdict
+    /// traffic while a retry is already pending must NOT grow this count.
+    /// Compiled out of the signed `-c release` sysext; present only under the
+    /// debug `swift test` build. Read via `reconnectScheduledCount`.
+    private var reconnectScheduledCountValue = 0
+    internal var reconnectScheduledCount: Int {
+        stateQueue.sync { reconnectScheduledCountValue }
+    }
+    #endif
     /// Greppable prefix for the Slice-M audit-emission drop-path probes.
     /// The signed-host engage drill runs
     /// `log stream --predicate 'process == "CastleWallExtension"'` and greps
@@ -623,6 +636,10 @@ public final class ExtensionDispatcher {
     private func scheduleReconnect(reason: String) {
         stateQueue.async {
             guard !self.isStopping else { return }
+
+            #if DEBUG
+            self.reconnectScheduledCountValue += 1
+            #endif
 
             self.retryTimer?.cancel()
             self.retryTimer = nil

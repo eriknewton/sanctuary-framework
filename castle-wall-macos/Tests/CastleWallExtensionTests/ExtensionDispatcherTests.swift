@@ -343,6 +343,57 @@ final class ExtensionDispatcherTests: XCTestCase {
         )
     }
 
+    /// Slice-M LAYER-1 starvation regression (`612f8d99`). Once `start()` has
+    /// failed its connect and scheduled a retry, the dispatcher sits in
+    /// `.retrying` with a PENDING retry timer. Steady verdict traffic — which an
+    /// armed wall produces constantly — must NOT keep resetting that timer, or
+    /// `attemptStartAndSubscribe` never fires and the audit channel never
+    /// reconnects (the 2026-06-29 drill: 0 producer-signed entries, endless
+    /// "reconnect scheduled" spam, zero "connected"). The fix guards the
+    /// reconnect-kick on `retryTimer == nil`; this test drives the exact
+    /// condition and asserts the pending timer is left intact (no new
+    /// reconnect scheduled) while verdicts pour in.
+    func test_notifyVerdict_whileRetryPending_doesNotResetTimer_starvationRegression() async {
+        let engine = FlowEvaluatorEngine()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            // Non-existent UDS path: the connect fails, so start() lands the
+            // dispatcher in `.retrying` with a pending retry timer.
+            ipcClient: makeFloatingClient(),
+            sendErrorHandler: { _ in }
+        )
+
+        let live = await dispatcher.start()
+        XCTAssertFalse(live, "start() against a dead socket must not report live")
+        // The sync read drains the (serial) state queue, so the scheduleReconnect
+        // dispatched by the start failure has fully run by the time we read.
+        XCTAssertEqual(dispatcher.connectionState, .retrying)
+        let baseline = dispatcher.reconnectScheduledCount
+        XCTAssertEqual(baseline, 1, "a single failed start schedules exactly one reconnect")
+
+        // Pour verdicts at the dispatcher while the retry timer is pending. The
+        // PRE-fix livelock reset the timer on every one of these; the guard must
+        // leave the pending timer untouched, so the schedule count stays put.
+        for _ in 0..<100 {
+            dispatcher.notifyVerdict(.allow(matchedRuleId: "r-1"), for: makeFlow())
+        }
+        // Settle async drop bookkeeping, staying well under the ~0.85s minimum
+        // retry delay so the pending timer cannot legitimately fire mid-window.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(
+            dispatcher.reconnectScheduledCount,
+            baseline,
+            "verdicts while a retry timer is pending must NOT reschedule (starvation guard)"
+        )
+        XCTAssertEqual(
+            dispatcher.connectionState,
+            .retrying,
+            "the dispatcher must remain in .retrying with its original pending timer"
+        )
+        dispatcher.stop()
+    }
+
     // MARK: - Outbound message-shape correctness via the builder
 
     func test_decisionRecordedShape_allow_carriesMatchedRuleId() {
