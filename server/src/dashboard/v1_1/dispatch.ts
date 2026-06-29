@@ -40,6 +40,10 @@ import {
   handleEnglishPolicyRoute,
   ENGLISH_POLICY_API_PREFIX,
 } from "../../policy-engine/english-policy-routes.js";
+import {
+  handlePiiRewriteRoute,
+  PII_REWRITE_API_PREFIX,
+} from "../../query-anonymity/pii-rewrite-routes.js";
 import type { V11Bindings } from "./wiring.js";
 import { enforceAuth, type AuthConfig } from "../../console/auth-middleware.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
@@ -401,6 +405,50 @@ export async function dispatchV11Request(
         ...(bindings.englishPolicy.defaultOperatorId !== undefined
           ? { defaultOperatorId: bindings.englishPolicy.defaultOperatorId }
           : {}),
+      },
+      req,
+      res,
+    );
+  }
+
+  // Tier B PII-rewrite API at /api/query-anonymity/pii(/*). Same auth
+  // chokepoint: `handlePiiRewriteRoute` runs `authMiddleware(authConfig)`
+  // first on every matched route, so an unauthenticated non-loopback
+  // request is rejected 401 before any handler runs. The PII binding
+  // (config store + audit + redactor-installed flag) is constructed by
+  // `buildV11Bindings` when storage + master key are present; absent it,
+  // match-then-auth-then-503 (never a bypass, never a silent 404).
+  if (
+    url.pathname === PII_REWRITE_API_PREFIX ||
+    url.pathname.startsWith(`${PII_REWRITE_API_PREFIX}/`)
+  ) {
+    const authConfig: AuthConfig = {
+      loopbackAutoAuth,
+      ...(authToken !== undefined ? { authToken } : {}),
+    };
+    if (!bindings.pii) {
+      try {
+        enforceAuth(authConfig, req, url);
+      } catch {
+        writeJSON(res, 401, { ok: false, error: "unauthorized" });
+        return true;
+      }
+      writeJSON(res, 503, {
+        ok: false,
+        error: "pii_rewrite_not_configured",
+        detail:
+          "Tier B PII rewrite is not wired into this dashboard binding.",
+      });
+      return true;
+    }
+    return handlePiiRewriteRoute(
+      {
+        authConfig,
+        store: bindings.pii.store,
+        auditLog: bindings.pii.auditLog,
+        identityId: bindings.pii.identityId,
+        fortressId: bindings.pii.fortressId,
+        redactorInstalled: bindings.pii.redactorInstalled,
       },
       req,
       res,

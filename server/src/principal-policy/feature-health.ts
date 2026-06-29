@@ -461,8 +461,14 @@ export interface FeatureRegistryEntry {
    * own `{ key, value }` pair to get the same gate WITHOUT inheriting Castle
    * Wall's signature machinery. A feature with no marker counts on the operation
    * string alone (the event-driven rows).
+   *
+   * `value` is `string | number` because some producers stamp a numeric
+   * discriminator in `details` (e.g. the PII-rewrite row gates on
+   * `filter_tier === 2` to count ONLY a real Tier 2 scrub, never the
+   * `filter_tier: 1` passthrough on the same op). The comparison below is a
+   * strict `===`, so the declared type must match the value's runtime type.
    */
-  provenanceMarker?: { readonly key: string; readonly value: string };
+  provenanceMarker?: { readonly key: string; readonly value: string | number };
   /**
    * Optional per-feature producer-signature scheme. When present, the
    * green-earning invocation evidence (and the liveness / stand-down lifecycle
@@ -707,25 +713,34 @@ export const SLICE1_FEATURE_REGISTRY: ReadonlyArray<FeatureRegistryEntry> =
     },
     {
       // Tier B PII rewrite (OPT-IN, off by default). Distinct from the Tier A
-      // `header_strip` row above: this row intentionally counts ONLY the actual
-      // rewrite op (`query_anonymity_pii_rewritten`), so a config update or a
-      // consent record (administrative housekeeping, not a strip) can never
-      // render it green without a single query having been rewritten (codex HIGH
-      // 2026-06-13).
+      // `header_strip` row above.
       //
-      // KNOWN STANDING (documentation only - do NOT change behavior to force
-      // green): the PII-rewrite emitter is not yet wired into the live selector
-      // path (the deferred Rho-2.5 boot-wiring), so `query_anonymity_pii_rewritten`
-      // does not fire in production today. This row therefore reads `unconfirmed`
-      // (amber) until that wiring lands. That is the honest state; the always-on
-      // privacy feature that DOES fire on every call is the `header_strip` row.
+      // Rho-2.5 (live-wiring fix): the row now counts the op the LIVE scrub
+      // path ACTUALLY emits. The consent-gated redactor installed on the
+      // production selector emits `intelligence_pii_redaction_event` on every
+      // call, stamping `filter_tier: 2` on a REAL Tier 2 scrub and
+      // `filter_tier: 1` on the toggled-off passthrough. The `provenanceMarker`
+      // gates this row on `filter_tier === 2`, so:
+      //   - a passthrough (Tier B off / unconsented) emits filter_tier:1 and
+      //     does NOT green the row;
+      //   - administrative housekeeping (config update / consent record) emits
+      //     a different op entirely and cannot green the row;
+      //   - only a genuine Tier 2 scrub of a live query greens it.
+      // This replaces the prior `query_anonymity_pii_rewritten` key, which no
+      // live path emitted (the redactor reports via the selector's
+      // `emitRedactionEvent`, not `emitPiiRewriteAudit`), so the row was stuck
+      // amber even during real scrubbing. The honest signal is the op that
+      // fires.
       id: "privacy_strips",
       label: "Query-privacy PII rewrite (opt-in)",
       layer: "l2",
       liveness: "event_driven",
       invocationOps: Object.freeze(
-        new Set<string>(["query_anonymity_pii_rewritten"]),
+        new Set<string>(["intelligence_pii_redaction_event"]),
       ),
+      // Count ONLY a real Tier 2 scrub, never the filter_tier:1 passthrough
+      // emitted on the same op when Tier B is off/unconsented.
+      provenanceMarker: { key: "filter_tier", value: 2 },
       brokenZeroDetectable: false,
     },
   ]);

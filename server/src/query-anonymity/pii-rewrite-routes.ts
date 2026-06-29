@@ -27,19 +27,24 @@
  *       persisted; it just does not produce live scrubbing yet, and
  *       the surface must not claim otherwise (never-overclaim rule).
  *
- * DEBT (real-feature follow-up, Erik-reviewed): wire the PII rewriter
- *   into the live path so the toggle actually scrubs. Concretely:
- *   (1) build the redactor via `buildPrivacyTier2Redactor` and install
- *       it on the production `SubstrateSelector` (constructed in
- *       `server/src/index.ts` ~:922) via `installRedactor`, replacing
- *       the default passthrough `IDENTITY_REDACTOR`;
- *   (2) pass `queryAnonymityConfig` (the Tier B enabled/smart-mode
- *       flags from `PiiConfigStore`) into the chat service so the
+ * WIRED (Rho-2.5, real-feature follow-up): the PII rewriter is now
+ *   installed on the live path so the toggle actually scrubs. Concretely:
+ *   (1) the entry point builds a consent-gated redactor via
+ *       `buildConsentGatedTier2Redactor` and installs it on the
+ *       production `SubstrateSelector` (constructed in
+ *       `server/src/index.ts`) via `installRedactor`, replacing the
+ *       default passthrough `IDENTITY_REDACTOR`. The redactor reads the
+ *       live `PiiConfigStore` per call and scrubs ONLY when the operator
+ *       opted in (`enabled`/`smart_mode_enabled`) AND consented;
+ *   (2) `queryAnonymityConfig` (the Tier B enabled/smart-mode flags from
+ *       `PiiConfigStore`) is passed into the chat service so the
  *       smart-mode rewrite path is read at invocation time.
- *   Until BOTH land, `effectiveTierBEnabled()` below stays `false` and
- *   the `feature-health.ts` `privacy_strips` row stays amber. This PR
- *   is copy + config-response truthfulness only; it does NOT change
- *   what reaches the substrate.
+ *   `effectiveTierBEnabled(config, redactorInstalled)` below now derives
+ *   the truth from BOTH the live config AND the redactor-installed
+ *   signal, so it returns `true` only when scrubbing genuinely happens.
+ *   The `feature-health.ts` `privacy_strips` row greens once the
+ *   `query_anonymity_pii_rewritten` op fires (an actual scrub), never
+ *   from a config update alone.
  *
  *   GET /api/query-anonymity/pii/trade-off
  *       Returns the plain-English trade-off explainer. The dashboard
@@ -83,28 +88,73 @@ const MAX_BODY_BYTES = 64 * 1024;
 const MAX_PREVIEW_TEXT_BYTES = 16 * 1024;
 
 /**
- * Honesty constant: the PII rewriter is not wired into the production
- * substrate path in this build, so toggling Tier B on does NOT scrub
- * live queries yet. The PATCH /config response and audit event report
- * this reason alongside `effective_tier_b_enabled: false` so the
- * operator's view matches reality. Flip `EFFECTIVE_TIER_B_ENABLED` (or
- * derive it from a real wiring signal) only when the live redactor /
- * smart-mode path is installed; see the DEBT note in this module's
- * header.
+ * Honesty reasons surfaced alongside `effective_tier_b_enabled: false`
+ * so the operator's view matches reality. Exactly one reason is reported
+ * for a non-effective state, derived from real signals (the live config
+ * and the redactor-installed flag), never guessed.
  */
-export const TIER_B_INACTIVE_REASON = "redactor not wired in this build";
+export const TIER_B_INACTIVE_REASON_NO_REDACTOR =
+  "redactor not installed on the substrate path in this binding";
+export const TIER_B_INACTIVE_REASON_DISABLED =
+  "Tier B is not enabled for this fortress";
+export const TIER_B_INACTIVE_REASON_UNCONSENTED =
+  "trade-off consent not recorded";
+
+/**
+ * Back-compat alias retained for any external reader of the prior
+ * constant. Points at the no-redactor reason, which was the standing
+ * cause before the live wiring landed.
+ */
+export const TIER_B_INACTIVE_REASON = TIER_B_INACTIVE_REASON_NO_REDACTOR;
 
 /**
  * Whether the operator's Tier B preference actually produces live
- * scrubbing. Hard-coded `false` until the production substrate-selector
- * is constructed with a real redactor (`installRedactor` /
- * `buildPrivacyTier2Redactor`) AND the chat service is passed the
- * query-anonymity config; until then a toggled-on flag is inert. Kept
- * as a single helper so the response body and the audit event derive
- * the truth from the same place.
+ * scrubbing on THIS binding. Derived from a real wiring signal, never
+ * hard-coded:
+ *   - `redactorInstalled`: the entry point installed the consent-gated
+ *     Tier 2 redactor on the production `SubstrateSelector`. A binding
+ *     without a selector (or one constructed before the install path)
+ *     has this `false`, so the surface reports the truthful inactive
+ *     state.
+ *   - `config.enabled || config.smart_mode_enabled`: the operator turned
+ *     Tier B (or smart mode) on.
+ *   - `config.consented_to_trade_off`: consent recorded; the redactor's
+ *     own gate requires this too, so the two never disagree.
+ *
+ * Returns true ONLY when all hold, i.e. an outbound query is genuinely
+ * scrubbed. Kept as a single helper so the response body, the audit
+ * event, and the inactive-reason derive the truth from the same place.
  */
-export function effectiveTierBEnabled(): boolean {
-  return false;
+export function effectiveTierBEnabled(
+  config: Pick<
+    PiiRewriteConfig,
+    "enabled" | "smart_mode_enabled" | "consented_to_trade_off"
+  >,
+  redactorInstalled: boolean,
+): boolean {
+  return (
+    redactorInstalled &&
+    (config.enabled || config.smart_mode_enabled) &&
+    config.consented_to_trade_off
+  );
+}
+
+/**
+ * The single inactive-reason for a non-effective Tier B state, computed
+ * from the same signals `effectiveTierBEnabled` uses. Returns `null`
+ * when Tier B IS effective.
+ */
+export function tierBInactiveReason(
+  config: Pick<
+    PiiRewriteConfig,
+    "enabled" | "smart_mode_enabled" | "consented_to_trade_off"
+  >,
+  redactorInstalled: boolean,
+): string | null {
+  if (effectiveTierBEnabled(config, redactorInstalled)) return null;
+  if (!redactorInstalled) return TIER_B_INACTIVE_REASON_NO_REDACTOR;
+  if (!config.consented_to_trade_off) return TIER_B_INACTIVE_REASON_UNCONSENTED;
+  return TIER_B_INACTIVE_REASON_DISABLED;
 }
 
 export interface PiiRewriteRouterDeps {
@@ -113,6 +163,14 @@ export interface PiiRewriteRouterDeps {
   auditLog: AuditLog;
   identityId: string;
   fortressId: string;
+  /**
+   * Whether the consent-gated Tier 2 redactor is actually installed on
+   * the production substrate selector for this binding. The dispatch
+   * layer passes `true` only when the entry point wired
+   * `buildConsentGatedTier2Redactor` via `installRedactor`. Defaults to
+   * `false` so an unwired binding reports the truthful inactive state.
+   */
+  redactorInstalled?: boolean;
   now?: () => Date;
 }
 
@@ -190,16 +248,17 @@ export async function handlePiiRewriteRoute(
       const now = (deps.now ?? (() => new Date()))();
       const config =
         (await deps.store.get()) ?? defaultPiiRewriteConfig(() => now);
-      // Honesty: surface the true effective state on read too, so the
-      // toggle UI reflects that a stored `enabled` preference is inert
-      // until the live scrubbing path is wired in.
-      const effectiveTierB = effectiveTierBEnabled();
+      // Honesty: surface the true effective state on read, derived from
+      // the live config AND whether the redactor is installed on this
+      // binding's substrate path.
+      const redactorInstalled = deps.redactorInstalled ?? false;
+      const effectiveTierB = effectiveTierBEnabled(config, redactorInstalled);
       writeJSON(res, 200, {
         ok: true,
         data: {
           config,
           effective_tier_b_enabled: effectiveTierB,
-          inactive_reason: effectiveTierB ? null : TIER_B_INACTIVE_REASON,
+          inactive_reason: tierBInactiveReason(config, redactorInstalled),
         },
       });
       return true;
@@ -238,16 +297,16 @@ export async function handlePiiRewriteRoute(
         const { config: updated, consentJustRecorded } =
           await deps.store.patch(patch);
         // Honesty (never-overclaim rule): the operator's preference is
-        // persisted (`updated.enabled` / `updated.smart_mode_enabled`),
-        // but Tier B does NOT scrub live queries until the production
-        // redactor + smart-mode wiring lands. The effective state is
-        // derived from a single source (`effectiveTierBEnabled`) so the
-        // audit event and the HTTP response can never disagree, and so
-        // the surface never reports `effective_tier_b_enabled: true`
-        // for a path that performs no scrubbing. See the DEBT note in
-        // this module's header.
-        const effectiveTierB = effectiveTierBEnabled();
-        const inactiveReason = effectiveTierB ? null : TIER_B_INACTIVE_REASON;
+        // persisted (`updated.enabled` / `updated.smart_mode_enabled`).
+        // The effective state is derived from a single source
+        // (`effectiveTierBEnabled`) over the live config AND the
+        // redactor-installed signal, so the audit event and the HTTP
+        // response can never disagree, and the surface reports
+        // `effective_tier_b_enabled: true` only for a binding that
+        // genuinely scrubs (redactor installed + enabled + consented).
+        const redactorInstalled = deps.redactorInstalled ?? false;
+        const effectiveTierB = effectiveTierBEnabled(updated, redactorInstalled);
+        const inactiveReason = tierBInactiveReason(updated, redactorInstalled);
         // Audit emission: consent first, then config-updated. The
         // consent op fires only on the false -> true consent
         // transition, signalled EXPLICITLY by the store (derived from

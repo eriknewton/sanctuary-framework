@@ -84,6 +84,7 @@ import {
 } from "./custody-flow.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
+import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
 import { recordWrappedHarnessRegistration } from "../workload-lifecycle/index.js";
 import {
@@ -1379,6 +1380,10 @@ export async function runWrap(
   // success banner. Updated below when the substrate selector loads.
   let intelligenceHealthy: boolean | undefined;
   let intelligenceError: string | undefined;
+  // Rho-2.5: whether the consent-gated Tier B redactor was installed on the
+  // wrap-auto selector. Threaded into buildV11Bindings so the wrap-emitted
+  // dashboard's /api/query-anonymity/pii route reports the truthful state.
+  let wrapTierBPiiRedactorInstalled = false;
   let wrapAuditLog: AuditLog | undefined;
 
   // Start the dashboard in-process.
@@ -1549,10 +1554,26 @@ export async function runWrap(
           identityId: `fortress:${storagePath}`,
         });
         await wrapIntelligenceSelector.load();
+        // Rho-2.5 (HIGH privacy-leak fix): the wrap-auto dashboard mounts
+        // the /api/query-anonymity/pii route and serves concierge over the
+        // frontier substrate. Without this install the selector kept the
+        // passthrough IDENTITY_REDACTOR, so an operator who opted into
+        // Tier B here egressed query + context UNSCRUBBED. Route through
+        // THE shared chokepoint with the SAME hashed fortressId that the
+        // buildV11Bindings call below uses, so the route's PATCH and the
+        // live scrub read the same encrypted config.
+        wrapTierBPiiRedactorInstalled = installConsentGatedRedactor({
+          selector: wrapIntelligenceSelector,
+          storage: v11Storage,
+          masterKey: derived.key,
+          fortressId: fortressIdFromStoragePath(storagePath),
+        });
         intelligenceHealthy = true;
       } catch (err) {
         intelligenceHealthy = false;
         intelligenceError = (err as Error).message;
+        // wrapTierBPiiRedactorInstalled stays false (its initialized value):
+        // the install assignment above only completes when no throw occurred.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Note: Intelligence panel unavailable on wrap URL ` +
@@ -1579,6 +1600,9 @@ export async function runWrap(
           // agent chat from first launch.
           storage: v11Storage,
           masterKey: derived.key,
+          // Rho-2.5: the consent-gated redactor is installed on the
+          // wrap-auto selector, so report the truthful effective state.
+          tierBPiiRedactorInstalled: wrapTierBPiiRedactorInstalled,
         }),
       );
       // The wrap-auto dashboard always binds 127.0.0.1. The printed URL

@@ -44,6 +44,7 @@ import {
   type CompiledPolicy,
 } from "../policy-engine/english-policy-compiler.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
+import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
@@ -182,6 +183,20 @@ async function tryLoadSubstrateSelector(): Promise<{
       identityId: fortressId,
     });
     await selector.load();
+    // Rho-2.5 (privacy-leak class fix): the English-policy compile path
+    // routes LLM-assist through the frontier substrate, so the operator's
+    // English policy text could egress UNSCRUBBED if they opted into Tier
+    // B. Install the consent-gated redactor via THE shared chokepoint.
+    // The config store binds to the HASHED fortress id (the same id the
+    // dashboard route uses when the operator records their Tier B
+    // preference), NOT the raw `fortress:${storagePath}` identity id, so
+    // the live scrub reads the operator's actual persisted config.
+    installConsentGatedRedactor({
+      selector,
+      storage,
+      masterKey,
+      fortressId: fortressIdFromStoragePath(storagePath),
+    });
     return { selector, auditLog, fortressId };
   } catch {
     return null;

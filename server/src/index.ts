@@ -139,6 +139,7 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -909,6 +910,12 @@ export async function createSanctuaryServer(options?: {
   // alongside the trap registry + trap store, so the declaration moves
   // here and the dashboard branch only assigns to it.
   let intelligenceSelector: SubstrateSelector | undefined;
+  // Rho-2.5: whether the consent-gated Tier B redactor was installed on
+  // the selector above. Threaded into the v1.1 PII binding so the
+  // `/api/query-anonymity/pii` route reports the truthful
+  // `effective_tier_b_enabled`. Stays false when the selector failed to
+  // construct (the route then honestly reports inactive).
+  let tierBPiiRedactorInstalled = false;
 
   if (config.dashboard.enabled) {
     // Resolve auth token: "auto" generates a random 32-byte hex token
@@ -964,6 +971,16 @@ export async function createSanctuaryServer(options?: {
         identityId: embeddedHubIdentityId,
       });
       await intelligenceSelector.load();
+      // Rho-2.5: install the consent-gated Tier B PII redactor on the
+      // production selector via THE shared chokepoint. The fortressId MUST
+      // match the one threaded into buildV11Bindings below so the route's
+      // PATCH and the live scrub read the same encrypted config.
+      tierBPiiRedactorInstalled = installConsentGatedRedactor({
+        selector: intelligenceSelector,
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(config.storage_path),
+      });
     } catch (err) {
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(
@@ -971,6 +988,8 @@ export async function createSanctuaryServer(options?: {
           `Run \`sanctuary dashboard\` and pick a substrate.`,
       );
       intelligenceSelector = undefined;
+      // tierBPiiRedactorInstalled stays false (its initialized value): the
+      // install assignment above only completes when the try did not throw.
     }
     dashboard.setV11Bindings(
       buildV11Bindings({
@@ -991,6 +1010,10 @@ export async function createSanctuaryServer(options?: {
         reputationStore,
         policy,
         config,
+        // Rho-2.5: the consent-gated Tier B redactor is installed on the
+        // selector above, so the /api/query-anonymity/pii route reports
+        // the truthful `effective_tier_b_enabled`.
+        tierBPiiRedactorInstalled,
       }),
     );
     // Loopback auto-auth (parity with `sanctuary dashboard`,

@@ -76,6 +76,7 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 import { DistressInbox } from "./distress/inbox.js";
 import { DistressListener } from "./distress/listener.js";
 import {
@@ -989,6 +990,10 @@ async function wireUnlockedDeps(args: {
   // a live config to render. Best-effort: any failure degrades to a
   // selector-less binding (panel surfaces "not configured").
   let intelligenceSelector: SubstrateSelector | undefined;
+  // Rho-2.5: whether the consent-gated Tier B redactor was installed on
+  // the selector below. Threaded into the v1.1 PII binding so the
+  // /api/query-anonymity/pii route reports the truthful effective state.
+  let tierBPiiRedactorInstalled = false;
   try {
     intelligenceSelector = new SubstrateSelector({
       storage,
@@ -997,12 +1002,23 @@ async function wireUnlockedDeps(args: {
       identityId: hubIdentityId,
     });
     await intelligenceSelector.load();
+    // Rho-2.5: install the consent-gated Tier B PII redactor via THE
+    // shared chokepoint. fortressId matches the buildV11Bindings call
+    // below so the route + the live scrub read the same encrypted config.
+    tierBPiiRedactorInstalled = installConsentGatedRedactor({
+      selector: intelligenceSelector,
+      storage,
+      masterKey,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+    });
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
     );
     intelligenceSelector = undefined;
+    // tierBPiiRedactorInstalled stays false (its initialized value): the
+    // install assignment above only completes when the try did not throw.
   }
   const v11Bindings = buildV11Bindings({
     identityId: hubIdentityId,
@@ -1024,6 +1040,9 @@ async function wireUnlockedDeps(args: {
     identityManager,
     policy,
     config,
+    // Rho-2.5: report the truthful `effective_tier_b_enabled` on the
+    // /api/query-anonymity/pii route.
+    tierBPiiRedactorInstalled,
   });
   // NOTE: v11Bindings is attached in the synchronous ATTACH TAIL below, not
   // here; see the ATOMIC WIRING note. setTaskService (next block) mutates the
