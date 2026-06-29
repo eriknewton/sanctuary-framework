@@ -38,6 +38,7 @@ import {
 } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 const IDENTITY_ID = "wrap-smoke-operator";
 
@@ -49,16 +50,12 @@ interface WrapAutoTestRig {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 31000 + Math.floor(Math.random() * 30000);
-}
-
 async function startWrapAutoRigWithRetry(): Promise<WrapAutoTestRig> {
   // Mirrors PR #27's EADDRINUSE retry helper. The wrap-auto dashboard
   // shares the host's port space with concurrent vitest workers; retry
   // on EADDRINUSE only — any other failure is a real bug.
   for (let attempt = 0; attempt < 6; attempt++) {
-    const port = pickPort();
+    const port = await getFreePort();
     const authToken = `wrap-smoke-${randomBytes(8).toString("hex")}`;
     try {
       const tmpFortress = await mkdtemp(join(tmpdir(), "sanctuary-v1_1-smoke-"));
