@@ -695,35 +695,59 @@ describe("Tier 3a Slice 1 — AC-1 end-to-end through SubstrateSelector", () => 
 /**
  * F-6 (within-crowd linkability): a tunnel connection reused across two
  * queries lets a downstream observer correlate those queries to one origin
- * and collapses the effective anonymity set below the raw crowd size k. The
- * reference dialer already opens a fresh tunnel per `dial()`; these tests
- * prove the transport ENFORCES no-reuse on every dialer — including a
- * misbehaving pooling/keep-alive dialer — and that the enforcement is
- * fail-closed (a reuse violation is denied, never sent direct), with the
- * disarmed-default + happy path unchanged.
+ * and collapses the effective anonymity set below the raw crowd size k.
+ *
+ * These tests pin EXACTLY what the transport provably does and does NOT do,
+ * so the suite never overstates the guard:
+ *   - it enforces one-query-per-handle-object and rejects same-object
+ *     aliasing (a dialer handing the SAME handle back), fail-closed; and
+ *   - it does NOT, and cannot from object identity, detect a pooling dialer
+ *     that returns FRESH handle objects over one shared kept-alive socket —
+ *     that case is documented honestly below as the dialer's no-reuse
+ *     contract, not something this slice closes.
+ * The reference dialer opens a fresh two-hop tunnel per `dial()` and so
+ * satisfies the connection-level contract; the disarmed default and happy
+ * path are unchanged.
  */
 describe("Tier 3a Slice 1.5 — connection-reuse hygiene (F-6)", () => {
   /**
-   * A controllable mock dialer. In `fresh` mode it hands back a NEW
-   * `TunnelFetch` per `dial()` (the correct shape). In `pooled` mode it
-   * hands back the SAME handle every time (a cached/keep-alive tunnel — the
-   * F-6 leak). It records how many times its underlying connection's fetch
-   * was actually invoked and whether close() fired.
+   * A controllable mock dialer with three modes:
+   *   - `fresh`: a NEW `TunnelFetch` per `dial()` over a NEW underlying
+   *     connection each time (the correct shape).
+   *   - `pooled`: the SAME handle object every time (same-object aliasing —
+   *     the case the transport's WeakSet guard catches).
+   *   - `shared-conn`: a FRESH handle object per `dial()`, but every handle
+   *     routes through ONE shared underlying connection (a kept-alive socket
+   *     reused across queries). This is the F-6 leak the object-identity
+   *     guard CANNOT catch; the test below documents that honestly.
+   * `connectionIds` records the underlying connection each served query rode,
+   * so a test can prove whether queries shared a connection.
    */
-  function makeMockDialer(reuse: "fresh" | "pooled"): {
+  function makeMockDialer(reuse: "fresh" | "pooled" | "shared-conn"): {
     dialer: TunnelDialer;
     state: {
       handlesIssued: TunnelFetch[];
       connectionFetchCalls: number;
       closes: number;
+      connectionIds: number[];
     };
   } {
-    const state = { handlesIssued: [] as TunnelFetch[], connectionFetchCalls: 0, closes: 0 };
-    const makeHandle = (): TunnelFetch => {
+    const state = {
+      handlesIssued: [] as TunnelFetch[],
+      connectionFetchCalls: 0,
+      closes: 0,
+      connectionIds: [] as number[],
+    };
+    // A fresh underlying connection id per call, unless a shared one is given
+    // (the `shared-conn` mode passes one stable id to model a kept-alive
+    // socket reused across handles).
+    let nextConnId = 1;
+    const makeHandle = (connId: number): TunnelFetch => {
       const handle: TunnelFetch = {
         egressIp: "203.0.113.7",
         fetch: (async () => {
           state.connectionFetchCalls++;
+          state.connectionIds.push(connId);
           return new Response("tunnel-ok", { status: 200 });
         }) as typeof fetch,
         close: () => {
@@ -733,15 +757,22 @@ describe("Tier 3a Slice 1.5 — connection-reuse hygiene (F-6)", () => {
       return handle;
     };
     let pooledHandle: TunnelFetch | null = null;
+    const sharedConnId = nextConnId; // the single reused socket for `shared-conn`
     const dialer: TunnelDialer = {
       label: `mock ${reuse} dialer`,
       async dial(): Promise<TunnelFetch | null> {
         if (reuse === "pooled") {
-          pooledHandle ??= makeHandle();
+          pooledHandle ??= makeHandle(nextConnId++);
           state.handlesIssued.push(pooledHandle);
           return pooledHandle;
         }
-        const h = makeHandle();
+        if (reuse === "shared-conn") {
+          // FRESH wrapper object, but bound to the ONE shared connection id.
+          const h = makeHandle(sharedConnId);
+          state.handlesIssued.push(h);
+          return h;
+        }
+        const h = makeHandle(nextConnId++);
         state.handlesIssued.push(h);
         return h;
       },
@@ -771,10 +802,12 @@ describe("Tier 3a Slice 1.5 — connection-reuse hygiene (F-6)", () => {
     expect(await r1.text()).toBe("tunnel-ok");
     expect(await r2.text()).toBe("tunnel-ok");
 
-    // Two queries to the SAME destination got two DISTINCT tunnel handles:
-    // no correlatable shared connection.
+    // Two queries to the SAME destination got two DISTINCT tunnel handles
+    // over two DISTINCT underlying connections: no correlatable shared
+    // connection (the dialer honored its no-reuse contract).
     expect(state.handlesIssued).toHaveLength(2);
     expect(state.handlesIssued[0]).not.toBe(state.handlesIssued[1]);
+    expect(state.connectionIds).toEqual([1, 2]);
     // Both succeeded as tunnel-used, none rejected as reuse.
     const ops = audits.map((e) => e.op);
     expect(ops.filter((o) => o === TIER3_AUDIT_OPS.TUNNEL_USED)).toHaveLength(2);
@@ -811,15 +844,45 @@ describe("Tier 3a Slice 1.5 — connection-reuse hygiene (F-6)", () => {
     expect(ops).toContain(TIER3_AUDIT_OPS.FAIL_CLOSED);
   });
 
-  it("single-use enforcement is independent of the dialer: the transport closes the tunnel after one query so a kept-alive socket cannot carry a second", async () => {
+  it("one-query-per-handle: the transport invokes a handle's fetch once and closes it after that one query", async () => {
     const { dialer, state } = makeMockDialer("fresh");
     const fetchFn = createTunneledFetch(baseFetchUnused(), armedConfig(dialer));
     const r = await fetchFn("https://api.anthropic.com/v1/messages");
     await r.text(); // drain the (empty) body → triggers close
-    // One query, one connection use, and the handle was closed (no socket
-    // left alive for a later query to reuse).
+    // One query → one fetch on the handle → the handle is closed. (Whether
+    // closing the handle frees the underlying socket is the dialer's job;
+    // this asserts only the per-handle invariant the transport owns.)
     expect(state.connectionFetchCalls).toBe(1);
     expect(state.closes).toBeGreaterThanOrEqual(1);
+  });
+
+  it("HONEST LIMITATION: a pooling dialer returning FRESH handles over ONE shared connection is NOT detected — three queries ride one reused connection, zero REUSE_REJECTED (this is the dialer's no-reuse contract, not transport-enforced)", async () => {
+    const { dialer, state } = makeMockDialer("shared-conn");
+    const audits: Tier3AuditEvent[] = [];
+    const fetchFn = createTunneledFetch(baseFetchUnused(), armedConfig(dialer), (e) =>
+      audits.push(e),
+    );
+
+    // Three queries through a dialer that hands back a fresh wrapper each
+    // time but routes them all over ONE kept-alive socket.
+    for (let i = 0; i < 3; i++) {
+      const res = await fetchFn("https://api.anthropic.com/v1/messages");
+      expect(await res.text()).toBe("tunnel-ok");
+    }
+
+    // Each query got a DISTINCT handle object, so the WeakSet guard never
+    // fires: object identity cannot see the shared socket beneath them.
+    expect(state.handlesIssued).toHaveLength(3);
+    expect(new Set(state.handlesIssued).size).toBe(3);
+    expect(audits.map((e) => e.op)).not.toContain(TIER3_AUDIT_OPS.REUSE_REJECTED);
+
+    // PoC of the F-6 gap the transport does NOT close: all three queries
+    // rode the SAME underlying connection. This is the case the
+    // `TunnelDialer` no-reuse contract obligates the dialer to prevent; the
+    // transport relies on the dialer and cannot detect it here. Documenting
+    // it in the suite keeps the limitation visible instead of hidden.
+    expect(state.connectionIds).toEqual([1, 1, 1]);
+    expect(new Set(state.connectionIds).size).toBe(1);
   });
 
   it("connection-reuse hygiene does NOT regress disarmed-default passthrough", () => {
