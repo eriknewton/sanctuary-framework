@@ -316,11 +316,14 @@ not a junk drawer. Do not move these casually.
 | `paths.ts` | `resolveStoragePath` + path constants. |
 | `version.ts` | The version constant. |
 
-Note: there are 8 other loose root files (`sanctuary-tools.ts`, `sovereignty-profile.ts`,
+Note: there are 9 other loose root files (`sanctuary-tools.ts`, `sovereignty-profile.ts`,
 `sovereignty-profile-tools.ts`, `dashboard-standalone.ts`, `system-prompt-generator.ts`,
-`tool-args.ts`, `update-check.ts`, `mcp-child-fortress-refusal.ts`). These are Phase-2 MOVE
-candidates, not part of the curated six above. `dashboard-standalone.ts` is the landmine called out
-in the console/dashboard cluster - it serves the principal-policy approval channel, not `dashboard/`.
+`tool-args.ts`, `update-check.ts`, `release-manifest.ts`, `mcp-child-fortress-refusal.ts`). These
+are Phase-2 MOVE candidates, not part of the curated six above. `dashboard-standalone.ts` is the
+landmine called out in the console/dashboard cluster - it serves the principal-policy approval
+channel, not `dashboard/`. `release-manifest.ts` is the Ed25519-signed-release-manifest verifier
+(pinned release key, canonical-JSON signed body, fail-closed refusal) that `update-check.ts`
+re-exports; the two move together.
 
 ---
 

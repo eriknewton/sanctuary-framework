@@ -234,7 +234,6 @@
 2	server/src/transparency/checkpoint.ts
 4	server/src/transparency/emitter.ts
 3	server/src/transparency/verify.ts
-1	server/src/update-check.ts
 6	server/src/v1/agents.ts
 1	server/src/v1/operator-signed.ts
 10	server/src/workload-lifecycle/host-attestation.ts

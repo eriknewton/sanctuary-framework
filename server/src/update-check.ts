@@ -1,14 +1,59 @@
 /**
- * Sanctuary MCP Server — Update Check
+ * Sanctuary MCP Server: Update Check
  *
  * Non-blocking check against the npm registry for newer versions.
  * Prints a notice to stderr if an update is available.
- * Never throws — failures are silently ignored (network issues, offline, etc.).
+ * Never throws; failures are silently ignored (network issues, offline, etc.).
  *
  * Respects SANCTUARY_NO_UPDATE_CHECK=1 to disable entirely.
+ *
+ * AUTHENTICITY: the bare version notice below trusts the registry for
+ * transport only. For an advisory whose authenticity is independent of the
+ * network, use `verifyAndAdviseUpdate`, which verifies an Ed25519-signed release
+ * manifest against the PINNED release-signing key (see `release-manifest.ts`)
+ * and fails closed on any unsigned/wrong-key/tampered manifest. The signed-
+ * manifest verifier and its constants are re-exported from this module.
  */
 
 import { get } from "node:https";
+import {
+  verifyReleaseManifest,
+  type ManifestVerificationResult,
+} from "./release-manifest.js";
+
+export {
+  verifyReleaseManifest,
+  verifyReleaseManifestWithKey,
+  buildReleaseManifestMessage,
+  loadPinnedReleaseKey,
+  PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL,
+  RELEASE_MANIFEST_DOMAIN,
+  type ReleaseManifestBody,
+  type SignedReleaseManifest,
+  type ManifestVerificationResult,
+  type ManifestRefusalReason,
+} from "./release-manifest.js";
+
+/**
+ * Minimal audit sink the update-gate writes to. Structurally compatible with
+ * `AuditLog.append` (see `operational/audit-log.ts`) so the real audit log is
+ * passed directly; kept narrow so this startup-path module does not pull in
+ * the heavy audit module. `append` is best-effort by contract; losing a
+ * telemetry entry must never change the (already fail-closed) trust decision.
+ */
+export interface UpdateAuditSink {
+  append(
+    layer: "l1" | "l2" | "l3" | "l4",
+    operation: string,
+    identityId: string,
+    details?: Record<string, unknown>,
+    result?: "success" | "failure",
+  ): Promise<void> | void;
+}
+
+/** Audit operation names for the signed-update gate (stable wire strings). */
+export const UPDATE_MANIFEST_VERIFIED_OP = "update.manifest.verified";
+export const UPDATE_MANIFEST_REFUSED_OP = "update.manifest.refused";
 
 /** npm registry endpoint for the package */
 const REGISTRY_URL =
@@ -103,8 +148,69 @@ export function fetchLatestVersion(
 }
 
 /**
+ * Verify a signed release manifest against the pinned key and, ONLY on a
+ * verified manifest, return the version to advise. Both the accepted and the
+ * refused paths are audited.
+ *
+ * Fail-closed (AGENTS.md invariant #5): any manifest that does not verify
+ * against the pinned key (unsigned, wrong-key, malformed, or tampered)
+ * returns `{ advise: false }` and emits a refusal audit event. There is no
+ * path where an unverified manifest produces an "update available" advisory.
+ *
+ * Never throws. Audit-sink failures are swallowed here (the sink's own
+ * `flush()` re-raises a lost critical/telemetry write at the call site);
+ * losing the telemetry entry must not flip the already-decided refusal.
+ *
+ * @param manifestValue - untrusted parsed manifest (e.g. fetched JSON)
+ * @param audit - optional audit sink; when present, both paths are recorded
+ * @param identityId - audit subject id (defaults to "system")
+ */
+export async function verifyAndAdviseUpdate(
+  manifestValue: unknown,
+  audit?: UpdateAuditSink,
+  identityId = "system",
+): Promise<
+  | { advise: true; version: string }
+  | { advise: false; reason: string }
+> {
+  const result: ManifestVerificationResult = verifyReleaseManifest(manifestValue);
+
+  if (!result.ok) {
+    if (audit) {
+      try {
+        await audit.append(
+          "l1",
+          UPDATE_MANIFEST_REFUSED_OP,
+          identityId,
+          { reason: result.reason },
+          "failure",
+        );
+      } catch {
+        // Audit best-effort; the refusal stands regardless.
+      }
+    }
+    return { advise: false, reason: result.reason };
+  }
+
+  if (audit) {
+    try {
+      await audit.append(
+        "l1",
+        UPDATE_MANIFEST_VERIFIED_OP,
+        identityId,
+        { version: result.body.version },
+        "success",
+      );
+    } catch {
+      // Audit best-effort; the verified advisory stands regardless.
+    }
+  }
+  return { advise: true, version: result.body.version };
+}
+
+/**
  * Run the update check and print a notice to stderr if an update is available.
- * This function is fire-and-forget — it never throws or blocks the server.
+ * This function is fire-and-forget; it never throws or blocks the server.
  *
  * Set SANCTUARY_NO_UPDATE_CHECK=1 to disable.
  */
