@@ -20,7 +20,7 @@ jobs:
     # PLAYWRIGHT_BROWSERS_PATH. Keep this tag in lockstep with the
     # @playwright/test version in server/package.json.
     container:
-      image: mcr.microsoft.com/playwright:v1.59.1-noble
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
     timeout-minutes: 30
 
     steps:
