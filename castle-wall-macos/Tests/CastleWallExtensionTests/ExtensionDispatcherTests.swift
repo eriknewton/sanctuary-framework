@@ -345,6 +345,33 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(dispatcher.connectionState, .disconnected)
     }
 
+    /// Slice-M audit-drop fix: a verdict on a NEVER-STARTED dispatcher must
+    /// NOT kick a connection attempt. The lazy-rebind path is gated on
+    /// `hasEverStarted`, so the pristine `.disconnected` state is preserved
+    /// and a not-yet-bootstrapped provider does not race its own bootstrap.
+    /// Several verdicts in a row stay `.disconnected` (no transition to
+    /// `.handshaking` / `.retrying`).
+    func test_notifyVerdict_neverStarted_doesNotLazyReconnect() {
+        let engine = FlowEvaluatorEngine()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(),
+            sendErrorHandler: { _ in }
+        )
+        for _ in 0..<5 {
+            dispatcher.notifyVerdict(.allow(matchedRuleId: "r-1"), for: makeFlow())
+        }
+        // Give any errant async reconnect a chance to flip the state.
+        let settle = self.expectation(description: "settle")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { settle.fulfill() }
+        wait(for: [settle], timeout: 1.0)
+        XCTAssertEqual(
+            dispatcher.connectionState,
+            .disconnected,
+            "a never-started dispatcher must not lazy-reconnect from notifyVerdict"
+        )
+    }
+
     // MARK: - Outbound message-shape correctness via the builder
 
     func test_decisionRecordedShape_allow_carriesMatchedRuleId() {
