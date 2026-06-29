@@ -97,7 +97,7 @@ describe("MCP child fortress refusal", () => {
   });
 
   afterEach(async () => {
-    await rm(tmp, { recursive: true, force: true });
+    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("refuses to boot against a missing fortress without creating it", async () => {

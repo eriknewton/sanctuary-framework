@@ -48,7 +48,7 @@ describe("castle-wall CLI verbs", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -814,7 +814,7 @@ describe("castle-wall audit-chain operator override", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
@@ -1104,7 +1104,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
