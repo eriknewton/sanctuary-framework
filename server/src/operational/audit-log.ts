@@ -92,6 +92,18 @@ export interface AuditLogConfig {
   maxTotalSizeBytes?: number;
   /** Maximum number of stored audit entry files to retain. Default: 100_000. */
   maxEntries?: number;
+  /**
+   * Upper bound on the number of decrypted entries the instance holds in memory
+   * (the recent-entry window in `this.entries` / `this.chainEntries`). This is
+   * DECOUPLED from `maxEntries` (the on-disk retention cap): the persisted log
+   * and every full re-read stay complete regardless of this value, which only
+   * bounds RAM growth on a long-running process. Defaults to `maxEntries` (never
+   * below {@link MIN_IN_MEMORY_ENTRY_FLOOR}) so behavior is unchanged unless set.
+   * Exposed primarily so the daemon can cap steady-state RAM below the (large)
+   * disk cap, and so tests can drive the in-memory trim independently of on-disk
+   * rotation.
+   */
+  maxInMemoryEntries?: number;
   /** Verify chain failures by throwing (strict) or surfacing findings (lenient). */
   integrityMode?: "strict" | "lenient";
   /** Write a checkpoint after this many critical appends. Default: 100. */
@@ -775,8 +787,14 @@ export class AuditLog {
     this.epochMacKey = epochKeys.epochMacKey;
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    // In-memory window cap, decoupled from the on-disk cap: defaults to
+    // `maxEntries` so behavior is unchanged unless a caller sets it explicitly,
+    // but is independently configurable so the daemon can keep less in RAM than
+    // it retains on disk (and so trim behavior can be exercised in isolation
+    // from on-disk rotation). Never below the floor, so a usable recent window
+    // survives even under a tiny cap.
     this.maxInMemoryEntries = Math.max(
-      this.maxEntries,
+      config?.maxInMemoryEntries ?? this.maxEntries,
       MIN_IN_MEMORY_ENTRY_FLOOR
     );
     this.integrityMode = config?.integrityMode ?? "strict";

@@ -11,7 +11,11 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 
 describe("AuditLog Rotation", () => {
-  function createLog(config?: { maxTotalSizeBytes?: number; maxEntries?: number }): {
+  function createLog(config?: {
+    maxTotalSizeBytes?: number;
+    maxEntries?: number;
+    maxInMemoryEntries?: number;
+  }): {
     log: AuditLog;
     storage: MemoryStorage;
   } {
@@ -83,28 +87,89 @@ describe("AuditLog Rotation", () => {
   // of the process. The fix bounds the in-memory recent-entry window
   // (`trimInMemoryRetention`) while leaving the persisted log and every full
   // re-read (`verifiedChainView`) complete.
+  //
+  // These tests DECOUPLE the on-disk cap from the in-memory cap: a LARGE
+  // `maxEntries` keeps the entire chain on disk (so a missing disk-reload is
+  // observable), while a small `maxInMemoryEntries` forces the in-memory window
+  // to be trimmed. `IN_MEMORY_FLOOR` mirrors `MIN_IN_MEMORY_ENTRY_FLOOR` in the
+  // source: even a tiny `maxInMemoryEntries` is raised to this floor, so the
+  // trimmed window settles at exactly the floor. After `flush()` the public
+  // `log.size` equals `this.entries.length` (no pending writes), so it is the
+  // assertion handle for "how many entries are held in memory".
   describe("in-memory retention is bounded (daemon OOM regression)", () => {
-    it("does not grow the in-memory window without bound across many appends", async () => {
-      // A tiny on-disk cap forces aggressive pruning; the in-memory floor caps
-      // the recent window. Before the fix `log.size` tracked the append count
-      // (5000) and the heap grew with it.
-      const { log } = createLog({ maxEntries: 5 });
+    const IN_MEMORY_FLOOR = 256;
+    const TOTAL = 1_000; // > IN_MEMORY_FLOOR, so the trim must fire
+    // Disk keeps everything; only the in-memory window is capped.
+    const DECOUPLED = { maxEntries: 1_000_000, maxInMemoryEntries: 1 } as const;
 
-      const snapshots = new Map<number, number>();
-      for (let i = 1; i <= 5000; i++) {
+    it("trims the in-memory window to the floor while every append survives on disk", async () => {
+      const { log, storage } = createLog(DECOUPLED);
+
+      // Snapshot mid-run AND at the end: the window must not climb with the
+      // append count. Before the fix `log.size` tracked the append count.
+      let midSize = 0;
+      for (let i = 1; i <= TOTAL; i++) {
         await log.append("l1", `op-${i}`, "id-1", { padding: "x".repeat(48) });
-        if (i === 1000 || i === 5000) snapshots.set(i, log.size);
+        if (i === 500) midSize = log.size;
       }
+      await log.flush();
 
-      // The in-memory window must NOT scale with the number of appends. The
-      // bound is the per-instance in-memory floor (256), well below 5000.
-      expect(snapshots.get(1000)).toBeLessThanOrEqual(256);
-      expect(snapshots.get(5000)).toBeLessThanOrEqual(256);
-      // And it must stay flat, not keep climbing between the two snapshots.
-      expect(snapshots.get(5000)).toBe(snapshots.get(1000));
+      // In-memory window pinned at the floor: PROOF the trim fired (it is far
+      // below TOTAL, and flat between the mid-run and final snapshots).
+      expect(log.size).toBe(IN_MEMORY_FLOOR);
+      expect(log.size).toBeLessThan(TOTAL);
+      expect(midSize).toBe(IN_MEMORY_FLOOR);
+
+      // ...yet the persisted log is COMPLETE (large on-disk cap, nothing pruned).
+      // This is what makes the next two tests meaningful: the disk holds the
+      // full chain even though memory holds only the recent window.
+      const onDisk = await storage.list("_audit");
+      expect(onDisk.length).toBe(TOTAL);
     });
 
-    it("still prunes the persisted log to the on-disk cap", async () => {
+    it("verifiedChainView returns the full surviving chain even though memory is trimmed", async () => {
+      // The trim must NOT corrupt the transparency Merkle view / workload replay:
+      // verifiedChainView reloads from disk and must serve the FULL chain, not the
+      // trimmed in-memory window. With memory capped at the floor (256) and TOTAL
+      // (1000) on disk, a view that served the in-memory window would return 256;
+      // the disk reload makes it return all 1000. So this test FAILS if the
+      // disk-reload step were removed: exactly the property that matters.
+      const { log } = createLog(DECOUPLED);
+      for (let i = 1; i <= TOTAL; i++) {
+        await log.append("l1", `op-${i}`, "id-1");
+      }
+      await log.flush();
+
+      // Precondition: the in-memory window really is trimmed below TOTAL.
+      expect(log.size).toBe(IN_MEMORY_FLOOR);
+      expect(log.size).toBeLessThan(TOTAL);
+
+      const view = await log.verifiedChainView();
+      expect(view.length).toBe(TOTAL); // full chain, NOT the 256-entry window
+      view.forEach((item, index) => {
+        expect(item.sequence).toBe(index + 1); // strictly sequential, no gaps
+      });
+    });
+
+    it("recent-entry query returns the correct latest entries even though memory is trimmed", async () => {
+      const { log } = createLog(DECOUPLED);
+      for (let i = 1; i <= TOTAL; i++) {
+        await log.append("l1", `op-${i}`, "id-1");
+      }
+      await log.flush();
+
+      // Precondition: trimmed below TOTAL.
+      expect(log.size).toBe(IN_MEMORY_FLOOR);
+      expect(log.size).toBeLessThan(TOTAL);
+
+      // query() re-reads from disk, so the latest entries are correct regardless
+      // of which entries the (trimmed) in-memory window happens to hold.
+      const result = await log.query({ limit: 3 });
+      const ops = result.entries.map((e) => e.operation);
+      expect(ops).toEqual([`op-${TOTAL - 2}`, `op-${TOTAL - 1}`, `op-${TOTAL}`]);
+    });
+
+    it("still prunes the persisted log to the on-disk cap (rotation unaffected by the in-memory trim)", async () => {
       const { log, storage } = createLog({ maxEntries: 5 });
       for (let i = 0; i < 200; i++) {
         await log.append("l1", `op-${i}`, "id-1");
@@ -113,39 +178,6 @@ describe("AuditLog Rotation", () => {
       await new Promise((r) => setTimeout(r, 300));
       const onDisk = await storage.list("_audit");
       expect(onDisk.length).toBeLessThanOrEqual(5);
-    });
-
-    it("verifiedChainView still returns the full surviving chain after trimming", async () => {
-      // The trim must NOT corrupt the transparency Merkle view: verifiedChainView
-      // reloads from disk and must serve the full surviving (pruned) chain, not
-      // the trimmed in-memory recent window. Use a generous on-disk cap so the
-      // whole run survives on disk while the in-memory append path is trimmed.
-      const { log } = createLog({ maxEntries: 100_000 });
-      const total = 600; // > the 256 in-memory floor, so the append path trims
-      for (let i = 1; i <= total; i++) {
-        await log.append("l1", `op-${i}`, "id-1");
-      }
-      await log.flush();
-
-      const view = await log.verifiedChainView();
-      // Every appended entry survives on disk, so the full chain view is complete
-      // and strictly sequential — proof the trim did not drop chain entries from
-      // the authoritative view.
-      expect(view.length).toBe(total);
-      view.forEach((item, index) => {
-        expect(item.sequence).toBe(index + 1);
-      });
-    });
-
-    it("recent-entry query still returns the most recent entries after trimming", async () => {
-      const { log } = createLog({ maxEntries: 100_000 });
-      for (let i = 1; i <= 600; i++) {
-        await log.append("l1", `op-${i}`, "id-1");
-      }
-      await log.flush();
-      const result = await log.query({ limit: 3 });
-      const ops = result.entries.map((e) => e.operation);
-      expect(ops).toEqual(["op-598", "op-599", "op-600"]);
     });
   });
 });
