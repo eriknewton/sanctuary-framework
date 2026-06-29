@@ -37,6 +37,12 @@ import {
   writeAuthenticatedConfigBaseline,
   CONFIG_BASELINE_META_KEY,
 } from "../../src/core/config-baseline.js";
+import {
+  readBaselineEstablishedLatch,
+  raiseBaselineEstablishedLatch,
+  readEpochWitness,
+  EPOCH_WITNESS_META_KEY,
+} from "../../src/core/anti-rollback.js";
 
 const NAMESPACE = "_meta";
 
@@ -585,5 +591,204 @@ describe("detectConfigDowngrades comparator (reused #791 logic)", () => {
         securityPostureFromConfig(rebuilt).dashboard_allow_plaintext_remote
       ).toBe(flag);
     }
+  });
+});
+
+/**
+ * DEBT-1 close-out: deletion-replay + older-schema-reseed, closed by binding the
+ * baseline's existence + sealed-schema floor into the boot-anchored monotonic
+ * epoch witness (`core/anti-rollback.ts`). The attack under regression: an
+ * on-host attacker WITHOUT the master key deletes the single deletable baseline
+ * record (or presents a recognized-older-schema record) to re-enter the
+ * first-run seed path and seed a DOWNGRADED posture. The witness — a SEPARATE
+ * master-MAC'd record — remembers a baseline was established, so the gate now
+ * fails closed instead of silently reseeding.
+ *
+ * The four legs (each a hard requirement):
+ *   1. deletion-replay attack        -> fail closed.
+ *   2. older-schema-reseed attack     -> fail closed (downgrade reseed).
+ *   3. legitimate first run           -> seeds normally (no false rollback).
+ *   4. legitimate forward upgrade     -> reseed allowed (no false brick;
+ *                                        the #805 reseed-not-brick survives).
+ */
+describe("config-security baseline — DEBT-1 deletion/downgrade replay (witness-anchored)", () => {
+  /** Hand-write an older-schema (v2) baseline record an attacker would forge.
+   * The marker is present and the schema is < current, so the reseed branch is
+   * reached BEFORE any MAC check — exactly the unauthenticated path DEBT-1
+   * closes. The MAC bytes are irrelevant on this path (never verified). */
+  async function writeOlderSchemaRecord(
+    storage: MemoryStorage,
+    schema: number
+  ): Promise<void> {
+    const envelope = {
+      __sanctuary_config_security_baseline_v1: true,
+      data: {
+        schema_version: schema,
+        observed_at: new Date().toISOString(),
+        // v2 posture shape (lacks the v3 fields) — irrelevant: the reseed path
+        // never trusts the old record's posture.
+        posture: { config_version: "1.4.0" },
+      },
+      mac: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    await storage.write(
+      NAMESPACE,
+      CONFIG_BASELINE_META_KEY,
+      stringToBytes(JSON.stringify(envelope))
+    );
+  }
+
+  it("LEG 1 — deletion-replay: a deleted baseline on a witnessed fortress fails closed", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // A fortress that has established a strong baseline. The witness now records
+    // that a baseline exists (the latch is raised by the gate).
+    await crossCheckConfigBaseline({ storage, master, config: strongConfig() });
+    expect((await readBaselineEstablishedLatch(storage, master)).established).toBe(
+      true
+    );
+
+    // The attacker DELETES the single deletable baseline record to replay
+    // first-run seeding from a downgraded config (webhook disabled).
+    await storage.delete(NAMESPACE, CONFIG_BASELINE_META_KEY);
+    expect(await storage.read(NAMESPACE, CONFIG_BASELINE_META_KEY)).toBeNull();
+
+    const weakened = strongConfig();
+    weakened.webhook.enabled = false;
+
+    // The witness exposes the deletion → fail closed. The downgraded posture is
+    // NOT seeded.
+    await expect(
+      crossCheckConfigBaseline({ storage, master, config: weakened })
+    ).rejects.toMatchObject({
+      downgrades: [{ reason: "config_baseline_rollback" }],
+    });
+    // No fresh (downgraded) baseline was written on the refusal.
+    expect(await storage.read(NAMESPACE, CONFIG_BASELINE_META_KEY)).toBeNull();
+  });
+
+  it("LEG 2 — older-schema reseed: a backward-schema record after a newer one existed fails closed", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // A fortress that sealed a CURRENT-schema (v3) baseline: the witness floor is
+    // the current schema.
+    await crossCheckConfigBaseline({ storage, master, config: strongConfig() });
+    const latch = await readBaselineEstablishedLatch(storage, master);
+    expect(latch.established).toBe(true);
+    expect(latch.sealedSchema).toBeGreaterThanOrEqual(3);
+
+    // The attacker rolls the record back to a hand-written OLDER-schema (v2)
+    // record to replay seeding from the current (possibly downgraded) config.
+    await writeOlderSchemaRecord(storage, 2);
+
+    await expect(
+      crossCheckConfigBaseline({ storage, master, config: strongConfig() })
+    ).rejects.toMatchObject({
+      downgrades: [{ reason: "config_baseline_rollback" }],
+    });
+  });
+
+  it("LEG 3 — legitimate first run: no prior witness seeds normally (no false rollback)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // No baseline, no witness latch — a genuine first boot.
+    expect((await readBaselineEstablishedLatch(storage, master)).established).toBe(
+      false
+    );
+
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(outcome.kind).toBe("seeded");
+
+    // The latch is now raised at the current schema so the NEXT deletion is
+    // caught — the residual closes forward.
+    const after = await readBaselineEstablishedLatch(storage, master);
+    expect(after.established).toBe(true);
+    expect(after.sealedSchema).toBe(3);
+  });
+
+  it("LEG 4 — legitimate forward upgrade: an older-schema record AT/ABOVE the sealed floor reseeds (no brick)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // Simulate a fortress whose PRIOR binary sealed a v2 baseline: the witness
+    // floor is 2 (raised directly, as the prior binary would have).
+    await raiseBaselineEstablishedLatch(storage, master, 2);
+    expect((await readBaselineEstablishedLatch(storage, master)).sealedSchema).toBe(
+      2
+    );
+
+    // The operator upgrades the binary (now v3) and the on-disk record is the
+    // legitimate prior v2 record. v2 is NOT below the sealed floor (2) → a real
+    // forward upgrade, not a downgrade replay.
+    await writeOlderSchemaRecord(storage, 2);
+
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    // Reseeds rather than bricking (the #805 reseed-not-brick behavior survives).
+    expect(outcome.kind).toBe("reseeded");
+
+    // A fresh sealed (current-schema) baseline was minted and the witness floor
+    // advanced to the current schema.
+    const witness = await readEpochWitness(storage, master);
+    expect(witness.status).toBe("valid");
+    const after = await readBaselineEstablishedLatch(storage, master);
+    expect(after.sealedSchema).toBe(3);
+    // The witness record is the SEPARATE deletable location from the baseline.
+    expect(await storage.read(NAMESPACE, EPOCH_WITNESS_META_KEY)).not.toBeNull();
+  });
+
+  it("LEG 4b — forward upgrade with NO prior schema floor (legacy latch) reseeds, not bricks", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    // A pre-DEBT-1 witness that established the latch WITHOUT a schema floor
+    // (legacy). An older-schema record must not be treated as a downgrade when
+    // there is no floor to compare against.
+    await raiseBaselineEstablishedLatch(storage, master, 0);
+    await writeOlderSchemaRecord(storage, 2);
+
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(outcome.kind).toBe("reseeded");
+  });
+
+  it("witness-untrusted residual: deleting BOTH records re-seeds (and re-raises the latch)", async () => {
+    const storage = new MemoryStorage();
+    const master = generateRandomKey();
+
+    await crossCheckConfigBaseline({ storage, master, config: strongConfig() });
+
+    // The attacker deletes BOTH the baseline record AND the master-MAC'd epoch
+    // witness (the documented full-wipe residual on a fortress with no other
+    // history). With no trustworthy latch, the gate cannot prove a baseline
+    // existed → it re-seeds, but RE-RAISES the latch so the next replay is caught.
+    await storage.delete(NAMESPACE, CONFIG_BASELINE_META_KEY);
+    await storage.delete(NAMESPACE, EPOCH_WITNESS_META_KEY);
+    expect(
+      (await readBaselineEstablishedLatch(storage, master)).witnessUntrusted
+    ).toBe(true);
+
+    const outcome = await crossCheckConfigBaseline({
+      storage,
+      master,
+      config: strongConfig(),
+    });
+    expect(outcome.kind).toBe("seeded");
+    expect((await readBaselineEstablishedLatch(storage, master)).established).toBe(
+      true
+    );
   });
 });
