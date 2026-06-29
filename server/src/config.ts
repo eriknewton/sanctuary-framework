@@ -167,6 +167,63 @@ export interface SanctuaryConfig {
   };
 }
 
+/**
+ * Why a config downgrade is refused. Surfaced in `ConfigDowngradeError` and
+ * (for the boot gate) in the audit trail; never carries secret values.
+ */
+export type ConfigDowngradeReason =
+  | "config_version_invalid"
+  | "config_version_rollback"
+  | "state_key_protection_downgrade"
+  | "execution_attestation_disabled"
+  | "dashboard_tls_disabled"
+  | "dashboard_plaintext_remote_enabled"
+  | "dashboard_auth_disabled"
+  | "webhook_gate_disabled"
+  | "privacy_filter_disabled"
+  | "privacy_fail_mode_downgrade"
+  | "config_baseline_invalid";
+
+export interface ConfigDowngrade {
+  field: string;
+  reason: ConfigDowngradeReason;
+  previous: unknown;
+  next: unknown;
+}
+
+export class ConfigDowngradeError extends Error {
+  constructor(public readonly downgrades: ConfigDowngrade[]) {
+    super(
+      "Sanctuary configuration downgrade refused: " +
+        downgrades.map((d) => `${d.field} (${d.reason})`).join(", ")
+    );
+    this.name = "ConfigDowngradeError";
+  }
+}
+
+/**
+ * The security-relevant projection of a config, captured in the authenticated
+ * baseline. Only fields whose weakening is a security downgrade are recorded;
+ * secrets are recorded as presence booleans, never as raw values.
+ */
+export interface ConfigSecurityPosture {
+  config_version: string;
+  state_key_protection: SanctuaryConfig["state"]["key_protection"];
+  execution_attestation: boolean;
+  dashboard_tls_configured: boolean;
+  dashboard_auth_configured: boolean;
+  /**
+   * Whether plaintext HTTP is permitted on non-loopback dashboard bindings.
+   * Flipping this false -> true is a security downgrade (it allows the operator
+   * console to serve unencrypted traffic on a routable interface), so the
+   * posture tracks it and the comparator gates it.
+   */
+  dashboard_allow_plaintext_remote: boolean;
+  webhook_enabled: boolean;
+  privacy_filter_mode: SanctuaryConfig["privacy_filter"]["mode"];
+  privacy_filter_fail_mode: SanctuaryConfig["privacy_filter"]["fail_mode"];
+}
+
 /** Default configuration */
 export function defaultConfig(): SanctuaryConfig {
   return {
@@ -836,4 +893,254 @@ export function assertSanctuaryConfigShape(c: Record<string, unknown>): void {
   if (typeof c.http_port !== "number" || !Number.isFinite(c.http_port)) {
     throw new Error(`Sanctuary config field "http_port" must be a finite number`);
   }
+}
+
+// ─── Config security-downgrade comparator ────────────────────────────────────
+//
+// These helpers detect whether one config posture is a SECURITY DOWNGRADE of
+// another. They are pure (no key, no I/O) and shared by the authenticated
+// boot-time baseline gate in `core/config-baseline.ts`. The comparator logic is
+// the sound half of the original (#791) downgrade gate; the FORGEABLE anchor it
+// shipped with (a plaintext adjacent `.security-baseline.json`) has been
+// discarded and replaced by a master-key-keyed MAC.
+
+/** Throw `ConfigDowngradeError` if `next` weakens any security posture vs `previous`. */
+export function assertNoConfigDowngrade(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): void {
+  const downgrades = detectConfigDowngrades(previous, next);
+  if (downgrades.length > 0) {
+    throw new ConfigDowngradeError(downgrades);
+  }
+}
+
+/** Enumerate every security-relevant field where `next` is weaker than `previous`. */
+export function detectConfigDowngrades(
+  previous: SanctuaryConfig,
+  next: SanctuaryConfig
+): ConfigDowngrade[] {
+  const downgrades: ConfigDowngrade[] = [];
+  const previousVersion = parseVersion(previous.version);
+  const nextVersion = parseVersion(next.version);
+  if (!previousVersion || !nextVersion) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_invalid",
+      previous: previous.version,
+      next: next.version,
+    });
+  } else if (compareParsedVersions(nextVersion, previousVersion) < 0) {
+    downgrades.push({
+      field: "version",
+      reason: "config_version_rollback",
+      previous: previous.version,
+      next: next.version,
+    });
+  }
+
+  const previousKeyProtection = keyProtectionRank(previous.state.key_protection);
+  const nextKeyProtection = keyProtectionRank(next.state.key_protection);
+  if (nextKeyProtection < previousKeyProtection) {
+    downgrades.push({
+      field: "state.key_protection",
+      reason: "state_key_protection_downgrade",
+      previous: previous.state.key_protection,
+      next: next.state.key_protection,
+    });
+  }
+
+  if (previous.execution.attestation && !next.execution.attestation) {
+    downgrades.push({
+      field: "execution.attestation",
+      reason: "execution_attestation_disabled",
+      previous: previous.execution.attestation,
+      next: next.execution.attestation,
+    });
+  }
+
+  if (hasDashboardTls(previous) && !hasDashboardTls(next)) {
+    downgrades.push({
+      field: "dashboard.tls",
+      reason: "dashboard_tls_disabled",
+      previous: previous.dashboard.tls,
+      next: next.dashboard.tls ?? null,
+    });
+  }
+
+  if (
+    previous.dashboard.allow_plaintext_remote !== true &&
+    next.dashboard.allow_plaintext_remote === true
+  ) {
+    downgrades.push({
+      field: "dashboard.allow_plaintext_remote",
+      reason: "dashboard_plaintext_remote_enabled",
+      previous: previous.dashboard.allow_plaintext_remote ?? false,
+      next: next.dashboard.allow_plaintext_remote,
+    });
+  }
+
+  if (hasDashboardAuth(previous) && !hasDashboardAuth(next)) {
+    downgrades.push({
+      field: "dashboard.auth_token",
+      reason: "dashboard_auth_disabled",
+      previous: redactConfiguredSecret(previous.dashboard.auth_token),
+      next: redactConfiguredSecret(next.dashboard.auth_token),
+    });
+  }
+
+  if (previous.webhook.enabled && !next.webhook.enabled) {
+    downgrades.push({
+      field: "webhook.enabled",
+      reason: "webhook_gate_disabled",
+      previous: previous.webhook.enabled,
+      next: next.webhook.enabled,
+    });
+  }
+
+  if (previous.privacy_filter.mode !== "off" && next.privacy_filter.mode === "off") {
+    downgrades.push({
+      field: "privacy_filter.mode",
+      reason: "privacy_filter_disabled",
+      previous: previous.privacy_filter.mode,
+      next: next.privacy_filter.mode,
+    });
+  }
+
+  if (
+    previous.privacy_filter.fail_mode === "closed" &&
+    next.privacy_filter.fail_mode === "fallback"
+  ) {
+    downgrades.push({
+      field: "privacy_filter.fail_mode",
+      reason: "privacy_fail_mode_downgrade",
+      previous: previous.privacy_filter.fail_mode,
+      next: next.privacy_filter.fail_mode,
+    });
+  }
+
+  return downgrades;
+}
+
+/** Project a full config to the security-relevant posture stored in the baseline. */
+export function securityPostureFromConfig(
+  config: SanctuaryConfig
+): ConfigSecurityPosture {
+  return {
+    config_version: config.version,
+    state_key_protection: config.state.key_protection,
+    execution_attestation: config.execution.attestation,
+    dashboard_tls_configured: hasDashboardTls(config),
+    dashboard_auth_configured: hasDashboardAuth(config),
+    dashboard_allow_plaintext_remote:
+      config.dashboard?.allow_plaintext_remote === true,
+    webhook_enabled: config.webhook.enabled,
+    privacy_filter_mode: config.privacy_filter.mode,
+    privacy_filter_fail_mode: config.privacy_filter.fail_mode,
+  };
+}
+
+/**
+ * Reconstruct a comparison config from a stored posture. The result is NOT a
+ * usable runtime config (only the security-relevant fields are meaningful); it
+ * exists purely so `detectConfigDowngrades` can compare the persisted posture
+ * against the running config with the same logic used for live saves.
+ */
+export function configFromSecurityPosture(
+  posture: ConfigSecurityPosture
+): SanctuaryConfig {
+  const config = defaultConfig();
+  config.version = posture.config_version;
+  config.state.key_protection = posture.state_key_protection;
+  config.execution.attestation = posture.execution_attestation;
+  config.dashboard = {
+    ...config.dashboard,
+    allow_plaintext_remote: posture.dashboard_allow_plaintext_remote,
+    ...(posture.dashboard_auth_configured ? { auth_token: "configured" } : {}),
+    ...(posture.dashboard_tls_configured
+      ? { tls: { cert_path: "configured", key_path: "configured" } }
+      : {}),
+  };
+  config.webhook.enabled = posture.webhook_enabled;
+  config.privacy_filter.mode = posture.privacy_filter_mode;
+  config.privacy_filter.fail_mode = posture.privacy_filter_fail_mode;
+  return config;
+}
+
+/** Type guard: a valid `state.key_protection` enum value. */
+export function isKeyProtectionValue(
+  value: unknown
+): value is SanctuaryConfig["state"]["key_protection"] {
+  return value === "none" || value === "passphrase" || value === "hardware-key";
+}
+
+/** Type guard: a valid `privacy_filter.mode` enum value. */
+export function isPrivacyFilterMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["mode"] {
+  return value === "local" || value === "opf" || value === "off";
+}
+
+/** Type guard: a valid `privacy_filter.fail_mode` enum value. */
+export function isPrivacyFailMode(
+  value: unknown
+): value is SanctuaryConfig["privacy_filter"]["fail_mode"] {
+  return value === "closed" || value === "fallback";
+}
+
+function hasDashboardTls(config: SanctuaryConfig): boolean {
+  const tls = config.dashboard.tls;
+  return (
+    typeof tls?.cert_path === "string" &&
+    tls.cert_path.trim().length > 0 &&
+    typeof tls.key_path === "string" &&
+    tls.key_path.trim().length > 0
+  );
+}
+
+function hasDashboardAuth(config: SanctuaryConfig): boolean {
+  const token = config.dashboard.auth_token;
+  return typeof token === "string" && token.trim().length > 0;
+}
+
+/** Reduce a secret-bearing field to a presence marker, never echoing the value. */
+function redactConfiguredSecret(value: string | undefined): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  return "configured";
+}
+
+function keyProtectionRank(
+  value: SanctuaryConfig["state"]["key_protection"]
+): number {
+  switch (value) {
+    case "none":
+      return 0;
+    case "passphrase":
+      return 1;
+    case "hardware-key":
+      return 2;
+  }
+}
+
+type ParsedVersion = readonly [number, number, number];
+
+function parseVersion(version: string): ParsedVersion | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/.exec(version);
+  if (!match) return null;
+  return [
+    Number.parseInt(match[1]!, 10),
+    Number.parseInt(match[2]!, 10),
+    Number.parseInt(match[3]!, 10),
+  ];
+}
+
+function compareParsedVersions(
+  left: ParsedVersion,
+  right: ParsedVersion
+): number {
+  for (let i = 0; i < 3; i += 1) {
+    const delta = left[i]! - right[i]!;
+    if (delta !== 0) return delta;
+  }
+  return 0;
 }

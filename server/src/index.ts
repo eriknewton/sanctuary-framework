@@ -126,6 +126,7 @@ import {
   evaluateAndEnforceRollback,
   evaluateAndEnforceRekorCounterFloor,
 } from "./core/anti-rollback.js";
+import { crossCheckConfigBaseline } from "./core/config-baseline.js";
 import {
   readCustodyEpochCount,
   probeAuditHeadAnchor,
@@ -343,6 +344,34 @@ export async function createSanctuaryServer(options?: {
         (err instanceof Error ? err.message : String(err))
     );
   }
+
+  // 5rc. Config-security-baseline cross-check (the custody-MAC config-downgrade
+  // gate; replaces #791's forgeable adjacent `.security-baseline.json`). The
+  // baseline is authenticated with a MAC keyed by the master key, so forging it
+  // requires the master key the on-host attacker lacks. This MUST run AFTER the
+  // master key is established (loadConfig at step 1 has no key, so the check
+  // cannot live there); it is adjacent to the 5rb/5rb2 anti-rollback checks.
+  //
+  // Unlike anti-rollback (which never refuses boot), this gate FAILS CLOSED and
+  // REFUSES boot on a detected downgrade OR any baseline authentication anomaly
+  // (tampered MAC, stripped marker, unparseable, schema mismatch). Refusing is
+  // correct here: a weakened/forged security posture is exactly what Sanctuary
+  // invariant #5 forbids us from silently accepting. A genuine first run (no
+  // prior baseline) seeds the current posture (the only accept path).
+  const configBaselineOutcome = await crossCheckConfigBaseline({
+    storage,
+    master: masterKey,
+    config,
+  });
+  await auditLog.appendCritical({
+    layer: "l2",
+    operation: "config_security_baseline_checked",
+    identity_id: fortressIdFromStoragePath(config.storage_path),
+    result: "success",
+    details: {
+      outcome: configBaselineOutcome.kind,
+    },
+  });
 
   // 5pre. Custody audit trail: record envelope creation/migration (never key
   // material — wrap types and install mode only), and surface the dual-path
