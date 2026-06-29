@@ -224,24 +224,93 @@ describe("release-manifest verifier", () => {
       // verifyReleaseManifest uses the PINNED key — must refuse.
       const result = verifyReleaseManifest(manifest);
       expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("bad_pinned_key");
     });
 
-    it("loadPinnedReleaseKey returns a 32-byte key (decodes) but cannot verify real sigs", () => {
-      const key = loadPinnedReleaseKey();
-      expect(key).not.toBeNull();
-      expect(key?.length).toBe(32);
+    it("loadPinnedReleaseKey REJECTS the all-zero placeholder (returns null)", () => {
+      // CRITICAL regression guard: the all-zero key is the Ed25519 identity
+      // point and would accept a zero-signature universal forgery. The pinned
+      // loader must refuse it so the gate truly fails closed until swap.
+      expect(loadPinnedReleaseKey()).toBeNull();
+    });
+  });
+
+  describe("CRITICAL: zero-signature / identity-point universal forgery is rejected", () => {
+    const ZERO_SIG_B64 = toBase64url(new Uint8Array(64));
+
+    it("verifyReleaseManifest refuses a zero-signature attacker manifest (was a universal forgery)", () => {
+      const attacker = {
+        body: { version: "99.9.9-evil", artifact_hashes: {} as Record<string, string> },
+        signature: ZERO_SIG_B64,
+      };
+      const result = verifyReleaseManifest(attacker);
+      expect(result.ok).toBe(false);
+    });
+
+    it("verifyAndAdviseUpdate REFUSES (no advise) a zero-signature manifest", async () => {
+      const attacker = {
+        body: { version: "99.9.9-evil", artifact_hashes: {} as Record<string, string> },
+        signature: ZERO_SIG_B64,
+      };
+      const out = await verifyAndAdviseUpdate(attacker);
+      expect(out.advise).toBe(false);
+    });
+
+    it("verifyReleaseManifestWithKey rejects an all-zero public key (bad_pinned_key)", () => {
+      const { privateKey } = generateKeypair();
+      const manifest = signManifest(BODY, privateKey);
+      const zeroKey = new Uint8Array(32);
+      const result = verifyReleaseManifestWithKey(manifest, zeroKey);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("bad_pinned_key");
+    });
+
+    it("verifyReleaseManifestWithKey rejects a zero signature even with a valid key (bad_signature)", () => {
+      const { publicKey } = generateKeypair();
+      const attacker = {
+        body: BODY,
+        signature: ZERO_SIG_B64,
+      };
+      const result = verifyReleaseManifestWithKey(attacker, publicKey);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("bad_signature");
+    });
+
+    it("the zero-sig forgery does NOT verify against the all-zero key directly (door slammed both ways)", () => {
+      const zeroKey = new Uint8Array(32);
+      const attacker = {
+        body: { version: "99.9.9-evil", artifact_hashes: {} as Record<string, string> },
+        signature: ZERO_SIG_B64,
+      };
+      // Even passing the identity-point key explicitly must refuse.
+      expect(verifyReleaseManifestWithKey(attacker, zeroKey).ok).toBe(false);
     });
   });
 
   describe("acceptance: each path emits an audit event", () => {
-    it("emits a refusal audit event on a malformed manifest", async () => {
+    it("emits a refusal audit event on a manifest the gate refuses", async () => {
+      // The audited gate uses the PINNED key, which is the rejected all-zero
+      // placeholder — so it refuses with `bad_pinned_key` before it even
+      // parses the body. The point of this test is the audit emission + the
+      // fail-closed advise:false; the reason reflects the pinned-key refusal
+      // while the placeholder stands. (The `malformed` reason itself is
+      // covered directly below against a valid key.)
       const { sink, events } = recordingSink();
       const out = await verifyAndAdviseUpdate({ body: BODY }, sink);
       expect(out.advise).toBe(false);
       expect(events).toHaveLength(1);
       expect(events[0]?.operation).toBe(UPDATE_MANIFEST_REFUSED_OP);
       expect(events[0]?.result).toBe("failure");
-      expect(events[0]?.details?.reason).toBe("malformed");
+      expect(events[0]?.details?.reason).toBe("bad_pinned_key");
+    });
+
+    it("the malformed refusal reason is produced against a valid key", () => {
+      // Direct coverage of the `malformed` path independent of the pinned
+      // placeholder: a missing signature against a real key -> malformed.
+      const { publicKey } = generateKeypair();
+      const result = verifyReleaseManifestWithKey({ body: BODY }, publicKey);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("malformed");
     });
 
     it("emits a refusal audit event on a wrong-key/tampered manifest (pinned placeholder)", async () => {

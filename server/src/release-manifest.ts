@@ -46,13 +46,31 @@ const ED25519_SIGNATURE_LENGTH = 64;
  * (Erik) and the release workflow signs the manifest with its private half;
  * this constant must be replaced with the real public key, and the release
  * pipeline wired to publish a signed manifest, before the signed-update path
- * is enabled in production. The placeholder is an all-zero key, which CANNOT
- * verify any real signature — so the gate fails closed until the swap lands.
- * It does NOT silently pass everything; tests exercise the mechanism with a
- * generated test keypair via `verifyReleaseManifestWithKey`.
+ * is enabled in production.
+ *
+ * SECURITY — why the placeholder is the all-zero key AND why it is explicitly
+ * rejected: the all-zero 32-byte value is the Ed25519 identity point. Under
+ * noble-curves (and Ed25519 generally) an all-zero signature verifies TRUE
+ * against the all-zero key for ANY message (the verification equation
+ * collapses to 0 == 0). So an all-zero pinned key is NOT inert — it is a
+ * universal-forgery key that would accept an attacker-crafted manifest with a
+ * zero signature. `loadPinnedReleaseKey` therefore REJECTS the placeholder
+ * (returns null), and `verifyReleaseManifestWithKey` rejects an all-zero key
+ * and an all-zero signature as defense-in-depth. Net effect: the gate truly
+ * fails closed until a real key is swapped in. Tests exercise the working
+ * mechanism with a generated test keypair via `verifyReleaseManifestWithKey`.
  */
 export const PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL =
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/** True iff every byte of `bytes` is zero (the Ed25519 identity point / a
+ * degenerate signature). Used to slam the universal-forgery door shut. */
+function isAllZero(bytes: Uint8Array): boolean {
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] !== 0) return false;
+  }
+  return true;
+}
 
 /**
  * The signed body of a release manifest. These fields — and ONLY these fields
@@ -158,6 +176,12 @@ export function verifyReleaseManifestWithKey(
   if (publicKey.length !== ED25519_PUBLIC_KEY_LENGTH) {
     return { ok: false, reason: "bad_pinned_key" };
   }
+  // Defense-in-depth: the all-zero public key is the curve identity point and
+  // is a universal-forgery key (a zero signature verifies against it for any
+  // message). Reject it outright so no caller can pass a degenerate key.
+  if (isAllZero(publicKey)) {
+    return { ok: false, reason: "bad_pinned_key" };
+  }
 
   const manifest = parseSignedManifest(value);
   if (manifest === null) {
@@ -172,6 +196,11 @@ export function verifyReleaseManifestWithKey(
   }
   if (signature.length !== ED25519_SIGNATURE_LENGTH) {
     return { ok: false, reason: "malformed" };
+  }
+  // Defense-in-depth: reject an all-zero signature. It is never a legitimate
+  // Ed25519 signature and is the forgery used against an identity-point key.
+  if (isAllZero(signature)) {
+    return { ok: false, reason: "bad_signature" };
   }
 
   let message: Uint8Array;
@@ -198,6 +227,12 @@ export function loadPinnedReleaseKey(): Uint8Array | null {
   try {
     const key = fromBase64url(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL);
     if (key.length !== ED25519_PUBLIC_KEY_LENGTH) return null;
+    // CRITICAL: reject the all-zero placeholder. The all-zero key is the
+    // Ed25519 identity point and accepts a zero signature for ANY message —
+    // a universal forgery. Returning null here makes "fails closed until the
+    // real key is swapped in" actually true: the gate refuses with
+    // `bad_pinned_key` rather than accepting forged manifests.
+    if (isAllZero(key)) return null;
     return key;
   } catch {
     return null;
