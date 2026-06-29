@@ -48,6 +48,37 @@
  * raw socket itself, so a dialer that respects the wrapped-fetch contract
  * cannot create an unwrapped egress path.
  *
+ * ── Connection-reuse hygiene (Slice 1.5, F-6) ───────────────────────────
+ *
+ * A reused tunnel connection is a within-crowd linkage channel: if two
+ * queries ride the same relay→egress tunnel (a kept-alive socket, a TLS
+ * session ticket, or a pooled/cached `TunnelFetch` handed back twice), a
+ * downstream observer can correlate those queries to one origin and the
+ * *effective* anonymity set collapses below the raw crowd size k (F-6 /
+ * HIGH-2 in the Property-2 design review). The reference dialer below
+ * already opens a fresh tunnel per `dial()` and forbids a second request
+ * on its single bound socket, but that is the dialer's own discipline.
+ * This slice makes no-reuse a **transport-enforced invariant that binds
+ * EVERY `TunnelDialer`**, reference or production, so a dialer that pools
+ * or keep-alives connections cannot leak through the seam:
+ *
+ *   1. Single-use per tunnel: a `TunnelFetch` returned by `dial()` is
+ *      allowed to serve at most ONE request; the transport closes it
+ *      immediately after that request (or its streamed body) completes,
+ *      so a kept-alive socket cannot carry a second query.
+ *   2. No handle aliasing: if a dialer ever returns the SAME `TunnelFetch`
+ *      instance for two queries (a pooled/cached tunnel), the transport
+ *      refuses to reuse it and fails closed (a reused handle is exactly
+ *      the correlatable connection F-6 describes).
+ *
+ * This does NOT measure or claim an anonymity-set size (that is Slice 2/3
+ * and gated on Erik's D-1..D-7 decisions); it only removes the cheap,
+ * in-scope connection-reuse contributor to F-6 so that any future honest
+ * Property-2 claim is not built over an open linkage channel. Fail-closed
+ * and disarmed-by-default are unchanged: a reuse violation is treated as a
+ * tunnel failure and routed through the existing `onTunnelFailure` policy
+ * (DENY by default), never a silent direct connection.
+ *
  * ── Fail-closed (WA-5) ──────────────────────────────────────────────────
  *
  * When the transport is armed but the tunnel cannot be established, the
@@ -243,6 +274,13 @@ export const TIER3_AUDIT_OPS = {
    * Surfaced loudly because it defeats Tier 3 for that request.
    */
   DEANON_FALLBACK: "query_anonymity_tier3_deanon_fallback",
+  /**
+   * A dialer handed back a tunnel handle that had already served a request
+   * (a pooled / aliased / kept-alive reuse). The transport refused to reuse
+   * it (a reused connection is an F-6 within-crowd linkage channel) and
+   * routed the query through the fail-closed policy instead (Slice 1.5).
+   */
+  REUSE_REJECTED: "query_anonymity_tier3_connection_reuse_rejected",
 } as const;
 
 export type Tier3AuditOp = (typeof TIER3_AUDIT_OPS)[keyof typeof TIER3_AUDIT_OPS];
@@ -302,6 +340,14 @@ export function createTunneledFetch(
     // not opted in.
     return baseFetch;
   }
+
+  // Slice 1.5 (F-6) connection-reuse hygiene: remember every tunnel handle
+  // this transport has already routed a query through. If a dialer ever
+  // hands the SAME handle back (a pooled / cached tunnel), reusing it would
+  // link the two queries on one connection and collapse the effective
+  // anonymity set. We refuse to reuse it and fail closed. A `WeakSet` keys
+  // on object identity and never retains the handle past its own lifetime.
+  const seenTunnels = new WeakSet<TunnelFetch>();
 
   const wrapped: typeof fetch = async (input, init) => {
     const destination = resolveDestination(input);
@@ -365,24 +411,62 @@ export function createTunneledFetch(
       );
     }
 
+    // Slice 1.5 (F-6): a tunnel handle may serve at most one query. If the
+    // dialer returned a handle we have already routed through, it is a
+    // pooled / aliased connection, and reusing it correlates the two queries.
+    // Refuse and fail closed (the handle is torn down so the pooled socket
+    // does not linger). This binds on EVERY dialer, not just the reference
+    // one, so a production keep-alive/pooling dialer cannot leak here.
+    if (seenTunnels.has(tunnel)) {
+      try {
+        tunnel.close();
+      } catch {
+        /* best-effort teardown of the reused handle */
+      }
+      onAudit?.({
+        op: TIER3_AUDIT_OPS.REUSE_REJECTED,
+        destinationHost: destination.host,
+        mode: config.mode,
+        posture: config.posture,
+        dialerLabel: config.dialer.label,
+        egressIp: null,
+      });
+      return handleTunnelFailure(
+        baseFetch,
+        config,
+        onAudit,
+        destination.host,
+        config.dialer.label,
+        input,
+        init,
+        new Error("dialer returned a reused tunnel handle (F-6 connection reuse)"),
+      );
+    }
+    seenTunnels.add(tunnel);
+
+    // Single-use enforcement: wrap the handle so it is hard-closed after one
+    // request (or one streamed body). A dialer that keeps its socket alive
+    // for reuse cannot carry a second query through this transport.
+    const singleUse = makeSingleUseTunnel(tunnel);
+
     try {
-      const response = await tunnel.fetch(input, init);
+      const response = await singleUse.fetch(input, init);
       onAudit?.({
         op: TIER3_AUDIT_OPS.TUNNEL_USED,
         destinationHost: destination.host,
         mode: config.mode,
         posture: config.posture,
         dialerLabel: config.dialer.label,
-        egressIp: tunnel.egressIp,
+        egressIp: singleUse.egressIp,
       });
       // Return the Response with its streaming body intact (AC-4). The
       // tunnel handle is closed once the body has been fully consumed.
-      return wrapResponseForTunnelClose(response, tunnel);
+      return wrapResponseForTunnelClose(response, singleUse);
     } catch (err) {
       // The tunnel was established but the request failed mid-flight. Do
       // NOT retry direct (that would deanonymize). Apply the fail-closed
       // policy; the tunnel is torn down.
-      tunnel.close();
+      singleUse.close();
       return handleTunnelFailure(
         baseFetch,
         config,
@@ -397,6 +481,45 @@ export function createTunneledFetch(
   };
 
   return wrapped;
+}
+
+/**
+ * Slice 1.5 (F-6) single-use wrapper. Wraps a `TunnelFetch` so that:
+ *   - its `fetch` may be invoked at most once; a second call throws rather
+ *     than carrying a second query over the same (possibly kept-alive)
+ *     connection, and
+ *   - `close()` is idempotent and is guaranteed to fire after that one
+ *     request (or its streamed body) completes, tearing down any socket the
+ *     dialer might otherwise have kept alive for reuse.
+ *
+ * This makes "one tunnel, one query" a transport-enforced invariant that
+ * binds every dialer, so a pooling / keep-alive dialer cannot create a
+ * cross-query connection-reuse linkage at this seam. `egressIp` is passed
+ * through unchanged.
+ */
+function makeSingleUseTunnel(tunnel: TunnelFetch): TunnelFetch {
+  let fetched = false;
+  let closed = false;
+  const closeOnce = () => {
+    if (closed) return;
+    closed = true;
+    tunnel.close();
+  };
+  return {
+    egressIp: tunnel.egressIp,
+    fetch: ((input, init) => {
+      if (fetched) {
+        // Reuse of this handle would link a second query to the first over
+        // the same connection (F-6). Refuse rather than serve it.
+        throw new Error(
+          "tunnel handle already used (Slice 1.5: one tunnel serves one query)",
+        );
+      }
+      fetched = true;
+      return tunnel.fetch(input, init);
+    }) as typeof fetch,
+    close: closeOnce,
+  };
 }
 
 /**
