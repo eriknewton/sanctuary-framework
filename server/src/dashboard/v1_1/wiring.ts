@@ -69,6 +69,12 @@ import {
   detectorClassForSpan,
 } from "../../operational/privacy-filter.js";
 import { listTemplates } from "../../templates/registry.js";
+import type { ConsoleService } from "../../console/console-service.js";
+import { SentinelFindingStore } from "../../sentinel/sentinel-finding-store.js";
+import { AnomalyPipelineDispatcher } from "../../anomaly-detection/anomaly-pipeline.js";
+import { EnglishPolicyDraftStore } from "../../policy-engine/english-policy-routes.js";
+import { EnglishPolicyCompiler } from "../../policy-engine/english-policy-compiler.js";
+import type { EnglishPolicyActivator } from "../../policy-engine/english-policy-activator.js";
 import {
   DID_WEB_AUDIT_OPS,
   dropExpiredDidWebKeys,
@@ -135,6 +141,46 @@ export interface BuildV11BindingsInputs {
    * `principal-policy.yaml` `concierge_memory_retention_days`.
    */
   conciergeMemoryRetentionDays?: number;
+  /**
+   * Operator Console domain service. The console (`/api/console/*`,
+   * `/console` static) is mounted behind the shared dashboard auth
+   * chokepoint when this is present. Constructed by the entry point
+   * (which owns the FortressService + node/principal signing keys); the
+   * dashboard wiring layer stays storage-agnostic and does not build it.
+   * Omit and the prefix answers 503 "not configured" (after auth).
+   */
+  consoleService?: ConsoleService;
+  /**
+   * Optional static asset dir for the console SPA, threaded to
+   * `handleConsoleRoute`'s `publicDir`.
+   */
+  consolePublicDir?: string;
+  /**
+   * Optional English-authored-policy activation lifecycle. When present
+   * it is threaded into the `/api/policy/*` routes so activate / revoke /
+   * status work; absent, the compile-only review surface still works and
+   * the lifecycle routes return 503.
+   */
+  englishPolicyActivator?: EnglishPolicyActivator;
+}
+
+/** Anomaly-detection binding mounted behind the dashboard auth chokepoint. */
+export interface V11AnomalyBinding {
+  dispatcher: AnomalyPipelineDispatcher;
+  findingStore: SentinelFindingStore;
+  auditLog: AuditLog;
+  identityId: string;
+  storage: StorageBackend;
+  masterKey: Uint8Array;
+  fortressId: string;
+}
+
+/** English-policy binding mounted behind the dashboard auth chokepoint. */
+export interface V11EnglishPolicyBinding {
+  compiler: EnglishPolicyCompiler;
+  store: EnglishPolicyDraftStore;
+  activator?: EnglishPolicyActivator;
+  defaultOperatorId?: string;
 }
 
 export interface V11Bindings {
@@ -156,6 +202,26 @@ export interface V11Bindings {
    * side `recordAgentReply` integration also need the service handle.
    */
   operatorChatService?: OperatorChatService;
+  /**
+   * Optional Operator Console domain service. When present the dispatch
+   * layer mounts `/api/console/*` (+ `/console`) behind the shared auth
+   * chokepoint; absent, the prefix answers 503 after auth.
+   */
+  consoleService?: ConsoleService;
+  /** Optional static asset dir for the console SPA. */
+  consolePublicDir?: string;
+  /**
+   * Optional Anomaly-detection binding. Constructed when storage +
+   * masterKey are passed to `buildV11Bindings`. Dispatch mounts
+   * `/api/anomaly/*` behind the shared auth chokepoint when set.
+   */
+  anomaly?: V11AnomalyBinding;
+  /**
+   * Optional English-authored-policy binding. Constructed when storage +
+   * masterKey are passed to `buildV11Bindings`. Dispatch mounts
+   * `/api/policy/*` behind the shared auth chokepoint when set.
+   */
+  englishPolicy?: V11EnglishPolicyBinding;
 }
 
 async function pruneExpiredDidWebKeysOnUnlock(
@@ -325,6 +391,56 @@ export function buildV11Bindings(
     });
   }
 
+  // Anomaly-detection binding: constructible whenever the fortress
+  // storage + master key are wired (same trigger as the chat service).
+  // Mounted by the dispatch layer behind the shared auth chokepoint.
+  let anomaly: V11AnomalyBinding | undefined;
+  if (inputs.storage && inputs.masterKey) {
+    const findingStore = new SentinelFindingStore({
+      storage: inputs.storage,
+      masterKey: inputs.masterKey,
+      fortressId: inputs.fortressId,
+    });
+    const dispatcher = new AnomalyPipelineDispatcher({
+      findingStore,
+      auditLog: inputs.auditLog,
+      storage: inputs.storage,
+      masterKey: inputs.masterKey,
+      fortressId: inputs.fortressId,
+      identityId: inputs.identityId,
+      // Dashboard-mounted dispatcher serves the read/subscribe HTTP
+      // surface; the background tick lifecycle is owned by the sentinel
+      // boot path, so disable auto-tick here to avoid a duplicate timer.
+      tickIntervalMs: 0,
+    });
+    anomaly = {
+      dispatcher,
+      findingStore,
+      auditLog: inputs.auditLog,
+      identityId: inputs.identityId,
+      storage: inputs.storage,
+      masterKey: inputs.masterKey,
+      fortressId: inputs.fortressId,
+    };
+  }
+
+  // English-authored-policy binding: compiler + in-memory review-draft
+  // store. The substrate selector (when present) powers the LLM-assist
+  // compile path; absent it, the deterministic matcher still works. The
+  // activation lifecycle is optional and threaded through when supplied.
+  const englishPolicy: V11EnglishPolicyBinding = {
+    compiler: new EnglishPolicyCompiler({
+      auditLog: inputs.auditLog,
+      fortressId: inputs.fortressId,
+      selector: inputs.intelligenceSelector ?? null,
+    }),
+    store: new EnglishPolicyDraftStore(),
+    ...(inputs.englishPolicyActivator
+      ? { activator: inputs.englishPolicyActivator }
+      : {}),
+    defaultOperatorId: inputs.identityId,
+  };
+
   const hubService = new HubService({
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
@@ -416,6 +532,12 @@ export function buildV11Bindings(
       ? { intelligenceSelector: inputs.intelligenceSelector }
       : {}),
     ...(operatorChatService ? { operatorChatService } : {}),
+    ...(inputs.consoleService ? { consoleService: inputs.consoleService } : {}),
+    ...(inputs.consolePublicDir !== undefined
+      ? { consolePublicDir: inputs.consolePublicDir }
+      : {}),
+    ...(anomaly ? { anomaly } : {}),
+    englishPolicy,
   };
 }
 
