@@ -15,10 +15,14 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { buildPrivacyTier2Redactor } from "../../src/intelligence/privacy-tier2-redactor.js";
+import {
+  buildPrivacyTier2Redactor,
+  buildConsentGatedTier2Redactor,
+} from "../../src/intelligence/privacy-tier2-redactor.js";
 import { SubstrateSelector, IDENTITY_REDACTOR } from "../../src/intelligence/selector.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import { PrivacyPlaceholderVault } from "../../src/operational/privacy-filter.js";
+import { PiiConfigStore } from "../../src/query-anonymity/pii-config-store.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -180,6 +184,148 @@ describe("Tier 2 redactor — frontier substrate end-to-end", () => {
     expect(captured.length).toBe(1);
     expect(captured[0]!.body).not.toContain("alice@example.com");
     expect(captured[0]!.body).toContain("EMAIL_");
+  });
+});
+
+describe("buildConsentGatedTier2Redactor — opt-in gating", () => {
+  function gatedHarness() {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const vault = new PrivacyPlaceholderVault(storage, masterKey);
+    const fortressId = "gated-fortress";
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-identity",
+    });
+    const configStore = new PiiConfigStore({ storage, masterKey, fortressId });
+    const redactor = buildConsentGatedTier2Redactor({
+      selector,
+      vault,
+      surface: "concierge",
+      substrate: "frontier-with-filter",
+      configStore,
+    });
+    return { storage, masterKey, auditLog, vault, selector, configStore, redactor };
+  }
+
+  it("passes text through unchanged when Tier B is OFF (default)", async () => {
+    const { redactor, selector, auditLog } = gatedHarness();
+    await selector.load();
+    const result = await redactor("contact alice@example.com today");
+    // Disabled -> no scrub, original preserved.
+    expect(result.redacted).toBe("contact alice@example.com today");
+    expect(result.matchCount).toBe(0);
+    // Transparency: emits filter_tier:1 so the UI shows Tier 2 did NOT run.
+    const events = await auditLog.query({
+      operation_type: INTEL_OPS.PII_REDACTION_EVENT,
+    });
+    expect(events.entries.length).toBe(1);
+    expect(
+      (events.entries[0]!.details as { filter_tier: number }).filter_tier,
+    ).toBe(1);
+  });
+
+  it("the store refuses enabled-without-consent, so the gate never sees an unconsented-active state", async () => {
+    const { redactor, selector, configStore } = gatedHarness();
+    await selector.load();
+    // Consent is enforced at WRITE time: you cannot persist enabled=true
+    // without consent. This is why the redactor gate (which also requires
+    // consent) can never be tricked into scrubbing/claiming-active for an
+    // unconsented operator.
+    await expect(configStore.patch({ enabled: true })).rejects.toThrow();
+    // With the write refused, config stays default-off -> passthrough.
+    const result = await redactor("contact alice@example.com today");
+    expect(result.redacted).toBe("contact alice@example.com today");
+    expect(result.matchCount).toBe(0);
+  });
+
+  it("SCRUBS PII when the operator enabled Tier B AND consented", async () => {
+    const { redactor, selector, configStore } = gatedHarness();
+    await selector.load();
+    await configStore.patch({ enabled: true, consented_to_trade_off: true });
+    const result = await redactor("contact alice@example.com today");
+    // Opted-in + consented -> real Tier 2 scrub.
+    expect(result.redacted).not.toContain("alice@example.com");
+    expect(result.redacted).toMatch(/EMAIL_/);
+    expect(result.matchCount).toBe(1);
+  });
+
+  it("SCRUBS when smart mode is enabled (with consent) even if basic enabled is off", async () => {
+    const { redactor, selector, configStore } = gatedHarness();
+    await selector.load();
+    await configStore.patch({
+      smart_mode_enabled: true,
+      consented_to_trade_off: true,
+    });
+    const result = await redactor("ping bob@example.com");
+    expect(result.redacted).not.toContain("bob@example.com");
+    expect(result.matchCount).toBe(1);
+  });
+
+  it("end-to-end: an actual outbound frontier query is scrubbed only after opt-in", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const vault = new PrivacyPlaceholderVault(storage, masterKey);
+    const fortressId = "e2e-fortress";
+    const configStore = new PiiConfigStore({ storage, masterKey, fortressId });
+
+    const captured: { body: string }[] = [];
+    const fetchImpl = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      captured.push({ body: init?.body ? String(init.body) : "" });
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "summary" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-identity",
+      fetchImpl,
+    });
+    await selector.load();
+    selector.installRedactor(
+      buildConsentGatedTier2Redactor({
+        selector,
+        vault,
+        surface: "concierge",
+        substrate: "frontier-with-filter",
+        configStore,
+      }),
+    );
+    await selector.setPerSurfaceChoice("concierge", "frontier-with-filter");
+    await selector.setFrontierApiKey("anthropic", "test-key");
+
+    // First call: Tier B OFF -> the real value reaches the substrate.
+    await selector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "user alice@example.com asked about taxes",
+      query: "summarize",
+    });
+    expect(captured.length).toBe(1);
+    expect(captured[0]!.body).toContain("alice@example.com");
+
+    // Operator opts in with consent.
+    await configStore.patch({ enabled: true, consented_to_trade_off: true });
+
+    // Second call: now the outbound body is scrubbed.
+    await selector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "user alice@example.com asked about taxes",
+      query: "summarize",
+    });
+    expect(captured.length).toBe(2);
+    expect(captured[1]!.body).not.toContain("alice@example.com");
+    expect(captured[1]!.body).toContain("EMAIL_");
   });
 });
 

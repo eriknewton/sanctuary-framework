@@ -139,6 +139,10 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+import { buildConsentGatedTier2Redactor } from "./intelligence/privacy-tier2-redactor.js";
+import { PiiConfigStore } from "./query-anonymity/pii-config-store.js";
+import { PrivacyPlaceholderVault } from "./operational/privacy-filter.js";
+import { PII_REWRITE_LLM_SURFACE } from "./query-anonymity/pii-rewrite.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -909,6 +913,12 @@ export async function createSanctuaryServer(options?: {
   // alongside the trap registry + trap store, so the declaration moves
   // here and the dashboard branch only assigns to it.
   let intelligenceSelector: SubstrateSelector | undefined;
+  // Rho-2.5: whether the consent-gated Tier B redactor was installed on
+  // the selector above. Threaded into the v1.1 PII binding so the
+  // `/api/query-anonymity/pii` route reports the truthful
+  // `effective_tier_b_enabled`. Stays false when the selector failed to
+  // construct (the route then honestly reports inactive).
+  let tierBPiiRedactorInstalled = false;
 
   if (config.dashboard.enabled) {
     // Resolve auth token: "auto" generates a random 32-byte hex token
@@ -964,6 +974,31 @@ export async function createSanctuaryServer(options?: {
         identityId: embeddedHubIdentityId,
       });
       await intelligenceSelector.load();
+      // Rho-2.5: install the consent-gated Tier B PII redactor on the
+      // production selector, replacing the default passthrough
+      // IDENTITY_REDACTOR. The redactor closes over the selector (for
+      // audit emission) and the per-fortress PiiConfigStore (read per
+      // call): it scrubs ONLY when the operator enabled Tier B AND
+      // consented; otherwise it passes through and audit-emits
+      // filter_tier:1. Late-binding via installRedactor avoids the
+      // selector<->redactor construction cycle. The same PiiConfigStore
+      // shape is rebuilt inside buildV11Bindings for the route; both read
+      // the same encrypted at-rest config (per-fortress AAD), so the
+      // toggle and the live scrubbing path never diverge.
+      tierBPiiRedactorInstalled = true;
+      intelligenceSelector.installRedactor(
+        buildConsentGatedTier2Redactor({
+          selector: intelligenceSelector,
+          vault: new PrivacyPlaceholderVault(storage, masterKey),
+          surface: PII_REWRITE_LLM_SURFACE,
+          substrate: "frontier-with-filter",
+          configStore: new PiiConfigStore({
+            storage,
+            masterKey,
+            fortressId: fortressIdFromStoragePath(config.storage_path),
+          }),
+        }),
+      );
     } catch (err) {
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(
@@ -971,6 +1006,7 @@ export async function createSanctuaryServer(options?: {
           `Run \`sanctuary dashboard\` and pick a substrate.`,
       );
       intelligenceSelector = undefined;
+      tierBPiiRedactorInstalled = false;
     }
     dashboard.setV11Bindings(
       buildV11Bindings({
@@ -991,6 +1027,10 @@ export async function createSanctuaryServer(options?: {
         reputationStore,
         policy,
         config,
+        // Rho-2.5: the consent-gated Tier B redactor is installed on the
+        // selector above, so the /api/query-anonymity/pii route reports
+        // the truthful `effective_tier_b_enabled`.
+        tierBPiiRedactorInstalled,
       }),
     );
     // Loopback auto-auth (parity with `sanctuary dashboard`,

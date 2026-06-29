@@ -75,6 +75,8 @@ import { AnomalyPipelineDispatcher } from "../../anomaly-detection/anomaly-pipel
 import { EnglishPolicyDraftStore } from "../../policy-engine/english-policy-routes.js";
 import { EnglishPolicyCompiler } from "../../policy-engine/english-policy-compiler.js";
 import type { EnglishPolicyActivator } from "../../policy-engine/english-policy-activator.js";
+import { PiiConfigStore } from "../../query-anonymity/pii-config-store.js";
+import { ReverseMappingStore } from "../../query-anonymity/reverse-mapping-store.js";
 import {
   DID_WEB_AUDIT_OPS,
   dropExpiredDidWebKeys,
@@ -162,6 +164,15 @@ export interface BuildV11BindingsInputs {
    * the lifecycle routes return 503.
    */
   englishPolicyActivator?: EnglishPolicyActivator;
+  /**
+   * Whether the entry point installed the consent-gated Tier B PII
+   * redactor (`buildConsentGatedTier2Redactor`) on the production
+   * substrate selector for this fortress. Threaded into the
+   * `/api/query-anonymity/pii` route so `effective_tier_b_enabled`
+   * reports the truthful active state. Defaults to false; an unwired
+   * binding reports inactive.
+   */
+  tierBPiiRedactorInstalled?: boolean;
 }
 
 /** Anomaly-detection binding mounted behind the dashboard auth chokepoint. */
@@ -173,6 +184,21 @@ export interface V11AnomalyBinding {
   storage: StorageBackend;
   masterKey: Uint8Array;
   fortressId: string;
+}
+
+/**
+ * Tier B PII-rewrite binding mounted behind the dashboard auth
+ * chokepoint at `/api/query-anonymity/pii`. The `redactorInstalled`
+ * flag carries whether the production substrate selector actually has
+ * the consent-gated redactor installed, so the route reports the
+ * truthful `effective_tier_b_enabled`.
+ */
+export interface V11PiiRewriteBinding {
+  store: PiiConfigStore;
+  auditLog: AuditLog;
+  identityId: string;
+  fortressId: string;
+  redactorInstalled: boolean;
 }
 
 /** English-policy binding mounted behind the dashboard auth chokepoint. */
@@ -222,6 +248,13 @@ export interface V11Bindings {
    * `/api/policy/*` behind the shared auth chokepoint when set.
    */
   englishPolicy?: V11EnglishPolicyBinding;
+  /**
+   * Optional Tier B PII-rewrite binding. Constructed when storage +
+   * masterKey are passed to `buildV11Bindings`. Dispatch mounts
+   * `/api/query-anonymity/pii` behind the shared auth chokepoint when
+   * set; absent, the prefix answers 503 after auth.
+   */
+  pii?: V11PiiRewriteBinding;
 }
 
 async function pruneExpiredDidWebKeysOnUnlock(
@@ -340,6 +373,21 @@ export function buildV11Bindings(
   // wired the service still works for direct-agent and concierge
   // returns the honest "Concierge unavailable; substrate not configured"
   // surface so the chat history reflects exactly what the operator sees.
+  // Rho-2.5: per-fortress Tier B PII-rewrite config store. Constructed
+  // once when storage + master key are wired, then shared by (a) the
+  // chat service (smart-mode rewrite gate, read at invocation time) and
+  // (b) the `/api/query-anonymity/pii` route binding. Sharing one store
+  // means the operator's PATCH /config and the live scrubbing path read
+  // the same persisted state.
+  let piiConfigStore: PiiConfigStore | undefined;
+  if (inputs.storage && inputs.masterKey) {
+    piiConfigStore = new PiiConfigStore({
+      storage: inputs.storage,
+      masterKey: inputs.masterKey,
+      fortressId: inputs.fortressId,
+    });
+  }
+
   let operatorChatService: OperatorChatService | undefined;
   if (inputs.storage && inputs.masterKey) {
     const chatStore = new OperatorChatStore(inputs.storage, inputs.masterKey);
@@ -374,6 +422,27 @@ export function buildV11Bindings(
         registry,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
+      // Rho-2.5: thread the live Tier B config so the concierge smart-mode
+      // rewrite path reads `shouldRewriteSmartMode()` at invocation time.
+      // The reverse-mapping store (encrypted, per-fortress) is required
+      // for the smart-mode path to fire end-to-end (store mappings ->
+      // restore at render); wired here when storage + master key + a
+      // storage path are available.
+      ...(piiConfigStore
+        ? {
+            queryAnonymityConfig: piiConfigStore,
+            queryAnonymityFortressId: inputs.fortressId,
+          }
+        : {}),
+      ...(piiConfigStore && inputs.storage && inputs.masterKey && inputs.storagePath
+        ? {
+            queryAnonymityReverseMappingStore: new ReverseMappingStore({
+              fortressPath: inputs.storagePath,
+              masterKey: inputs.masterKey,
+              storage: inputs.storage,
+            }),
+          }
+        : {}),
       conciergeMemory,
       conciergeContextFetchers: buildConciergeContextFetchers({
         auditLog: inputs.auditLog,
@@ -421,6 +490,23 @@ export function buildV11Bindings(
       storage: inputs.storage,
       masterKey: inputs.masterKey,
       fortressId: inputs.fortressId,
+    };
+  }
+
+  // Rho-2.5: Tier B PII-rewrite binding. Constructible whenever the
+  // fortress storage + master key are wired (same trigger as the chat
+  // service + anomaly binding). Mounted by the dispatch layer behind the
+  // shared auth chokepoint. `redactorInstalled` reports whether the
+  // entry point actually installed the consent-gated redactor on the
+  // selector, so the route surfaces the truthful effective state.
+  let pii: V11PiiRewriteBinding | undefined;
+  if (piiConfigStore) {
+    pii = {
+      store: piiConfigStore,
+      auditLog: inputs.auditLog,
+      identityId: inputs.identityId,
+      fortressId: inputs.fortressId,
+      redactorInstalled: inputs.tierBPiiRedactorInstalled ?? false,
     };
   }
 
@@ -538,6 +624,7 @@ export function buildV11Bindings(
       : {}),
     ...(anomaly ? { anomaly } : {}),
     englishPolicy,
+    ...(pii ? { pii } : {}),
   };
 }
 

@@ -28,9 +28,11 @@
  * `consoleService` input; anomaly + policy bindings auto-construct from
  * `storage` + `masterKey`.
  *
- * A fourth prefix — `/api/query-anonymity/pii` — is deliberately PARKED
- * (not mounted; redactor not wired in this build). The final test pins
- * that it does NOT reach a wired handler.
+ * A fourth prefix — `/api/query-anonymity/pii` — is NOW WIRED (Rho-2.5):
+ * mounted behind the same auth chokepoint, with the consent-gated Tier B
+ * redactor installed on the production selector. The tests below pin the
+ * same gate property for it (401 without bearer; reaches handler with
+ * bearer), and the absent-binding rig pins match-then-auth-then-503.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -49,6 +51,7 @@ import { FortressService } from "../../src/fortress/index.js";
 import { CONSOLE_API_PREFIX } from "../../src/console/constants.js";
 import { ANOMALY_API_PREFIX } from "../../src/anomaly-detection/anomaly-routes.js";
 import { ENGLISH_POLICY_API_PREFIX } from "../../src/policy-engine/english-policy-routes.js";
+import { PII_REWRITE_API_PREFIX } from "../../src/query-anonymity/pii-rewrite-routes.js";
 import { getFreePort } from "../helpers/free-port.js";
 
 const IDENTITY_ID = "operator-test-routes";
@@ -236,19 +239,31 @@ describe("wire-unmounted-routes — auth gate holds on every newly-wired prefix"
     expect(res.status).toBe(401);
   });
 
-  // ── /api/query-anonymity/pii is PARKED (not wired) ───────────────────
+  // ── /api/query-anonymity/pii is NOW WIRED (Rho-2.5) ──────────────────
 
-  it("PARKED: /api/query-anonymity/pii does NOT reach a wired handler", async () => {
-    // The pii-rewrite prefix is explicitly NOT mounted in this PR (the
-    // redactor is not wired in this build; Erik-confirmed next build).
-    // With a valid bearer it must NOT produce a wired-handler 200; it
-    // falls through to the legacy table (404). This pins that we did not
-    // accidentally light it up.
+  it("GET /api/query-anonymity/pii/config without a bearer is REJECTED (401)", async () => {
+    const res = await fetch(`${rig.baseUrl}/api/query-anonymity/pii/config`);
+    expect(res.status).toBe(401);
+  });
+
+  it("GET /api/query-anonymity/pii/config WITH the operator bearer REACHES the handler (not 404/401)", async () => {
     const res = await fetch(
-      `${rig.baseUrl}/api/query-anonymity/pii`,
+      `${rig.baseUrl}/api/query-anonymity/pii/config`,
       { headers: { Authorization: `Bearer ${rig.authToken}` } },
     );
-    expect(res.status).toBe(404);
+    // Reaches the wired handler: a real domain response, not the auth 401
+    // and not a 404 (which would mean the prefix is still unmounted).
+    expect(res.status).not.toBe(401);
+    expect(res.status).not.toBe(404);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      data: { effective_tier_b_enabled: boolean };
+    };
+    expect(body.ok).toBe(true);
+    // The route reports the truthful effective state (default off ->
+    // false here; the redactorInstalled flag is not threaded by this rig).
+    expect(typeof body.data.effective_tier_b_enabled).toBe("boolean");
   });
 
   // ── Hub behavior unchanged (regression guard) ────────────────────────
@@ -341,5 +356,20 @@ describe("wire-unmounted-routes — bindings absent: match-then-auth-then-503 (n
   it("anomaly binding absent: no bearer -> 401 (auth runs before the 503)", async () => {
     const res = await fetch(`${baseUrl}${ANOMALY_API_PREFIX}/detectors`);
     expect(res.status).toBe(401);
+  });
+
+  it("pii binding absent: no bearer -> 401 (auth runs before the 503)", async () => {
+    const res = await fetch(`${baseUrl}${PII_REWRITE_API_PREFIX}/config`);
+    expect(res.status).toBe(401);
+  });
+
+  it("pii binding absent: WITH bearer -> 503 not_configured (gate passed, honestly unconfigured)", async () => {
+    const res = await fetch(`${baseUrl}${PII_REWRITE_API_PREFIX}/config`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { ok: boolean; error: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe("pii_rewrite_not_configured");
   });
 });

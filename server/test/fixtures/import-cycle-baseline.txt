@@ -2,7 +2,7 @@
   Sanctuary import-cycle baseline (server/src)
 ============================================================
   files scanned ......... 736
-  intra-src edges ....... 3298
+  intra-src edges ....... 3311
   self-imports .......... 0
   cycles (SCC size > 1) . 9
 
@@ -15,7 +15,7 @@ Cycle 1  (4 files):
     principal-policy/gate.ts
     router.ts
 
-Cycle 2  (11 files):
+Cycle 2  (12 files):
     anomaly-detection/anomaly-routes.ts
     console/api-router.ts
     console/auth-middleware.ts
@@ -27,6 +27,7 @@ Cycle 2  (11 files):
     hub/api-router.ts
     hub/index.ts
     policy-engine/english-policy-routes.ts
+    query-anonymity/pii-rewrite-routes.ts
 
 Cycle 3  (2 files):
     castle-wall/audit/events.ts

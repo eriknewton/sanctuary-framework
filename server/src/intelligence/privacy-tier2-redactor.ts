@@ -39,6 +39,7 @@ import {
   PrivacyPlaceholderVault,
   detectSensitiveSpans,
 } from "../operational/privacy-filter.js";
+import type { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
 import type { FrontierRedactor } from "./substrates/frontier.js";
 import type { SubstrateSelector } from "./selector.js";
 import type { Surface, SubstrateChoice } from "./types.js";
@@ -123,5 +124,73 @@ export function buildPrivacyTier2Redactor(cfg: Tier2RedactorConfig): FrontierRed
     });
 
     return { redacted, matchCount };
+  };
+}
+
+/**
+ * Config for the consent-gated Tier B redactor installed on the
+ * production substrate selector at boot.
+ */
+export interface ConsentGatedTier2RedactorConfig extends Tier2RedactorConfig {
+  /**
+   * Live per-fortress Tier B config store. Read at EVERY call so the
+   * operator's toggle takes effect immediately without re-installing the
+   * redactor. Tier 2 scrubbing fires ONLY when the operator opted in
+   * (`enabled` or `smart_mode_enabled`) AND recorded consent
+   * (`consented_to_trade_off`); otherwise the redactor is a passthrough
+   * that audit-emits `filter_tier: 1` so the transparency UI shows the
+   * Tier B step did not run.
+   */
+  configStore: PiiConfigStore;
+}
+
+/**
+ * Build the redactor the entry point installs on the production
+ * `SubstrateSelector` via `installRedactor`. Unlike the bare
+ * `buildPrivacyTier2Redactor`, this variant is opt-in + consent-gated:
+ * it reads the live `PiiConfigStore` on every call and only performs the
+ * Tier 2 scrub when the operator has both enabled Tier B and consented to
+ * the trade-off. When Tier B is off or unconsented, it returns the input
+ * unchanged and emits a `filter_tier: 1` redaction event (zero matches),
+ * exactly matching the prior `IDENTITY_REDACTOR` behavior so a toggled-off
+ * operator sees no behavior change.
+ *
+ * Honesty (never-overclaim rule): the gate is read from real persisted
+ * state at call time, so a query is scrubbed iff the operator genuinely
+ * opted in with consent. `effectiveTierBEnabled()` in the route layer
+ * derives the same truth from the same config plus the
+ * redactor-installed signal, so the operator-facing surface never claims
+ * active scrubbing the path does not perform.
+ */
+export function buildConsentGatedTier2Redactor(
+  cfg: ConsentGatedTier2RedactorConfig,
+): FrontierRedactor {
+  const tier2 = buildPrivacyTier2Redactor(cfg);
+  return async (text: string) => {
+    let active = false;
+    try {
+      const config = await cfg.configStore.get();
+      active = Boolean(
+        config &&
+          (config.enabled || config.smart_mode_enabled) &&
+          config.consented_to_trade_off,
+      );
+    } catch {
+      // Fail closed toward NO claimed protection: a store read error must
+      // never silently behave as if Tier B is active. Passthrough (the
+      // substrate still receives the text) with a filter_tier:1 event so
+      // the transparency UI reflects that Tier 2 did not run.
+      active = false;
+    }
+    if (!active) {
+      cfg.selector.emitRedactionEvent({
+        surface: cfg.surface,
+        substrate: cfg.substrate,
+        matchCount: 0,
+        filterTier: 1,
+      });
+      return { redacted: text, matchCount: 0 };
+    }
+    return tier2(text);
   };
 }

@@ -60,7 +60,11 @@ import {
   handlePiiRewriteRoute,
   emitPiiRewriteAudit,
   effectiveTierBEnabled,
+  tierBInactiveReason,
   TIER_B_INACTIVE_REASON,
+  TIER_B_INACTIVE_REASON_NO_REDACTOR,
+  TIER_B_INACTIVE_REASON_UNCONSENTED,
+  TIER_B_INACTIVE_REASON_DISABLED,
 } from "../../src/query-anonymity/pii-rewrite-routes.js";
 
 const FORTRESS_A = "fortress_a";
@@ -698,6 +702,173 @@ describe("Rho-2 HTTP routes", () => {
   });
 });
 
+describe("Rho-2.5 live wiring: auth-gate + effective-state route", () => {
+  function makeAuthServer(
+    rig: ReturnType<typeof makeRig>,
+    opts: { authToken?: string; redactorInstalled?: boolean },
+  ): Promise<{ base: string; close: () => Promise<void> }> {
+    const server: Server = createServer(async (req, res) => {
+      const handled = await handlePiiRewriteRoute(
+        {
+          authConfig: {
+            loopbackAutoAuth: false,
+            ...(opts.authToken !== undefined
+              ? { authToken: opts.authToken }
+              : {}),
+          },
+          store: rig.store,
+          auditLog: rig.auditLog,
+          identityId: IDENTITY,
+          fortressId: rig.fortressId,
+          ...(opts.redactorInstalled !== undefined
+            ? { redactorInstalled: opts.redactorInstalled }
+            : {}),
+        },
+        req,
+        res,
+      );
+      if (!handled) res.writeHead(404).end();
+    });
+    return new Promise((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address() as AddressInfo;
+        resolve({
+          base: `http://127.0.0.1:${addr.port}`,
+          close: () =>
+            new Promise<void>((r) => server.close(() => r())),
+        });
+      });
+    });
+  }
+
+  it("unauthenticated non-loopback request -> 401 (auth runs FIRST)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeAuthServer(rig, {
+      authToken: "secret-operator-token",
+    });
+    try {
+      // No bearer header, loopbackAutoAuth disabled -> rejected before handler.
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`);
+      expect(res.status).toBe(401);
+    } finally {
+      await close();
+    }
+  });
+
+  it("operator bearer token -> reaches the handler (real 200, not 404)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeAuthServer(rig, {
+      authToken: "secret-operator-token",
+    });
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        headers: { Authorization: "Bearer secret-operator-token" },
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { ok: boolean; data: unknown };
+      expect(body.ok).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("with redactor installed + enabled + consented, the route reports effective_tier_b_enabled=true", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeAuthServer(rig, {
+      authToken: "tok",
+      redactorInstalled: true,
+    });
+    try {
+      // Opt in with consent.
+      const patchRes = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok",
+        },
+        body: JSON.stringify({ enabled: true, consented_to_trade_off: true }),
+      });
+      expect(patchRes.status).toBe(200);
+      const patchBody = (await patchRes.json()) as {
+        data: { effective_tier_b_enabled: boolean; inactive_reason: string | null };
+      };
+      // The wiring signal is real (redactorInstalled) AND the operator opted
+      // in with consent -> the surface truthfully reports active.
+      expect(patchBody.data.effective_tier_b_enabled).toBe(true);
+      expect(patchBody.data.inactive_reason).toBeNull();
+
+      // The audit event agrees (single source of truth).
+      const audit = await rig.auditLog.query({ layer: "l2", limit: 100 });
+      const updated = audit.entries.find(
+        (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONFIG_UPDATED,
+      );
+      expect(updated?.details?.["effective_tier_b_enabled"]).toBe(true);
+      expect(updated?.details?.["inactive_reason"]).toBeNull();
+
+      // GET reflects the same active state.
+      const getRes = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        headers: { Authorization: "Bearer tok" },
+      });
+      const getBody = (await getRes.json()) as {
+        data: { effective_tier_b_enabled: boolean };
+      };
+      expect(getBody.data.effective_tier_b_enabled).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("consent gate still holds: enabled without consent -> 409 consent_required", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeAuthServer(rig, {
+      authToken: "tok",
+      redactorInstalled: true,
+    });
+    try {
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok",
+        },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("consent_required");
+    } finally {
+      await close();
+    }
+  });
+
+  it("redactor installed but Tier B not enabled -> effective false, reason=disabled", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeAuthServer(rig, {
+      authToken: "tok",
+      redactorInstalled: true,
+    });
+    try {
+      // Record consent only (no enable). Smart/basic both off.
+      const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer tok",
+        },
+        body: JSON.stringify({ consented_to_trade_off: true }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        data: { effective_tier_b_enabled: boolean; inactive_reason: string | null };
+      };
+      expect(body.data.effective_tier_b_enabled).toBe(false);
+      expect(body.data.inactive_reason).toBe(TIER_B_INACTIVE_REASON_DISABLED);
+    } finally {
+      await close();
+    }
+  });
+});
+
 describe("Rho-2 audit emission helper", () => {
   it("emitPiiRewriteAudit fires PII_REWRITTEN with per-category counts + LLM flags", async () => {
     const rig = makeRig();
@@ -732,31 +903,99 @@ describe("Rho-2 audit emission helper", () => {
   });
 });
 
-describe("Rho-2 Tier B honesty (never-overclaim)", () => {
-  it("explainer carries a not-yet-active notice", () => {
-    expect(PII_TRADE_OFF_EXPLAINER).toContain("not yet active");
+describe("Rho-2.5 Tier B honesty (never-overclaim)", () => {
+  it("explainer states the feature is OFF by default and opt-in", () => {
+    // Now that the redactor is wired, the copy must still NOT claim
+    // unconditional protection: it is opt-in + off by default, and the
+    // explainer says so plainly.
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("OFF by default");
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("opt-in");
   });
 
-  it("explainer no longer asserts an active 'never crosses the outbound boundary' protection", () => {
-    // The present-tense overclaim ("Your original text never crosses
-    // the outbound boundary") must be gone; any boundary language must
-    // be future-tense/conditional. Guard against the exact prior copy.
+  it("explainer frames protection conditionally on the toggle, never as unconditionally-on", () => {
+    // Boundary/protection language must be conditioned on Tier B being
+    // on ("when on"), never an absolute always-on claim.
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("when on");
     expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
       "Your original text never crosses the outbound boundary",
     );
+    // No absolute "never crosses" claim (it crosses when Tier B is off).
     expect(PII_TRADE_OFF_EXPLAINER).not.toContain("never crosses");
   });
 
-  it("explainer describes the protection in the future tense, not as currently-on", () => {
-    expect(PII_TRADE_OFF_EXPLAINER).toContain("once active");
-    // No present-tense active-protection claim at the top.
-    expect(PII_TRADE_OFF_EXPLAINER).not.toContain(
-      "scrubs personal information from your queries\nbefore they reach",
-    );
+  it("explainer names the always-on alternative so an off operator is not misled", () => {
+    // While Tier B is off, the operator still gets the Tier A header
+    // strip; the copy must name that so "off" is not read as "no privacy".
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("Tier A header strip");
+    expect(PII_TRADE_OFF_EXPLAINER).toContain("does NOT");
   });
 
-  it("effectiveTierBEnabled() is false until the redactor is wired", () => {
-    expect(effectiveTierBEnabled()).toBe(false);
+  it("effectiveTierBEnabled() is false when no redactor is installed, even with enabled+consented config", () => {
+    const config = {
+      enabled: true,
+      smart_mode_enabled: false,
+      consented_to_trade_off: true,
+    };
+    expect(effectiveTierBEnabled(config, false)).toBe(false);
+  });
+
+  it("effectiveTierBEnabled() is true only when redactor installed AND enabled AND consented", () => {
+    const installed = true;
+    expect(
+      effectiveTierBEnabled(
+        { enabled: true, smart_mode_enabled: false, consented_to_trade_off: true },
+        installed,
+      ),
+    ).toBe(true);
+    // smart-mode counts as "on" too
+    expect(
+      effectiveTierBEnabled(
+        { enabled: false, smart_mode_enabled: true, consented_to_trade_off: true },
+        installed,
+      ),
+    ).toBe(true);
+    // disabled -> false
+    expect(
+      effectiveTierBEnabled(
+        { enabled: false, smart_mode_enabled: false, consented_to_trade_off: true },
+        installed,
+      ),
+    ).toBe(false);
+    // unconsented -> false (never claim active without consent)
+    expect(
+      effectiveTierBEnabled(
+        { enabled: true, smart_mode_enabled: false, consented_to_trade_off: false },
+        installed,
+      ),
+    ).toBe(false);
+  });
+
+  it("tierBInactiveReason() picks the single truthful reason", () => {
+    expect(
+      tierBInactiveReason(
+        { enabled: true, smart_mode_enabled: false, consented_to_trade_off: true },
+        false,
+      ),
+    ).toBe(TIER_B_INACTIVE_REASON_NO_REDACTOR);
+    expect(
+      tierBInactiveReason(
+        { enabled: true, smart_mode_enabled: false, consented_to_trade_off: false },
+        true,
+      ),
+    ).toBe(TIER_B_INACTIVE_REASON_UNCONSENTED);
+    expect(
+      tierBInactiveReason(
+        { enabled: false, smart_mode_enabled: false, consented_to_trade_off: true },
+        true,
+      ),
+    ).toBe(TIER_B_INACTIVE_REASON_DISABLED);
+    // active -> null
+    expect(
+      tierBInactiveReason(
+        { enabled: true, smart_mode_enabled: false, consented_to_trade_off: true },
+        true,
+      ),
+    ).toBeNull();
   });
 });
 
