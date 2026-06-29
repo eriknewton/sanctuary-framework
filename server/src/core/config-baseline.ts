@@ -51,6 +51,18 @@
  * rollback), or externally attest it. Upgrade path: thread the config-baseline
  * epoch through `observeWitnessEpoch`/`evaluateAndEnforceRollback`
  * (`core/anti-rollback.ts`).
+ *
+ * The recognized-older-schema reseed (`loadAuthenticatedBaseline` ->
+ * `{status:"reseed"}`) is a SECOND entry point into this same residual, not a
+ * separate weakness: like deletion, it lets an on-host attacker mint a fresh
+ * baseline from the current (possibly downgraded) config WITHOUT the master key
+ * (the older-schema branch is reached before the MAC check, so for that path the
+ * MAC does NOT gate the reseed; what bounds the attacker is the unchanged "no
+ * trustworthy prior posture exists -> accept from current" property, identical
+ * to first-run/deletion). It is reseed-only and is recorded by a chained
+ * critical `config_security_baseline_checked` audit entry (outcome
+ * `reseeded`), so it is at least as observable as deletion. The same
+ * monotonic-witness upgrade path closes both entry points at once.
  */
 
 import type { StorageBackend } from "../storage/interface.js";
@@ -261,10 +273,16 @@ async function loadAuthenticatedBaseline(
   }
   // Schema migration vs. tamper. A recognized OLDER schema (an operator who
   // upgraded the binary) is not an attack: signal a reseed so the caller writes
-  // a fresh sealed baseline under the current schema. A v1 record can never
-  // authenticate as v2 (the MAC covers schema_version), so this does NOT weaken
-  // the gate — the master-key MAC still gates who may seed. An UNKNOWN/FUTURE
-  // schema (version > current, or a non-integer) is forged/tampered: fail closed.
+  // a fresh sealed baseline under the current schema. NOTE: this branch is
+  // reached BEFORE the MAC check, so the older record's MAC is NOT verified here
+  // (a v1 record cannot authenticate as v2 anyway; the MAC covers the schema).
+  // That does not weaken the gate beyond the documented residual: the reseed
+  // mints from the CURRENT config and never trusts the old record's posture, so
+  // a hand-written v1 record gives an on-host attacker exactly the deletion-
+  // replay capability and nothing more (see the DEBT block above: this is its
+  // second entry point, bounded by the same monotonic-witness upgrade path and
+  // recorded by the chained `reseeded` audit entry). An UNKNOWN/FUTURE schema
+  // (version > current, or a non-integer) is forged/tampered: fail closed.
   if (body.schema_version !== CONFIG_BASELINE_SCHEMA_VERSION) {
     if (
       typeof body.schema_version === "number" &&
