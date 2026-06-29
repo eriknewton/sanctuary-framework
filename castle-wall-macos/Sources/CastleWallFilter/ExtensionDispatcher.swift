@@ -339,16 +339,26 @@ public final class ExtensionDispatcher {
     /// `.disconnected` state (a never-started dispatcher), so unit tests that
     /// drive `notifyVerdict` without `start()` keep their `.disconnected`
     /// invariant, and a not-yet-bootstrapped provider does not race its own
-    /// bootstrap. Idempotent: `scheduleReconnect` cancels any pending timer
-    /// and `attemptStartAndSubscribe` guards on `socketFD`/`isStopping`.
+    /// bootstrap. The reconnect-kick is suppressed while a retry timer is
+    /// already pending, so steady verdict traffic cannot starve the scheduled
+    /// attempt; `attemptStartAndSubscribe` guards on `socketFD`/`isStopping`.
     private func maybeLazyReconnect(reason: String) {
         let shouldReconnect: Bool = stateQueue.sync {
             guard hasEverStarted, !isStopping else { return false }
             switch connectionStateValue {
             case .deadChannel, .retrying:
-                // Collapse any in-flight exponential backoff so the rebind is
-                // prompt: a verdict is live demand for the audit channel, so we
-                // do not want it waiting out a 30s retry window.
+                // Kick a reconnect ONLY when none is already scheduled. A verdict
+                // is live demand for the audit channel, but resetting an in-flight
+                // retry timer on every verdict STARVES the reconnect under load:
+                // an armed wall sees constant traffic, so the timer is cancelled
+                // and rescheduled faster than its delay can ever elapse and
+                // `attemptStartAndSubscribe` never runs (drill 2026-06-29: 0
+                // producer-signed entries, "reconnect scheduled" spam, zero
+                // "connected"/"start failed" across 2h). When a retry timer is
+                // already pending we let it fire; only a timerless degraded state
+                // (e.g. a fresh transport close) collapses the backoff and kicks
+                // a fresh attempt.
+                guard retryTimer == nil else { return false }
                 retryDelaySeconds = Self.initialRetryDelaySeconds
                 return true
             case .disconnected, .handshaking, .connected:
