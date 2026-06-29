@@ -72,7 +72,7 @@ describe("sanctuary transparency (bundled binary round-trip)", () => {
 
   afterEach(async () => {
     for (const dir of tempDirs.splice(0)) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 
