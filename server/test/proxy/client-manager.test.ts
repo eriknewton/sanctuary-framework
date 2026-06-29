@@ -16,25 +16,36 @@ import {
 import type { UpstreamServer } from "../../src/sovereignty-profile.js";
 
 // Mock the MCP SDK transports to prevent real process spawning
+// Vitest 4 rewrote the spy implementation (vitest PR #8363): a mock whose
+// implementation is an arrow function is no longer a valid constructor, so the
+// `new Client()` / `new StdioClientTransport()` call sites below would throw
+// "is not a constructor". Use regular `function` expressions so the mock is
+// construct-callable (returning the stub object via the implicit `new` return).
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
-  Client: vi.fn().mockImplementation(() => ({
-    connect: vi.fn(async () => {}),
-    close: vi.fn(async () => {}),
-    listTools: vi.fn(async () => ({ tools: [] })),
-    callTool: vi.fn(async () => ({ content: [] })),
-  })),
+  Client: vi.fn(function () {
+    return {
+      connect: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
+      listTools: vi.fn(async () => ({ tools: [] })),
+      callTool: vi.fn(async () => ({ content: [] })),
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
-  StdioClientTransport: vi.fn().mockImplementation(() => ({
-    close: vi.fn(async () => {}),
-  })),
+  StdioClientTransport: vi.fn(function () {
+    return {
+      close: vi.fn(async () => {}),
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: vi.fn().mockImplementation(() => ({
-    close: vi.fn(async () => {}),
-  })),
+  SSEClientTransport: vi.fn(function () {
+    return {
+      close: vi.fn(async () => {}),
+    };
+  }),
 }));
 
 vi.mock("node:dns/promises", () => ({

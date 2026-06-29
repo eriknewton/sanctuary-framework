@@ -21,8 +21,14 @@ const clientInstances: Array<{
   onerror?: (error: Error) => void;
 }> = [];
 
+// Vitest 4 rewrote the spy implementation (vitest PR #8363): a mock whose
+// implementation is an arrow function is no longer a valid constructor, so the
+// `new Client()` / `new StdioClientTransport()` call sites in client-manager.ts
+// would throw "is not a constructor". Use regular `function` expressions (here
+// and in the per-test mockImplementation overrides below) so the mocks are
+// construct-callable.
 vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
-  Client: vi.fn().mockImplementation(() => {
+  Client: vi.fn(function () {
     const client = {
       connect: vi.fn(async () => {}),
       close: vi.fn(async () => {}),
@@ -37,15 +43,19 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
-  StdioClientTransport: vi.fn().mockImplementation(() => ({
-    close: vi.fn(async () => {}),
-  })),
+  StdioClientTransport: vi.fn(function () {
+    return {
+      close: vi.fn(async () => {}),
+    };
+  }),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
-  SSEClientTransport: vi.fn().mockImplementation(() => ({
-    close: vi.fn(async () => {}),
-  })),
+  SSEClientTransport: vi.fn(function () {
+    return {
+      close: vi.fn(async () => {}),
+    };
+  }),
 }));
 
 function makeServer(overrides?: Partial<UpstreamServer>): UpstreamServer {
@@ -84,7 +94,7 @@ describe("dynamic proxy discovery", () => {
   it("refreshes proxy tools when slow upstream startup completes after the old 2s window", async () => {
     vi.useFakeTimers();
     const onToolListChanged = vi.fn();
-    vi.mocked(Client).mockImplementationOnce(() => {
+    vi.mocked(Client).mockImplementationOnce(function () {
       const client = {
         connect: vi.fn(
           () => new Promise<void>((resolve) => setTimeout(resolve, 2101))
@@ -145,7 +155,7 @@ describe("dynamic proxy discovery", () => {
     vi.useFakeTimers();
     let discoveredName = "first_tool";
     const onToolListChanged = vi.fn();
-    vi.mocked(Client).mockImplementation(() => {
+    vi.mocked(Client).mockImplementation(function () {
       const client = {
         connect: vi.fn(async () => {}),
         close: vi.fn(async () => {}),

@@ -17,9 +17,11 @@ import {
   ContextGateNoPolicyError,
   type EnforcerConfig,
 } from "../../src/operational/context-gate-enforcer.js";
-import type { ContextGatePolicyStore } from "../../src/operational/context-gate.js";
+// `ContextGatePolicyStore` and `AuditLog` are classes, so the value import below
+// supplies both the value and the type; the separate `import type` lines that
+// used to sit here were redundant and Vite 8's oxc transformer (stricter than
+// the esbuild transformer it replaces) rejected them as redeclarations.
 import { ContextGatePolicyStore } from "../../src/operational/context-gate.js";
-import type { AuditLog } from "../../src/operational/audit-log.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolHandler } from "../../src/router.js";
 import { toolResult } from "../../src/router.js";
