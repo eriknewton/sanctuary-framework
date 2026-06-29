@@ -1882,6 +1882,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
     this.reprojectFederationRevocations(ctx);
+    if (ctx.revokedRootPubkeys instanceof Set) {
+      for (const pubkey of ctx.revokedRootPubkeys) {
+        this._federationRevokedRoots.add(pubkey);
+      }
+    }
+    if (typeof ctx.highestRevocationSerial === "number") {
+      this._federationHighestRevocationSerial = Math.max(
+        this._federationHighestRevocationSerial,
+        ctx.highestRevocationSerial,
+      );
+    }
     ctx.isNodeRevoked = (nodeId) => this.isFederationNodeRevoked(nodeId);
     this._federationRenewal = startFederationNodeCertificateAutoRenewal({
       renewNow: () => this.renewLocalFederationNodeCertificate(),
