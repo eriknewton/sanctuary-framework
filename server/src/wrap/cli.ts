@@ -1572,7 +1572,8 @@ export async function runWrap(
       } catch (err) {
         intelligenceHealthy = false;
         intelligenceError = (err as Error).message;
-        wrapTierBPiiRedactorInstalled = false;
+        // wrapTierBPiiRedactorInstalled stays false (its initialized value):
+        // the install assignment above only completes when no throw occurred.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Note: Intelligence panel unavailable on wrap URL ` +

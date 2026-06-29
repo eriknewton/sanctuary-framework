@@ -169,7 +169,7 @@ export function buildConsentGatedTier2Redactor(
 ): FrontierRedactor {
   const tier2 = buildPrivacyTier2Redactor(cfg);
   return async (text: string) => {
-    let active = false;
+    let active: boolean;
     try {
       const config = await cfg.configStore.get();
       active = Boolean(

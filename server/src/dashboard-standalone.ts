@@ -1017,7 +1017,8 @@ async function wireUnlockedDeps(args: {
       `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
     );
     intelligenceSelector = undefined;
-    tierBPiiRedactorInstalled = false;
+    // tierBPiiRedactorInstalled stays false (its initialized value): the
+    // install assignment above only completes when the try did not throw.
   }
   const v11Bindings = buildV11Bindings({
     identityId: hubIdentityId,

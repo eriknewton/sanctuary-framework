@@ -988,7 +988,8 @@ export async function createSanctuaryServer(options?: {
           `Run \`sanctuary dashboard\` and pick a substrate.`,
       );
       intelligenceSelector = undefined;
-      tierBPiiRedactorInstalled = false;
+      // tierBPiiRedactorInstalled stays false (its initialized value): the
+      // install assignment above only completes when the try did not throw.
     }
     dashboard.setV11Bindings(
       buildV11Bindings({
