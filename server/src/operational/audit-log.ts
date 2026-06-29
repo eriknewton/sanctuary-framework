@@ -130,6 +130,20 @@ export type AuditIntegrityAnomalySubscriber = (
 const DEFAULT_MAX_TOTAL_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_MAX_ENTRIES = 100_000;
 const DEFAULT_CHECKPOINT_INTERVAL = 100;
+// In-memory retention bound for the decrypted recent-entry window the instance
+// holds in `this.entries` / `this.chainEntries`. On-disk rotation prunes the
+// PERSISTED log (authoritative), but the in-memory arrays were never trimmed:
+// every `append()` pushed one more decrypted entry forever, so a long-running
+// daemon's heap grew without bound (the full-mode `castle-wall daemon` OOM,
+// ~4GB after a few minutes of heartbeat appends). These arrays only ever serve
+// recent-entry reads (`query` returns `slice(-limit)`, default 50) and the
+// chained-tail view (which re-reads the full chain from disk first), so there is
+// no correctness need to hold more than the recent window in RAM. We cap the
+// in-memory window at the on-disk entry cap (so any log within its disk budget
+// is byte-for-byte unchanged) but never below a small floor (so a tiny
+// `maxEntries` test/config still keeps a usable recent window in memory while
+// still bounding growth). The disk remains the source of truth for full reads.
+const MIN_IN_MEMORY_ENTRY_FLOOR = 256;
 const AUDIT_NAMESPACE = "_audit";
 const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // F3: reserved storage key for the single MAC-authenticated rotation checkpoint.
@@ -674,6 +688,15 @@ export class AuditLog {
   private counter = 0;
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
+  /**
+   * Upper bound on how many entries the instance keeps decrypted in memory
+   * (`this.entries` / `this.chainEntries`). Mirrors the on-disk entry cap but
+   * never drops below {@link MIN_IN_MEMORY_ENTRY_FLOOR}. Prevents the
+   * append-only in-memory arrays from growing without bound on a long-running
+   * daemon (the full-mode daemon OOM). The persisted log is unaffected; full
+   * reads re-load from disk.
+   */
+  private readonly maxInMemoryEntries: number;
   private readonly integrityMode: "strict" | "lenient";
   private readonly checkpointInterval: number;
   private readonly checkpointSigner?: (
@@ -752,6 +775,10 @@ export class AuditLog {
     this.epochMacKey = epochKeys.epochMacKey;
     this.maxTotalSizeBytes = config?.maxTotalSizeBytes ?? DEFAULT_MAX_TOTAL_SIZE_BYTES;
     this.maxEntries = config?.maxEntries ?? DEFAULT_MAX_ENTRIES;
+    this.maxInMemoryEntries = Math.max(
+      this.maxEntries,
+      MIN_IN_MEMORY_ENTRY_FLOOR
+    );
     this.integrityMode = config?.integrityMode ?? "strict";
     this.checkpointInterval =
       config?.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL;
@@ -932,6 +959,11 @@ export class AuditLog {
         this.nextSequence = sequence + 1;
         this.lastEntryHash = entryHash;
         this.hashesSinceCheckpoint.push(entryHash);
+        // Bound the in-memory recent-entry window. Without this the arrays grow
+        // one element per append forever (the long-running-daemon OOM); disk
+        // rotation never touched them. Trimming here keeps the heap flat while
+        // the persisted log (and every full re-read) stays complete.
+        this.trimInMemoryRetention();
         if (options.critical) {
           this.criticalAppendsSinceCheckpoint++;
         }
@@ -962,6 +994,49 @@ export class AuditLog {
       if (!options.critical && this.pendingVisibleEntries > 0) {
         this.pendingVisibleEntries--;
       }
+    }
+  }
+
+  /**
+   * Cap the decrypted recent-entry window held in memory.
+   *
+   * `this.entries` is `[legacy..., chained...]`; the chained suffix aligns 1:1
+   * with `this.chainEntries`. We trim the OLDEST entries from the front of both
+   * arrays in lockstep so the alignment invariant
+   * (`entries.length - chainEntries.length` === surviving legacy count) is
+   * preserved: dropping `n` from the front of `entries` while dropping the same
+   * count of the oldest aligned `chainEntries` removes legacy entries first (no
+   * chained counterpart) and only then chained entries (each with its
+   * `chainEntries` twin). `this.hashesSinceCheckpoint` is bounded the same way.
+   *
+   * SAFETY: this only drops the in-memory cache of OLD entries. The persisted
+   * log is untouched, the verified chain HEAD is tracked by `nextSequence` /
+   * `lastEntryHash` (not the array tail), checkpoint roots are computed from
+   * disk (`collectPersistedEntryHashes`), and `verifiedChainView()` / `query()`
+   * re-read the full chain from disk before serving. So trimming the in-memory
+   * window changes no on-the-wire, on-disk, or verification behavior; it only
+   * stops the heap from growing without bound on a long-running daemon.
+   */
+  private trimInMemoryRetention(): void {
+    const cap = this.maxInMemoryEntries;
+    const overflow = this.entries.length - cap;
+    if (overflow > 0) {
+      // Drop the oldest `overflow` entries from the front. The chained suffix
+      // shrinks by however many of those dropped entries were chained, which is
+      // exactly `overflow` once the legacy prefix has been consumed; before
+      // that, dropped entries are legacy-only and `chainEntries` is left intact.
+      const legacyCount = this.entries.length - this.chainEntries.length;
+      this.entries.splice(0, overflow);
+      const chainedDropped = Math.max(0, overflow - legacyCount);
+      if (chainedDropped > 0) {
+        this.chainEntries.splice(0, chainedDropped);
+      }
+    }
+    if (this.hashesSinceCheckpoint.length > cap) {
+      this.hashesSinceCheckpoint.splice(
+        0,
+        this.hashesSinceCheckpoint.length - cap
+      );
     }
   }
 
@@ -2376,6 +2451,13 @@ export class AuditLog {
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
+      // NOTE: we deliberately do NOT trim here. `verifiedChainView()` reloads
+      // from disk and then reads these freshly-rebuilt arrays to serve the FULL
+      // surviving chain (the transparency Merkle root + workload-replay depend on
+      // it). A full load is bounded by the on-disk entry cap (`maxEntries`); the
+      // unbounded growth was the APPEND path pushing past that cap between
+      // reloads, which `trimInMemoryRetention()` (called from the append path)
+      // now bounds. Reloads naturally re-cap the cache to the on-disk size.
       // A complete on-disk re-scan just ran: reset the eager-read backstop throttle
       // so the next eager read serves from this freshly-verified view without
       // re-paying, and re-baseline the sentinel fingerprint to this verified state
