@@ -394,7 +394,12 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
             )
           );
         },
-        15_000,
+        // CI-load headroom: the condition always eventually holds (the test
+        // passes in <2s locally, N=3), but shared CI runners under concurrent
+        // job load have intermittently exceeded 15s here. No race - just a
+        // timing flake; 30s gives margin while a genuinely-broken dispatch
+        // still fails.
+        30_000,
         50,
         "split-brain conflict observed on A"
       );
