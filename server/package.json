@@ -118,5 +118,8 @@
     "reputation",
     "privacy"
   ],
-  "author": "Erik Newton"
+  "author": "Erik Newton",
+  "overrides": {
+    "ws": "^8.21.0"
+  }
 }
