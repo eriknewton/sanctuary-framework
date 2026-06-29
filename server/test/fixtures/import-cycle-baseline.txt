@@ -2,7 +2,7 @@
   Sanctuary import-cycle baseline (server/src)
 ============================================================
   files scanned ......... 736
-  intra-src edges ....... 3311
+  intra-src edges ....... 3309
   self-imports .......... 0
   cycles (SCC size > 1) . 9
 

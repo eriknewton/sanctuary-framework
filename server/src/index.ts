@@ -139,10 +139,7 @@ import {
   fortressIdFromStoragePath,
 } from "./dashboard/v1_1/wiring.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
-import { buildConsentGatedTier2Redactor } from "./intelligence/privacy-tier2-redactor.js";
-import { PiiConfigStore } from "./query-anonymity/pii-config-store.js";
-import { PrivacyPlaceholderVault } from "./operational/privacy-filter.js";
-import { PII_REWRITE_LLM_SURFACE } from "./query-anonymity/pii-rewrite.js";
+import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -975,30 +972,15 @@ export async function createSanctuaryServer(options?: {
       });
       await intelligenceSelector.load();
       // Rho-2.5: install the consent-gated Tier B PII redactor on the
-      // production selector, replacing the default passthrough
-      // IDENTITY_REDACTOR. The redactor closes over the selector (for
-      // audit emission) and the per-fortress PiiConfigStore (read per
-      // call): it scrubs ONLY when the operator enabled Tier B AND
-      // consented; otherwise it passes through and audit-emits
-      // filter_tier:1. Late-binding via installRedactor avoids the
-      // selector<->redactor construction cycle. The same PiiConfigStore
-      // shape is rebuilt inside buildV11Bindings for the route; both read
-      // the same encrypted at-rest config (per-fortress AAD), so the
-      // toggle and the live scrubbing path never diverge.
-      tierBPiiRedactorInstalled = true;
-      intelligenceSelector.installRedactor(
-        buildConsentGatedTier2Redactor({
-          selector: intelligenceSelector,
-          vault: new PrivacyPlaceholderVault(storage, masterKey),
-          surface: PII_REWRITE_LLM_SURFACE,
-          substrate: "frontier-with-filter",
-          configStore: new PiiConfigStore({
-            storage,
-            masterKey,
-            fortressId: fortressIdFromStoragePath(config.storage_path),
-          }),
-        }),
-      );
+      // production selector via THE shared chokepoint. The fortressId MUST
+      // match the one threaded into buildV11Bindings below so the route's
+      // PATCH and the live scrub read the same encrypted config.
+      tierBPiiRedactorInstalled = installConsentGatedRedactor({
+        selector: intelligenceSelector,
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(config.storage_path),
+      });
     } catch (err) {
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
       console.error(

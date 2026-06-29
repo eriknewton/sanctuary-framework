@@ -483,14 +483,17 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
     expect(privacy.status).toBe("unconfirmed");
   });
 
-  it("an actual pii_rewritten DOES render privacy_strips active", async () => {
+  it("an actual Tier 2 scrub (filter_tier:2) DOES render privacy_strips active", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
+    // Rho-2.5: the live consent-gated redactor emits this op with
+    // filter_tier:2 on a REAL scrub.
     await log.appendCritical({
       layer: "l2",
-      operation: "query_anonymity_pii_rewritten",
+      operation: "intelligence_pii_redaction_event",
       identity_id: FORTRESS,
       result: "success",
+      details: { filter_tier: 2, match_count: 1 },
       timestamp: new Date(now - 60_000).toISOString(),
     });
     const panel = await buildFeatureHealthPanel({
@@ -499,6 +502,30 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
       now,
     });
     expect(row(panel, "privacy_strips").status).toBe("active");
+  });
+
+  it("a toggled-off passthrough (filter_tier:1) does NOT render privacy_strips green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    // The consent-gated redactor emits filter_tier:1 when Tier B is off /
+    // unconsented. The provenanceMarker (filter_tier===2) must NOT count it,
+    // so a quiet-Tier-B fortress can never read green from passthrough alone.
+    await log.appendCritical({
+      layer: "l2",
+      operation: "intelligence_pii_redaction_event",
+      identity_id: FORTRESS,
+      result: "success",
+      details: { filter_tier: 1, match_count: 0 },
+      timestamp: new Date(now - 60_000).toISOString(),
+    });
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now,
+    });
+    const privacy = row(panel, "privacy_strips");
+    expect(privacy.status).not.toBe("active");
+    expect(privacy.status).toBe("unconfirmed");
   });
 
   it("MEDIUM regression: an UNMARKED Castle Wall fault still flips the wall to fault, even with fresh marked enforcement present", async () => {
@@ -548,14 +575,14 @@ describe("feature-health — green-strict/fault-loose + activity honesty (codex 
 });
 
 describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the always-on feature that actually fires)", () => {
-  // Context: the registry's only OTHER privacy row (`privacy_strips`) counts the
-  // Tier B PII-rewrite op, which is NOT wired into the live selector path, so it
-  // can only ever read `unconfirmed`. The Tier A header strip, by contrast, fires
-  // `query_anonymity_headers_stripped` on EVERY outbound substrate call. Before
-  // this slice the panel ignored the privacy feature that runs and counted one
-  // that does not - a lying-by-omission. These cases lock the honest behavior in.
+  // Context: the registry's OTHER privacy row (`privacy_strips`) counts the Tier
+  // B PII-rewrite scrub (`intelligence_pii_redaction_event` gated on
+  // filter_tier:2 since Rho-2.5), which is opt-in. The Tier A header strip, by
+  // contrast, fires `query_anonymity_headers_stripped` on EVERY outbound
+  // substrate call. These cases lock in that the header_strip row keys on its
+  // OWN always-on op and does not borrow the Tier B op.
 
-  it("the header_strip row exists, is event-driven, and keys on the op that actually fires (NOT pii_rewritten)", async () => {
+  it("the header_strip row exists, is event-driven, and keys on its own always-on op (not the Tier B op)", async () => {
     const { log } = newAuditLog();
     const panel = await buildFeatureHealthPanel({
       auditLog: log,
@@ -564,12 +591,15 @@ describe("feature-health - query-privacy header strip (Phase 2 Slice 1; the alwa
     });
     const hs = row(panel, "header_strip");
     expect(hs.liveness).toBe("event_driven");
-    // Keys on the always-on event, never the never-firing pii_rewritten op.
+    // Keys on the always-on header-strip event, never the Tier B scrub ops.
     const entry = SLICE1_FEATURE_REGISTRY.find((f) => f.id === "header_strip");
     expect(entry?.invocationOps.has("query_anonymity_headers_stripped")).toBe(
       true,
     );
     expect(entry?.invocationOps.has("query_anonymity_pii_rewritten")).toBe(false);
+    expect(entry?.invocationOps.has("intelligence_pii_redaction_event")).toBe(
+      false,
+    );
   });
 
   it("HONESTY: the label describes metadata/header stripping and never claims anonymity or privacy guarantees", () => {

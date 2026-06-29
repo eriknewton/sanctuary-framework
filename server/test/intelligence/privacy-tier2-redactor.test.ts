@@ -18,6 +18,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   buildPrivacyTier2Redactor,
   buildConsentGatedTier2Redactor,
+  installConsentGatedRedactor,
 } from "../../src/intelligence/privacy-tier2-redactor.js";
 import { SubstrateSelector, IDENTITY_REDACTOR } from "../../src/intelligence/selector.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
@@ -326,6 +327,156 @@ describe("buildConsentGatedTier2Redactor — opt-in gating", () => {
     expect(captured.length).toBe(2);
     expect(captured[1]!.body).not.toContain("alice@example.com");
     expect(captured[1]!.body).toContain("EMAIL_");
+  });
+});
+
+describe("installConsentGatedRedactor — shared chokepoint (all production selectors)", () => {
+  // This is the helper EVERY production `new SubstrateSelector` site now routes
+  // through (index.ts, dashboard-standalone.ts, wrap/cli.ts, cli/policy.ts).
+  // The wrap-path leak (HIGH) was that wrap's selector kept IDENTITY_REDACTOR;
+  // this test proves the helper installs a working consent-gated scrub, and the
+  // wrap-symmetric e2e proves an opted-in concierge frontier call is scrubbed.
+
+  it("returns true and installs a redactor that scrubs only after opt-in", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const fortressId = "chokepoint-fortress";
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-identity",
+    });
+    await selector.load();
+
+    const installed = installConsentGatedRedactor({
+      selector,
+      storage,
+      masterKey,
+      fortressId,
+    });
+    expect(installed).toBe(true);
+
+    // The helper builds its own PiiConfigStore internally; to drive it we use a
+    // store with the SAME fortressId (same encrypted at-rest config).
+    const configStore = new PiiConfigStore({ storage, masterKey, fortressId });
+
+    // Capture the outbound frontier body.
+    const captured: { body: string }[] = [];
+    const fetchImpl = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      captured.push({ body: init?.body ? String(init.body) : "" });
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "ok" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    // A second selector sharing the same storage + the installed redactor lets
+    // us drive a real frontier call through the captured fetch.
+    const driving = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-identity",
+      fetchImpl,
+    });
+    await driving.load();
+    // Re-install through the same chokepoint so the driving selector scrubs.
+    installConsentGatedRedactor({ selector: driving, storage, masterKey, fortressId });
+    await driving.setPerSurfaceChoice("concierge", "frontier-with-filter");
+    await driving.setFrontierApiKey("anthropic", "test-key");
+
+    // Off -> unscrubbed.
+    await driving.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "reach carol@example.com now",
+      query: "summarize",
+    });
+    expect(captured[0]!.body).toContain("carol@example.com");
+
+    // Opt in + consent -> scrubbed.
+    await configStore.patch({ enabled: true, consented_to_trade_off: true });
+    await driving.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "reach carol@example.com now",
+      query: "summarize",
+    });
+    expect(captured[1]!.body).not.toContain("carol@example.com");
+    expect(captured[1]!.body).toContain("EMAIL_");
+  });
+
+  it("wrap-path symmetric: an opted-in concierge frontier call on the wrap selector is scrubbed", async () => {
+    // Mirrors the wrap/cli.ts wiring: the wrap-auto fortress builds a selector,
+    // the chokepoint installs the consent-gated redactor with the HASHED
+    // fortress id (the same id wrap's buildV11Bindings uses), and concierge is
+    // bound to the frontier substrate. Before the fix this egressed UNSCRUBBED.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    // Stand in for fortressIdFromStoragePath(storagePath) — any stable id the
+    // route + redactor agree on; the test uses one value for both.
+    const wrapFortressId = "fortress-deadbeefcafe0000";
+
+    const captured: { body: string }[] = [];
+    const fetchImpl = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      captured.push({ body: init?.body ? String(init.body) : "" });
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "ok" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const wrapSelector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "fortress:/tmp/wrap-fortress",
+      fetchImpl,
+    });
+    await wrapSelector.load();
+    const installed = installConsentGatedRedactor({
+      selector: wrapSelector,
+      storage,
+      masterKey,
+      fortressId: wrapFortressId,
+    });
+    expect(installed).toBe(true);
+    await wrapSelector.setPerSurfaceChoice("concierge", "frontier-with-filter");
+    await wrapSelector.setFrontierApiKey("anthropic", "test-key");
+
+    // Operator opts in via the route store (same hashed fortress id).
+    const routeStore = new PiiConfigStore({
+      storage,
+      masterKey,
+      fortressId: wrapFortressId,
+    });
+    await routeStore.patch({ enabled: true, consented_to_trade_off: true });
+
+    await wrapSelector.invokeSummarize("concierge", {
+      kind: "summarize",
+      context: "user alice@example.com asked about taxes",
+      query: "summarize",
+    });
+    expect(captured.length).toBe(1);
+    // The HIGH leak is closed: the wrap-path outbound body is scrubbed.
+    expect(captured[0]!.body).not.toContain("alice@example.com");
+    expect(captured[0]!.body).toContain("EMAIL_");
+
+    // And a real Tier 2 scrub emitted the op the feature-health row greens on.
+    const events = await auditLog.query({
+      operation_type: INTEL_OPS.PII_REDACTION_EVENT,
+    });
+    const scrub = events.entries.find(
+      (e) => (e.details as { filter_tier?: number }).filter_tier === 2,
+    );
+    expect(scrub).toBeDefined();
   });
 });
 
