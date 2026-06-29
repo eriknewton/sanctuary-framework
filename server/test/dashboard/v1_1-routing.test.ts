@@ -23,6 +23,7 @@ import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../../src/dashboard/v1_1/wiring.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 const IDENTITY_ID = "operator-test-001";
 const FORTRESS_STORAGE_PATH = "/tmp/sanctuary-v1.1.1-test";
@@ -34,9 +35,6 @@ interface TestRig {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
-}
 
 async function startRig(options: { host?: string; allowPlaintextRemote?: boolean } = {}): Promise<TestRig> {
   const storage = new MemoryStorage();
@@ -44,7 +42,7 @@ async function startRig(options: { host?: string; allowPlaintextRemote?: boolean
   const auditLog = new AuditLog(storage, masterKey);
 
   const authToken = `v1-1-1-test-${randomBytes(8).toString("hex")}`;
-  const port = pickPort();
+  const port = await getFreePort();
 
   const dashboard = new DashboardApprovalChannel({
     port,

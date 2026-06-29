@@ -67,6 +67,7 @@ import {
   type FortressNode,
   type MultiNodeFortress,
 } from "./fed-materials.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 interface NodeDaemon {
   dashboard: DashboardApprovalChannel;
@@ -76,15 +77,11 @@ interface NodeDaemon {
   stop: () => Promise<void>;
 }
 
-function pickPort(): number {
-  return 30000 + Math.floor(Math.random() * 20000);
-}
-
 /** Boot one daemon for a fortress node, federation enabled + provisioned. */
 async function startNodeDaemon(node: FortressNode): Promise<NodeDaemon> {
   const storage = new MemoryStorage();
   const auditLog = new AuditLog(storage, randomBytes(32));
-  const port = pickPort();
+  const port = await getFreePort();
   const dashboard = new DashboardApprovalChannel({
     port,
     host: "127.0.0.1",

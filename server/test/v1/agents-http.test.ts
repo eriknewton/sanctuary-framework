@@ -26,6 +26,7 @@ import type { IdentityManager } from "../../src/cognitive/tools.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { signOperatorPayload } from "../../src/v1/operator-signed.js";
 import { toBase64url, fromBase64url } from "../../src/core/encoding.js";
+import { getFreePort } from "../helpers/free-port.js";
 
 const operator = (() => {
   const privateKey = randomBytes(32);
@@ -38,10 +39,6 @@ interface TestRig {
   baseUrl: string;
   authToken: string;
   stop: () => Promise<void>;
-}
-
-function pickPort(): number {
-  return 17000 + Math.floor(Math.random() * 20000);
 }
 
 /** A minimal IdentityManager exposing only what the /v1 agent routes read. */
@@ -65,7 +62,7 @@ async function startRig(opts?: { withOperatorIdentity?: boolean }): Promise<Test
   const masterKey = randomBytes(32);
   const auditLog = new AuditLog(storage, masterKey);
   const authToken = `v1-pr-a2-test-${randomBytes(8).toString("hex")}`;
-  const port = pickPort();
+  const port = await getFreePort();
 
   const dashboard = new DashboardApprovalChannel({
     port,
