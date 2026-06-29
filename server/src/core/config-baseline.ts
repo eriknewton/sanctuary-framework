@@ -98,13 +98,16 @@ const CONFIG_BASELINE_MARKER = "__sanctuary_config_security_baseline_v1";
  * Schema version of the authenticated baseline record.
  *
  * v1 -> v2 (#805 review fix): the posture now tracks
- * `dashboard_allow_plaintext_remote`. A v1 record lacks that field, so it
- * cannot be authenticated as v2 — but an operator who upgraded the binary is
- * NOT an attacker, so a recognized OLDER schema reseeds (fresh sealed baseline
- * under the same master-key MAC) rather than bricking the boot. An UNKNOWN
- * (future/forged, schema > current) version still fails closed.
+ * `dashboard_allow_plaintext_remote`.
+ * v2 -> v3 (second-angle sibling-gap sweep): the posture now also tracks
+ * `privacy_filter_command`, `disclosure_default_policy`, `verascore_auto_publish`,
+ * and `erc8004_confirmation_enabled`. An older record (v1 or v2) lacks these
+ * fields, so it cannot be authenticated as v3, but an operator who upgraded
+ * the binary is NOT an attacker, so a recognized OLDER schema reseeds (fresh
+ * sealed baseline under the same master-key MAC) rather than bricking the boot.
+ * An UNKNOWN (future/forged, schema > current) version still fails closed.
  */
-const CONFIG_BASELINE_SCHEMA_VERSION = 2 as const;
+const CONFIG_BASELINE_SCHEMA_VERSION = 3 as const;
 
 /**
  * HKDF purpose label for the baseline MAC key. ADDITIVE — never reuse or alter
@@ -182,7 +185,11 @@ function parsePosture(value: unknown): ConfigSecurityPosture | null {
     typeof p.dashboard_allow_plaintext_remote !== "boolean" ||
     typeof p.webhook_enabled !== "boolean" ||
     !isPrivacyFilterMode(p.privacy_filter_mode) ||
-    !isPrivacyFailMode(p.privacy_filter_fail_mode)
+    !isPrivacyFailMode(p.privacy_filter_fail_mode) ||
+    typeof p.privacy_filter_command !== "string" ||
+    !isDisclosureDefaultPolicy(p.disclosure_default_policy) ||
+    typeof p.verascore_auto_publish !== "boolean" ||
+    typeof p.erc8004_confirmation_enabled !== "boolean"
   ) {
     return null;
   }
@@ -196,7 +203,18 @@ function parsePosture(value: unknown): ConfigSecurityPosture | null {
     webhook_enabled: p.webhook_enabled,
     privacy_filter_mode: p.privacy_filter_mode,
     privacy_filter_fail_mode: p.privacy_filter_fail_mode,
+    privacy_filter_command: p.privacy_filter_command,
+    disclosure_default_policy: p.disclosure_default_policy,
+    verascore_auto_publish: p.verascore_auto_publish,
+    erc8004_confirmation_enabled: p.erc8004_confirmation_enabled,
   };
+}
+
+/** Type guard: a valid `disclosure.default_policy` enum value. */
+function isDisclosureDefaultPolicy(
+  value: unknown
+): value is ConfigSecurityPosture["disclosure_default_policy"] {
+  return value === "minimum-necessary" || value === "withhold-all";
 }
 
 /** Outcome of loading the persisted baseline. */
@@ -275,10 +293,11 @@ async function loadAuthenticatedBaseline(
   // upgraded the binary) is not an attack: signal a reseed so the caller writes
   // a fresh sealed baseline under the current schema. NOTE: this branch is
   // reached BEFORE the MAC check, so the older record's MAC is NOT verified here
-  // (a v1 record cannot authenticate as v2 anyway; the MAC covers the schema).
-  // That does not weaken the gate beyond the documented residual: the reseed
-  // mints from the CURRENT config and never trusts the old record's posture, so
-  // a hand-written v1 record gives an on-host attacker exactly the deletion-
+  // (an older-schema record cannot authenticate as the current schema anyway;
+  // the MAC covers the schema). That does not weaken the gate beyond the
+  // documented residual: the reseed mints from the CURRENT config and never
+  // trusts the old record's posture, so a hand-written older record gives an
+  // on-host attacker exactly the deletion-
   // replay capability and nothing more (see the DEBT block above: this is its
   // second entry point, bounded by the same monotonic-witness upgrade path and
   // recorded by the chained `reseeded` audit entry). An UNKNOWN/FUTURE schema
