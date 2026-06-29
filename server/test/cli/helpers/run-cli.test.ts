@@ -61,7 +61,7 @@ describe("runCliRaw resilience (CLI-subprocess flake fix)", () => {
 
       expect(result.code).toBe(0);
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, 30_000);
 

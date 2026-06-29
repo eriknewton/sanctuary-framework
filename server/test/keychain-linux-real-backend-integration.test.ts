@@ -82,7 +82,7 @@ describe.skipIf(skipUnlessRealBackend)(
       for (const service of touchedServices) {
         clearKeyringEntry(service);
       }
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
 
     function trackTenant(tenantPath: string): void {
