@@ -409,6 +409,13 @@ describe("Rho-2 PiiConfigStore lifecycle", () => {
 });
 
 describe("Rho-2 HTTP routes", () => {
+  // The PATCH /config MUTATION is DEFAULT-DENY: it requires the operator bearer
+  // even on loopback (requireToken suppresses the loopback shortcut). GET and
+  // the stateless POST /rewrite preview stay loopback-readable. The rig wires a
+  // fixed operator token; PATCH calls send it via `PATCH_AUTH`.
+  const ROUTE_AUTH_TOKEN = "rho2-http-routes-operator-token";
+  const PATCH_AUTH = { Authorization: `Bearer ${ROUTE_AUTH_TOKEN}` };
+
   async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
     base: string;
     close: () => Promise<void>;
@@ -416,7 +423,10 @@ describe("Rho-2 HTTP routes", () => {
     const server: Server = createServer(async (req, res) => {
       const handled = await handlePiiRewriteRoute(
         {
-          authConfig: { loopbackAutoAuth: true },
+          authConfig: {
+            loopbackAutoAuth: true,
+            authToken: ROUTE_AUTH_TOKEN,
+          },
           store: rig.store,
           auditLog: rig.auditLog,
           identityId: IDENTITY,
@@ -460,7 +470,7 @@ describe("Rho-2 HTTP routes", () => {
     try {
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: true }),
       });
       expect(res.status).toBe(409);
@@ -477,7 +487,7 @@ describe("Rho-2 HTTP routes", () => {
     try {
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({
           enabled: true,
           consented_to_trade_off: true,
@@ -504,7 +514,7 @@ describe("Rho-2 HTTP routes", () => {
     try {
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({
           enabled: true,
           consented_to_trade_off: true,
@@ -533,14 +543,14 @@ describe("Rho-2 HTTP routes", () => {
       // First flip records consent.
       await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ consented_to_trade_off: true }),
       });
       // Second PATCH re-affirms consent (already true) + toggles a
       // different field; must NOT produce a second consent event.
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({
           consented_to_trade_off: true,
           enabled: true,
@@ -565,7 +575,7 @@ describe("Rho-2 HTTP routes", () => {
       // consent event.
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({ smart_mode_enabled: false }),
       });
       expect(res.status).toBe(200);
@@ -618,7 +628,7 @@ describe("Rho-2 HTTP routes", () => {
     try {
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({
           enabled: true,
           consented_to_trade_off: true,
@@ -648,7 +658,7 @@ describe("Rho-2 HTTP routes", () => {
     try {
       const res = await fetch(`${base}${PII_REWRITE_API_PREFIX}/config`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...PATCH_AUTH, "Content-Type": "application/json" },
         body: JSON.stringify({
           enabled: true,
           smart_mode_enabled: true,

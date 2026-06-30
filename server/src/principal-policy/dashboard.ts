@@ -88,6 +88,7 @@ import {
 import { buildFeatureHealthPanel } from "./feature-health.js";
 import { FeatureFaultRaiser } from "./feature-fault-raise.js";
 import { QUERY_ANONYMITY_API_PREFIX } from "../query-anonymity/query-anonymity-routes.js";
+import { PII_REWRITE_API_PREFIX } from "../query-anonymity/pii-rewrite-routes.js";
 import { resolveCompositionConfig } from "../composition/composition-config.js";
 import {
   V1IdempotencyStore,
@@ -354,6 +355,29 @@ export function isDashboardViewRoute(method: string, path: string): boolean {
     // /api/posture/evidence`) still hits the throttled JSON endpoints.
     path === POSTURE_EVIDENCE_PATH
   );
+}
+
+/**
+ * READ-STYLE EXEMPT SET for the legacy dispatcher's default-deny mutation gate.
+ *
+ * The gate in {@link DashboardApprovalChannel.handleLegacyRequest} is
+ * DEFAULT-DENY: every non-GET method requires the operator bearer
+ * (`requireToken: true`), exactly like the v1.1 routers. This set is the SMALL,
+ * EXPLICIT exception — non-GET routes that genuinely neither persist nor mutate
+ * nor leak state, kept loopback/session-readable for local convenience.
+ *
+ *   - POST `/api/query-anonymity/pii/rewrite` -> a STATELESS preview that runs
+ *     the regex redactor over operator-supplied text and returns the scrubbed
+ *     result. It persists nothing and exposes no operator/fleet/custody state,
+ *     so it stays session-readable so the dashboard's live PII preview works
+ *     without a bearer. The PERSISTING sibling
+ *     (`PATCH /api/query-anonymity/pii/config`) is NOT exempt — it is gated.
+ *
+ * Any OTHER non-GET route is gated. Do NOT add a route here unless you can
+ * confirm it neither persists nor mutates nor leaks state.
+ */
+function isDashboardReadStyleNonGet(method: string, path: string): boolean {
+  return method === "POST" && path === `${PII_REWRITE_API_PREFIX}/rewrite`;
 }
 
 interface FederationDashboardState {
@@ -3723,22 +3747,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Authenticate all other non-OPTIONS requests.
     //
-    // SECURITY: legacy decision/state-mutation routes require the operator
-    // bearer token even on loopback. A co-resident agent sharing loopback must
-    // not be able to release Tier-1 approvals or mutate operator configuration
-    // with a short-lived session, cookie, or mere network position.
-    const isLegacyStrictMutation =
-      method === "POST" &&
-      (url.pathname.startsWith("/api/approve/") ||
-        url.pathname.startsWith("/api/deny/") ||
-        url.pathname === "/api/sovereignty-profile" ||
-        url.pathname === "/api/proxy/servers");
+    // SECURITY (default-deny on mutation): ANY non-GET method requires the
+    // operator bearer token even on loopback. A co-resident agent sharing
+    // loopback must not be able to release Tier-1 approvals or mutate operator
+    // configuration with a short-lived session, cookie, or mere network
+    // position.
+    //
+    // This INVERTS a prior 4-entry allowlist (`/api/approve/`, `/api/deny/`,
+    // `/api/sovereignty-profile`, `/api/proxy/servers`) that fell through to
+    // `{ allowSession: true }` for every other non-GET route. That allowlist
+    // was the exact miss-prone pattern the v1.1 routers already replaced
+    // (hub `api-router.ts`: the allowlist "DID miss" the concierge-thread
+    // DELETE and SEND): it silently left the PII-config PATCH
+    // (`PATCH /api/query-anonymity/pii/config`, a real operator-config +
+    // consent mutation dispatched below) on session-only auth. Default-deny
+    // closes that class — a newly added non-GET route is gated automatically,
+    // no allowlist edit required.
+    //
+    // The exempt set is the SMALL, EXPLICIT exception (mirrors the hub
+    // read-style exempt set): non-GET routes that genuinely neither persist nor
+    // mutate state and are intentionally loopback/session-readable. Today that
+    // is ONLY `POST /api/query-anonymity/pii/rewrite` — a STATELESS preview
+    // that runs the regex redactor over operator-supplied text and returns the
+    // result (no persistence, no state leak), kept loopback-readable so the
+    // dashboard's live PII preview works without a bearer. GET/read routes keep
+    // `{ allowSession: true }` as before.
+    const requiresOperatorBearer =
+      method !== "GET" &&
+      method !== "HEAD" &&
+      !isDashboardReadStyleNonGet(method, url.pathname);
     if (
       !this.checkAuth(
         req,
         url,
         res,
-        isLegacyStrictMutation ? { requireToken: true } : { allowSession: true },
+        requiresOperatorBearer ? { requireToken: true } : { allowSession: true },
       )
     )
       return;
@@ -3883,22 +3926,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    // Only accept the long-lived token via Authorization header - NEVER from URL
+    // Only accept the long-lived token via Authorization header - NEVER from URL.
+    //
+    // SECURITY (invariant 7, no auth oracle): a MISSING Authorization header and
+    // a PRESENT-but-WRONG bearer return a BYTE-IDENTICAL generic 401. The prior
+    // split ("Authorization header required" vs "Invalid bearer token") was an
+    // oracle that told an unauthenticated caller whether it had supplied a
+    // header at all - a distinction a co-resident agent could probe. Both
+    // failure modes now collapse to the same generic body, matching the generic
+    // posture elsewhere in this file (checkAuth -> "unauthorized"; unlock ->
+    // "unlock failed"). The response is sent constant-shape regardless of which
+    // sub-check failed.
     const authHeader = req.headers.authorization;
-    if (!authHeader) {
+    const parts = authHeader?.split(" ");
+    const hasValidBearer =
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken);
+    if (!hasValidBearer) {
       res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Authorization header required" }));
-      return;
-    }
-
-    const parts = authHeader.split(" ");
-    if (
-      parts.length !== 2 ||
-      parts[0] !== "Bearer" ||
-      !constantTimeEquals(parts[1]!, this.authToken)
-    ) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid bearer token" }));
+      res.end(JSON.stringify({ error: "authentication required" }));
       return;
     }
 
