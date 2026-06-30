@@ -46,6 +46,39 @@ export interface AuditEntry {
   contributors?: PluginContribution[];
 }
 
+/** One chained, decrypted, verified entry handed to a streaming consumer. */
+export interface VerifiedChainItem {
+  sequence: number;
+  entry_hash: string;
+  entry: AuditEntry;
+}
+
+/**
+ * Streaming consumer of the verified hash chain (the daemon-OOM-on-a-large-log
+ * bound). The full decrypted chain is NEVER simultaneously resident: each
+ * chained entry is decrypted + hash-checked, handed to `onEntry`, and then
+ * released. The contiguous chain walk + anchor/checkpoint verification complete
+ * AFTER the stream, before `streamVerifiedChain` resolves; in strict mode it
+ * throws on any failure, so a consumer that commits its fold only after the
+ * await returns clean never commits over an unverified chain (see
+ * {@link AuditLog.streamVerifiedChain}). Consumers fold their result
+ * incrementally (Merkle leaves, per-rule counters, workload replay) instead of
+ * materializing the whole `AuditEntry[]`.
+ *
+ * `reset` is the read-consistency contract: the verified pass runs under a
+ * torn-read retry loop, so a pass that observed a transient mid-mutation state
+ * is discarded and re-run. `reset()` fires before such a re-run so the consumer
+ * drops everything it accumulated from the abandoned pass and starts clean; the
+ * entries delivered between the LAST `reset()` (or the start) and a clean return
+ * are exactly the entries of the single accepted verified pass. A consumer that
+ * does not implement `reset` MUST be commutative-and-idempotent over re-delivery
+ * (none of the three production consumers are, so they all implement it).
+ */
+export interface VerifiedChainConsumer {
+  onEntry: (item: VerifiedChainItem) => void;
+  reset?: () => void;
+}
+
 export type AuditEntryInput = Omit<AuditEntry, "timestamp"> & {
   timestamp?: string;
 };
@@ -667,6 +700,24 @@ export class AuditIntegrityError extends Error {
         : `${findings.length} audit integrity findings detected`
     );
     this.name = "AuditIntegrityError";
+  }
+}
+
+/**
+ * Internal marker wrapping an error thrown by a {@link VerifiedChainConsumer}'s
+ * `onEntry` during a streaming reload pass. The decrypt loop runs inside
+ * `loadPersistedEntries`' outer try (it iterates a live `storage.list`), so a
+ * raw consumer throw would otherwise be caught there and relabeled
+ * `storage_unavailable`. Tagging it lets the outer catch re-throw the consumer's
+ * ORIGINAL error verbatim: a consumer rejection (e.g. a malformed workload
+ * lifecycle payload) is neither a storage failure nor a decrypt failure and must
+ * surface as itself, never be absorbed into the integrity findings (#504). Never
+ * escapes the module: it is always unwrapped before it leaves `loadPersistedEntries`.
+ */
+class ConsumerRejectedEntryError extends Error {
+  constructor(readonly cause: unknown) {
+    super("audit-chain consumer rejected a decrypted entry");
+    this.name = "ConsumerRejectedEntryError";
   }
 }
 
@@ -1525,7 +1576,6 @@ export class AuditLog {
     chainedEntries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }>,
     legacyCount: number,
     legacyAnchorHash: string,
@@ -1667,21 +1717,56 @@ export class AuditLog {
    * throws `AuditIntegrityError` — a transparency checkpoint must never be
    * minted over a log that does not verify (fail closed, never degrade).
    */
-  async verifiedChainView(): Promise<
-    Array<{ sequence: number; entry_hash: string; entry: AuditEntry }>
-  > {
+  async verifiedChainView(): Promise<Array<VerifiedChainItem>> {
+    // Backward-compatible array view: materializes the full chain (so it is as
+    // memory-heavy as a caller that genuinely needs the whole array), but is now
+    // backed by the streaming verifier so it shares ONE verification path with
+    // {@link streamVerifiedChain}. Long-running daemon hot paths (transparency
+    // emit, against-log recount, workload replay) call streamVerifiedChain
+    // directly so the whole decrypted chain is never resident at once; that is
+    // the daemon-OOM-on-a-large-log fix. This array variant is retained for
+    // tests and any caller that legitimately wants the materialized view.
+    const view: Array<VerifiedChainItem> = [];
+    await this.streamVerifiedChain({
+      onEntry: (item) => view.push(item),
+      // A torn-read retry restarts the pass: drop the partially-built array so
+      // the returned view is exactly the single accepted verified pass.
+      reset: () => {
+        view.length = 0;
+      },
+    });
+    return view;
+  }
+
+  /**
+   * Streaming verified view of the surviving hash chain. Runs the SAME strict
+   * chain verification as {@link verifiedChainView} (it throws
+   * `AuditIntegrityError` in strict mode on a chain that does not verify, so a
+   * transparency checkpoint is never minted over a tampered log), but hands each
+   * chained entry to `consumer.onEntry` in ascending chain-sequence order and
+   * then RELEASES it. The full decrypted chain is never simultaneously resident,
+   * so a large on-disk log no longer allocates its whole multi-GB decrypted
+   * payload set per call.
+   *
+   * Ordering / tamper-evidence (read carefully, the safety is in the await, not
+   * a pre-stream gate): `onEntry` fires DURING the decrypt loop, so each entry is
+   * decrypted + hash-checked before the consumer sees it, but the FULL-CHAIN
+   * checks (the contiguous sequence/prev-hash walk, the legacy / rotation / head
+   * anchors, the checkpoint roots) run AFTER the loop, on cheap envelope metadata.
+   * The guarantee a consumer relies on is therefore the AWAIT boundary, not a
+   * pre-stream verification: this method does not resolve until those full-chain
+   * checks have run, and in strict mode it THROWS `AuditIntegrityError` if any
+   * failed. So a consumer that commits its incremental fold only AFTER
+   * `await streamVerifiedChain(...)` returns clean never commits a result over an
+   * unverified or tampered chain (a mid-stream tamper makes the await reject, the
+   * fold is discarded). The full-chain invariants are derived from envelope
+   * metadata and on-disk reads, never from a materialized decrypted array, so
+   * streaming changes WHEN payloads are released, not WHAT is verified. See
+   * {@link VerifiedChainConsumer} for the `reset` (read-consistency) contract.
+   */
+  async streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void> {
     await this.appendQueue;
-    await this.reloadPersistedEntries();
-    // this.entries is [legacy..., chained...] in order; the chained suffix
-    // aligns 1:1 with this.chainEntries (both built from the same load pass).
-    const chainedEntries = this.entries.slice(
-      this.entries.length - this.chainEntries.length
-    );
-    return this.chainEntries.map((chained, index) => ({
-      sequence: chained.sequence,
-      entry_hash: chained.entry_hash,
-      entry: chainedEntries[index]!,
-    }));
+    await this.reloadPersistedEntries(consumer);
   }
 
   /**
@@ -2017,8 +2102,10 @@ export class AuditLog {
     }
   }
 
-  private async reloadPersistedEntries(): Promise<void> {
-    await this.loadPersistedEntriesWithReadConsistency();
+  private async reloadPersistedEntries(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
+    await this.loadPersistedEntriesWithReadConsistency(consumer);
     this.loaded = true;
     await this.reportIntegrityFindingsIfAny();
     const contextAllowsIntegrityFindings =
@@ -2032,11 +2119,21 @@ export class AuditLog {
     }
   }
 
-  private async loadPersistedEntriesWithReadConsistency(): Promise<void> {
+  private async loadPersistedEntriesWithReadConsistency(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
     const deadline = Date.now() + AUDIT_READ_CONSISTENCY_MAX_MS;
     let lastSignature: string | null = null;
+    let streamedThisLoop = false;
     for (;;) {
-      await this.loadPersistedEntries();
+      // A retry means the prior pass observed a transient mid-mutation state and
+      // is being discarded. Tell the streaming consumer to drop everything it
+      // accumulated from that abandoned pass BEFORE we re-decrypt, so the entries
+      // it keeps are exactly those of the single accepted pass (the one we return
+      // from). The first pass needs no reset (nothing accumulated yet).
+      if (consumer && streamedThisLoop) consumer.reset?.();
+      await this.loadPersistedEntries(consumer);
+      streamedThisLoop = consumer !== undefined;
       if (this.integrityFindings.length === 0) {
         return; // clean read
       }
@@ -2307,14 +2404,70 @@ export class AuditLog {
     }
   }
 
-  private async loadPersistedEntries(): Promise<void> {
+  /**
+   * Decrypt + strict-verify the full surviving chain.
+   *
+   * Memory contract (the daemon-OOM-on-a-large-log fix): the full decrypted
+   * chain is NEVER simultaneously resident. Each chained entry is decrypted to
+   * (a) prove it decrypts (the `entry_decrypt_failed` integrity check) and
+   * (b) be handed to the streaming `consumer` when one drives this pass, OR slid
+   * into the bounded recent-entry window otherwise; either way the decrypted
+   * payload is then released. The full-chain structures we retain
+   * (`chainedEntries`, `legacyRawEntries`, `this.chainEntries`) carry only cheap
+   * envelope / raw-byte metadata (sequence, entry_hash, prev_hash, key), so a
+   * large on-disk log no longer allocates its whole multi-GB decrypted payload
+   * set per reload. Verification coverage is unchanged: every entry is still
+   * decrypted, hash-checked, chain-walked, and anchor/checkpoint-covered.
+   *
+   * When a `consumer` is supplied (transparency emitter / against-log recount /
+   * workload replay) each decrypted chained entry streams to it in ascending
+   * chain-sequence order (listing order is sequence order because keys carry a
+   * zero-padded sequence, the same invariant the chain walk already relies on)
+   * and the non-streaming window is left untouched for the other callers. The
+   * chain is still verified AFTER the decrypt loop; in strict mode any tamper
+   * finding makes the caller throw `AuditIntegrityError`, discarding whatever the
+   * consumer accumulated (it folds incrementally, never persisting until the
+   * verified pass returns clean), so a tampered log never yields a usable result.
+   */
+  private async loadPersistedEntries(
+    consumer?: VerifiedChainConsumer
+  ): Promise<void> {
     const findings: AuditIntegrityFinding[] = [];
-    const legacyRawEntries: Array<{ key: string; raw: Uint8Array; entry: AuditEntry }> = [];
+    // Cheap full-chain metadata only; no decrypted payloads retained here.
+    const legacyRawEntries: Array<{ key: string; raw: Uint8Array }> = [];
     const chainedEntries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }> = [];
+    // Bounded recent-entry window built during the streaming decrypt for the
+    // non-streaming callers (query / posture / append). Only the newest
+    // `maxInMemoryEntries` decrypted entries are kept; older payloads are dropped
+    // as the window slides, so a large chain never materializes its full
+    // decrypted set. A streaming `consumer` keeps NO window; it already received
+    // every chained entry in order.
+    const windowCap = this.maxInMemoryEntries;
+    const recentEntries: AuditEntry[] = [];
+    const recentChained: Array<{ sequence: number; entry_hash: string }> = [];
+    const pushWindow = (
+      entry: AuditEntry,
+      chained: { sequence: number; entry_hash: string } | null
+    ): void => {
+      if (consumer) return; // streaming consumer keeps no window
+      recentEntries.push(entry);
+      if (chained) recentChained.push(chained);
+      // Trim the OLDEST entries from the front in lockstep with their aligned
+      // chained twins (legacy entries, which have no chained twin, are dropped
+      // first) so `recentEntries.length - recentChained.length` stays equal to
+      // the surviving legacy count (the same alignment invariant the append
+      // path's trimInMemoryRetention preserves).
+      const overflow = recentEntries.length - windowCap;
+      if (overflow > 0) {
+        const legacyResident = recentEntries.length - recentChained.length;
+        recentEntries.splice(0, overflow);
+        const chainedDropped = Math.max(0, overflow - legacyResident);
+        if (chainedDropped > 0) recentChained.splice(0, chainedDropped);
+      }
+    };
 
     try {
       const storedEntries = await this.storage.list(AUDIT_NAMESPACE);
@@ -2370,12 +2523,12 @@ export class AuditLog {
             });
           }
 
+          let entry: AuditEntry;
           try {
             const encryptedBytes = fromBase64url(parsed.encrypted_payload_bytes);
             const encrypted: EncryptedPayload = JSON.parse(bytesToString(encryptedBytes));
             const decrypted = await this.decryptEntryPayload(encrypted);
-            const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-            chainedEntries.push({ key: meta.key, envelope: parsed, entry });
+            entry = JSON.parse(bytesToString(decrypted));
           } catch {
             findings.push({
               kind: "entry_decrypt_failed",
@@ -2383,22 +2536,70 @@ export class AuditLog {
               sequence: parsed.sequence,
               message: `audit entry ${meta.key} could not be decrypted at sequence ${parsed.sequence}`,
             });
+            continue;
+          }
+          // Retain only cheap envelope metadata for the full-chain verify.
+          chainedEntries.push({ key: meta.key, envelope: parsed });
+          // Stream the decrypted entry to the consumer (Merkle/recount/replay) or
+          // slide it into the bounded window; release it either way so a large
+          // chain is never fully resident. Listing order is ascending sequence
+          // order (zero-padded sequence in the key), so the consumer sees entries
+          // in chain-sequence order. This is DELIBERATELY outside the decrypt
+          // try/catch above: a consumer that throws (e.g. workload replay's
+          // validateWorkloadLifecyclePayload rejecting a malformed lifecycle
+          // entry) must propagate as ITSELF, not be miscategorized as
+          // `entry_decrypt_failed` (decrypt already succeeded). Mislabeling it
+          // would, under a future lenient pass, silently SKIP the entry: exactly
+          // the #504 under-report the consumers forbid.
+          if (consumer) {
+            try {
+              consumer.onEntry({
+                sequence: parsed.sequence,
+                entry_hash: parsed.entry_hash,
+                entry,
+              });
+            } catch (consumerErr) {
+              // The consumer rejected this (decrypted, hash-checked) entry, e.g.
+              // workload replay's validateWorkloadLifecyclePayload on a malformed
+              // lifecycle record. Propagate it AS ITSELF: tag it so the outer
+              // catch re-throws verbatim instead of relabeling it
+              // `storage_unavailable`. It is neither a decrypt failure nor a
+              // storage failure, and must never be silently absorbed into the
+              // findings list (the #504 under-report the consumers forbid).
+              throw new ConsumerRejectedEntryError(consumerErr);
+            }
+          } else {
+            pushWindow(entry, {
+              sequence: parsed.sequence,
+              entry_hash: parsed.entry_hash,
+            });
           }
           continue;
         }
 
+        let legacyEntry: AuditEntry;
         try {
           const encrypted = parsed as EncryptedPayload;
           const decrypted = await this.decryptEntryPayload(encrypted);
-          const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-          legacyRawEntries.push({ key: meta.key, raw, entry });
+          legacyEntry = JSON.parse(bytesToString(decrypted));
         } catch {
           findings.push({
             kind: "entry_decrypt_failed",
             key: meta.key,
             message: `legacy audit entry ${meta.key} could not be decrypted`,
           });
+          continue;
         }
+        // Keep the raw bytes (needed for the legacy-anchor hash below); the
+        // decrypted entry only slides into the bounded window. Legacy entries
+        // carry no chained (sequence, entry_hash) pair and the streaming
+        // consumers operate on the chained region only, so a legacy entry is
+        // never streamed; the legacy region's coverage is attested by the legacy
+        // anchor, not by these decrypted payloads. The window push is outside the
+        // decrypt try/catch above for the same reason as the chained path: a
+        // post-decrypt throw must not be miscategorized as a decrypt failure.
+        legacyRawEntries.push({ key: meta.key, raw });
+        pushWindow(legacyEntry, null);
       }
 
       const legacyHashes = legacyRawEntries.map((legacy, index) =>
@@ -2442,14 +2643,19 @@ export class AuditLog {
         findings
       );
 
-      this.entries = [
-        ...legacyRawEntries.map((item) => item.entry),
-        ...chainedEntries.map((item) => item.entry),
-      ];
-      this.chainEntries = chainedEntries.map((item) => ({
-        sequence: item.envelope.sequence,
-        entry_hash: item.envelope.entry_hash,
-      }));
+      // Serve the bounded recent-entry window built during the streaming decrypt
+      // above (NOT the full decrypted chain). When a streaming consumer drove
+      // this pass, both window arrays are empty by design: the consumer already
+      // received every chained entry in order, and the non-streaming window is
+      // left to the query / posture / append callers. The full-chain integrity
+      // invariants are unaffected: the chain head (`nextSequence` /
+      // `lastEntryHash`), the legacy / rotation / head anchors, and the
+      // checkpoint roots are all derived from the cheap envelope metadata and the
+      // on-disk reads below, never from this window.
+      if (!consumer) {
+        this.entries = recentEntries;
+        this.chainEntries = recentChained;
+      }
       // F3: continue from the HIGHEST surviving sequence, not the entry count.
       // After rotation prunes a contiguous prefix, count != highest sequence, and
       // a count-based nextSequence would re-issue an already-used sequence and
@@ -2469,13 +2675,16 @@ export class AuditLog {
       this.lastEntryHash = highestChainedHash;
       this.hashesSinceCheckpoint = this.collectHashesSinceLastCheckpoint();
       this.integrityFindings = findings;
-      // NOTE: we deliberately do NOT trim here. `verifiedChainView()` reloads
-      // from disk and then reads these freshly-rebuilt arrays to serve the FULL
-      // surviving chain (the transparency Merkle root + workload-replay depend on
-      // it). A full load is bounded by the on-disk entry cap (`maxEntries`); the
-      // unbounded growth was the APPEND path pushing past that cap between
-      // reloads, which `trimInMemoryRetention()` (called from the append path)
-      // now bounds. Reloads naturally re-cap the cache to the on-disk size.
+      // The reload now keeps only the bounded recent-entry WINDOW resident (the
+      // splice in pushWindow slid it during the streaming decrypt), so a large
+      // on-disk log no longer materializes its full multi-GB decrypted payload
+      // set per reload; that was the daemon-OOM-on-a-large-log amplification.
+      // `verifiedChainView()` / `streamVerifiedChain()` STREAM the full surviving
+      // chain from disk one decrypted entry at a time, so the transparency Merkle
+      // root, the against-log recount, and workload replay still cover the
+      // complete chain without it ever being fully resident. #821's APPEND-path
+      // bound (trimInMemoryRetention) and this RELOAD-path bound together keep the
+      // heap flat on a long-running daemon.
       // A complete on-disk re-scan just ran: reset the eager-read backstop throttle
       // so the next eager read serves from this freshly-verified view without
       // re-paying, and re-baseline the sentinel fingerprint to this verified state
@@ -2483,6 +2692,15 @@ export class AuditLog {
       this.lastFullVerifyAtMs = Date.now();
       await this.refreshExpectedStoreFingerprint();
     } catch (err) {
+      // A consumer that rejected a (successfully decrypted, hash-checked) entry
+      // is NOT a storage failure: propagate its original error verbatim rather
+      // than mislabeling it `storage_unavailable` and swallowing it into the
+      // findings list. (The streaming consumers run in strict mode, where any
+      // finding throws anyway, but a future lenient pass must surface the
+      // consumer's real rejection, not a generic storage finding.)
+      if (err instanceof ConsumerRejectedEntryError) {
+        throw err.cause;
+      }
       findings.push({
         kind: "storage_unavailable",
         message: `audit storage could not be listed: ${failureMessage(err)}`,
@@ -2535,7 +2753,6 @@ export class AuditLog {
     entries: Array<{
       key: string;
       envelope: PersistedAuditEnvelopeV2;
-      entry: AuditEntry;
     }>,
     expectedSequenceSeed: number,
     expectedPrevHashSeed: string,

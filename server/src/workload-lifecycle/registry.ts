@@ -110,8 +110,8 @@ export class WorkloadRegistry {
    * Build the projection by replaying the audit chain's workload-lifecycle
    * entries in AUTHENTICATED CHAIN-SEQUENCE order.
    *
-   * Ordering integrity (codex FIX 1): replay walks `auditLog.verifiedChainView()`,
-   * which returns each surviving chained entry paired with its authenticated
+   * Ordering integrity (codex FIX 1): replay streams `auditLog.streamVerifiedChain()`,
+   * which delivers each surviving chained entry paired with its authenticated
    * `sequence` (the hash-chain position), in ascending sequence order, AND with
    * the decrypted `entry` carrying the full `details` payload. That method runs
    * strict-mode chain verification (it throws `AuditIntegrityError` if the chain
@@ -135,16 +135,25 @@ export class WorkloadRegistry {
    * #504 discipline forbids.
    */
   static async fromAuditLog(auditLog: AuditLog): Promise<WorkloadRegistry> {
-    const registry = new WorkloadRegistry();
-    // Authenticated chain order: verifiedChainView() returns the surviving
-    // chained entries paired with their hash-chain `sequence`, in ascending
-    // sequence order, each carrying its decrypted `entry` (with `details`). It
-    // strict-verifies the chain (throws on a break), so this is the
-    // cryptographically authenticated append order, not a skewable timestamp.
-    const chainView = await auditLog.verifiedChainView();
-    for (const { entry } of chainView) {
-      registry.apply(entry);
-    }
+    // Authenticated chain order: streamVerifiedChain delivers the surviving
+    // chained entries (each carrying its decrypted `entry` with `details`) in
+    // ascending hash-chain `sequence` order — exactly the fold order `apply`
+    // requires. It runs the SAME strict verification as the array view (throws
+    // AuditIntegrityError on a chain break), so this is the cryptographically
+    // authenticated append order, not a skewable timestamp. Streaming keeps the
+    // full decrypted log from ever being resident at once (the daemon-OOM-on-a-
+    // large-log bound). `reset` rebuilds the projection from scratch if the audit
+    // log's read-consistency loop abandons a torn-read pass, so the returned
+    // registry reflects exactly the single accepted verified pass.
+    let registry = new WorkloadRegistry();
+    await auditLog.streamVerifiedChain({
+      onEntry: ({ entry }) => {
+        registry.apply(entry);
+      },
+      reset: () => {
+        registry = new WorkloadRegistry();
+      },
+    });
     return registry;
   }
 
