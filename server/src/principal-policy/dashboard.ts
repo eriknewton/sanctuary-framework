@@ -3883,22 +3883,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       return;
     }
 
-    // Only accept the long-lived token via Authorization header - NEVER from URL
+    // Only accept the long-lived token via Authorization header - NEVER from URL.
+    //
+    // SECURITY (invariant 7, no auth oracle): a MISSING Authorization header and
+    // a PRESENT-but-WRONG bearer return a BYTE-IDENTICAL generic 401. The prior
+    // split ("Authorization header required" vs "Invalid bearer token") was an
+    // oracle that told an unauthenticated caller whether it had supplied a
+    // header at all - a distinction a co-resident agent could probe. Both
+    // failure modes now collapse to the same generic body, matching the generic
+    // posture elsewhere in this file (checkAuth -> "unauthorized"; unlock ->
+    // "unlock failed"). The response is sent constant-shape regardless of which
+    // sub-check failed.
     const authHeader = req.headers.authorization;
-    if (!authHeader) {
+    const parts = authHeader?.split(" ");
+    const hasValidBearer =
+      parts?.length === 2 &&
+      parts[0] === "Bearer" &&
+      constantTimeEquals(parts[1]!, this.authToken);
+    if (!hasValidBearer) {
       res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Authorization header required" }));
-      return;
-    }
-
-    const parts = authHeader.split(" ");
-    if (
-      parts.length !== 2 ||
-      parts[0] !== "Bearer" ||
-      !constantTimeEquals(parts[1]!, this.authToken)
-    ) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid bearer token" }));
+      res.end(JSON.stringify({ error: "authentication required" }));
       return;
     }
 

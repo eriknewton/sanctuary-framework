@@ -180,4 +180,37 @@ describe("SEC-012: Dashboard auth token never in URL query string", () => {
     });
     expect(res.status).toBe(401);
   });
+
+  // ── Test 9: no auth oracle on /auth/session (invariant 7) ───────────
+  //
+  // A MISSING Authorization header and a PRESENT-but-WRONG bearer must
+  // return a BYTE-IDENTICAL generic 401 (status + body). The prior code
+  // returned "Authorization header required" vs "Invalid bearer token" —
+  // an oracle that told an unauthenticated caller whether it had supplied
+  // a header at all. Both now collapse to one generic body.
+  it("returns a byte-identical generic 401 for missing-header and wrong-token (no oracle)", async () => {
+    await createDashboard();
+
+    const missing = await fetch(`${baseUrl}/auth/session`, { method: "POST" });
+    const wrong = await fetch(`${baseUrl}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+
+    // Identical status.
+    expect(missing.status).toBe(401);
+    expect(wrong.status).toBe(401);
+
+    // Byte-identical body: the raw text must match exactly, so no
+    // distinguishing oracle leaks through the error string.
+    const missingBody = await missing.text();
+    const wrongBody = await wrong.text();
+    expect(missingBody).toBe(wrongBody);
+
+    // And the body is the generic shape, not either of the old oracle
+    // strings.
+    expect(missingBody).toBe(JSON.stringify({ error: "authentication required" }));
+    expect(missingBody).not.toContain("Authorization header required");
+    expect(missingBody).not.toContain("Invalid bearer token");
+  });
 });
