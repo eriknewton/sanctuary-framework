@@ -209,24 +209,38 @@ export async function verifyAgainstLog(
   let countersRecomputed = false;
   if (input.auditLog) {
     try {
-      const chain = await input.auditLog.verifiedChainView();
-      const covered = chain.filter(
-        (item) =>
-          item.sequence >= checkpoint.audit.lowest_sequence &&
-          item.sequence <= checkpoint.audit.highest_sequence
-      );
+      // Stream the verified chain and fold the covered-range recount one entry
+      // at a time, so a large on-disk log is never fully resident (the
+      // daemon-OOM-on-a-large-log bound). streamVerifiedChain runs the same
+      // strict verification (throws on a chain that does not verify). `reset`
+      // discards a torn-read pass the audit log's consistency loop abandons.
+      let coveredCount = 0;
+      let recountAcc = newRecountAccumulator();
+      await input.auditLog.streamVerifiedChain({
+        onEntry: (item) => {
+          if (
+            item.sequence < checkpoint.audit.lowest_sequence ||
+            item.sequence > checkpoint.audit.highest_sequence
+          ) {
+            return;
+          }
+          coveredCount++;
+          accumulateRecount(recountAcc, checkpoint.fortress_id, item.entry);
+        },
+        reset: () => {
+          coveredCount = 0;
+          recountAcc = newRecountAccumulator();
+        },
+      });
       if (
-        covered.length !== checkpoint.audit.entry_count &&
+        coveredCount !== checkpoint.audit.entry_count &&
         checkpoint.audit.entry_count > 0
       ) {
         notes.push(
-          `only ${covered.length} of ${checkpoint.audit.entry_count} covered entries survive (rotation); counters recounted over the surviving subset would not be comparable, so the recount was skipped`
+          `only ${coveredCount} of ${checkpoint.audit.entry_count} covered entries survive (rotation); counters recounted over the surviving subset would not be comparable, so the recount was skipped`
         );
       } else {
-        const recount = recountEnforcement(
-          checkpoint.fortress_id,
-          covered.map((item) => item.entry)
-        );
+        const recount = finalizeRecount(recountAcc);
         const mismatch = diffEnforcement(recount, checkpoint.enforcement);
         if (mismatch) {
           findings.push({
@@ -352,38 +366,54 @@ async function readSurvivingEnvelopes(
   return envelopes;
 }
 
-function recountEnforcement(
+/**
+ * Incremental recount accumulator: lets the host recount fold the covered audit
+ * entries one streamed entry at a time, so the full decrypted chain is never
+ * materialized to recount (bounded-memory host verify). The finalized result is
+ * byte-identical to a batch recount over the same ordered entry set.
+ */
+interface RecountAccumulator {
+  totalAllowed: number;
+  totalBlocked: number;
+  rules: Map<string, { allowed: number; blocked: number }>;
+}
+
+function newRecountAccumulator(): RecountAccumulator {
+  return { totalAllowed: 0, totalBlocked: 0, rules: new Map() };
+}
+
+function accumulateRecount(
+  acc: RecountAccumulator,
   fortressId: string,
-  entries: ReadonlyArray<{
-    operation: string;
-    details?: Record<string, unknown>;
-  }>
-): {
+  entry: { operation: string; details?: Record<string, unknown> }
+): void {
+  const kind =
+    entry.operation === "egress_allowed"
+      ? "allowed"
+      : entry.operation === "egress_blocked"
+        ? "blocked"
+        : null;
+  if (!kind) return;
+  if (kind === "allowed") acc.totalAllowed++;
+  else acc.totalBlocked++;
+  const ruleId = entry.details?.rule_id;
+  if (typeof ruleId !== "string" || ruleId.length === 0) return;
+  const label = transparencyRuleLabel(fortressId, ruleId);
+  const bucket = acc.rules.get(label) ?? { allowed: 0, blocked: 0 };
+  bucket[kind]++;
+  acc.rules.set(label, bucket);
+}
+
+function finalizeRecount(acc: RecountAccumulator): {
   total_allowed: number;
   total_blocked: number;
   rules: Map<string, { allowed: number; blocked: number }>;
 } {
-  let totalAllowed = 0;
-  let totalBlocked = 0;
-  const rules = new Map<string, { allowed: number; blocked: number }>();
-  for (const entry of entries) {
-    const kind =
-      entry.operation === "egress_allowed"
-        ? "allowed"
-        : entry.operation === "egress_blocked"
-          ? "blocked"
-          : null;
-    if (!kind) continue;
-    if (kind === "allowed") totalAllowed++;
-    else totalBlocked++;
-    const ruleId = entry.details?.rule_id;
-    if (typeof ruleId !== "string" || ruleId.length === 0) continue;
-    const label = transparencyRuleLabel(fortressId, ruleId);
-    const bucket = rules.get(label) ?? { allowed: 0, blocked: 0 };
-    bucket[kind]++;
-    rules.set(label, bucket);
-  }
-  return { total_allowed: totalAllowed, total_blocked: totalBlocked, rules };
+  return {
+    total_allowed: acc.totalAllowed,
+    total_blocked: acc.totalBlocked,
+    rules: acc.rules,
+  };
 }
 
 function diffEnforcement(
