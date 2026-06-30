@@ -328,6 +328,29 @@ export async function handleRequest(
     if (handled) return true;
   }
 
+  // ── `/` posture-shell fallback when v1.1 bindings are absent ─────────
+  // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+  // dispatch above. But that dispatch is gated on `deps.v11Bindings`, which is
+  // null in two reachable windows: (a) the startup race between listen() and
+  // setV11Bindings(), and (b) the permanent degraded path where buildV11Bindings
+  // throws and setV11Bindings is therefore never called (wrap/cli.ts swallows the
+  // throw and prints a note). Without this fallback `/` would skip both the
+  // posture block above (now `/posture`-only) and the v1.1 dispatch, fall through
+  // to `return false`, and 404 - a regression from the pre-flip behavior where
+  // `/` always served the posture shell. This mirrors the principal-policy
+  // router's `isRootServedAsShell` fallback (principal-policy/dashboard.ts): when
+  // there is no concierge to fall through to, `/` keeps serving the posture board
+  // shell as the honest degraded surface rather than 404ing. Same read-auth gate
+  // the posture block above and the pre-flip `/` used.
+  if (method === "GET" && path === "/" && !deps.v11Bindings) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    writeText(res, 200, renderPostureHomeHTML(), "text/html; charset=utf-8");
+    return true;
+  }
+
   // ── Health (unauthenticated liveness only) ───────────────────────────
   // Mirrors the principal-policy dashboard contract exactly: `{ ok, mode }`
   // plus the opaque per-process `instance` + `since` (restart-detection

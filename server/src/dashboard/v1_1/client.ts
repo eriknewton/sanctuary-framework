@@ -2570,7 +2570,10 @@ function renderPostureStory(d) {
   ];
   return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
 }
-function renderPostureAnomalies(findings) {
+function renderPostureAnomalies(findings, unknown) {
+  if (unknown) {
+    return '<p class="muted">Open anomaly findings unavailable (the detector did not respond). This is not a confirmation of zero findings.</p>';
+  }
   if (!findings || !findings.length) {
     return '<p class="muted">No open anomaly findings.</p>';
   }
@@ -2616,6 +2619,7 @@ function renderPostureScreen() {
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
+  const anomalyUnknown = home.anomaly_findings_unknown === true;
   const chainPill = home.digest && home.digest.chain_verified
     ? '<span class="pill tone-verified">Verified</span>'
     : '<span class="pill tone-locked">Unverified</span>';
@@ -2625,7 +2629,7 @@ function renderPostureScreen() {
       postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed") +
       postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall") +
       postureMetricCard(escHtml(pending), "Approvals waiting") +
-      postureMetricCard(escHtml(findings.length), "Open anomalies") +
+      postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
       postureMetricCard(chainPill, "Audit chain") +
     '</div>';
   const storyToggle =
@@ -2646,7 +2650,7 @@ function renderPostureScreen() {
       '</section>',
       '<section class="card">',
         '<h3>Anomaly findings</h3>',
-        renderPostureAnomalies(findings),
+        renderPostureAnomalies(findings, anomalyUnknown),
       '</section>',
       '<section class="card">',
         '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
@@ -2769,15 +2773,26 @@ async function fetchPostureHome() {
     } else {
       // Anomaly findings come from the dedicated endpoint; tolerate its absence
       // (a fortress with no anomaly detector wired) without failing the screen.
+      // Honesty (never-overclaim): a genuine fetch FAILURE (network throw or a
+      // 5xx server error) must NOT render as an affirmative "Open anomalies: 0" /
+      // "No open anomaly findings" - that conflates "the detector errored" with
+      // "genuinely zero", which is a soft overclaim on the posture surface. So we
+      // distinguish an UNKNOWN state (anomaly_findings_unknown) from a real zero.
+      // A 404 (or any 4xx) is treated as "not wired" = legitimately empty, per
+      // the tolerate-absence intent; only a throw or a 5xx reads as unknown.
       let findings = [];
+      let anomalyUnknown = false;
       try {
         const ar = await fetch("/api/anomaly/findings?_t=" + Date.now(), { headers: headers, cache: "no-store" });
         if (ar.ok) {
           const ab = await ar.json();
           findings = (ab && ab.data && ab.data.findings) || [];
+        } else if (ar.status >= 500) {
+          anomalyUnknown = true;
         }
-      } catch (e) { findings = []; }
+      } catch (e) { anomalyUnknown = true; }
       body.anomaly_findings = findings;
+      body.anomaly_findings_unknown = anomalyUnknown;
       state.posture.home = body;
       state.posture.homeError = null;
     }

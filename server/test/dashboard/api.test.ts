@@ -322,6 +322,28 @@ describe("Dashboard HTTP API", () => {
     expect(res.status).toBe(404);
   });
 
+  it("serves the posture shell at / as the fallback when v1.1 bindings are absent", async () => {
+    // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+    // v1.1 dispatch, but that dispatch is gated on v11Bindings. This rig boots
+    // WITHOUT v11Bindings (the degraded/startup-race window). `/` must keep
+    // serving the posture board shell as the honest fallback, mirroring the
+    // principal-policy router's isRootServedAsShell fallback - NOT 404 (the
+    // regression this asserts against).
+    handle = await startForTest();
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Sanctuary - Sovereignty Posture");
+  });
+
+  it("401s / fallback shell when an operator token is required and missing", async () => {
+    // The no-bindings `/` fallback honors the same read-auth gate the pre-flip
+    // `/` and `/posture` use: when a token is required and absent, it 401s.
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(401);
+  });
+
   // ERROR-DETAIL-001: completes the #604 error-envelope sweep. The legacy
   // dashboard 500-paths used to serialize `(err as Error).message` to the
   // client. The fix keeps the specific public error code but emits no
