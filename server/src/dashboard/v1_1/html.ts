@@ -1245,25 +1245,255 @@ body {
   .agents-list-head span:nth-child(4), .agents-list .agent-row > .agent-last { display: none; }
   .inspect-pane { position: static; max-height: none; }
 }
+
+/* ===================================================================
+ * Wave 1 redesign (2026-06-30): conversational-spine layout.
+ *
+ * Three new pieces of chrome and one re-styled rail:
+ *  1. The Talk hero block + grouped sidebar (the spine reads as primary).
+ *  2. The top-bar agent switcher (who am I steering) + posture seal
+ *     (how protected am I, from the HONEST evidence-gated verdict).
+ *  3. The right rail becomes a calm two-element column: a click-to-clear
+ *     approvals queue + ambient posture. The heavy inbox filter panel
+ *     moved OFF the rail to the Activity screen.
+ * All colors come from the existing token palette; accents carry meaning
+ * only (ochre = waiting on you, sage = protected, rust = locked).
+ * =================================================================== */
+
+/* Talk hero block (promoted spine entry in the sidebar). */
+.sidebar nav .nav-talk {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 12px; margin: 0 0 10px;
+  border-radius: var(--rad-lg);
+  background: var(--surface); border: 1px solid var(--rule);
+  box-shadow: var(--shadow);
+}
+.sidebar nav .nav-talk:hover { background: var(--surface); border-color: var(--rule-2); }
+.sidebar nav .nav-talk.active { background: var(--surface); border-color: var(--ink-3); }
+.sidebar nav .nav-talk svg { width: 18px; height: 18px; color: var(--ink); flex-shrink: 0; }
+.nav-talk-glyph { display: inline-flex; }
+.nav-talk-text { display: flex; flex-direction: column; line-height: 1.2; }
+.nav-talk-text strong { font-family: var(--serif); font-size: var(--text-lg); font-weight: 500; }
+.nav-talk-sub { font-family: var(--mono); font-size: 10px; color: var(--ink-3); letter-spacing: 0.02em; }
+.nav-group-label {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--ink-4);
+  padding: 10px 12px 4px;
+}
+
+/* Top-bar agent switcher. */
+.agent-switcher { position: relative; }
+.agent-switcher-trigger {
+  display: flex; align-items: center; gap: 9px;
+  padding: 4px 9px 4px 6px;
+  border: 1px solid var(--rule); border-radius: 999px;
+  background: var(--surface); color: var(--ink);
+  font-family: var(--sans); font-size: var(--text-sm); cursor: pointer;
+}
+.agent-switcher-trigger:hover { border-color: var(--rule-2); background: var(--surface-2); }
+.agent-switcher-trigger .sw-glyph {
+  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: var(--paper-3); border: 1px solid var(--rule);
+  font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--ink-2);
+}
+.agent-switcher-trigger .sw-text { display: flex; flex-direction: column; line-height: 1.15; text-align: left; }
+.agent-switcher-trigger .sw-agent { font-size: var(--text-base); font-weight: 500; }
+.agent-switcher-trigger .sw-scope { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.02em; }
+.agent-switcher-trigger .sw-caret {
+  width: 0; height: 0; margin-left: 1px;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-top: 5px solid var(--ink-3);
+}
+.agent-switcher-menu {
+  position: absolute; top: calc(100% + 6px); left: 0;
+  width: 260px; max-height: 320px; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--rule-2);
+  border-radius: var(--rad-lg); box-shadow: var(--shadow);
+  padding: 6px; z-index: 50;
+}
+.agent-switcher-menu[hidden] { display: none; }
+.agent-switcher-opt {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 7px 8px; border: 0; border-radius: var(--rad);
+  background: transparent; color: var(--ink); cursor: pointer;
+  font-family: var(--sans); font-size: var(--text-base); text-align: left;
+}
+.agent-switcher-opt:hover { background: var(--paper-2); }
+.agent-switcher-opt.selected { background: var(--paper-2); box-shadow: inset 3px 0 0 var(--ink); }
+.agent-switcher-opt .opt-glyph {
+  width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+  display: grid; place-items: center;
+  background: var(--paper-3); border: 1px solid var(--rule);
+  font-family: var(--mono); font-size: 10px; font-weight: 600; color: var(--ink-2);
+}
+.agent-switcher-opt .opt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-switcher-opt .opt-state { font-family: var(--mono); font-size: 9px; color: var(--ink-3); }
+
+/* Posture seal (top bar) + popover. Honest verdict drives the color. */
+.posture-seal-wrap { position: relative; }
+.posture-seal {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 4px 11px 4px 8px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--rule); background: var(--surface-2); color: var(--ink-2);
+  font-family: var(--mono); font-size: var(--text-xs); letter-spacing: 0.02em;
+}
+.posture-seal .seal-glyph { width: 12px; height: 12px; position: relative; flex-shrink: 0; }
+.posture-seal .seal-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
+.posture-seal .seal-glyph::after { content: ""; position: absolute; inset: 4px; background: currentColor; border-radius: 50%; opacity: 0.9; }
+.posture-seal .seal-word { text-transform: uppercase; font-weight: 600; }
+.posture-seal.tone-protected { border-color: var(--sage); background: var(--sage-bg); color: var(--sage); }
+.posture-seal.tone-attention { border-color: var(--ochre); background: var(--ochre-bg); color: var(--ochre); }
+.posture-seal.tone-locked { border-color: var(--rust); background: var(--rust-bg); color: var(--rust); }
+.posture-seal-pop {
+  position: absolute; top: calc(100% + 6px); right: 0;
+  width: 320px; background: var(--surface);
+  border: 1px solid var(--rule-2); border-radius: var(--rad-lg);
+  box-shadow: var(--shadow); padding: 14px 16px; z-index: 50;
+}
+.posture-seal-pop[hidden] { display: none; }
+.posture-seal-pop h4 { margin: 0 0 4px; font-family: var(--serif); font-weight: 500; font-size: var(--text-lg); }
+.posture-seal-pop .pp-sub { margin: 0 0 10px; color: var(--ink-3); font-size: var(--text-sm); line-height: 1.5; }
+.posture-seal-pop .pp-line {
+  display: flex; align-items: center; gap: 8px; padding: 6px 0;
+  border-bottom: 1px dashed var(--rule); font-size: var(--text-base);
+}
+.posture-seal-pop .pp-line:last-child { border-bottom: 0; }
+.posture-seal-pop .pp-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--sage); flex-shrink: 0; }
+.posture-seal-pop .pp-dot.warn { background: var(--ochre); }
+.posture-seal-pop .pp-dot.off { background: var(--ink-4); }
+.posture-seal-pop .pp-k { color: var(--ink-2); }
+.posture-seal-pop .pp-v { margin-left: auto; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+
+/* Spine: the promoted concierge hero. The center column gets the air;
+ * the page-head display headline is the one display moment per screen. */
+.concierge-wrap.spine-hero { max-width: 880px; }
+.concierge-wrap.spine-hero .page-head { border-bottom: 0; padding-bottom: 6px; margin-bottom: 14px; }
+.concierge-wrap.spine-hero .page-head h1 { font-size: var(--text-display); line-height: 1.08; }
+.concierge-wrap.spine-hero .page-head .sub { font-size: var(--text-lg); max-width: 56ch; }
+.concierge-wrap.spine-hero .concierge-card { box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 10px 30px rgba(0,0,0,0.06); }
+
+/* Right rail wave-1 layout: queue + ambient posture, calm and tight. */
+.rail-section { display: flex; flex-direction: column; gap: 10px; }
+.rail-section-label {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-3); display: flex; align-items: center; justify-content: space-between;
+  margin: 2px 2px 2px;
+}
+.rail-section-label .count {
+  font-family: var(--mono); background: var(--ochre-bg); color: var(--ochre);
+  border: 1px solid var(--ochre); border-radius: 999px; padding: 0 7px; font-size: 10px; line-height: 16px;
+}
+.rail-section-label .count.zero { background: var(--paper-3); color: var(--ink-3); border-color: var(--rule); }
+.approval-queue { display: flex; flex-direction: column; gap: 8px; }
+.approval-tile {
+  background: var(--surface); border: 1px solid var(--ochre); border-left: 3px solid var(--ochre);
+  border-radius: var(--rad); padding: 11px 12px;
+  display: flex; flex-direction: column; gap: 8px;
+  transition: opacity 240ms ease, transform 240ms ease, max-height 260ms ease, margin 260ms ease, padding 260ms ease, border-width 260ms ease;
+  max-height: 220px; overflow: hidden;
+}
+.approval-tile.leaving {
+  opacity: 0; transform: translateX(12px);
+  max-height: 0; margin-bottom: -8px; padding-top: 0; padding-bottom: 0; border-width: 0;
+}
+.approval-tile .at-what { font-size: var(--text-base); line-height: 1.45; color: var(--ink); }
+.approval-tile .at-agent {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.approval-tile .at-agent .ad { width: 6px; height: 6px; border-radius: 50%; background: var(--ochre); flex-shrink: 0; }
+.approval-tile .at-actions { display: flex; gap: 6px; }
+.approval-tile .at-actions .btn { flex: 1; justify-content: center; }
+.approval-tile .btn.at-approve { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.approval-tile .btn.at-approve:hover:not(:disabled) { background: var(--ink-2); }
+.approval-tile .btn.at-deny:hover:not(:disabled) { color: var(--rust); border-color: var(--rust); background: var(--rust-bg); }
+.queue-empty {
+  display: flex; align-items: center; gap: 9px;
+  padding: 13px 13px; border: 1px dashed var(--rule-2); border-radius: var(--rad);
+  color: var(--ink-3); font-size: var(--text-base); background: var(--surface);
+}
+.queue-empty .qe-check {
+  width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--sage);
+  position: relative; flex-shrink: 0;
+}
+.queue-empty .qe-check::after {
+  content: ""; position: absolute; left: 4px; top: 2px; width: 4px; height: 7px;
+  border-right: 1.5px solid var(--sage); border-bottom: 1.5px solid var(--sage); transform: rotate(45deg);
+}
+.ambient-posture {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--rad);
+  padding: 13px 14px; display: flex; flex-direction: column; gap: 11px;
+}
+.ambient-seal { display: flex; align-items: center; gap: 9px; padding-bottom: 11px; border-bottom: 1px solid var(--rule); }
+.ambient-seal .as-glyph { width: 16px; height: 16px; position: relative; flex-shrink: 0; color: var(--sage); }
+.ambient-seal.tone-attention .as-glyph { color: var(--ochre); }
+.ambient-seal.tone-locked .as-glyph { color: var(--rust); }
+.ambient-seal.tone-unknown .as-glyph { color: var(--ink-4); }
+.ambient-seal .as-glyph::before { content: ""; position: absolute; inset: 0; border: 1.5px solid currentColor; border-radius: 50%; }
+.ambient-seal .as-glyph::after { content: ""; position: absolute; inset: 5px; background: currentColor; border-radius: 50%; opacity: 0.9; }
+.ambient-seal .as-text { display: flex; flex-direction: column; line-height: 1.2; }
+.ambient-seal .as-text strong { font-size: var(--text-md); }
+.ambient-seal .as-text small { font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.ambient-line { font-size: var(--text-base); color: var(--ink-2); line-height: 1.5; }
+.ambient-line .lead {
+  display: block; margin-bottom: 3px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-3);
+}
+.ambient-stats { display: flex; border-top: 1px solid var(--rule); padding-top: 10px; }
+.ambient-stat { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.ambient-stat:not(:last-child) { border-right: 1px solid var(--rule); }
+.ambient-stat .n { font-family: var(--serif); font-size: 19px; line-height: 1; }
+.ambient-stat .l { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
 `;
 
 /**
  * Sidebar nav definition. Out-of-scope screens at v1.1 ship are NOT
  * present in this list. Federation (v1.3), Composition (v1.4+), and full
  * Recovery management are excluded by construction.
+ *
+ * Wave 1 redesign (2026-06-30): the prior flat 11-item list read every
+ * surface at equal weight, so the conversational spine ("Dashboard", the
+ * concierge) was item one of eleven and did not read as primary. The list
+ * is now grouped so the spine is the emphasized default and the rest steps
+ * down into named groups: Operate (run the fleet), Verify (check the
+ * record), Advanced (everything else, including the flourishing /
+ * anti-mind-crime surfaces, which stay tucked here and never on the
+ * surface). The Talk item is rendered separately (a promoted hero block),
+ * so it is NOT in any group. Route ids are unchanged frozen surfaces; only
+ * the visible grouping + the "Dashboard" -> "Talk" / "Activity" labels move.
+ *
+ * "Activity" is a NEW route hosting the full inbox + the heavy six-field
+ * filter panel that previously sat inline on the right rail. The rail keeps
+ * only the click-to-clear approvals queue; power-querying lives here.
  */
-const NAV_ITEMS: Array<{ id: string; label: string }> = [
-  { id: "dashboard", label: "Dashboard" },
-  { id: "agents", label: "Agents" },
-  { id: "policy", label: "Policy" },
-  { id: "auto-trigger", label: "Auto-trigger" },
-  { id: "intelligence", label: "Intelligence" },
-  { id: "attestation", label: "Attestation" },
-  { id: "honeypot", label: "Honeypots" },
-  { id: "privacy", label: "Privacy" },
-  { id: "coordination", label: "Coordination" },
-  { id: "health", label: "Health" },
-  { id: "exit-drill", label: "Exit drill" },
+const NAV_GROUPS: Array<{ label: string; items: Array<{ id: string; label: string }> }> = [
+  {
+    label: "Operate",
+    items: [
+      { id: "agents", label: "Agents" },
+      { id: "policy", label: "Policy" },
+      { id: "auto-trigger", label: "Auto-trigger" },
+    ],
+  },
+  {
+    label: "Verify",
+    items: [
+      { id: "activity", label: "Activity" },
+      { id: "attestation", label: "Attestation" },
+      { id: "health", label: "Health" },
+    ],
+  },
+  {
+    label: "Advanced",
+    items: [
+      { id: "intelligence", label: "Intelligence" },
+      { id: "privacy", label: "Privacy" },
+      { id: "honeypot", label: "Honeypots" },
+      { id: "coordination", label: "Coordination" },
+      { id: "exit-drill", label: "Exit drill" },
+    ],
+  },
 ];
 
 /**
@@ -1283,6 +1513,10 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/><path d="M6 9h4M6 11.5h4"/>',
   "auto-trigger":
     '<path d="M3 12V4l5-2 5 2v8l-5 2z"/><path d="M8 5v3l2 1"/>',
+  activity:
+    '<path d="M1.5 8h3l2-5 3 10 2-5h3"/>',
+  talk:
+    '<path d="M2 3.5h12v7H8l-3 3v-3H2z"/>',
   intelligence:
     '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
   attestation:
@@ -1337,10 +1571,23 @@ export function renderDashboardV11Html(
   const sanctuaryVersion = options.sanctuaryVersion ?? SANCTUARY_VERSION;
   const embedClient = options.embedClient !== false;
 
-  const nav = NAV_ITEMS.map((n) => {
+  const navItemHtml = (n: { id: string; label: string }) => {
     const iconPath = NAV_ICON_PATHS[n.id] ?? "";
     const icon = iconPath ? SVG_OPEN + iconPath + "</svg>" : "";
     return `<a href="#${n.id}" data-route="${n.id}">${icon}<span>${escHtml(n.label)}</span></a>`;
+  };
+  // Talk hero block: the promoted conversational spine. data-route
+  // "dashboard" is the SAME frozen route the concierge has always used;
+  // only the visible affordance (a hero card, not a flat nav row) changes.
+  const talkIcon = SVG_OPEN + (NAV_ICON_PATHS["talk"] ?? "") + "</svg>";
+  const talkHero =
+    `<a href="#dashboard" data-route="dashboard" class="nav-talk">` +
+    `<span class="nav-talk-glyph">${talkIcon}</span>` +
+    `<span class="nav-talk-text"><strong>Talk</strong><span class="nav-talk-sub">your fortress</span></span>` +
+    `</a>`;
+  const nav = talkHero + "\n        " + NAV_GROUPS.map((g) => {
+    const groupItems = g.items.map(navItemHtml).join("\n          ");
+    return `<div class="nav-group-label">${escHtml(g.label)}</div>\n          ${groupItems}`;
   }).join("\n        ");
 
   // Emit raw JSON inside `<script type="application/json">`. HTML parsers
@@ -1381,13 +1628,28 @@ export function renderDashboardV11Html(
     </aside>
     <header class="topbar">
       <span class="brand mono">${tenantName ? `${escHtml(tenantName)} ` : ""}${escHtml(fortressId)}</span>
+      <div class="agent-switcher" id="agent-switcher" data-switcher>
+        <button type="button" class="agent-switcher-trigger" id="agent-switcher-trigger" data-action="agent-switcher-toggle" aria-haspopup="true" aria-expanded="false" title="Choose which protected agent you are steering">
+          <span class="sw-glyph" id="agent-switcher-glyph">··</span>
+          <span class="sw-text"><span class="sw-agent" id="agent-switcher-label">All agents</span><span class="sw-scope">this fortress</span></span>
+          <span class="sw-caret" aria-hidden="true"></span>
+        </button>
+        <div class="agent-switcher-menu" id="agent-switcher-menu" role="menu" hidden></div>
+      </div>
       <div class="pills" id="topbar-pills">
         <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
         <span class="pill" data-pill="deployment">deployment: local</span>
         <span class="pill" data-pill="mode">mode: solo</span>
         <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
       </div>
-      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines">Fleet Switcher</a>
+      <div class="posture-seal-wrap" id="posture-seal-wrap" data-seal>
+        <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="How protected you are right now">
+          <span class="seal-glyph" aria-hidden="true"></span>
+          <span class="seal-word" id="posture-seal-word">Checking</span>
+        </button>
+        <div class="posture-seal-pop" id="posture-seal-pop" hidden></div>
+      </div>
+      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines (more machines arrive in a later wave)">Fleet Switcher</a>
       <button class="btn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
         <span class="icon-moon">${THEME_ICON_MOON}</span>
         <span class="icon-sun">${THEME_ICON_SUN}</span>

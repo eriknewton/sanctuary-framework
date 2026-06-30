@@ -159,25 +159,29 @@ describe("Intelligence panel — sidebar nav welcome card link", () => {
 });
 
 describe("Intelligence panel — CCCC first-load render + substrate-missing wording", () => {
-  it("notConfigured empty-state names the missing config and gives the exact command (NNNNN pattern)", () => {
+  it("notConfigured empty-state points at the in-dashboard picker, not a dead CLI command (wave-1 copy fix)", () => {
     const client = getClientScript();
-    expect(client).toContain("No intelligence substrate configured");
-    expect(client).toContain("sanctuary intelligence configure --substrate local");
+    expect(client).toContain("Pick a model for your fortress");
+    // The dead `sanctuary intelligence configure` verb must NOT appear in any
+    // operator-visible copy (no such CLI command exists). A substrate is
+    // chosen in the dashboard Intelligence picker / via env vars.
+    expect(client).not.toContain("sanctuary intelligence configure --substrate local");
+    expect(client).toContain("picker on this Intelligence screen");
   });
 
-  it("notConfigured empty-state lists all three substrate options (local, hosted, hybrid)", () => {
+  it("notConfigured empty-state spells out the per-substrate privacy tradeoff (canonical strings)", () => {
     const client = getClientScript();
-    // The notConfigured block should reference all three substrate choices
-    // so the operator knows what their options are.
-    expect(client).toContain("--substrate local");
-    expect(client).toContain("--substrate hosted");
-    expect(client).toContain("--substrate hybrid");
+    // Reuses the canonical tradeoff strings from intelligence/templates.ts so
+    // the operator understands where their queries go BEFORE they choose.
+    expect(client).toContain("Your queries never leave your machine");
+    expect(client).toContain("contractual, not cryptographic");
+    expect(client).toContain("expect imperfect privacy");
   });
 
-  it("loadError state shows substrate-configuration guidance for new fortresses", () => {
+  it("loadError state shows substrate-picker guidance (not a dead CLI command) for new fortresses", () => {
     const client = getClientScript();
-    expect(client).toContain("If this is a new fortress, configure a substrate first");
-    expect(client).toContain("sanctuary intelligence configure --substrate local");
+    expect(client).toContain("pick a model in the Intelligence picker");
+    expect(client).not.toContain("sanctuary intelligence configure --substrate local");
   });
 
   it("fetchIntelligenceState handles 401 with a dashboard-auth-specific message, not raw 'unauthorized'", () => {
