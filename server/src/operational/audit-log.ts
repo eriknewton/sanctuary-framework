@@ -56,9 +56,14 @@ export interface VerifiedChainItem {
 /**
  * Streaming consumer of the verified hash chain (the daemon-OOM-on-a-large-log
  * bound). The full decrypted chain is NEVER simultaneously resident: each
- * chained entry is decrypted, strict-verified, handed to `onEntry`, and then
- * released. Consumers fold their result incrementally (Merkle leaves, per-rule
- * counters, workload replay) instead of materializing the whole `AuditEntry[]`.
+ * chained entry is decrypted + hash-checked, handed to `onEntry`, and then
+ * released. The contiguous chain walk + anchor/checkpoint verification complete
+ * AFTER the stream, before `streamVerifiedChain` resolves; in strict mode it
+ * throws on any failure, so a consumer that commits its fold only after the
+ * await returns clean never commits over an unverified chain (see
+ * {@link AuditLog.streamVerifiedChain}). Consumers fold their result
+ * incrementally (Merkle leaves, per-rule counters, workload replay) instead of
+ * materializing the whole `AuditEntry[]`.
  *
  * `reset` is the read-consistency contract: the verified pass runs under a
  * torn-read retry loop, so a pass that observed a transient mid-mutation state
@@ -695,6 +700,24 @@ export class AuditIntegrityError extends Error {
         : `${findings.length} audit integrity findings detected`
     );
     this.name = "AuditIntegrityError";
+  }
+}
+
+/**
+ * Internal marker wrapping an error thrown by a {@link VerifiedChainConsumer}'s
+ * `onEntry` during a streaming reload pass. The decrypt loop runs inside
+ * `loadPersistedEntries`' outer try (it iterates a live `storage.list`), so a
+ * raw consumer throw would otherwise be caught there and relabeled
+ * `storage_unavailable`. Tagging it lets the outer catch re-throw the consumer's
+ * ORIGINAL error verbatim: a consumer rejection (e.g. a malformed workload
+ * lifecycle payload) is neither a storage failure nor a decrypt failure and must
+ * surface as itself, never be absorbed into the integrity findings (#504). Never
+ * escapes the module: it is always unwrapped before it leaves `loadPersistedEntries`.
+ */
+class ConsumerRejectedEntryError extends Error {
+  constructor(readonly cause: unknown) {
+    super("audit-chain consumer rejected a decrypted entry");
+    this.name = "ConsumerRejectedEntryError";
   }
 }
 
@@ -1725,14 +1748,21 @@ export class AuditLog {
    * so a large on-disk log no longer allocates its whole multi-GB decrypted
    * payload set per call.
    *
-   * Tamper-evidence is byte-for-byte unchanged from the array view: every entry
-   * is still decrypted, hash-checked, sequence/prev-hash-walked, and covered by
-   * the legacy / rotation / head anchors and checkpoint roots before `onEntry`
-   * ever sees it. Those full-chain invariants are derived from cheap envelope
-   * metadata (sequence, entry_hash, prev_hash) and on-disk reads, never from a
-   * materialized decrypted array, so streaming changes WHEN payloads are
-   * released, not WHAT is verified. See {@link VerifiedChainConsumer} for the
-   * `reset` (read-consistency) contract.
+   * Ordering / tamper-evidence (read carefully, the safety is in the await, not
+   * a pre-stream gate): `onEntry` fires DURING the decrypt loop, so each entry is
+   * decrypted + hash-checked before the consumer sees it, but the FULL-CHAIN
+   * checks (the contiguous sequence/prev-hash walk, the legacy / rotation / head
+   * anchors, the checkpoint roots) run AFTER the loop, on cheap envelope metadata.
+   * The guarantee a consumer relies on is therefore the AWAIT boundary, not a
+   * pre-stream verification: this method does not resolve until those full-chain
+   * checks have run, and in strict mode it THROWS `AuditIntegrityError` if any
+   * failed. So a consumer that commits its incremental fold only AFTER
+   * `await streamVerifiedChain(...)` returns clean never commits a result over an
+   * unverified or tampered chain (a mid-stream tamper makes the await reject, the
+   * fold is discarded). The full-chain invariants are derived from envelope
+   * metadata and on-disk reads, never from a materialized decrypted array, so
+   * streaming changes WHEN payloads are released, not WHAT is verified. See
+   * {@link VerifiedChainConsumer} for the `reset` (read-consistency) contract.
    */
   async streamVerifiedChain(consumer: VerifiedChainConsumer): Promise<void> {
     await this.appendQueue;
@@ -2493,30 +2523,12 @@ export class AuditLog {
             });
           }
 
+          let entry: AuditEntry;
           try {
             const encryptedBytes = fromBase64url(parsed.encrypted_payload_bytes);
             const encrypted: EncryptedPayload = JSON.parse(bytesToString(encryptedBytes));
             const decrypted = await this.decryptEntryPayload(encrypted);
-            const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-            // Retain only cheap envelope metadata for the full-chain verify.
-            chainedEntries.push({ key: meta.key, envelope: parsed });
-            // Stream the decrypted entry to the consumer (Merkle/recount/replay)
-            // or slide it into the bounded window; release it either way so a
-            // large chain is never fully resident. Listing order is ascending
-            // sequence order (zero-padded sequence in the key), so the consumer
-            // sees entries in chain-sequence order.
-            if (consumer) {
-              consumer.onEntry({
-                sequence: parsed.sequence,
-                entry_hash: parsed.entry_hash,
-                entry,
-              });
-            } else {
-              pushWindow(entry, {
-                sequence: parsed.sequence,
-                entry_hash: parsed.entry_hash,
-              });
-            }
+            entry = JSON.parse(bytesToString(decrypted));
           } catch {
             findings.push({
               kind: "entry_decrypt_failed",
@@ -2524,29 +2536,70 @@ export class AuditLog {
               sequence: parsed.sequence,
               message: `audit entry ${meta.key} could not be decrypted at sequence ${parsed.sequence}`,
             });
+            continue;
+          }
+          // Retain only cheap envelope metadata for the full-chain verify.
+          chainedEntries.push({ key: meta.key, envelope: parsed });
+          // Stream the decrypted entry to the consumer (Merkle/recount/replay) or
+          // slide it into the bounded window; release it either way so a large
+          // chain is never fully resident. Listing order is ascending sequence
+          // order (zero-padded sequence in the key), so the consumer sees entries
+          // in chain-sequence order. This is DELIBERATELY outside the decrypt
+          // try/catch above: a consumer that throws (e.g. workload replay's
+          // validateWorkloadLifecyclePayload rejecting a malformed lifecycle
+          // entry) must propagate as ITSELF, not be miscategorized as
+          // `entry_decrypt_failed` (decrypt already succeeded). Mislabeling it
+          // would, under a future lenient pass, silently SKIP the entry: exactly
+          // the #504 under-report the consumers forbid.
+          if (consumer) {
+            try {
+              consumer.onEntry({
+                sequence: parsed.sequence,
+                entry_hash: parsed.entry_hash,
+                entry,
+              });
+            } catch (consumerErr) {
+              // The consumer rejected this (decrypted, hash-checked) entry, e.g.
+              // workload replay's validateWorkloadLifecyclePayload on a malformed
+              // lifecycle record. Propagate it AS ITSELF: tag it so the outer
+              // catch re-throws verbatim instead of relabeling it
+              // `storage_unavailable`. It is neither a decrypt failure nor a
+              // storage failure, and must never be silently absorbed into the
+              // findings list (the #504 under-report the consumers forbid).
+              throw new ConsumerRejectedEntryError(consumerErr);
+            }
+          } else {
+            pushWindow(entry, {
+              sequence: parsed.sequence,
+              entry_hash: parsed.entry_hash,
+            });
           }
           continue;
         }
 
+        let legacyEntry: AuditEntry;
         try {
           const encrypted = parsed as EncryptedPayload;
           const decrypted = await this.decryptEntryPayload(encrypted);
-          const entry: AuditEntry = JSON.parse(bytesToString(decrypted));
-          // Keep the raw bytes (needed for the legacy-anchor hash below); the
-          // decrypted entry only slides into the bounded window. Legacy entries
-          // carry no chained (sequence, entry_hash) pair and the streaming
-          // consumers operate on the chained region only, so a legacy entry is
-          // never streamed; the legacy region's coverage is attested by the
-          // legacy anchor, not by these decrypted payloads.
-          legacyRawEntries.push({ key: meta.key, raw });
-          pushWindow(entry, null);
+          legacyEntry = JSON.parse(bytesToString(decrypted));
         } catch {
           findings.push({
             kind: "entry_decrypt_failed",
             key: meta.key,
             message: `legacy audit entry ${meta.key} could not be decrypted`,
           });
+          continue;
         }
+        // Keep the raw bytes (needed for the legacy-anchor hash below); the
+        // decrypted entry only slides into the bounded window. Legacy entries
+        // carry no chained (sequence, entry_hash) pair and the streaming
+        // consumers operate on the chained region only, so a legacy entry is
+        // never streamed; the legacy region's coverage is attested by the legacy
+        // anchor, not by these decrypted payloads. The window push is outside the
+        // decrypt try/catch above for the same reason as the chained path: a
+        // post-decrypt throw must not be miscategorized as a decrypt failure.
+        legacyRawEntries.push({ key: meta.key, raw });
+        pushWindow(legacyEntry, null);
       }
 
       const legacyHashes = legacyRawEntries.map((legacy, index) =>
@@ -2639,6 +2692,15 @@ export class AuditLog {
       this.lastFullVerifyAtMs = Date.now();
       await this.refreshExpectedStoreFingerprint();
     } catch (err) {
+      // A consumer that rejected a (successfully decrypted, hash-checked) entry
+      // is NOT a storage failure: propagate its original error verbatim rather
+      // than mislabeling it `storage_unavailable` and swallowing it into the
+      // findings list. (The streaming consumers run in strict mode, where any
+      // finding throws anyway, but a future lenient pass must surface the
+      // consumer's real rejection, not a generic storage finding.)
+      if (err instanceof ConsumerRejectedEntryError) {
+        throw err.cause;
+      }
       findings.push({
         kind: "storage_unavailable",
         message: `audit storage could not be listed: ${failureMessage(err)}`,

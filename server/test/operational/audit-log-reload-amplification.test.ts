@@ -28,6 +28,11 @@ import {
 import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import {
+  WORKLOAD_LIFECYCLE_OPS,
+  WorkloadLifecycleSchemaError,
+  WorkloadRegistry,
+} from "../../src/workload-lifecycle/index.js";
 
 const IN_MEMORY_FLOOR = 256;
 
@@ -203,6 +208,74 @@ describe("AuditLog reload amplification bound", () => {
       maxInMemoryEntries: IN_MEMORY_FLOOR,
     });
 
+    await expect(
+      reader.streamVerifiedChain({ onEntry: () => undefined })
+    ).rejects.toBeInstanceOf(AuditIntegrityError);
+  });
+
+  it("propagates a CONSUMER's rejection AS ITSELF, not relabeled as a decrypt/storage finding", async () => {
+    // A consumer (here workload replay) that throws on a malformed-but-decrypted
+    // entry must surface its REAL error, not be miscategorized. Before the hoist,
+    // onEntry ran inside the decrypt try/catch, so a consumer throw was relabeled
+    // `entry_decrypt_failed` (decrypt actually SUCCEEDED) and, under a lenient
+    // pass, would be silently skipped (the #504 under-report). The hoist makes the
+    // consumer error propagate verbatim.
+    const { log } = createLog();
+    // A clean lifecycle entry first, then a lifecycle op with malformed details
+    // (decrypts fine; fails validateWorkloadLifecyclePayload). appendCritical
+    // does NOT validate the lifecycle payload shape, so the malformed details
+    // reach the chain decrypted and intact, exercising exactly the consumer path.
+    await log.appendCritical({
+      layer: "l1",
+      operation: WORKLOAD_LIFECYCLE_OPS.REGISTERED,
+      identity_id: "id-good",
+      result: "success",
+      details: { lifecycle_schema: "definitely-not-the-real-schema", junk: true },
+    });
+    await log.flush();
+
+    // The registry consumer streams the verified chain and calls apply ->
+    // validateWorkloadLifecyclePayload, which throws WorkloadLifecycleSchemaError.
+    await expect(WorkloadRegistry.fromAuditLog(log)).rejects.toBeInstanceOf(
+      WorkloadLifecycleSchemaError
+    );
+    // It must NOT be swallowed/relabeled as an integrity finding.
+    await expect(WorkloadRegistry.fromAuditLog(log)).rejects.not.toBeInstanceOf(
+      AuditIntegrityError
+    );
+  });
+
+  it("a genuinely undecryptable entry STILL surfaces as a decrypt finding (decrypt-error semantics preserved)", async () => {
+    // The hoist must not weaken the real decrypt path: corrupt an entry's
+    // ciphertext so decryption fails, and confirm strict mode still throws
+    // AuditIntegrityError (an entry_decrypt_failed finding), distinct from the
+    // consumer-rejection path above.
+    const { log, storage, masterKey } = createLog();
+    await log.append("l1", "egress_allowed", "id-1", { rule_id: "r" });
+    await log.flush();
+
+    const keys = (await storage.list("_audit")).map((m) => m.key).sort();
+    const victimKey = keys[keys.length - 1]!;
+    const env = JSON.parse(
+      bytesToString((await storage.read("_audit", victimKey))!)
+    ) as PersistedAuditEnvelopeV2;
+    // Truncate the encrypted payload so the inner decrypt/JSON.parse throws. The
+    // entry_hash covers these bytes, so a strict reader surfaces a finding
+    // (decrypt failure and/or hash mismatch) and throws AuditIntegrityError; the
+    // point is that this is an INTEGRITY finding, NOT the consumer-rejection
+    // error class from the previous test.
+    env.encrypted_payload_bytes = env.encrypted_payload_bytes.slice(0, 8);
+    await storage.write(
+      "_audit",
+      victimKey,
+      stringToBytes(JSON.stringify(env))
+    );
+
+    const reader = new AuditLog(storage, masterKey, {
+      maxEntries: 1_000_000,
+      maxTotalSizeBytes: 10 * 1024 * 1024 * 1024,
+      maxInMemoryEntries: IN_MEMORY_FLOOR,
+    });
     await expect(
       reader.streamVerifiedChain({ onEntry: () => undefined })
     ).rejects.toBeInstanceOf(AuditIntegrityError);
