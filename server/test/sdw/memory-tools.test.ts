@@ -67,7 +67,12 @@ function makeAuditLog(failOperations: readonly string[] = []): { log: AuditLog; 
   return { log, calls };
 }
 
-function makeTools(options: { failAuditOperations?: readonly string[] } = {}): {
+function makeTools(
+  options: {
+    failAuditOperations?: readonly string[];
+    ownerIdentity?: () => string | undefined;
+  } = {},
+): {
   tools: Map<string, ToolDefinition>;
   storage: MemoryStorage;
   adapter: SdwMemoryBackendAdapter;
@@ -82,7 +87,11 @@ function makeTools(options: { failAuditOperations?: readonly string[] } = {}): {
     now: () => NOW,
   });
   const { log, calls } = makeAuditLog(options.failAuditOperations);
-  const defs = createSdwMemoryTools({ adapter, auditLog: log });
+  const defs = createSdwMemoryTools({
+    adapter,
+    auditLog: log,
+    ownerIdentity: options.ownerIdentity,
+  });
   return { tools: new Map(defs.map((tool) => [tool.name, tool])), storage, adapter, calls };
 }
 
@@ -434,5 +443,157 @@ describe("SDW memory tools: custody + denial discipline", () => {
     expect(calls.find((c) => c.operation === "memory_search")?.details?.result_count).toBe(1);
     expect(calls.find((c) => c.operation === "memory_list")?.details?.result_count).toBe(1);
     expect(calls.find((c) => c.operation === "memory_count")?.details?.count).toBe(1);
+  });
+});
+
+describe("SDW memory tools: fail-closed multi-agent isolation guard", () => {
+  const ALL_OPS: ReadonlyArray<{ name: string; args: Record<string, unknown> }> = [
+    { name: "memory_insert", args: { text: "x", taint: "agent_derived_clean" } },
+    { name: "memory_get", args: { passage_id: "p" } },
+    { name: "memory_search", args: { text: "x" } },
+    { name: "memory_list", args: {} },
+    { name: "memory_count", args: {} },
+    { name: "memory_delete", args: { passage_id: "p" } },
+  ];
+
+  it("NO-OP when no ownerIdentity resolver is wired (single-coordinator default)", async () => {
+    const { tools } = makeTools();
+    const result = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "single-agent passage",
+        taint: "agent_derived_clean",
+        passage_id: "noop-1",
+      }),
+    );
+    expect(result.inserted).toBe(true);
+  });
+
+  it("NO-OP for a stable single identity: every op proceeds, none refused", async () => {
+    const { tools, calls } = makeTools({ ownerIdentity: () => "agent-alpha" });
+    // Insert one passage so reads/search/list/count/delete have a real target.
+    await tools.get("memory_insert")!.handler({
+      text: "alpha searchable passage",
+      taint: "agent_derived_clean",
+      passage_id: "alpha-1",
+    });
+    for (const op of ALL_OPS) {
+      const result = parse(
+        await tools
+          .get(op.name)!
+          .handler(op.name === "memory_get" || op.name === "memory_delete"
+            ? { passage_id: "alpha-1" }
+            : op.args),
+      );
+      // None of these should be the isolation refusal.
+      expect(result.message).not.toBe("This action is not available in the current context.");
+    }
+    expect(
+      calls.some(
+        (c) => c.details?.denial_class === "sdw_memory_multi_agent_isolation_required",
+      ),
+    ).toBe(false);
+  });
+
+  it("NO-OP for a stable undefined identity (no SANCTUARY_AGENT_ID configured)", async () => {
+    const { tools } = makeTools({ ownerIdentity: () => undefined });
+    const result = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "undefined-identity passage",
+        taint: "agent_derived_clean",
+        passage_id: "undef-1",
+      }),
+    );
+    expect(result.inserted).toBe(true);
+  });
+
+  it("REFUSES a second, distinct agent identity with the typed isolation reason", async () => {
+    let current = "agent-alpha";
+    const { tools, calls } = makeTools({ ownerIdentity: () => current });
+    // First caller pins the bound identity.
+    const first = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "alpha owns this scope",
+        taint: "agent_derived_clean",
+        passage_id: "alpha-pin",
+      }),
+    );
+    expect(first.inserted).toBe(true);
+
+    // A different agent now reaches the SAME shared fleet-self scope -> refuse.
+    current = "agent-beta";
+    const denied = parse(await tools.get("memory_search")!.handler({ text: "alpha" }));
+    expect(denied.denied).toBe(true);
+    // Typed reason is audit-only.
+    expect(
+      calls.some(
+        (c) =>
+          c.operation === "memory_search_denied" &&
+          c.result === "failure" &&
+          c.details?.denial_class === "sdw_memory_multi_agent_isolation_required",
+      ),
+    ).toBe(true);
+  });
+
+  it("refusal is fail-closed and leaks no scope detail (fixed denial only)", async () => {
+    let current = "agent-alpha";
+    const { tools } = makeTools({ ownerIdentity: () => current });
+    await tools.get("memory_insert")!.handler({
+      text: "alpha owns this scope",
+      taint: "agent_derived_clean",
+      passage_id: "alpha-leak",
+    });
+    current = "agent-beta";
+    const denied = parse(await tools.get("memory_get")!.handler({ passage_id: "alpha-leak" }));
+    // The fixed denial shape: no owner_ref, no observed/bound identities, no passage body.
+    expect(denied).toEqual({
+      denied: true,
+      message: "This action is not available in the current context.",
+      remediation_class: "request_review",
+      retry_after: null,
+      audit_ref: "audit:memory_get",
+    });
+    const serialized = JSON.stringify(denied);
+    expect(serialized).not.toContain("agent-alpha");
+    expect(serialized).not.toContain("agent-beta");
+    expect(serialized).not.toContain("fleet-self");
+    expect(serialized).not.toContain("tools-archive");
+  });
+
+  it("blocks writes from a second identity BEFORE any mutation (no leak into the shared scope)", async () => {
+    let current = "agent-alpha";
+    const { tools } = makeTools({ ownerIdentity: () => current });
+    // Alpha pins the scope.
+    await tools.get("memory_count")!.handler({});
+
+    // Beta tries to write; the guard fires before insertPassage.
+    current = "agent-beta";
+    const denied = parse(
+      await tools.get("memory_insert")!.handler({
+        text: "beta should never land in alpha's scope",
+        taint: "agent_derived_clean",
+        passage_id: "beta-write",
+      }),
+    );
+    expect(denied.denied).toBe(true);
+
+    // Confirm nothing was written: alpha re-takes the scope and the count is 0.
+    current = "agent-alpha";
+    const count = parse(await tools.get("memory_count")!.handler({}));
+    expect(count.count).toBe(0);
+  });
+
+  it("does not advance the pin: alternating callers cannot walk the guard forward", async () => {
+    let current = "agent-alpha";
+    const { tools } = makeTools({ ownerIdentity: () => current });
+    await tools.get("memory_count")!.handler({}); // pin alpha
+
+    current = "agent-beta";
+    const betaDenied = parse(await tools.get("memory_count")!.handler({}));
+    expect(betaDenied.denied).toBe(true);
+
+    // Back to alpha: still allowed (the pin never moved to beta).
+    current = "agent-alpha";
+    const alphaAllowed = parse(await tools.get("memory_count")!.handler({}));
+    expect(alphaAllowed.count).toBe(0);
   });
 });

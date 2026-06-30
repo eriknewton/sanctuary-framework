@@ -1442,6 +1442,14 @@ export async function createSanctuaryServer(options?: {
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,
+    // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
+    // shared `fleet-self` owner scope reused for every caller, so SDW memory has
+    // no per-agent custody isolation yet. Resolving the SAME caller identity the
+    // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
+    // the shared scope serves and REFUSE any second, distinct wrapped-agent
+    // identity until real per-agent isolation lands. For single-coordinator use
+    // this resolves a stable value (or stable undefined) and is a strict NO-OP.
+    ownerIdentity: () => process.env.SANCTUARY_AGENT_ID,
   }).map((tool) =>
     tool.name === "memory_insert"
       ? {
