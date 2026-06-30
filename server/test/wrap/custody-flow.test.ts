@@ -32,7 +32,13 @@ import {
   derivePurposeKey,
 } from "../../src/core/key-derivation.js";
 import { encrypt } from "../../src/core/encryption.js";
-import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
+import {
+  toBase64url,
+  fromBase64url,
+  stringToBytes,
+} from "../../src/core/encoding.js";
+import { hkdf } from "@noble/hashes/hkdf";
+import { sha256 } from "@noble/hashes/sha256";
 
 function extractRecoveryKey(fileContent: string): string {
   const line = fileContent
@@ -178,6 +184,82 @@ describe("establishWrapCustody", () => {
     const auditLog = new AuditLog(storage, result.masterKey);
     const { entries } = await auditLog.query({ layer: "l2", limit: 50 });
     expect(entries.map((e) => e.operation)).toContain("custody_legacy_migrated");
+  });
+
+  it("recovery-unlock-enroll over a pre-mac recovery-only envelope: the in-place re-stamp is audited as custody_legacy_migrated, not masked as a plain wrap-add", async () => {
+    // Seed a pre-mac v:1 envelope whose ONLY wrap is recovery-key (no
+    // passphrase wrap, no top-level mac, no wrap.id) bound with the id-less
+    // legacy recovery AAD, plus a matching identity so migration evidence
+    // CONFIRMS. Running `wrap` with a passphrase fails to unlock (no passphrase
+    // wrap) and falls into the recovery-unlock-enroll path; establishMaster
+    // there re-stamps the pre-mac envelope in place (migratedInPlace === true)
+    // AND the passphrase is enrolled. The transition must be labeled as the
+    // security-relevant legacy migration, not the co-occurring wrap-add.
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const master = generateRandomKey();
+    const recoveryKeyStr = toBase64url(generateRandomKey());
+    const recoveryKeyBytes = fromBase64url(recoveryKeyStr);
+    const recoveryWrapKey = hkdf(
+      sha256,
+      recoveryKeyBytes,
+      stringToBytes("sanctuary-custody-v1"),
+      stringToBytes("recovery-key-wrap"),
+      32
+    );
+    const legacyAad = stringToBytes("sanctuary-custody-v1:recovery-key");
+    const payload = encrypt(master, recoveryWrapKey, legacyAad);
+    recoveryWrapKey.fill(0);
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(
+        JSON.stringify({
+          v: 1,
+          install_mode: "legacy-migrated",
+          wraps: [
+            {
+              type: "recovery-key",
+              payload,
+              verified: true,
+              created_at: new Date().toISOString(),
+            },
+          ],
+          created_at: new Date().toISOString(),
+          // NO mac, NO wrap.id (the pre-mac shape).
+        })
+      )
+    );
+    const idKey = derivePurposeKey(master, "identity-encryption");
+    await storage.write(
+      "_identities",
+      "seed",
+      stringToBytes(
+        JSON.stringify(encrypt(stringToBytes('{"identity_id":"seed"}'), idKey))
+      )
+    );
+
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "new-pass",
+      interactive: true,
+      io: {
+        input: Readable.from([recoveryKeyStr + "\n"]),
+        output: new Writable({
+          write(_chunk, _enc, cb) {
+            cb();
+          },
+        }),
+      },
+    });
+    expect(result.origin).toBe("recovery-unlock-enroll");
+    expect(toBase64url(result.masterKey)).toBe(toBase64url(master));
+
+    const auditLog = new AuditLog(storage, result.masterKey);
+    const { entries } = await auditLog.query({ layer: "l2", limit: 50 });
+    const ops = entries.map((e) => e.operation);
+    // The re-stamp must surface as a legacy migration, never be masked.
+    expect(ops).toContain("custody_legacy_migrated");
+    expect(ops).not.toContain("custody_wrap_added");
   });
 
   it("re-running wrap custody is idempotent: no re-mint, recovery-key.txt unchanged", async () => {

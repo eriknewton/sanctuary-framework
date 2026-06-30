@@ -153,18 +153,26 @@ export async function establishWrapCustody(
 
   // `migratedInPlace` re-stamps a pre-mac legacy envelope (full re-wrap + fresh
   // MAC + new sentinel) while keeping origin "envelope"; audit it as a legacy
-  // migration so the custody state transition is never silent.
+  // migration so the custody state transition is never silent. The
+  // recovery-unlock-enroll path reassigns `result` to a fresh establishMaster,
+  // which itself re-stamps a pre-mac envelope in place, so a re-stamp can
+  // co-occur with a wrap-add. `migratedInPlace` takes precedence over the
+  // recovery-unlock-enroll label so the security-relevant legacy migration is
+  // never masked as a plain wrap-add (matching the boot paths in index.ts /
+  // dashboard-standalone.ts, which emit custody_legacy_migrated on a re-stamp).
   if (origin !== "envelope" || result.migratedInPlace) {
     await auditLog.appendCritical({
       layer: "l2",
       operation:
         origin === "first-run"
           ? "custody_envelope_created"
-          : origin === "recovery-unlock-enroll"
-            ? "custody_wrap_added"
-            : origin === "legacy-deferred"
-              ? "custody_migration_deferred"
-              : "custody_legacy_migrated",
+          : result.migratedInPlace
+            ? "custody_legacy_migrated"
+            : origin === "recovery-unlock-enroll"
+              ? "custody_wrap_added"
+              : origin === "legacy-deferred"
+                ? "custody_migration_deferred"
+                : "custody_legacy_migrated",
       identity_id: fortressId,
       result: "success",
       details: envelope

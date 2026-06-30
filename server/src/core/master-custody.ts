@@ -1033,9 +1033,16 @@ export async function enforceCustodyFloor(
     // migration. It has no MAC to verify, so do NOT call verifyEnvelopeMac
     // (an empty MAC would always throw). A sentinel beside a mac-absent
     // envelope is tamper (the MAC was stripped): fail closed; otherwise this
-    // is a genuine pre-#496 fortress: treat as legacy-compatible (it migrates
-    // to a degraded `legacy-migrated`/headless install on first unlock, which
-    // is floor-exempt and audited), so do not block trust-bearing writes here.
+    // is a genuine pre-#496 fortress: treat as legacy-compatible, the same
+    // allow the envelope-absent legacy path above grants. Such an envelope
+    // carries no authenticated install_mode to test against the floor, and on
+    // its first unlock migrateLegacyEnvelopeInPlace re-stamps it to
+    // `interactive` (NOT floor-exempt: the two-factor floor STAYS in force,
+    // decided by the actual verified wrap count) with an audited transition.
+    // Blocking here would be stricter than the post-migration state, so do not
+    // block trust-bearing writes here. (Defense-in-depth: every live caller
+    // obtains its master via establishMaster, which migrates the envelope
+    // before this re-read, so this branch is not reached on the live path.)
     if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
       throw legacyEnvelopeButSentinelPresent();
     }
