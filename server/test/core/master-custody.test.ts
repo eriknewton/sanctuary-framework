@@ -929,23 +929,59 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
     ).rejects.toThrow(CustodyMigrationRefusedError);
   });
 
-  it("preserves the on-disk install_mode through migration (no downgrade, no upgrade)", async () => {
+  it("re-stamps the install_mode to the most-restrictive `interactive`, never trusting the on-disk value (anti downgrade-laundering)", async () => {
+    // The mac-absent envelope carries no authenticated install_mode. An attacker
+    // who strips the top-level mac can equally delete the sentinel, so this
+    // sentinel-absent branch can be reached with an attacker-chosen,
+    // floor-exempt install_mode (here `headless`). Honoring the on-disk value
+    // would silently bless that downgrade with a fresh valid MAC and disable the
+    // two-factor floor. The migration must re-stamp to `interactive` instead.
     const storage = new MemoryStorage();
     await seedPreMacFortress(storage, "headless");
     await establishMaster({ storage, passphrase: LEGACY_PASSPHRASE });
     const reread = await readCustodyEnvelope(storage);
-    expect(reread!.install_mode).toBe("headless");
+    expect(reread!.install_mode).toBe("interactive");
+  });
+
+  it("a born-#496 fortress with mac + sentinel stripped and install_mode flipped to floor-exempt cannot launder a downgrade through the migration path", async () => {
+    // Reproduces the full attack: a real post-#496 fortress whose two-factor
+    // custody the attacker wants to dodge. They (a) strip the top-level mac,
+    // (b) DELETE the sentinel, and (c) flip install_mode to a floor-exempt
+    // value. On the legit operator's next unlock the master still
+    // GCM-authenticates from the wraps and the fortress ciphertext CONFIRMS, so
+    // the migration runs, but it must NOT bless the attacker's floor-exempt
+    // install_mode. It re-stamps `interactive`, keeping the floor in force.
+    const storage = new MemoryStorage();
+    const master = await seedPreMacFortress(storage, "legacy-migrated");
+    const result = await establishMaster({
+      storage,
+      passphrase: LEGACY_PASSPHRASE,
+    });
+    expect(result.migratedInPlace).toBe(true);
+    expect(b64(result.masterKey)).toBe(b64(master));
+    const reread = await readCustodyEnvelope(storage);
+    // NOT the attacker-chosen floor-exempt `legacy-migrated`.
+    expect(reread!.install_mode).toBe("interactive");
+    // And the floor now governs: a single verified factor type on an
+    // `interactive` envelope is below CUSTODY_FLOOR_WRAPS, so a trust-bearing
+    // write is refused rather than silently allowed.
+    await expect(
+      enforceCustodyFloor(storage, "test-action", result.masterKey)
+    ).rejects.toThrow(CustodyFloorError);
   });
 
   it("the migrated envelope is tamper-evident: flipping install_mode now fails the MAC", async () => {
     const storage = new MemoryStorage();
     const master = await seedPreMacFortress(storage);
     await establishMaster({ storage, passphrase: LEGACY_PASSPHRASE });
-    // Attacker flips install_mode on the now-MAC'd envelope.
+    // Attacker flips install_mode on the now-MAC'd envelope. The migration
+    // re-stamps to `interactive`, so flip to a DIFFERENT (floor-exempt) value
+    // to exercise tamper-evidence.
     const onDisk = JSON.parse(
       bytesToString((await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!)
     );
-    onDisk.install_mode = "interactive";
+    expect(onDisk.install_mode).toBe("interactive");
+    onDisk.install_mode = "headless";
     await storage.write(
       "_meta",
       CUSTODY_ENVELOPE_KEY,

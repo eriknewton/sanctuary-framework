@@ -1343,9 +1343,13 @@ async function reWrapLegacyWrap(
  * HARD security invariants (fail closed):
  *  - SENTINEL PRESENT ⇒ a MAC'd envelope existed and its MAC was stripped:
  *    tamper, never migrate (mirrors {@link envelopeMissingButSentinelPresent}).
- *    The install_mode is re-stamped from the on-disk value ONLY in the
- *    no-sentinel case, so this is the gate that stops downgrade-laundering
- *    (e.g. flipping interactive→legacy-migrated to dodge the two-factor floor).
+ *  - The on-disk install_mode is NEVER trusted here: a mac-absent envelope
+ *    carries no authenticated install_mode, and an attacker who strips the MAC
+ *    can also delete the sentinel, so the sentinel-absent path can be reached
+ *    with an attacker-chosen install_mode. The re-stamp forces the most-
+ *    restrictive `interactive`, which keeps the two-factor floor in force and
+ *    stops downgrade-laundering (e.g. flipping interactive→legacy-migrated to
+ *    dodge the floor) regardless of the on-disk value.
  *  - The unwrapped master must be CONFIRMED (or not contradicted) against
  *    existing fortress ciphertext before writing the blessed envelope, so a
  *    wrong/forged credential cannot mint a MAC'd envelope (same evidence check
@@ -1397,15 +1401,28 @@ async function migrateLegacyEnvelopeInPlace(
     reWrapped.push(next);
   }
 
-  // Re-stamp: install_mode is taken from the on-disk value, SAFE only because
-  // the sentinel-absent gate above proved no prior authenticated install_mode
-  // could have been tampered. writeCustodyEnvelope computes the MAC + writes
-  // the sentinel, so the next unlock passes the strict verifyEnvelopeMac path.
+  // Re-stamp the install_mode to the MOST-RESTRICTIVE value (`interactive`)
+  // rather than trusting the on-disk one. The mac-absent envelope carries NO
+  // authenticated install_mode, and the sentinel-absent gate above does NOT
+  // prove the on-disk value is genuine: an attacker who strips the top-level
+  // `mac` can equally delete the sentinel, so a confirmed-master fortress can
+  // reach this branch with an attacker-chosen install_mode (e.g. flipped to a
+  // floor-exempt `legacy-migrated`/`headless` to dodge the two-factor floor).
+  // Honoring the on-disk value here would silently bless that downgrade with a
+  // fresh valid MAC. Forcing `interactive` keeps the two-factor floor in force,
+  // decided by the actual re-wrappable verified wrap count above: a genuine
+  // fortress with ≥2 verified factor types passes enforceCustodyFloor; an
+  // under-enrolled one is refused (safe: by construction it holds nothing
+  // precious yet and may be re-initialized). A real degraded install (headless/
+  // stdio-server/legacy-migrated) is recorded by writeCustodyEnvelope at
+  // CREATION and never round-trips through this never-observed mac-absent shape.
+  // writeCustodyEnvelope computes the MAC + writes the sentinel, so the next
+  // unlock passes the strict verifyEnvelopeMac path.
   return writeCustodyEnvelope(
     storage,
     {
       v: 1,
-      install_mode: envelope.install_mode,
+      install_mode: "interactive",
       wraps: reWrapped,
       created_at: envelope.created_at,
       ...(typeof envelope.epoch === "number"
