@@ -8,6 +8,33 @@
 
 import { resolve } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
+import { BACKEND_FALLBACK_STRINGS } from "../intelligence/templates.js";
+
+/**
+ * Print the model-choice privacy tradeoff to the operator-facing CLI channel.
+ * The copy is REUSED verbatim from the canonical badge strings in
+ * `intelligence/templates.ts` (the same strings the dashboard Intelligence
+ * picker shows); it is not re-authored here. Leads with what the operator
+ * controls about their own data so a fresh operator sees the tradeoff in the
+ * CLI setup path, not only in the dashboard.
+ */
+function printSubstratePrivacyNote(): void {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error("");
+  console.error("Choosing a model: your privacy tradeoff");
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(
+    `  Local (default): ${BACKEND_FALLBACK_STRINGS["intelligence.badge.local.tradeoff"]}`,
+  );
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(
+    `  Venice.ai: ${BACKEND_FALLBACK_STRINGS["intelligence.badge.venice.tradeoff"]}`,
+  );
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(
+    `  Frontier (Anthropic/OpenAI/Google): ${BACKEND_FALLBACK_STRINGS["intelligence.badge.frontier.tradeoff"]}`,
+  );
+}
 
 interface IntelligenceCommandOpts {
   argv: string[];
@@ -192,6 +219,7 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
     console.error(
       "  ANTHROPIC_API_KEY, OPENAI_API_KEY, VENICE_API_KEY, or OLLAMA_HOST",
     );
+    printSubstratePrivacyNote();
     return 1;
   }
 
@@ -241,6 +269,8 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
       `  ${key}: ${val ? `set (${val.slice(0, 4)}...)` : "not set"}`,
     );
   }
+
+  printSubstratePrivacyNote();
 
   return 0;
 }

@@ -37,6 +37,10 @@ describe("sanctuary intelligence diagnose --fortress (CCCCC)", () => {
     expect(code).toBe(0);
     const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(output).toContain(`Fortress: ${tempDir}`);
+    // Privacy tradeoff note surfaces in the CLI setup path (reused from the
+    // canonical templates.ts badge strings).
+    expect(output).toContain("Choosing a model: your privacy tradeoff");
+    expect(output).toContain("Your queries never leave your machine");
   });
 
   it("diagnose without --fortress defaults to env var", async () => {
@@ -49,5 +53,7 @@ describe("sanctuary intelligence diagnose --fortress (CCCCC)", () => {
     const code = await runIntelligenceCommand({ argv: ["diagnose"] });
     const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(output).toContain(`Fortress: ${tempDir}`);
+    // Not-initialized path also surfaces the model-choice privacy tradeoff.
+    expect(output).toContain("Choosing a model: your privacy tradeoff");
   });
 });
