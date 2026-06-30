@@ -1357,6 +1357,12 @@ async function reWrapLegacyWrap(
  *    restrictive `interactive`, which keeps the two-factor floor in force and
  *    stops downgrade-laundering (e.g. flipping interactive→legacy-migrated to
  *    dodge the floor) regardless of the on-disk value.
+ *  - The on-disk epoch is NEVER trusted here either, for the SAME reason: a
+ *    mac-absent envelope carries no authenticated epoch, so the re-stamp DROPS
+ *    it (omit ⇒ epoch 0). Carrying an attacker-chosen epoch forward would bless
+ *    it with a fresh MAC and latch the write-only monotonic rollback witness to
+ *    it on the next boot, permanently freezing all trust-bearing writes (a
+ *    lockout DoS). A genuine pre-mac envelope predates the epoch field entirely.
  *  - The unwrapped master must be CONFIRMED (or not contradicted) against
  *    existing fortress ciphertext before writing the blessed envelope, so a
  *    wrong/forged credential cannot mint a MAC'd envelope (same evidence check
@@ -1425,6 +1431,21 @@ async function migrateLegacyEnvelopeInPlace(
   // CREATION and never round-trips through this never-observed mac-absent shape.
   // writeCustodyEnvelope computes the MAC + writes the sentinel, so the next
   // unlock passes the strict verifyEnvelopeMac path.
+  //
+  // DROP the on-disk epoch (omit ⇒ epoch 0) for the SAME reason `install_mode`
+  // is forced above: a mac-absent envelope carries NO authenticated epoch, and
+  // the sentinel-absent gate does not prove the on-disk value is genuine, so an
+  // attacker who strips the mac can supply an attacker-chosen epoch. Carrying it
+  // forward would bless it with a fresh valid MAC, and on the next boot
+  // evaluateAndEnforceRollback would ADVANCE the write-only monotonic rollback
+  // witness to that value (anti-rollback.ts). The witness never lowers, so every
+  // subsequent legitimate state (real rotation epochs start at 0 and increment
+  // by 1) would then trip evaluateRollback and PERMANENTLY freeze all
+  // trust-bearing writes (a lockout DoS recoverable only by operator
+  // restore-attest --force). A genuine pre-mac envelope predates the epoch field
+  // entirely, so the only envelope reaching here WITH an epoch is the attacker-
+  // crafted one; re-stamping epoch 0 sacrifices nothing real and refuses to
+  // promote an unauthenticated epoch into the authenticated witness.
   return writeCustodyEnvelope(
     storage,
     {
@@ -1432,9 +1453,6 @@ async function migrateLegacyEnvelopeInPlace(
       install_mode: "interactive",
       wraps: reWrapped,
       created_at: envelope.created_at,
-      ...(typeof envelope.epoch === "number"
-        ? { epoch: envelope.epoch, epoch_id: envelope.epoch_id ?? "" }
-        : {}),
     },
     master
   );

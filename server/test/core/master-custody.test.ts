@@ -786,7 +786,8 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
    */
   async function seedPreMacFortress(
     storage: MemoryStorage,
-    installMode = "legacy-migrated"
+    installMode = "legacy-migrated",
+    epoch?: number
   ): Promise<Uint8Array> {
     const master = generateRandomKey();
     const { key: wrapKey, params } = await deriveMasterKey(LEGACY_PASSPHRASE);
@@ -808,6 +809,9 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
       ],
       created_at: new Date().toISOString(),
       // NO mac, NO wrap.id (the pre-#496 shape).
+      // Optional attacker-injected epoch (a genuine pre-mac envelope predates
+      // the epoch field; only a crafted mac-absent envelope carries one).
+      ...(typeof epoch === "number" ? { epoch, epoch_id: "attacker-chosen" } : {}),
     };
     await storage.write(
       "_meta",
@@ -992,6 +996,35 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
     expect(() => verifyEnvelopeMac(tampered!, master)).toThrow(
       CustodyEnvelopeIntegrityError
     );
+  });
+
+  it("DROPS an attacker-injected epoch on migration, never promoting it into the authenticated rollback witness", async () => {
+    // A mac-absent envelope carries no authenticated epoch. An attacker who
+    // strips the top-level mac can equally delete the sentinel, so this
+    // sentinel-absent migration branch can be reached with an attacker-chosen
+    // epoch (here a very high 999). Carrying it forward would bless it with a
+    // fresh valid MAC; on the next boot evaluateAndEnforceRollback would advance
+    // the write-only monotonic rollback witness to 999, and every subsequent
+    // legitimate state (real rotation epochs start at 0 and increment by 1) would
+    // then trip the rollback gate and PERMANENTLY freeze the fortress (a lockout
+    // DoS). The migration must DROP the epoch (re-stamp to epoch 0), exactly as
+    // it forces install_mode. A genuine pre-mac envelope predates the epoch field
+    // entirely, so dropping it sacrifices nothing real.
+    const storage = new MemoryStorage();
+    const master = await seedPreMacFortress(storage, "legacy-migrated", 999);
+    const result = await establishMaster({
+      storage,
+      passphrase: LEGACY_PASSPHRASE,
+    });
+    expect(result.migratedInPlace).toBe(true);
+    expect(b64(result.masterKey)).toBe(b64(master));
+
+    // The migrated envelope carries NO epoch (reads as epoch 0), NOT 999.
+    const reread = await readCustodyEnvelope(storage);
+    expect(reread!.epoch).toBeUndefined();
+    // And it is genuinely MAC'd over the epoch-less shape: a strict verify
+    // passes, proving the attacker's 999 was not authenticated forward.
+    verifyEnvelopeMac(reread!, result.masterKey);
   });
 });
 
