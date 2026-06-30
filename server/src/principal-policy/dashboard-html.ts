@@ -545,6 +545,14 @@ export function generateDashboardHTML(options: {
       color: var(--amber);
     }
 
+    /* Neutral "configured" state: the capability is present but live
+       enforcement is unproven on this surface. NEVER green - green means a
+       verdict, not config presence (the green-on-presence honesty fix). */
+    .layer-card.configured .layer-status {
+      background-color: rgba(139, 148, 158, 0.15);
+      color: var(--text-secondary, #8b949e);
+    }
+
     .layer-card.inactive .layer-status {
       background-color: rgba(248, 81, 73, 0.15);
       color: var(--red);
@@ -2064,7 +2072,12 @@ export function generateDashboardHTML(options: {
       scoreEl.textContent = score;
 
       badge.classList.remove('degraded', 'inactive');
-      if (score < 70) badge.classList.add('degraded');
+      // Green-on-presence fix: the badge goes green ONLY when the live wall
+      // arm-state is "armed" (a fresh enforcement verdict). With no live verdict
+      // the badge is amber at best, regardless of how high the capability score
+      // climbs - green must mean a verdict, not config presence.
+      const wallArmed = data.live_enforcement && data.live_enforcement.castle_wall_arm_state === 'armed';
+      if (!wallArmed || score < 70) badge.classList.add('degraded');
       if (score < 40) badge.classList.add('inactive');
 
       updateLayerCards(data);
@@ -2105,12 +2118,15 @@ export function generateDashboardHTML(options: {
       if (!card) return;
 
       const status = layerData.status || 'inactive';
-      card.classList.remove('degraded', 'inactive');
+      card.classList.remove('degraded', 'inactive', 'configured');
 
       if (status === 'degraded') {
         card.classList.add('degraded');
       } else if (status === 'inactive') {
         card.classList.add('inactive');
+      } else if (status === 'configured') {
+        // Capability present, live enforcement unproven: neutral, never green.
+        card.classList.add('configured');
       }
 
       document.getElementById(\`\${layer}-status\`).textContent = status.toUpperCase();

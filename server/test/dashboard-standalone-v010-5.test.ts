@@ -296,4 +296,52 @@ describe("v0.10.5: dashboard panels populate — route table matches HTML calls"
       }),
     );
   }, 15000);
+
+  it("/api/sovereignty is NOT green-on-presence: an unarmed tenant gets a configured (not active-green) L1/L3 and a non-full score", async () => {
+    // Green-on-presence honesty regression (parity with the 2026-06-17
+    // /api/posture/* + /v1 rollup fix). A freshly seeded tenant has NO Castle
+    // Wall enforcement evidence in its audit log (no egress_allowed/blocked,
+    // no operator_decision), so the canonical buildCastleWallPosture reader
+    // yields arm_state "unknown". The legacy /api/sovereignty surface must
+    // reflect that VERDICT, not the SHR's static capability `active`:
+    //   - L1 (the enforcing layer) renders the neutral "configured", NEVER
+    //     green "active".
+    //   - L3 (ZK / selective disclosure) likewise renders "configured", not a
+    //     green live pill (relabel of the capability `active`).
+    //   - the aggregate score does NOT reach a high green / "full" reading.
+    //   - live_enforcement surfaces the real arm-state the green rests on.
+    await seedTenant(root, "v010-5-sov-honest-pass");
+    process.env.SANCTUARY_STORAGE_PATH = root;
+
+    const started = await startWithRetry({
+      passphrase: "v010-5-sov-honest-pass",
+      host: "127.0.0.1",
+    });
+    dashboard = started.dashboard;
+    const port = started.port;
+
+    const res = await fetch(`http://127.0.0.1:${port}/api/sovereignty`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // The live wall is unproven on a fresh tenant — never "armed".
+    expect(body.live_enforcement).toBeDefined();
+    expect(body.live_enforcement.castle_wall_arm_state).not.toBe("armed");
+    expect(body.live_enforcement.castle_wall_arm_state).toBe("unknown");
+
+    // L1 + L3 live pills must NOT be the green "active" — green means a verdict.
+    expect(body.layers.l1.status).not.toBe("active");
+    expect(body.layers.l1.status).toBe("configured");
+    expect(body.layers.l3.status).not.toBe("active");
+    expect(body.layers.l3.status).toBe("configured");
+
+    // The SHR capability is preserved separately (the build DOES support these),
+    // so a consumer can still tell capability from live enforcement.
+    expect(body.layers.l1.capability_status).toBe("active");
+    expect(body.layers.l3.capability_status).toBe("active");
+
+    // Without a fresh wall verdict the aggregate is neither full nor high-green.
+    expect(body.overall_level).not.toBe("full");
+    expect(body.score).toBeLessThan(70);
+  }, 15000);
 });
