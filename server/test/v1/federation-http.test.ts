@@ -20,6 +20,18 @@ import type { BootstrapToken, NodeIdentityCertificate, PrincipalCertificate } fr
 import { toBase64url } from "../../src/core/encoding.js";
 import { OPERATOR, startRig, openDurableSession, type TestRig } from "./rig.js";
 import { makeFederationMaterials, assembleJoinRequest, type FedMaterials } from "./fed-materials.js";
+import { generateKeypair } from "../../src/core/identity.js";
+import { issueGuardianRoster } from "../../src/mesh/guardian/guardian-roster.js";
+import type { GuardianIdentity } from "../../src/mesh/guardian/types.js";
+import {
+  buildApprovalSigningInput,
+  signApproval,
+  type GuardianApproval,
+} from "../../src/recovery/index.js";
+import {
+  revocationCascadeId,
+  GUARDIAN_SIGN_OFF_ACTION,
+} from "../../src/v1/federation-revocation-guardian-gate.js";
 
 let rig: TestRig;
 let materials: FedMaterials;
@@ -473,5 +485,216 @@ describe("/v1/federation join ceremony end-to-end over HTTP", { retry: 2 }, () =
     });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+});
+
+// retry:2 - same loopback /v1 rig flake class as the perimeter suites above.
+describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 }, () => {
+  async function enableFederation(token: string) {
+    const res = await fetch(`${rig.baseUrl}/v1/federation/enable`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(operatorSigned("/v1/federation/enable", { idempotency_key: "k1" })),
+    });
+    expect(res.status).toBe(200);
+  }
+
+  function buildGuardians(count: number): Array<{
+    identity: GuardianIdentity;
+    kp: ReturnType<typeof generateKeypair>;
+  }> {
+    const out: Array<{
+      identity: GuardianIdentity;
+      kp: ReturnType<typeof generateKeypair>;
+    }> = [];
+    for (let i = 0; i < count; i++) {
+      const kp = generateKeypair();
+      out.push({
+        identity: {
+          guardian_id: `guardian-${i}`,
+          public_key: toBase64url(kp.publicKey),
+          kind: "human",
+          invited_at: new Date().toISOString(),
+        },
+        kp,
+      });
+    }
+    return out;
+  }
+
+  function signApprovals(
+    guardians: Array<{
+      identity: GuardianIdentity;
+      kp: ReturnType<typeof generateKeypair>;
+    }>,
+    count: number,
+    nodeId: string,
+    rosterVersion: number,
+  ): GuardianApproval[] {
+    const cascadeId = revocationCascadeId(materials.fortressId, nodeId);
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: cascadeId,
+      recovery_action: GUARDIAN_SIGN_OFF_ACTION,
+      fortress_id: materials.fortressId,
+      roster_version: rosterVersion,
+    });
+    return guardians.slice(0, count).map((g) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.kp.privateKey,
+        recovery_action: GUARDIAN_SIGN_OFF_ACTION,
+        cascade_id: cascadeId,
+      }),
+    );
+  }
+
+  async function joinNode(token: string, nodeId: string): Promise<void> {
+    const initRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/init`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/authorize/init", {
+          intended_node_id: nodeId,
+          intended_node_mode: "local",
+        }),
+      ),
+    });
+    expect(initRes.status).toBe(200);
+    const { bootstrap_token } = (await initRes.json()) as { bootstrap_token: BootstrapToken };
+    const assembled = assembleJoinRequest({
+      bootstrapToken: bootstrap_token,
+      fortressMasterSecret: materials.masterSecret,
+    });
+    const completeRes = await fetch(`${rig.baseUrl}/v1/federation/authorize/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(assembled.joinRequest),
+    });
+    expect(completeRes.status).toBe(200);
+  }
+
+  it("default-off: revoke succeeds with no guardian approvals (legacy path unchanged)", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    await joinNode(token, "edge-default-off");
+
+    // No requirement configured (the default). Revoke with NO guardian field.
+    const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/revoke", {
+          node_id: "edge-default-off",
+          reason: "operator_removed",
+        }),
+      ),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ revoked: true, node_id: "edge-default-off" });
+    expect(materials.context.isNodeRevoked("edge-default-off")).toBe(true);
+  });
+
+  it("enabled + exactly-threshold valid quorum: revoke is accepted", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    await joinNode(token, "edge-quorum-ok");
+
+    const guardians = buildGuardians(5);
+    const roster = issueGuardianRoster({
+      m: 3,
+      n: 5,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: materials.fortressId,
+      version: 1,
+      master_private_key: materials.masterSecret,
+    });
+    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    const approvals = signApprovals(guardians, 3, "edge-quorum-ok", roster.version);
+    const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...operatorSigned("/v1/federation/revoke", {
+          node_id: "edge-quorum-ok",
+          reason: "operator_removed",
+        }),
+        guardian_approvals: approvals,
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ revoked: true, node_id: "edge-quorum-ok" });
+    expect(materials.context.isNodeRevoked("edge-quorum-ok")).toBe(true);
+  });
+
+  it("enabled + under-threshold quorum: revoke is REFUSED (403, fail-closed)", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    await joinNode(token, "edge-under-threshold");
+
+    const guardians = buildGuardians(5);
+    const roster = issueGuardianRoster({
+      m: 3,
+      n: 5,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: materials.fortressId,
+      version: 1,
+      master_private_key: materials.masterSecret,
+    });
+    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Only 2 valid approvals against an M=3 roster.
+    const approvals = signApprovals(guardians, 2, "edge-under-threshold", roster.version);
+    const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...operatorSigned("/v1/federation/revoke", {
+          node_id: "edge-under-threshold",
+          reason: "operator_removed",
+        }),
+        guardian_approvals: approvals,
+      }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "forbidden" });
+    // Fail-closed: the node was NOT revoked.
+    expect(materials.context.isNodeRevoked("edge-under-threshold")).toBe(false);
+    expect(await auditOps()).toContainEqual({
+      operation: "v1_federation_revoke",
+      result: "failure",
+    });
+  });
+
+  it("enabled + missing guardian approvals: revoke is REFUSED (403)", async () => {
+    const token = await openDurableSession(rig);
+    await enableFederation(token);
+    await joinNode(token, "edge-no-approvals");
+
+    const guardians = buildGuardians(5);
+    const roster = issueGuardianRoster({
+      m: 3,
+      n: 5,
+      guardians: guardians.map((g) => g.identity),
+      fortress_id: materials.fortressId,
+      version: 1,
+      master_private_key: materials.masterSecret,
+    });
+    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Requirement is on but the operator omits the guardian_approvals field.
+    const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(
+        operatorSigned("/v1/federation/revoke", {
+          node_id: "edge-no-approvals",
+          reason: "operator_removed",
+        }),
+      ),
+    });
+    expect(res.status).toBe(403);
+    expect(materials.context.isNodeRevoked("edge-no-approvals")).toBe(false);
   });
 });
