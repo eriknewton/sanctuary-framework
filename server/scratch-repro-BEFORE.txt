@@ -1,0 +1,19 @@
+Seeding 20000 entries, ~512B payload each, RSS@start=94.7MB
+  seeded 5000  RSS=262.1MB heap=52.2MB
+  seeded 10000  RSS=283.1MB heap=51.9MB
+  seeded 15000  RSS=313.4MB heap=43.4MB
+Seeded. on-disk entries=20000  RSS=410.5MB heap=22.8MB
+Post-GC baseline: RSS=410.5MB heap=22.9MB
+  tick 0: viewLen=20000 acc=NaN RSS=418.3MB heap=100.1MB
+  tick 5: viewLen=20000 acc=NaN RSS=542.7MB heap=272.5MB
+  tick 10: viewLen=20000 acc=NaN RSS=591.8MB heap=301.6MB
+  tick 15: viewLen=20000 acc=NaN RSS=605.5MB heap=125.5MB
+
+=== RESULT ===
+on-disk entries:        20000
+payload bytes/entry:    512
+ticks (verifiedChainView calls): 20  (10237ms total)
+baseline RSS (post-GC): 410.5MB
+PEAK RSS during ticks:  609.1MB   (delta +198.6MB)
+PEAK heap during ticks: 301.6MB  (delta +278.7MB)
+post-ticks RSS (post-GC): 608.2MB
