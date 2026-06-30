@@ -158,15 +158,16 @@ these subsystems are largely independent. The fix is documentation, not deletion
 - **shr/** = a SIGNED, versioned, portable capability ADVERTISEMENT an agent hands a counterparty to
   PROVE posture without being trusted (the external cryptographic claim).
 - **principal-policy/posture.ts + posture-routes.ts** = the operator-facing posture HTTP
-  DASHBOARD (the live human UI surface). Since the 2026-06-19 root-flip the SAME static HTML shell
-  is the default page at BOTH `/` and `/posture` on the **standalone `DashboardApprovalChannel`**
-  front door (`principal-policy/dashboard.ts` serves it before the auth gate; that is the channel
-  used by the MCP server boot path and `sanctuary dashboard`). The shell carries no posture data and
-  fetches the evidence from `/api/posture/*`, which stay behind `checkAuth`. The SEPARATE co-located
-  `wrap` server (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP server) also serves that
-  posture shell at `/` and `/posture`, mounts `/api/posture/*` behind read auth, and preserves the
-  v1.1 SPA compatibility aliases at `/dashboard` and `/v1.1`; its `/api/status` remains
-  `decision_capable:false` because that process cannot release live approval promises. Do NOT
+  DASHBOARD (the live human UI surface). Since the 2026-06-30 one-surface flip the **v1.1 concierge
+  is the single default page at `/`** on BOTH the **standalone `DashboardApprovalChannel`** front
+  door (`principal-policy/dashboard.ts` serves it before the auth gate; that is the channel used by
+  the MCP server boot path and `sanctuary dashboard`) AND the SEPARATE co-located `wrap` server
+  (`dashboard/api.ts`, the `sanctuary wrap` / "Protect" HTTP server). The static posture board shell
+  is preserved at `/posture` (and folded into the concierge via the seal-click expand), still
+  carries no posture data, and fetches the evidence from `/api/posture/*`, which stay behind
+  `checkAuth`. Both routers keep the v1.1 SPA compatibility aliases at `/dashboard` and `/v1.1`; the
+  wrap server's `/api/status` remains `decision_capable:false` because that process cannot release
+  live approval promises. Do NOT
   confuse this dashboard posture with the
   unauthenticated `/api/health` probe: `/api/health` is a cheap O(1) liveness answer carrying ONLY
   `{ ok, mode, instance, since }` (no arm-state, no audit scan) - `instance` is an opaque per-process

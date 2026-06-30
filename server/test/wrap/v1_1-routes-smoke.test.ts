@@ -162,18 +162,22 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
     expect(await aliasRes.json()).toEqual(await directRes.json());
   });
 
-  it("GET / with a short-lived session URL serves the folded posture board", async () => {
+  it("GET / with a short-lived session URL serves the v1.1 concierge (default surface)", async () => {
+    // Default-flip (2026-06-30): `/` serves the v1.1 concierge as the single
+    // default surface, even in the wrap-auto path. The posture board is folded
+    // into the concierge (a Posture entry in the Verify group; the seal expands
+    // to full detail) and preserved standalone at /posture (asserted below).
     const sessionUrl = rig.handle.createSessionUrl?.() ?? rig.baseUrl;
     expect(sessionUrl).not.toContain("?token=");
     const res = await fetch(sessionUrl);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    expect(html).toContain("/api/posture/home");
-    expect(html).toContain("Approvals waiting");
+    expect(html).toContain('id="main"');
+    expect(html).toContain('data-route="posture"');
   });
 
-  it("GET / and GET /posture serve the same posture board", async () => {
+  it("GET / serves the concierge; GET /posture serves the posture board (distinct surfaces)", async () => {
     const [rootRes, postureRes] = await Promise.all([
       fetch(`${rig.baseUrl}/`),
       fetch(`${rig.baseUrl}/posture`),
@@ -184,8 +188,9 @@ describe("wrap-auto dashboard exposes v1.1 surfaces (Finding V)", () => {
       rootRes.text(),
       postureRes.text(),
     ]);
-    expect(rootBody).toBe(postureBody);
-    expect(rootBody).toContain("/api/posture/home");
+    expect(rootBody).not.toBe(postureBody);
+    expect(rootBody).toContain('id="main"');
+    expect(postureBody).toContain("/api/posture/home");
   });
 
   it("wrap-auto posture auxiliaries are read-only and not decision-capable", async () => {

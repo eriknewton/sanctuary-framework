@@ -359,6 +359,36 @@ describe("Dashboard API", () => {
       expect(res._status).toBe(503);
     });
 
+    it("serves /posture/evidence on the wrap server's default surface (no 404)", async () => {
+      // REGRESSION: the folded-in Posture screen (now the default surface at `/`
+      // on the wrap server) renders a hardcoded link to `/posture/evidence`. The
+      // wrap server's posture matcher must route that path through
+      // handlePostureRoute, not let it fall through to a 404. Without the
+      // POSTURE_EVIDENCE_PATH arm in the matcher this link is dead on the wrap
+      // server even though it resolves on the standalone dashboard.
+      const res = mockRes();
+      const deps = makeDeps();
+      deps.sources.auditLog = new AuditLog(new MemoryStorage(), generateRandomKey()) as any;
+      const req = mockReq({
+        url: "/posture/evidence",
+        headers: { authorization: "Bearer tok" },
+      });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(200);
+      expect(res._headers["Content-Type"]).toContain("text/html");
+      expect(res._body).toContain("<");
+    });
+
+    it("/posture/evidence requires auth on the wrap server", async () => {
+      const res = mockRes();
+      const deps = makeDeps();
+      const req = mockReq({ url: "/posture/evidence" });
+      const matched = await handleRequest(deps, req, res);
+      expect(matched).toBe(true);
+      expect(res._status).toBe(401);
+    });
+
     it("returns false for unmatched routes", async () => {
       const res = mockRes();
       const deps = makeDeps();

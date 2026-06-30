@@ -30,6 +30,7 @@ import {
   handlePostureRoute,
   POSTURE_AGENT_PATH_PREFIX,
   POSTURE_API_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_HOME_PATH,
 } from "../principal-policy/posture-routes.js";
 
@@ -220,11 +221,19 @@ export async function handleRequest(
   const method = (req.method ?? "GET").toUpperCase();
   const path = url.pathname;
 
-  // ── Posture board shell (3-to-1 fold, minimal Stack A retirement) ───
-  // The co-located wrap server serves the same posture shell at `/` and
-  // `/posture`, while keeping `/api/status` decision_capable false below so
-  // the approval area stays read-only on this process.
-  if (method === "GET" && (path === "/" || path === POSTURE_HOME_PATH)) {
+  // ── Posture board shell (folded INTO the concierge default) ─────────
+  // Default-flip (2026-06-30): `/` now serves the v1.1 concierge as the single
+  // default surface (handled by the v1.1 dispatch below), and the posture board
+  // is preserved at `/posture` AND folded into the concierge (the seal expands
+  // to full posture detail; a Posture entry lives in the Verify group). This
+  // block now owns ONLY `/posture`. `/api/status` keeps decision_capable false
+  // below so the approval area stays read-only on this process.
+  //
+  // NOTE: `/posture` keeps its prior read-auth gate in this router (unchanged
+  // by the default-flip). `/` falls through to the v1.1 dispatch, which serves
+  // the concierge SPA tokenless and runs its own client-side auth dance,
+  // exactly as `/dashboard` and `/v1.1` already do.
+  if (method === "GET" && path === POSTURE_HOME_PATH) {
     if (!isAuthorizedForRead(deps, req, url)) {
       writeJSON(res, 401, { error: "unauthorized" });
       return true;
@@ -236,6 +245,7 @@ export async function handleRequest(
   if (
     path === POSTURE_API_PREFIX ||
     path.startsWith(`${POSTURE_API_PREFIX}/`) ||
+    path === POSTURE_EVIDENCE_PATH ||
     path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   ) {
     if (!isAuthorizedForRead(deps, req, url)) {
@@ -296,7 +306,9 @@ export async function handleRequest(
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
   // Try v1.1 compatibility routes first when bindings are set. Mounted at
-  // /dashboard + /v1.1 (HTML) and /api/hub/* (API); `/` is the posture
+  // /dashboard + /v1.1 (HTML) and /api/hub/* (API). After the default-flip
+  // (2026-06-30) `/` falls THROUGH to this dispatch and is served by the
+  // v1.1 concierge as the single default surface; `/posture` is the posture
   // shell handled above.
   //
   // Auth gating is intentionally inside the shared helper so the v1.1
@@ -316,6 +328,29 @@ export async function handleRequest(
       method,
     );
     if (handled) return true;
+  }
+
+  // ── `/` posture-shell fallback when v1.1 bindings are absent ─────────
+  // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+  // dispatch above. But that dispatch is gated on `deps.v11Bindings`, which is
+  // null in two reachable windows: (a) the startup race between listen() and
+  // setV11Bindings(), and (b) the permanent degraded path where buildV11Bindings
+  // throws and setV11Bindings is therefore never called (wrap/cli.ts swallows the
+  // throw and prints a note). Without this fallback `/` would skip both the
+  // posture block above (now `/posture`-only) and the v1.1 dispatch, fall through
+  // to `return false`, and 404 - a regression from the pre-flip behavior where
+  // `/` always served the posture shell. This mirrors the principal-policy
+  // router's `isRootServedAsShell` fallback (principal-policy/dashboard.ts): when
+  // there is no concierge to fall through to, `/` keeps serving the posture board
+  // shell as the honest degraded surface rather than 404ing. Same read-auth gate
+  // the posture block above and the pre-flip `/` used.
+  if (method === "GET" && path === "/" && !deps.v11Bindings) {
+    if (!isAuthorizedForRead(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    writeText(res, 200, renderPostureHomeHTML(), "text/html; charset=utf-8");
+    return true;
   }
 
   // ── Health (unauthenticated liveness only) ───────────────────────────
@@ -420,10 +455,11 @@ export async function handleRequest(
   }
 
   // ── Legacy v1.0 HTML (preserved at /v1.0) ───────────────────────────
-  // v1.1.7: root serves the posture shell above; /dashboard and /v1.1
-  // remain compatibility aliases via dispatchV11. The legacy four-panel
-  // dashboard moved to /v1.0 so operators who explicitly want the prior
-  // surface can reach it; /index.html alias preserved on the legacy path.
+  // Default-flip: root serves the v1.1 concierge (via dispatchV11 above);
+  // /dashboard and /v1.1 remain compatibility aliases; /posture serves the
+  // posture shell above. The legacy four-panel dashboard moved to /v1.0 so
+  // operators who explicitly want the prior surface can reach it; /index.html
+  // alias preserved on the legacy path.
   if (
     method === "GET" &&
     (path === "/v1.0" || path === "/v1.0/" || path === "/v1.0/index.html")

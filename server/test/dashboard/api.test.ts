@@ -58,8 +58,9 @@ describe("Dashboard HTTP API", () => {
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
     // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
-    // Root serves the posture shell; /dashboard and /v1.1 are v1.1 SPA
-    // compatibility aliases when production wiring provides v11Bindings. This
+    // Default-flip (2026-06-30): root serves the v1.1 concierge (the single
+    // default surface) when production wiring provides v11Bindings; /posture
+    // serves the posture board; /dashboard and /v1.1 are v1.1 SPA aliases. This
     // rig boots without v11Bindings, so legacy serves at the new /v1.0 URL.
     handle = await startForTest();
     const res = await fetch(`${handle.url}/v1.0`);
@@ -319,6 +320,28 @@ describe("Dashboard HTTP API", () => {
     handle = await startForTest();
     const res = await fetch(`${handle.url}/does-not-exist`);
     expect(res.status).toBe(404);
+  });
+
+  it("serves the posture shell at / as the fallback when v1.1 bindings are absent", async () => {
+    // Default-flip (2026-06-30): `/` normally serves the v1.1 concierge via the
+    // v1.1 dispatch, but that dispatch is gated on v11Bindings. This rig boots
+    // WITHOUT v11Bindings (the degraded/startup-race window). `/` must keep
+    // serving the posture board shell as the honest fallback, mirroring the
+    // principal-policy router's isRootServedAsShell fallback - NOT 404 (the
+    // regression this asserts against).
+    handle = await startForTest();
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Sanctuary - Sovereignty Posture");
+  });
+
+  it("401s / fallback shell when an operator token is required and missing", async () => {
+    // The no-bindings `/` fallback honors the same read-auth gate the pre-flip
+    // `/` and `/posture` use: when a token is required and absent, it 401s.
+    handle = await startForTest({ authToken: "secret-xyz" });
+    const res = await fetch(`${handle.url}/`);
+    expect(res.status).toBe(401);
   });
 
   // ERROR-DETAIL-001: completes the #604 error-envelope sweep. The legacy

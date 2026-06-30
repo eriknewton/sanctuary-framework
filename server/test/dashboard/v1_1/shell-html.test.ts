@@ -66,6 +66,72 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(html).not.toContain("—");
   });
 
+  // ── One-surface posture fold (default-flip 2026-06-30) ────────────────
+  // The full posture detail is folded into the single default surface: a
+  // Posture entry in the Verify group, a Posture screen renderer that reuses
+  // the existing /api/posture/* data endpoints, and the seal click-to-expand
+  // into that screen. Nothing is lost; nothing is duplicated.
+  it("exposes a Posture entry in the sidebar (folded-in posture detail)", () => {
+    const html = renderDashboardV11Html({});
+    expect(html).toContain('data-route="posture"');
+    // It sits in the Verify group alongside Activity / Attestation / Health.
+    expect(html).toContain('data-route="activity"');
+    expect(html).toContain('data-route="attestation"');
+  });
+
+  it("renders the folded Posture screen reusing the existing posture data endpoints", () => {
+    const client = getClientScript();
+    // The Posture screen renderer + its route are wired.
+    expect(client).toContain("renderPostureScreen");
+    expect(client).toContain('case "posture":');
+    // It REUSES the existing posture data endpoints, never a duplicate API.
+    expect(client).toContain("/api/posture/home");
+    expect(client).toContain("/api/anomaly/findings");
+    // The per-agent drill-down and the Evidence view stay reachable.
+    expect(client).toContain("/posture/agent/");
+    expect(client).toContain("/posture/evidence");
+    // The six named metric cards from the posture board are folded in.
+    expect(client).toContain("Protection requested");
+    expect(client).toContain("Enforcement confirmed");
+    expect(client).toContain("Castle Wall");
+    expect(client).toContain("Approvals waiting");
+    expect(client).toContain("Open anomalies");
+    expect(client).toContain("Audit chain");
+    // Today's story + the plain-summary toggle are folded in (apostrophe is
+    // emitted as the &#39; entity so the raw client string is plain).
+    expect(client).toContain("Today&#39;s story");
+    expect(client).toContain("posture-story-plain");
+    // Anomaly findings list is folded in.
+    expect(client).toContain("Anomaly findings");
+  });
+
+  it("the seal click-to-expand routes into the full Posture detail", () => {
+    const client = getClientScript();
+    expect(client).toContain("posture-detail-open");
+    expect(client).toContain("See full posture detail");
+  });
+
+  it("the folded posture detail honors the never-overclaim seal (green only on armed)", () => {
+    const client = getClientScript();
+    // Castle Wall reads green/Enforcing ONLY on an armed arm-state; the
+    // per-agent pill reads green ONLY on confirmed live enforcement.
+    expect(client).toContain('armState === "armed"');
+    expect(client).toContain('a.enforcement_active === "active"');
+  });
+
+  it("the folded posture detail uses named layers only (no L1/L2/L3/L4 in copy)", () => {
+    const client = getClientScript();
+    // The Posture screen renderer block must not reintroduce L-numbering in
+    // operator-visible copy. Scan the renderPostureScreen region for the
+    // retired tokens as standalone layer labels.
+    const start = client.indexOf("function renderPostureScreen");
+    const region = start >= 0 ? client.slice(start, start + 4000) : client;
+    expect(region).not.toMatch(/\bL1 Cognitive\b/);
+    expect(region).not.toMatch(/\bL2 Operational\b/);
+    expect(region).not.toMatch(/\bL3\b/);
+    expect(region).not.toMatch(/\bL4 Reputation\b/);
+  });
+
   it("no UBAI dead-claims in operator-visible copy", () => {
     const html = renderDashboardV11Html({});
     const client = getClientScript();

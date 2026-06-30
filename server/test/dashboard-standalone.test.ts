@@ -605,7 +605,8 @@ describe("Standalone Dashboard", () => {
 
     const base = `http://127.0.0.1:${result.port}`;
 
-    // No bearer => login page (offers a token box), NOT the empty posture shell.
+    // No bearer => login page (offers a token box), NOT the empty concierge
+    // shell. Default-flip preserves the remote-login affordance for `/`.
     const noAuth = await fetch(`${base}/`);
     expect(noAuth.status).toBe(200);
     const noAuthBody = await noAuth.text();
@@ -618,15 +619,17 @@ describe("Standalone Dashboard", () => {
     expect(aliasNoAuth.status).toBe(200);
     expect(await aliasNoAuth.text()).toMatch(/Auth Token/);
 
-    // With a valid bearer token, the SAME root path serves the real posture
-    // shell - auth is not weakened, the login box is just the unauthenticated
-    // entry point.
+    // With a valid bearer token, the SAME root path serves the v1.1 concierge
+    // (the single default surface) - auth is not weakened, the login box is
+    // just the unauthenticated entry point. Default-flip: `/` is the concierge,
+    // NOT the separate posture shell (which is preserved at /posture).
     const authed = await fetch(`${base}/`, {
       headers: { Authorization: "Bearer test-token-remote-login" },
     });
     expect(authed.status).toBe(200);
     const authedBody = await authed.text();
-    expect(authedBody).toContain("Sovereignty Posture");
+    expect(authedBody).toContain('id="main"');
+    expect(authedBody).not.toContain("Sovereignty Posture");
     expect(authedBody).not.toMatch(/Session tokens expire/);
 
     // SECURITY: the data routes still require the token regardless of the
@@ -635,7 +638,7 @@ describe("Standalone Dashboard", () => {
     expect(dataNoAuth.status).toBe(401);
   });
 
-  it("FIX 3 (loopback unchanged): an auto-auth loopback GET / still serves the posture shell, not the login page", async () => {
+  it("FIX 3 (loopback): an auto-auth loopback GET / serves the v1.1 concierge (default surface), not the login page", async () => {
     // Seed an identity so standalone enables loopback auto-auth.
     process.env.SANCTUARY_STORAGE_PATH = tempDir;
     process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN = "test-token-loopback-shell";
@@ -672,12 +675,20 @@ describe("Standalone Dashboard", () => {
     });
     dashboard = result.dashboard;
 
-    // Loopback auto-auth => the posture shell, never the login page.
+    // Loopback auto-auth => the v1.1 concierge (default surface), never the
+    // login page. Default-flip: `/` serves the concierge, NOT the posture shell
+    // (the posture board is preserved at /posture and folded into the concierge).
     const res = await fetch(`http://127.0.0.1:${result.port}/`);
     expect(res.status).toBe(200);
     const body = await res.text();
-    expect(body).toContain("Sovereignty Posture");
+    expect(body).toContain('id="main"');
+    expect(body).not.toContain("Sovereignty Posture");
     expect(body).not.toMatch(/Auth Token/);
     expect(body).not.toMatch(/Session tokens expire/);
+
+    // The posture board is preserved at /posture (frozen surface).
+    const postureRes = await fetch(`http://127.0.0.1:${result.port}/posture`);
+    expect(postureRes.status).toBe(200);
+    expect(await postureRes.text()).toContain("Sovereignty Posture");
   });
 });
