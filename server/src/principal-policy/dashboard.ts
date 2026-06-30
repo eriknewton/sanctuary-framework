@@ -4397,6 +4397,42 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   // ── Sovereignty Data Routes ─────────────────────────────────────────
 
+  /**
+   * GET /api/sovereignty - the legacy operator-dashboard sovereignty panel.
+   *
+   * HONESTY CONTRACT (the green-on-presence fix, parity with the 2026-06-17
+   * `/api/posture/*` + `/v1` rollup honesty work): the per-layer LIVE pills and
+   * the aggregate "sovereignty score" must reflect a real ENFORCEMENT VERDICT,
+   * not config presence. The SHR is a portable CAPABILITY receipt ("this build
+   * supports encryption / ZK / reputation"), so `l1.status:"active"` is a true
+   * capability claim THERE; the defect this fixes is the live dashboard reusing
+   * that capability receipt to paint a green "ACTIVE" live health pill + a high
+   * score even on a host where Castle Wall is dead / not installed / never wired.
+   *
+   * The fix, per-layer:
+   *
+   *  - L1 (the ENFORCING layer): its live status is now driven by the canonical
+   *    evidence-gated {@link buildCastleWallPosture} reader (via
+   *    {@link buildStatusCastleWall}), NOT the static SHR capability. A wall that
+   *    is `armed` (fresh enforcement verdict) renders green `active`; anything
+   *    else (`degraded` / `unknown` / `not_installed`) renders the neutral
+   *    `configured` state - capability present, live enforcement unproven - and
+   *    never green. The wall arm-state is a real, visible input to the score.
+   *  - L3 (Selective Disclosure / ZK): there is no live enforcement verdict for
+   *    proof-system availability on this surface, so its capability `active` is
+   *    RELABELLED to the neutral `configured` (capability present), never a green
+   *    live "ACTIVE" pill.
+   *  - L2 / L4: already carry honest degraded logic in the SHR generator; passed
+   *    through unchanged.
+   *
+   * Because L3 can never exceed `configured` (15) here, a perfect 100 is no
+   * longer reachable from capability presence alone - that is correct: a host
+   * cannot honestly claim full sovereignty when ZK is only a build capability and
+   * the wall has adjudicated no flow. Full green requires a fresh wall verdict.
+   *
+   * Never throws into the request path: any failure resolves to an honest error
+   * body or an `unknown` wall posture, never a fabricated green.
+   */
   private handleSovereignty(res: ServerResponse): void {
     if (!this.shrOpts) {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -4412,40 +4448,106 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
 
     const layers = shr.body.layers;
-    // Compute sovereignty score: 25 points per layer, deductions for degraded/inactive
-    let score = 0;
-    for (const layer of [layers.l1, layers.l2, layers.l3, layers.l4]) {
-      if (layer.status === "active") score += 25;
-      else if (layer.status === "degraded") score += 15;
-      // inactive = 0
-    }
-
-    const overallLevel = score === 100 ? "full"
-      : score >= 65 ? "degraded"
-      : score >= 25 ? "minimal"
-      : "unverified";
     const federationPosture = this.buildFederationPostureSummary();
 
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      score,
-      overall_level: overallLevel,
-      layers: {
-        l1: { status: layers.l1.status, detail: layers.l1.encryption, key_custody: layers.l1.key_custody },
-        l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
-        l3: { status: layers.l3.status, detail: layers.l3.proof_system, selective_disclosure: layers.l3.selective_disclosure },
-        l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable },
-      },
-      degradations: shr.body.degradations,
-      capabilities: shr.body.capabilities,
-      federation: {
-        operator_cloud_nodes: federationPosture.operator_cloud_nodes,
-        provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
-        tee_attested: federationPosture.tee_attested,
-        trust_boundary: federationPosture,
-      },
-      config_loaded: this._sanctuaryConfig != null,
-    }));
+    // Read the LIVE Castle Wall arm-state from the canonical evidence-gated
+    // shaper (never the SHR capability), then assemble the honest payload. The
+    // shaper is async, so the handler completes on the promise - mirroring
+    // handleSnapshot - and always answers (an honest `unknown` posture on any
+    // failure, never a thrown 500 that paints green by omission).
+    this.buildStatusCastleWall()
+      .then((wall) => {
+        // L1 LIVE status: green `active` ONLY on a fresh enforcement verdict
+        // (`armed`); every other arm-state is the neutral `configured`
+        // (capability present, live enforcement unproven), never green.
+        const l1LiveStatus = wall.arm_state === "armed" ? "active" : "configured";
+        // L3 LIVE status: capability present, no live verdict on this surface →
+        // neutral `configured`, never a green live pill (relabel of the SHR
+        // capability `active`).
+        const l3LiveStatus = "configured";
+
+        // Score: the enforcing layer (L1) earns its points from the wall arm
+        // VERDICT, not config presence. `configured` is a non-green PARTIAL - the
+        // encryption-at-rest capability is real, but live enforcement is unproven,
+        // so it can never reach the full-green 25. L3 likewise caps at the
+        // `configured` partial. L2/L4 keep the SHR's honest active/degraded scale.
+        const layerPoints = (status: string): number =>
+          status === "active" ? 25
+            : status === "degraded" ? 15
+              : status === "configured" ? 10
+                : 0; // inactive
+        const l1Points =
+          wall.arm_state === "armed" ? 25
+            : wall.arm_state === "degraded" ? 10
+              : 5; // unknown / not_installed: capability real, enforcement unproven
+        const score =
+          l1Points +
+          layerPoints(layers.l2.status) +
+          layerPoints(l3LiveStatus) +
+          layerPoints(layers.l4.status);
+
+        // `full` now requires a fresh wall verdict (l1=25) AND non-degraded
+        // L2/L4; a capability-only host tops out below `full`, honestly.
+        const overallLevel =
+          wall.arm_state === "armed" && score >= 90 ? "full"
+            : score >= 65 ? "degraded"
+              : score >= 25 ? "minimal"
+                : "unverified";
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          score,
+          overall_level: overallLevel,
+          layers: {
+            // L1 live status comes from the wall verdict; the SHR capability is
+            // preserved under `capability_status` so a consumer can still tell
+            // "build supports this" from "it is live-enforcing now".
+            l1: {
+              status: l1LiveStatus,
+              capability_status: layers.l1.status,
+              detail: layers.l1.encryption,
+              key_custody: layers.l1.key_custody,
+            },
+            l2: { status: layers.l2.status, detail: layers.l2.isolation_type, attestation: layers.l2.attestation_available },
+            l3: {
+              status: l3LiveStatus,
+              capability_status: layers.l3.status,
+              detail: layers.l3.proof_system,
+              selective_disclosure: layers.l3.selective_disclosure,
+            },
+            l4: { status: layers.l4.status, detail: layers.l4.attestation_format, reputation_portable: layers.l4.reputation_portable },
+          },
+          // The real enforcement signal behind the L1 pill + score, surfaced so
+          // the operator can see WHY green was or was not earned (never a leak of
+          // rule internals - the same honest enum the /api/posture surface uses).
+          live_enforcement: {
+            castle_wall_arm_state: wall.arm_state,
+            evidence_basis: wall.evidence_basis,
+            last_enforcement_evidence_at: wall.last_enforcement_evidence_at,
+            audit_integrity_ok: wall.audit_integrity_ok,
+          },
+          degradations: shr.body.degradations,
+          capabilities: shr.body.capabilities,
+          federation: {
+            operator_cloud_nodes: federationPosture.operator_cloud_nodes,
+            provider_in_trust_boundary: federationPosture.provider_in_trust_boundary,
+            tee_attested: federationPosture.tee_attested,
+            trust_boundary: federationPosture,
+          },
+          config_loaded: this._sanctuaryConfig != null,
+        }));
+      })
+      .catch((err) => {
+        logCaughtError(
+          err,
+          { route: "/api/sovereignty", operation: "get_sovereignty" },
+          { status: 500 },
+        );
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "sovereignty_failed" }));
+        }
+      });
   }
 
   private handleIdentity(res: ServerResponse): void {
