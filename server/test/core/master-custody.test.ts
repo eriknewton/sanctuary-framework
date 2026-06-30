@@ -753,6 +753,203 @@ describe("envelope persistence safety", () => {
     );
     await expect(readCustodyEnvelope(storage)).rejects.toThrow(/unsupported/i);
   });
+
+  it("a wrap missing type/verified/payload still fails closed (genuinely malformed)", async () => {
+    const storage = new MemoryStorage();
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(
+        JSON.stringify({
+          v: 1,
+          install_mode: "interactive",
+          wraps: [{ id: "x", type: "passphrase" }], // no verified, no payload
+          created_at: new Date().toISOString(),
+          mac: "deadbeef",
+        })
+      )
+    );
+    await expect(readCustodyEnvelope(storage)).rejects.toThrow(/unsupported/i);
+  });
+});
+
+describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
+  const LEGACY_PASSPHRASE = "legacy-passphrase-from-before-the-mac";
+
+  /**
+   * Materialize on disk a fortress provisioned BEFORE the top-level `mac` and
+   * per-wrap `id` fields existed: a v:1 envelope with NO mac and a single
+   * passphrase wrap WITHOUT an id, whose payload was bound with the id-less
+   * legacy AEAD AAD (`sanctuary-custody-v1:passphrase`). Plus a matching
+   * encrypted identity under the master so the migration evidence check
+   * CONFIRMS. Returns the true master.
+   */
+  async function seedPreMacFortress(
+    storage: MemoryStorage,
+    installMode = "legacy-migrated"
+  ): Promise<Uint8Array> {
+    const master = generateRandomKey();
+    const { key: wrapKey, params } = await deriveMasterKey(LEGACY_PASSPHRASE);
+    // Pre-#496 wraps had no id, so the AAD omitted it.
+    const legacyAad = stringToBytes("sanctuary-custody-v1:passphrase");
+    const payload = encrypt(master, wrapKey, legacyAad);
+    wrapKey.fill(0);
+    const legacyEnvelope = {
+      v: 1,
+      install_mode: installMode,
+      wraps: [
+        {
+          type: "passphrase",
+          payload,
+          kdf: params,
+          verified: true,
+          created_at: new Date().toISOString(),
+        },
+      ],
+      created_at: new Date().toISOString(),
+      // NO mac, NO wrap.id (the pre-#496 shape).
+    };
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(JSON.stringify(legacyEnvelope))
+    );
+    // Matching encrypted state so checkMasterEvidence CONFIRMS the master.
+    const idKey = derivePurposeKey(master, "identity-encryption");
+    const enc = encrypt(stringToBytes('{"identity_id":"legacy-seed"}'), idKey);
+    await storage.write(
+      "_identities",
+      "legacy-seed",
+      stringToBytes(JSON.stringify(enc))
+    );
+    return master;
+  }
+
+  it("readCustodyEnvelope ACCEPTS a pre-mac envelope and flags it needs-migration", async () => {
+    const storage = new MemoryStorage();
+    await seedPreMacFortress(storage);
+    const envelope = await readCustodyEnvelope(storage);
+    expect(envelope).not.toBeNull();
+    expect(envelope!.needsMacMigration).toBe(true);
+    // It does NOT throw the old "unsupported shape" error.
+  });
+
+  it("unlocks a pre-mac fortress AND re-stamps it (mac present, every wrap has an id)", async () => {
+    const storage = new MemoryStorage();
+    const master = await seedPreMacFortress(storage);
+
+    const result = await establishMaster({
+      storage,
+      passphrase: LEGACY_PASSPHRASE,
+    });
+    expect(result.origin).toBe("envelope");
+    // Same master, no data lost.
+    expect(b64(result.masterKey)).toBe(b64(master));
+    // The seeded identity still decrypts.
+    const idKey = derivePurposeKey(result.masterKey, "identity-encryption");
+    const raw = await storage.read("_identities", "legacy-seed");
+    expect(bytesToString(decrypt(JSON.parse(bytesToString(raw!)), idKey))).toContain(
+      "legacy-seed"
+    );
+
+    // On-disk envelope is now UPGRADED: mac present, every wrap has an id.
+    const onDisk = JSON.parse(
+      bytesToString((await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!)
+    );
+    expect(typeof onDisk.mac).toBe("string");
+    expect(onDisk.mac.length).toBeGreaterThan(0);
+    for (const w of onDisk.wraps) {
+      expect(typeof w.id).toBe("string");
+      expect(w.id.length).toBeGreaterThan(0);
+    }
+
+    // A SECOND unlock passes the strict MAC path cleanly (no needs-migration).
+    const second = await establishMaster({
+      storage,
+      passphrase: LEGACY_PASSPHRASE,
+    });
+    expect(second.origin).toBe("envelope");
+    expect(b64(second.masterKey)).toBe(b64(master));
+    const reread = await readCustodyEnvelope(storage);
+    expect(reread!.needsMacMigration).toBeUndefined();
+    verifyEnvelopeMac(reread!, second.masterKey);
+  });
+
+  it("wrap id assignment is stable: repeated reads yield the same synthetic ids", async () => {
+    const storage = new MemoryStorage();
+    await seedPreMacFortress(storage);
+    const first = await readCustodyEnvelope(storage);
+    const second = await readCustodyEnvelope(storage);
+    expect(first!.wraps.map((w) => w.id)).toEqual(second!.wraps.map((w) => w.id));
+    expect(first!.wraps[0]!.id).toBe("legacy-0");
+  });
+
+  it("FAILS CLOSED when a sentinel is present but the mac is absent (tamper / stripped mac)", async () => {
+    const storage = new MemoryStorage();
+    await seedPreMacFortress(storage);
+    // A sentinel proves a MAC'd envelope existed; a mac-absent envelope beside
+    // it means the mac was stripped. Migration must refuse (no laundering).
+    await storage.write(
+      "_meta",
+      "custody-sentinel",
+      stringToBytes(JSON.stringify({ v: 1, alg: "aes-256-gcm", iv: "x", ct: "y" }))
+    );
+    await expect(
+      establishMaster({ storage, passphrase: LEGACY_PASSPHRASE })
+    ).rejects.toThrow(CustodyEnvelopeIntegrityError);
+    // The on-disk envelope is unchanged (still no mac); nothing was blessed.
+    const onDisk = JSON.parse(
+      bytesToString((await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!)
+    );
+    expect(onDisk.mac).toBeUndefined();
+  });
+
+  it("REFUSES to bless a pre-mac envelope whose unlocked master contradicts existing data", async () => {
+    const storage = new MemoryStorage();
+    await seedPreMacFortress(storage);
+    // Overwrite the seeded identity with ciphertext under a DIFFERENT master,
+    // so the (correctly unwrapped) master contradicts the fortress data.
+    const otherMaster = generateRandomKey();
+    const otherIdKey = derivePurposeKey(otherMaster, "identity-encryption");
+    const enc = encrypt(stringToBytes('{"identity_id":"other"}'), otherIdKey);
+    await storage.write(
+      "_identities",
+      "legacy-seed",
+      stringToBytes(JSON.stringify(enc))
+    );
+    await expect(
+      establishMaster({ storage, passphrase: LEGACY_PASSPHRASE })
+    ).rejects.toThrow(CustodyMigrationRefusedError);
+  });
+
+  it("preserves the on-disk install_mode through migration (no downgrade, no upgrade)", async () => {
+    const storage = new MemoryStorage();
+    await seedPreMacFortress(storage, "headless");
+    await establishMaster({ storage, passphrase: LEGACY_PASSPHRASE });
+    const reread = await readCustodyEnvelope(storage);
+    expect(reread!.install_mode).toBe("headless");
+  });
+
+  it("the migrated envelope is tamper-evident: flipping install_mode now fails the MAC", async () => {
+    const storage = new MemoryStorage();
+    const master = await seedPreMacFortress(storage);
+    await establishMaster({ storage, passphrase: LEGACY_PASSPHRASE });
+    // Attacker flips install_mode on the now-MAC'd envelope.
+    const onDisk = JSON.parse(
+      bytesToString((await storage.read("_meta", CUSTODY_ENVELOPE_KEY))!)
+    );
+    onDisk.install_mode = "interactive";
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(JSON.stringify(onDisk))
+    );
+    const tampered = await readCustodyEnvelope(storage);
+    expect(tampered!.needsMacMigration).toBeUndefined();
+    expect(() => verifyEnvelopeMac(tampered!, master)).toThrow(
+      CustodyEnvelopeIntegrityError
+    );
+  });
 });
 
 describe("checkCastlePinCustody", () => {

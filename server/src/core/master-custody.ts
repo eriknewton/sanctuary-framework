@@ -114,6 +114,22 @@ export interface CustodyEnvelope {
    * the master (codex finding H2/M2; anti-rollback Stage 1).
    */
   mac: string;
+  /**
+   * TRANSIENT read-only flag, NEVER persisted. Set by
+   * {@link readCustodyEnvelope} when it accepts a structurally-valid
+   * PRE-MAC legacy envelope, one written by a Sanctuary build before the
+   * "one master per fortress" change added the top-level `mac` and per-wrap
+   * `id` (#496). Such an envelope has no authenticated `install_mode` to have
+   * been tampered, so it is accepted on read (additive backward-compat, the
+   * same "absent field = older shape, allowed" philosophy as the epoch-absent
+   * handling) and RE-STAMPED in place by {@link establishMaster} on the first
+   * unlock, once the master is available and verified against existing
+   * ciphertext. Callers that perform the strict {@link verifyEnvelopeMac}
+   * check must migrate first (the synthesized `mac` is empty and will not
+   * verify). This field is stripped before any write (see
+   * {@link writeCustodyEnvelope}).
+   */
+  needsMacMigration?: boolean;
 }
 
 /**
@@ -476,6 +492,24 @@ function envelopeMissingButSentinelPresent(): CustodyEnvelopeIntegrityError {
 }
 
 /**
+ * Message for "a pre-mac legacy envelope exists but a sentinel is present":
+ * a sentinel proves a MAC'd envelope was written, so a mac-ABSENT envelope is
+ * tampering (the mac was stripped), not a genuine pre-mac fortress. Fail
+ * closed; never re-stamp (re-stamping would launder a stripped mac and could
+ * resurrect a downgraded install_mode). Mirrors
+ * {@link envelopeMissingButSentinelPresent}.
+ */
+function legacyEnvelopeButSentinelPresent(): CustodyEnvelopeIntegrityError {
+  return new CustodyEnvelopeIntegrityError(
+    "Sanctuary: this fortress's custody sentinel exists but its custody envelope\n" +
+      "has no integrity MAC. A sentinel is only written alongside a MAC'd\n" +
+      "envelope, so the MAC was stripped. Refusing to re-stamp it (that would\n" +
+      "launder a tampered envelope and could downgrade the install mode).\n" +
+      "Restore _meta/custody-envelope from a trusted backup."
+  );
+}
+
+/**
  * Existing encrypted data was found with no custody envelope and no legacy
  * markers. Creating fresh custody over it would orphan the data (split
  * state) — fail closed instead (codex finding H1).
@@ -497,6 +531,19 @@ export class OrphanedFortressStateError extends Error {
 
 function custodyAad(type: CustodyWrapType, id: string): Uint8Array {
   return stringToBytes(`${CUSTODY_HKDF_SALT}:${type}:${id}`);
+}
+
+/**
+ * AEAD AAD for a PRE-MAC legacy wrap, one written before per-wrap ids
+ * existed (#496 backward-compat). Such a wrap's payload was bound WITHOUT an
+ * id, so it must be decrypted with this id-less AAD. The current id-bound
+ * {@link custodyAad} cannot recover it because the id it would supply
+ * (synthesized at read time) was never part of the ciphertext's AAD. On
+ * migration the wrap is RE-wrapped under the current id-bound AAD, after which
+ * this legacy AAD is never used for it again.
+ */
+function legacyCustodyAad(type: CustodyWrapType): Uint8Array {
+  return stringToBytes(`${CUSTODY_HKDF_SALT}:${type}`);
 }
 
 function newWrapId(): string {
@@ -622,7 +669,13 @@ export async function unwrapMaster(
         ? "recovery-key"
         : "keychain";
 
-  const match = await unwrapMatchingWrap(envelope.wraps, credential, type);
+  // A PRE-MAC legacy envelope (#496 backward-compat) carries wraps whose
+  // ciphertext was bound WITHOUT a per-wrap id, so the unwrap must also try
+  // the id-less legacy AAD. GCM authentication still decides; the legacy AAD
+  // is just an additional candidate, never a weaker derivation (#5).
+  const match = await unwrapMatchingWrap(envelope.wraps, credential, type, {
+    legacyNoId: envelope.needsMacMigration === true,
+  });
   if (!match) throw new CustodyUnlockError();
   return match.master;
 }
@@ -657,7 +710,8 @@ export async function unwrapMasterFromWraps(
 async function unwrapMatchingWrap(
   wraps: CustodyWrap[],
   credential: CustodyCredential,
-  type: CustodyWrapType
+  type: CustodyWrapType,
+  opts?: { legacyNoId?: boolean }
 ): Promise<{ master: Uint8Array; wrapId: string } | null> {
   for (const wrap of wraps) {
     if (wrap.type !== type) continue;
@@ -673,8 +727,21 @@ async function unwrapMatchingWrap(
         wrapKey = keychainWrapKey(credential.keychainKey);
       }
       try {
-        const master = decrypt(wrap.payload, wrapKey, custodyAad(type, wrap.id));
-        return { master, wrapId: wrap.id };
+        // Candidate AADs in order. The current id-bound AAD is the norm; a
+        // pre-mac legacy envelope additionally allows the id-less AAD its
+        // wraps were actually bound with. GCM authentication accepts at most
+        // one. There is no weaker fallback, only an additional candidate.
+        const aads = opts?.legacyNoId
+          ? [legacyCustodyAad(type), custodyAad(type, wrap.id)]
+          : [custodyAad(type, wrap.id)];
+        for (const aad of aads) {
+          try {
+            const master = decrypt(wrap.payload, wrapKey, aad);
+            return { master, wrapId: wrap.id };
+          } catch {
+            // Wrong AAD for this wrap; try the next candidate.
+          }
+        }
       } finally {
         wrapKey.fill(0);
       }
@@ -770,35 +837,78 @@ export async function readCustodyEnvelope(
     );
   }
   const envelope = parsed as CustodyEnvelope;
-  if (
-    envelope === null ||
-    typeof envelope !== "object" ||
-    envelope.v !== 1 ||
-    !Array.isArray(envelope.wraps) ||
-    typeof envelope.mac !== "string" ||
-    !CUSTODY_INSTALL_MODES.has(envelope.install_mode) ||
+
+  // Common structural floor shared by both the current and the pre-mac legacy
+  // shapes. A genuinely-malformed envelope (bad version, non-array wraps,
+  // wraps missing type/verified/payload, malformed epoch) is ALWAYS rejected;
+  // the only fields a legacy envelope is permitted to lack are the top-level
+  // `mac` and the per-wrap `id` (both added by #496 "one master per fortress").
+  const structurallyValid =
+    envelope !== null &&
+    typeof envelope === "object" &&
+    envelope.v === 1 &&
+    Array.isArray(envelope.wraps) &&
+    CUSTODY_INSTALL_MODES.has(envelope.install_mode) &&
     // Anti-rollback Stage 1: when present, epoch must be a non-negative safe
     // integer and epoch_id a string — a malformed epoch fails closed (the MAC
     // would not verify anyway, but reject early so the boot detector never
     // sees a garbage epoch). Absent epoch is the pre-Stage-1 shape: allowed.
-    (envelope.epoch !== undefined &&
+    !(
+      envelope.epoch !== undefined &&
       (typeof envelope.epoch !== "number" ||
         !Number.isSafeInteger(envelope.epoch) ||
-        envelope.epoch < 0)) ||
-    (envelope.epoch_id !== undefined && typeof envelope.epoch_id !== "string") ||
-    envelope.wraps.some(
+        envelope.epoch < 0)
+    ) &&
+    !(envelope.epoch_id !== undefined && typeof envelope.epoch_id !== "string") &&
+    envelope.wraps.every(
       (w) =>
-        typeof w?.id !== "string" ||
-        typeof w?.type !== "string" ||
-        typeof w?.verified !== "boolean" ||
-        typeof w?.payload !== "object"
-    )
-  ) {
+        w !== null &&
+        typeof w === "object" &&
+        typeof w?.type === "string" &&
+        typeof w?.verified === "boolean" &&
+        typeof w?.payload === "object"
+    );
+
+  if (!structurallyValid) {
     throw new Error(
       "Sanctuary: custody envelope exists but has an unsupported shape or version.\n" +
         "Refusing to start. Restore _meta/custody-envelope from backup or upgrade Sanctuary."
     );
   }
+
+  // PRE-MAC legacy detection (#496 backward-compat): a top-level `mac` that is
+  // not a string, OR any wrap whose `id` is not a string, marks an envelope
+  // written before the mac+wrap-id fields existed. Distinguish it from a
+  // genuinely-malformed envelope (already rejected above) and from a current
+  // envelope, then accept it as needs-migration. The master is NOT available
+  // here, so the re-stamp (computing the real `mac`, assigning persistent wrap
+  // `id`s, verifying the master against existing ciphertext, and writing the
+  // upgraded envelope) is performed by `establishMaster` on the first unlock,
+  // NEVER silently here. Same additive "absent field = older shape, allowed"
+  // philosophy as the epoch-absent handling above.
+  const macAbsent = typeof envelope.mac !== "string";
+  const anyWrapIdAbsent = envelope.wraps.some((w) => typeof w?.id !== "string");
+
+  if (macAbsent || anyWrapIdAbsent) {
+    // Assign DETERMINISTIC, STABLE synthetic wrap ids by position so the
+    // recomputed MAC is reproducible across repeated reads of the same
+    // on-disk envelope (the re-stamp in `establishMaster` persists these
+    // exact ids). Wraps that already carry an id (mixed/partial legacy)
+    // keep theirs. The AEAD AAD for each wrap was bound with the wrap's id
+    // at WRITE time; a pre-mac legacy wrap was written before per-wrap ids
+    // existed, so its AAD does not depend on the id (see `establishMaster`).
+    const migrated: CustodyEnvelope = {
+      ...envelope,
+      wraps: envelope.wraps.map((w, i) => ({
+        ...w,
+        id: typeof w?.id === "string" ? w.id : `legacy-${i}`,
+      })),
+      mac: typeof envelope.mac === "string" ? envelope.mac : "",
+      needsMacMigration: true,
+    };
+    return migrated;
+  }
+
   return envelope;
 }
 
@@ -911,6 +1021,19 @@ export async function enforceCustodyFloor(
     // fortress with NEITHER artifact is genuine pre-envelope legacy.
     if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
       throw envelopeMissingButSentinelPresent();
+    }
+    return;
+  }
+  if (envelope.needsMacMigration) {
+    // PRE-MAC legacy envelope reaching the floor before its first unlock-time
+    // migration. It has no MAC to verify, so do NOT call verifyEnvelopeMac
+    // (an empty MAC would always throw). A sentinel beside a mac-absent
+    // envelope is tamper (the MAC was stripped): fail closed; otherwise this
+    // is a genuine pre-#496 fortress: treat as legacy-compatible (it migrates
+    // to a degraded `legacy-migrated`/headless install on first unlock, which
+    // is floor-exempt and audited), so do not block trust-bearing writes here.
+    if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
+      throw legacyEnvelopeButSentinelPresent();
     }
     return;
   }
@@ -1138,6 +1261,137 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
 }
 
 /**
+ * Re-wrap ONE legacy wrap under the current id-bound AEAD AAD, re-deriving the
+ * wrap key from the supplied credential (the only secret we hold). The wrap's
+ * payload was bound with the id-less {@link legacyCustodyAad}; after this it is
+ * bound with {@link custodyAad}`(type, freshId)` so a future strict read works.
+ * The master is NOT re-derived or changed; only the AAD binding is upgraded.
+ * Returns null when the wrap's type does not match the supplied credential
+ * (we cannot re-derive that wrap key without its secret).
+ */
+async function reWrapLegacyWrap(
+  wrap: CustodyWrap,
+  master: Uint8Array,
+  credential: CustodyCredential
+): Promise<CustodyWrap | null> {
+  const id = newWrapId();
+  let wrapKey: Uint8Array;
+  let kdf: KeyDerivationParams | undefined;
+  if ("passphrase" in credential && wrap.type === "passphrase") {
+    // Reuse the wrap's existing Argon2id params so the operator's SAME
+    // passphrase keeps unlocking the fortress (no credential change).
+    if (!wrap.kdf) return null;
+    const derived = await deriveMasterKey(credential.passphrase, wrap.kdf);
+    wrapKey = derived.key;
+    kdf = wrap.kdf;
+  } else if ("recoveryKey" in credential && wrap.type === "recovery-key") {
+    wrapKey = recoveryWrapKey(credential.recoveryKey);
+  } else if ("keychainKey" in credential && wrap.type === "keychain") {
+    wrapKey = keychainWrapKey(credential.keychainKey);
+  } else {
+    return null;
+  }
+  try {
+    const payload = encrypt(master, wrapKey, custodyAad(wrap.type, id));
+    return {
+      id,
+      type: wrap.type,
+      payload,
+      ...(kdf ? { kdf } : {}),
+      verified: wrap.verified,
+      created_at: wrap.created_at,
+    };
+  } finally {
+    wrapKey.fill(0);
+  }
+}
+
+/**
+ * Migrate a structurally-valid PRE-MAC legacy envelope (#496 backward-compat)
+ * IN PLACE, now that the master has been unwrapped from it. This is the
+ * upgrade-safety fix: an envelope written before the top-level `mac` and
+ * per-wrap `id` fields existed must be ACCEPTED and re-stamped, NOT rejected
+ * (the old `readCustodyEnvelope` bricked every pre-#496 fortress on first
+ * boot after upgrade). Models the legacy-marker migration writes below: verify
+ * the master against existing ciphertext, then write a MAC'd v:1 envelope.
+ *
+ * HARD security invariants (fail closed):
+ *  - SENTINEL PRESENT ⇒ a MAC'd envelope existed and its MAC was stripped:
+ *    tamper, never migrate (mirrors {@link envelopeMissingButSentinelPresent}).
+ *    The install_mode is re-stamped from the on-disk value ONLY in the
+ *    no-sentinel case, so this is the gate that stops downgrade-laundering
+ *    (e.g. flipping interactive→legacy-migrated to dodge the two-factor floor).
+ *  - The unwrapped master must be CONFIRMED (or not contradicted) against
+ *    existing fortress ciphertext before writing the blessed envelope, so a
+ *    wrong/forged credential cannot mint a MAC'd envelope (same evidence check
+ *    the legacy-marker paths use).
+ *  - Every wrap is re-wrapped under the current id-bound AAD; a wrap we cannot
+ *    re-wrap (its secret was not supplied) fails closed rather than silently
+ *    breaking on the next strict read.
+ */
+async function migrateLegacyEnvelopeInPlace(
+  storage: StorageBackend,
+  envelope: CustodyEnvelope,
+  master: Uint8Array,
+  credential: CustodyCredential
+): Promise<CustodyEnvelope> {
+  // DANGEROUS case, fail closed. A sentinel is written only beside a MAC'd
+  // envelope (writeCustodyEnvelope), so a mac-absent envelope WITH a sentinel
+  // means the mac was stripped: treat as tamper, never re-stamp.
+  if (await storage.read("_meta", CUSTODY_SENTINEL_KEY)) {
+    throw legacyEnvelopeButSentinelPresent();
+  }
+
+  // Never bless a master the fortress's existing ciphertext contradicts:
+  // a wrong/forged credential must not be able to mint a MAC'd envelope.
+  const evidence = await checkMasterEvidence(storage, master);
+  if (evidence === "contradicted") {
+    throw new CustodyMigrationRefusedError();
+  }
+  // "no-evidence" is acceptable here: unlike the legacy-marker paths, the
+  // master was just proven by GCM-authenticating an actual wrap of this
+  // envelope, so it is the fortress's real master regardless of how much
+  // checkable ciphertext exists.
+
+  // Re-wrap every wrap under the current id-bound AAD. The supplied credential
+  // is the only secret we hold; a wrap of another factor type cannot be
+  // re-wrapped without its secret, so fail closed rather than silently strip
+  // or corrupt it (legacy-migrated envelopes carry exactly one wrap).
+  const reWrapped: CustodyWrap[] = [];
+  for (const wrap of envelope.wraps) {
+    const next = await reWrapLegacyWrap(wrap, master, credential);
+    if (!next) {
+      throw new CustodyEnvelopeIntegrityError(
+        "Sanctuary: cannot upgrade this pre-mac legacy custody envelope.\n" +
+          "It enrolls a recovery factor whose secret was not supplied, so its\n" +
+          "wrap cannot be re-bound under the current scheme. Unlock with the\n" +
+          "original creating credential, or re-initialize the fortress with\n" +
+          "`sanctuary init` after exporting any state you need to keep."
+      );
+    }
+    reWrapped.push(next);
+  }
+
+  // Re-stamp: install_mode is taken from the on-disk value, SAFE only because
+  // the sentinel-absent gate above proved no prior authenticated install_mode
+  // could have been tampered. writeCustodyEnvelope computes the MAC + writes
+  // the sentinel, so the next unlock passes the strict verifyEnvelopeMac path.
+  return writeCustodyEnvelope(
+    storage,
+    {
+      v: 1,
+      install_mode: envelope.install_mode,
+      wraps: reWrapped,
+      created_at: envelope.created_at,
+      ...(typeof envelope.epoch === "number"
+        ? { epoch: envelope.epoch, epoch_id: envelope.epoch_id ?? "" }
+        : {}),
+    },
+    master
+  );
+}
+
+/**
  * THE master-establishment path. Envelope-first; legacy markers honored and
  * migrated in place (same master, no data re-encryption, markers kept so an
  * interrupted migration leaves a pure-legacy fortress); first runs create
@@ -1163,22 +1417,43 @@ export async function establishMaster(
   if (envelope) {
     let masterKey: Uint8Array;
     let keyProtection: "passphrase" | "recovery-key";
+    let credential: CustodyCredential;
     if (opts.passphrase !== undefined) {
-      masterKey = await unwrapMaster(envelope, { passphrase: opts.passphrase });
+      credential = { passphrase: opts.passphrase };
+      masterKey = await unwrapMaster(envelope, credential);
       keyProtection = "passphrase";
     } else if (opts.recoveryKey !== undefined) {
-      masterKey = await unwrapMaster(envelope, {
-        recoveryKey: decodeRecoveryKey(opts.recoveryKey),
-      });
+      credential = { recoveryKey: decodeRecoveryKey(opts.recoveryKey) };
+      masterKey = await unwrapMaster(envelope, credential);
       keyProtection = "recovery-key";
     } else if (opts.keychainKey !== undefined) {
-      masterKey = await unwrapMaster(envelope, {
-        keychainKey: opts.keychainKey,
-      });
+      credential = { keychainKey: opts.keychainKey };
+      masterKey = await unwrapMaster(envelope, credential);
       keyProtection = "passphrase";
     } else {
       throw new CustodyCredentialMissingError(opts.storagePathHint);
     }
+
+    // PRE-MAC legacy envelope (#496 backward-compat): the credential unwrapped
+    // the master, but the on-disk envelope predates the policy MAC and the
+    // per-wrap ids, so there is no MAC to verify yet. Re-stamp it IN PLACE
+    // now that the master is in hand, never reject, never silently trust an
+    // unauthenticated install_mode.
+    if (envelope.needsMacMigration) {
+      const upgraded = await migrateLegacyEnvelopeInPlace(
+        storage,
+        envelope,
+        masterKey,
+        credential
+      );
+      return {
+        masterKey,
+        envelope: upgraded,
+        origin: "envelope",
+        keyProtection,
+      };
+    }
+
     // Authenticate the envelope's policy metadata under the unwrapped
     // master before anyone trusts install_mode / verified flags (H2).
     verifyEnvelopeMac(envelope, masterKey);
