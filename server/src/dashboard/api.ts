@@ -30,6 +30,7 @@ import {
   handlePostureRoute,
   POSTURE_AGENT_PATH_PREFIX,
   POSTURE_API_PREFIX,
+  POSTURE_EVIDENCE_PATH,
   POSTURE_HOME_PATH,
 } from "../principal-policy/posture-routes.js";
 
@@ -244,6 +245,7 @@ export async function handleRequest(
   if (
     path === POSTURE_API_PREFIX ||
     path.startsWith(`${POSTURE_API_PREFIX}/`) ||
+    path === POSTURE_EVIDENCE_PATH ||
     path.startsWith(POSTURE_AGENT_PATH_PREFIX)
   ) {
     if (!isAuthorizedForRead(deps, req, url)) {
