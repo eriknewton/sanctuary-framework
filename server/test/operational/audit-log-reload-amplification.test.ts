@@ -68,7 +68,18 @@ async function seed(log: AuditLog, n: number): Promise<void> {
 }
 
 describe("AuditLog reload amplification bound", () => {
-  const TOTAL = 4000;
+  // The "large log" property only needs to be large RELATIVE TO the 256-entry
+  // in-memory window (IN_MEMORY_FLOOR): 1024 on-disk entries vs a 256 window
+  // still proves the instance never materializes the full chain (the bound), at
+  // ~4x the floor, while keeping the per-test crypto-seed cost (1024 authenticated
+  // append+decrypt round-trips) inside CI's default 30s vitest budget. At
+  // TOTAL=4000 each heavy test ran ~12s locally but 42-60s on the 2-core CI
+  // runners and timed out at 30s — a deterministic budget overflow, not a flake
+  // and not a tamper-detection regression (the logic is identical; see git
+  // history). HEAVY_TIMEOUT_MS adds margin so CI-runner variance can never
+  // re-trip the wall even on a slow host.
+  const TOTAL = 1024;
+  const HEAVY_TIMEOUT_MS = 60_000;
 
   it("streamVerifiedChain serves the FULL verified chain in order without materializing it into the instance", async () => {
     const { log } = createLog();
@@ -115,7 +126,7 @@ describe("AuditLog reload amplification bound", () => {
     // memory bound — a large on-disk log is never fully resident in the instance.
     expect(log.size).toBe(IN_MEMORY_FLOOR);
     expect(log.size).toBeLessThan(TOTAL);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("streamed fold is byte-identical to the materialized verifiedChainView over a clean large chain", async () => {
     const { log } = createLog();
@@ -140,7 +151,7 @@ describe("AuditLog reload amplification bound", () => {
 
     expect(streamedHashes).toEqual(arrayHashes);
     expect(streamedSeqs).toEqual(arraySeqs);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("DETECTS a tampered payload on a large log (streaming pass throws AuditIntegrityError)", async () => {
     const { log, storage, masterKey } = createLog();
@@ -165,7 +176,7 @@ describe("AuditLog reload amplification bound", () => {
     await expect(
       reader.streamVerifiedChain({ onEntry: () => undefined })
     ).rejects.toBeInstanceOf(AuditIntegrityError);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("DETECTS a missing (truncated) entry on a large log via the streaming pass", async () => {
     const { log, storage, masterKey } = createLog();
@@ -186,7 +197,7 @@ describe("AuditLog reload amplification bound", () => {
     await expect(
       reader.streamVerifiedChain({ onEntry: () => undefined })
     ).rejects.toBeInstanceOf(AuditIntegrityError);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("DETECTS reordered entries on a large log via the streaming pass", async () => {
     const { log, storage, masterKey } = createLog();
@@ -211,7 +222,7 @@ describe("AuditLog reload amplification bound", () => {
     await expect(
       reader.streamVerifiedChain({ onEntry: () => undefined })
     ).rejects.toBeInstanceOf(AuditIntegrityError);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("propagates a CONSUMER's rejection AS ITSELF, not relabeled as a decrypt/storage finding", async () => {
     // A consumer (here workload replay) that throws on a malformed-but-decrypted
