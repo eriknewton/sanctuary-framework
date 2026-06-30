@@ -843,6 +843,10 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
       passphrase: LEGACY_PASSPHRASE,
     });
     expect(result.origin).toBe("envelope");
+    // The re-stamp is a security-relevant custody transition; origin stays
+    // "envelope" so `migratedInPlace` is the ONLY signal the boot paths gate
+    // the `custody_legacy_migrated` audit event on. It MUST be set here.
+    expect(result.migratedInPlace).toBe(true);
     // Same master, no data lost.
     expect(b64(result.masterKey)).toBe(b64(master));
     // The seeded identity still decrypts.
@@ -869,6 +873,9 @@ describe("pre-mac legacy envelope migration (#496 upgrade-safety)", () => {
       passphrase: LEGACY_PASSPHRASE,
     });
     expect(second.origin).toBe("envelope");
+    // An ordinary strict-MAC unlock is NOT a migration: the flag must be unset
+    // so the boot paths do not emit a spurious migration audit every unlock.
+    expect(second.migratedInPlace).toBeUndefined();
     expect(b64(second.masterKey)).toBe(b64(master));
     const reread = await readCustodyEnvelope(storage);
     expect(reread!.needsMacMigration).toBeUndefined();

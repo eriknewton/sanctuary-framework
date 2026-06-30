@@ -151,7 +151,10 @@ export async function establishWrapCustody(
   const auditLog = new AuditLog(storage, masterKey);
   const fortressId = fortressIdFromStoragePath(opts.storagePath);
 
-  if (origin !== "envelope") {
+  // `migratedInPlace` re-stamps a pre-mac legacy envelope (full re-wrap + fresh
+  // MAC + new sentinel) while keeping origin "envelope"; audit it as a legacy
+  // migration so the custody state transition is never silent.
+  if (origin !== "envelope" || result.migratedInPlace) {
     await auditLog.appendCritical({
       layer: "l2",
       operation:

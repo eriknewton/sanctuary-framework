@@ -892,11 +892,15 @@ export async function readCustodyEnvelope(
   if (macAbsent || anyWrapIdAbsent) {
     // Assign DETERMINISTIC, STABLE synthetic wrap ids by position so the
     // recomputed MAC is reproducible across repeated reads of the same
-    // on-disk envelope (the re-stamp in `establishMaster` persists these
-    // exact ids). Wraps that already carry an id (mixed/partial legacy)
-    // keep theirs. The AEAD AAD for each wrap was bound with the wrap's id
-    // at WRITE time; a pre-mac legacy wrap was written before per-wrap ids
-    // existed, so its AAD does not depend on the id (see `establishMaster`).
+    // on-disk envelope. These synthetic ids are TRANSIENT, not persisted: the
+    // re-stamp in `establishMaster` re-wraps every wrap via `reWrapLegacyWrap`,
+    // which assigns a FRESH random id (`newWrapId`) and persists THAT; the
+    // `legacy-${i}` ids never reach disk. They serve only read-to-read MAC
+    // reproducibility here. Wraps that already carry an id (mixed/partial
+    // legacy) keep theirs. The AEAD AAD for each wrap was bound with the wrap's
+    // id at WRITE time; a pre-mac legacy wrap was written before per-wrap ids
+    // existed, so its payload decrypts under the id-less `legacyCustodyAad` and
+    // the synthetic id never affects decryption (see `establishMaster`).
     const migrated: CustodyEnvelope = {
       ...envelope,
       wraps: envelope.wraps.map((w, i) => ({
@@ -1239,6 +1243,16 @@ export interface EstablishMasterResult {
   keyProtection: "passphrase" | "recovery-key";
   /** Present only when a fresh recovery key was minted on this call. */
   mintedRecoveryKey?: string;
+  /**
+   * True ONLY when this call re-stamped a pre-mac legacy envelope in place
+   * (`needsMacMigration`): a full re-wrap under id-bound AAD + a fresh policy
+   * MAC + a new sentinel. `origin` stays "envelope" (the master was unwrapped
+   * from a real envelope, and a second unlock is an ordinary strict-MAC read),
+   * so this flag is the ONLY signal that a security-relevant custody state
+   * transition occurred. Boot paths gate the `custody_legacy_migrated` audit
+   * event on it; without it the re-stamp would leave no audit trail.
+   */
+  migratedInPlace?: boolean;
 }
 
 function decodeRecoveryKey(recoveryKey: string): Uint8Array {
@@ -1451,17 +1465,28 @@ export async function establishMaster(
     // now that the master is in hand, never reject, never silently trust an
     // unauthenticated install_mode.
     if (envelope.needsMacMigration) {
-      const upgraded = await migrateLegacyEnvelopeInPlace(
-        storage,
-        envelope,
-        masterKey,
-        credential
-      );
+      let upgraded: CustodyEnvelope;
+      try {
+        upgraded = await migrateLegacyEnvelopeInPlace(
+          storage,
+          envelope,
+          masterKey,
+          credential
+        );
+      } catch (err) {
+        // Scrub the transient plaintext master before propagating, matching
+        // the legacy-marker establishment paths' zeroize-before-throw
+        // discipline (the migration helper can throw on sentinel-present,
+        // contradicted-master, or un-rewrappable-wrap).
+        masterKey.fill(0);
+        throw err;
+      }
       return {
         masterKey,
         envelope: upgraded,
         origin: "envelope",
         keyProtection,
+        migratedInPlace: true,
       };
     }
 

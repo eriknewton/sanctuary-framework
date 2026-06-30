@@ -378,7 +378,10 @@ export async function createSanctuaryServer(options?: {
   // material — wrap types and install mode only), and surface the dual-path
   // damage signature (Castle pin wrapped under a master nobody can produce,
   // the 2026-06-12 incident shape) instead of silently carrying it.
-  if (custody.origin !== "envelope") {
+  // `migratedInPlace` re-stamps a pre-mac legacy envelope (full re-wrap + fresh
+  // MAC + new sentinel) while keeping origin "envelope"; audit it as a legacy
+  // migration so the custody state transition is never silent.
+  if (custody.origin !== "envelope" || custody.migratedInPlace) {
     await auditLog.appendCritical({
       layer: "l2",
       operation:

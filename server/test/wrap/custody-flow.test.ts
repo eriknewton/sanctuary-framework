@@ -17,7 +17,9 @@ import { establishWrapCustody } from "../../src/wrap/custody-flow.js";
 import {
   establishMaster,
   readCustodyEnvelope,
+  CUSTODY_ENVELOPE_KEY,
 } from "../../src/core/master-custody.js";
+import { generateRandomKey } from "../../src/core/random.js";
 import {
   verifyRecoveryKeyReentry,
   RecoveryKeyReentryMismatchError,
@@ -120,6 +122,62 @@ describe("establishWrapCustody", () => {
     const recoveryKey = extractRecoveryKey(fileContent);
     const unlocked = await establishMaster({ storage, recoveryKey });
     expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(legacyMaster));
+  });
+
+  it("pre-mac legacy envelope: in-place re-stamp emits a custody_legacy_migrated audit entry (no silent custody transition)", async () => {
+    // Seed a pre-mac v:1 envelope (no top-level mac, wrap has no id) whose
+    // single passphrase wrap was bound with the id-less legacy AEAD AAD, plus
+    // a matching identity so the migration evidence check CONFIRMS.
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const master = generateRandomKey();
+    const { key: wrapKey, params } = await deriveMasterKey("pre-mac-pass");
+    const legacyAad = stringToBytes("sanctuary-custody-v1:passphrase");
+    const payload = encrypt(master, wrapKey, legacyAad);
+    wrapKey.fill(0);
+    await storage.write(
+      "_meta",
+      CUSTODY_ENVELOPE_KEY,
+      stringToBytes(
+        JSON.stringify({
+          v: 1,
+          install_mode: "legacy-migrated",
+          wraps: [
+            {
+              type: "passphrase",
+              payload,
+              kdf: params,
+              verified: true,
+              created_at: new Date().toISOString(),
+            },
+          ],
+          created_at: new Date().toISOString(),
+          // NO mac, NO wrap.id (the pre-mac shape).
+        })
+      )
+    );
+    const idKey = derivePurposeKey(master, "identity-encryption");
+    await storage.write(
+      "_identities",
+      "seed",
+      stringToBytes(
+        JSON.stringify(encrypt(stringToBytes('{"identity_id":"seed"}'), idKey))
+      )
+    );
+
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "pre-mac-pass",
+      interactive: false,
+    });
+    // The re-stamp keeps origin "envelope"; the migration signal is the flag.
+    expect(result.origin).toBe("envelope");
+    expect(toBase64url(result.masterKey)).toBe(toBase64url(master));
+
+    // The custody state transition (full re-wrap + fresh MAC + new sentinel)
+    // MUST be audited; before the fix this path emitted nothing.
+    const auditLog = new AuditLog(storage, result.masterKey);
+    const { entries } = await auditLog.query({ layer: "l2", limit: 50 });
+    expect(entries.map((e) => e.operation)).toContain("custody_legacy_migrated");
   });
 
   it("re-running wrap custody is idempotent: no re-mint, recovery-key.txt unchanged", async () => {
