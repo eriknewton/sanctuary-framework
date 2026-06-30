@@ -82,6 +82,10 @@ import {
   signFederationNodeEvictionPayload,
   type FederationNodeCertificateRenewalConfig,
 } from "./federation-revocation.js";
+import {
+  evaluateGuardianRevocationSignOff,
+  type GuardianRevocationRequirement,
+} from "./federation-revocation-guardian-gate.js";
 
 const NODE_MODES: readonly NodeMode[] = [
   "local",
@@ -620,6 +624,18 @@ export interface V1FederationDeps {
   ): Promise<boolean>;
   /** Structured aggregate disclosure for status surfaces. */
   federationPosture(): FederationPostureSummary;
+  /**
+   * OPTIONAL, operator-configurable M-of-N guardian sign-off requirement for the
+   * revoke/kill path. DEFAULT-OFF: when this dep is absent or returns `null`,
+   * the revoke handler runs the legacy single-operator path unchanged (provably
+   * a no-op). When it returns a {@link GuardianRevocationRequirement}, the
+   * handler requires M-of-N valid guardian signatures BEFORE minting the
+   * eviction and FAILS CLOSED (refuses, never executes) on insufficient,
+   * invalid, forged, or duplicate guardian approvals. Composes the existing
+   * guardian threshold evaluator onto the existing operator-signed revocation
+   * primitive; it can only ADD a required precondition, never weaken one.
+   */
+  requireGuardianRevocationSignOff?(): GuardianRevocationRequirement | null;
 }
 
 export interface FederationNodeView {
@@ -1045,6 +1061,34 @@ async function handleRevoke(
     });
     writeJson(res, 503, { error: "unavailable" });
     return;
+  }
+
+  // OPTIONAL guardian sign-off gate (default-off, fail-closed). When the host
+  // has not configured a requirement, `requirement` is null and this block is a
+  // no-op: control falls straight through to the legacy single-operator mint
+  // below, byte-for-byte unchanged. When a requirement IS configured, an
+  // M-of-N guardian quorum bound to THIS (fortress, node) revocation must
+  // verify before the eviction is minted; any insufficient/invalid/forged/
+  // duplicate approval set REFUSES the revocation (it is never executed).
+  const guardianRequirement = deps.requireGuardianRevocationSignOff?.() ?? null;
+  if (guardianRequirement !== null) {
+    const { guardian_approvals } = body as { guardian_approvals?: unknown };
+    const decision = evaluateGuardianRevocationSignOff({
+      requirement: guardianRequirement,
+      fortressId: ctx.fortressId,
+      nodeId: node_id,
+      approvals: guardian_approvals,
+    });
+    if (!decision.allowed) {
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: node_id,
+        details: { reason: decision.reason },
+      });
+      denyForbidden(res);
+      return;
+    }
   }
 
   const originNodeId = federationOperatorAuthorityOrigin(ctx.fortressId);

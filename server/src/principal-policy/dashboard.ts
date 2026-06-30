@@ -128,6 +128,7 @@ import {
   startFederationNodeCertificateAutoRenewal,
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
+import type { GuardianRevocationRequirement } from "../v1/federation-revocation-guardian-gate.js";
 import {
   FEDERATION_POLICY_BUNDLE_EVENT_KIND,
   foldFederationPolicyBundleEvent as foldVerifiedFederationPolicyBundleEvent,
@@ -607,6 +608,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private _federationContext: FederationContext | null = null;
   private _federationEnabled = false;
+  /**
+   * OPTIONAL operator opt-in: when set, the /v1/federation/revoke (kill) path
+   * requires an M-of-N guardian quorum before a node eviction is minted.
+   * DEFAULT-OFF (`null`): the revoke path behaves exactly as the legacy single-
+   * operator path. Bound out of band by the operator via
+   * {@link setFederationGuardianRevocationRequirement}; surfaced to the handler
+   * through `buildV1FederationDeps().requireGuardianRevocationSignOff`.
+   */
+  private _federationGuardianRevocationRequirement:
+    | GuardianRevocationRequirement
+    | null = null;
   private readonly _federationRoster = new Set<string>();
   private _federationState: FederationDashboardState = {
     eventLog: [],
@@ -1924,6 +1936,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
   }
 
+  /**
+   * Operator opt-in for M-of-N guardian sign-off on the /v1/federation/revoke
+   * (kill) path. Pass a {@link GuardianRevocationRequirement} (the pinned,
+   * fortress-master-signed guardian roster) to REQUIRE an M-of-N guardian quorum
+   * before any node eviction is minted; pass `null` to DISABLE the requirement
+   * and restore the legacy single-operator revoke path. Default is `null`
+   * (off). This is an additive precondition only: it never relaxes the existing
+   * operator-signature gate on revoke.
+   */
+  setFederationGuardianRevocationRequirement(
+    requirement: GuardianRevocationRequirement | null,
+  ): void {
+    this._federationGuardianRevocationRequirement = requirement;
+  }
+
   /** True when federation materials are bound (issuer or joiner context). */
   isFederationProvisioned(): boolean {
     return this._federationContext !== null;
@@ -2228,6 +2255,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         return this._federationReissueChallengeStore.consume(params);
       },
       federationPosture: () => this.buildFederationPostureSummary(),
+      // DEFAULT-OFF: returns null unless the operator has opted in via
+      // setFederationGuardianRevocationRequirement. When null the revoke handler
+      // skips the guardian gate entirely (legacy single-operator path).
+      requireGuardianRevocationSignOff: () =>
+        this._federationGuardianRevocationRequirement,
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);
