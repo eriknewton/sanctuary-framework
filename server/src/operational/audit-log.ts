@@ -1700,7 +1700,7 @@ export class AuditLog {
     // backed by the streaming verifier so it shares ONE verification path with
     // {@link streamVerifiedChain}. Long-running daemon hot paths (transparency
     // emit, against-log recount, workload replay) call streamVerifiedChain
-    // directly so the whole decrypted chain is never resident at once — that is
+    // directly so the whole decrypted chain is never resident at once; that is
     // the daemon-OOM-on-a-large-log fix. This array variant is retained for
     // tests and any caller that legitimately wants the materialized view.
     const view: Array<VerifiedChainItem> = [];
@@ -1717,9 +1717,9 @@ export class AuditLog {
 
   /**
    * Streaming verified view of the surviving hash chain. Runs the SAME strict
-   * chain verification as {@link verifiedChainView} — it throws
-   * `AuditIntegrityError` (in strict mode) on a chain that does not verify, so a
-   * transparency checkpoint is never minted over a tampered log — but hands each
+   * chain verification as {@link verifiedChainView} (it throws
+   * `AuditIntegrityError` in strict mode on a chain that does not verify, so a
+   * transparency checkpoint is never minted over a tampered log), but hands each
    * chained entry to `consumer.onEntry` in ascending chain-sequence order and
    * then RELEASES it. The full decrypted chain is never simultaneously resident,
    * so a large on-disk log no longer allocates its whole multi-GB decrypted
@@ -2379,20 +2379,20 @@ export class AuditLog {
    *
    * Memory contract (the daemon-OOM-on-a-large-log fix): the full decrypted
    * chain is NEVER simultaneously resident. Each chained entry is decrypted to
-   * (a) prove it decrypts — the `entry_decrypt_failed` integrity check — and
+   * (a) prove it decrypts (the `entry_decrypt_failed` integrity check) and
    * (b) be handed to the streaming `consumer` when one drives this pass, OR slid
    * into the bounded recent-entry window otherwise; either way the decrypted
    * payload is then released. The full-chain structures we retain
-   * (`chainedEntries`, `legacyKeyHashes`, `this.chainEntries`) carry only cheap
-   * envelope metadata — sequence, entry_hash, prev_hash, key — so a large
-   * on-disk log no longer allocates its whole multi-GB decrypted payload set per
-   * reload. Verification coverage is unchanged: every entry is still decrypted,
-   * hash-checked, chain-walked, and anchor/checkpoint-covered exactly as before.
+   * (`chainedEntries`, `legacyRawEntries`, `this.chainEntries`) carry only cheap
+   * envelope / raw-byte metadata (sequence, entry_hash, prev_hash, key), so a
+   * large on-disk log no longer allocates its whole multi-GB decrypted payload
+   * set per reload. Verification coverage is unchanged: every entry is still
+   * decrypted, hash-checked, chain-walked, and anchor/checkpoint-covered.
    *
    * When a `consumer` is supplied (transparency emitter / against-log recount /
    * workload replay) each decrypted chained entry streams to it in ascending
-   * chain-sequence order — listing order is sequence order because keys carry a
-   * zero-padded sequence, the same invariant the chain walk already relies on —
+   * chain-sequence order (listing order is sequence order because keys carry a
+   * zero-padded sequence, the same invariant the chain walk already relies on)
    * and the non-streaming window is left untouched for the other callers. The
    * chain is still verified AFTER the decrypt loop; in strict mode any tamper
    * finding makes the caller throw `AuditIntegrityError`, discarding whatever the
@@ -2403,7 +2403,7 @@ export class AuditLog {
     consumer?: VerifiedChainConsumer
   ): Promise<void> {
     const findings: AuditIntegrityFinding[] = [];
-    // Cheap full-chain metadata only — no decrypted payloads retained here.
+    // Cheap full-chain metadata only; no decrypted payloads retained here.
     const legacyRawEntries: Array<{ key: string; raw: Uint8Array }> = [];
     const chainedEntries: Array<{
       key: string;
@@ -2413,7 +2413,7 @@ export class AuditLog {
     // non-streaming callers (query / posture / append). Only the newest
     // `maxInMemoryEntries` decrypted entries are kept; older payloads are dropped
     // as the window slides, so a large chain never materializes its full
-    // decrypted set. A streaming `consumer` keeps NO window — it already received
+    // decrypted set. A streaming `consumer` keeps NO window; it already received
     // every chained entry in order.
     const windowCap = this.maxInMemoryEntries;
     const recentEntries: AuditEntry[] = [];
@@ -2428,8 +2428,8 @@ export class AuditLog {
       // Trim the OLDEST entries from the front in lockstep with their aligned
       // chained twins (legacy entries, which have no chained twin, are dropped
       // first) so `recentEntries.length - recentChained.length` stays equal to
-      // the surviving legacy count — the same alignment invariant the append
-      // path's trimInMemoryRetention preserves.
+      // the surviving legacy count (the same alignment invariant the append
+      // path's trimInMemoryRetention preserves).
       const overflow = recentEntries.length - windowCap;
       if (overflow > 0) {
         const legacyResident = recentEntries.length - recentChained.length;
@@ -2536,7 +2536,7 @@ export class AuditLog {
           // decrypted entry only slides into the bounded window. Legacy entries
           // carry no chained (sequence, entry_hash) pair and the streaming
           // consumers operate on the chained region only, so a legacy entry is
-          // never streamed — the legacy region's coverage is attested by the
+          // never streamed; the legacy region's coverage is attested by the
           // legacy anchor, not by these decrypted payloads.
           legacyRawEntries.push({ key: meta.key, raw });
           pushWindow(entry, null);
@@ -2592,7 +2592,7 @@ export class AuditLog {
 
       // Serve the bounded recent-entry window built during the streaming decrypt
       // above (NOT the full decrypted chain). When a streaming consumer drove
-      // this pass, both window arrays are empty by design — the consumer already
+      // this pass, both window arrays are empty by design: the consumer already
       // received every chained entry in order, and the non-streaming window is
       // left to the query / posture / append callers. The full-chain integrity
       // invariants are unaffected: the chain head (`nextSequence` /
@@ -2625,7 +2625,7 @@ export class AuditLog {
       // The reload now keeps only the bounded recent-entry WINDOW resident (the
       // splice in pushWindow slid it during the streaming decrypt), so a large
       // on-disk log no longer materializes its full multi-GB decrypted payload
-      // set per reload — that was the daemon-OOM-on-a-large-log amplification.
+      // set per reload; that was the daemon-OOM-on-a-large-log amplification.
       // `verifiedChainView()` / `streamVerifiedChain()` STREAM the full surviving
       // chain from disk one decrypted entry at a time, so the transparency Merkle
       // root, the against-log recount, and workload replay still cover the
