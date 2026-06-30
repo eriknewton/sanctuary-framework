@@ -160,30 +160,31 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("GET / serves the posture board shell WITHOUT a token (real auth path)", async () => {
-    // The one-surface correction flips the default page at `/` to the posture
-    // board (the same shell `/posture` serves), even with v1.1 bindings wired.
-    // This rig sets a real `auth_token`, so this exercises the PRODUCTION auth
-    // path (not an auth-disabled rig): the static shell carries no posture data
-    // and must be served WITHOUT a bearer, while its `/api/posture/*` data
-    // fetches stay behind checkAuth (asserted by the 401 test below). The v1.1
-    // SPA is preserved at /dashboard and /v1.1 (asserted below).
+  it("GET / serves the v1.1 concierge as the single default surface (default-flip 2026-06-30)", async () => {
+    // Default-flip: `/` now serves the v1.1 concierge SPA, NOT the separate
+    // posture board shell. This is the "ONE SURFACE" requirement: the concierge
+    // is the default landing on a bare standalone dashboard boot, and the
+    // posture data is folded INTO it (the seal expands to full posture detail;
+    // a Posture entry lives in the Verify group). The SPA is served tokenless
+    // (it runs its own client-side auth dance), exactly like /dashboard + /v1.1.
     const res = await fetch(`${rig.baseUrl}/`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    // Posture-board marker: the shell fetches the posture API client-side. It is
-    // NOT the v1.1 SPA (which mounts on #main / #fortress).
-    expect(html).toContain("/api/posture/home");
-    expect(html).not.toContain('id="fortress"');
+    // Concierge SPA markers: the v1.1 shell mounts on #main and carries the
+    // Talk hero + grouped sidebar. It is NOT the standalone posture board shell
+    // (which would fetch /api/posture/home directly from its own static page).
+    expect(html).toContain('id="main"');
+    expect(html).toContain("nav-talk");
+    // The folded-in Posture entry is reachable from the single surface.
+    expect(html).toContain('data-route="posture"');
   });
 
-  it("GET / and GET /posture are ONE surface under real auth (byte-for-byte, no token)", async () => {
-    // Delta Review A3 remediation: `/` and `/posture` must serve the SAME shell
-    // under the SAME auth posture. Before the fix `/` was unauthenticated while
-    // `/posture`'s HTML sat behind checkAuth, so the equivalence only held when
-    // a test rig disabled auth. With a real `auth_token` set, BOTH paths must
-    // answer 200 with the identical shell to an UNAUTHENTICATED caller.
+  it("GET / (concierge) and GET /posture (board) are now DISTINCT surfaces", async () => {
+    // The posture data is folded INTO the concierge, but the standalone posture
+    // board is PRESERVED at /posture (a frozen surface, never blind-deleted).
+    // So `/` and `/posture` now serve DIFFERENT HTML: `/` is the concierge SPA;
+    // `/posture` is the posture board shell that fetches /api/posture/home.
     const [rootRes, postureRes] = await Promise.all([
       fetch(`${rig.baseUrl}/`),
       fetch(`${rig.baseUrl}/posture`),
@@ -194,8 +195,11 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
       rootRes.text(),
       postureRes.text(),
     ]);
-    expect(rootBody).toBe(postureBody);
-    expect(rootBody).toContain("/api/posture/home");
+    expect(rootBody).not.toBe(postureBody);
+    // `/` is the concierge SPA.
+    expect(rootBody).toContain('id="main"');
+    // `/posture` is the preserved posture board shell.
+    expect(postureBody).toContain("/api/posture/home");
   });
 
   it("the posture shell's data routes stay behind auth (401 without a token)", async () => {

@@ -78,7 +78,14 @@ const state = {
   // (#828). castleWallArmState drives the seal color; NEVER green-on-presence.
   // null until first load; load failure leaves it null and the seal reads
   // "Unknown / Attention", never a fabricated "Protected".
-  posture: { data: null, error: null, sealOpen: false },
+  //
+  // home / homeError (2026-06-30 one-surface fold): the full posture-home
+  // payload from GET /api/posture/home (metric cards, today's story, anomaly
+  // findings, per-agent rows). Reuses the EXISTING posture data endpoint - the
+  // Posture screen folded into this single surface renders from this, and links
+  // out to the per-agent drill-down (/posture/agent/:id) and the evidence view
+  // (/posture/evidence). storyPlain toggles the plain-language story summary.
+  posture: { data: null, error: null, sealOpen: false, home: null, homeError: null, storyPlain: false },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
   },
@@ -614,7 +621,12 @@ function renderPostureSeal() {
       '<span class="pp-k">' + escHtml(l.k) + '</span>' +
       '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
   }).join("");
-  popEl.innerHTML = '<h4>' + escHtml(head) + '</h4><p class="pp-sub">' + escHtml(sub) + '</p>' + lines;
+  // One-surface fold: the seal expands to a "See full posture detail" link that
+  // routes into the Posture screen (the folded-in metric cards, today's story,
+  // anomaly findings, and per-agent drill-down). data-seal keeps the click
+  // inside the seal so the outside-click dismiss does not fire first.
+  const more = '<a class="pp-more" href="#posture" data-action="posture-detail-open">See full posture detail</a>';
+  popEl.innerHTML = '<h4>' + escHtml(head) + '</h4><p class="pp-sub">' + escHtml(sub) + '</p>' + lines + more;
 }
 
 // Per-route cache of the last HTML written to #main. Used by renderMain
@@ -689,6 +701,7 @@ function renderMain() {
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
     case "activity": nextHtml = renderActivityScreen(); break;
+    case "posture": nextHtml = renderPostureScreen(); break;
     case "agents": nextHtml = renderAgentsList(); break;
     case "agent-detail": nextHtml = renderAgentDetail(); break;
     case "policy": nextHtml = renderPolicyCenter(); break;
@@ -2513,6 +2526,136 @@ function renderActivityScreen() {
   ].join("");
 }
 
+// ── Posture screen (one-surface fold, 2026-06-30) ───────────────────────
+// The full posture detail folded into the single default surface. Reuses the
+// EXISTING /api/posture/* data (state.posture.home, fetched by fetchPostureHome)
+// and renders the same evidence the standalone posture board showed: the six
+// metric cards (Protection Requested, Enforcement Confirmed, Castle Wall,
+// Approvals Waiting, Open Anomalies, Audit Chain), Today's Story with the
+// plain-summary toggle, the Anomaly Findings list, and the per-agent rows that
+// link out to the per-agent drill-down (/posture/agent/:id) and the Evidence
+// view (/posture/evidence). HONESTY: Castle Wall reads green only on an "armed"
+// arm-state; each agent reads green only on confirmed live enforcement; the
+// audit chain reads VERIFIED only when chain_verified is true. Named layers
+// only (no L-numbers); no em-dashes in user-visible copy.
+function postureWallLabel(armState) {
+  if (armState === "armed") return { cls: "pill tone-verified", text: "Enforcing" };
+  if (armState === "degraded") return { cls: "pill tone-degraded", text: "Degraded" };
+  if (armState === "not_installed") return { cls: "pill", text: "Not installed" };
+  if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
+  return { cls: "pill", text: "Unknown" };
+}
+function postureMetricCard(value, label) {
+  return '<div class="posture-metric"><span class="pm-v">' + value + '</span><span class="pm-l">' + escHtml(label) + '</span></div>';
+}
+function renderPostureStory(d) {
+  if (state.posture.storyPlain) {
+    const chainText = d.chain_verified
+      ? "The audit log verified clean: no tampering."
+      : "The audit log is unverified: " + escHtml(d.integrity_finding_count) + " integrity finding(s).";
+    return '<p>Today your agents ran <strong>' + escHtml(d.total_operations) +
+      '</strong> operations in the last 24h. Sanctuary blocked <strong>' + escHtml(d.kernel_blocks) +
+      '</strong> outbound connections and allowed <strong>' + escHtml(d.kernel_allows) +
+      '</strong>. You denied <strong>' + escHtml(d.approvals_denied) +
+      '</strong> approvals and granted <strong>' + escHtml(d.approvals_granted) +
+      '</strong>. ' + chainText + '</p>';
+  }
+  const lines = [
+    '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h.',
+    '<strong>' + escHtml(d.kernel_blocks) + '</strong> outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
+    '<strong>' + escHtml(d.approvals_denied) + '</strong> approvals denied, ' + escHtml(d.approvals_granted) + ' granted by you.',
+    d.chain_verified
+      ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
+      : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>'
+  ];
+  return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
+}
+function renderPostureAnomalies(findings) {
+  if (!findings || !findings.length) {
+    return '<p class="muted">No open anomaly findings.</p>';
+  }
+  return findings.map(function (f) {
+    return '<div class="story-line"><span class="pill tone-degraded">' + escHtml(f.severity || "finding") + '</span> ' +
+      escHtml(f.summary || f.detector_id || f.finding_id || "anomaly") + '</div>';
+  }).join("");
+}
+function renderPostureAgentRows(home) {
+  const rows = (home.agents || []);
+  if (!rows.length) return '<p class="muted">No protected agents yet.</p>';
+  return rows.map(function (a) {
+    // HONEST per-agent pill (#634): green ONLY on confirmed live enforcement;
+    // amber on policy-only protection; never machine-arm bleed-through.
+    var pill;
+    if (a.enforcement_active === "active") pill = '<span class="pill tone-verified">Enforcing</span>';
+    else if (a.policy_protected) pill = '<span class="pill tone-degraded">Protection requested</span>';
+    else pill = '<span class="pill">Not protected</span>';
+    const drill = "/posture/agent/" + encodeURIComponent(a.agent_id);
+    return '<div class="row">' +
+      '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong> ' + pill +
+      '<div class="muted mono">' + escHtml(a.harness) + ' &middot; status ' + escHtml(a.status) + '</div></div>' +
+      '<a class="btn" href="' + drill + '">View posture</a>' +
+      '</div>';
+  }).join("");
+}
+function renderPostureScreen() {
+  const home = state.posture.home;
+  const head =
+    '<div class="page-head"><div>' +
+      '<p class="eyebrow">Posture</p>' +
+      '<h1>How safe you are right now.</h1>' +
+      '<p class="sub">The full posture detail, on this one surface. Castle Wall reads protected only on a fresh enforcement check. Every number traces to your signed audit trail.</p>' +
+    '</div></div>';
+  if (!home) {
+    const why = state.posture.homeError
+      ? 'Could not load posture detail (' + escHtml(state.posture.homeError) + '). The data routes stay behind your operator token.'
+      : 'Loading posture detail.';
+    return '<section class="concierge-wrap">' + head +
+      '<section class="card"><p class="muted">' + why + '</p></section>' +
+      '</section>';
+  }
+  const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
+  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
+  const findings = home.anomaly_findings || [];
+  const chainPill = home.digest && home.digest.chain_verified
+    ? '<span class="pill tone-verified">Verified</span>'
+    : '<span class="pill tone-locked">Unverified</span>';
+  const metricCards =
+    '<div class="posture-metrics">' +
+      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested") +
+      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed") +
+      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall") +
+      postureMetricCard(escHtml(pending), "Approvals waiting") +
+      postureMetricCard(escHtml(findings.length), "Open anomalies") +
+      postureMetricCard(chainPill, "Audit chain") +
+    '</div>';
+  const storyToggle =
+    '<label class="story-toggle"><input type="checkbox" data-action="posture-story-plain"' +
+    (state.posture.storyPlain ? ' checked' : '') + '> Plain summary</label>';
+  return [
+    '<section class="concierge-wrap">',
+      head,
+      '<section class="card">',
+        '<h3>At a glance</h3>',
+        metricCards,
+        '<p class="muted">Machine: ' + escHtml(home.origin_machine || "(local)") + '</p>',
+      '</section>',
+      '<section class="card">',
+        '<div class="card-head-row"><h3>Today&#39;s story</h3>' + storyToggle + '</div>',
+        renderPostureStory(home.digest || {}),
+        '<div class="evidence"><a href="/posture/evidence">Open the Evidence view</a></div>',
+      '</section>',
+      '<section class="card">',
+        '<h3>Anomaly findings</h3>',
+        renderPostureAnomalies(findings),
+      '</section>',
+      '<section class="card">',
+        '<h3>Per-agent posture (' + (home.agents || []).length + ')</h3>',
+        renderPostureAgentRows(home),
+      '</section>',
+    '</section>'
+  ].join("");
+}
+
 // ── Hub API actions ────────────────────────────────────────────────────
 async function fetchAll() {
   try {
@@ -2555,6 +2698,7 @@ async function fetchAll() {
   await fetchIntelligenceState();
   await fetchHoneypotState();
   await fetchSovereignty();
+  await fetchPostureHome();
   // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
   // The direct-agent surface was removed; the inspect panel is fetched
   // lazily on click rather than maintained in state.
@@ -2598,6 +2742,48 @@ async function fetchSovereignty() {
   } catch (e) {
     state.posture.data = null;
     state.posture.error = e && e.message ? e.message : String(e);
+  }
+}
+
+// One-surface fold (2026-06-30): hydrate the full posture detail folded into
+// this surface. Reuses the EXISTING posture data endpoints, never a duplicate:
+// GET /api/posture/home (the same buildHome payload the /posture board renders -
+// metric cards, today's story digest, per-agent rows) and GET
+// /api/anomaly/findings (the open anomaly list). Both are GET reads behind the
+// SAME read-auth contract as the rest of the surface (the operator bearer from
+// sessionStorage when set; on a local bind the server may grant a loopback read
+// without a token, exactly as the other GET reads do). These are READS only; no
+// approve/deny or mutation is issued here. A read failure leaves
+// state.posture.home null and the Posture screen shows an honest "could not
+// load" state, never fabricated data.
+async function fetchPostureHome() {
+  const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  try {
+    const res = await fetch("/api/posture/home?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    if (!res.ok || !body || body.error) {
+      state.posture.home = null;
+      state.posture.homeError = (body && body.error) || ("HTTP " + res.status);
+    } else {
+      // Anomaly findings come from the dedicated endpoint; tolerate its absence
+      // (a fortress with no anomaly detector wired) without failing the screen.
+      let findings = [];
+      try {
+        const ar = await fetch("/api/anomaly/findings?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+        if (ar.ok) {
+          const ab = await ar.json();
+          findings = (ab && ab.findings) || [];
+        }
+      } catch (e) { findings = []; }
+      body.anomaly_findings = findings;
+      state.posture.home = body;
+      state.posture.homeError = null;
+    }
+  } catch (e) {
+    state.posture.home = null;
+    state.posture.homeError = e && e.message ? e.message : String(e);
   }
 }
 
@@ -3056,6 +3242,21 @@ document.addEventListener("click", function (ev) {
     state.posture.sealOpen = !state.posture.sealOpen;
     state.agentScope.switcherOpen = false;
     return renderTopbar();
+  }
+  // One-surface fold: the seal click-to-expand routes into the full Posture
+  // screen (the folded-in posture detail). Closes the popover and navigates.
+  if (action === "posture-detail-open") {
+    ev.preventDefault();
+    state.posture.sealOpen = false;
+    setRoute("posture");
+    location.hash = "#posture";
+    renderTopbar();
+    return;
+  }
+  // Today's Story plain-summary toggle on the Posture screen.
+  if (action === "posture-story-plain") {
+    state.posture.storyPlain = !state.posture.storyPlain;
+    return rerender();
   }
   if (action === "intel-reload") { return void fetchIntelligenceState().then(rerender); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);

@@ -1517,10 +1517,16 @@ describe("Principal Dashboard", () => {
     });
   });
 
-  // ── One-surface root-flip (Piece C) ─────────────────────────────────
-
-  describe("Root-flip: posture board served at /", () => {
-    it("GET / serves the posture board HTML (the one posture surface)", async () => {
+  // ── One-surface default-flip fallback (Piece C) ─────────────────────
+  //
+  // Default-flip (2026-06-30): when v1.1 bindings are wired (the production
+  // standalone dashboard ALWAYS wires them), `/` serves the v1.1 concierge as
+  // the single default surface (proven in test/dashboard/v1_1-routing.test.ts).
+  // This rig boots a bare DashboardApprovalChannel with NO v1.1 bindings, so
+  // there is no concierge to serve and `/` keeps serving the posture board as
+  // the honest fallback rather than 404ing. These tests pin THAT fallback.
+  describe("Default-flip fallback: posture board served at / without v1.1 bindings", () => {
+    it("GET / serves the posture board HTML (no-bindings fallback)", async () => {
       const res = await fetch(`http://127.0.0.1:${port}/`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/html");

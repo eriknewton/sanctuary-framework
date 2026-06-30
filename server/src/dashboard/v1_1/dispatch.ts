@@ -221,12 +221,15 @@ export async function dispatchV11Request(
 ): Promise<boolean> {
   const { bindings, authToken, loopbackAutoAuth } = inputs;
 
-  // v1.1 dashboard HTML at /dashboard and /v1.1 (and trailing slash). The
-  // bare root match remains for direct/back-compat helper callers, but both
-  // production dashboard routers now serve the posture shell at `/` before
-  // dispatch reaches this helper. Legacy v1.0 dashboard is preserved at
-  // /v1.0 by the legacy route tables in principal-policy/dashboard.ts and
-  // dashboard/api.ts; /v1.1 continues to serve operator bookmarks.
+  // v1.1 dashboard HTML at `/` (the single default surface), /dashboard, and
+  // /v1.1 (and trailing slash). Default-flip (2026-06-30): `/` now serves the
+  // v1.1 concierge here. Both production dashboard routers
+  // (principal-policy/dashboard.ts and dashboard/api.ts) NO LONGER serve the
+  // posture shell at `/`; they let `/` fall through to this helper, while the
+  // posture shell is preserved at `/posture` and folded into the concierge (the
+  // posture seal expands to full detail; a Posture entry lives in the Verify
+  // group). Legacy v1.0 dashboard is preserved at /v1.0 by the legacy route
+  // tables in those two routers; /v1.1 continues to serve operator bookmarks.
   if (
     method === "GET" &&
     (url.pathname === "/" ||

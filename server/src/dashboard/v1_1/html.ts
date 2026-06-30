@@ -1364,6 +1364,33 @@ body {
 .posture-seal-pop .pp-dot.off { background: var(--ink-4); }
 .posture-seal-pop .pp-k { color: var(--ink-2); }
 .posture-seal-pop .pp-v { margin-left: auto; font-family: var(--mono); font-size: var(--text-xs); color: var(--ink-3); }
+.posture-seal-pop .pp-more {
+  display: inline-block; margin-top: 10px; font-size: var(--text-sm);
+  color: var(--indigo); text-decoration: none;
+}
+.posture-seal-pop .pp-more:hover { text-decoration: underline; }
+
+/* Posture screen (one-surface fold): the full posture detail folded in. */
+.posture-metrics {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px; margin: 8px 0 4px;
+}
+.posture-metric {
+  display: flex; flex-direction: column; gap: 4px; padding: 12px;
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2);
+}
+.posture-metric .pm-v { font-size: var(--text-xl); font-family: var(--serif); }
+.posture-metric .pm-l {
+  font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--text-sm); user-select: none; }
+.story-toggle input { margin: 0; }
+.story-line { margin: 4px 0; }
+.evidence { margin-top: 8px; font-size: var(--text-sm); }
+.evidence a { color: var(--indigo); text-decoration: none; }
+.evidence a:hover { text-decoration: underline; }
 
 /* Spine: the promoted concierge hero. The center column gets the air;
  * the page-head display headline is the one display moment per screen. */
@@ -1480,6 +1507,11 @@ const NAV_GROUPS: Array<{ label: string; items: Array<{ id: string; label: strin
     label: "Verify",
     items: [
       { id: "activity", label: "Activity" },
+      // Posture: the full posture detail (metric cards, today's story, anomaly
+      // findings, per-agent drill-down, evidence view) folded into the single
+      // surface. Reuses the existing /api/posture/* data endpoints; the seal in
+      // the top bar also expands into this same screen.
+      { id: "posture", label: "Posture" },
       { id: "attestation", label: "Attestation" },
       { id: "health", label: "Health" },
     ],
@@ -1515,6 +1547,8 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<path d="M3 12V4l5-2 5 2v8l-5 2z"/><path d="M8 5v3l2 1"/>',
   activity:
     '<path d="M1.5 8h3l2-5 3 10 2-5h3"/>',
+  posture:
+    '<path d="M8 1.5l5 2v4.5c0 3.1-2.1 5.2-5 6.5-2.9-1.3-5-3.4-5-6.5V3.5z"/><path d="M5.8 8l1.6 1.6L10.4 6"/>',
   talk:
     '<path d="M2 3.5h12v7H8l-3 3v-3H2z"/>',
   intelligence:

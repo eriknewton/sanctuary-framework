@@ -1432,40 +1432,45 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * One-surface root-flip: the posture board is the default page served at BOTH
-   * `/` and `/posture`.
+   * One-surface default-flip: the v1.1 concierge is the single default page at
+   * `/`; the posture board is preserved at the `/posture` alias and is folded
+   * INTO the concierge (the seal expands to full posture detail; a Posture entry
+   * lives in the Verify group). Nothing is lost: every byte of posture evidence
+   * is reachable from the one default surface.
    *
-   * Serves the posture-home HTML shell (`renderPostureHomeHTML`) byte-for-byte
-   * identically on the root path and the `/posture` alias. This is the one
-   * posture surface the embedded native web view and any browser both land on.
+   * Operator directive (2026-06-30): "New design should be the default, but the
+   * posture data should be incorporated into the new design somewhere. ONE
+   * SURFACE." Before this change `/` served the SEPARATE `renderPostureHomeHTML`
+   * shell while the concierge lived only at `/dashboard` and `/v1.1`, so there
+   * were two surfaces and the new design was not the default. The fix flips `/`
+   * to the concierge by NO LONGER owning `/` here; the bare-root request now
+   * falls through to the v1.1 dispatch ladder (which already serves the
+   * concierge at `/`). The posture board stays one click away at `/posture`.
    *
-   * Auth contract (Delta Review A3 remediation): the shell is a STATIC page that
-   * carries no posture data - it negotiates its own auth client-side (loopback
-   * auto-auth or a pasted bearer) and fetches `/api/posture/*` for every byte of
-   * evidence, and those JSON routes stay behind `checkAuth`. So the shell itself
-   * is served WITHOUT a server-side auth gate, identically on `/` and
-   * `/posture`. Previously `/` was served here (unauthenticated) while
-   * `/posture`'s HTML was served by the posture router AFTER `checkAuth`, so the
-   * two surfaces had divergent auth contracts and were only "equivalent" when
-   * the test rig disabled auth. Serving both here, before the auth gate, makes
-   * them genuinely one surface under the real production auth posture. The
-   * `/posture` HTML branch was removed from {@link handlePostureRoute}
-   * accordingly (it would now be unreachable); the data routes it owns are
-   * unchanged.
+   * Auth contract (Delta Review A3 remediation), preserved for `/posture`: the
+   * posture shell is a STATIC page that carries no posture data - it negotiates
+   * its own auth client-side (loopback auto-auth or a pasted bearer) and fetches
+   * `/api/posture/*` for every byte of evidence, and those JSON routes stay
+   * behind `checkAuth`. So the `/posture` shell is served WITHOUT a server-side
+   * auth gate, before the auth gate, exactly as before. The `/posture` HTML
+   * branch was removed from {@link handlePostureRoute} accordingly (it would now
+   * be unreachable); the data routes it owns are unchanged.
    *
-   * Scope: this matches ONLY the bare root path (`/`) and the `/posture` alias.
-   * `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`, `/posture/agent/:id`, and every
-   * `/api/*` route (including the approval channel and the posture JSON API) are
-   * untouched and keep their existing handlers and auth gates.
+   * Scope: this now matches ONLY the `/posture` alias (plus the v1.1 SPA aliases
+   * `/dashboard`, `/v1.1`, which it falls through for). `/`, `/v1.0`,
+   * `/fortress`, `/posture/agent/:id`, and every `/api/*` route (including the
+   * approval channel and the posture JSON API) are untouched and keep their
+   * existing handlers and auth gates.
    *
    * Surface scope: this standalone `DashboardApprovalChannel` owns live approval
    * decisions. The SEPARATE co-located `wrap` server (`dashboard/api.ts`, the
-   * `sanctuary wrap` / "Protect" HTTP server) performs its own fold: `/` and
-   * `/posture` serve the posture shell, `/api/posture/*` stays behind read auth,
-   * and `/dashboard` + `/v1.1` remain v1.1 compatibility aliases.
+   * `sanctuary wrap` / "Protect" HTTP server) performs the SAME default-flip: `/`
+   * serves the concierge, `/posture` serves the posture shell, `/api/posture/*`
+   * stays behind read auth, and `/dashboard` + `/v1.1` remain v1.1 aliases.
    *
    * Returns true when it served the posture board shell; false to fall through
-   * to the existing v1.1 / legacy dispatch ladder.
+   * to the existing v1.1 / legacy dispatch ladder (which serves the concierge at
+   * `/`).
    */
   private dispatchRootPosture(
     req: IncomingMessage,
@@ -1474,15 +1479,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     method: string,
   ): boolean {
     // The SPA view routes whose static shell fetches its data client-side from
-    // checkAuth-gated JSON routes: the posture shell (`/`, `/posture`) and the
-    // v1.1 dashboard SPA aliases (`/dashboard`, `/v1.1`).
+    // checkAuth-gated JSON routes: the posture shell (`/posture`) and the v1.1
+    // dashboard SPA aliases (`/dashboard`, `/v1.1`). NOTE (default-flip): `/` is
+    // NO LONGER a posture-shell path - it falls through to the v1.1 concierge.
+    const isRoot = url.pathname === "/";
+    // default-flip: when v1.1 bindings are wired (the production standalone
+    // dashboard ALWAYS wires them), `/` serves the v1.1 concierge - so `/`
+    // falls through to the v1.1 dispatch ladder and is treated here ONLY for the
+    // remote-login affordance below. When v1.1 bindings are ABSENT (a degenerate
+    // bare DashboardApprovalChannel, e.g. an isolated unit-test rig), there is
+    // no concierge to fall through to, so `/` keeps serving the posture board
+    // shell as the honest fallback rather than 404ing.
+    const isRootServedAsShell = isRoot && !this.v11Bindings;
     const isPostureShellPath =
-      url.pathname === "/" || url.pathname === POSTURE_HOME_PATH;
+      url.pathname === POSTURE_HOME_PATH || isRootServedAsShell;
     const isV11SpaAlias =
       url.pathname === "/dashboard" ||
       url.pathname === "/v1.1" ||
       url.pathname === "/v1.1/";
-    if (method !== "GET" || (!isPostureShellPath && !isV11SpaAlias)) {
+    if (method !== "GET" || (!isPostureShellPath && !isV11SpaAlias && !isRoot)) {
       return false;
     }
 
@@ -3367,13 +3382,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     _selfOrigin: string,
   ): void {
     // One-surface root-flip: the posture board is the default page at `/` AND
-    // its `/posture` alias. Intercepted here, BEFORE the v1.1 SPA dispatch
-    // (which previously owned `/`), the auth gate, and the legacy route table,
-    // so both paths serve the one unauthenticated static shell under the same
-    // auth contract (the shell's data fetches stay behind checkAuth). Matches
-    // ONLY `/` and `/posture` - `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
-    // `/posture/agent/:id`, and every `/api/*` route (the approval channel and
-    // the posture JSON API included) fall through untouched.
+    // its `/posture` alias. Intercepted here, BEFORE the v1.1 SPA dispatch and
+    // the legacy route table, so `/posture` serves the one unauthenticated
+    // static posture shell under the same auth contract (its data fetches stay
+    // behind checkAuth). NOTE (default-flip 2026-06-30): `/` is NO LONGER served
+    // here - it falls through to the v1.1 concierge below (the single default
+    // surface). `dispatchRootPosture` still owns `/` ONLY for the remote-login
+    // affordance (a remote unauthenticated browser gets a token box). Matches
+    // `/posture` for the shell; `/dashboard`, `/v1.0`, `/v1.1`, `/fortress`,
+    // `/posture/agent/:id`, and every `/api/*` route fall through untouched.
     if (this.dispatchRootPosture(req, res, url, method)) return;
 
     // Federation PR-A1: the additive /v1 API surface (RFC v7 session

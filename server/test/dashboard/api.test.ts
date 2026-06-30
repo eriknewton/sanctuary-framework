@@ -58,8 +58,9 @@ describe("Dashboard HTTP API", () => {
 
   it("serves the legacy hero HTML at /v1.0 (v1.1.7 path-flip)", async () => {
     // v1.1.7: legacy four-panel hero dashboard moved from `/` to `/v1.0`.
-    // Root serves the posture shell; /dashboard and /v1.1 are v1.1 SPA
-    // compatibility aliases when production wiring provides v11Bindings. This
+    // Default-flip (2026-06-30): root serves the v1.1 concierge (the single
+    // default surface) when production wiring provides v11Bindings; /posture
+    // serves the posture board; /dashboard and /v1.1 are v1.1 SPA aliases. This
     // rig boots without v11Bindings, so legacy serves at the new /v1.0 URL.
     handle = await startForTest();
     const res = await fetch(`${handle.url}/v1.0`);
