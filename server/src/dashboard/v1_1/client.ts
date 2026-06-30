@@ -2774,7 +2774,7 @@ async function fetchPostureHome() {
         const ar = await fetch("/api/anomaly/findings?_t=" + Date.now(), { headers: headers, cache: "no-store" });
         if (ar.ok) {
           const ab = await ar.json();
-          findings = (ab && ab.findings) || [];
+          findings = (ab && ab.data && ab.data.findings) || [];
         }
       } catch (e) { findings = []; }
       body.anomaly_findings = findings;
