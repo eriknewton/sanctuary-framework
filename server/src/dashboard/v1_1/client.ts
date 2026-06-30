@@ -463,7 +463,7 @@ function setRoute(route) {
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["activity", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
+  const fullRoutes = ["activity", "posture", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
   if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -2773,13 +2773,16 @@ async function fetchPostureHome() {
     } else {
       // Anomaly findings come from the dedicated endpoint; tolerate its absence
       // (a fortress with no anomaly detector wired) without failing the screen.
-      // Honesty (never-overclaim): a genuine fetch FAILURE (network throw or a
-      // 5xx server error) must NOT render as an affirmative "Open anomalies: 0" /
-      // "No open anomaly findings" - that conflates "the detector errored" with
-      // "genuinely zero", which is a soft overclaim on the posture surface. So we
-      // distinguish an UNKNOWN state (anomaly_findings_unknown) from a real zero.
-      // A 404 (or any 4xx) is treated as "not wired" = legitimately empty, per
-      // the tolerate-absence intent; only a throw or a 5xx reads as unknown.
+      // Honesty (never-overclaim): a genuine fetch FAILURE must NOT render as an
+      // affirmative "Open anomalies: 0" / "No open anomaly findings" - that
+      // conflates "the detector errored / auth failed" with "genuinely zero",
+      // which is a soft overclaim on the posture surface. So we distinguish an
+      // UNKNOWN state (anomaly_findings_unknown) from a real zero.
+      // The ONLY non-ok status that is a legitimate "not wired = empty" signal is
+      // 503 (anomaly_not_configured, emitted by dispatch when the anomaly binding
+      // is absent). Every other non-ok status - notably a 401 from an
+      // expired/missing bearer (the route returns 401, never 404, on auth
+      // failure) or any 5xx - is an honest UNKNOWN, never a confirmed clean zero.
       let findings = [];
       let anomalyUnknown = false;
       try {
@@ -2787,7 +2790,7 @@ async function fetchPostureHome() {
         if (ar.ok) {
           const ab = await ar.json();
           findings = (ab && ab.data && ab.data.findings) || [];
-        } else if (ar.status >= 500) {
+        } else if (ar.status !== 503) {
           anomalyUnknown = true;
         }
       } catch (e) { anomalyUnknown = true; }
