@@ -242,8 +242,10 @@ async function cmdCompile(
   ) {
     ctx.err.write(
       "LLM-assist requires intelligence substrate. " +
-        "Set SANCTUARY_PASSPHRASE and ensure intelligence is configured:\n" +
-        "  sanctuary intelligence configure --substrate local\n",
+        "Set SANCTUARY_PASSPHRASE, then pick a model in the dashboard " +
+        "Intelligence picker or set a substrate env var " +
+        "(OLLAMA_HOST for local, or VENICE_API_KEY / ANTHROPIC_API_KEY / " +
+        "OPENAI_API_KEY for a hosted model).\n",
     );
   }
 

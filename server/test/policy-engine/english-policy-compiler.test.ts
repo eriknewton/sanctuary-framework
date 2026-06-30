@@ -441,9 +441,13 @@ describe("Xi-1 — CLI subcommands", () => {
       expect(code).toBe(0);
       // Output should contain low confidence (no deterministic match, no LLM)
       expect(out.text).toContain("compile_confidence: low");
-      // Stderr should contain the improved message
+      // Stderr should contain the improved message and point to the REAL
+      // config path (the dashboard picker / env vars), not the removed
+      // `sanctuary intelligence configure` subcommand.
       expect(err.text).toContain("intelligence substrate");
-      expect(err.text).toContain("sanctuary intelligence configure");
+      expect(err.text).toContain("Intelligence picker");
+      expect(err.text).toContain("OLLAMA_HOST");
+      expect(err.text).not.toContain("sanctuary intelligence configure");
     } finally {
       if (savedPassphrase !== undefined) {
         process.env["SANCTUARY_PASSPHRASE"] = savedPassphrase;
