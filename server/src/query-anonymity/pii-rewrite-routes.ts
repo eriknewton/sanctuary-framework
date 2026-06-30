@@ -237,7 +237,27 @@ export async function handlePiiRewriteRoute(
     return false;
   }
 
-  const checkAuth = authMiddleware(deps.authConfig);
+  // DEFAULT-DENY on mutation (invariant 7, co-resident-agent threat): any
+  // non-GET method requires the operator bearer (`requireToken: true`), which
+  // suppresses the loopback auto-auth shortcut so a co-resident agent sharing
+  // loopback cannot mutate operator config by network position alone. This
+  // mirrors the per-router default-deny the other v1.1 routers already use
+  // (e.g. `intelligence-api-router.ts`: `requiresOperatorBearer = method !==
+  // "GET"`), replacing the prior flat `authMiddleware(authConfig)` that let
+  // loopback auto-auth release the `PATCH /config` mutation.
+  //
+  // SMALL EXPLICIT read-style EXEMPTION: `POST /pii/rewrite` is a STATELESS
+  // preview that runs the regex redactor over operator-supplied text and
+  // returns the result; it persists nothing and leaks no operator/fleet state,
+  // so it keeps loopback-readable convenience (no bearer required on loopback).
+  // The persisting sibling `PATCH /config` is NOT exempt — it is gated.
+  const isReadStylePreview =
+    method === "POST" && path === `${PII_REWRITE_API_PREFIX}/rewrite`;
+  const requiresOperatorBearer = method !== "GET" && !isReadStylePreview;
+  const checkAuth = authMiddleware(
+    deps.authConfig,
+    requiresOperatorBearer ? { requireToken: true } : undefined,
+  );
   if (!checkAuth(req, res, url)) return true;
 
   try {

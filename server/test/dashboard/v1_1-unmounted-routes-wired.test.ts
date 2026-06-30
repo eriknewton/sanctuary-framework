@@ -373,3 +373,175 @@ describe("wire-unmounted-routes — bindings absent: match-then-auth-then-503 (n
     expect(body.error).toBe("pii_rewrite_not_configured");
   });
 });
+
+describe("PII-rewrite v1.1 router — default-deny on non-GET mutation (co-resident threat)", () => {
+  // PRODUCTION path: when v1.1 bindings are wired, the PII Tier-B surface is
+  // served by `handlePiiRewriteRoute` (via dispatchV11), which used a FLAT
+  // `authMiddleware(authConfig)` for ALL methods. That let LOOPBACK auto-auth
+  // release the `PATCH /config` MUTATION without the operator bearer — a
+  // co-resident agent sharing loopback could flip operator PII config + consent
+  // by network position alone. These tests pin the inversion to DEFAULT-DENY:
+  // with loopback auto-auth ENABLED, a no-bearer loopback caller can still hit
+  // the GET read and the stateless POST /rewrite preview, but the PATCH /config
+  // mutation now REQUIRES the operator bearer.
+  let rig: TestRig;
+
+  beforeEach(async () => {
+    rig = await startRig();
+    // Simulate the native-app deployment: loopback auto-auth ON. This is the
+    // exact configuration under which the old flat gate leaked the mutation.
+    rig.dashboard.setAutoAuthLocalhost(true);
+  });
+
+  afterEach(async () => {
+    await rig.stop();
+  });
+
+  // ── GET read on loopback: auto-auth is sufficient (regression guard) ─────
+  it("GET pii/config on loopback with NO bearer REACHES the handler (auto-auth read still works)", async () => {
+    const res = await fetch(`${rig.baseUrl}${PII_REWRITE_API_PREFIX}/config`);
+    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(200);
+  });
+
+  // ── POST /rewrite on loopback: the read-style EXEMPTION holds ────────────
+  it("POST pii/rewrite on loopback with NO bearer REACHES the handler (stateless preview exempt)", async () => {
+    const res = await fetch(`${rig.baseUrl}${PII_REWRITE_API_PREFIX}/rewrite`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "contact me at jane@example.com" }),
+    });
+    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean };
+    expect(body.ok).toBe(true);
+  });
+
+  // ── PATCH /config on loopback: the MUTATION now requires the bearer ──────
+  it("PATCH pii/config on loopback with NO bearer is REJECTED (401) — default-deny closes the co-resident hole", async () => {
+    const res = await fetch(`${rig.baseUrl}${PII_REWRITE_API_PREFIX}/config`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+    // Was 200 under the flat gate (loopback auto-auth released the mutation);
+    // now 401 because requireToken suppresses the loopback shortcut.
+    expect(res.status).toBe(401);
+  });
+
+  it("PATCH pii/config WITH the operator bearer REACHES the handler (not 401/404)", async () => {
+    const res = await fetch(`${rig.baseUrl}${PII_REWRITE_API_PREFIX}/config`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${rig.authToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).not.toBe(401);
+    expect(res.status).not.toBe(404);
+  });
+});
+
+describe("legacy dispatcher — default-deny on non-GET mutation (allowlist inversion)", () => {
+  // NON-v1.1 path (dashboard-standalone / SEC-012 rig): with NO v1.1 bindings,
+  // the legacy dispatcher's gate is the active chokepoint. It used a 4-entry
+  // allowlist (`/api/approve/`, `/api/deny/`, `/api/sovereignty-profile`,
+  // `/api/proxy/servers`) and fell through to `{ allowSession: true }` for
+  // every OTHER non-GET route. These tests pin the inversion to DEFAULT-DENY: a
+  // valid SESSION is NOT sufficient for ANY non-GET mutation; the operator
+  // bearer is required; reads still work with a session.
+  const AUTH_TOKEN = `legacy-default-deny-${randomBytes(8).toString("hex")}`;
+  let dashboard: DashboardApprovalChannel;
+  let baseUrl: string;
+
+  // A minimal rig with NO v11Bindings so the legacy gate is the active path.
+  async function exchangeSession(): Promise<string> {
+    const res = await fetch(`${baseUrl}/auth/session`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { session_id: string };
+    return body.session_id;
+  }
+
+  beforeEach(async () => {
+    const port = await getFreePort();
+    dashboard = new DashboardApprovalChannel({
+      port,
+      host: "127.0.0.1",
+      timeout_seconds: 30,
+      auth_token: AUTH_TOKEN,
+      auto_open: false,
+    });
+    await dashboard.start();
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterEach(async () => {
+    await dashboard.stop();
+  });
+
+  // ── The 4 originally-allowlisted mutations stay gated against a session ──
+  it("POST /api/sovereignty-profile with a valid SESSION is REJECTED (401)", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(
+      `${baseUrl}/api/sovereignty-profile?session=${session}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /api/proxy/servers with a valid SESSION is REJECTED (401)", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(`${baseUrl}/api/proxy/servers?session=${session}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ servers: [] }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /api/approve/:id with a valid SESSION is REJECTED (401)", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(`${baseUrl}/api/approve/some-id?session=${session}`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /api/deny/:id with a valid SESSION is REJECTED (401)", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(`${baseUrl}/api/deny/some-id?session=${session}`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // ── A novel non-GET path (no allowlist entry) is gated by DEFAULT ───────
+  it("an arbitrary non-GET path with a SESSION is REJECTED (401) — default-deny, no allowlist edit needed", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(
+      `${baseUrl}/api/some-future-mutation?session=${session}`,
+      { method: "POST" },
+    );
+    // The OLD allowlist fell through to `{ allowSession: true }` here, so a
+    // session would have authenticated this un-listed mutation. Default-deny
+    // requires the bearer: 401 before any route match.
+    expect(res.status).toBe(401);
+  });
+
+  // ── GET read with a session still works (regression guard) ──────────────
+  it("GET /api/pending with a valid SESSION is authenticated (read routes unaffected)", async () => {
+    const session = await exchangeSession();
+    const res = await fetch(`${baseUrl}/api/pending?session=${session}`);
+    // Reaches the read handler (not the auth 401). The legacy /api/pending
+    // route serves with deps unset here, returning its empty-list shape.
+    expect(res.status).not.toBe(401);
+  });
+});
