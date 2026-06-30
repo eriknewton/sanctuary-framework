@@ -187,6 +187,20 @@ export async function runRestoreAttestCommand(
       );
       return 1;
     }
+    // A pre-mac legacy envelope (#496 backward-compat) has no policy MAC yet,
+    // so the strict verifyEnvelopeMac below would throw a misleading
+    // integrity error ("may have been tampered with or replaced") on a
+    // fortress that is merely pre-mac, not tampered. The mac re-stamp is owned
+    // by establishMaster (`sanctuary wrap`/MCP boot); route the operator there
+    // with a clear migrate-first message instead of into the integrity path.
+    if (envelope.needsMacMigration) {
+      err.write(
+        "This fortress is on a pre-upgrade (pre-mac) custody envelope; boot it once\n" +
+          "via `sanctuary wrap` (it migrates the envelope in place) and then retry\n" +
+          "`sanctuary restore-attest`.\n"
+      );
+      return 1;
+    }
 
     // Passphrase: env first, then prompt.
     let passphrase =

@@ -1308,12 +1308,23 @@ async function reWrapLegacyWrap(
 
 /**
  * Migrate a structurally-valid PRE-MAC legacy envelope (#496 backward-compat)
- * IN PLACE, now that the master has been unwrapped from it. This is the
- * upgrade-safety fix: an envelope written before the top-level `mac` and
- * per-wrap `id` fields existed must be ACCEPTED and re-stamped, NOT rejected
- * (the old `readCustodyEnvelope` bricked every pre-#496 fortress on first
- * boot after upgrade). Models the legacy-marker migration writes below: verify
- * the master against existing ciphertext, then write a MAC'd v:1 envelope.
+ * IN PLACE, now that the master has been unwrapped from it. A `v:1` envelope
+ * that lacks the top-level `mac` and per-wrap `id` fields is ACCEPTED and
+ * re-stamped here rather than rejected at read time.
+ *
+ * REACHABILITY (honest note, do not overclaim): the entire CustodyEnvelope
+ * shape (`v:1`, `install_mode`, `wraps`, `mac`, per-wrap `id`) was introduced
+ * together in #496, and `writeCustodyEnvelope` has computed the `mac` on every
+ * write since that commit. No released Sanctuary build is known to have written
+ * a mac-absent `v:1` envelope, so this branch is defense-in-depth for that
+ * never-observed shape, NOT a remedy for a confirmed field brick. Genuine
+ * pre-envelope (pre-#496) fortresses stored the master via legacy markers
+ * (`_meta/key-params`, `_meta/recovery-key-hash`) and migrate through the
+ * SEPARATE legacy-marker path below, never through this envelope branch. If an
+ * on-disk mac-absent corpus is ever observed in the wild, cite the sample here.
+ *
+ * Models the legacy-marker migration writes below: verify the master against
+ * existing ciphertext, then write a MAC'd v:1 envelope.
  *
  * HARD security invariants (fail closed):
  *  - SENTINEL PRESENT ⇒ a MAC'd envelope existed and its MAC was stripped:
