@@ -68,6 +68,17 @@ const state = {
   handoffEvents: [],
   honeypot: { toolTraps: [], credentialTraps: [], loadError: null },
   topbarPills: { deployment: "local", mode: "solo", attestation: "pending" },
+  // Wave 1 (2026-06-30): which protected agent the operator is steering.
+  // null means "All agents" (fortress-wide). Scopes the approvals queue +
+  // ambient posture readout. The conversation spine is fortress-wide today
+  // (the concierge reads fortress state), so the scope label is shown but
+  // the concierge thread is not re-queried per agent in wave 1.
+  agentScope: { selectedAgentId: null, switcherOpen: false },
+  // Wave 1: HONEST posture from the evidence-gated /api/sovereignty verdict
+  // (#828). castleWallArmState drives the seal color; NEVER green-on-presence.
+  // null until first load; load failure leaves it null and the seal reads
+  // "Unknown / Attention", never a fabricated "Protected".
+  posture: { data: null, error: null, sealOpen: false },
   tier1: {
     lockdown: { state: "idle", inboxItemId: null }
   },
@@ -445,7 +456,7 @@ function setRoute(route) {
   const app = document.getElementById("app");
   if (!app) return;
   app.setAttribute("data-route", route);
-  const fullRoutes = ["agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
+  const fullRoutes = ["activity", "agents", "policy", "auto-trigger", "intelligence", "honeypot", "privacy", "coordination", "health", "exit-drill", "agent-detail"];
   if (fullRoutes.indexOf(route) >= 0) app.classList.add("route-full");
   else app.classList.remove("route-full");
   document.querySelectorAll("#sidebar-nav a").forEach(function (a) {
@@ -509,6 +520,101 @@ function renderTopbar() {
   } else {
     btn.textContent = "Lockdown";
   }
+  renderAgentSwitcher();
+  renderPostureSeal();
+}
+
+// Wave 1 (2026-06-30): the top-bar agent switcher. Wired to the EXISTING
+// GET /api/hub/agents (state.agents, populated by the wrap command).
+// Selecting an agent sets state.agentScope.selectedAgentId, which scopes the
+// approvals queue (pendingApprovalItems) and the ambient posture readout.
+// "All agents" (null) is the fortress-wide default. The fortress (machine)
+// switcher is DEFERRED to wave 2; the existing "Fleet Switcher" deep-link
+// remains the cross-machine affordance for now.
+function agentScopeGlyph(agentId) {
+  if (!agentId) return "··";
+  const tail = String(agentId).split(":").pop() || "";
+  const cleaned = tail.replace(/[^a-zA-Z0-9]/g, "");
+  return (cleaned.slice(0, 2) || "··").toUpperCase();
+}
+function renderAgentSwitcher() {
+  const labelEl = document.getElementById("agent-switcher-label");
+  const glyphEl = document.getElementById("agent-switcher-glyph");
+  const menuEl = document.getElementById("agent-switcher-menu");
+  const trigger = document.getElementById("agent-switcher-trigger");
+  if (!labelEl || !glyphEl || !menuEl) return;
+  const selected = state.agentScope.selectedAgentId;
+  const selectedAgent = selected
+    ? state.agents.find(function (a) { return a.agent_id === selected; })
+    : null;
+  // If the selected agent disappeared from the registry, fall back to "All".
+  if (selected && !selectedAgent) state.agentScope.selectedAgentId = null;
+  const curLabel = state.agentScope.selectedAgentId || "All agents";
+  labelEl.textContent = curLabel;
+  glyphEl.textContent = agentScopeGlyph(state.agentScope.selectedAgentId);
+  const open = !!state.agentScope.switcherOpen;
+  menuEl.hidden = !open;
+  if (trigger) trigger.setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) return;
+  const allSelected = !state.agentScope.selectedAgentId;
+  const rows = ['<button type="button" class="agent-switcher-opt' + (allSelected ? ' selected' : '') +
+    '" data-action="agent-scope-select" data-agent-id="">' +
+    '<span class="opt-glyph">··</span>' +
+    '<span class="opt-name">All agents</span>' +
+    '<span class="opt-state">' + state.agents.length + ' wrapped</span>' +
+    '</button>'];
+  state.agents.forEach(function (a) {
+    const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
+    const isSel = a.agent_id === state.agentScope.selectedAgentId;
+    rows.push('<button type="button" class="agent-switcher-opt' + (isSel ? ' selected' : '') +
+      '" data-action="agent-scope-select" data-agent-id="' + escHtml(a.agent_id) + '">' +
+      '<span class="opt-glyph">' + escHtml(agentScopeGlyph(a.agent_id)) + '</span>' +
+      '<span class="opt-name">' + escHtml(a.agent_id) + '</span>' +
+      '<span class="opt-state">' + escHtml(map.label || "") + '</span>' +
+      '</button>');
+  });
+  menuEl.innerHTML = rows.join("");
+}
+
+// Wave 1 (2026-06-30): the posture seal. Honest verdict drives its color and
+// word (deriveSeal); the popover spells out the named layers (no L-numbers).
+function renderPostureSeal() {
+  const seal = deriveSeal();
+  const sealEl = document.getElementById("posture-seal");
+  const wordEl = document.getElementById("posture-seal-word");
+  const popEl = document.getElementById("posture-seal-pop");
+  if (!sealEl || !wordEl || !popEl) return;
+  sealEl.classList.remove("tone-protected", "tone-attention", "tone-locked");
+  if (seal.tone === "protected") sealEl.classList.add("tone-protected");
+  else if (seal.tone === "locked") sealEl.classList.add("tone-locked");
+  else if (seal.tone === "attention") sealEl.classList.add("tone-attention");
+  // "unknown" tone keeps the neutral default styling.
+  wordEl.textContent = seal.word;
+  const open = !!state.posture.sealOpen;
+  popEl.hidden = !open;
+  sealEl.setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) return;
+  var head, sub;
+  if (seal.tone === "protected") {
+    head = "You are protected.";
+    sub = "Everything below is checked right now. Nothing leaves this machine without your hand on it.";
+  } else if (seal.tone === "locked") {
+    head = "This fortress is locked down.";
+    sub = "Wrapped agents are held until you lift the lockdown. The Charter still gates every risky action.";
+  } else if (seal.tone === "attention") {
+    head = "Needs your attention.";
+    sub = "Live enforcement is degraded or unconfirmed right now. The Charter still holds risky actions for your approval. Check the Health screen.";
+  } else {
+    head = "Posture is being checked.";
+    sub = "Live enforcement evidence is not loaded yet. Until it is confirmed, this is not shown as protected.";
+  }
+  const lines = postureLayerLines().map(function (l) {
+    const dotCls = l.off ? "pp-dot off" : (l.warn ? "pp-dot warn" : "pp-dot");
+    return '<div class="pp-line"><span class="' + dotCls + '"></span>' +
+      '<span class="pp-k">' + escHtml(l.k) + '</span>' +
+      '<span class="pp-v">' + escHtml(l.v) + '</span></div>';
+  }).join("");
+  popEl.innerHTML = '<h4>' + escHtml(head) + '</h4><p class="pp-sub">' + escHtml(sub) + '</p>' + lines;
 }
 
 // Per-route cache of the last HTML written to #main. Used by renderMain
@@ -582,6 +688,7 @@ function renderMain() {
   let nextHtml;
   switch (state.route) {
     case "dashboard": nextHtml = renderDashboardConcierge(); break;
+    case "activity": nextHtml = renderActivityScreen(); break;
     case "agents": nextHtml = renderAgentsList(); break;
     case "agent-detail": nextHtml = renderAgentDetail(); break;
     case "policy": nextHtml = renderPolicyCenter(); break;
@@ -731,7 +838,7 @@ function renderDashboardConcierge() {
     : "";
   const activeChatsPanel = renderActiveChatsPanel();
   return [
-    '<div class="concierge-wrap">',
+    '<div class="concierge-wrap spine-hero">',
       '<div class="page-head"><div>',
         '<p class="eyebrow">Concierge</p>',
         '<h1>Talk to your fortress.</h1>',
@@ -1395,13 +1502,25 @@ function tierLabel(tier) {
 }
 
 function renderIntelligenceCenter() {
+  // Wave 1 (2026-06-30) copy fix: the prior empty-state pointed at a dead
+  // dead "sanctuary intelligence configure" command (no such CLI verb; a
+  // substrate is picked in THIS dashboard's Intelligence picker, persisted via
+  // /api/hub/intelligence/preferences). The corrected copy points operators at
+  // the in-dashboard picker, and spells out the substrate privacy tradeoff
+  // using the canonical strings from server/src/intelligence/templates.ts
+  // (BACKEND_FALLBACK_STRINGS): local = queries never leave your machine;
+  // Venice = contractual, not cryptographic; cloud/frontier = may log, expect
+  // imperfect privacy. So the operator understands the privacy stakes BEFORE
+  // they choose, on the first screen they see.
   if (state.intelligence.notConfigured) {
     return '<section class="intel-center">' +
       '<p class="eyebrow">INTELLIGENCE</p>' +
-      '<h1>No intelligence substrate configured</h1>' +
-      '<p class="intel-subtitle">No Intelligence Substrate Selector is bound to this dashboard. Configure one with:</p>' +
-      '<div class="code-block">sanctuary intelligence configure --substrate local</div>' +
-      '<p class="intel-subtitle muted">Options: <code>--substrate local</code> (privacy, runs on device), <code>--substrate hosted</code> (capability, uses Venice.ai), <code>--substrate hybrid</code> (per-surface routing). Then re-launch the dashboard.</p>' +
+      '<h1>Pick a model for your fortress</h1>' +
+      '<p class="intel-subtitle">No model is connected yet, so the concierge and other intelligence surfaces are quiet. Choose one to turn them on. Your choice decides where your questions go.</p>' +
+      '<p class="intel-subtitle muted"><strong>Local model:</strong> Your queries never leave your machine. Capability is moderate; complex reasoning may underperform a frontier model. Needs 8GB RAM Apple Silicon M1+ or equivalent.</p>' +
+      '<p class="intel-subtitle muted"><strong>Venice.ai:</strong> Queries reach Venice\'s relay during inference. Venice\'s contract states no retention or training on your data. Trust is contractual, not cryptographic. Capability higher than local.</p>' +
+      '<p class="intel-subtitle muted"><strong>Frontier with PII filter:</strong> Queries reach the frontier provider after redaction. Highest capability. The provider may log queries per their terms. Redaction can fail on subtle PII; expect imperfect privacy.</p>' +
+      '<p class="intel-subtitle muted">Choose and connect a model in the picker on this Intelligence screen (the cards appear once a substrate is bound). It also reads the substrate environment variables set when the dashboard launched.</p>' +
     '</section>';
   }
   if (state.intelligence.loadError) {
@@ -1409,7 +1528,7 @@ function renderIntelligenceCenter() {
       '<p class="eyebrow">INTELLIGENCE</p>' +
       '<h1>Could not load substrate status</h1>' +
       '<p class="intel-subtitle error-text">' + escHtml(state.intelligence.loadError) + '</p>' +
-      '<p class="intel-subtitle muted">If this is a new fortress, configure a substrate first: <code>sanctuary intelligence configure --substrate local</code> (or <code>--substrate hosted</code>, <code>--substrate hybrid</code>).</p>' +
+      '<p class="intel-subtitle muted">If this is a new fortress, pick a model in the Intelligence picker on this screen first (local keeps your queries on your machine; Venice.ai is contractual, not cryptographic; a frontier model is highest capability but may log queries, so expect imperfect privacy). The picker reads the substrate environment variables set when the dashboard launched.</p>' +
       '<button class="btn" data-action="intel-reload">Retry</button>' +
     '</section>';
   }
@@ -2137,9 +2256,180 @@ function filterInbox(items) {
   });
 }
 
+// Wave 1 (2026-06-30): the right rail is now a calm two-element column:
+// the click-to-clear approvals queue + ambient posture. The heavy six-field
+// inbox filter panel and the full multi-kind inbox moved OFF the rail to the
+// Activity screen (renderActivityScreen); the rail holds only what is
+// "waiting on you" plus an at-a-glance "how protected am I right now".
+//
+// SECURITY (HIGH, non-negotiable): each Approve/Deny tile issues the
+// IDENTICAL operator-bearer-token-gated request the inbox path uses, by
+// calling onInboxAction(itemId, action) -> api("/inbox/:id/approve|deny",
+// {method:"POST"}). There is NO new approve path, NO loopback shortcut, NO
+// token in served HTML (api() reads TOKEN from sessionStorage at runtime).
+// A tokenless POST is rejected by the requireToken chokepoint in
+// hub/api-router.ts (#823). See test/dashboard/v1_1/queue-approve-token-gate.test.ts.
+function pendingApprovalItems() {
+  // Pending Tier-1 approvals, scoped to the selected agent when one is
+  // chosen. These are the only items the rail queue shows; everything else
+  // (privacy events, budget warnings, blocked egress) lives on Activity.
+  const scope = state.agentScope.selectedAgentId;
+  return state.inbox.filter(function (i) {
+    if (i.resolved) return false;
+    if (i.kind !== "approval_pending") return false;
+    if (i.tier !== "tier1" && i.tier !== "tier2") return false;
+    if (scope && (i.agent_id || "") !== scope) return false;
+    return true;
+  });
+}
+
+// Wave 1: the fortress-column agents card and Recognition Layer health card
+// previously lived on the right rail. They are real surfaces (agent
+// lifecycle controls + did:web rotation), so they were relocated to the
+// Activity screen rather than removed; the markup, data-action hooks, and
+// capability-gating logic are preserved verbatim. The rail keeps only the
+// approvals queue + ambient posture.
+function renderFortressAgentsCard() {
+  return state.agents.length
+    ? state.agents.slice(0, 8).map(function (a) {
+        const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
+        const c = a.capabilities || {};
+        const menuItems = [
+          { action: "pause", label: "Pause", enabled: !!c.can_pause },
+          { action: "resume", label: "Resume", enabled: !!c.can_resume },
+          { action: "restart", label: "Restart", enabled: !!c.can_restart },
+          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
+          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
+        ];
+        const buttons = menuItems.map(function (mi) {
+          const tip = mi.enabled
+            ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
+            : "This harness does not support " + mi.label.toLowerCase() + ".";
+          return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
+        }).join("");
+        // Click-to-inspect: the head sub-row is the click target. A click
+        // navigates to agent-detail and opens the read-only inspect panel
+        // synchronously via the WP-V1.2 reshape route. Lifecycle buttons in
+        // agent-row-actions still take precedence (the dispatcher walks up to
+        // the closest data-action ancestor; buttons are siblings, not
+        // children, of the head).
+        return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
+          '<div class="agent-row-head" data-action="agent-row-inspect-open" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
+            '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
+            '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
+            '<span class="pill">' + escHtml(map.label) + '</span>' +
+          '</div>' +
+          '<div class="agent-row-actions">' + buttons + '</div>' +
+          '</div>';
+      }).join("\n")
+    : '<p class="muted">No agents protected.</p>';
+}
+
+function renderRecognitionHealthCard() {
+  const recognition = state.recognition.health;
+  if (state.recognition.error) {
+    return '<p class="muted">Recognition Layer health unavailable: ' + escHtml(state.recognition.error) + '</p>';
+  }
+  if (!recognition) {
+    return '<p class="muted">Loading Recognition Layer health.</p>';
+  }
+  if (!recognition.configured) {
+    return '<p class="muted">No did:web identifier registered. Run <code>sanctuary did-web issue --authority-host &lt;host&gt;</code>.</p>';
+  }
+  const last = recognition.last_rotation
+    ? shortTime(recognition.last_rotation.rotated_at) + ' (' + recognition.last_rotation.reason + ')'
+    : 'never';
+  const history = recognition.key_history && recognition.key_history.length
+    ? recognition.key_history.slice().reverse().slice(0, 4).map(function (h) {
+        return '<div class="row"><div class="grow"><span class="mono">' + escHtml(shortTime(h.rotated_at)) + '</span><br><span class="muted">' + escHtml(h.reason) + '</span></div><span class="pill">' + escHtml(h.new_verification_method_id.split("#").pop() || "key") + '</span></div>';
+      }).join("")
+    : '<p class="muted">No rotations yet.</p>';
+  return '<dl class="kv">' +
+    '<dt>Identifier</dt><dd class="mono">' + escHtml(recognition.identifier) + '</dd>' +
+    '<dt>Last rotation</dt><dd>' + escHtml(last) + '</dd>' +
+    '<dt>Next periodic</dt><dd>' + escHtml(recognition.days_until_recommended_rotation) + ' days</dd>' +
+    '</dl>' +
+    '<button class="btn btn-danger" data-action="did-web-rotate-compromised"' + (state.recognition.rotating ? ' disabled' : '') + '>' + (state.recognition.rotating ? 'Rotating...' : 'Compromised rotation') + '</button>' +
+    '<div style="margin-top:8px;">' + history + '</div>';
+}
+
+function renderApprovalTile(i) {
+  const text = renderTemplate(i.display_template_id, i.display_template_args);
+  const agentId = i.agent_id || (i.display_template_args && i.display_template_args.agent_id) || "this fortress";
+  return '<div class="approval-tile" data-approval-tile="' + escHtml(i.item_id) + '">' +
+    '<div class="at-what">' + escHtml(text) + '</div>' +
+    '<div class="at-agent"><span class="ad"></span>' + escHtml(agentId) + '</div>' +
+    '<div class="at-actions">' +
+      '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '">Approve</button>' +
+      '<button class="btn btn-sm at-deny" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
+    '</div>' +
+  '</div>';
+}
+
 function renderFortress() {
   const fortress = document.getElementById("fortress");
   if (!fortress) return;
+  const pending = pendingApprovalItems();
+  const countCls = pending.length ? "count" : "count zero";
+  const queueBody = pending.length
+    ? '<div class="approval-queue" id="approval-queue">' + pending.map(renderApprovalTile).join("") + '</div>'
+    : '<div class="queue-empty"><span class="qe-check"></span>Nothing waiting on you.</div>';
+
+  // Ambient posture: honest, glanceable. The seal mirrors the top bar; the
+  // one-line "what's protecting you" uses NAMED layers only (no L-numbers).
+  const seal = deriveSeal();
+  const scopeLabel = state.agentScope.selectedAgentId
+    ? escHtml(state.agentScope.selectedAgentId)
+    : "All agents";
+  const fortressLabel = escHtml(config.tenantName || config.fortressId || "this fortress");
+  var protectingLine;
+  if (seal.arm === "armed") {
+    protectingLine = "Castle Wall is enforcing on this machine. Sentinels watch every wrapped agent, and the Charter holds anything risky for your approval.";
+  } else if (seal.arm === "locked_down") {
+    protectingLine = "This fortress is locked down. Wrapped agents are held until you lift it. The Charter still gates every risky action.";
+  } else if (seal.arm === "degraded") {
+    protectingLine = "Castle Wall protection is degraded right now. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval. Check the Health screen.";
+  } else {
+    protectingLine = "Castle Wall enforcement is not confirmed on this machine right now. Sentinels still watch your wrapped agents and the Charter still holds risky actions for your approval.";
+  }
+  const wrapped = state.agents.length;
+  const federationState = (state.posture.data && state.posture.data.federation && state.posture.data.federation.operator_cloud_nodes)
+    ? "On" : "Off";
+
+  fortress.innerHTML = [
+    '<div class="rail-section">',
+      '<div class="rail-section-label">Waiting on you <span class="' + countCls + '" id="queue-count">' + pending.length + '</span></div>',
+      queueBody,
+    '</div>',
+    '<div class="rail-section">',
+      '<div class="rail-section-label" style="color:var(--ink-4)">Right now</div>',
+      '<div class="ambient-posture">',
+        '<div class="ambient-seal tone-' + seal.tone + '">',
+          '<span class="as-glyph"></span>',
+          '<span class="as-text"><strong>' + escHtml(seal.word) + '</strong><small>' + scopeLabel + ' &middot; ' + fortressLabel + '</small></span>',
+        '</div>',
+        '<div class="ambient-line"><span class="lead">What is protecting you</span>' + escHtml(protectingLine) + '</div>',
+        '<div class="ambient-stats">',
+          '<div class="ambient-stat"><span class="n">' + wrapped + '</span><span class="l">Wrapped</span></div>',
+          '<div class="ambient-stat"><span class="n">' + pending.length + '</span><span class="l">Waiting</span></div>',
+          '<div class="ambient-stat"><span class="n">' + federationState + '</span><span class="l">Federation</span></div>',
+        '</div>',
+      '</div>',
+    '</div>'
+  ].join("");
+}
+
+// Wave 1 (2026-06-30): the Activity screen. The heavy six-field inbox
+// filter panel + the full multi-kind inbox (privacy events, blocked egress,
+// budget warnings, recovery prompts, agent errors, AND the tiered approvals)
+// moved here OFF the right rail, where power-querying belongs. The rail now
+// shows only the click-to-clear approvals queue. This renderer reuses the
+// EXACT filter panel + inbox-row markup that previously lived inline in the
+// rail, including the same data-action hooks, so the batch toolbar, snooze
+// dialog, and per-item approve/deny continue to route through the same
+// token-gated paths (onInboxAction -> api()). No behavior change; only the
+// home of the panel moved.
+function renderActivityScreen() {
   const visibleInbox = filterInbox(state.inbox.filter(function (i) { return !i.resolved; }));
   const selectedIds = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   const batchToolbar = selectedIds.length
@@ -2175,7 +2465,6 @@ function renderFortress() {
   if (!visibleInbox.length) {
     inboxRows = '<p class="muted">Nothing pending.</p>';
   } else {
-    // Group by tier/kind for visual hierarchy (VVVVV restore).
     var tier1Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier1"; });
     var tier2Items = visibleInbox.filter(function (i) { return i.kind === "approval_pending" && i.tier === "tier2"; });
     var otherItems = visibleInbox.filter(function (i) { return i.kind !== "approval_pending" || (i.tier !== "tier1" && i.tier !== "tier2"); });
@@ -2203,86 +2492,24 @@ function renderFortress() {
     if (otherItems.length) sections.push((tier1Items.length || tier2Items.length ? '<h4 class="inbox-group-head">Other</h4>' : '') + otherItems.map(renderInboxRow).join("\n"));
     inboxRows = sections.join("\n");
   }
-
-  const agentsCard = state.agents.length
-    ? state.agents.slice(0, 8).map(function (a) {
-        const map = STATUS_MAP[a.status] || STATUS_MAP.unknown;
-        const c = a.capabilities || {};
-        const menuItems = [
-          { action: "pause", label: "Pause", enabled: !!c.can_pause },
-          { action: "resume", label: "Resume", enabled: !!c.can_resume },
-          { action: "restart", label: "Restart", enabled: !!c.can_restart },
-          { action: "lockdown", label: "Lockdown", enabled: !!c.can_lockdown, tier1: true },
-          { action: "unwrap", label: "Unwrap", enabled: !!c.can_unwrap, tier1: true }
-        ];
-        const buttons = menuItems.map(function (mi) {
-          const tip = mi.enabled
-            ? (mi.tier1 ? "Tier 1: requires inbox approval." : "")
-            : "This harness does not support " + mi.label.toLowerCase() + ".";
-          return '<button class="btn" data-action="agent-' + mi.action + '" data-agent-id="' + escHtml(a.agent_id) + '"' + (mi.enabled ? '' : ' disabled') + ' title="' + escHtml(tip) + '">' + escHtml(mi.label) + '</button>';
-        }).join("");
-        // Click-to-inspect: the head sub-row is the click target. A click
-        // navigates to agent-detail and opens the read-only inspect panel
-        // synchronously via the WP-V1.2 reshape route (the original PR #98
-        // chat wire-up was repurposed when direct-agent chat was removed
-        // from v1.2). Lifecycle buttons in agent-row-actions still take
-        // precedence (the dispatcher walks up to the closest data-action
-        // ancestor; buttons are siblings, not children, of the head).
-        return '<div class="row agent-row" data-agent-row="' + escHtml(a.agent_id) + '">' +
-          '<div class="agent-row-head" data-action="agent-row-inspect-open" data-agent-id="' + escHtml(a.agent_id) + '" role="button" tabindex="0" title="Open inspect panel for ' + escHtml(a.agent_id) + '">' +
-            '<span class="glyph ' + map.glyph + '" title="' + escHtml(REASON_LABELS[a.status_reason_class] || "") + '"></span>' +
-            '<div class="grow"><strong>' + escHtml(a.agent_id) + '</strong></div>' +
-            '<span class="pill">' + escHtml(map.label) + '</span>' +
-          '</div>' +
-          '<div class="agent-row-actions">' + buttons + '</div>' +
-          '</div>';
-      }).join("\n")
-    : '<p class="muted">No agents protected.</p>';
-
-  const recognition = state.recognition.health;
-  let recognitionCard;
-  if (state.recognition.error) {
-    recognitionCard = '<p class="muted">Recognition Layer health unavailable: ' + escHtml(state.recognition.error) + '</p>';
-  } else if (!recognition) {
-    recognitionCard = '<p class="muted">Loading Recognition Layer health.</p>';
-  } else if (!recognition.configured) {
-    recognitionCard = '<p class="muted">No did:web identifier registered. Run <code>sanctuary did-web issue --authority-host &lt;host&gt;</code>.</p>';
-  } else {
-    const last = recognition.last_rotation
-      ? shortTime(recognition.last_rotation.rotated_at) + ' (' + recognition.last_rotation.reason + ')'
-      : 'never';
-    const history = recognition.key_history && recognition.key_history.length
-      ? recognition.key_history.slice().reverse().slice(0, 4).map(function (h) {
-          return '<div class="row"><div class="grow"><span class="mono">' + escHtml(shortTime(h.rotated_at)) + '</span><br><span class="muted">' + escHtml(h.reason) + '</span></div><span class="pill">' + escHtml(h.new_verification_method_id.split("#").pop() || "key") + '</span></div>';
-        }).join("")
-      : '<p class="muted">No rotations yet.</p>';
-    recognitionCard =
-      '<dl class="kv">' +
-      '<dt>Identifier</dt><dd class="mono">' + escHtml(recognition.identifier) + '</dd>' +
-      '<dt>Last rotation</dt><dd>' + escHtml(last) + '</dd>' +
-      '<dt>Next periodic</dt><dd>' + escHtml(recognition.days_until_recommended_rotation) + ' days</dd>' +
-      '</dl>' +
-      '<button class="btn btn-danger" data-action="did-web-rotate-compromised"' + (state.recognition.rotating ? ' disabled' : '') + '>' + (state.recognition.rotating ? 'Rotating...' : 'Compromised rotation') + '</button>' +
-      '<div style="margin-top:8px;">' + history + '</div>';
-  }
-
-  fortress.innerHTML = [
-    '<section class="card">',
-      '<h3>This fortress</h3>',
-      (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
-      '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
-      '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
-    '</section>',
-    '<section class="card"><h3>Layers</h3>',
-      '<div class="layer-card"><h4>L1 Cognitive</h4><p>Encrypted state at rest.</p></div>',
-      '<div class="layer-card"><h4>L2 Operational</h4><p>Approval gates and policy enforcement.</p></div>',
-      '<div class="layer-card"><h4>L3 Selective disclosure</h4><p>Commitments without revealing values.</p></div>',
-      '<div class="layer-card"><h4>L4 Verifiable reputation</h4><p>Signed attestations, portable.</p></div>',
-    '</section>',
-    '<section class="card"><h3>Inbox (' + state.inbox.filter(function (i) { return !i.resolved; }).length + ')</h3>' + filterPanel + batchToolbar + inboxRows + snoozeDialog + '</section>',
-    '<section class="card"><h3>Recognition Layer health</h3>' + recognitionCard + '</section>',
-    '<section class="card"><h3>Agents (' + state.agents.length + ')</h3>' + agentsCard + '</section>',
-    '<section class="card"><h3>Posture</h3><p class="muted">Local-only. Single operator. Federation: off.</p></section>'
+  const total = state.inbox.filter(function (i) { return !i.resolved; }).length;
+  return [
+    '<section class="concierge-wrap">',
+      '<div class="page-head"><div>',
+        '<p class="eyebrow">Activity</p>',
+        '<h1>Everything across your fortress.</h1>',
+        '<p class="sub">Approvals, blocked actions, privacy events, and budget warnings, with filters to find one. Approve or deny right here. Anything waiting on you also shows in the rail.</p>',
+      '</div></div>',
+      '<section class="card">',
+        '<h3>This fortress</h3>',
+        (config.tenantName ? '<p><strong>' + escHtml(config.tenantName) + '</strong></p>' : ''),
+        '<p class="muted mono">' + escHtml(config.fortressId || "(local)") + '</p>',
+        '<p class="muted">Operator: ' + escHtml(config.identityId || "(unknown)") + '</p>',
+      '</section>',
+      '<section class="card"><h3>Inbox (' + total + ')</h3>' + filterPanel + batchToolbar + inboxRows + snoozeDialog + '</section>',
+      '<section class="card"><h3>Agents (' + state.agents.length + ')</h3>' + renderFortressAgentsCard() + '</section>',
+      '<section class="card"><h3>Recognition Layer health</h3>' + renderRecognitionHealthCard() + '</section>',
+    '</section>'
   ].join("");
 }
 
@@ -2327,6 +2554,7 @@ async function fetchAll() {
   }
   await fetchIntelligenceState();
   await fetchHoneypotState();
+  await fetchSovereignty();
   // WP-V1.2 reshape: hydrate the concierge thread on every fetch cycle.
   // The direct-agent surface was removed; the inspect panel is fetched
   // lazily on click rather than maintained in state.
@@ -2343,6 +2571,75 @@ async function fetchHoneypotState() {
   } catch (e) {
     state.honeypot.loadError = e && e.message ? e.message : String(e);
   }
+}
+
+// Wave 1 (2026-06-30): the HONEST posture read. /api/sovereignty returns
+// the evidence-gated Castle Wall arm-state (#828): green ONLY on a fresh
+// enforcement verdict (arm_state "armed"), never on config presence. The
+// seal + ambient posture render from this, so the operator never sees a
+// fabricated "Protected". This endpoint lives at the server root (NOT under
+// /api/hub), so it is fetched directly with the same bearer token. A read
+// failure leaves state.posture.data null; the seal then reads "Unknown"
+// (an honest non-green state), never "Protected".
+async function fetchSovereignty() {
+  try {
+    const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
+    if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+    const res = await fetch("/api/sovereignty?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    if (!res.ok || !body || body.error) {
+      state.posture.data = null;
+      state.posture.error = (body && body.error) || ("HTTP " + res.status);
+      return;
+    }
+    state.posture.data = body;
+    state.posture.error = null;
+  } catch (e) {
+    state.posture.data = null;
+    state.posture.error = e && e.message ? e.message : String(e);
+  }
+}
+
+// Wave 1: map the honest Castle Wall arm-state to the operator-facing seal.
+// "armed" (fresh enforcement evidence) is the ONLY green/Protected state;
+// "degraded" reads Attention; everything else (unknown, not_installed,
+// missing data) reads Attention too, NEVER Protected (never-overclaim).
+// A locked-down fortress (the lockdown control engaged) reads Locked.
+function deriveSeal() {
+  const t1 = state.tier1.lockdown.state;
+  if (t1 === "engaged") {
+    return { tone: "locked", word: "Locked", arm: "locked_down" };
+  }
+  const d = state.posture.data;
+  const arm = d && d.live_enforcement ? d.live_enforcement.castle_wall_arm_state : null;
+  if (arm === "armed") return { tone: "protected", word: "Protected", arm: arm };
+  if (arm === "degraded") return { tone: "attention", word: "Attention", arm: arm };
+  if (arm) return { tone: "attention", word: "Attention", arm: arm };
+  return { tone: "unknown", word: "Unknown", arm: null };
+}
+
+// Plain-English line for the named layer in the posture popover. Uses the
+// retired-L-number rule: named layers only, never "L1".."L4". Values are
+// honest: the wall line reflects the real arm-state, not config presence.
+function postureLayerLines() {
+  const d = state.posture.data;
+  const seal = deriveSeal();
+  var wallV;
+  if (seal.arm === "armed") wallV = "enforcing";
+  else if (seal.arm === "degraded") wallV = "degraded";
+  else if (seal.arm === "locked_down") wallV = "locked down";
+  else if (seal.arm) wallV = "not enforcing";
+  else wallV = "unknown";
+  const wallWarn = seal.arm !== "armed";
+  const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
+  const wrapped = state.agents.length;
+  return [
+    { k: "Castle Wall (boundary)", v: wallV, warn: wallWarn },
+    { k: "Sentinels watching agents", v: wrapped + " wrapped", warn: false, off: wrapped === 0 },
+    { k: "Charter approvals", v: pending ? pending + " waiting" : "clear", warn: pending > 0 },
+    { k: "Heralds (reputation)", v: d && d.layers && d.layers.l4 && d.layers.l4.status === "active" ? "signed" : "configured", warn: false }
+  ];
 }
 
 async function onAutoTriggerRecommendation(ruleId, action) {
@@ -2703,6 +3000,19 @@ document.addEventListener("click", function (ev) {
   while (tgt && !tgt.getAttribute("data-action")) {
     tgt = tgt.parentElement;
   }
+  // Wave 1: close the top-bar popovers on any click that lands outside both
+  // of them (and is not their own toggle, which is handled below). Runs
+  // before the no-action early-return so a click on empty page chrome
+  // dismisses an open switcher / seal.
+  if (state.agentScope.switcherOpen || state.posture.sealOpen) {
+    const insideSwitcher = !!rawTgt.closest("[data-switcher]");
+    const insideSeal = !!rawTgt.closest("[data-seal]");
+    if (!insideSwitcher && !insideSeal) {
+      state.agentScope.switcherOpen = false;
+      state.posture.sealOpen = false;
+      renderTopbar();
+    }
+  }
   if (!tgt) return;
   const action = tgt.getAttribute("data-action");
   if (!action) return;
@@ -2721,6 +3031,31 @@ document.addEventListener("click", function (ev) {
     sessionStorage.setItem(THEME_KEY, next);
     applyTheme(next);
     return;
+  }
+  // Wave 1: agent switcher + posture seal (top-bar popovers).
+  if (action === "agent-switcher-toggle") {
+    ev.stopPropagation();
+    state.agentScope.switcherOpen = !state.agentScope.switcherOpen;
+    state.posture.sealOpen = false;
+    return renderTopbar();
+  }
+  if (action === "agent-scope-select") {
+    const id = tgt.getAttribute("data-agent-id") || "";
+    state.agentScope.selectedAgentId = id || null;
+    state.agentScope.switcherOpen = false;
+    // Scope the queue + ambient posture to the chosen agent; re-render the
+    // rail and the topbar. The conversation spine stays fortress-wide in
+    // wave 1 (the concierge reads fortress state); per-agent conversation
+    // scoping is a wave-2 follow-up.
+    renderTopbar();
+    renderFortress();
+    return;
+  }
+  if (action === "posture-seal-toggle") {
+    ev.stopPropagation();
+    state.posture.sealOpen = !state.posture.sealOpen;
+    state.agentScope.switcherOpen = false;
+    return renderTopbar();
   }
   if (action === "intel-reload") { return void fetchIntelligenceState().then(rerender); }
   if (action === "intel-picker-open" && intelSurface) return void onIntelPickerOpen(intelSurface);
@@ -2861,6 +3196,23 @@ document.addEventListener("click", function (ev) {
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
+    // Wave 1: when the click is on a rail approval-queue tile, animate the
+    // tile out for a click-to-clear feel. The resolve itself is the SAME
+    // token-gated onInboxAction path the inbox rows use; the animation is
+    // cosmetic and never bypasses the request. A subsequent fetchAll +
+    // rerender re-renders the rail authoritatively from server state.
+    if (sub === "approve" || sub === "deny") {
+      const tile = rawTgt.closest(".approval-tile");
+      if (tile) {
+        tile.classList.add("leaving");
+        const countEl = document.getElementById("queue-count");
+        if (countEl) {
+          const remaining = document.querySelectorAll(".approval-tile:not(.leaving)").length;
+          countEl.textContent = String(remaining);
+          if (remaining === 0) countEl.classList.add("zero");
+        }
+      }
+    }
     return void onInboxAction(itemId, sub);
   }
   if (action.indexOf("agent-") === 0 && agentId) {
