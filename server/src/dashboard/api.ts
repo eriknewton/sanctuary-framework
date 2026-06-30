@@ -304,7 +304,9 @@ export async function handleRequest(
 
   // ── v1.1 dispatch (v1.1.2 hotfix, Finding V) ────────────────────────
   // Try v1.1 compatibility routes first when bindings are set. Mounted at
-  // /dashboard + /v1.1 (HTML) and /api/hub/* (API); `/` is the posture
+  // /dashboard + /v1.1 (HTML) and /api/hub/* (API). After the default-flip
+  // (2026-06-30) `/` falls THROUGH to this dispatch and is served by the
+  // v1.1 concierge as the single default surface; `/posture` is the posture
   // shell handled above.
   //
   // Auth gating is intentionally inside the shared helper so the v1.1
