@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.5.0] - 2026-06-30
+
+Minor release. Roughly two weeks and a large body of feature, hardening, and fix work since the v1.4.0 tag (2026-06-15). The feature weight is a semver minor bump: the additions are backward-compatible and the new enforcement mechanisms ship default-off and fail-closed. This section groups the work; per-PR detail is in the git history from the v1.4.0 tag through `main`.
+
+The headline since 1.4.0 is the signed operator policy-distribution rail that pushes a signed policy across a fleet of machines, a remote operator console with a fleet switcher and honest per-node policy-version and drift reporting, a consolidation of every approval-bearing route behind a single fail-closed authentication chokepoint, a competitor-readiness hardening wave (signed self-update, config-downgrade and anti-rollback gates anchored to a custody MAC), and live PII scrubbing on the query-anonymity surface. Two real daemon out-of-memory paths on large audit logs were closed.
+
+### Added
+
+- **Signed operator policy-distribution rail.** An operator can publish a signed policy that propagates across federated machines: the slice-1 distribution rail (#789), policy-push cursor-less signed-payload reconstruction fixes caught on the stock CLI (#792, #794), real per-node policy version and drift surfaced in the fleet console (#793), a fleet-wide sync-health rollup with honest distribution status (#788), and verified compromise-root joiner-adopt (#802, gated HALT pending custody-core review).
+- **Remote operator console and fleet switcher.** A remote operator console with a fleet switcher for managing multiple machines from one surface (#375), plus Slice 2 park-not-exit with a user-domain launchd LaunchAgent (#724).
+- **Optional M-of-N guardian sign-off on the revoke and kill path.** A default-off, fail-closed gate that can require a threshold of guardian signatures before a federation revoke or kill action proceeds (#824).
+- **Live PII scrubbing on the query-anonymity surface.** Tier-B live PII redaction wired through a real redactor behind an auth-gated route (#819), plus Slice-1.5 connection-reuse hygiene that closes a connection-fingerprint leak (#815).
+- **Optional ERC-8004 on-chain registry confirmation.** An off-by-default, egress-gated recognition path that can confirm an agent against an on-chain registry (#803).
+- **NIST AI RMF 1.0 compliance crosswalk.** A NIST AI Risk Management Framework crosswalk extending the existing EU AI Act compliance pack (#769).
+
+### Security
+
+- **One fail-closed authentication chokepoint for every approval-bearing route.** Tier-1 approval authentication is consolidated to a single bearer-only `requireToken` chokepoint that never places a token in served HTML (#800), extended to custody-mutation routes (#801), operational-mutation routes (#806), and the console, anomaly, and policy routes (#816), with second-angle sibling gaps closed across templates and init auth, config-posture coverage, and the approval aggregator default-deny (#808).
+- **Generic 401 with no auth oracle, and default-deny on non-GET mutations.** The dashboard returns a generic 401 that does not reveal whether authentication or authorization failed, and gates non-GET mutations default-deny; this closed a real live hole where a consent-config mutation was released by loopback auto-auth without the operator bearer (#823).
+- **Competitor-readiness hardening wave.** Signed-release-manifest verification before advising any self-update, fail-closed (#818); a config-downgrade gate rebuilt on a custody-MAC anchor, replacing an earlier unsigned baseline (#805); mesh anti-rollback and activator-downgrade gates (#804); and a config-baseline deletion-replay close-out anchored to a boot-anchored monotonic witness (#817, gated HALT pending custody-core review).
+- **Exfiltration hardening of the default API allowlist.** Messaging channels are dropped from the default API allowlist so the out-of-the-box posture does not permit them (#820).
+- **Multi-agent SDW isolation guard.** A fail-closed guard blocks multi-agent Sovereign Data Workspace memory use until per-agent custody isolation lands, so the shared-memory path cannot be used before it is safe (#822).
+
+### Fixed
+
+- **Two real daemon out-of-memory paths on large audit logs.** The full-mode daemon in-memory-array leak that triggered an out-of-memory after about seven minutes is bounded (#821), and the audit-chain reload amplification that re-materialized the whole decrypted chain per verification tick is replaced with a streaming verified-chain pass that releases each entry (#825).
+- **Honest fleet and federation reporting.** A federation banner and drift null-guard corrected from adversarial-sweep findings (#795), and a cursor-null federation path that still returned 403 (#794).
+- **Dependency and tooling refresh.** Upgrade to Vite 8 and Vitest 4 clearing dev-tooling audit advisories (#814), a `ws` override clearing the runtime memory-exhaustion advisory (#813), and the server-minor-patch dependency group (#798), alongside several CI test-stability fixes (#810, #811, #812, #790).
+
 ## [1.4.0] - 2026-06-15
 
 Minor release. The published `latest` (1.3.3, 2026-05-26) is roughly three weeks behind `main`, which has accumulated a large body of feature, hardening, and fix work since the v1.3.2 git tag. This release brings `latest` back in line with `main` and reconciles the version story: there is no separate v1.3.3 git tag, and the feature weight here is a semver minor bump.
