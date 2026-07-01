@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFile, mkdir, readFile, readdir, stat, rm } from "node:fs/promises";
+import { writeFile, mkdir, mkdtemp, readFile, readdir, stat, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -45,11 +45,10 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
   let originalStoragePath: string | undefined;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-dryrun-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp atomically creates a uniquely-named dir (O_EXCL semantics),
+    // avoiding the predictable-name TOCTOU that a manual join(tmpdir(), name)
+    // + mkdir can hit (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-dryrun-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;
@@ -134,6 +133,46 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
     expect(output).toContain("config.yaml");
     expect(output).toContain("Dry run. No changes made.");
     await expect(stat(join(tmpHome, ".hermes"))).rejects.toThrow();
+  });
+
+  it("does NOT claim 'no config found' when config.yaml already exists but the JSON surface is absent (honesty fix)", async () => {
+    // The exact install target: a host with a populated ~/.hermes/config.yaml
+    // (a `venice` MCP entry) but NO cli-config.json. Pre-fix, the bootstrap
+    // path fired on the absent JSON and printed "No existing hermes config
+    // found." + "0 MCP servers", which is false on this host — Hermes routes
+    // MCP traffic through config.yaml (hermes-yaml.ts:4-10).
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    await writeFile(
+      join(hermesDir, "config.yaml"),
+      'mcp_servers:\n  venice:\n    command: "uvx"\n    args:\n      - "mcp-venice"\n'
+    );
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runWrap({ hermes: true, dryRun: true, noOpen: true }, tripwireDeps());
+    const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+
+    // Honest: names config.yaml, promises preservation, does NOT lie.
+    expect(output).not.toContain("No existing hermes config found");
+    expect(output).toContain("Found your Hermes MCP config");
+    expect(output).toContain("config.yaml");
+    expect(output).toContain("preserved");
+    // The routing line still reports the venice entry it would preserve.
+    expect(output).toContain("Hermes MCP routing: would");
+    expect(output).toContain("1 existing entry preserved");
+
+    // Still write-free: no JSON bootstrapped, config.yaml untouched.
+    await expect(
+      stat(join(hermesDir, "cli-config.json"))
+    ).rejects.toThrow();
+  });
+
+  it("still says 'No existing hermes config found' when NEITHER surface exists (fresh install unchanged)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runWrap({ hermes: true, dryRun: true, noOpen: true }, tripwireDeps());
+    const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(output).toContain("No existing hermes config found");
+    expect(output).not.toContain("Found your Hermes MCP config");
   });
 
   it("creates NOTHING when --claude-code --dry-run hits the bootstrap path (fix covers all platforms)", async () => {
