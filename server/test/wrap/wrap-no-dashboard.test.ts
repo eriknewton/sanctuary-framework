@@ -102,7 +102,7 @@ describe("formatWrapSuccessNoDashboard", () => {
     expect(out).not.toContain("Sovereignty Dashboard running at");
   });
 
-  it("preserves the protected-status footer when Castle Wall armed", () => {
+  it("prints the protected-status footer only on observed enforcement evidence", () => {
     const out = formatWrapSuccessNoDashboard({
       toolName: "Claude Code",
       version: "1.1.5",
@@ -110,14 +110,36 @@ describe("formatWrapSuccessNoDashboard", () => {
       serverCount: 0,
       passphraseLocation: "fixture-keychain",
       passphraseSource: "generated",
-      // Honesty (audit seam #1): the protected/Full footer is reserved for an
-      // observed daemon arm.
+      // F4 (v1.6.1): the protected/Full footer is reserved for observed
+      // enforcement evidence (dashboard standard), never daemon start alone.
       castleWallArmed: true,
+      castleWallEnforcementObserved: true,
     });
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
     // L1-L4 numbering was MANDATORY-retired 2026-05-24.
     expect(out).not.toMatch(/\bL[1-4]\b/);
+  });
+
+  // F4 (v1.6.1 first-run honesty): a started daemon WITHOUT enforcement
+  // evidence must not print protected/Full (a sysext-less Mac starts the
+  // userspace daemon and filters nothing).
+  it("does NOT print protected/Full when the daemon started without enforcement evidence", () => {
+    const out = formatWrapSuccessNoDashboard({
+      toolName: "Claude Code",
+      version: "1.1.5",
+      toolCount: 0,
+      serverCount: 0,
+      passphraseLocation: "fixture-keychain",
+      passphraseSource: "generated",
+      castleWallArmed: true,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain(
+      "Castle Wall daemon started (enforcement not confirmed)"
+    );
+    expect(out).toContain("enforcement is not confirmed");
   });
 
   // Honesty (audit seam #1): a failed arm must not print protected/Full.

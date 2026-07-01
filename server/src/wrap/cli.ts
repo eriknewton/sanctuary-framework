@@ -40,6 +40,7 @@ import {
   backupConfig,
   saveWrapMeta,
   findLatestBackup,
+  removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
   getPlatformPaths,
@@ -729,14 +730,28 @@ export async function runWrap(
       `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
   } else if (agentConfig.servers.length === 0) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
-    );
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `  Sanctuary will be installed as the only MCP server.\n`
-    );
+    if (agentConfig.platform === "hermes") {
+      // F7 (v1.6.1 first-run honesty): the empty surface here is the legacy
+      // cli-config.json artifact Hermes does NOT consult for MCP routing
+      // (see the DEBT note in the bootstrap path above). Printing "installed
+      // as the only MCP server" contradicted the config.yaml message printed
+      // moments earlier ("existing MCP servers there are preserved"), so
+      // point at the authoritative YAML surface instead.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Hermes routes MCP traffic through ${hermesConfigYamlPath()}.` +
+          `\n  Sanctuary will be added there; existing MCP entries are preserved.\n`
+      );
+    } else {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Sanctuary will be installed as the only MCP server.\n`
+      );
+    }
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1008,6 +1023,48 @@ export async function runWrap(
       auditLog,
     });
     registerCastleWallCleanup();
+  };
+
+  // F4 (v1.6.1 first-run honesty): the affirmative "Your agent is protected. /
+  // Castle Wall Full" hero is reserved for OBSERVED enforcement, judged by the
+  // SAME adjudicated-flow-evidence standard the dashboard uses (feature-health
+  // panel: only fresh, provenance- and producer-signature-gated
+  // egress_allowed / egress_blocked / operator_decision evidence arms the
+  // wall; daemon presence, heartbeats, and policy loads never do). A started
+  // userspace daemon proves nothing about the system extension actually
+  // filtering traffic; on a sysext-less Mac the daemon starts and filters
+  // nothing. Fail-closed: any probe failure reads as not-observed.
+  const probeCastleWallEnforcementObserved = async (
+    auditLog: AuditLog,
+  ): Promise<boolean> => {
+    try {
+      const { buildFeatureHealthPanel } = await import(
+        "../principal-policy/feature-health.js"
+      );
+      const { loadFortressProducerKey } = await import(
+        "../castle-wall/runtime/producer-signature.js"
+      );
+      const keyLoad = await loadFortressProducerKey(storagePath);
+      // Eager-read scope: same one-verified-view discipline as the dashboard
+      // callers of buildFeatureHealthPanel (H4 chokepoint).
+      const panel = await auditLog.runEagerReads(() =>
+        buildFeatureHealthPanel({
+          auditLog,
+          originMachine: fortressIdFromStoragePath(storagePath),
+          pinnedProducerKeyB64url:
+            keyLoad.status === "present" ? keyLoad.keyB64url : null,
+          ...(keyLoad.status === "unreadable"
+            ? { producerKeyExpectedButUnavailable: true }
+            : {}),
+        }),
+      );
+      const row = panel.rows.find(
+        (r) => r.feature_id === "castle_wall_egress",
+      );
+      return row?.status === "active";
+    } catch {
+      return false;
+    }
   };
 
   // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
@@ -1370,6 +1427,10 @@ export async function runWrap(
     // and the auto-open browser path; print a concise success line that
     // points operators at the persistent dashboard.
 
+    // F4: enforcement-evidence signal for the success banner; false unless
+    // the fail-closed probe below observes dashboard-standard evidence.
+    let ndEnforcementObserved = false;
+
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
     // dashboard startup path. Derive the master key and create a default
@@ -1420,6 +1481,12 @@ export async function runWrap(
           });
         }
         await ndAuditLog.flush();
+        // F4: probe for real enforcement evidence (adjudicated flows) so the
+        // banner can distinguish "daemon started" from "observed enforcing".
+        if (castleWallDaemon !== undefined) {
+          ndEnforcementObserved =
+            await probeCastleWallEnforcementObserved(ndAuditLog);
+        }
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -1436,12 +1503,16 @@ export async function runWrap(
       version: readPackageVersion(),
       toolCount: countUpstreamTools(upstreamServers),
       serverCount: upstreamServers.length,
+      platform: agentConfig.platform,
       passphraseLocation,
       passphraseSource,
       // Honest arm outcome: castleWallDaemon is only defined when
       // startCastleWallForWrap succeeded; on a start failure the catch above
-      // ran warnCastleWallDaemonNotStarted and left it undefined.
+      // ran warnCastleWallDaemonNotStarted and left it undefined. Daemon
+      // start alone never renders "protected"; that needs the F4 evidence
+      // signal below.
       castleWallArmed: castleWallDaemon !== undefined,
+      castleWallEnforcementObserved: ndEnforcementObserved,
     });
     return;
   }
@@ -1738,11 +1809,19 @@ export async function runWrap(
     await wrapAuditLog.flush();
   }
 
+  // F4: probe for real enforcement evidence (adjudicated flows) so the banner
+  // can distinguish "daemon started" from "observed enforcing". Fail-closed.
+  const enforcementObserved =
+    castleWallDaemon !== undefined && wrapAuditLog !== undefined
+      ? await probeCastleWallEnforcementObserved(wrapAuditLog)
+      : false;
+
   printWrapSuccess({
     toolName,
     version: readPackageVersion(),
     toolCount: countUpstreamTools(upstreamServers),
     serverCount: upstreamServers.length,
+    platform: agentConfig.platform,
     dashboardUrl,
     browserOpened: !options.noOpen,
     passphraseLocation,
@@ -1750,7 +1829,10 @@ export async function runWrap(
     intelligenceHealthy,
     intelligenceError,
     // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
+    // Daemon start alone never renders "protected"; that needs the F4
+    // evidence signal below.
     castleWallArmed: castleWallDaemon !== undefined,
+    castleWallEnforcementObserved: enforcementObserved,
   });
 }
 
@@ -1831,6 +1913,13 @@ interface WrapSuccessInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /**
+   * Wrap platform, used for platform-specific banner copy (F7: on Hermes with
+   * an empty legacy JSON surface, the upstream-count line would read
+   * "0 tools registered across 0 upstream servers" and appear to contradict
+   * the authoritative config.yaml routing message).
+   */
+  platform?: AgentPlatform;
   dashboardUrl: string;
   browserOpened: boolean;
   passphraseLocation: string;
@@ -1838,14 +1927,26 @@ interface WrapSuccessInfo {
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
   /**
-   * Whether the Castle Wall enforcement daemon actually armed during this
-   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
-   * fired and traffic is not being filtered; `undefined` => no arm signal was
-   * threaded into the banner (treated conservatively as not-confirmed, never
-   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
-   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   * Whether the Castle Wall USERSPACE DAEMON started during this wrap.
+   * `true` => daemon started - which says NOTHING about enforcement (on a
+   * Mac with no approved system extension the daemon starts and filters
+   * nothing); `false` => the loud "NOT armed" warning fired and traffic is
+   * not being filtered; `undefined` => no signal was threaded into the
+   * banner (treated conservatively). Daemon start alone NEVER earns the
+   * affirmative "protected / Castle Wall Full" hero; that requires
+   * `castleWallEnforcementObserved` (F4, v1.6.1 first-run honesty).
    */
   castleWallArmed?: boolean;
+  /**
+   * Whether REAL enforcement evidence was observed: fresh adjudicated-flow
+   * evidence (egress_allowed / egress_blocked / operator_decision), judged
+   * by the SAME provenance- and producer-signature-gated standard the
+   * dashboard's feature-health panel uses. ONLY this (together with
+   * `castleWallArmed === true`) earns the affirmative "Your agent is
+   * protected. / Castle Wall Full" hero; daemon presence, heartbeats, and
+   * policy loads never do.
+   */
+  castleWallEnforcementObserved?: boolean;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1859,9 +1960,7 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`
   );
@@ -1880,13 +1979,20 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
   // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
-  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
-  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
-  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
-  // that is the exact overclaim the audit flagged (a green hero printed
-  // seconds after the loud "traffic NOT filtered" warning).
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
+  // affirmative "Castle Wall Full" hero claim for OBSERVED ENFORCEMENT
+  // (F4, v1.6.1): fresh adjudicated-flow evidence on the dashboard's
+  // standard, never daemon start alone. A daemon that merely started
+  // (`castleWallArmed === true`, no evidence) renders the honest
+  // "wrapped, but enforcement is not confirmed" hero; a failed start
+  // (`false`) or an absent signal (`undefined`) never renders "Full".
+  const enforcementObserved =
+    info.castleWallArmed === true &&
+    info.castleWallEnforcementObserved === true;
+  const castleWallLabel = renderCastleWallBannerLabel(
+    info.castleWallArmed,
+    enforcementObserved,
+  );
+  const heroPrefix = enforcementObserved
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
@@ -1909,15 +2015,44 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
 }
 
 /**
- * Render the Castle Wall segment of the wrap success banner from the real arm
- * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
- * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
- * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ * Render the Castle Wall segment of the wrap success banner from the real
+ * outcome. Honesty discipline (F4, v1.6.1): "Castle Wall Full" is only
+ * printed on OBSERVED ENFORCEMENT (fresh adjudicated-flow evidence on the
+ * dashboard's standard). A daemon that merely started renders "daemon
+ * started (enforcement not confirmed)"; a failed start renders a loud
+ * "NOT ARMED"; an absent signal renders "status unknown". Never "Full" on
+ * daemon presence alone.
  */
-function renderCastleWallBannerLabel(armed: boolean | undefined): string {
-  if (armed === true) return "Castle Wall Full";
+function renderCastleWallBannerLabel(
+  armed: boolean | undefined,
+  enforcementObserved: boolean,
+): string {
+  if (armed === true && enforcementObserved) return "Castle Wall Full";
+  if (armed === true) {
+    return "Castle Wall daemon started (enforcement not confirmed)";
+  }
   if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
   return "Castle Wall status unknown (not confirmed armed)";
+}
+
+/**
+ * Render the upstream tools/servers count line. F7 (v1.6.1 first-run
+ * honesty): on Hermes the counts derive from the legacy cli-config.json
+ * surface Hermes does not consult for MCP routing, so a first run would
+ * print "0 tools registered across 0 upstream servers" moments after the
+ * (correct) message that config.yaml entries are preserved. When the
+ * authoritative surface is the Hermes YAML and the legacy surface is empty,
+ * say what actually happened instead.
+ */
+function renderUpstreamCountLine(info: {
+  toolCount: number;
+  serverCount: number;
+  platform?: AgentPlatform;
+}): string {
+  if (info.platform === "hermes" && info.serverCount === 0) {
+    return "Sanctuary MCP routing installed in Hermes config.yaml (existing entries preserved)";
+  }
+  return `${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`;
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1930,12 +2065,19 @@ interface WrapSuccessNoDashboardInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /** See WrapSuccessInfo.platform; same platform-specific copy rules. */
+  platform?: AgentPlatform;
   passphraseLocation: string;
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
-  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
+  /** See WrapSuccessInfo.castleWallArmed; same daemon-start-only semantics. */
   castleWallArmed?: boolean;
+  /**
+   * See WrapSuccessInfo.castleWallEnforcementObserved; same
+   * evidence-only-affirmative discipline.
+   */
+  castleWallEnforcementObserved?: boolean;
 }
 
 /**
@@ -1958,9 +2100,7 @@ export function formatWrapSuccessNoDashboard(
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`,
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`,
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
   );
@@ -1970,10 +2110,17 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
-  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
+  // Honesty: same outcome discipline as formatWrapSuccess (F4, v1.6.1) \u2014
+  // reserve the affirmative "protected" / "Castle Wall Full" hero for
+  // observed enforcement evidence, never daemon start alone.
+  const enforcementObserved =
+    info.castleWallArmed === true &&
+    info.castleWallEnforcementObserved === true;
+  const castleWallLabel = renderCastleWallBannerLabel(
+    info.castleWallArmed,
+    enforcementObserved,
+  );
+  const heroPrefix = enforcementObserved
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
@@ -2202,6 +2349,19 @@ async function unwrap(dryRun: boolean): Promise<void> {
       }
     }
   }
+
+  // F6 (v1.6.1 wrap safety): a completed unwrap retires the wrap-meta
+  // pointer files, so "a wrap-meta exists" means "currently wrapped" and a
+  // FUTURE wrap records a fresh pristine backup instead of preserving a
+  // stale pointer (see saveWrapMeta). The backup files themselves stay.
+  const metaRemovalFailures = await removeWrapMeta();
+  for (const failedPath of metaRemovalFailures) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
+        `re-wrap may preserve a stale restore pointer. Remove it manually.`
+    );
+  }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
 }
@@ -2236,12 +2396,17 @@ function warnCastleWallDaemonNotStarted(err: unknown): void {
     lines.push(
       "",
       "  Castle Wall now signs through a root helper by default (A2/B2). To",
-      "  arm the wall, do ONE of:",
+      "  start the userspace daemon, do ONE of:",
       '    1. Install the Castle Wall app (one-time "Allow background item"',
       "       approval), then set SANCTUARY_CASTLE_SIGNER_CLIENT to its shim:",
       "       /Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
       "    2. To keep the legacy local-signing key, set SANCTUARY_CASTLE_LOCAL_SIGN=1",
       "  then re-run 'sanctuary wrap'.",
+      "",
+      "  NOTE: either option only starts the userspace daemon; that alone does",
+      "  NOT mean traffic is being filtered. Enforcement also needs the approved",
+      "  system extension, and is confirmed only by observed flow evidence on",
+      "  the dashboard's Castle Wall panel.",
     );
   } else {
     lines.push(

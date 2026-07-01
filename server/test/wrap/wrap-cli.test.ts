@@ -173,10 +173,13 @@ describe("formatWrapSuccess", () => {
     browserOpened: true,
     passphraseLocation: "macOS Keychain",
     passphraseSource: "generated",
-    // Honesty (audit seam #1): the "Your agent is protected / Castle Wall Full"
-    // hero is now reserved for an observed daemon arm. The baseline fixture
-    // models the armed case; the not-armed case is covered separately below.
+    // Honesty (F4, v1.6.1): the "Your agent is protected / Castle Wall Full"
+    // hero is reserved for OBSERVED ENFORCEMENT EVIDENCE (the dashboard's
+    // adjudicated-flow standard), never daemon start alone. The baseline
+    // fixture models the fully-observed case; the daemon-started-only and
+    // not-armed cases are covered separately below.
     castleWallArmed: true,
+    castleWallEnforcementObserved: true,
   };
 
   it("includes wrapped tool name and version", () => {
@@ -205,7 +208,7 @@ describe("formatWrapSuccess", () => {
     );
   });
 
-  it("includes the agent-protected summary line when Castle Wall armed", () => {
+  it("includes the agent-protected summary line on observed enforcement evidence", () => {
     const out = formatWrapSuccess(baseInfo);
     expect(out).toContain("Your agent is protected");
     expect(out).toContain("Castle Wall Full");
@@ -220,11 +223,47 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
+  // F4 (v1.6.1 first-run honesty): daemon start alone must NOT claim
+  // "protected" / "Castle Wall Full". On a Mac with no approved system
+  // extension the userspace daemon starts (e.g. via
+  // SANCTUARY_CASTLE_LOCAL_SIGN=1) and filters NOTHING; only observed
+  // adjudicated-flow evidence (the dashboard's standard) earns the
+  // affirmative hero.
+  it("does NOT claim protected / Full when the daemon started without enforcement evidence", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallEnforcementObserved: undefined,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain(
+      "Castle Wall daemon started (enforcement not confirmed)"
+    );
+    expect(out).toContain("enforcement is not confirmed");
+  });
+
+  // F4 defensive: an evidence signal without a started daemon is an
+  // inconsistent input; fail closed (never affirmative).
+  it("does NOT claim protected / Full when evidence is claimed but the daemon did not start", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallArmed: false,
+      castleWallEnforcementObserved: true,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
+  });
+
   // Honesty (audit seam #1): when the Castle Wall daemon failed to arm, the
   // banner must NOT claim "protected" / "Castle Wall Full" — that contradicted
   // the loud "traffic NOT filtered" warning printed seconds earlier.
   it("does NOT claim protected / Full when Castle Wall did not arm", () => {
-    const out = formatWrapSuccess({ ...baseInfo, castleWallArmed: false });
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallArmed: false,
+      castleWallEnforcementObserved: false,
+    });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall NOT ARMED");
@@ -239,6 +278,29 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall status unknown");
     expect(out).not.toContain("Your agent is protected");
+  });
+
+  // F7 (v1.6.1 first-run honesty): on Hermes the tool/server counts derive
+  // from the legacy cli-config.json surface Hermes does not consult for MCP
+  // routing; an empty legacy surface must not render "0 tools registered
+  // across 0 upstream servers" right after the config.yaml preservation
+  // message.
+  it("replaces the 0/0 upstream count line with the config.yaml routing line on Hermes", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      platform: "hermes",
+      toolCount: 0,
+      serverCount: 0,
+    });
+    expect(out).not.toContain("0 tools registered across 0 upstream servers");
+    expect(out).toContain(
+      "Sanctuary MCP routing installed in Hermes config.yaml"
+    );
+  });
+
+  it("keeps the real upstream count line on Hermes when the legacy surface has servers", () => {
+    const out = formatWrapSuccess({ ...baseInfo, platform: "hermes" });
+    expect(out).toContain("74 tools registered across 2 upstream servers");
   });
 
   it("includes the dashboard URL without the long-lived token", () => {
