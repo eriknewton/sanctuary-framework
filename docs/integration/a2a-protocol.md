@@ -44,7 +44,7 @@ from google.adk.tools.mcp_tool import MCPToolset, StdioServerParams
 sanctuary_tools = MCPToolset(
     connection_params=StdioServerParams(
         command="npx",
-        args=["@sanctuary-framework/mcp-server"]
+        args=["-y", "@sanctuary-framework/mcp-server"]
     )
 )
 
@@ -64,7 +64,7 @@ from langchain_mcp import MCPToolkit
 
 toolkit = MCPToolkit(
     server_command="npx",
-    server_args=["@sanctuary-framework/mcp-server"]
+    server_args=["-y", "@sanctuary-framework/mcp-server"]
 )
 
 tools = toolkit.get_tools()
@@ -208,7 +208,7 @@ negotiation and agreement. Neither depends on the other, but they compose:
 ```python
 # Google ADK example with both
 sanctuary = MCPToolset(connection_params=StdioServerParams(
-    command="npx", args=["@sanctuary-framework/mcp-server"]
+    command="npx", args=["-y", "@sanctuary-framework/mcp-server"]
 ))
 concordia = MCPToolset(connection_params=StdioServerParams(
     command="python3", args=["-m", "concordia"]

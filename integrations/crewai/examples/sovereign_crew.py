@@ -33,7 +33,7 @@ researcher = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/researcher"},
             "transport": "stdio",
         }
@@ -58,7 +58,7 @@ reviewer = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/reviewer"},
             "transport": "stdio",
         }

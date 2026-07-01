@@ -44,7 +44,7 @@ Add Sanctuary to your OpenClaw MCP config:
   "mcpServers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"]
+      "args": ["-y", "@sanctuary-framework/mcp-server"]
     }
   }
 }

@@ -23,6 +23,7 @@ import {
   HermesYamlUnsupportedError,
 } from "../../src/wrap/hermes-yaml.js";
 import { runWrap } from "../../src/wrap/cli.js";
+import { SANCTUARY_VERSION } from "../../src/config.js";
 import { findLatestBackup } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
@@ -304,7 +305,10 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
     expect(yamlContainsSanctuaryEntry(yaml)).toBe(true);
     expect(yaml).toContain("# user notes");
     expect(yaml).toContain("  weather:");
-    expect(yaml).toContain('- "@sanctuary-framework/mcp-server"');
+    expect(yaml).toContain(
+      `- "@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}"`
+    );
+    expect(yaml).toContain('- "sanctuary"');
 
     // JSON surface kept for forward-compat.
     const json = JSON.parse(await readFile(jsonPath, "utf-8"));

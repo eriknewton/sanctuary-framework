@@ -1221,8 +1221,8 @@ function printWrapHelpEarly(): void {
                        harness. Use this for the clean operator setup
                        (one persistent dashboard + many wraps).
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
-                       local Sanctuary build (\`node <path>\` instead of
-                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       local Sanctuary build (\`node <path>\` instead of the
+                       version-pinned npx registry entry). Required
                        when testing an unpublished branch; the published
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.

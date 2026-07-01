@@ -97,12 +97,16 @@ export function isNewerVersion(current: string, latest: string): boolean {
 
 /**
  * Format the update notification message.
+ *
+ * The suggested command pins the exact version the message announces
+ * (v1.6.1 install-path hardening): the operator runs precisely what was
+ * advertised, not whatever `latest` resolves to by the time they act.
  */
 export function formatUpdateMessage(
   current: string,
   latest: string
 ): string {
-  return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@latest`;
+  return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@${latest}`;
 }
 
 /**

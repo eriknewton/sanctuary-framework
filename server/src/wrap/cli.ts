@@ -164,10 +164,11 @@ export interface WrapOptions {
   noDashboard?: boolean;
   /**
    * Dogfood path (`--dev-dist <path>`): point the harness MCP
-   * config entry at a local Sanctuary build instead of `npx
-   * @sanctuary-framework/mcp-server`. Without this, an unpublished branch
-   * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
-   * because npx pulls from the registry, not from the local checkout.
+   * config entry at a local Sanctuary build instead of the
+   * version-pinned npx registry entry. Without this, an unpublished
+   * branch (e.g. an in-flight PR) gets shadowed by the npm-resolved
+   * version because npx pulls from the registry, not from the local
+   * checkout.
    *
    * Pass the absolute path to the build's `dist/cli.js`. The wrap CLI
    * registers `node <path>` as the `sanctuary` command. `--dev-dist`
@@ -303,6 +304,20 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
  * (e.g. an in-flight PR) gets shadowed by the npm-resolved version
  * because npx pulls from the registry. Published-version wraps omit
  * the flag and use the npx default unchanged.
+ *
+ * Published-version form (v1.6.1 install-path hardening, F2): the entry
+ * is PINNED to the version of the server that performed the wrap and
+ * names the `sanctuary` bin explicitly via `-p <pkg>@<version> sanctuary`.
+ * Two failure modes of the previous bare
+ * `npx @sanctuary-framework/mcp-server` form drove this:
+ * 1. npm's multi-bin resolution could not pick an executable for the
+ *    bare package name (dead at spawn on npm >= 7 for v1.4.0..v1.6.0).
+ * 2. An unpinned entry re-resolves to `latest` at every cold npx run,
+ *    so what the operator approved at wrap time is silently swapped
+ *    for whatever the registry serves later (no version custody).
+ * `-y` keeps the non-interactive MCP spawn from wedging on the npx
+ * install prompt. Upgrades re-run `sanctuary protect`, which rewrites
+ * the pin to the new version.
  */
 function resolveSanctuaryCommand(options: WrapOptions): {
   command: string;
@@ -311,7 +326,14 @@ function resolveSanctuaryCommand(options: WrapOptions): {
   const useDevDist = options.devDist !== undefined;
   return {
     command: useDevDist ? "node" : "npx",
-    args: useDevDist ? [options.devDist!] : ["@sanctuary-framework/mcp-server"],
+    args: useDevDist
+      ? [options.devDist!]
+      : [
+          "-y",
+          "-p",
+          `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+          "sanctuary",
+        ],
   };
 }
 
@@ -2637,8 +2659,8 @@ function printWrapHelp(): void {
                        Equivalent to running
                        \`sanctuary transparency anchor enable\` later.
     --dev-dist <path>  Dogfood path. Point the harness MCP entries at a
-                       local Sanctuary build (\`node <path>\` instead of
-                       \`npx @sanctuary-framework/mcp-server\`). Required
+                       local Sanctuary build (\`node <path>\` instead of the
+                       version-pinned npx registry entry). Required
                        when testing an unpublished branch; the published
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.

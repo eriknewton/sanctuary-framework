@@ -37,7 +37,7 @@ async def main():
         {
             "sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server"],
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
                 "transport": "stdio",
             }
         }

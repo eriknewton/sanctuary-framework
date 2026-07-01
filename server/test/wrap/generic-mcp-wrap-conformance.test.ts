@@ -29,6 +29,19 @@ import {
   writeCustodyEnvelope,
 } from "../../src/core/master-custody.js";
 import { readPersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
+import { SANCTUARY_VERSION } from "../../src/config.js";
+
+/**
+ * The published-version MCP entry the wrap writes (v1.6.1 install-path
+ * hardening, F2): version-pinned, explicit `sanctuary` bin, `-y` for the
+ * non-interactive spawn.
+ */
+const PINNED_SANCTUARY_ARGS = [
+  "-y",
+  "-p",
+  `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+  "sanctuary",
+];
 
 const PASSPHRASE_SECRET = "codex-fixture-passphrase-secret-2026-06-22";
 const AGENT_PRIVATE_KEY_SECRET =
@@ -137,7 +150,7 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers?.beta).toEqual(original.mcpServers.beta);
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
-      args: ["@sanctuary-framework/mcp-server"],
+      args: PINNED_SANCTUARY_ARGS,
     });
 
     const profile = JSON.parse(
@@ -200,7 +213,7 @@ describe("generic MCP wrap conformance", () => {
     });
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
-      args: ["@sanctuary-framework/mcp-server"],
+      args: PINNED_SANCTUARY_ARGS,
     });
     expect(
       readPersistedLocalAgents(process.env.SANCTUARY_STORAGE_PATH!)[0]?.harness,
@@ -226,7 +239,7 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers).toEqual({
       sanctuary: {
         command: "npx",
-        args: ["@sanctuary-framework/mcp-server"],
+        args: PINNED_SANCTUARY_ARGS,
       },
     });
     expect(

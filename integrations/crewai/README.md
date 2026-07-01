@@ -32,7 +32,7 @@ sovereign_agent = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "transport": "stdio",
         }
     ],
@@ -72,7 +72,7 @@ async def run():
         {
             "sanctuary": {
                 "command": "npx",
-                "args": ["@sanctuary-framework/mcp-server"],
+                "args": ["-y", "@sanctuary-framework/mcp-server"],
                 "transport": "stdio",
             }
         }
@@ -134,7 +134,7 @@ analyst = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/analyst"},
             "transport": "stdio",
         }
@@ -149,7 +149,7 @@ negotiator = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/negotiator"},
             "transport": "stdio",
         }
@@ -210,7 +210,7 @@ negotiator = Agent(
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "transport": "stdio",
         },
         {

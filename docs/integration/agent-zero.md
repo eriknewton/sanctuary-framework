@@ -25,7 +25,7 @@ Edit your Agent Zero MCP server configuration:
   "mcp_servers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"],
+      "args": ["-y", "@sanctuary-framework/mcp-server"],
       "env": {
         "SANCTUARY_PASSPHRASE": "your-passphrase-here"
       }
@@ -128,7 +128,7 @@ shows Sanctuary tools in the "Available Tools" panel. Ask the agent:
   "mcp_servers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"],
+      "args": ["-y", "@sanctuary-framework/mcp-server"],
       "env": { "SANCTUARY_PASSPHRASE": "your-passphrase" }
     },
     "concordia": {
