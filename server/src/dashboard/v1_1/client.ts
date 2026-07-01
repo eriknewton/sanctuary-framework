@@ -44,6 +44,7 @@ const cfgEl = document.getElementById("dashboard-config");
 const config = cfgEl ? JSON.parse(cfgEl.textContent || "{}") : {};
 const HUB = config.hubApiBase || "/api/hub";
 const AUTO_TRIGGER = "/api/auto-trigger";
+const POLICY = "/api/policy";
 const INBOX_PREFS = "/api/inbox/unified/prefs";
 const STREAM = config.streamUrl || "/api/stream";
 let TOKEN = config.authToken || sessionStorage.getItem("authToken") || "";
@@ -63,6 +64,10 @@ const state = {
   activity: [],
   policies: [],
   autoTrigger: { rules: [], recommendations: [], loadError: null, savingRuleId: null },
+  // Tunability UX: plain-English view of the LIVE Principal Policy, fetched
+  // from the operator-bearer-gated GET /api/policy/current. null until first
+  // load; loadError carries a truthful failure message. Read-only surface.
+  policyView: { view: null, loadError: null, loading: false },
   templateBinding: { agentId: null, selectedTemplateId: null, pendingItemId: null, error: null },
   privacyEvents: [],
   handoffEvents: [],
@@ -282,6 +287,43 @@ async function autoTriggerApi(path, opts) {
   return body;
 }
 
+// Tunability UX: all /api/policy/* calls (plain-English view + promote)
+// go through here. Same operator-bearer gate as api(): the token is read
+// from sessionStorage at runtime and sent as the Authorization header;
+// it is NEVER embedded in served HTML. A 401 on a mutation re-prompts for
+// the operator token once, exactly like api(). There is no loopback
+// shortcut and no second, weaker path: the server runs authMiddleware
+// then requireOperatorCredential on every sensitive policy route.
+async function policyApi(path, opts) {
+  const init = Object.assign({ headers: {} }, opts || {});
+  if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
+  if (init.body && typeof init.body !== "string") {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(init.body);
+  }
+  init.cache = "no-store";
+  init.headers["Cache-Control"] = "no-cache";
+  init.headers["Pragma"] = "no-cache";
+  let url = POLICY + path;
+  const method = (init.method || "GET").toUpperCase();
+  if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+  let res = await fetch(url, init);
+  if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
+    init.headers["Authorization"] = "Bearer " + TOKEN;
+    res = await fetch(url, init);
+  }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) {
+    const detail = body && (body.detail || body.error) ? (body.detail || body.error) : ("HTTP " + res.status);
+    const err = new Error(detail);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
 async function createStreamSessionQuery() {
   if (!TOKEN) return "";
   const res = await fetch("/auth/session", {
@@ -472,6 +514,35 @@ function setRoute(route) {
   });
   renderMain();
   renderFortress();
+  // Tunability UX: entering the Policy surface loads the LIVE plain-English
+  // policy from the operator-bearer-gated GET /api/policy/current. Fired
+  // fire-and-forget; loadPolicyView rerenders when the view arrives.
+  if (route === "policy") void loadPolicyView();
+}
+
+// Tunability UX: fetch the plain-English rendering of the LIVE Principal
+// Policy from the operator-bearer-gated GET /api/policy/current. Read-only.
+// On failure it records a truthful loadError rather than showing a
+// fabricated policy. Never exposes an agent-readable path: policyApi()
+// sends the operator bearer and the server gates the route.
+async function loadPolicyView() {
+  state.policyView.loading = true;
+  state.policyView.loadError = null;
+  try {
+    const r = await policyApi("/current", { method: "GET" });
+    state.policyView.view = (r && r.data && r.data.view) || null;
+  } catch (e) {
+    state.policyView.view = null;
+    state.policyView.loadError =
+      e.status === 401 || e.status === 403
+        ? "Operator token required to view your policy."
+        : e.status === 503
+          ? "Policy engine is not configured on this fortress."
+          : (e.message || "Could not load policy.");
+  } finally {
+    state.policyView.loading = false;
+    if (state.route === "policy") rerender();
+  }
 }
 
 // Renders the global attestation badge (Q1 layer 1, persistent across
@@ -2008,6 +2079,47 @@ async function onAgentInspectOpen(agentId) {
 }
 
 // ── Render: policy ─────────────────────────────────────────────────────
+
+// Tunability UX: the LIVE Principal Policy rendered in plain English, so the
+// operator can SEE what their fine-grained policy actually does without
+// reading manifest YAML. Read-only view (editing is guided elsewhere). The
+// data comes from the operator-bearer-gated GET /api/policy/current; a
+// co-resident agent cannot reach it, upholding AGENTS.md hard rule 7.
+const POLICY_SECTION_TITLES = {
+  approval: "Always asks you first",
+  auto_allow: "Agents may do freely",
+  anomaly: "Unusual-behavior rules",
+  channel: "How approvals reach you"
+};
+const POLICY_SECTION_ORDER = ["approval", "auto_allow", "anomaly", "channel"];
+function renderPolicyPlainEnglishPanel() {
+  const pv = state.policyView;
+  let body;
+  if (pv.loadError) {
+    body = '<p class="muted">' + escHtml(pv.loadError) + '</p>';
+  } else if (!pv.view) {
+    body = '<p class="muted">' + (pv.loading ? "Loading your policy." : "Your policy will appear here.") + '</p>';
+  } else {
+    const lines = pv.view.lines || [];
+    const sections = POLICY_SECTION_ORDER.map(function (sec) {
+      const secLines = lines.filter(function (l) { return l.section === sec; });
+      if (!secLines.length) return "";
+      return '<div class="policy-plain-section">' +
+        '<h3>' + escHtml(POLICY_SECTION_TITLES[sec] || sec) + '</h3>' +
+        '<ul class="policy-plain-list">' +
+        secLines.map(function (l) { return '<li>' + escHtml(l.text) + '</li>'; }).join("") +
+        '</ul>' +
+      '</div>';
+    }).join("");
+    body = sections || '<p class="muted">No rules configured yet.</p>';
+  }
+  return '<section class="policy-panel policy-plain-english">' +
+    '<h2>Your policy in plain English</h2>' +
+    '<p class="muted">This is what your fine-grained policy does right now. It is read-only here; tune it by approving from the queue or editing a rule.</p>' +
+    body +
+  '</section>';
+}
+
 function renderPolicyCenter() {
   const tmplCards = CHANNEL_TEMPLATES.map(function (t) {
     return '<article class="template-card">' +
@@ -2043,6 +2155,7 @@ function renderPolicyCenter() {
     '<p class="eyebrow">POLICY CENTER</p>' +
     '<h1>One screen for every rule</h1>' +
     '<p class="policy-subtitle">Templates, per-agent rules, egress allowlists, retention, budgets, and privacy-minimization settings. Edits write a signed receipt; agents pick up changes within one tool-call cycle.</p>' +
+    renderPolicyPlainEnglishPanel() +
     '<section class="policy-panel"><h2>Channel templates · ' + CHANNEL_TEMPLATES.length + ' shipped</h2><div class="template-grid">' + tmplCards + '</div></section>' +
     '<section class="policy-panel"><h2>Per-agent rules</h2>' +
       '<div class="rules-scroll"><table class="rules-table">' +
@@ -2369,14 +2482,47 @@ function renderRecognitionHealthCard() {
 function renderApprovalTile(i) {
   const text = renderTemplate(i.display_template_id, i.display_template_args);
   const agentId = i.agent_id || (i.display_template_args && i.display_template_args.agent_id) || "this fortress";
+  // Tunability UX: "always allow this" promotes the one-time approval into
+  // a durable standing rule so each interruption teaches the wall instead of
+  // nagging the operator into disabling it. The promote issues the SAME
+  // operator-bearer-gated api() request path as approve/deny and lands on the
+  // REAL english-policy activator (compile -> activate), which runs the
+  // conflict-detector and the #805 downgrade gate server-side. It is offered
+  // ONLY for operations that name a promotable category; policy_change and
+  // other non-operation approvals are not promotable and omit the button.
+  const promotable = promotableOperation(i);
+  const promoteBtn = promotable
+    ? '<button class="btn btn-sm at-promote" data-action="inbox-promote" data-item-id="' + escHtml(i.item_id) + '" title="Turn this into a standing rule so agents can do it without asking you again.">Always allow</button>'
+    : '';
   return '<div class="approval-tile" data-approval-tile="' + escHtml(i.item_id) + '">' +
     '<div class="at-what">' + escHtml(text) + '</div>' +
     '<div class="at-agent"><span class="ad"></span>' + escHtml(agentId) + '</div>' +
     '<div class="at-actions">' +
       '<button class="btn btn-sm at-approve" data-action="inbox-approve" data-item-id="' + escHtml(i.item_id) + '">Approve</button>' +
       '<button class="btn btn-sm at-deny" data-action="inbox-deny" data-item-id="' + escHtml(i.item_id) + '">Deny</button>' +
+      promoteBtn +
     '</div>' +
   '</div>';
+}
+
+// The operation an approval names, when it maps to a promotable standing
+// rule. Returns null for approvals with no concrete operation to promote
+// (e.g. policy_change, lockdown, unwrap). Kept in sync with the server
+// deterministic compiler, which recognizes "auto-allow <snake_case_op>".
+const NON_PROMOTABLE_OPERATIONS = {
+  policy_change: true,
+  lockdown: true,
+  unwrap: true
+};
+function promotableOperation(i) {
+  const op = i && i.operation_category;
+  if (typeof op !== "string" || op.length === 0) return null;
+  if (NON_PROMOTABLE_OPERATIONS[op]) return null;
+  // Server compiler pattern is /^auto-allow [a-z][a-z0-9_]*$/. Guard the
+  // client side to the same shape so we never send a payload the compiler
+  // would low-confidence-reject.
+  if (!/^[a-z][a-z0-9_]*$/.test(op)) return null;
+  return op;
 }
 
 function renderFortress() {
@@ -2997,6 +3143,102 @@ async function onInboxAction(itemId, action) {
   }
 }
 
+// Tunability UX: promote a pending approval into a durable standing rule.
+// ONE guided action, backed by the REAL english-policy activator (no stub,
+// no parallel path):
+//   1. POST /api/policy/compile      -> deterministic "auto-allow <op>"
+//                                        yields a tier3_add_operation draft.
+//   2. POST /api/policy/drafts/:id/activate
+//                                     -> the SAME EnglishPolicyActivator the
+//                                        Xi-2 lifecycle uses. Server-side it
+//                                        runs the conflict-detector AND the
+//                                        #805 config-downgrade gate, so a
+//                                        promotion that would WEAKEN posture
+//                                        is refused (or requires the explicit
+//                                        audited override) and every promote
+//                                        emits an audit event.
+// Both requests carry the operator bearer via policyApi(); a co-resident
+// agent on loopback cannot promote by network position alone. This never
+// creates an agent-readable policy path (AGENTS.md hard rule 7): the agent
+// sees only the generic gate denial, never the promoted rule.
+async function onInboxPromote(itemId) {
+  const item = state.inbox.find(function (x) { return x.item_id === itemId; });
+  if (!item) return;
+  const op = promotableOperation(item);
+  if (!op) {
+    toast("This approval cannot be turned into a standing rule.", "error");
+    return;
+  }
+  try {
+    // Step 1: compile the standing rule from plain English. The compiler
+    // recognizes "auto-allow <op>" deterministically (high confidence), so
+    // no substrate call is needed and the draft is inspectable.
+    const compiled = await policyApi("/compile", {
+      method: "POST",
+      body: { english_text: "auto-allow " + op }
+    });
+    const draft = compiled && compiled.data && compiled.data.draft;
+    if (!draft || !draft.draft_id) {
+      toast("Could not prepare a rule for " + op + ".", "error");
+      return;
+    }
+    // Step 2: activate the draft through the REAL activator. The server
+    // enforces conflict detection + the #805 downgrade gate; we surface its
+    // decision honestly rather than pretending success.
+    await activateStandingRule(draft.draft_id, op, false);
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) {
+      toast("Operator token required to change policy.", "error");
+    } else if (e.status === 503) {
+      toast("Policy engine is not configured on this fortress.", "error");
+    } else {
+      toast("Could not add standing rule: " + e.message, "error");
+    }
+  }
+}
+
+// Activate a compiled standing-rule draft. On a #805 posture-downgrade
+// refusal (409), the operator is asked to explicitly confirm; ONLY then do
+// we retry with the audited override. The gate is never bypassed silently:
+// a refused promote either stops or goes through the operator-confirmed,
+// server-audited (policy_force_downgrade_used) path.
+async function activateStandingRule(draftId, op, force) {
+  const path = "/drafts/" + encodeURIComponent(draftId) + "/activate" +
+    (force ? "?override_downgrade=true" : "");
+  try {
+    const activated = await policyApi(path, { method: "POST", body: {} });
+    const status = activated && activated.data && activated.data.status;
+    if (status === "activated") {
+      toast(force
+        ? "Standing rule added (you confirmed it relaxes protection)."
+        : "Standing rule added: agents may " + op + " without asking.");
+      if (state.route === "policy") await loadPolicyView();
+      await fetchAll();
+      rerender();
+    } else {
+      toast("Rule not activated (" + (status || "refused") + ").", "error");
+    }
+  } catch (e) {
+    if (e.status === 409 && !force) {
+      // The downgrade gate refused because the rule would WEAKEN protection.
+      // Confirm explicitly, then retry through the audited override path.
+      const ok = window.confirm(
+        "This rule would relax your protection so agents can " + op +
+        " without asking you. This is recorded in your audit log. Add it anyway?");
+      if (ok) return activateStandingRule(draftId, op, true);
+      toast("Kept your protection: no standing rule added.");
+      return;
+    }
+    if (e.status === 401 || e.status === 403) {
+      toast("Operator token required to change policy.", "error");
+    } else if (e.status === 503) {
+      toast("Policy engine is not configured on this fortress.", "error");
+    } else {
+      toast("Could not add standing rule: " + e.message, "error");
+    }
+  }
+}
+
 async function onInboxBatchAction(action, until) {
   const ids = Object.keys(state.inboxOps.selected).filter(function (id) { return state.inboxOps.selected[id]; });
   if (ids.length === 0) return;
@@ -3412,6 +3654,13 @@ document.addEventListener("click", function (ev) {
     const input = document.querySelector('[data-action="inbox-snooze-custom"]');
     const raw = input && input.value ? input.value : "";
     return void onInboxBatchAction("snooze", raw ? new Date(raw).toISOString() : new Date(Date.now() + 3600000).toISOString());
+  }
+  // Tunability UX: promote-to-standing-rule. Intercepted BEFORE the generic
+  // inbox-* -> onInboxAction slice below, because promote is NOT an
+  // /inbox/:id/<action> hub mutation; it runs the compile -> activate flow
+  // on the real english-policy activator via policyApi().
+  if (action === "inbox-promote" && itemId) {
+    return void onInboxPromote(itemId);
   }
   if (action.indexOf("inbox-") === 0 && itemId) {
     const sub = action.slice("inbox-".length);
