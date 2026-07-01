@@ -10,6 +10,7 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import {
   classifyApprovalRequest,
+  COOPERATIVE_DENIAL_DISCOVERY_HINT,
   fixedDenial,
   fingerprintIdentityId,
   OpaqueNamespaceRegistry,
@@ -652,6 +653,7 @@ describe("agent-native Phase 1 safety base", () => {
       remediation_class: "wait",
       retry_after: "minutes",
       audit_ref: "audit:ref",
+      discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
     });
     expect(fixedDenial("audit:ref").retry_after).toBeNull();
   });

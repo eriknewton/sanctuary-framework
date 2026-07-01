@@ -529,6 +529,7 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_recall",
     "sanctuary_hide",
     "sanctuary_help",
+    "sanctuary_capabilities", // Read-only static catalog - no side effects, stays Tier 3
     "sanctuary_who_am_i",
     "sanctuary_active_protections",
     "sanctuary_events_open_cursor",

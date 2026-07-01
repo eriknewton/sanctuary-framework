@@ -87,6 +87,7 @@
     "reputation_record",
     "sanctuary_active_protections",
     "sanctuary_audit_search",
+    "sanctuary_capabilities",
     "sanctuary_distress",
     "sanctuary_events_close",
     "sanctuary_events_open_cursor",

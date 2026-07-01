@@ -7,6 +7,7 @@ import {
 import type { IdentityManager } from "../cognitive/tools.js";
 import { toolResult, type ToolDefinition } from "../router.js";
 import type { StorageBackend } from "../storage/interface.js";
+import { COOPERATIVE_CAPABILITIES } from "./capabilities-catalog.js";
 import {
   ApprovalProofStore,
   approvalEnvelopeHash,
@@ -708,7 +709,7 @@ export function createAgentNativeCooperativeTools(
     },
     {
       name: "sanctuary_help",
-      description: "Given a free-text intent, return static safety-class guidance on which Sanctuary tools to use and how, including a runnable example for ordinary (non-gated) intents. Use to discover the right tool before acting. Read-only; returns the classified guidance plus an audit_ref.",
+      description: "Given a free-text intent (e.g. \"save my timezone\", \"delete a stored secret\"), return which Sanctuary tool to use and how, including a runnable example for ordinary requests. This is the fastest way to find the sanctioned tool before acting; for the full tool catalog instead, call sanctuary_capabilities. Read-only; returns the guidance plus an audit_ref. Guidance is deliberately coarse for sensitive requests and never reveals policy internals.",
       tool_class: "read",
       inputSchema: {
         type: "object",
@@ -726,6 +727,29 @@ export function createAgentNativeCooperativeTools(
           return toolResult({ ...classified, probe_key: undefined, audit_ref: auditRef });
         } catch {
           return deny("audit:sanctuary_help", "wait");
+        }
+      },
+    },
+    {
+      name: "sanctuary_capabilities",
+      description: "Return the start-here catalog of Sanctuary's cooperative tools: for each tool, what it does and when to reach for it. Read-only, takes no arguments. Call this to discover what cooperative memory/identity/audit tools are available and route your work through them instead of ad-hoc state. The same catalog is also delivered in the MCP server instructions at connect time; this tool re-serves it on demand. Returns { capabilities: [{ tool, does, when }], audit_ref }.",
+      tool_class: "read",
+      inputSchema: { type: "object", properties: {} },
+      handler: async () => {
+        try {
+          const auditRef = await audit("sanctuary_capabilities", {
+            tool_count: COOPERATIVE_CAPABILITIES.length,
+          });
+          return toolResult({
+            capabilities: COOPERATIVE_CAPABILITIES.map((entry) => ({
+              tool: entry.tool,
+              does: entry.does,
+              when: entry.when,
+            })),
+            audit_ref: auditRef,
+          });
+        } catch {
+          return deny("audit:sanctuary_capabilities", "wait");
         }
       },
     },
