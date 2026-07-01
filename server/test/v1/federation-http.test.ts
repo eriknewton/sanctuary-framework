@@ -609,7 +609,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       version: 1,
       master_private_key: materials.masterSecret,
     });
-    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+    await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
     const approvals = signApprovals(guardians, 3, "edge-quorum-ok", roster.version);
     const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {
@@ -642,7 +642,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       version: 1,
       master_private_key: materials.masterSecret,
     });
-    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+    await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
     // Only 2 valid approvals against an M=3 roster.
     const approvals = signApprovals(guardians, 2, "edge-under-threshold", roster.version);
@@ -681,7 +681,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       version: 1,
       master_private_key: materials.masterSecret,
     });
-    rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
+    await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
     // Requirement is on but the operator omits the guardian_approvals field.
     const res = await fetch(`${rig.baseUrl}/v1/federation/revoke`, {

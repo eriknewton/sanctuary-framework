@@ -129,6 +129,7 @@ import {
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
 import type { GuardianRevocationRequirement } from "../v1/federation-revocation-guardian-gate.js";
+import { verifyGuardianRoster } from "../mesh/guardian/guardian-roster.js";
 import {
   FEDERATION_POLICY_BUNDLE_EVENT_KIND,
   foldFederationPolicyBundleEvent as foldVerifiedFederationPolicyBundleEvent,
@@ -619,6 +620,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private _federationGuardianRevocationRequirement:
     | GuardianRevocationRequirement
     | null = null;
+  /**
+   * FAIL-CLOSED latch for the persisted guardian revocation requirement. Set
+   * true when a requirement WAS persisted at rest but its fortress-master-signed
+   * roster did NOT re-verify against the current pinned master on rehydrate
+   * (at-rest tamper, wrong-fortress roster, or a roster stale after a legitimate
+   * master rotation). While true the revoke/kill path must REFUSE every
+   * revocation rather than silently drop to single-operator kill (AGENTS.md
+   * constraint 5): a configured M-of-N requirement that cannot be verified must
+   * not evaporate. Cleared only by a clean rehydrate or an explicit operator
+   * re-pin via {@link setFederationGuardianRevocationRequirement}.
+   */
+  private _federationGuardianRevocationRequirementInvalid = false;
   private readonly _federationRoster = new Set<string>();
   private _federationState: FederationDashboardState = {
     eventLog: [],
@@ -1960,10 +1973,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * (off). This is an additive precondition only: it never relaxes the existing
    * operator-signature gate on revoke.
    */
-  setFederationGuardianRevocationRequirement(
+  async setFederationGuardianRevocationRequirement(
     requirement: GuardianRevocationRequirement | null,
-  ): void {
+  ): Promise<void> {
     this._federationGuardianRevocationRequirement = requirement;
+    // An explicit operator (re-)pin or clear supersedes any prior fail-closed
+    // latch: the operator is asserting the current requirement directly.
+    this._federationGuardianRevocationRequirementInvalid = false;
+    // Persist so the requirement SURVIVES A RESTART. Without this the M-of-N
+    // guarantee would evaporate on the next reboot and silently revert to
+    // single-operator kill. THROWS on a durable-write failure so the operator's
+    // opt-in is not acknowledged unless it durably committed (fail-closed write).
+    await this.persistFederationSyncState();
   }
 
   /** True when federation materials are bound (issuer or joiner context). */
@@ -2081,6 +2102,53 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ),
     };
     this.projectAppliedPoliciesOntoRoster();
+    this.rehydrateGuardianRevocationRequirement(
+      snapshot.guardianRevocationRequirement,
+    );
+  }
+
+  /**
+   * Restore the operator's guardian revocation requirement from the durable
+   * snapshot, FAIL-CLOSED. The persisted requirement carries the
+   * fortress-master-signed roster verbatim; we re-verify that signature against
+   * the CURRENT pinned master before enforcing it.
+   *
+   *   - snapshot has NO requirement -> clear the live requirement + latch
+   *     (legacy single-operator revoke; not a downgrade).
+   *   - roster VERIFIES against the pinned master -> restore it and enforce.
+   *   - roster DOES NOT verify (at-rest tamper, wrong fortress, or a roster
+   *     stale after a legitimate master rotation) -> DO NOT restore it and DO NOT
+   *     drop to single-operator kill. Latch invalid so the revoke path refuses
+   *     every revocation until the operator re-pins a valid roster. Collapsing
+   *     this into "no requirement" would be a silent security downgrade.
+   *   - no pinned master available yet -> latch invalid (fail closed) rather than
+   *     enforce an unverified requirement.
+   */
+  private rehydrateGuardianRevocationRequirement(
+    persisted: GuardianRevocationRequirement | null,
+  ): void {
+    if (persisted === null) {
+      this._federationGuardianRevocationRequirement = null;
+      this._federationGuardianRevocationRequirementInvalid = false;
+      return;
+    }
+    const pinnedMaster = this._federationContext?.pinnedMasterPubkey ?? null;
+    if (pinnedMaster === null) {
+      // A requirement was persisted but we cannot verify it without the pinned
+      // master. Fail closed: latch invalid so the revoke path refuses.
+      this._federationGuardianRevocationRequirement = null;
+      this._federationGuardianRevocationRequirementInvalid = true;
+      return;
+    }
+    try {
+      verifyGuardianRoster(persisted.roster, pinnedMaster);
+    } catch {
+      this._federationGuardianRevocationRequirement = null;
+      this._federationGuardianRevocationRequirementInvalid = true;
+      return;
+    }
+    this._federationGuardianRevocationRequirement = persisted;
+    this._federationGuardianRevocationRequirementInvalid = false;
   }
 
   /**
@@ -2119,6 +2187,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           { ...marker },
         ]),
       ),
+      // Persist the operator's guardian revocation requirement so it survives a
+      // restart. Carries the fortress-master-signed roster verbatim so its
+      // signature can be re-verified against the pinned master on rehydrate.
+      guardianRevocationRequirement:
+        this._federationGuardianRevocationRequirement,
     };
   }
 
@@ -2272,9 +2345,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       federationPosture: () => this.buildFederationPostureSummary(),
       // DEFAULT-OFF: returns null unless the operator has opted in via
       // setFederationGuardianRevocationRequirement. When null the revoke handler
-      // skips the guardian gate entirely (legacy single-operator path).
-      requireGuardianRevocationSignOff: () =>
-        this._federationGuardianRevocationRequirement,
+      // skips the guardian gate entirely (legacy single-operator path). When a
+      // requirement was persisted but its roster failed to re-verify on
+      // rehydrate, returns the `{ unavailable: true }` sentinel so the handler
+      // FAILS CLOSED (refuses every revocation) instead of dropping to
+      // single-operator kill.
+      requireGuardianRevocationSignOff: () => {
+        if (this._federationGuardianRevocationRequirementInvalid) {
+          return { unavailable: true };
+        }
+        return this._federationGuardianRevocationRequirement;
+      },
       audit: async ({ operation, result, identityId, details }) => {
         try {
           await this.auditLog?.append("l2", operation, identityId, details, result);

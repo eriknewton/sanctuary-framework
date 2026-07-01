@@ -1,0 +1,279 @@
+/**
+ * Durable persistence codec for the OPTIONAL M-of-N guardian revocation
+ * requirement (competitor-readiness item 6: "no single person can kill the
+ * fleet").
+ *
+ * COMPOSITION ONLY. This module adds NO cryptography and NO new at-rest HKDF
+ * label. It is the encode/decode/verify seam that lets the existing durable
+ * federation security-state record ({@link FederationSyncStateStore}) carry the
+ * operator's guardian-revocation requirement so the requirement SURVIVES A
+ * RESTART. Before this seam the requirement lived in memory only
+ * (`_federationGuardianRevocationRequirement`), so a daemon restart silently
+ * reverted the fleet to single-operator kill: the "no single person can kill the
+ * fleet" guarantee evaporated on every reboot. That is the standing weakness this
+ * closes.
+ *
+ * WHY REUSE THE SYNC-STATE RECORD (no new HKDF label): the requirement is small,
+ * derived, per-fortress config that must survive rotate-master exactly like the
+ * revoked-node / revoked-root projections already persisted in that record. It
+ * rides in the SAME AES-256-GCM blob under the SAME purpose key, so it inherits:
+ *   - the AEAD tag (an at-rest tamper of the persisted roster fails decryption),
+ *   - the fail-closed load contract (a corrupt record THROWS; the caller denies),
+ *   - the rotate-master recipe coverage (no new label to register), and
+ *   - the cross-process monotonic merge.
+ *
+ * FAIL-CLOSED VERIFICATION ON LOAD: the persisted requirement carries the
+ * fortress-master-SIGNED guardian roster. On rehydrate the caller re-verifies
+ * that roster signature against the CURRENT pinned fortress-master via
+ * {@link verifyGuardianRoster}. If it does NOT verify (at-rest tamper that
+ * survived AEAD only via a same-key re-encrypt, a roster for a different
+ * fortress, or a stale roster after a legitimate master rotation), the caller
+ * MUST NOT silently drop to single-operator kill. {@link
+ * loadGuardianRevocationRequirement} returns a discriminated result so the caller
+ * can distinguish "no requirement configured" (legacy single-operator, allowed)
+ * from "a requirement is configured but its roster failed verification"
+ * (fail-closed: the revoke path must refuse every revocation until an operator
+ * re-pins a valid roster). Collapsing those two into "no requirement" would be a
+ * silent security downgrade (AGENTS.md constraint 5).
+ */
+
+import type { SignatureScheme } from "../mesh/constants.js";
+import { verifyGuardianRoster } from "../mesh/guardian/guardian-roster.js";
+import type {
+  GuardianIdentity,
+  GuardianRoster,
+} from "../mesh/guardian/types.js";
+import type { FortressMasterPublicKey } from "../mesh/types.js";
+import type { GuardianRevocationRequirement } from "./federation-revocation-guardian-gate.js";
+
+/**
+ * The at-rest JSON shape of a persisted guardian revocation requirement. Carries
+ * the whole fortress-master-signed roster verbatim (so its master signature can
+ * be re-verified on load) plus the optional pinned expected roster version.
+ *
+ * ADDITIVE + OPTIONAL on read: a record written before this field existed decodes
+ * to "no requirement configured" (the legacy single-operator revoke path). The
+ * AEAD tag of the enclosing sync-state record authenticates this sub-object; a
+ * tampered blob still fails closed at the enclosing decrypt.
+ */
+export interface PersistedGuardianRevocationRequirement {
+  /** Format version for forward-compat within the enclosing v1 record. */
+  v: 1;
+  /** The fortress-master-signed guardian roster (verbatim, re-verified on load). */
+  roster: PersistedGuardianRoster;
+  /** Optional pinned expected roster version (extra stale-roster guard). */
+  expected_roster_version?: number;
+}
+
+interface PersistedGuardianRoster {
+  m: number;
+  n: number;
+  guardians: GuardianIdentity[];
+  signature_scheme: SignatureScheme;
+  version: number;
+  created_at: string;
+  fortress_id: string;
+  master_signature: string;
+}
+
+/**
+ * Result of loading + verifying a persisted guardian revocation requirement.
+ *
+ *   - `kind: "none"`     -> no requirement was persisted (fresh fortress or an
+ *                           operator who never opted in). The revoke path runs the
+ *                           legacy single-operator path. NOT a security downgrade.
+ *   - `kind: "verified"` -> a requirement was persisted AND its roster signature
+ *                           verifies against the current pinned master. Enforce.
+ *   - `kind: "invalid"`  -> a requirement was persisted but its roster did NOT
+ *                           verify (tamper / wrong fortress / stale after master
+ *                           rotation). FAIL CLOSED: the caller must refuse every
+ *                           revocation, NOT silently drop to single-operator.
+ */
+export type LoadedGuardianRevocationRequirement =
+  | { kind: "none" }
+  | { kind: "verified"; requirement: GuardianRevocationRequirement }
+  | { kind: "invalid"; reason: string };
+
+/** Serialize a live requirement for at-rest persistence. */
+export function encodeGuardianRevocationRequirement(
+  requirement: GuardianRevocationRequirement,
+): PersistedGuardianRevocationRequirement {
+  const roster = requirement.roster;
+  const persisted: PersistedGuardianRevocationRequirement = {
+    v: 1,
+    roster: {
+      m: roster.m,
+      n: roster.n,
+      guardians: roster.guardians.map((g) => ({ ...g })),
+      signature_scheme: roster.signature_scheme,
+      version: roster.version,
+      created_at: roster.created_at,
+      fortress_id: roster.fortress_id,
+      master_signature: roster.master_signature,
+    },
+  };
+  if (requirement.expectedRosterVersion !== undefined) {
+    persisted.expected_roster_version = requirement.expectedRosterVersion;
+  }
+  return persisted;
+}
+
+/**
+ * Structurally decode a persisted requirement. Returns `undefined` when the field
+ * is absent (legitimate back-compat: no requirement configured) and throws only
+ * when the field is PRESENT but structurally malformed (never accept a
+ * half-decoded requirement, mirroring the enclosing record's fail-closed decode).
+ *
+ * This is STRUCTURE only; it does NOT verify the master signature. Signature
+ * re-verification against the pinned master happens in {@link
+ * verifyLoadedGuardianRevocationRequirement} because the pinned master is not
+ * available at pure-decode time.
+ */
+export function decodeGuardianRevocationRequirement(
+  value: unknown,
+): PersistedGuardianRevocationRequirement | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new GuardianRevocationPolicyDecodeError("requirement is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  if (obj.v !== 1) {
+    throw new GuardianRevocationPolicyDecodeError(
+      `unsupported requirement version: ${String(obj.v)}`,
+    );
+  }
+  const roster = decodeRoster(obj.roster);
+  const expectedRosterVersion = obj.expected_roster_version;
+  if (expectedRosterVersion !== undefined) {
+    if (
+      typeof expectedRosterVersion !== "number" ||
+      !Number.isSafeInteger(expectedRosterVersion) ||
+      expectedRosterVersion < 1
+    ) {
+      throw new GuardianRevocationPolicyDecodeError(
+        "expected_roster_version is invalid",
+      );
+    }
+  }
+  return {
+    v: 1,
+    roster,
+    ...(expectedRosterVersion !== undefined
+      ? { expected_roster_version: expectedRosterVersion }
+      : {}),
+  };
+}
+
+/**
+ * Verify a decoded persisted requirement against the pinned fortress-master and
+ * project it into the live {@link GuardianRevocationRequirement} the gate
+ * consumes. FAIL-CLOSED: a roster that does not verify yields `kind: "invalid"`,
+ * never a silent `kind: "none"`.
+ */
+export function verifyLoadedGuardianRevocationRequirement(
+  persisted: PersistedGuardianRevocationRequirement | undefined,
+  pinnedMaster: FortressMasterPublicKey,
+): LoadedGuardianRevocationRequirement {
+  if (persisted === undefined) return { kind: "none" };
+  const roster: GuardianRoster = { ...persisted.roster };
+  try {
+    verifyGuardianRoster(roster, pinnedMaster);
+  } catch (err) {
+    return {
+      kind: "invalid",
+      reason:
+        err instanceof Error ? err.message : "guardian roster failed to verify",
+    };
+  }
+  const requirement: GuardianRevocationRequirement = { roster };
+  if (persisted.expected_roster_version !== undefined) {
+    requirement.expectedRosterVersion = persisted.expected_roster_version;
+  }
+  return { kind: "verified", requirement };
+}
+
+function decodeRoster(value: unknown): PersistedGuardianRoster {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new GuardianRevocationPolicyDecodeError("roster is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const m = obj.m;
+  const n = obj.n;
+  const guardians = obj.guardians;
+  const signatureScheme = obj.signature_scheme;
+  const version = obj.version;
+  const createdAt = obj.created_at;
+  const fortressId = obj.fortress_id;
+  const masterSignature = obj.master_signature;
+  if (typeof m !== "number" || !Number.isSafeInteger(m) || m < 1) {
+    throw new GuardianRevocationPolicyDecodeError("roster m is invalid");
+  }
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 1) {
+    throw new GuardianRevocationPolicyDecodeError("roster n is invalid");
+  }
+  if (!Array.isArray(guardians)) {
+    throw new GuardianRevocationPolicyDecodeError("roster guardians is not an array");
+  }
+  const decodedGuardians = guardians.map((g) => decodeGuardian(g));
+  if (typeof signatureScheme !== "string" || signatureScheme.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("roster signature_scheme is invalid");
+  }
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    throw new GuardianRevocationPolicyDecodeError("roster version is invalid");
+  }
+  if (typeof createdAt !== "string" || createdAt.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("roster created_at is invalid");
+  }
+  if (typeof fortressId !== "string" || fortressId.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("roster fortress_id is invalid");
+  }
+  if (typeof masterSignature !== "string" || masterSignature.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("roster master_signature is invalid");
+  }
+  return {
+    m,
+    n,
+    guardians: decodedGuardians,
+    signature_scheme: signatureScheme as SignatureScheme,
+    version,
+    created_at: createdAt,
+    fortress_id: fortressId,
+    master_signature: masterSignature,
+  };
+}
+
+function decodeGuardian(value: unknown): GuardianIdentity {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new GuardianRevocationPolicyDecodeError("guardian is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const guardianId = obj.guardian_id;
+  const publicKey = obj.public_key;
+  const kind = obj.kind;
+  const invitedAt = obj.invited_at;
+  if (typeof guardianId !== "string" || guardianId.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("guardian_id is invalid");
+  }
+  if (typeof publicKey !== "string" || publicKey.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("guardian public_key is invalid");
+  }
+  if (typeof kind !== "string" || kind.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("guardian kind is invalid");
+  }
+  if (typeof invitedAt !== "string" || invitedAt.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError("guardian invited_at is invalid");
+  }
+  return {
+    guardian_id: guardianId,
+    public_key: publicKey,
+    kind,
+    invited_at: invitedAt,
+  };
+}
+
+export class GuardianRevocationPolicyDecodeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GuardianRevocationPolicyDecodeError";
+  }
+}
