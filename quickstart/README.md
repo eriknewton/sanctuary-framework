@@ -57,7 +57,7 @@ npx @sanctuary-framework/quickstart --name="My Agent" --yes
 ## How it works
 
 1. Generates an Ed25519 keypair locally.
-2. Derives a `did:key` DID from the public key (multicodec `0xed01`, base64url encoding).
+2. Derives a `did:key` DID from the public key (multicodec `0xed01`, base64url encoding). Note: this quickstart still emits the legacy base64url `did:key` shape; the full Sanctuary package now uses the canonical base58btc encoding under the `z` multibase prefix (see [`../docs/DID_ENCODING.md`](../docs/DID_ENCODING.md)).
 3. Saves the identity to `~/.sanctuary/quickstart-identity.json` with `0600` permissions.
 4. Builds a minimal Sovereignty Health Report describing the four sovereignty layers.
 5. Signs the SHR payload with your private key.
