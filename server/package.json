@@ -28,6 +28,7 @@
   "scripts": {
     "build": "node scripts/sign-reference-plugin.mjs && tsup && node scripts/copy-templates.js",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
+    "sign-release": "tsx scripts/sign-release-manifest.mjs",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "pretest": "npm run build",
