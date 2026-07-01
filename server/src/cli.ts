@@ -15,7 +15,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
-import { checkForUpdate } from "./update-check.js";
+import { checkForUpdate, checkForSignedUpdate } from "./update-check.js";
 import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
@@ -568,6 +568,14 @@ Commands:
     // Non-blocking update check. Fire and forget (checkForUpdate catches
     // all failures internally and never rejects).
     void checkForUpdate(PKG_VERSION);
+
+    // Non-blocking AUTHENTICATED update check. Fetches the signed release
+    // manifest from the GitHub Releases channel and verifies it against the
+    // PINNED release-signing key, advising only on a verified newer version.
+    // Inert (silent) while the pinned key is the all-zero placeholder; it
+    // fails closed on any unsigned/wrong-key/tampered/absent manifest. Fire
+    // and forget: it catches all failures internally and never rejects.
+    void checkForSignedUpdate(PKG_VERSION);
   } else {
     // HTTP transport (future implementation)
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.

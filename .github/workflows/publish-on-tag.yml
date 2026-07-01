@@ -45,8 +45,14 @@ jobs:
     name: publish
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       id-token: write
+
+    # Job-level env so the `if:` guards below can read env.RELEASE_SIGNING_KEY.
+    # A step's own `if:` cannot see that step's step-level env, so the secret is
+    # surfaced to env here once for the whole job.
+    env:
+      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
 
     steps:
       - name: Checkout
@@ -158,3 +164,40 @@ jobs:
       - name: Publish to npm
         working-directory: server
         run: npm publish --access public --tag "${{ steps.dist-tag.outputs.tag }}"
+
+      # Sign the release manifest and attach it to the GitHub Release.
+      #
+      # Custody = Option B (ratified 2026-07-01): the Ed25519 signing seed is a
+      # GitHub Actions secret (RELEASE_SIGNING_KEY), base64url of the 32-byte
+      # seed. The sign script reads it via SANCTUARY_RELEASE_SIGNING_KEY_B64URL,
+      # never logs it, and zeroes it after signing.
+      #
+      # PRE-ACTIVATION GUARD: while the secret is empty/absent (the state today,
+      # before Erik's key-activation), this step SKIPS cleanly with a clear log
+      # line and does NOT fail the publish. The workflow stays green with no
+      # secret set. Once the secret is populated, the step signs + uploads.
+      - name: Sign + attach release manifest
+        if: ${{ env.RELEASE_SIGNING_KEY != '' }}
+        working-directory: server
+        env:
+          SANCTUARY_RELEASE_SIGNING_KEY_B64URL: ${{ secrets.RELEASE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.verify-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm run sign-release -- "$VERSION" --out release-manifest.json
+          # Determine the release tag. Prefer the v-prefixed tag matching the
+          # version; fall back to the checked-out ref if it is already a tag.
+          tag="v${VERSION}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag not found; creating it."
+            gh release create "$tag" --title "$tag" --notes "Automated release. Signed manifest attached." --target "$GITHUB_SHA"
+          fi
+          gh release upload "$tag" release-manifest.json --clobber
+          echo "Attached signed release-manifest.json to release $tag."
+
+      - name: Signed manifest skipped (no signing key configured)
+        if: ${{ env.RELEASE_SIGNING_KEY == '' }}
+        run: |
+          echo "RELEASE_SIGNING_KEY secret is not set. Skipping signed-manifest generation and upload."
+          echo "This is expected PRE-ACTIVATION: the signed-update path stays inert until the release-signing key is activated."

@@ -59,8 +59,24 @@ export const UPDATE_MANIFEST_REFUSED_OP = "update.manifest.refused";
 const REGISTRY_URL =
   "https://registry.npmjs.org/@sanctuary-framework/mcp-server/latest";
 
+/**
+ * GitHub Releases API endpoint for the latest release of the source repo.
+ * The signed `release-manifest.json` is published as an asset on the release
+ * for each `vX.Y.Z` tag. This is a DISTINCT channel from the npm registry, so
+ * a registry compromise or MITM cannot forge a manifest that verifies against
+ * the pinned key.
+ */
+const GITHUB_LATEST_RELEASE_URL =
+  "https://api.github.com/repos/eriknewton/sanctuary-framework/releases/latest";
+
+/** The asset filename the signed manifest is published under. */
+const RELEASE_MANIFEST_ASSET_NAME = "release-manifest.json";
+
 /** Request timeout in milliseconds */
 const TIMEOUT_MS = 3000;
+
+/** Max bytes we will read from any single update-related HTTP response. */
+const MAX_RESPONSE_BYTES = 65536;
 
 /**
  * Compare two semver version strings (major.minor.patch only).
@@ -206,6 +222,157 @@ export async function verifyAndAdviseUpdate(
     }
   }
   return { advise: true, version: result.body.version };
+}
+
+/**
+ * GET a URL and resolve to its UTF-8 body text, or null on any failure.
+ * Bounded, timed, and non-throwing: any non-200 status, timeout, network
+ * error, or oversized body resolves to null (offline / unreachable = silent).
+ * A GitHub API call requires a User-Agent header or GitHub returns 403.
+ */
+function httpGetText(url: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const req = get(
+      url,
+      {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "sanctuary-mcp-server-update-check",
+        },
+        timeout: TIMEOUT_MS,
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume(); // drain
+          resolve(null);
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf-8");
+        res.on("data", (chunk: string) => {
+          data += chunk;
+          if (data.length > MAX_RESPONSE_BYTES) {
+            res.destroy();
+            resolve(null);
+          }
+        });
+        res.on("end", () => resolve(data));
+      },
+    );
+
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+/**
+ * Fetch the latest release's signed `release-manifest.json` from the GitHub
+ * Releases API and return its parsed (still-untrusted) JSON value, or null if
+ * unavailable. This performs NO verification; the returned value MUST be routed
+ * through `verifyAndAdviseUpdate` (which calls `verifyReleaseManifest`) before
+ * any advisory is emitted. Never throws; offline / missing asset = null.
+ */
+export async function fetchLatestSignedManifest(): Promise<unknown | null> {
+  const releaseJson = await httpGetText(GITHUB_LATEST_RELEASE_URL);
+  if (releaseJson === null) return null;
+
+  let release: unknown;
+  try {
+    release = JSON.parse(releaseJson);
+  } catch {
+    return null;
+  }
+  if (typeof release !== "object" || release === null) return null;
+
+  const assets = (release as { assets?: unknown }).assets;
+  if (!Array.isArray(assets)) return null;
+
+  let assetUrl: string | null = null;
+  for (const asset of assets) {
+    if (typeof asset !== "object" || asset === null) continue;
+    const a = asset as { name?: unknown; browser_download_url?: unknown };
+    if (
+      a.name === RELEASE_MANIFEST_ASSET_NAME &&
+      typeof a.browser_download_url === "string"
+    ) {
+      assetUrl = a.browser_download_url;
+      break;
+    }
+  }
+  if (assetUrl === null) return null;
+
+  const manifestText = await httpGetText(assetUrl);
+  if (manifestText === null) return null;
+
+  try {
+    return JSON.parse(manifestText);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Signed-update check: fetch the latest signed release manifest from the
+ * GitHub Releases channel, verify it against the PINNED release-signing key,
+ * and print an AUTHENTICATED update notice to stderr ONLY on `{ ok: true }`.
+ *
+ * Fail-closed (AGENTS.md invariant #5): on any refusal (unsigned, wrong-key,
+ * malformed, tampered, or simply absent/unreachable) this stays SILENT: it
+ * never falls through to a bare-npm advisory for the authenticated path. Both
+ * the verified and refused outcomes are audited when an audit sink is supplied.
+ *
+ * Fire-and-forget: never throws, never blocks startup. Respects
+ * SANCTUARY_NO_UPDATE_CHECK=1.
+ *
+ * With the pinned key still the all-zero placeholder, `verifyReleaseManifest`
+ * refuses with `bad_pinned_key`, so this function is INERT (silent) until the
+ * real key is activated. That inertness is intentional.
+ *
+ * @param currentVersion - the running version (advisory is suppressed unless
+ *   the verified manifest attests a strictly newer version)
+ * @param audit - optional audit sink; both paths are recorded when present
+ */
+export async function checkForSignedUpdate(
+  currentVersion: string,
+  audit?: UpdateAuditSink,
+): Promise<void> {
+  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") {
+    return;
+  }
+
+  try {
+    const manifestValue = await fetchLatestSignedManifest();
+    if (manifestValue === null) {
+      // Absent / unreachable manifest is a silent refusal: never a false
+      // advisory, and no fall-through to the bare npm notice.
+      if (audit) {
+        try {
+          await audit.append(
+            "l1",
+            UPDATE_MANIFEST_REFUSED_OP,
+            "system",
+            { reason: "unavailable" },
+            "failure",
+          );
+        } catch {
+          // Audit best-effort; the silent refusal stands regardless.
+        }
+      }
+      return;
+    }
+
+    const outcome = await verifyAndAdviseUpdate(manifestValue, audit);
+    if (outcome.advise && isNewerVersion(currentVersion, outcome.version)) {
+      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this authenticated advisory.
+      console.error(formatUpdateMessage(currentVersion, outcome.version));
+    }
+    // On refusal, or on a verified-but-not-newer manifest, stay silent.
+  } catch {
+    // Never fail the server over an update check.
+  }
 }
 
 /**
