@@ -16,42 +16,44 @@ headless arm/disarm (`sanctuary castle-wall enable|disable`, shipped in PR
 #448) is summarized in
 [castle-wall-headless-arm-design.md](castle-wall-headless-arm-design.md).
 
-## Phase 2 (Alpha-3) scope
+## Shipped capability
 
-What Phase 2 ships:
+This doc originally staged large parts of the flow as unbuilt "Phase 2 /
+Alpha-3 / Alpha-4" scope. Those have since shipped. What is live today (traced to
+ASSURANCE_MATRIX row 18 "Egress enforcement: macOS"):
 
-- Real verdict-emit wiring. Every flow decision the extension reaches
-  (`allow` / `drop` / `uncertain`) fires an IPC notification back to
-  Sanctuary main (`flow_decision_recorded` / `flow_pending_approval`).
-- Manifest hot-reload. When the operator's allowlist changes, the
-  extension's `ManifestStore` is replaced atomically and the verdict
-  cache clears in the same critical section.
-- Server-side UDS listener. Sanctuary main hosts the listener; the
-  extension connects as a client and registers as a manifest
-  subscriber.
-- Developer-ID-signed build pipeline. The extension is produced as a
-  Developer-ID-signed `.app` with hardened runtime + entitlements.
-  Notarization (`xcrun notarytool`) is operator-side and out of scope
-  for the build; the produced binary is notarization-ready.
+- **The system extension enforces per-uid allow/deny that survives reboot** on a
+  Developer-ID-signed + notarized + stapled binary, proven by the drills linked
+  in ASSURANCE_MATRIX row 18. Do not claim beyond that row (in particular this is
+  NOT tamper-evident per-flow audit).
+- **`.systemextension` bundle wrapping + install.** The signed `.app` is wrapped
+  and installed; the sysext is approved in System Settings and (on Tahoe)
+  toggled ON.
+- **Headless arm/disarm CLI.** `sanctuary castle-wall enable` / `disable` arm and
+  disarm the live content filter (SSH-safe after the one-time GUI consent),
+  shipped in PR #448.
+- **Safe-mode boot service.** `sudo sanctuary castle-wall install-boot` installs
+  a launchd boot service so a reboot does not come up deny-all with no daemon
+  (F1 Option C); see [castle-wall-macos-boot-service.md](castle-wall-macos-boot-service.md).
+- **Trust-anchor re-pin.** `sanctuary castle-wall re-pin` migrates the trust
+  anchor to the root signer helper's key.
+- **Real verdict-emit wiring + manifest hot-reload + server-side UDS listener**,
+  as described in the architecture section below.
 
-What is NOT in Phase 2 (deferred to a follow-up):
+For the end-to-end arm / verify / disarm sequence as an operator runbook, see
+[castle-wall-macos-arm-runbook.md](castle-wall-macos-arm-runbook.md).
 
-- `.systemextension` bundle wrapping. The Developer-ID-signed `.app`
-  is the substrate; wrapping it as a system-extension bundle inside
-  the operator's host application is part of the install scope.
-- Live operator demo against a loaded kernel extension. The Swift +
-  TypeScript test suites exercise every contract at the IPC + verdict
-  layers, but a real "wrapped agent attempts curl exfil and the wall
-  blocks at kernel boundary" demo requires the loaded extension and
-  is documented as a manual verification in this guide.
-- Full handshake signature round-trip. The Swift `IPCClient` is at
-  foundation scope: it receives the server's `handshake_challenge`
-  and treats arrival as handshake-complete without verifying the
-  server's signature. Hardening the round-trip is a separate PR.
-- `decision_response` operator-resume path for uncertain flows.
-  Uncertain verdicts return `.pause()` to the framework; resuming
-  the flow once the operator decides requires `resumeFlow(_:with:)`
-  wiring that lands with the install flow.
+Known bounds still owed (per ASSURANCE_MATRIX row 18, do NOT claim past these):
+
+- The TTL-expiry leg through the pure CLI `enable` path on Tahoe is still
+  inconclusive (the headless-arm wedge, W7-1); arm is proven via the GUI toggle +
+  safe-mode boot daemon.
+- Full IPC handshake signature round-trip: the Swift `IPCClient` receives the
+  server's `handshake_challenge` and treats arrival as handshake-complete without
+  verifying the server's signature. Hardening the round-trip is a separate PR.
+- `decision_response` operator-resume path for uncertain flows: uncertain
+  verdicts return `.pause()`; resuming a paused flow once the operator decides is
+  a follow-up.
 
 ## Prerequisites
 
@@ -166,15 +168,19 @@ the runtime starts, the listener:
 2. Binds the path with mode `0600`.
 3. Begins accepting extension connections.
 
-Verify Sanctuary main is listening:
+Verify enforcement state with the live status probe:
 
 ```bash
 sanctuary castle-wall status
-# Expected:
-#   listener: ai.sanctuaryprotocol.macos.castle-wall
-#   socket:   /Users/<you>/.sanctuary/castle.sock (active)
-#   subscribers: 1   ← once the extension has connected
 ```
+
+`status` re-reads the LIVE Network Extension filter state (it never infers
+"enforcing" from config presence). The current output reports the pinned-key
+fingerprint, the global pin + trust-anchor verdict, the sysext state, the
+`Content filter:` state (`enabled` when the wall is live), the app build
+identity, and a dead-man lease line (labeled advisory, not enforcement, when the
+filter is disabled). Read the live output rather than matching a fixed sample;
+the exact lines evolve with the CLI.
 
 ## Manual end-to-end verification
 
@@ -184,9 +190,8 @@ extension. The verification below walks the operator through it.
 
 1. Build the signed `.app` (above).
 2. Wrap the `.app` into a `.systemextension` bundle inside the
-   operator's host application. This step is the Alpha-4 install
-   scope; the build script alone does not produce a
-   `.systemextension`.
+   operator's host application (shipped; the build script alone does
+   not produce a `.systemextension`).
 3. Install the system extension: from the host app, call
    `OSSystemExtensionManager`'s `submitRequest(_:)` with a
    `OSSystemExtensionRequest.activationRequest`. macOS will prompt
@@ -244,7 +249,7 @@ menubar notification fire within ~50ms of the block.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `sanctuary castle-wall status` shows `listener: not active` on macOS | Sanctuary main did not start the macOS listener (e.g. on Linux that is expected) | confirm platform is darwin; check the runtime startup logs for `MacOSFlowIpcListener` |
+| `sanctuary castle-wall status` shows the sysext not loaded / `Content filter: disabled` on macOS you expect armed | the system extension is not loaded or the filter is not armed (on Linux this path is expected) | confirm platform is darwin; confirm the sysext is approved + (Tahoe) toggled ON; check the runtime startup logs for `MacOSFlowIpcListener` |
 | Extension loaded but every flow is default-denied; logs show "no pinned key" | `~/.sanctuary/castle-pinned-pubkey.bin` is missing | run `sanctuary castle-wall provision-pin` to provision the pin and activate enforcement |
 | Codesign fails with "unable to read identity" | Developer-ID cert not in keychain | run `security find-identity -v -p codesigning` and import the cert from the Apple Developer portal |
 | Build succeeds but `spctl assess` reports `rejected` | unnotarized bundle | run `xcrun notarytool submit` (operator step) |
