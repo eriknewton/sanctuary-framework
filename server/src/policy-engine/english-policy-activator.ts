@@ -151,6 +151,13 @@ export const ENGLISH_POLICY_ACTIVATION_AUDIT_OPS = {
   CONFLICT_DETECTED: "policy_conflict_detected",
   CONFLICT_ACKNOWLEDGED: "policy_conflict_acknowledged",
   FORCE_CONFLICT_USED: "policy_force_conflict_used",
+  /**
+   * The operator explicitly forced a posture-WEAKENING activation through
+   * the #805 downgrade gate. This is the audited-override branch: the write
+   * is NOT silently applied; it is applied only with this event recording
+   * exactly which fields were weakened, so a relaxation is always traceable.
+   */
+  FORCE_DOWNGRADE_USED: "policy_force_downgrade_used",
 } as const;
 
 export type EnglishPolicyActivationAuditOp =
@@ -273,6 +280,17 @@ export interface ActivateOptions {
   override_low_confidence?: boolean;
   conflicts_acknowledged?: PolicyConflict[];
   force_conflict_ids?: string[];
+  /**
+   * Explicit operator override of the #805 config-downgrade gate. When a
+   * promotion WEAKENS enforcement posture (e.g. moving an operation onto
+   * the Tier-3 always-allow list, so agents no longer route it to the
+   * operator), the gate refuses by DEFAULT. Setting this true does NOT
+   * silence the gate: the downgrade is force-applied AND recorded with a
+   * `policy_force_downgrade_used` audit event naming every weakened field.
+   * This is the "refused OR forced through the explicit audited override,
+   * never silently applied" contract for the tunability promote flow.
+   */
+  override_posture_downgrade?: boolean;
 }
 
 type ActivatorPolicyWritePhase = "activate" | "revoke";
@@ -435,6 +453,7 @@ export class EnglishPolicyActivator {
         draftId: draft.draft_id,
         operatorId,
         phase: "activate",
+        forceDowngrade: opts.override_posture_downgrade === true,
       });
       if (!writeResult.ok) {
         const reason: ActivationFailure = "policy_posture_downgrade_refused";
@@ -598,6 +617,17 @@ export class EnglishPolicyActivator {
     return { ok: true, updated_policy: updatedPolicy, record };
   }
 
+  /**
+   * Read the current live Principal Policy snapshot. Exposed so the
+   * bearer-gated dashboard "plain-English policy" surface can render the
+   * live policy without a second, parallel read path. This is a
+   * read-only accessor over the SAME `readPolicy` callback the activate /
+   * revoke lifecycle uses, so there is one source of policy truth.
+   */
+  async getCurrentPolicy(): Promise<PrincipalPolicy> {
+    return this.readPolicy();
+  }
+
   /** Look up an activation record by draft id. */
   async getRecord(draftId: string): Promise<PolicyDraftRecord | null> {
     return this.store.load(draftId);
@@ -651,6 +681,7 @@ export class EnglishPolicyActivator {
     draftId: string;
     operatorId: string;
     phase: ActivatorPolicyWritePhase;
+    forceDowngrade?: boolean;
   }): Promise<ActivatorPolicyWriteResult> {
     const candidates =
       params.candidatePolicy === undefined
@@ -662,6 +693,27 @@ export class EnglishPolicyActivator {
       } catch (err) {
         if (!(err instanceof PrincipalPolicyDowngradeError)) {
           throw err;
+        }
+        // The #805 gate detected a posture-weakening change. If the operator
+        // did NOT explicitly force it, refuse and audit the refusal. If they
+        // DID force it, we still do NOT apply silently: record an explicit
+        // force-downgrade event naming every weakened field, then continue to
+        // the write. The gate only yields to an audited, operator-held flag.
+        if (params.forceDowngrade === true) {
+          await this.auditLog.append(
+            "l2",
+            ENGLISH_POLICY_ACTIVATION_AUDIT_OPS.FORCE_DOWNGRADE_USED,
+            params.operatorId,
+            {
+              draft_id: params.draftId,
+              phase: params.phase,
+              downgrade_fields: err.downgrades.map((d) => d.field),
+              downgrade_reasons: err.downgrades.map((d) => d.reason),
+              fortress_id: this.fortressId,
+            },
+            "success",
+          );
+          continue;
         }
         await this.auditLog.append(
           "l2",

@@ -5,6 +5,7 @@
  * Chi-3 / Psi-1 sibling-view pattern via existing `authMiddleware`.
  *
  *   POST /api/policy/compile          submit English; returns CompiledPolicy
+ *   GET  /api/policy/current          plain-English view of the LIVE policy
  *   GET  /api/policy/drafts           list compiled drafts (review surface)
  *   GET  /api/policy/drafts/:id       full detail
  *
@@ -37,6 +38,7 @@ import {
 import type { EnglishPolicyActivator } from "./english-policy-activator.js";
 import type { PolicyConflict } from "./conflict-detector.js";
 import { ENGLISH_POLICY_ACTIVATION_AUDIT_OPS } from "./english-policy-activator.js";
+import { renderPolicyPlainEnglish } from "./policy-plain-english.js";
 
 export const ENGLISH_POLICY_API_PREFIX = "/api/policy";
 
@@ -316,6 +318,31 @@ export async function handleEnglishPolicyRoute(
       return true;
     }
 
+    if (method === "GET" && path === `${ENGLISH_POLICY_API_PREFIX}/current`) {
+      // Plain-English view of the LIVE Principal Policy for the tunability
+      // UX. Operator-bearer-gated exactly like the activation surface: an
+      // agent must NOT be able to read or infer the policy (AGENTS.md hard
+      // rule 7), so this route requires the operator credential and is
+      // never reachable on the agent's cooperative path. Read-only; it
+      // never mutates policy.
+      if (!requireOperatorCredential(deps.authConfig, req, res)) {
+        return true;
+      }
+      if (!deps.activator) {
+        writeJSON(res, 503, {
+          ok: false,
+          error: "activator_not_configured",
+        });
+        return true;
+      }
+      const policy = await deps.activator.getCurrentPolicy();
+      writeJSON(res, 200, {
+        ok: true,
+        data: { view: renderPolicyPlainEnglish(policy) },
+      });
+      return true;
+    }
+
     if (method === "GET" && path === `${ENGLISH_POLICY_API_PREFIX}/drafts`) {
       const since = url.searchParams.get("since") ?? undefined;
       const limitRaw = url.searchParams.get("limit") ?? undefined;
@@ -389,11 +416,17 @@ export async function handleEnglishPolicyRoute(
       const overrideRaw = url.searchParams.get("override");
       const overrideLowConfidence =
         overrideRaw === "true" || overrideRaw === "1";
+      // The posture-downgrade override is DISTINCT from the low-confidence
+      // override so a relaxation is never conflated with a "trust the
+      // compiler" bypass. It must be requested explicitly (query or body),
+      // and even then the activator audits the forced downgrade (#805 gate).
+      const overrideDowngradeRaw = url.searchParams.get("override_downgrade");
       let parsedBody: {
         conflicts_acknowledged?: PolicyConflict[];
         acknowledge_conflicts?: boolean;
         force_conflict_ids?: string[];
         force_conflict?: string;
+        override_posture_downgrade?: boolean;
       };
       try {
         parsedBody = await readOptionalJSONBody(req);
@@ -415,6 +448,10 @@ export async function handleEnglishPolicyRoute(
         parsedBody.acknowledge_conflicts === true
           ? await deps.activator.checkConflicts(draft, operatorId)
           : undefined;
+      const overridePostureDowngrade =
+        overrideDowngradeRaw === "true" ||
+        overrideDowngradeRaw === "1" ||
+        parsedBody.override_posture_downgrade === true;
       const outcome = await deps.activator.activate(draft, operatorId, {
         override_low_confidence: overrideLowConfidence,
         conflicts_acknowledged:
@@ -423,6 +460,7 @@ export async function handleEnglishPolicyRoute(
             ? parsedBody.conflicts_acknowledged
             : undefined),
         force_conflict_ids: forceConflictIds,
+        override_posture_downgrade: overridePostureDowngrade,
       });
       if (!outcome.ok) {
         const status =
@@ -432,6 +470,8 @@ export async function handleEnglishPolicyRoute(
               ? 409
               : outcome.reason === "policy_conflict_force_required"
                 ? 409
+            : outcome.reason === "policy_posture_downgrade_refused"
+              ? 409
             : outcome.reason === "draft_not_found"
               ? 404
               : outcome.reason === "already_activated"
