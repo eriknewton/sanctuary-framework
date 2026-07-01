@@ -1,5 +1,5 @@
 {
-  "tool_count": 96,
+  "tool_count": 97,
   "tools": [
     {
       "name": "identity_create",
@@ -2100,6 +2100,13 @@
         "required": [
           "intent"
         ]
+      }
+    },
+    {
+      "name": "sanctuary_capabilities",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
       }
     },
     {

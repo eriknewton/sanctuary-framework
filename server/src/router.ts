@@ -63,6 +63,13 @@ export interface ServerOptions {
   auditLog?: AuditLog;
   /** Active session identity binding for agent-native approval/namespace checks. */
   currentSessionBinding?: () => SessionBinding | undefined;
+  /**
+   * Agent-facing MCP `instructions` string, returned in the initialize
+   * response so a connecting harness immediately learns the cooperative
+   * tool catalog and why to route through it (first-class surfacing). Purely
+   * a discovery aid; it makes no enforcement claim.
+   */
+  instructions?: string;
 }
 
 export function assertToolClasses(tools: readonly ToolDefinition[]): void {
@@ -96,6 +103,7 @@ export function createServer(
       capabilities: {
         tools: {},
       },
+      ...(options?.instructions ? { instructions: options.instructions } : {}),
     }
   );
 

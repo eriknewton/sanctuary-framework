@@ -3,6 +3,7 @@ import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interfa
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
+import { COOPERATIVE_DENIAL_DISCOVERY_HINT } from "../../src/agent-native/safety-base.js";
 import type { ToolDefinition } from "../../src/router.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 
@@ -551,6 +552,7 @@ describe("SDW memory tools: fail-closed multi-agent isolation guard", () => {
       remediation_class: "request_review",
       retry_after: null,
       audit_ref: "audit:memory_get",
+      discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
     });
     const serialized = JSON.stringify(denied);
     expect(serialized).not.toContain("agent-alpha");

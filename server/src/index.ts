@@ -72,6 +72,7 @@ import {
   type SessionBinding,
 } from "./agent-native/safety-base.js";
 import { createAgentNativeCooperativeTools } from "./agent-native/cooperative-surface.js";
+import { buildServerInstructions } from "./agent-native/capabilities-catalog.js";
 import { createSHRTools } from "./shr/tools.js";
 import { createHandshakeTools } from "./handshake/tools.js";
 import { createFederationTools } from "./federation/tools.js";
@@ -1784,6 +1785,7 @@ export async function createSanctuaryServer(options?: {
     toolCallTrapRuntime,
     currentAgentId: () => process.env.SANCTUARY_AGENT_ID,
     currentSessionBinding,
+    instructions: buildServerInstructions(),
   });
   if (proxyRouter) {
     enableToolListChangedNotifications(server);

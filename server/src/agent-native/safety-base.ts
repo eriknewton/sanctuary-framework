@@ -21,10 +21,33 @@ export interface FixedDenial {
   remediation_class: RemediationClass;
   retry_after: RetryAfterBucket;
   audit_ref: string;
+  /**
+   * Static, invariant discovery pointer (never parameterized). Same on every
+   * denial so it cannot leak tier/rule/attempt; see
+   * COOPERATIVE_DENIAL_DISCOVERY_HINT.
+   */
+  discovery_hint: typeof COOPERATIVE_DENIAL_DISCOVERY_HINT;
 }
 
 export const FIXED_DENIAL_MESSAGE =
   "This action is not available in the current context." as const;
+
+/**
+ * Static discovery pointer attached to every cooperative denial
+ * (enforcement-as-teacher, harness-agnostic non-wall part; design Section 5
+ * move 3).
+ *
+ * SAFETY (AGENTS.md hard rule 7 - no-policy-inference): this string is a
+ * compile-time CONSTANT and is IDENTICAL on every denial, regardless of which
+ * tool, tier, or rule produced it. It names only the general discovery
+ * entrypoints (sanctuary_help / sanctuary_capabilities), never a per-request
+ * tool. It therefore cannot leak which tier/rule fired or what the caller
+ * attempted: the field is byte-for-byte the same on every denial. It teaches
+ * "where to look" without revealing "what tripped". Do NOT parameterize this
+ * by intent, tool, or denial reason.
+ */
+export const COOPERATIVE_DENIAL_DISCOVERY_HINT =
+  "To find the sanctioned Sanctuary tool for what you need, call sanctuary_help with your intent, or sanctuary_capabilities for the full catalog." as const;
 
 export function fixedDenial(
   auditRef: string,
@@ -37,6 +60,7 @@ export function fixedDenial(
     remediation_class: remediationClass,
     retry_after: retryAfter,
     audit_ref: auditRef,
+    discovery_hint: COOPERATIVE_DENIAL_DISCOVERY_HINT,
   };
 }
 
