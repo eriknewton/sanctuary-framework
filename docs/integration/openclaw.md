@@ -10,7 +10,7 @@ Verified working on Mac Mini M4 running OpenClaw 2026.4.2 + Sanctuary v1.3.0-rc.
 
 - OpenClaw installed and running
 - Node.js 22+
-- Sanctuary: `npm install @sanctuary-framework/mcp-server@1.3.0-rc.1`
+- Sanctuary: `npm install @sanctuary-framework/mcp-server`
   (or use `npx` for zero-install)
 
 ## Step 1: Add Sanctuary to Your Config
@@ -23,7 +23,7 @@ Edit `~/.openclaw/openclaw.json` (or `~/.openclaw/agents/{agent}/config.json`):
     "servers": {
       "sanctuary": {
         "command": "npx",
-        "args": ["@sanctuary-framework/mcp-server@1.3.0-rc.1"],
+        "args": ["-y", "@sanctuary-framework/mcp-server"],
         "env": {
           "SANCTUARY_PASSPHRASE": "your-passphrase-here"
         }
@@ -93,7 +93,7 @@ needed:
 
 ```bash
 # Dashboard as separate process (optional)
-npx @sanctuary-framework/mcp-server@1.3.0-rc.1 dashboard --port 3501 &
+npx @sanctuary-framework/mcp-server dashboard --port 3501 &
 ```
 
 **Environment variables.** OpenClaw passes only the `env` vars defined in the
@@ -114,7 +114,7 @@ the Sovereignty Dashboard in your browser. For production, the direct config
     "servers": {
       "sanctuary": {
         "command": "npx",
-        "args": ["@sanctuary-framework/mcp-server@1.3.0-rc.1"],
+        "args": ["-y", "@sanctuary-framework/mcp-server"],
         "env": { "SANCTUARY_PASSPHRASE": "your-passphrase" }
       },
       "concordia": {
@@ -131,11 +131,11 @@ the Sovereignty Dashboard in your browser. For production, the direct config
 
 **Double tool name prefix (`sanctuary__sanctuary-manifest`)**
 You're on an older Sanctuary release. Upgrade:
-`npm install @sanctuary-framework/mcp-server@1.3.0-rc.1`
+`npm install @sanctuary-framework/mcp-server`
 
 **"MCP server failed to initialize" / subprocess crash**
 Remove `--dashboard` from args. This is the most common cause. Check
-`node --version >= 22`. Run `npx @sanctuary-framework/mcp-server@1.3.0-rc.1`
+`node --version >= 22`. Run `npx @sanctuary-framework/mcp-server`
 manually in a terminal to verify it starts.
 
 **Env vars not reaching Sanctuary**
@@ -143,7 +143,7 @@ Verify they're in the `"env"` block of the server config, not at the top level
 of `openclaw.json`. OpenClaw passes only what's in `env`.
 
 **Tools not appearing in agent**
-Run `npx @sanctuary-framework/mcp-server@1.3.0-rc.1` manually to verify it starts.
+Run `npx @sanctuary-framework/mcp-server` manually to verify it starts.
 Check OpenClaw logs at `~/.openclaw/logs/`.
 
 **Tools show "Not connected" when called**

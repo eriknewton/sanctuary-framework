@@ -55,9 +55,10 @@ describe("update-check", () => {
       expect(msg).toContain("0.4.0");
     });
 
-    it("includes update command", () => {
+    it("includes an update command pinned to the announced version", () => {
       const msg = formatUpdateMessage("0.3.1", "0.4.0");
-      expect(msg).toContain("npx @sanctuary-framework/mcp-server@latest");
+      expect(msg).toContain("npx @sanctuary-framework/mcp-server@0.4.0");
+      expect(msg).not.toContain("@latest");
     });
 
     it("uses [Sanctuary] prefix", () => {

@@ -66,7 +66,7 @@ Sanctuary runs alongside your agent's own MCP server. Both appear as separate to
     },
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"],
+      "args": ["-y", "@sanctuary-framework/mcp-server"],
       "env": {
         "SANCTUARY_PASSPHRASE": "your-passphrase-here"
       }
@@ -129,7 +129,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/sanctuary/sanctuary.env
-ExecStart=/usr/bin/npx @sanctuary-framework/mcp-server
+ExecStart=/usr/bin/npx -y @sanctuary-framework/mcp-server
 Restart=on-failure
 RestartSec=5s
 WorkingDirectory=%h

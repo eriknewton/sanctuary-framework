@@ -33,7 +33,7 @@ async with MultiServerMCPClient(
     {
         "sanctuary": {
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "transport": "stdio",
         }
     }
@@ -70,13 +70,13 @@ async with MultiServerMCPClient(
     {
         "agent_alice": {
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/alice"},
             "transport": "stdio",
         },
         "agent_bob": {
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": "~/.sanctuary/bob"},
             "transport": "stdio",
         },
@@ -111,7 +111,7 @@ async with MultiServerMCPClient(
     {
         "sanctuary": {
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "transport": "stdio",
         },
         "concordia": {

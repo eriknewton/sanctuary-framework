@@ -191,7 +191,7 @@ Then add Sanctuary to the harness MCP config. The exact form depends on the harn
 ```json
 {
   "command": "npx",
-  "args": ["@sanctuary-framework/mcp-server"],
+  "args": ["-y", "@sanctuary-framework/mcp-server"],
   "env": {
     "SANCTUARY_PASSPHRASE": "<generated-passphrase>"
   }
@@ -222,13 +222,13 @@ If you prefer to edit your harness MCP config by hand:
 
 ```bash
 # OpenClaw
-openclaw mcp set sanctuary '{"command":"npx","args":["@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
+openclaw mcp set sanctuary '{"command":"npx","args":["-y","@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
 
 # Hermes Agent
-hermes mcp set sanctuary '{"command":"npx","args":["@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
+hermes mcp set sanctuary '{"command":"npx","args":["-y","@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
 
 # Claude Code
-claude mcp add sanctuary -- npx @sanctuary-framework/mcp-server
+claude mcp add sanctuary -- npx -y @sanctuary-framework/mcp-server
 ```
 
 Generate a passphrase before first launch:

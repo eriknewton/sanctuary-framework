@@ -23,7 +23,7 @@ def make_sovereign_mcp_config(agent_name: str) -> list:
         {
             "name": "sanctuary",
             "command": "npx",
-            "args": ["@sanctuary-framework/mcp-server"],
+            "args": ["-y", "@sanctuary-framework/mcp-server"],
             "env": {"SANCTUARY_STORAGE_PATH": f"~/.sanctuary/{agent_name}"},
             "transport": "stdio",
         },

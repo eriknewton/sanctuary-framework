@@ -71,7 +71,7 @@ def generate_hermes_config() -> dict:
             "mcps": {
                 "sanctuary": {
                     "command": "npx",
-                    "args": ["@sanctuary-framework/mcp-server"],
+                    "args": ["-y", "@sanctuary-framework/mcp-server"],
                     "transport": "stdio",
                     "env": {
                         "SANCTUARY_STORAGE_PATH": str(

@@ -19,6 +19,19 @@ import {
   type DashboardStarter,
   type RunWrapDeps,
 } from "../../src/wrap/cli.js";
+import { SANCTUARY_VERSION } from "../../src/config.js";
+
+/**
+ * The published-version MCP entry the wrap writes (v1.6.1 install-path
+ * hardening, F2): version-pinned, explicit `sanctuary` bin, `-y` so the
+ * non-interactive MCP spawn never wedges on the npx install prompt.
+ */
+const PINNED_SANCTUARY_ARGS = [
+  "-y",
+  "-p",
+  `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+  "sanctuary",
+];
 
 describe("validateDevDist (Finding 4, 2026-06-25)", () => {
   let dir: string;
@@ -423,7 +436,7 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
 
     expect(rewriteSpy).toHaveBeenCalledTimes(1);
     const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
-    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
+    expect(rewriteArgs).toEqual(PINNED_SANCTUARY_ARGS);
     expect(rewriteArgs.join(" ")).not.toContain(sentinel);
     expect(rewriteArgs).not.toContain("--passphrase");
 
@@ -519,7 +532,7 @@ describe("runWrap — SEC-061 passphrase leak regression", () => {
     );
 
     const rewriteArgs = rewriteSpy.mock.calls[0]?.[2] as string[];
-    expect(rewriteArgs).toEqual(["@sanctuary-framework/mcp-server"]);
+    expect(rewriteArgs).toEqual(PINNED_SANCTUARY_ARGS);
   });
 });
 

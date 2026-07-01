@@ -7,6 +7,7 @@
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
+    "mcp-server": "dist/cli.js",
     "sanctuary-mcp-server": "dist/cli.js",
     "sanctuary": "dist/cli.js",
     "verify-transparency": "dist/verify-transparency.js",

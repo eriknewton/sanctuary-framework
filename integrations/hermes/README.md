@@ -198,7 +198,7 @@ agent:
   mcps:
     sanctuary:
       command: "npx"
-      args: ["@sanctuary-framework/mcp-server"]
+      args: ["-y", "@sanctuary-framework/mcp-server"]
       env:
         SANCTUARY_STORAGE_PATH: "~/.sanctuary/coordinator"
 
@@ -209,7 +209,7 @@ agent:
       mcps:
         sanctuary:
           command: "npx"
-          args: ["@sanctuary-framework/mcp-server"]
+          args: ["-y", "@sanctuary-framework/mcp-server"]
           env:
             SANCTUARY_STORAGE_PATH: "~/.sanctuary/researcher"
 
@@ -219,7 +219,7 @@ agent:
       mcps:
         sanctuary:
           command: "npx"
-          args: ["@sanctuary-framework/mcp-server"]
+          args: ["-y", "@sanctuary-framework/mcp-server"]
           env:
             SANCTUARY_STORAGE_PATH: "~/.sanctuary/reviewer"
 ```
@@ -242,7 +242,7 @@ agent:
   mcps:
     sanctuary:
       command: "npx"
-      args: ["@sanctuary-framework/mcp-server"]
+      args: ["-y", "@sanctuary-framework/mcp-server"]
 
   automations:
     - name: "daily_sovereignty_audit"
@@ -333,7 +333,7 @@ agent:
   mcps:
     sanctuary:
       command: "npx"
-      args: ["@sanctuary-framework/mcp-server"]
+      args: ["-y", "@sanctuary-framework/mcp-server"]
 
   startup:
     - |
@@ -457,7 +457,7 @@ agent:
   mcps:
     sanctuary:
       command: "npx"
-      args: ["@sanctuary-framework/mcp-server"]
+      args: ["-y", "@sanctuary-framework/mcp-server"]
       env:
         SANCTUARY_STORAGE_PATH: "~/.sanctuary/negotiator"
 

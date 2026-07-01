@@ -30,7 +30,7 @@ If you're running OpenClaw, add Sanctuary to your MCP config:
   "mcpServers": {
     "sanctuary": {
       "command": "npx",
-      "args": ["@sanctuary-framework/mcp-server"]
+      "args": ["-y", "@sanctuary-framework/mcp-server"]
     }
   }
 }

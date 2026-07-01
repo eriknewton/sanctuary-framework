@@ -302,7 +302,7 @@ layout: null
 "mcpServers": {
   "sanctuary": {
     "command": "npx",
-    "args": ["@sanctuary-framework/mcp-server"]
+    "args": ["-y", "@sanctuary-framework/mcp-server"]
   }
 }</code></pre>
           </div>
@@ -347,7 +347,7 @@ agent = Agent(
 <pre><code><span class="token--dim"># langchain-mcp-adapters</span>
 from langchain_mcp import MCPTool
 sanctuary = MCPTool.from_stdio(
-  "npx", ["@sanctuary-framework/mcp-server"],
+  "npx", ["-y", "@sanctuary-framework/mcp-server"],
 )</code></pre>
           </div>
         </article>
@@ -379,7 +379,7 @@ sanctuary = MCPTool.from_stdio(
           <span class="step__number">Step 02 · Connect</span>
           <h3 class="step__heading">Wire into your harness</h3>
           <p class="step__body">Add Sanctuary as an MCP server in your harness config. No agent code changes.</p>
-<pre class="step__code"><code><span class="token--dim">$</span> claude mcp add sanctuary npx @sanctuary-framework/mcp-server</code></pre>
+<pre class="step__code"><code><span class="token--dim">$</span> claude mcp add sanctuary -- npx -y @sanctuary-framework/mcp-server</code></pre>
         </article>
 
         <article class="step surface-card">

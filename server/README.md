@@ -76,7 +76,7 @@ Add to your Claude Code MCP configuration (`~/.claude/mcp_servers.json`):
 {
   "sanctuary": {
     "command": "npx",
-    "args": ["@sanctuary-framework/mcp-server"],
+    "args": ["-y", "@sanctuary-framework/mcp-server"],
     "env": {
       "SANCTUARY_PASSPHRASE": "your-passphrase-here"
     }

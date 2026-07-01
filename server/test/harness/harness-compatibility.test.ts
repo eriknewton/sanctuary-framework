@@ -18,6 +18,7 @@ import {
   type RunWrapDeps,
   type WrapOptions,
 } from "../../src/wrap/cli.js";
+import { SANCTUARY_VERSION } from "../../src/config.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -176,7 +177,12 @@ describe("harness compatibility matrix", () => {
         });
         expect(extractSanctuaryEntry(JSON.parse(await readFile(configPath, "utf-8")), harness.serversKey)).toMatchObject({
           command: "npx",
-          args: ["@sanctuary-framework/mcp-server"],
+          args: [
+            "-y",
+            "-p",
+            `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
+            "sanctuary",
+          ],
         });
         expect(stderrText()).toContain("Sovereignty Dashboard running at");
         expect(stderrText()).toMatch(/http:\/\/127\.0\.0\.1:35\d\d\?session=/);
