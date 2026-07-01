@@ -634,9 +634,31 @@ export interface V1FederationDeps {
    * invalid, forged, or duplicate guardian approvals. Composes the existing
    * guardian threshold evaluator onto the existing operator-signed revocation
    * primitive; it can only ADD a required precondition, never weaken one.
+   *
+   * Return contract (fail-closed):
+   *   - `null`                          -> no requirement configured; legacy
+   *                                        single-operator revoke (byte-for-byte).
+   *   - a {@link GuardianRevocationRequirement} -> enforce M-of-N.
+   *   - `{ unavailable: true }`         -> a requirement WAS configured but is
+   *                                        currently unverifiable (a persisted
+   *                                        roster failed to re-verify against the
+   *                                        pinned master). The handler MUST REFUSE
+   *                                        every revocation, never fall through to
+   *                                        single-operator kill.
    */
-  requireGuardianRevocationSignOff?(): GuardianRevocationRequirement | null;
+  requireGuardianRevocationSignOff?(): GuardianRevocationSignOffState;
 }
+
+/**
+ * State returned by the guardian-revocation sign-off hook. Distinguishes "no
+ * requirement" (allowed single-operator path) from "requirement configured but
+ * unverifiable" (fail-closed refusal) so a broken/tampered persisted requirement
+ * can never silently revert the fleet to single-operator kill.
+ */
+export type GuardianRevocationSignOffState =
+  | GuardianRevocationRequirement
+  | { unavailable: true }
+  | null;
 
 export interface FederationNodeView {
   node_id: string;
@@ -1070,16 +1092,45 @@ async function handleRevoke(
   // M-of-N guardian quorum bound to THIS (fortress, node) revocation must
   // verify before the eviction is minted; any insufficient/invalid/forged/
   // duplicate approval set REFUSES the revocation (it is never executed).
-  const guardianRequirement = deps.requireGuardianRevocationSignOff?.() ?? null;
-  if (guardianRequirement !== null) {
+  const guardianSignOff = deps.requireGuardianRevocationSignOff?.() ?? null;
+  if (guardianSignOff !== null) {
+    // FAIL-CLOSED: a configured-but-unverifiable requirement (a persisted roster
+    // that failed to re-verify against the pinned master) must REFUSE, never fall
+    // through to single-operator kill.
+    if ("unavailable" in guardianSignOff) {
+      await deps.audit({
+        operation,
+        result: "failure",
+        identityId: node_id,
+        details: { reason: "guardian_signoff_unavailable" },
+      });
+      denyForbidden(res);
+      return;
+    }
     const { guardian_approvals } = body as { guardian_approvals?: unknown };
     const decision = evaluateGuardianRevocationSignOff({
-      requirement: guardianRequirement,
+      requirement: guardianSignOff,
       fortressId: ctx.fortressId,
       nodeId: node_id,
       approvals: guardian_approvals,
     });
+    // Emit a dedicated audit event on EVERY guardian-gated decision (allowed OR
+    // refused), so the durable audit trail records the M-of-N sign-off outcome
+    // (who approved a fleet-kill and when) distinctly from the revoke outcome.
+    await deps.audit({
+      operation: "v1_federation_revoke_guardian_signoff",
+      result: decision.allowed ? "success" : "failure",
+      identityId: node_id,
+      details: decision.allowed
+        ? {
+            guardian_signoff: "allowed",
+            valid_guardian_ids: decision.validGuardianIds,
+          }
+        : { guardian_signoff: "refused", reason: decision.reason },
+    });
     if (!decision.allowed) {
+      // Preserve the pre-existing revoke-failure audit event too (the revoke
+      // path's own outcome), unchanged in shape.
       await deps.audit({
         operation,
         result: "failure",
