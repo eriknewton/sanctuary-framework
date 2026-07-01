@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFile, mkdir, readFile, readdir, stat, rm } from "node:fs/promises";
+import { writeFile, mkdir, mkdtemp, readFile, readdir, stat, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -45,11 +45,10 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
   let originalStoragePath: string | undefined;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-dryrun-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp atomically creates a uniquely-named dir (O_EXCL semantics),
+    // avoiding the predictable-name TOCTOU that a manual join(tmpdir(), name)
+    // + mkdir can hit (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-dryrun-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;
