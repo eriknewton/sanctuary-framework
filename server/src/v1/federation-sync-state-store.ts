@@ -122,6 +122,20 @@ export interface FederationSyncStateSnapshot {
    * (fail-closed; see {@link FederationSyncStateStore} consumers).
    */
   guardianRevocationRequirement: GuardianRevocationRequirement | null;
+  /**
+   * Monotonic generation counter for {@link guardianRevocationRequirement}. The
+   * dashboard setter increments it on EVERY set (including `set(null)`), so the
+   * merge can pick the value with the HIGHER generation and a STALE writer can
+   * never clobber a fresher requirement. This is REQUIRED because the requirement
+   * is NOT grow-only (it can be cleared), and a SECOND writer of this blob (the
+   * `rotate-root --compromised` CLI in {@link
+   * federation-rotate-root.ts}) does an unlocked `load()` then `persist()`
+   * carrying a STALE copy of this field; without a generation the CLI's stale
+   * `persist` would silently revert a concurrently-set requirement to its old
+   * value (a Tier-1 downgrade). Defaults to 0 (fresh fortress / no requirement
+   * ever set).
+   */
+  guardianRevocationRequirementGeneration: number;
 }
 
 interface PersistedSyncState {
@@ -158,6 +172,12 @@ interface PersistedSyncState {
    * authenticates it, so a tampered blob still fails closed at decrypt.
    */
   guardian_revocation_requirement?: PersistedGuardianRevocationRequirement | null;
+  /**
+   * Monotonic generation for `guardian_revocation_requirement`. Optional on read
+   * (a pre-item-6 record omits it -> 0). The merge keeps the value with the
+   * higher generation so a stale writer cannot clobber a fresher requirement.
+   */
+  guardian_revocation_requirement_generation?: number;
 }
 
 interface PersistedAppliedPolicyVersion {
@@ -187,6 +207,7 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     operatorPolicy: null,
     appliedPolicyVersions: new Map(),
     guardianRevocationRequirement: null,
+    guardianRevocationRequirementGeneration: 0,
   };
 }
 
@@ -338,6 +359,8 @@ export class FederationSyncStateStore {
                 merged.guardianRevocationRequirement,
               )
             : null,
+          guardian_revocation_requirement_generation:
+            merged.guardianRevocationRequirementGeneration,
         };
         const serialized = stringToBytes(JSON.stringify(persisted));
         try {
@@ -381,6 +404,9 @@ function cloneSnapshot(
       (snapshot as Partial<FederationSyncStateSnapshot>)
         .guardianRevocationRequirement ?? null,
     ),
+    guardianRevocationRequirementGeneration:
+      (snapshot as Partial<FederationSyncStateSnapshot>)
+        .guardianRevocationRequirementGeneration ?? 0,
   };
 }
 
@@ -462,18 +488,45 @@ function mergeSyncStateMonotonic(
     operatorPolicy: newerPolicy(base.operatorPolicy, next.operatorPolicy),
     appliedPolicyVersions,
     // The guardian revocation requirement is operator CONFIG, not grow-only
-    // security state, and is written by exactly ONE process (the dashboard); the
-    // cross-process `rotate-root --compromised` CLI never touches this field. So
-    // the live caller's snapshot (`next`) is this process's latest intent and is
-    // authoritative: it must be able to UPGRADE the roster, RE-PIN it, or CLEAR
-    // it (disable the requirement). Preferring `next` cannot lose a cross-process
-    // write because no other process writes this field. A grow-only union here
-    // would WRONGLY make the requirement un-clearable (a Tier-1 relaxation the
-    // operator is entitled to make), and a version-max here would wrongly resist
-    // a re-pin at the same version.
+    // security state: it can be upgraded, re-pinned, OR cleared (disable). A
+    // grow-only union would wrongly make it un-clearable, so we cannot union it.
+    // But it is NOT single-writer: the `rotate-root --compromised` CLI (in
+    // federation-rotate-root.ts) ALSO persists this blob, doing an unlocked
+    // load() then persist() that carries a STALE copy of this field (it only
+    // mutates the revoked-root set + serial). A naive last-writer-wins here would
+    // let that stale CLI persist silently CLOBBER a requirement the dashboard set
+    // concurrently, reverting a Tier-1 setting (down to null, or back to an old
+    // roster). We resolve with a MONOTONIC GENERATION counter (mirrors the serial
+    // floors): keep the value carrying the HIGHER generation. A stale writer's
+    // lower generation can never lower or clobber a fresher on-disk value; the
+    // store's locked read-modify-write re-reads the on-disk generation, so the
+    // fresher value always wins the merge regardless of interleaving.
+    ...selectGuardianRevocationRequirementByGeneration(base, next),
+  };
+}
+
+/**
+ * Choose the guardian revocation requirement + its generation by the HIGHER
+ * generation counter. On a tie (neither writer bumped the generation) the values
+ * are identical, so `base` is kept deterministically. This is the stale-clobber
+ * guard: `base` is the freshly re-read on-disk state and `next` is the caller's
+ * (possibly stale) snapshot; a stale `next` carries an OLD generation and loses.
+ */
+function selectGuardianRevocationRequirementByGeneration(
+  base: FederationSyncStateSnapshot,
+  next: FederationSyncStateSnapshot,
+): {
+  guardianRevocationRequirement: GuardianRevocationRequirement | null;
+  guardianRevocationRequirementGeneration: number;
+} {
+  const baseGen = base.guardianRevocationRequirementGeneration;
+  const nextGen = next.guardianRevocationRequirementGeneration;
+  const winner = nextGen > baseGen ? next : base;
+  return {
     guardianRevocationRequirement: cloneGuardianRevocationRequirement(
-      next.guardianRevocationRequirement,
+      winner.guardianRevocationRequirement,
     ),
+    guardianRevocationRequirementGeneration: Math.max(baseGen, nextGen),
   };
 }
 
@@ -526,6 +579,15 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     persistedRequirement === undefined
       ? null
       : projectPersistedRequirement(persistedRequirement);
+  // Optional on read: a pre-item-6 record omits the generation -> 0.
+  // PRESENT-but-malformed THROWS (same fail-closed-on-corrupt contract).
+  const guardianRevocationRequirementGeneration =
+    obj.guardian_revocation_requirement_generation === undefined
+      ? 0
+      : decodeNonNegativeInt(
+          obj.guardian_revocation_requirement_generation,
+          "guardian_revocation_requirement_generation",
+        );
 
   return {
     acceptedHighWater,
@@ -537,6 +599,7 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     operatorPolicy,
     appliedPolicyVersions,
     guardianRevocationRequirement,
+    guardianRevocationRequirementGeneration,
   };
 }
 

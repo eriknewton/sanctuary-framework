@@ -632,6 +632,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * re-pin via {@link setFederationGuardianRevocationRequirement}.
    */
   private _federationGuardianRevocationRequirementInvalid = false;
+  /**
+   * Monotonic generation for the guardian revocation requirement. Incremented on
+   * EVERY {@link setFederationGuardianRevocationRequirement} call (including
+   * `set(null)`), stamped into the durable snapshot, and rehydrated from disk on
+   * boot so it keeps climbing across restarts. The durable-store merge keeps the
+   * value carrying the higher generation, so a stale cross-process writer (the
+   * rotate-root CLI, which persists this blob with a stale copy of this field)
+   * can never clobber a fresher requirement.
+   */
+  private _federationGuardianRevocationRequirementGeneration = 0;
   private readonly _federationRoster = new Set<string>();
   private _federationState: FederationDashboardState = {
     eventLog: [],
@@ -1980,6 +1990,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // An explicit operator (re-)pin or clear supersedes any prior fail-closed
     // latch: the operator is asserting the current requirement directly.
     this._federationGuardianRevocationRequirementInvalid = false;
+    // Bump the monotonic generation on EVERY set (enable, re-pin, OR clear) so a
+    // stale cross-process writer (the rotate-root CLI) can never clobber this
+    // change in the durable-store merge.
+    this._federationGuardianRevocationRequirementGeneration += 1;
+    // LOUD, DURABLE audit on every call. Turning the fleet-kill guard OFF
+    // (`set(null)`) is a Tier-1-class relaxation and MUST be as loud as enabling
+    // it; it is emitted as a critical audit event, never silent. Emitted BEFORE
+    // the persist so the intent is on the record even if the durable write then
+    // fails. (Disabling is not gated by M-of-N in this build by product
+    // decision; it is instead made unmistakably auditable.)
+    await this.auditLog?.appendCritical({
+      layer: "l2",
+      operation:
+        requirement === null
+          ? "federation_guardian_revocation_requirement_disabled"
+          : "federation_guardian_revocation_requirement_set",
+      identity_id: "dashboard",
+      result: "success",
+      details: {
+        enabled: requirement !== null,
+        generation: this._federationGuardianRevocationRequirementGeneration,
+        ...(requirement !== null
+          ? {
+              roster_version: requirement.roster.version,
+              guardian_m: requirement.roster.m,
+              guardian_n: requirement.roster.n,
+            }
+          : {}),
+      },
+    });
     // Persist so the requirement SURVIVES A RESTART. Without this the M-of-N
     // guarantee would evaporate on the next reboot and silently revert to
     // single-operator kill. THROWS on a durable-write failure so the operator's
@@ -2104,6 +2144,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.projectAppliedPoliciesOntoRoster();
     this.rehydrateGuardianRevocationRequirement(
       snapshot.guardianRevocationRequirement,
+      snapshot.guardianRevocationRequirementGeneration,
     );
   }
 
@@ -2126,7 +2167,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private rehydrateGuardianRevocationRequirement(
     persisted: GuardianRevocationRequirement | null,
+    persistedGeneration: number,
   ): void {
+    // Always adopt the persisted generation as the floor for the live counter so
+    // subsequent sets climb ABOVE the last durably-committed generation across a
+    // restart. Never regress it. This holds regardless of whether the roster
+    // verifies below (the generation is monotonic bookkeeping, not the value).
+    this._federationGuardianRevocationRequirementGeneration = Math.max(
+      this._federationGuardianRevocationRequirementGeneration,
+      persistedGeneration,
+    );
     if (persisted === null) {
       this._federationGuardianRevocationRequirement = null;
       this._federationGuardianRevocationRequirementInvalid = false;
@@ -2192,6 +2242,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // signature can be re-verified against the pinned master on rehydrate.
       guardianRevocationRequirement:
         this._federationGuardianRevocationRequirement,
+      // Stamp the monotonic generation so the durable-store merge keeps the
+      // higher-generation value; a stale cross-process writer (rotate-root CLI)
+      // carrying an older generation cannot clobber this requirement.
+      guardianRevocationRequirementGeneration:
+        this._federationGuardianRevocationRequirementGeneration,
     };
   }
 

@@ -171,3 +171,57 @@ describe("guardian revocation requirement: restart survival at the dashboard sea
     expect(state).toBeNull();
   });
 });
+
+describe("guardian revocation requirement: enable/disable is loudly audited", () => {
+  it("emits an audit event on BOTH enabling AND disabling (disable is not silent)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, randomBytes(32));
+
+    const dashboard = new DashboardApprovalChannel({
+      port: 0,
+      host: "127.0.0.1",
+      timeout_seconds: 30,
+      auth_token: "test",
+      auto_open: false,
+    }) as DepsAccess;
+    dashboard.setDependencies({
+      policy: {
+        version: 1,
+        tier1_always_approve: [],
+        tier3_auto_allow: [],
+        anomaly_thresholds: {
+          new_namespace: true,
+          unfamiliar_counterparty_window_days: 7,
+          frequency_spike_multiplier: 5,
+        },
+        approval_channel: { type: "stderr", timeout_seconds: 30 },
+      } as never,
+      baseline: { load: async () => {}, save: async () => {} } as never,
+      auditLog,
+    });
+    dashboard.setFederationContext(fortress.nodes["mini-1"]!.context);
+    dashboard._federationEnabled = true;
+    await dashboard.setFederationSyncStateStore(
+      new FederationSyncStateStore({ storage, masterKey: MASTER_KEY }),
+    );
+
+    const roster = buildRoster(fortress, "mini-1");
+    // Enable, then disable (the fleet-kill guard is turned OFF).
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    await dashboard.setFederationGuardianRevocationRequirement(null);
+
+    const { entries } = await auditLog.query({ layer: "l2", limit: 1000 });
+    const ops = entries.map((e) => ({ operation: e.operation, result: e.result }));
+
+    expect(ops).toContainEqual({
+      operation: "federation_guardian_revocation_requirement_set",
+      result: "success",
+    });
+    // The disable MUST be as loud as the enable: an explicit audit event.
+    expect(ops).toContainEqual({
+      operation: "federation_guardian_revocation_requirement_disabled",
+      result: "success",
+    });
+  });
+});

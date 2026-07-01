@@ -79,8 +79,13 @@ function buildFixture(): {
 
 function snapshotWith(
   requirement: GuardianRevocationRequirement | null,
+  generation = 1,
 ): FederationSyncStateSnapshot {
-  return { ...emptyFederationSyncState(), guardianRevocationRequirement: requirement };
+  return {
+    ...emptyFederationSyncState(),
+    guardianRevocationRequirement: requirement,
+    guardianRevocationRequirementGeneration: generation,
+  };
 }
 
 // ── round-trip through the durable record ────────────────────────────────────
@@ -123,11 +128,76 @@ describe("guardian revocation requirement: durable persistence round-trip", () =
     const { roster } = buildFixture();
     const storage = new MemoryStorage();
     const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
-    await store.persist(snapshotWith({ roster }));
-    // Operator disables the requirement: null must win the monotonic merge.
-    await store.persist(snapshotWith(null));
+    await store.persist(snapshotWith({ roster }, 1));
+    // Operator disables the requirement at a HIGHER generation: null must win.
+    await store.persist(snapshotWith(null, 2));
     const loaded = await store.load();
     expect(loaded.guardianRevocationRequirement).toBeNull();
+    expect(loaded.guardianRevocationRequirementGeneration).toBe(2);
+  });
+});
+
+// ── stale lower-generation write cannot clobber a fresher requirement ─────────
+
+describe("guardian revocation requirement: generation counter blocks stale clobber", () => {
+  it("a stale write (lower generation, null) does NOT overwrite a higher-generation requirement", async () => {
+    const { roster } = buildFixture();
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+
+    // The dashboard sets a requirement at generation 5 (already on disk).
+    await store.persist(snapshotWith({ roster }, 5));
+
+    // A STALE writer (the rotate-root CLI) loaded the blob BEFORE the set (it
+    // carries generation 0, no requirement) and persists that stale snapshot.
+    // Model it directly: a snapshot with null + generation 0.
+    await store.persist(snapshotWith(null, 0));
+
+    const loaded = await store.load();
+    // The fresher generation-5 requirement MUST survive the stale null persist.
+    expect(loaded.guardianRevocationRequirement).not.toBeNull();
+    expect(loaded.guardianRevocationRequirement!.roster.master_signature).toBe(
+      roster.master_signature,
+    );
+    expect(loaded.guardianRevocationRequirementGeneration).toBe(5);
+  });
+
+  it("a stale write (lower generation, OLD roster) does NOT overwrite a newer roster", async () => {
+    const older = buildFixture();
+    const newer = buildFixture();
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+
+    // Newer roster committed at generation 9.
+    await store.persist(snapshotWith({ roster: newer.roster }, 9));
+    // Stale writer carrying the OLD roster at a lower generation 3.
+    await store.persist(snapshotWith({ roster: older.roster }, 3));
+
+    const loaded = await store.load();
+    // The generation-9 roster (newer) MUST survive; the stale roster loses.
+    expect(loaded.guardianRevocationRequirement!.roster.master_signature).toBe(
+      newer.roster.master_signature,
+    );
+    expect(loaded.guardianRevocationRequirementGeneration).toBe(9);
+  });
+
+  it("a higher-generation write DOES supersede an older one (both directions work)", async () => {
+    const { roster } = buildFixture();
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+
+    // Requirement at generation 2, then cleared at generation 3 (higher wins).
+    await store.persist(snapshotWith({ roster }, 2));
+    await store.persist(snapshotWith(null, 3));
+    let loaded = await store.load();
+    expect(loaded.guardianRevocationRequirement).toBeNull();
+    expect(loaded.guardianRevocationRequirementGeneration).toBe(3);
+
+    // Re-enabled at generation 4 (higher still wins).
+    await store.persist(snapshotWith({ roster }, 4));
+    loaded = await store.load();
+    expect(loaded.guardianRevocationRequirement).not.toBeNull();
+    expect(loaded.guardianRevocationRequirementGeneration).toBe(4);
   });
 });
 
