@@ -15,7 +15,8 @@
  * manifest verifier and its constants are re-exported from this module.
  */
 
-import { get } from "node:https";
+import { get as httpsGet } from "node:https";
+import { get as httpGet } from "node:http";
 import {
   verifyReleaseManifest,
   type ManifestVerificationResult,
@@ -112,7 +113,7 @@ export function fetchLatestVersion(
   currentVersion: string
 ): Promise<string | null> {
   return new Promise((resolve) => {
-    const req = get(
+    const req = httpsGet(
       REGISTRY_URL,
       {
         headers: { Accept: "application/json" },
@@ -225,14 +226,80 @@ export async function verifyAndAdviseUpdate(
 }
 
 /**
- * GET a URL and resolve to its UTF-8 body text, or null on any failure.
- * Bounded, timed, and non-throwing: any non-200 status, timeout, network
- * error, or oversized body resolves to null (offline / unreachable = silent).
- * A GitHub API call requires a User-Agent header or GitHub returns 403.
+ * Maximum number of redirect hops httpGetText will follow. GitHub's
+ * release-asset download route (`browser_download_url` and the API
+ * octet-stream asset route) returns a 302 to `*.githubusercontent.com`, so
+ * following redirects is REQUIRED for the signed manifest to be fetchable.
+ * Bounded at 2 so a redirect loop can never hang or amplify the request.
  */
-function httpGetText(url: string): Promise<string | null> {
+const MAX_REDIRECT_HOPS = 2;
+
+/**
+ * SSRF guard: a redirect Location is followed ONLY if its host is one of these
+ * (or a subdomain of `.githubusercontent.com`). This is the exact set GitHub
+ * uses for the API + release-asset flow, so an attacker cannot redirect the
+ * update fetch to an internal/metadata host. A host that does not match here
+ * makes httpGetText resolve null (silent, never a false advisory).
+ */
+export function isAllowedRedirectHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return (
+    host === "github.com" ||
+    host === "api.github.com" ||
+    host === "githubusercontent.com" ||
+    host.endsWith(".githubusercontent.com")
+  );
+}
+
+/**
+ * Predicate deciding whether a redirect target may be followed. Given the
+ * parsed target URL, returns true only if it is safe to follow.
+ */
+export type RedirectPolicy = (next: URL) => boolean;
+
+/**
+ * The PRODUCTION redirect policy (the default): https-only AND an allowlisted
+ * GitHub host. This is the SSRF-preserving policy; nothing in production
+ * overrides it. Tests may pass a different policy to exercise the redirect-
+ * follow MECHANISM against a local server, but the production fetch path
+ * always uses this default.
+ */
+export const productionRedirectPolicy: RedirectPolicy = (next) =>
+  next.protocol === "https:" && isAllowedRedirectHost(next.hostname);
+
+/**
+ * GET a URL and resolve to its UTF-8 body text, or null on any failure.
+ * Bounded, timed, and non-throwing: any non-2xx (after bounded redirects),
+ * timeout, network error, or oversized body resolves to null (offline /
+ * unreachable = silent). A GitHub API call requires a User-Agent header or
+ * GitHub returns 403.
+ *
+ * Redirects: a 3xx with a `Location` header is followed up to
+ * MAX_REDIRECT_HOPS times, and ONLY to a target the redirect policy accepts.
+ * The default `productionRedirectPolicy` is https-only + an allowlisted GitHub
+ * host. This is required because GitHub release assets 302-redirect to
+ * `*.githubusercontent.com`; the allowlist + https-only + hop cap keep the
+ * SSRF guard intact. Every invariant (65536-byte cap, 3000ms timeout,
+ * silent-on-any-error, never throws) is re-applied on each followed hop.
+ *
+ * `policy` is injectable ONLY so tests can drive the follow mechanism against
+ * a local server; production callers never pass it, so the SSRF-preserving
+ * default is always in force on the real fetch path.
+ */
+export function httpGetText(
+  url: string,
+  hopsRemaining = MAX_REDIRECT_HOPS,
+  policy: RedirectPolicy = productionRedirectPolicy,
+): Promise<string | null> {
+  // Select the transport by scheme. Production always uses https (the GitHub
+  // API + release-asset redirect targets are https, enforced by the redirect
+  // policy). http support exists so the redirect-follow behavior is testable
+  // against a local server without a TLS cert; it never weakens the production
+  // path, which starts at an https API URL and uses the https-only default
+  // policy.
+  const client = url.startsWith("http://") ? httpGet : httpsGet;
   return new Promise((resolve) => {
-    const req = get(
+    const req = client(
       url,
       {
         headers: {
@@ -242,7 +309,35 @@ function httpGetText(url: string): Promise<string | null> {
         timeout: TIMEOUT_MS,
       },
       (res) => {
-        if (res.statusCode !== 200) {
+        const status = res.statusCode ?? 0;
+
+        // Redirect handling (bounded + policy-gated). A 3xx with a Location is
+        // followed only to a policy-approved target, and only while hops
+        // remain; anything else is a silent null.
+        if (status >= 300 && status < 400) {
+          res.resume(); // drain the redirect response body
+          const location = res.headers.location;
+          if (typeof location !== "string" || hopsRemaining <= 0) {
+            resolve(null);
+            return;
+          }
+          let next: URL;
+          try {
+            // Resolve relative Location against the current URL.
+            next = new URL(location, url);
+          } catch {
+            resolve(null);
+            return;
+          }
+          if (!policy(next)) {
+            resolve(null);
+            return;
+          }
+          resolve(httpGetText(next.toString(), hopsRemaining - 1, policy));
+          return;
+        }
+
+        if (status !== 200) {
           res.resume(); // drain
           resolve(null);
           return;
