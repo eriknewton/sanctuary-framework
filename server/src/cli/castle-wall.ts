@@ -219,8 +219,18 @@ function formatDeadManLeaseStatus(
   const ttl = lease.ttl_seconds === null ? "none (--no-ttl)" : `${lease.ttl_seconds}s`;
   const filter =
     contentFilterState === null ? "" : `; content-filter=${contentFilterState}`;
+  // The lease line is a liveness signal for the dead-man BROADCAST, not an
+  // enforcement verdict - enforcement is the live content-filter state above.
+  // When the filter is disabled, the word "armed" can mislead a skimmer into
+  // reading it as "protected". In that case make the advisory nature explicit
+  // so the line cannot be mistaken for enforcement (audit-D F5).
+  const enforcementActive = contentFilterState === "enabled";
+  const label =
+    lease.armed && !enforcementActive
+      ? "Dead-man lease (advisory broadcast, not enforcement): armed"
+      : `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}`;
   return (
-    `Dead-man lease broadcast: ${lease.armed ? "armed" : "disarmed"}` +
+    `${label}` +
     `${filter}; ttl=${ttl}; heartbeat=${lease.heartbeat_interval_seconds}s; updated=${lease.updated_at}\n`
   );
 }
@@ -555,8 +565,21 @@ async function writeGlobalPinnedPublicKey(
     // Under A2 the global pin is root:wheel 0644 and owned by the signer helper;
     // an operator-UID provision-pin CANNOT (and must not) overwrite it, and the
     // directory may not exist yet (ENOENT) because only the helper creates it.
-    // Both are expected - the trust anchor is migrated via `castle-wall re-pin`.
-    if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
+    // Both are expected, but they mean different things to the operator, so the
+    // guidance differs:
+    //   - ENOENT: fresh install, no root signer helper yet, no shared pin exists.
+    //     There is nothing to migrate. Emit a quiet, non-action-implying line so a
+    //     first-time installer is not told to "migrate the trust anchor" that does
+    //     not exist. (audit-C MED-1 / audit-D omit noise on fresh wrap.)
+    //   - EACCES/EPERM: a root-owned pin already exists and a helper owns it. THAT
+    //     is the case where `re-pin` migrates the trust anchor to the signer helper.
+    if (code === "ENOENT") {
+      console.warn(
+        `[castle-wall] shared pin not provisioned (root signer helper not installed); nothing to do for a cooperative-only install.`,
+      );
+      return;
+    }
+    if (code === "EACCES" || code === "EPERM") {
       console.warn(
         `[castle-wall] global pin ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
       );
@@ -2396,7 +2419,10 @@ function validateHeadlessBuildIdentity(
   }
   if (appBuild.git_sha !== cliGitSha) {
     return (
-      `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app.`
+      `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app. ` +
+      `(The CLI SHA comes from SANCTUARY_CASTLE_BUILD_SHA or, if unset, 'git rev-parse HEAD' in the ` +
+      `current working directory - NOT the binary. If you are running from a git worktree whose HEAD ` +
+      `differs from the deployed app, run outside a repo or 'export SANCTUARY_CASTLE_BUILD_SHA=${appBuild.git_sha}'.)`
     );
   }
   return null;
