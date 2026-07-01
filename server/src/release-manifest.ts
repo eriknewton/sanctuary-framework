@@ -41,27 +41,27 @@ const ED25519_SIGNATURE_LENGTH = 64;
 /**
  * The PINNED Sanctuary release-signing public key, base64url-encoded.
  *
- * PLACEHOLDER-UNTIL-REAL-KEY: this is a build-time placeholder, NOT a
- * production key. The real release-signing key is custodied by the operator
- * (Erik) and the release workflow signs the manifest with its private half;
- * this constant must be replaced with the real public key, and the release
- * pipeline wired to publish a signed manifest, before the signed-update path
- * is enabled in production.
+ * LIVE PRODUCTION KEY (activated 2026-07-01). This is the real release-signing
+ * public key. Its private half (the 32-byte Ed25519 seed) is custodied by the
+ * operator, NOT in this repo: it lives in the `RELEASE_SIGNING_KEY` GitHub
+ * Actions secret (the Publish workflow signs the release manifest with it) plus
+ * an off-host operator escrow. The signing backend is swappable with zero client
+ * impact: rotating the key is a one-line change to this constant plus updating
+ * the secret. To rotate, replace the value below with a new public key and set
+ * the new seed in the `RELEASE_SIGNING_KEY` secret.
  *
- * SECURITY — why the placeholder is the all-zero key AND why it is explicitly
- * rejected: the all-zero 32-byte value is the Ed25519 identity point. Under
- * noble-curves (and Ed25519 generally) an all-zero signature verifies TRUE
- * against the all-zero key for ANY message (the verification equation
- * collapses to 0 == 0). So an all-zero pinned key is NOT inert — it is a
- * universal-forgery key that would accept an attacker-crafted manifest with a
- * zero signature. `loadPinnedReleaseKey` therefore REJECTS the placeholder
- * (returns null), and `verifyReleaseManifestWithKey` rejects an all-zero key
- * and an all-zero signature as defense-in-depth. Net effect: the gate truly
- * fails closed until a real key is swapped in. Tests exercise the working
- * mechanism with a generated test keypair via `verifyReleaseManifestWithKey`.
+ * SECURITY — the all-zero identity-point guard stays as defense-in-depth: the
+ * all-zero 32-byte value is the Ed25519 identity point, against which an
+ * all-zero signature verifies TRUE for ANY message (the verification equation
+ * collapses to 0 == 0) — a universal forgery. `loadPinnedReleaseKey` REJECTS an
+ * all-zero pinned key (returns null) and `verifyReleaseManifestWithKey` rejects
+ * an all-zero key and an all-zero signature, so a misconfiguration that blanked
+ * this constant fails closed rather than accepting forged manifests. Tests
+ * exercise the mechanism with a generated test keypair via
+ * `verifyReleaseManifestWithKey`.
  */
 export const PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL =
-  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  "61YBfiq_zlbTP5rl_r_msbPk40IXJL-_PuAxlpBVeF0";
 
 /** True iff every byte of `bytes` is zero (the Ed25519 identity point / a
  * degenerate signature). Used to slam the universal-forgery door shut. */

@@ -123,8 +123,8 @@ describe("signed-update wiring: runtime refusal is silent (no advisory)", () => 
   }
 
   it("a valid-but-non-pinned manifest is REFUSED by the pinned gate (no advise)", async () => {
-    // The runtime gate uses the pinned placeholder, so even a correctly signed
-    // manifest from a real key must be refused. This is the inertness contract.
+    // The runtime gate uses the real pinned key, so a manifest signed by any
+    // other (non-pinned) key must be refused (bad_signature) and never advised.
     const { privateKey } = generateKeypair();
     const manifest = signLikeReleaseScript(BODY, privateKey);
     const { sink, events } = recordingSink();
