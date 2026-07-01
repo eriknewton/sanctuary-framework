@@ -54,7 +54,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.5.0** on the npm `latest` channel (cut 2026-06-30). v1.5.0 adds the signed operator policy-distribution rail that pushes a signed policy across a fleet of machines, a remote operator console with a fleet switcher and honest per-node policy-version and drift reporting, a consolidation of every approval-bearing route behind a single fail-closed authentication chokepoint, config-downgrade and anti-rollback hardening anchored to a custody MAC, and live PII scrubbing on the query-anonymity surface. See [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.6.0** on the npm `latest` channel (cut 2026-07-01). v1.6.0 makes the conversational concierge the single default dashboard surface, hardens the dashboard status surface so the sovereignty score and layer cards reflect a real enforcement verdict and never show green on mere config presence, and adds honest install-time messaging for the setup flow and the Hermes wrap path plus a Castle Wall arming runbook for macOS. The macOS Castle Wall bounds are unchanged: per-uid allow/deny plus boot-survival plus WAN-containment are proven; there is no per-flow rule-attributed audit trail. See the [v1.6.0 release notes](docs/releases/v1.6.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
