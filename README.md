@@ -54,7 +54,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.4.0** on the npm `latest` channel (cut 2026-06-15, the first tag since v1.3.2). v1.4.0 brings the published package back in line with `main`: it adds the macOS Castle Wall per-uid allow/deny enforcement demonstration (drill 2026-06-11), a wave of Sentinel and audit-surface hardening, the agent-native cooperative surface, the Sovereign Data Workspace storage spine, federation v1 plumbing, and signed transparency checkpoints with opt-in external-anchoring scaffolding. See the [v1.4.0 release notes](docs/releases/v1.4.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.5.0** on the npm `latest` channel (cut 2026-06-30). v1.5.0 adds the signed operator policy-distribution rail that pushes a signed policy across a fleet of machines, a remote operator console with a fleet switcher and honest per-node policy-version and drift reporting, a consolidation of every approval-bearing route behind a single fail-closed authentication chokepoint, config-downgrade and anti-rollback hardening anchored to a custody MAC, and live PII scrubbing on the query-anonymity surface. See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
@@ -72,14 +72,14 @@ Current capability summary:
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
 | Concordia composition (negotiation receipts), Verascore composition (reputation) | Optional, default off; both shipped |
 | Castle Wall (OS-level egress enforcement): Linux | Shipped (Phase 1, 2026-05-06) |
-| Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; per-uid allow/deny egress-enforcement demonstrated on a real host (drill 2026-06-11, one host / one OS version). Not reboot-survival; not an audited per-rule-per-flow trail |
+| Castle Wall macOS: signed sysext, host app, content-filter provider, retail UX | Shipped; enforces a signed operator policy with a clean per-uid allow/deny demonstration that survives reboot (N=5, drill 2026-06-22, one host / one OS version, Dev-ID-signed and notarized). Not an audited per-rule-per-flow trail |
 | Castle Wall Windows | Roadmapped |
 | Mobile (PWA) operator companion | Roadmapped |
 | Fleet console, operator-cloud deployment, sovereign-managed TEE, post-quantum migration | Roadmapped |
 
 Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md). Public-facing claims trace to `proven` or `partial` rows in that matrix; the platform, gap, and next-proof limits named on each row are preserved.
 
-Roadmap shape: the current focus is closing the Mac Castle Wall thesis-gate (sysext rebuild + Track 4A drill PASS on Mini1) so the structural-enforcement claim is honest on both Linux and macOS. After that, Wave 1 (API parity + CLI MVP + federation-ready API) and the Castle Wall Windows backend. See [ROADMAP.md](ROADMAP.md).
+Roadmap shape: with the Mac Castle Wall per-uid allow/deny plus reboot-survival demonstration proven, the current focus is the per-flow rule-attributed audit trail (still the real gap), the Castle Wall Windows backend, and the fleet / operator-cloud surfaces. See [ROADMAP.md](ROADMAP.md).
 
 ---
 
