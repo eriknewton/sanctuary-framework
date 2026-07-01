@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFile, mkdir, readFile, rm, access, symlink } from "node:fs/promises";
+import { writeFile, mkdir, mkdtemp, readFile, rm, access, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -233,11 +233,8 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
   let originalStoragePath: string | undefined;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-hermes-yaml-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-hermes-yaml-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;
@@ -417,11 +414,8 @@ describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)"
   let exitSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-hermes-atomic-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-hermes-atomic-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;

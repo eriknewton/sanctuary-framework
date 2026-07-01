@@ -40,6 +40,7 @@ import {
   backupConfig,
   saveWrapMeta,
   findLatestBackup,
+  findNewerBackup,
   removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
@@ -1034,6 +1035,17 @@ export async function runWrap(
   // userspace daemon proves nothing about the system extension actually
   // filtering traffic; on a sysext-less Mac the daemon starts and filters
   // nothing. Fail-closed: any probe failure reads as not-observed.
+  //
+  // Known bounded staleness (accepted tradeoff, harden round): the panel's
+  // evidence-freshness window is DEFAULT_ENFORCEMENT_FRESHNESS_MS (10
+  // minutes) - the SAME standard the dashboard applies - so adjudicated-flow
+  // evidence written by a PRIOR daemon/extension instance inside that window
+  // still reads "active". An operator who tears enforcement down and re-runs
+  // wrap within minutes can therefore see the one-shot protected banner off
+  // the dead instance's evidence; the dashboard self-corrects when the
+  // window expires, this banner does not. A stricter banner-only window
+  // would diverge from the dashboard standard and false-negative on
+  // genuinely-armed hosts whose most recent adjudicated flow is minutes old.
   const probeCastleWallEnforcementObserved = async (
     auditLog: AuditLog,
   ): Promise<boolean> => {
@@ -1187,22 +1199,38 @@ export async function runWrap(
   if (hermesYaml?.existedBefore) {
     hermesYamlBackupPath = await backupConfig(hermesYaml.yamlPath);
   }
-  await saveWrapMeta({
-    backupPath,
-    originalPath: agentConfig.configPath,
-    platform: agentConfig.platform,
-    wrappedAt: new Date().toISOString(),
-    ...(hermesYaml
-      ? {
-          auxiliary: [
-            {
-              originalPath: hermesYaml.yamlPath,
-              backupPath: hermesYamlBackupPath,
-            },
-          ] satisfies WrapMetaAuxiliaryFile[],
+
+  // Harden round: the wrap-meta write is DEFERRED until every wrapped
+  // surface below is verified-committed. Writing it here (as earlier
+  // revisions did) violated the F6 invariant ("a wrap-meta exists" means
+  // "currently wrapped"): every rollback path after the write left the
+  // meta behind, and the next SUCCESSFUL wrap then preserved that stale
+  // pristine pointer, so a later --unwrap restored pre-failed-wrap content
+  // and silently discarded operator edits made between the failed wrap and
+  // the retry (worse for the created-fresh Hermes config.yaml, where a
+  // stale `backupPath: null` made unwrap DELETE an operator-authored file).
+
+  // Rollback for every post-rewrite failure: restore the primary config
+  // and, for Hermes, the config.yaml surface (or remove it when this wrap
+  // created it fresh). Defined here so the deferred wrap-meta write below
+  // shares the exact rollback the YAML block uses.
+  const rollbackWrapSurfaces = async (): Promise<void> => {
+    if (hermesYaml) {
+      if (hermesYamlBackupPath) {
+        await restoreFromBackup(hermesYaml.yamlPath, hermesYamlBackupPath);
+      } else {
+        try {
+          // Round-3 P1-A: parent-walk-safe even on the rollback path.
+          await unlinkSafeUnderRoot(hermesYaml.yamlPath);
+        } catch {
+          // Best-effort removal of the file this wrap created (it may not
+          // exist when the write itself was what failed, or be refused if a
+          // symlink was raced into its parent).
         }
-      : {}),
-  });
+      }
+    }
+    await restoreFromBackup(agentConfig.configPath, backupPath);
+  };
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
   await rewrite(
@@ -1227,21 +1255,6 @@ export async function runWrap(
   // non-zero, so the wrap is atomic: fully applied or fully rolled back.
   if (hermesYaml) {
     const yamlSurface = hermesYaml;
-    const rollbackBothSurfaces = async (): Promise<void> => {
-      if (hermesYamlBackupPath) {
-        await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
-      } else {
-        try {
-          // Round-3 P1-A: parent-walk-safe even on the rollback path.
-          await unlinkSafeUnderRoot(yamlSurface.yamlPath);
-        } catch {
-          // Best-effort removal of the file this wrap created (it may not
-          // exist when the write itself was what failed, or be refused if a
-          // symlink was raced into its parent).
-        }
-      }
-      await restoreFromBackup(agentConfig.configPath, backupPath);
-    };
     let yamlVerified = false;
     try {
       // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
@@ -1264,7 +1277,7 @@ export async function runWrap(
       console.error(
         `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
       );
-      await rollbackBothSurfaces();
+      await rollbackWrapSurfaces();
       process.exit(1);
     }
     if (!yamlVerified) {
@@ -1272,13 +1285,61 @@ export async function runWrap(
       console.error(
         `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
       );
-      await rollbackBothSurfaces();
+      await rollbackWrapSurfaces();
       process.exit(1);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
     );
+  }
+
+  // F6 + harden round: persist the unwrap pointer ONLY now, after every
+  // wrapped surface is verified-committed, so no failure path can leave a
+  // meta behind for a wrap that did not stick. `configStillWrapped` carries
+  // the PRE-wrap detection result (did ANY wrapped surface genuinely still
+  // carry the sanctuary entry? for Hermes that includes the authoritative
+  // config.yaml, whose plan action `replace-entry` means it did) so a stale
+  // meta left by a pre-1.6.1 unwrap - which never removed metas - or by a
+  // by-hand unwrap cannot pin an ancient pristine pointer over a config the
+  // operator has since edited, while a re-wrap over a partially-unwrapped
+  // Hermes install (JSON restored, YAML restore failed and retained the
+  // meta) still preserves the good pristine pointers. If the meta write
+  // itself fails, roll both surfaces back: a wrapped config with no unwrap
+  // pointer would strand --unwrap entirely.
+  const configStillWrapped =
+    hasSanctuaryInRaw || hermesYaml?.plan.action === "replace-entry";
+  try {
+    await saveWrapMeta(
+      {
+        backupPath,
+        originalPath: agentConfig.configPath,
+        platform: agentConfig.platform,
+        wrappedAt: new Date().toISOString(),
+        ...(hermesYaml
+          ? {
+              auxiliary: [
+                {
+                  originalPath: hermesYaml.yamlPath,
+                  backupPath: hermesYamlBackupPath,
+                },
+              ] satisfies WrapMetaAuxiliaryFile[],
+            }
+          : {}),
+      },
+      { configStillWrapped },
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Wrap metadata write FAILED: ${(err as Error).message}`
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Rolling back: a wrapped config without an unwrap pointer would strand --unwrap.`
+    );
+    await rollbackWrapSurfaces();
+    process.exit(1);
   }
 
   // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
@@ -2303,13 +2364,27 @@ async function unwrap(dryRun: boolean): Promise<void> {
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
   console.error(`  Backup preserved at: ${meta.backupPath}`);
+  // Harden round (operator breadcrumb): the restored snapshot is the FIRST
+  // pre-wrap backup (F6 pristine-pointer preservation); config edits made
+  // while wrapped survive only in the newer timestamped backups that
+  // nothing points at. Say where they are so the discard is recoverable.
+  const newerPrimaryBackup = await findNewerBackup(meta.backupPath);
+  if (newerPrimaryBackup) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: this restored the pristine pre-wrap snapshot. Newer backups exist;` +
+        `\n  config changes made while wrapped may be recoverable from: ${newerPrimaryBackup}`
+    );
+  }
 
   // D4 staging, Bug 2: restore auxiliary files the wrap touched (the
   // Hermes config.yaml surface). A null backupPath means wrap created the
   // file fresh; restoring the pre-wrap state removes it. Best-effort: the
   // primary config restore above already succeeded, so an auxiliary
   // failure reports loudly with the manual recovery path instead of
-  // aborting the unwrap.
+  // aborting the unwrap. Failures are counted: the wrap-meta retirement
+  // below is gated on ALL restores having succeeded.
+  let auxiliaryRestoreFailures = 0;
   for (const aux of auxiliary) {
     try {
       if (aux.backupPath) {
@@ -2319,6 +2394,14 @@ async function unwrap(dryRun: boolean): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
+        const newerAuxBackup = await findNewerBackup(aux.backupPath);
+        if (newerAuxBackup) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: newer backups of this file exist; changes made while wrapped` +
+              `\n  may be recoverable from: ${newerAuxBackup}`
+          );
+        }
       } else if (aux.alreadyAbsent) {
         // Round-2 P2: created-by-wrap file whose parent directory is gone -
         // the "absent" end-state already holds; informational no-op.
@@ -2337,6 +2420,7 @@ async function unwrap(dryRun: boolean): Promise<void> {
         );
       }
     } catch (err) {
+      auxiliaryRestoreFailures += 1;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  WARNING: could not restore ${aux.originalPath}: ${(err as Error).message}`
@@ -2350,17 +2434,36 @@ async function unwrap(dryRun: boolean): Promise<void> {
     }
   }
 
-  // F6 (v1.6.1 wrap safety): a completed unwrap retires the wrap-meta
+  // F6 (v1.6.1 wrap safety): a COMPLETED unwrap retires the wrap-meta
   // pointer files, so "a wrap-meta exists" means "currently wrapped" and a
   // FUTURE wrap records a fresh pristine backup instead of preserving a
   // stale pointer (see saveWrapMeta). The backup files themselves stay.
-  const metaRemovalFailures = await removeWrapMeta();
-  for (const failedPath of metaRemovalFailures) {
+  //
+  // Harden round: retirement is gated on every auxiliary restore having
+  // succeeded. Removing the meta after a partial restore stranded the CLI
+  // retry path: a re-run of --unwrap reported "No Sanctuary wrap found"
+  // while e.g. the Hermes config.yaml still routed traffic through
+  // Sanctuary, and a subsequent wrap recorded that still-wrapped file as
+  // the new "pristine" backup. Keeping the meta keeps --unwrap re-runnable.
+  // The retirement is also scoped to the originalPath just restored, so a
+  // legacy meta naming a DIFFERENT wrapped surface keeps its pointer.
+  if (auxiliaryRestoreFailures > 0) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
-      `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
-        `re-wrap may preserve a stale restore pointer. Remove it manually.`
+      `  WARNING: ${auxiliaryRestoreFailures} auxiliary ` +
+        `${auxiliaryRestoreFailures === 1 ? "restore" : "restores"} failed; ` +
+        `keeping the wrap metadata so 'sanctuary wrap --unwrap' can be ` +
+        `re-run after fixing the cause above.`
     );
+  } else {
+    const metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    for (const failedPath of metaRemovalFailures) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
+          `re-wrap may preserve a stale restore pointer. Remove it manually.`
+      );
+    }
   }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
