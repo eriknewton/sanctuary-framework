@@ -582,7 +582,7 @@ export async function runWrap(
     const canonicalPath = candidatePaths[0];
     // Honesty fix: for Hermes, the JSON surface detected above
     // (cli-config.json / config.json) is NOT where Hermes routes MCP
-    // traffic — v0.16.0 reads ~/.hermes/config.yaml (see hermes-yaml.ts
+    // traffic. v0.16.0 reads ~/.hermes/config.yaml (see hermes-yaml.ts
     // header). A host that already has a populated config.yaml (e.g. a
     // `venice` entry) has a REAL Hermes MCP config, so claiming "No
     // existing hermes config found" is false and confusing on the exact
@@ -624,7 +624,7 @@ export async function runWrap(
         // ~/.hermes -> /tmp/victim). Route it through the same safe-path
         // discipline as every other wrap sink.
         // DEBT (hermes cli-config.json): this JSON file is a legacy compat
-        // artifact — Hermes v0.16.0 does NOT consult it for MCP routing
+        // artifact. Hermes v0.16.0 does NOT consult it for MCP routing
         // (hermes-yaml.ts:4-10). It is kept because the generic wrap flow
         // keys off `agentConfig`, which detectAgentConfigWithDiagnostics
         // derives from the JSON surface, and unwrap unlinks it
