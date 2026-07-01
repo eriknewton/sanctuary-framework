@@ -42,7 +42,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -152,7 +152,7 @@ jobs:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - name: Cache cargo registry and build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
