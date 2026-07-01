@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.6.0] - 2026-07-01
+
+Minor release. The published `latest` channel is at 1.5.0, which predates the single-surface concierge dashboard, the dashboard status-honesty hardening, and a set of honest install-time messaging fixes. This release brings `latest` back in line with `main`. The feature weight is a semver minor bump: the additions are backward-compatible and the honesty fixes remove overclaims rather than add capability. Per-PR detail is in the git history from the v1.5.0 tag through `main`.
+
+The headline is the concierge dashboard: the conversational concierge is now the single default surface an operator sees, with posture folded to a `/posture` view and a dedicated Verify nav item. Alongside it, the dashboard status surface is hardened so the sovereignty score and the layer cards reflect a real enforcement verdict and never show green on mere config presence. The release also ships honest install-time messaging for the setup flow and for the Hermes wrap path, and a Castle Wall arming runbook for macOS. The macOS Castle Wall bounds are unchanged: per-uid allow/deny plus boot-survival plus WAN-containment are proven; there is no per-flow rule-attributed audit trail.
+
+### Added
+
+- **Single-surface concierge dashboard.** The v1.1 conversational concierge is now the single default dashboard surface: the conversational spine, a click-to-clear approvals queue, and an agent switcher (#830), promoted to the default with posture folded to a `/posture` view and a Verify nav item (#832).
+- **Model-choice privacy note in setup.** The CLI setup flow now surfaces the model-choice privacy tradeoff so an operator can see it at configure time (#829).
+
+### Changed
+
+- **Dashboard is now conversational-first.** The default surface is the concierge; the posture home moves to `/posture` and verification gets its own nav item rather than being the landing view (#832).
+
+### Hardened
+
+- **Dashboard status never shows green on config presence.** The `/api/sovereignty` score and the layer cards now reflect a real enforcement verdict, not the presence of a config file, so the dashboard cannot report green when Castle Wall is not actually enforcing (#828).
+
+### Docs & Fixes
+
+- **Honest Hermes first-run messaging.** The Hermes wrap path gives honest first-run messaging when `~/.hermes/config.yaml` already exists, instead of implying a fresh setup (#836).
+- **Honest Castle Wall fresh-wrap messaging plus a macOS arm runbook.** Fresh-wrap messaging no longer shows a spurious re-pin nag, and a new macOS arming runbook plus status and deploy doc currency ship alongside it (#834).
+- **Version and macOS-capability currency.** README, ROADMAP, and quickstart are brought to current version and honest macOS capability bounds (#833).
+- **Changelog honesty and artifact cleanup.** A signed-self-update overclaim is corrected and stray Codex artifacts are removed (#827); a dead `intelligence configure` reference in the CLI is fixed (#829).
+
 ## [1.5.0] - 2026-06-30
 
 Minor release. Roughly two weeks and a large body of feature, hardening, and fix work since the v1.4.0 tag (2026-06-15). The feature weight is a semver minor bump: the additions are backward-compatible and the new enforcement mechanisms ship default-off and fail-closed. This section groups the work; per-PR detail is in the git history from the v1.4.0 tag through `main`.
