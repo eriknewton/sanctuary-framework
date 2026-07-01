@@ -963,45 +963,44 @@ export async function saveWrapMeta(
  * files themselves are never deleted. Returns the paths that could not be
  * removed (absent files are not failures) so the caller can warn loudly.
  *
- * Harden round (mixed legacy state): when `restoredOriginalPath` is given,
- * a meta file that parses and names a DIFFERENT originalPath is left in
- * place: it is the only pointer to that OTHER surface's pristine backup
- * (e.g. a pre-sweep release wrote the legacy meta for Hermes and a newer
- * wrap wrote the canonical meta for Claude Code; unwrap restored only the
+ * Harden round (mixed legacy state): a meta file that parses and names a
+ * DIFFERENT originalPath than `restoredOriginalPath` is left in place: it
+ * is the only pointer to that OTHER surface's pristine backup (e.g. a
+ * pre-sweep release wrote the legacy meta for Hermes and a newer wrap
+ * wrote the canonical meta for Claude Code; unwrap restored only the
  * latter). An unparseable meta file points at nothing restorable and is
- * still removed. With no argument, both files are removed unconditionally.
+ * still removed. (The parameter is REQUIRED: an earlier optional-argument
+ * "remove unconditionally" mode had no production caller and was deleted.)
  */
 export async function removeWrapMeta(
-  restoredOriginalPath?: string,
+  restoredOriginalPath: string,
 ): Promise<string[]> {
   const failures: string[] = [];
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     const metaPath = join(backupDir(), filename);
-    if (restoredOriginalPath !== undefined) {
-      let pointsAtOtherSurface = false;
-      try {
-        const parsed: unknown = JSON.parse(
-          await readFileCustody(metaPath, {
-            encoding: "utf-8",
-            verifyPathIdentity: true,
-          }),
-        );
-        if (
-          parsed &&
-          typeof parsed === "object" &&
-          !Array.isArray(parsed) &&
-          typeof (parsed as Record<string, unknown>).originalPath === "string" &&
-          resolve((parsed as Record<string, unknown>).originalPath as string) !==
-            resolve(restoredOriginalPath)
-        ) {
-          pointsAtOtherSurface = true;
-        }
-      } catch {
-        // Missing or unparseable: nothing another surface could be restored
-        // from; fall through to the unlink (ENOENT is a no-op there).
+    let pointsAtOtherSurface = false;
+    try {
+      const parsed: unknown = JSON.parse(
+        await readFileCustody(metaPath, {
+          encoding: "utf-8",
+          verifyPathIdentity: true,
+        }),
+      );
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof (parsed as Record<string, unknown>).originalPath === "string" &&
+        resolve((parsed as Record<string, unknown>).originalPath as string) !==
+          resolve(restoredOriginalPath)
+      ) {
+        pointsAtOtherSurface = true;
       }
-      if (pointsAtOtherSurface) continue;
+    } catch {
+      // Missing or unparseable: nothing another surface could be restored
+      // from; fall through to the unlink (ENOENT is a no-op there).
     }
+    if (pointsAtOtherSurface) continue;
     try {
       await unlink(metaPath);
     } catch (err) {

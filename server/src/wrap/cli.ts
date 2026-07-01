@@ -1233,12 +1233,28 @@ export async function runWrap(
   };
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
-  await rewrite(
-    agentConfig,
-    sanctuaryCommand,
-    sanctuaryArgs,
-    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-  );
+  // Harden round: the primary rewrite writes the live config IN PLACE
+  // (O_TRUNC via writeFileNoFollow, not temp+rename), so a throw mid-write
+  // (disk full, EIO) can leave the config truncated. With the wrap-meta
+  // write deferred until after verification, an uncaught throw here would
+  // propagate out of runWrap with no rollback AND no meta, so
+  // `--unwrap` would report nothing to restore. Catch, restore the
+  // pre-wrap surfaces, and exit non-zero, matching the YAML-write path.
+  try {
+    await rewrite(
+      agentConfig,
+      sanctuaryCommand,
+      sanctuaryArgs,
+      Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Config rewrite FAILED: ${(err as Error).message}`
+    );
+    await rollbackWrapSurfaces();
+    process.exit(1);
+  }
 
   const verifyOk = await verifyRewrittenConfig(
     agentConfig.configPath,

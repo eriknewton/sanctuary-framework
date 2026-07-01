@@ -316,6 +316,49 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
     expect(await readFile(settingsPath, "utf-8")).toBe(editedV2);
   });
 
+  it("a rewrite that corrupts the config then THROWS rolls both back and exits non-zero", async () => {
+    const settingsDir = join(tmpHome, ".claude");
+    await mkdir(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    const pristine = JSON.stringify({ mcpServers: {} }, null, 2);
+    await writeFile(settingsPath, pristine);
+
+    // The primary rewrite writes the live config IN PLACE (O_TRUNC, not
+    // temp+rename), so a mid-write throw (disk full, EIO) leaves the config
+    // truncated. Harden round: pre-fix the throw escaped runWrap uncaught,
+    // no rollback ran, and (with the meta write deferred until after
+    // verification) no wrap-meta existed either, so `--unwrap` reported
+    // nothing to restore over a corrupted config. The rewrite is now inside
+    // the same rollback + exit(1) discipline as the YAML-write path.
+    const exitSpy = vi
+      .spyOn(process, "exit")
+      .mockImplementation((code?: string | number | null) => {
+        throw new Error(`process.exit:${code}`);
+      });
+    try {
+      await expect(
+        runWrap(
+          { claudeCode: true, noOpen: true },
+          {
+            ...makeDeps(),
+            rewriteConfig: async () => {
+              // Simulate the in-place write dying mid-stream: the file is
+              // already truncated/corrupted when the error surfaces.
+              await writeFile(settingsPath, '{"trunc');
+              throw new Error("EIO: i/o error, write");
+            },
+          },
+        ),
+      ).rejects.toThrow("process.exit:1");
+    } finally {
+      exitSpy.mockRestore();
+    }
+
+    // Rolled back: pre-wrap content intact, no truncated config, no meta.
+    expect(await readFile(settingsPath, "utf-8")).toBe(pristine);
+    expect(await findLatestBackup()).toBeNull();
+  });
+
   it("a stale wrap-meta over an UNWRAPPED config does not pin the ancient pointer (pre-1.6.1 unwraps left metas behind)", async () => {
     const settingsDir = join(tmpHome, ".claude");
     await mkdir(settingsDir, { recursive: true });
@@ -441,10 +484,10 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
     });
     expect(await findLatestBackup()).not.toBeNull();
 
-    expect(await removeWrapMeta()).toEqual([]);
+    expect(await removeWrapMeta(configPath)).toEqual([]);
     expect(await findLatestBackup()).toBeNull();
 
     // Idempotent: absent files are not failures.
-    expect(await removeWrapMeta()).toEqual([]);
+    expect(await removeWrapMeta(configPath)).toEqual([]);
   });
 });
