@@ -212,26 +212,35 @@ describe("release-manifest verifier", () => {
     });
   });
 
-  describe("pinned-key gate fails closed (placeholder is not a real key)", () => {
-    it("the pinned constant is the all-zero placeholder", () => {
-      // Documents that the production key has NOT been swapped in yet.
-      expect(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL).toMatch(/^A+$/);
+  describe("pinned-key gate (live production key, activated 2026-07-01)", () => {
+    it("the pinned constant is a real base64url key, not the all-zero placeholder", () => {
+      // The production key has been swapped in. It must be a 43-char base64url
+      // value and must NOT be the all-zero identity-point placeholder.
+      expect(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL).toMatch(
+        /^[A-Za-z0-9_-]{43}$/,
+      );
+      expect(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL).not.toMatch(/^A+$/);
     });
 
-    it("a real, validly signed manifest does NOT verify against the pinned placeholder", () => {
+    it("a manifest signed by a NON-pinned key does NOT verify against the pinned key", () => {
+      // The repo has no access to the real private seed, so any manifest a test
+      // can produce is signed by a foreign key and must be refused as a bad
+      // signature (not bad_pinned_key: the pinned key is now valid).
       const { privateKey } = generateKeypair();
       const manifest = signManifest(BODY, privateKey);
-      // verifyReleaseManifest uses the PINNED key — must refuse.
       const result = verifyReleaseManifest(manifest);
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.reason).toBe("bad_pinned_key");
+      if (!result.ok) expect(result.reason).toBe("bad_signature");
     });
 
-    it("loadPinnedReleaseKey REJECTS the all-zero placeholder (returns null)", () => {
-      // CRITICAL regression guard: the all-zero key is the Ed25519 identity
-      // point and would accept a zero-signature universal forgery. The pinned
-      // loader must refuse it so the gate truly fails closed until swap.
-      expect(loadPinnedReleaseKey()).toBeNull();
+    it("loadPinnedReleaseKey returns the real 32-byte pinned key (non-null)", () => {
+      // The pinned constant is now a real key, so the loader returns it. The
+      // all-zero identity-point rejection remains covered as defense-in-depth by
+      // "verifyReleaseManifestWithKey rejects an all-zero public key" below — an
+      // all-zero key is still refused if it were ever pinned again.
+      const key = loadPinnedReleaseKey();
+      expect(key).not.toBeNull();
+      expect(key?.length).toBe(32);
     });
   });
 
@@ -289,19 +298,16 @@ describe("release-manifest verifier", () => {
 
   describe("acceptance: each path emits an audit event", () => {
     it("emits a refusal audit event on a manifest the gate refuses", async () => {
-      // The audited gate uses the PINNED key, which is the rejected all-zero
-      // placeholder — so it refuses with `bad_pinned_key` before it even
-      // parses the body. The point of this test is the audit emission + the
-      // fail-closed advise:false; the reason reflects the pinned-key refusal
-      // while the placeholder stands. (The `malformed` reason itself is
-      // covered directly below against a valid key.)
+      // The audited gate uses the real PINNED key. A value with no signature is
+      // malformed and refused before any verify. The point of this test is the
+      // audit emission + the fail-closed advise:false.
       const { sink, events } = recordingSink();
       const out = await verifyAndAdviseUpdate({ body: BODY }, sink);
       expect(out.advise).toBe(false);
       expect(events).toHaveLength(1);
       expect(events[0]?.operation).toBe(UPDATE_MANIFEST_REFUSED_OP);
       expect(events[0]?.result).toBe("failure");
-      expect(events[0]?.details?.reason).toBe("bad_pinned_key");
+      expect(events[0]?.details?.reason).toBe("malformed");
     });
 
     it("the malformed refusal reason is produced against a valid key", () => {
@@ -313,11 +319,11 @@ describe("release-manifest verifier", () => {
       if (!result.ok) expect(result.reason).toBe("malformed");
     });
 
-    it("emits a refusal audit event on a wrong-key/tampered manifest (pinned placeholder)", async () => {
+    it("emits a refusal audit event on a wrong-key manifest (pinned live key)", async () => {
       const { sink, events } = recordingSink();
       const { privateKey } = generateKeypair();
       const manifest = signManifest(BODY, privateKey);
-      // Real signature, but verified against the pinned placeholder -> refuse.
+      // Real signature by a foreign key, verified against the pinned live key -> refuse.
       const out = await verifyAndAdviseUpdate(manifest, sink);
       expect(out.advise).toBe(false);
       expect(events).toHaveLength(1);
@@ -330,7 +336,7 @@ describe("release-manifest verifier", () => {
       // keypair and asserting the verified op fires. We exercise the gate's
       // accept branch directly via verifyReleaseManifestWithKey + a manual
       // audit append to mirror verifyAndAdviseUpdate's success path, since the
-      // production gate is intentionally pinned to a placeholder.
+      // repo cannot sign for the real pinned key (its private seed is not here).
       const { sink, events } = recordingSink();
       const { publicKey, privateKey } = generateKeypair();
       const manifest = signManifest(BODY, privateKey);
