@@ -599,11 +599,13 @@ export async function runWrap(
     if (canonicalPath && options.dryRun) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       if (hermesYamlExists) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
             `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
         );
       } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`\n  No existing ${platformHint} config found.`);
       }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -630,11 +632,13 @@ export async function runWrap(
         await writeFileSafeUnderRoot(canonicalPath, "{}", { mode: 0o600 });
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         if (hermesYamlExists) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(
             `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
               `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
           );
         } else {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(`\n  No existing ${platformHint} config found.`);
         }
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
