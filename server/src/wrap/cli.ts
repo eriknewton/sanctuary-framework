@@ -382,6 +382,20 @@ function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string 
 }
 
 /**
+ * Read-only existence probe. Returns true if `path` is reachable, false on
+ * any error (absent, permission, etc.). Used to decide first-run messaging;
+ * never mutates the filesystem.
+ */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * D4 staging, Bugs 1+2: dry-run preview of the Hermes config.yaml
  * injection. Read-only by construction (planHermesYamlInjection is pure;
  * the only filesystem touch is the readFile probe), and previews the
@@ -566,13 +580,32 @@ export async function runWrap(
   if (!agentConfig && platformHint && !options.wrap) {
     const candidatePaths = getPlatformPaths()[platformHint];
     const canonicalPath = candidatePaths[0];
+    // Honesty fix: for Hermes, the JSON surface detected above
+    // (cli-config.json / config.json) is NOT where Hermes routes MCP
+    // traffic — v0.16.0 reads ~/.hermes/config.yaml (see hermes-yaml.ts
+    // header). A host that already has a populated config.yaml (e.g. a
+    // `venice` entry) has a REAL Hermes MCP config, so claiming "No
+    // existing hermes config found" is false and confusing on the exact
+    // install target. When config.yaml exists we say so, name the
+    // authoritative file, and note existing entries are preserved; the
+    // per-entry preserved count is reported by the config.yaml routing
+    // line (reportHermesYamlDryRun / the real injection below).
+    const hermesYamlExists =
+      platformHint === "hermes" && (await pathExists(hermesConfigYamlPath()));
     // D4 staging, Bug 1: --dry-run must guarantee ZERO filesystem writes.
     // This bootstrap ran BEFORE the dry-run gate below, so `protect
     // --hermes --dry-run` on a host with no config still created the file.
     // Report what would be bootstrapped and stop before any write path.
     if (canonicalPath && options.dryRun) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\n  No existing ${platformHint} config found.`);
+      if (hermesYamlExists) {
+        console.error(
+          `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
+            `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
+        );
+      } else {
+        console.error(`\n  No existing ${platformHint} config found.`);
+      }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
       if (platformHint === "hermes") {
@@ -588,11 +621,22 @@ export async function runWrap(
         // plain writeFile, both of which follow a symlinked parent (e.g.
         // ~/.hermes -> /tmp/victim). Route it through the same safe-path
         // discipline as every other wrap sink.
+        // DEBT (hermes cli-config.json): this JSON file is a legacy compat
+        // artifact — Hermes v0.16.0 does NOT consult it for MCP routing
+        // (hermes-yaml.ts:4-10). It is kept because the generic wrap flow
+        // keys off `agentConfig`, which detectAgentConfigWithDiagnostics
+        // derives from the JSON surface, and unwrap unlinks it
+        // (config-reader.ts). The authoritative surface is config.yaml.
         await writeFileSafeUnderRoot(canonicalPath, "{}", { mode: 0o600 });
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `\n  No existing ${platformHint} config found.`
-        );
+        if (hermesYamlExists) {
+          console.error(
+            `\n  Found your Hermes MCP config at ${hermesConfigYamlPath()}.` +
+              `\n  Existing MCP servers there are preserved; Sanctuary routing will be added.`
+          );
+        } else {
+          console.error(`\n  No existing ${platformHint} config found.`);
+        }
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
           `  Bootstrapped a fresh config at ${canonicalPath}.\n`
