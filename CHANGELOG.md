@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.6.1] - 2026-07-01
+
+Patch release: the install path works again, and the first-run experience tells the truth. No new capability.
+
+The headline fix: `npx @sanctuary-framework/mcp-server` had been broken since v1.4.0 ("could not determine executable to run") because the package declared no bin matching its unscoped name. This release restores the bare-npx form, makes `sanctuary protect`/`wrap` write a version-pinned MCP entry into harness configs (no more dead entries at harness restart, no drift to whatever `latest` becomes), and adds a CI gate that packs the real publish tarball and proves both invocation forms resolve so this class of breakage cannot ship again.
+
+### Fixed
+
+- **Bare `npx @sanctuary-framework/mcp-server` resolves again.** Added the `mcp-server` bin entry npm needs for scoped-package basename resolution; broken v1.4.0 through v1.6.0 (#846).
+- **Wrap writes a pinned, working MCP entry.** Harness configs now get `npx -y -p @sanctuary-framework/mcp-server@<version> sanctuary` instead of the unpinned bare form, so the entry works at harness restart and does not drift across releases; the update notice also suggests the exact announced version instead of `@latest` (#846).
+- **MCP stdio stdout purity.** An audit-log notice that could print to stdout on the stdio boot path now goes to stderr, keeping the JSON-RPC channel clean; a new test pins stdout purity (#843).
+- **Pristine unwrap survives failed and interrupted wraps.** The wrap metadata that `--unwrap` uses to restore your original config is now written only after every wrapped surface verifies, with full rollback of all surfaces if any step fails, a fallback metadata write if a rollback itself fails, and loud, explicit guidance in the residual corner cases instead of silent state (#843).
+
+### Changed
+
+- **The "protected" banner is evidence-gated.** The wrap flow's protection banner now requires a real, fresh, signature-gated Castle Wall enforcement verdict (the same standard as the dashboard) and fails closed on any probe error; first-run copy no longer overstates what a fresh wrap provides (#843).
+
+### CI
+
+- **Install-path gate.** A new workflow packs the publish tarball and asserts the bare npx form, the pinned wrap form, and every declared bin all resolve (#846).
+
 ## [1.6.0] - 2026-07-01
 
 Minor release. The published `latest` channel is at 1.5.0, which predates the single-surface concierge dashboard, the dashboard status-honesty hardening, and a set of honest install-time messaging fixes. This release brings `latest` back in line with `main`. The feature weight is a semver minor bump: the additions are backward-compatible and the honesty fixes remove overclaims rather than add capability. Per-PR detail is in the git history from the v1.5.0 tag through `main`.
