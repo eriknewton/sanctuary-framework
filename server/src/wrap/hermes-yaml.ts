@@ -441,9 +441,12 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
 
 /**
  * Exclusive end of an entry's lines: deeper-indented content (including
- * indented comments) belongs to the entry; blank lines are included only
- * when deeper-indented content follows them before the next boundary, so
- * trailing whitespace between entries is never swallowed by a replace.
+ * indented comments) belongs to the entry; blank/comment lines are included
+ * only when deeper-indented content follows them before the next boundary,
+ * so trailing whitespace between entries is never swallowed by a replace.
+ * YAML comments are ignored for structure, even when they are outdented, so
+ * an outdented comment between two nested field lines must not hide the
+ * later field from the whitelist/extractor.
  */
 function entryEnd(
   lines: string[],
@@ -454,7 +457,7 @@ function entryEnd(
   let end = start + 1;
   for (let i = start + 1; i < blockEnd; i++) {
     const line = lines[i]!;
-    if (line.trim() === "") continue;
+    if (isBlankOrComment(line)) continue;
     if (indentOf(line) > entryIndent) {
       end = i + 1;
       continue;

@@ -227,6 +227,22 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses unreadable sanctuary env hidden behind an outdented comment PyYAML ignores structurally", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "# operator note inside the sanctuary entry",
+      "    env:",
+      "      OPERATOR_BLOCK_TOK: |",
+      "        secret-line",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
   it("refuses a sanctuary entry with duplicate env fields (block form first, inline second) instead of dropping the vars PyYAML last-wins fed Hermes", () => {
     const existing = [
       "mcp_servers:",
@@ -1010,6 +1026,21 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
     expect(extractSanctuaryEntryEnv(yaml)).toEqual({
       SANCTUARY_DASHBOARD_AUTH_TOKEN: "plain-tok",
       SANCTUARY_PASSPHRASE: "it's quoted",
+    });
+  });
+
+  it("keeps scanning a sanctuary entry through an outdented comment that PyYAML ignores structurally", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "# operator note inside the sanctuary entry",
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok",
     });
   });
 
