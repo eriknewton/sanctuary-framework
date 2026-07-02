@@ -8,8 +8,10 @@
 # executable to run" for three consecutive releases because nothing in CI
 # ever exercised the literal install command users are told to run.
 #
-# npm's multi-bin resolution only auto-selects an executable when a bin
-# name matches the package's unscoped name (`mcp-server`). This job packs
+# npm's multi-bin resolution auto-selects an executable only when all bin
+# values point at the same file (the alias rule that carried v1.3.x) or
+# when a bin name matches the package's unscoped name (`mcp-server`).
+# v1.4.0 broke the former by adding a bin with a distinct target. This job packs
 # the server exactly as `npm publish` would, then runs the packed tarball
 # through `npx` with a guaranteed-cold npm cache and asserts that the
 # bare form resolves, exits 0, and prints the package version on stdout.
