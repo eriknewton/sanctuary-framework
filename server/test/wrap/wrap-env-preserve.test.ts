@@ -249,6 +249,85 @@ describe("Wrap env-var preservation", () => {
     expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("persisted-tok");
   });
 
+  it("does not inherit the plaintext-remote downgrade flag past an explicit-env re-wrap", async () => {
+    // SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE is a permissive,
+    // less-secure setting: inheriting it would keep plaintext remote
+    // dashboard access silently sticky across a re-wrap the operator ran
+    // WITHOUT asking for it. It must be re-asserted per wrap run
+    // (--allow-plaintext-remote or the env var). Ordinary persisted vars
+    // (the dashboard token) still survive the same merge.
+    for (const key of ENV_KEYS) delete process.env[key];
+
+    const rawConfig = {
+      mcp: {
+        servers: {
+          sanctuary: {
+            command: "npx",
+            args: ["@sanctuary-framework/mcp-server"],
+            env: {
+              SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
+              SANCTUARY_DASHBOARD_AUTH_TOKEN: "persisted-tok",
+            },
+          },
+        },
+      },
+    };
+    const config: AgentConfig = {
+      platform: "openclaw",
+      configPath,
+      servers: [],
+      rawConfig,
+    };
+    await writeFile(configPath, JSON.stringify(rawConfig), { mode: 0o600 });
+
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"], {
+      SANCTUARY_STORAGE_PATH: "/tmp/tenant-storage",
+    });
+
+    const result = JSON.parse(await readFile(configPath, "utf-8"));
+    const env = result.mcp.servers.sanctuary.env;
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBeUndefined();
+    expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("persisted-tok");
+  });
+
+  it("keeps the plaintext-remote flag when the re-wrap explicitly re-asserts it", async () => {
+    // The opt-in path: --allow-plaintext-remote (or the env var) lands in
+    // the explicit env, and explicit keys win the merge, so an operator who
+    // re-asserts the downgrade on the re-wrap keeps it.
+    for (const key of ENV_KEYS) delete process.env[key];
+
+    const rawConfig = {
+      mcp: {
+        servers: {
+          sanctuary: {
+            command: "npx",
+            args: ["@sanctuary-framework/mcp-server"],
+            env: {
+              SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
+              SANCTUARY_DASHBOARD_AUTH_TOKEN: "persisted-tok",
+            },
+          },
+        },
+      },
+    };
+    const config: AgentConfig = {
+      platform: "openclaw",
+      configPath,
+      servers: [],
+      rawConfig,
+    };
+    await writeFile(configPath, JSON.stringify(rawConfig), { mode: 0o600 });
+
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"], {
+      SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
+    });
+
+    const result = JSON.parse(await readFile(configPath, "utf-8"));
+    const env = result.mcp.servers.sanctuary.env;
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
+    expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("persisted-tok");
+  });
+
   it("does not inject env vars when none are available", async () => {
     delete process.env.SANCTUARY_PASSPHRASE;
     delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;

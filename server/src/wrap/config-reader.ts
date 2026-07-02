@@ -1386,13 +1386,25 @@ export async function rewriteConfigForWrap(
   // sets only SANCTUARY_STORAGE_PATH (the wrapped-install upgrade path)
   // must not clobber entry-persisted vars an earlier wrap wrote (e.g.
   // SANCTUARY_DASHBOARD_AUTH_TOKEN) that are absent from the current shell.
-  // The storage-tenancy pair is the exception: it is never inherited on the
-  // explicit path, because the caller's env reflects the wrap run's own
-  // storage resolution (the run just wrote wrap-meta/custody/profile
-  // against it), and a stale SANCTUARY_FORTRESS_PATH from the old entry
-  // would win the spawned server's boot-time re-promotion and point it at
-  // a different fortress than the one this wrap run populated.
-  const TENANCY_VARS = ["SANCTUARY_FORTRESS_PATH", "SANCTUARY_STORAGE_PATH"];
+  // Two classes of vars are never inherited on the explicit path:
+  //
+  // - The storage-tenancy pair: the caller's env reflects the wrap run's
+  //   own storage resolution (the run just wrote wrap-meta/custody/profile
+  //   against it), and a stale SANCTUARY_FORTRESS_PATH from the old entry
+  //   would win the spawned server's boot-time re-promotion and point it
+  //   at a different fortress than the one this wrap run populated.
+  // - The plaintext-remote transport-downgrade flag: it is a permissive,
+  //   less-secure setting, so it must be re-asserted per wrap run (via
+  //   --allow-plaintext-remote or the env var, both of which land in the
+  //   explicit env and win the merge); silently inheriting it would keep
+  //   plaintext remote dashboard access sticky across a re-wrap that did
+  //   not ask for it. Fail-secure: not inheriting it can only DISABLE the
+  //   downgrade, never enable it.
+  const NON_INHERITED_VARS = [
+    "SANCTUARY_FORTRESS_PATH",
+    "SANCTUARY_STORAGE_PATH",
+    "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
+  ];
   let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv
     ? { ...sanctuaryEnv }
     : undefined;
@@ -1404,7 +1416,7 @@ export async function rewriteConfigForWrap(
         resolvedEnv = inherited;
       } else {
         for (const [key, value] of Object.entries(inherited)) {
-          if (TENANCY_VARS.includes(key)) continue;
+          if (NON_INHERITED_VARS.includes(key)) continue;
           if (!(key in resolvedEnv)) resolvedEnv[key] = value;
         }
       }
