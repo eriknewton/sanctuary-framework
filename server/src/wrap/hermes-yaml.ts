@@ -25,8 +25,10 @@
  *     YAML that PyYAML rejects, breaking Hermes startup
  *   - duplicate top-level `mcp_servers:` keys
  *   - an existing sanctuary entry carrying an inline `env:` value (e.g.
- *     `env: {TOK: v}`): the replace-entry write cannot inherit vars it
- *     cannot read, so proceeding would silently drop them
+ *     `env: {TOK: v}`) or duplicate `env` field keys: the replace-entry
+ *     write cannot inherit vars it cannot read (PyYAML is last-wins on
+ *     duplicates), so proceeding would silently drop them; quoted field
+ *     keys (`"env":`) count, since PyYAML reads them as the same key
  * The empty flow form `mcp_servers: {}` IS supported (rewritten to block
  * form, any trailing comment preserved), since fresh installs commonly
  * ship it.
@@ -377,30 +379,55 @@ function ensureTrailingNewline(lines: string[]): string {
 }
 
 /**
- * Refuse an inline (flow/scalar) `env:` value on the EXISTING sanctuary
- * entry before it is replaced wholesale. extractSanctuaryEntryEnv cannot
- * read that shape (its env-line match requires block form), so proceeding
- * would silently drop the operator's hand-authored vars (e.g. a dashboard
- * auth token) from the rewritten entry, the same silent-drop class the
- * env inheritance exists to prevent. Refusing loudly here keeps the
- * extractor's contract honest: a null from it never masks a write. The
- * empty flow form `env: {}` carries nothing to drop and stays editable.
+ * Field-level `env` key on an entry, bare or quoted (`env:`, `"env":`,
+ * `'env':`). PyYAML resolves all three to the same mapping key, so the
+ * refusal screen and the extractor must recognize every spelling or a
+ * quoted key silently escapes both.
+ */
+const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
+
+/**
+ * Refuse `env` field shapes on the EXISTING sanctuary entry that
+ * extractSanctuaryEntryEnv cannot faithfully read, before the entry is
+ * replaced wholesale:
+ *   - an inline (flow/scalar) `env:` value (the extractor's env-line
+ *     match requires block form)
+ *   - duplicate `env` field keys (PyYAML is last-wins; the extractor
+ *     reads one line, so it cannot know which set Hermes actually used)
+ * Proceeding on either shape would silently drop the operator's
+ * hand-authored vars (e.g. a dashboard auth token) from the rewritten
+ * entry, the same silent-drop class the env inheritance exists to
+ * prevent. Every field line is scanned (no early return) and quoted
+ * `env` keys count, so nothing PyYAML would treat as the env field can
+ * slip past the screen. Refusing loudly here keeps the extractor's
+ * contract honest: a null from it never masks a write. The empty flow
+ * form `env: {}` carries nothing to drop and stays editable.
  */
 function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
   let fieldIndent = -1;
+  let sawEnvField = false;
   for (let i = entry.start + 1; i < entry.end; i++) {
     const line = lines[i]!;
     if (isBlankOrComment(line)) continue;
     const indent = indentOf(line);
     if (fieldIndent === -1) fieldIndent = indent;
     if (indent !== fieldIndent) continue;
-    const m = /^env\s*:\s*(.*)$/.exec(line.trim());
+    const m = ENV_FIELD_RE.exec(line.trim());
     if (!m) continue;
-    const remainder = m[1]!.trim();
+    if (sawEnvField) {
+      throw new HermesYamlUnsupportedError(
+        "config.yaml sanctuary entry carries duplicate env fields this " +
+          "tool cannot safely inherit (Hermes keeps only the last one); " +
+          "remove the duplicate and re-run wrap."
+      );
+    }
+    sawEnvField = true;
+    const remainder = m[2]!.trim();
     // Block form (empty remainder or trailing comment) is the readable
-    // shape; the empty flow mapping `{}` has nothing to inherit.
-    if (remainder === "" || remainder.startsWith("#")) return;
-    if (/^\{\s*\}\s*(#.*)?$/.test(remainder)) return;
+    // shape; the empty flow mapping `{}` has nothing to inherit. Keep
+    // scanning: a LATER duplicate env field must still refuse.
+    if (remainder === "" || remainder.startsWith("#")) continue;
+    if (/^\{\s*\}\s*(#.*)?$/.test(remainder)) continue;
     throw new HermesYamlUnsupportedError(
       "config.yaml sanctuary entry carries an inline env value this tool " +
         "cannot safely inherit; convert it to block-mapping form (one " +
@@ -426,10 +453,12 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
  * aliases, tags, flow collections, and multi-line plain scalars all
  * resolve to no inheritance for that var (never a corrupted literal), and
  * a flow-form `env: {...}` or an unsupported `mcp_servers` shape resolves
- * null. Null never masks a write: the consuming injection REFUSES both
- * unsupported block shapes and an inline sanctuary `env:` value loudly
- * (HermesYamlUnsupportedError, see refuseInlineSanctuaryEnv) before any
- * replace-entry write proceeds.
+ * null. Null never masks a write: the consuming injection REFUSES
+ * unsupported block shapes, an inline sanctuary `env:` value, and
+ * duplicate sanctuary `env` fields loudly (HermesYamlUnsupportedError,
+ * see refuseInlineSanctuaryEnv) before any replace-entry write proceeds;
+ * both screens match quoted `env` keys, so no PyYAML-valid spelling of
+ * the field escapes the refusal while eluding this read.
  */
 export function extractSanctuaryEntryEnv(
   existingContent: string | null
@@ -457,7 +486,8 @@ export function extractSanctuaryEntryEnv(
     const indent = indentOf(line);
     if (fieldIndent === -1) fieldIndent = indent;
     if (indent !== fieldIndent) continue;
-    if (/^env\s*:\s*(#.*)?$/.test(line.trim())) {
+    const m = ENV_FIELD_RE.exec(line.trim());
+    if (m && (m[2]!.trim() === "" || m[2]!.trim().startsWith("#"))) {
       envLine = i;
       break;
     }

@@ -227,6 +227,50 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses a sanctuary entry with duplicate env fields (block form first, inline second) instead of dropping the vars PyYAML last-wins fed Hermes", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      SANCTUARY_STORAGE_PATH: "/tmp/tenant"',
+      "    env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok}",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("refuses a sanctuary entry with duplicate BLOCK-form env fields (the extractor cannot know which set Hermes used)", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      SANCTUARY_STORAGE_PATH: "/old"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it('refuses an inline sanctuary env behind a QUOTED field key (PyYAML reads `"env":` as the same key)', () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      '    "env": {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok}',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
   it("still replaces a sanctuary entry whose env is block-form or the empty flow `{}`, and ignores inline env on OTHER entries", () => {
     const blockForm = [
       "mcp_servers:",
@@ -295,6 +339,20 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
     expect(extractSanctuaryEntryEnv(yaml)).toEqual({
       SANCTUARY_DASHBOARD_AUTH_TOKEN: "plain-tok",
       SANCTUARY_PASSPHRASE: "it's quoted",
+    });
+  });
+
+  it('reads a block env behind a QUOTED field key (`"env":`), matching how PyYAML resolves it', () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      '    "env":',
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok",
     });
   });
 
