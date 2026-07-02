@@ -416,14 +416,6 @@ function ensureTrailingNewline(lines: string[]): string {
   return content.endsWith("\n") ? content : `${content}\n`;
 }
 
-/**
- * Field-level `env` key on an entry, bare or quoted (`env:`, `"env":`,
- * `'env':`). PyYAML resolves all three to the same mapping key, so the
- * refusal screen and the extractor must recognize every spelling or a
- * quoted key silently escapes both.
- */
-const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
-
 /** The empty flow mapping `{}`, optionally followed by a comment. */
 const EMPTY_FLOW_RE = /^\{\s*\}\s*(#.*)?$/;
 
@@ -655,6 +647,17 @@ export function extractSanctuaryEntryEnv(
   // Locate the entry's `env:` field line. The first non-blank content line
   // after the entry name fixes the field indent; only lines at exactly
   // that indent are entry fields (deeper lines are nested values).
+  //
+  // Header detection uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the
+  // SAME decode assertReplaceableSanctuaryEntry uses to recognize the
+  // `env` field header, rather than the narrower raw-literal ENV_FIELD_RE.
+  // A quoted key that decodes to `env` under PyYAML but is not the exact
+  // bare/`"env"`/`'env'` spelling (an escaped-quote or unicode-escape
+  // spelling, e.g. `"env":`) is a shape the whitelist screen already
+  // treats as the canonical `env` field, so this extractor must recognize
+  // it too or the whole block silently resolves null (dropping the entire
+  // env block, e.g. SANCTUARY_DASHBOARD_AUTH_TOKEN, on a write the
+  // whitelist did not refuse).
   let fieldIndent = -1;
   let envLine = -1;
   for (let i = entry.start + 1; i < entry.end; i++) {
@@ -663,8 +666,10 @@ export function extractSanctuaryEntryEnv(
     const indent = indentOf(line);
     if (fieldIndent === -1) fieldIndent = indent;
     if (indent !== fieldIndent) continue;
-    const m = ENV_FIELD_RE.exec(line.trim());
-    if (m && (m[2]!.trim() === "" || m[2]!.trim().startsWith("#"))) {
+    const trimmed = line.trim();
+    const m = RECOGNIZED_FIELD_RE.exec(trimmed);
+    const key = m ? canonicalFieldKey(m) : null;
+    if (key === "env") {
       envLine = i;
       break;
     }
@@ -707,13 +712,22 @@ export function extractSanctuaryEntryEnv(
     // The whole env block is unreadable, so resolve null (skip, not
     // guess); the consuming injection's refusal screen blocks the write.
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) return null;
-    const m = /^(?:"([^"]+)"|'([^']+)'|([^\s:#'"][^:]*?))\s*:\s*(.*)$/.exec(
-      trimmed
-    );
-    if (!m) continue;
-    const key = (m[1] ?? m[2] ?? m[3] ?? "").trim();
-    if (!key) continue;
-    const value = parseYamlScalarValue(m[4] ?? "");
+    // Key decoding uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the SAME
+    // decode assertReplaceableSanctuaryEntry uses for env var keys, so
+    // this extractor can never diverge from what the whitelist screen
+    // already proved readable. A key the whitelist recognizes (e.g. an
+    // escaped-quote spelling like "A\"B", or a doubled-quote spelling
+    // like 'A''B') but this extractor's OLD narrower key regex could not
+    // span would otherwise let a replace-entry write proceed while
+    // dropping that var with no key string to name it by in `skipped`
+    // (no key means no notice either). Resolve the whole block as
+    // unreadable instead when a line's key cannot be decoded at all,
+    // matching the flow-collection precedent above: there is no partial
+    // key set to guess at.
+    const m = RECOGNIZED_FIELD_RE.exec(trimmed);
+    const key = m ? canonicalFieldKey(m) : null;
+    if (key === null) return null;
+    const value = parseYamlScalarValue((m![4] ?? "").trim());
     if (value === null) {
       // Duplicate keys are last-wins under PyYAML (the parser Hermes
       // runs), so an unreadable LAST occurrence un-inherits any readable

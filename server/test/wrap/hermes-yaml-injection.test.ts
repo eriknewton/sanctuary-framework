@@ -680,6 +680,53 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
     });
   });
 
+  it('reads a block env behind an ESCAPE-DECODED `env` field key (`"\\u0065nv":` decodes to `env` under PyYAML), matching the whitelist screen\'s own decode instead of silently dropping the whole block', () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      '    "\\u0065nv":',
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok",
+    });
+    expect(planHermesYamlInjection(yaml, ENTRY).action).toBe("replace-entry");
+  });
+
+  it("reads env var keys the whitelist screen recognizes but a narrower key regex would miss: an escaped quote inside a double-quoted key, and a doubled quote inside a single-quoted key", () => {
+    const escapedDoubleQuoteKey = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      "A\\"B": "secret-token"',
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(escapedDoubleQuoteKey)).toEqual({
+      'A"B': "secret-token",
+    });
+    expect(planHermesYamlInjection(escapedDoubleQuoteKey, ENTRY).action).toBe(
+      "replace-entry"
+    );
+
+    const doubledSingleQuoteKey = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      'A''B': 'secret-token'",
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(doubledSingleQuoteKey)).toEqual({
+      "A'B": "secret-token",
+    });
+    expect(
+      planHermesYamlInjection(doubledSingleQuoteKey, ENTRY).action
+    ).toBe("replace-entry");
+  });
+
   it("skips nested mappings under env: instead of flattening their children into phantom vars", () => {
     const yaml = [
       "mcp_servers:",
