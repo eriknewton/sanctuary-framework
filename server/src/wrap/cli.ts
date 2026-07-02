@@ -53,6 +53,7 @@ import {
   writeFileSafeUnderRoot,
   unlinkSafeUnderRoot,
   WrapMetaValidationError,
+  type WrapMetaRemovalFailure,
   type AgentPlatform,
   type MCPServerEntry,
   type WrapMetaAuxiliaryFile,
@@ -497,6 +498,32 @@ async function findNpmProjectRoot(cwd: string): Promise<string> {
 }
 
 /**
+ * Best-effort path of npm's GLOBAL config file (`$PREFIX/etc/npmrc`, the
+ * file `npm config set --location=global registry=...` writes). Mirrors
+ * npm's own derivation approximately: an explicit globalconfig override in
+ * the npm config env wins, then a prefix override, then node's install
+ * prefix (the executable's grandparent directory on POSIX, its directory
+ * on Windows). Never throws; the caller treats an absent/unreadable file
+ * as "no keys", so an imprecise path only degrades to the pre-fix
+ * behavior.
+ */
+function defaultGlobalNpmrcPath(env: NodeJS.ProcessEnv): string {
+  const explicit = env.npm_config_globalconfig ?? env.NPM_CONFIG_GLOBALCONFIG;
+  if (typeof explicit === "string" && explicit.trim() !== "") {
+    return explicit.trim();
+  }
+  const prefixOverride =
+    env.npm_config_prefix ?? env.NPM_CONFIG_PREFIX ?? env.PREFIX;
+  const prefix =
+    typeof prefixOverride === "string" && prefixOverride.trim() !== ""
+      ? prefixOverride.trim()
+      : platform() === "win32"
+        ? dirname(process.execPath)
+        : resolvePath(process.execPath, "..", "..");
+  return join(prefix, "etc", "npmrc");
+}
+
+/**
  * Best-effort, WRAP-TIME approximation of the npm registry the
  * wrap-written `npx` entry will consult at spawn time (2026-07-02 fix
  * round). The probe previously hard-coded the public registry, so in a
@@ -515,7 +542,11 @@ async function findNpmProjectRoot(cwd: string): Promise<string> {
  * Mirrors npm's per-key precedence approximately: the package-scope key
  * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
  * within each key the env override beats the project `.npmrc` beats the
- * user `~/.npmrc`; duplicate keys within one file are last-wins, matching
+ * user `~/.npmrc` beats npm's GLOBAL npmrc (`$PREFIX/etc/npmrc`, resolved
+ * by defaultGlobalNpmrcPath - a mirror configured only via `npm config
+ * set --location=global` previously resolved default+direct and rendered
+ * the same false-affirmative "unpublished" warning the other levels'
+ * fixes closed); duplicate keys within one file are last-wins, matching
  * npm's ini semantics. The project `.npmrc` is read at the PROJECT ROOT
  * (findNpmProjectRoot's upward walk from cwd), matching where npm reads
  * it - the literal cwd alone missed a repo-root override when the wrap
@@ -530,10 +561,17 @@ async function findNpmProjectRoot(cwd: string): Promise<string> {
  * or proxy egress (npx honors HTTPS_PROXY/HTTP_PROXY; node:https does not).
  * The caller then treats a 404 as honest-unknown instead of affirmative.
  *
- * `seams` (env/cwd/home) exist for tests; production callers pass nothing.
+ * `seams` (env/cwd/home/globalNpmrcPath) exist for tests; production
+ * callers pass nothing. `globalNpmrcPath: null` means "no global npmrc"
+ * (keeps hermetic tests off the host's real `$PREFIX/etc/npmrc`).
  */
 export async function resolveNpmRegistryForProbe(
-  seams: { env?: NodeJS.ProcessEnv; cwd?: string; home?: string } = {},
+  seams: {
+    env?: NodeJS.ProcessEnv;
+    cwd?: string;
+    home?: string;
+    globalNpmrcPath?: string | null;
+  } = {},
 ): Promise<{ base: string; indirect: boolean }> {
   const env = seams.env ?? process.env;
   // Guard the cwd lookup: process.cwd() THROWS (uv_cwd ENOENT) when the
@@ -549,6 +587,10 @@ export async function resolveNpmRegistryForProbe(
       cwd = undefined;
     }
   }
+  const globalNpmrcPath =
+    seams.globalNpmrcPath !== undefined
+      ? seams.globalNpmrcPath
+      : defaultGlobalNpmrcPath(env);
   const files = [
     cwd !== undefined
       ? await readNpmrcRegistryKeys(
@@ -556,6 +598,9 @@ export async function resolveNpmRegistryForProbe(
         )
       : { scoped: null as string | null, registry: null as string | null },
     await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
+    globalNpmrcPath !== null
+      ? await readNpmrcRegistryKeys(globalNpmrcPath)
+      : { scoped: null as string | null, registry: null as string | null },
   ];
   // Per-key precedence: first PRESENT raw value wins (env beats project
   // .npmrc beats user ~/.npmrc), and only then is the winner normalized.
@@ -579,12 +624,14 @@ export async function resolveNpmRegistryForProbe(
     env["npm_config_@sanctuary-framework:registry"],
     files[0].scoped,
     files[1].scoped,
+    files[2].scoped,
   );
   const plainRaw = firstPresent(
     env.npm_config_registry,
     env.NPM_CONFIG_REGISTRY,
     files[0].registry,
     files[1].registry,
+    files[2].registry,
   );
   const winningRaw = scopedRaw ?? plainRaw;
   const normalized = normalizeRegistryUrl(winningRaw ?? undefined);
@@ -624,7 +671,7 @@ export async function resolveNpmRegistryForProbe(
  *
  * 2026-07-02 fix round (registry-config honesty): the probe consults the
  * registry npx will most likely use, resolved at WRAP time
- * (resolveNpmRegistryForProbe: npm config env, project/user `.npmrc`;
+ * (resolveNpmRegistryForProbe: npm config env, project/user/global npmrc;
  * the harness's spawn-time cwd can differ, so even an affirmative
  * "unpublished" stays advisory), and when resolution is `indirect` (non-default
  * registry, which may hide packages from this deliberately unauthenticated
@@ -3228,7 +3275,36 @@ async function unwrap(dryRun: boolean): Promise<void> {
         `re-run after fixing the cause above.`
     );
   } else {
-    const metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    // 2026-07-02 hardening (honest failure surface): removeWrapMeta can now
+    // THROW - its wrap-meta lock acquisition is bounded + fail-closed (the
+    // 15s timeout while another sanctuary wrap/unwrap holds the lock, and
+    // the displaced-holder mutation guard). Uncaught, that throw fell
+    // through runWrap to the CLI's top-level catch, which printed
+    // "Sanctuary MCP Server failed to start:" plus a raw error AFTER the
+    // "Sanctuary: Unwrapped" success lines - a server-boot banner for a
+    // wrap subcommand whose restore had already succeeded. State is safe
+    // either way (config restored, meta retained, a re-run recovers), so
+    // report the failure in the retirement-warning voice with re-run
+    // advice and exit non-zero without the misleading banner.
+    let metaRemovalFailures: WrapMetaRemovalFailure[];
+    try {
+      metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    } catch (err) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not retire the wrap metadata: ${(err as Error).message}`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  The restore above succeeded; the wrap metadata was left in place` +
+          `\n  so 'sanctuary wrap --unwrap' can be re-run to retire it once no` +
+          `\n  other sanctuary wrap/unwrap is running.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error("");
+      process.exitCode = 1;
+      return;
+    }
     for (const failure of metaRemovalFailures) {
       // The advice must match the failure class: an UNREADABLE pointer may
       // be a DIFFERENT wrapped surface's only restore pointer (a successful

@@ -45,8 +45,8 @@
  *      pristine pointer; hasExistingWrapMeta stays deliberately lenient
  *      (unreadable reads false, failing toward the crash-window warning).
  *  11. The pin probe consults the registry npx will actually use
- *      (resolveNpmRegistryForProbe: npm config env + project/user .npmrc)
- *      and, when resolution is indirect (custom registry or proxy egress),
+ *      (resolveNpmRegistryForProbe: npm config env + project/user/global
+ *      npmrc) and, when resolution is indirect (custom registry or proxy egress),
  *      a 404 maps to honest-unknown "unreachable" instead of the loud
  *      false "unpublished" dead-pin warning.
  *
@@ -854,6 +854,104 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(await hasExistingWrapMeta(configPath)).toBe(true);
   });
 
+  it("a failed acquisition AFTER the O_EXCL create (ENOSPC-class) removes the just-created lock instead of leaking it", async () => {
+    // The pid write (or close) can fail after the lock file was created
+    // (disk full, EIO). Rethrowing with the lock left on disk wedged every
+    // later wrap/unwrap on the tenant for up to the 60s stale break, each
+    // failing with the false "another sanctuary wrap/unwrap appears to be
+    // updating the wrap metadata" cause while nothing else was running.
+    const configPath = join(tmpHome, "enospc-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+
+    let fired = false;
+    __wrapMetaLockTestHooks.onLockCreated = async () => {
+      if (fired) return;
+      fired = true;
+      const err = new Error(
+        "ENOSPC: no space left on device, write",
+      ) as NodeJS.ErrnoException;
+      err.code = "ENOSPC";
+      throw err;
+    };
+    try {
+      await expect(
+        saveWrapMeta({
+          backupPath: backup,
+          originalPath: configPath,
+          platform: "claude-code",
+          wrappedAt: new Date().toISOString(),
+        }),
+      ).rejects.toThrow(/ENOSPC/);
+    } finally {
+      delete __wrapMetaLockTestHooks.onLockCreated;
+    }
+    expect(fired).toBe(true);
+    // The just-created lock did NOT leak...
+    await expect(access(lockPath)).rejects.toThrow();
+    // ...so the next mutation acquires immediately (a leaked lock would
+    // stall it into the 15s fail-closed timeout) and completes.
+    await saveWrapMeta({
+      backupPath: backup,
+      originalPath: configPath,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+  });
+
+  it("an unwrap whose meta retirement THROWS keeps the honest wrap voice: retirement WARNING + re-run advice + exit code 1, never an uncaught crash", async () => {
+    // removeWrapMeta's lock acquisition is bounded + fail-closed and can
+    // now THROW (lock-wait timeout, displaced-holder refusal). Pre-fix the
+    // throw escaped unwrap() to the CLI's top-level catch, which printed
+    // "Sanctuary MCP Server failed to start:" plus a raw error AFTER the
+    // "Sanctuary: Unwrapped" success lines - a server-boot banner for a
+    // wrap subcommand whose restore had already succeeded.
+    const settingsDir = join(tmpHome, ".claude");
+    await mkdir(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    await writeFile(settingsPath, JSON.stringify({ mcpServers: {} }, null, 2));
+    await runWrap({ claudeCode: true, noOpen: true }, makeDeps());
+
+    errSpy.mockClear();
+    const originalExitCode = process.exitCode;
+    let exitCodeAfter: typeof process.exitCode;
+    let fired = false;
+    __wrapMetaLockTestHooks.onLockAcquired = async (lock) => {
+      if (fired) return;
+      fired = true;
+      // Displaced holder: the retirement's assertLockHeld gate throws.
+      await unlink(lock);
+    };
+    try {
+      // Must RESOLVE (the throw is handled in the unwrap flow), not reject
+      // into the top-level server-boot catch.
+      await runWrap({ unwrap: true }, makeDeps());
+      exitCodeAfter = process.exitCode;
+    } finally {
+      delete __wrapMetaLockTestHooks.onLockAcquired;
+      process.exitCode = originalExitCode;
+    }
+    expect(fired).toBe(true);
+
+    const out = stderrOutput();
+    // The restore genuinely succeeded and still says so...
+    expect(out).toContain("Sanctuary: Unwrapped");
+    expect(await readFile(settingsPath, "utf-8")).toBe(
+      JSON.stringify({ mcpServers: {} }, null, 2),
+    );
+    // ...and the retirement failure is reported in the retirement-warning
+    // voice with re-run advice, exiting non-zero without the misleading
+    // server-boot banner.
+    expect(out).toContain("WARNING: could not retire the wrap metadata");
+    expect(out).toContain("wrap metadata was left in place");
+    expect(out).not.toContain("failed to start");
+    expect(exitCodeAfter).toBe(1);
+    // The meta survives, so a re-run can retire it.
+    expect(await hasExistingWrapMeta(settingsPath)).toBe(true);
+  });
+
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──
 
   it.skipIf(process.getuid?.() === 0)(
@@ -1157,6 +1255,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://registry.npmjs.org", indirect: false });
       });
@@ -1167,6 +1266,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: { npm_config_registry: "https://registry.npmjs.org/" },
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://registry.npmjs.org", indirect: false });
       });
@@ -1177,6 +1277,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: { npm_config_registry: "https://npm.corp.example/" },
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://npm.corp.example", indirect: true });
       });
@@ -1196,6 +1297,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://scoped.example/npm", indirect: true });
       });
@@ -1214,7 +1316,11 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         });
         try {
           await expect(
-            resolveNpmRegistryForProbe({ env: {}, home: tmpHome }),
+            resolveNpmRegistryForProbe({
+              env: {},
+              home: tmpHome,
+              globalNpmrcPath: null,
+            }),
           ).resolves.toEqual({
             base: "https://registry.npmjs.org",
             indirect: false,
@@ -1230,6 +1336,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: { HTTPS_PROXY: "http://proxy.corp.example:8080" },
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://registry.npmjs.org", indirect: true });
       });
@@ -1265,6 +1372,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://npm.corp.example", indirect: true });
       });
@@ -1283,6 +1391,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: tmpHome,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://registry.npmjs.org", indirect: true });
       });
@@ -1307,6 +1416,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: subDir,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://mirror.corp.example/npm", indirect: true });
       });
@@ -1323,8 +1433,83 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             env: {},
             cwd: bareDir,
             home: tmpHome,
+            globalNpmrcPath: null,
           }),
         ).toEqual({ base: "https://fallback.example/npm", indirect: true });
+      });
+
+      it("a mirror configured ONLY in npm's global npmrc ($PREFIX/etc/npmrc) is honored and marked indirect", async () => {
+        // `npm config set --location=global registry=...` writes the global
+        // config file, a level the probe previously never read: the mirror
+        // resolved to the public default marked DIRECT, so a mirror-only
+        // version 404ed into the loud false-affirmative "unpublished"
+        // dead-pin warning npx disproves at spawn time - the same class the
+        // wrong-registry, duplicate-key, and project-root fixes closed for
+        // the other config levels.
+        const globalEtc = join(tmpHome, "prefix", "etc");
+        await mkdir(globalEtc, { recursive: true });
+        const globalNpmrc = join(globalEtc, "npmrc");
+        await writeFile(
+          globalNpmrc,
+          "registry=https://global-mirror.corp.example/npm/\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+            globalNpmrcPath: globalNpmrc,
+          }),
+        ).toEqual({
+          base: "https://global-mirror.corp.example/npm",
+          indirect: true,
+        });
+      });
+
+      it("the user ~/.npmrc beats the global npmrc (npm's per-key precedence)", async () => {
+        const globalEtc = join(tmpHome, "prefix", "etc");
+        await mkdir(globalEtc, { recursive: true });
+        const globalNpmrc = join(globalEtc, "npmrc");
+        await writeFile(
+          globalNpmrc,
+          "registry=https://global-mirror.corp.example/npm\n",
+        );
+        await writeFile(
+          join(tmpHome, ".npmrc"),
+          "registry=https://user-mirror.corp.example/npm\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+            globalNpmrcPath: globalNpmrc,
+          }),
+        ).toEqual({
+          base: "https://user-mirror.corp.example/npm",
+          indirect: true,
+        });
+      });
+
+      it("an npm_config_globalconfig env override locates the global npmrc without the seam", async () => {
+        // Production callers pass no globalNpmrcPath seam; the path is
+        // derived from the npm config env (globalconfig beats prefix beats
+        // node's install prefix). Pin the env-derivation branch.
+        const globalNpmrc = join(tmpHome, "elsewhere-npmrc");
+        await writeFile(
+          globalNpmrc,
+          "registry=https://derived.corp.example/npm\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: { npm_config_globalconfig: globalNpmrc },
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({
+          base: "https://derived.corp.example/npm",
+          indirect: true,
+        });
       });
     });
   });

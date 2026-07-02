@@ -1254,11 +1254,18 @@ const WRAP_META_LOCK_RETRY_MS = 50;
  * broken by a waiter (its lock replaced by a successor's, or destroyed
  * outright) while it was still inside fn(); the pins assert the displaced
  * holder fails CLOSED before mutating and that its release never evicts
- * the successor's lock. Both hooks are always undefined in production.
+ * the successor's lock.
+ *
+ * `onLockCreated` runs after the O_EXCL create succeeds, BEFORE the pid
+ * write completes the acquisition; a throwing hook simulates the
+ * mid-acquisition failure (ENOSPC on the write, EIO on close) whose
+ * leaked lock file used to wedge every later wrap/unwrap into the 60s
+ * stale break. All hooks are always undefined in production.
  */
 export const __wrapMetaLockTestHooks: {
   onStaleLockObserved?: (lockPath: string) => void | Promise<void>;
   onLockAcquired?: (lockPath: string) => void | Promise<void>;
+  onLockCreated?: (lockPath: string) => void | Promise<void>;
 } = {};
 
 async function withWrapMetaLock<T>(
@@ -1275,16 +1282,39 @@ async function withWrapMetaLock<T>(
     try {
       const handle = await open(lockPath, "wx", 0o600);
       try {
-        await handle.writeFile(`${process.pid}\n`);
         try {
-          const written = await handle.stat();
-          acquired = { ino: written.ino, mtimeMs: written.mtimeMs };
-        } catch {
-          // Identity unavailable; the release below degrades to the
-          // pre-verify unconditional unlink rather than leaking the lock.
+          if (__wrapMetaLockTestHooks.onLockCreated) {
+            await __wrapMetaLockTestHooks.onLockCreated(lockPath);
+          }
+          await handle.writeFile(`${process.pid}\n`);
+          try {
+            const written = await handle.stat();
+            acquired = { ino: written.ino, mtimeMs: written.mtimeMs };
+          } catch {
+            // Identity unavailable; the release below degrades to the
+            // pre-verify unconditional unlink rather than leaking the lock.
+          }
+        } finally {
+          await handle.close();
         }
-      } finally {
-        await handle.close();
+      } catch (postCreateErr) {
+        // Tenth+ round (no lock leak on a failed acquisition): the O_EXCL
+        // create SUCCEEDED but finishing the acquisition failed (ENOSPC on
+        // the pid write, EIO on close). Rethrowing with the just-created
+        // lock file left behind wedged every other wrap/unwrap on the
+        // tenant for up to the 60s stale break, and made each of them
+        // fail with "another sanctuary wrap/unwrap appears to be
+        // updating the wrap metadata" when nothing else was running.
+        // This process created the file an instant ago and never entered
+        // the critical section, so unlinking it here cannot evict a
+        // legitimate holder.
+        acquired = undefined;
+        try {
+          await unlink(lockPath);
+        } catch {
+          // Best-effort; a survivor ages into the stale break.
+        }
+        throw postCreateErr;
       }
       break;
     } catch (err) {
