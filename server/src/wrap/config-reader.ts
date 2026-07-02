@@ -1324,6 +1324,94 @@ function extractEnv(env: unknown): Record<string, string> | undefined {
 }
 
 /**
+ * Vars NEVER inherited from an existing sanctuary entry, on ANY path.
+ *
+ * The plaintext-remote transport-downgrade flag is a permissive,
+ * less-secure setting, so it must be re-asserted per wrap run (via
+ * --allow-plaintext-remote or the env var, both of which land in the
+ * explicit env and win the merge); silently inheriting it would keep
+ * plaintext remote dashboard access sticky across a re-wrap that did not
+ * ask for it, including the bare re-wrap (`sanctuary protect --<harness>`
+ * from a clean shell, the most common shape the wrapped-install update
+ * advice drives), which supplies NO explicit env at all. Fail-secure: not
+ * inheriting it can only DISABLE the downgrade, never enable it.
+ */
+const NEVER_INHERITED_VARS = ["SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE"];
+
+/**
+ * The storage-tenancy pair: not inherited when the wrap run supplied an
+ * explicit env, because that env reflects the run's own storage resolution
+ * (the run just wrote wrap-meta/custody/profile against it), and a stale
+ * SANCTUARY_FORTRESS_PATH from the old entry would win the spawned
+ * server's boot-time re-promotion and point it at a different fortress
+ * than the one this wrap run populated. On the bare path (no explicit env:
+ * clean shell, no tenancy flags) the pair IS inherited: screening it there
+ * would silently re-point an existing fortress/tenant install at the
+ * default storage path, orphaning its identity/custody/policy/audit state
+ * on the most common re-wrap shape.
+ */
+const TENANCY_VARS_CALLER_AUTHORITATIVE = [
+  "SANCTUARY_FORTRESS_PATH",
+  "SANCTUARY_STORAGE_PATH",
+];
+
+/**
+ * Critical vars backstopped from process.env when neither the caller nor
+ * the existing entry provided a value. (The plaintext-remote flag here is
+ * a per-run re-assertion from the CURRENT shell, not inheritance, so it
+ * does not conflict with the never-inherited screen above.)
+ */
+const CRITICAL_WRAP_ENV_VARS = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_DASHBOARD_AUTH_TOKEN",
+  "SANCTUARY_DASHBOARD_ENABLED",
+  "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
+] as const;
+
+/**
+ * Resolve the env block for a wrapped `sanctuary` entry from the three
+ * sources every wrap surface shares, in precedence order:
+ *
+ * 1. `explicitEnv`: the env the current wrap run built (buildSanctuaryEnv
+ *    in wrap/cli.ts); its keys always win.
+ * 2. `inheritedEnv`: the env persisted on the surface's EXISTING
+ *    sanctuary entry; fills the gaps (so a re-wrap from a shell missing
+ *    vars an earlier wrap wrote, e.g. SANCTUARY_DASHBOARD_AUTH_TOKEN,
+ *    does not clobber them), subject to the inheritance screens above.
+ * 3. `process.env`: final backstop for the critical vars only.
+ *
+ * Exported as the ONE merge chokepoint for every wrap surface: the JSON
+ * harness rewrite below and the authoritative Hermes config.yaml injection
+ * (wrap/cli.ts) both resolve their entry env here, so the plaintext-remote
+ * screen and the tenancy rules cannot drift apart between surfaces.
+ */
+export function resolveWrapEntryEnv(
+  explicitEnv: Record<string, string> | undefined,
+  inheritedEnv: Record<string, string> | null | undefined,
+): Record<string, string> | undefined {
+  let resolvedEnv: Record<string, string> | undefined = explicitEnv
+    ? { ...explicitEnv }
+    : undefined;
+  if (inheritedEnv) {
+    for (const [key, value] of Object.entries(inheritedEnv)) {
+      if (NEVER_INHERITED_VARS.includes(key)) continue;
+      if (explicitEnv && TENANCY_VARS_CALLER_AUTHORITATIVE.includes(key)) {
+        continue;
+      }
+      if (!resolvedEnv) resolvedEnv = {};
+      if (!(key in resolvedEnv)) resolvedEnv[key] = value;
+    }
+  }
+  for (const key of CRITICAL_WRAP_ENV_VARS) {
+    if (process.env[key] && (!resolvedEnv || !resolvedEnv[key])) {
+      if (!resolvedEnv) resolvedEnv = {};
+      resolvedEnv[key] = process.env[key]!;
+    }
+  }
+  return resolvedEnv;
+}
+
+/**
  * Description of an additional MCP server entry to register alongside
  * `sanctuary` in the harness config. v1.2.x F9 uses this for the
  * `sanctuary-chat` reply-hook subprocess; future companions (v1.3
@@ -1380,62 +1468,15 @@ export async function rewriteConfigForWrap(
     existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
   }
 
-  // Inherit env vars from the existing sanctuary entry, then fall back to
-  // process.env for the critical vars. When an explicit env was passed, its
-  // keys win and inherited keys fill the gaps: a re-wrap in a shell that
-  // sets only SANCTUARY_STORAGE_PATH (the wrapped-install upgrade path)
-  // must not clobber entry-persisted vars an earlier wrap wrote (e.g.
-  // SANCTUARY_DASHBOARD_AUTH_TOKEN) that are absent from the current shell.
-  // Two classes of vars are never inherited on the explicit path:
-  //
-  // - The storage-tenancy pair: the caller's env reflects the wrap run's
-  //   own storage resolution (the run just wrote wrap-meta/custody/profile
-  //   against it), and a stale SANCTUARY_FORTRESS_PATH from the old entry
-  //   would win the spawned server's boot-time re-promotion and point it
-  //   at a different fortress than the one this wrap run populated.
-  // - The plaintext-remote transport-downgrade flag: it is a permissive,
-  //   less-secure setting, so it must be re-asserted per wrap run (via
-  //   --allow-plaintext-remote or the env var, both of which land in the
-  //   explicit env and win the merge); silently inheriting it would keep
-  //   plaintext remote dashboard access sticky across a re-wrap that did
-  //   not ask for it. Fail-secure: not inheriting it can only DISABLE the
-  //   downgrade, never enable it.
-  const NON_INHERITED_VARS = [
-    "SANCTUARY_FORTRESS_PATH",
-    "SANCTUARY_STORAGE_PATH",
-    "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
-  ];
-  let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv
-    ? { ...sanctuaryEnv }
-    : undefined;
+  // Resolve the entry env through the shared chokepoint (explicit wins,
+  // entry-persisted vars fill the gaps subject to the inheritance screens,
+  // process.env backstops the critical vars). See resolveWrapEntryEnv.
   const existingSanctuary = existingServers.sanctuary as Record<string, unknown> | undefined;
-  if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
-    const inherited = extractEnv(existingSanctuary.env);
-    if (inherited) {
-      if (!resolvedEnv) {
-        resolvedEnv = inherited;
-      } else {
-        for (const [key, value] of Object.entries(inherited)) {
-          if (NON_INHERITED_VARS.includes(key)) continue;
-          if (!(key in resolvedEnv)) resolvedEnv[key] = value;
-        }
-      }
-    }
-  }
-  // Ensure the critical env vars survive the rewrite even when
-  // neither the caller nor the existing config provided them.
-  const CRITICAL_VARS = [
-    "SANCTUARY_PASSPHRASE",
-    "SANCTUARY_DASHBOARD_AUTH_TOKEN",
-    "SANCTUARY_DASHBOARD_ENABLED",
-    "SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE",
-  ] as const;
-  for (const key of CRITICAL_VARS) {
-    if (process.env[key] && (!resolvedEnv || !resolvedEnv[key])) {
-      if (!resolvedEnv) resolvedEnv = {};
-      resolvedEnv[key] = process.env[key]!;
-    }
-  }
+  const inheritedEnv =
+    existingSanctuary?.env && typeof existingSanctuary.env === "object"
+      ? extractEnv(existingSanctuary.env)
+      : undefined;
+  const resolvedEnv = resolveWrapEntryEnv(sanctuaryEnv, inheritedEnv);
 
   const sanctuaryEntry: Record<string, unknown> = {
     command: sanctuaryCommand,
@@ -1460,7 +1501,7 @@ export async function rewriteConfigForWrap(
       : undefined;
     // Inherit critical vars from process.env when the caller didn't supply
     // them explicitly. Mirrors the sanctuary-entry inheritance above.
-    for (const key of CRITICAL_VARS) {
+    for (const key of CRITICAL_WRAP_ENV_VARS) {
       if (process.env[key] && (!auxEnv || !auxEnv[key])) {
         if (!auxEnv) auxEnv = {};
         auxEnv[key] = process.env[key]!;

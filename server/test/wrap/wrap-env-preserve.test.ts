@@ -90,11 +90,7 @@ describe("Wrap env-var preservation", () => {
   });
 
   it("inherits from existing sanctuary entry env when no explicit env", async () => {
-    // Clear process.env so it doesn't interfere
-    delete process.env.SANCTUARY_PASSPHRASE;
-    delete process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-    delete process.env.SANCTUARY_DASHBOARD_ENABLED;
-    delete process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE;
+    for (const key of ENV_KEYS) delete process.env[key];
 
     const rawConfig = {
       mcp: {
@@ -106,7 +102,6 @@ describe("Wrap env-var preservation", () => {
               SANCTUARY_PASSPHRASE: "existing-pass",
               SANCTUARY_DASHBOARD_AUTH_TOKEN: "existing-tok",
               SANCTUARY_DASHBOARD_ENABLED: "true",
-              SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
             },
           },
           other: { command: "node", args: ["x.js"] },
@@ -128,7 +123,49 @@ describe("Wrap env-var preservation", () => {
     expect(env.SANCTUARY_PASSPHRASE).toBe("existing-pass");
     expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("existing-tok");
     expect(env.SANCTUARY_DASHBOARD_ENABLED).toBe("true");
-    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBe("true");
+  });
+
+  it("never inherits the plaintext-remote downgrade flag, even on a bare re-wrap with no explicit env", async () => {
+    // The wholesale-inheritance path (no explicit env at all — a bare
+    // `sanctuary protect --<harness>` from a clean shell, the most common
+    // re-wrap shape the wrapped-install update advice drives) must apply
+    // the same never-inherit screen as the explicit-env merge path:
+    // the plaintext-remote transport downgrade is re-asserted per wrap
+    // run or dropped. The tenancy pair and ordinary persisted vars ARE
+    // inherited here (dropping the fortress pointer on a bare re-wrap
+    // would orphan the install's identity/custody/policy/audit state).
+    for (const key of ENV_KEYS) delete process.env[key];
+
+    const rawConfig = {
+      mcp: {
+        servers: {
+          sanctuary: {
+            command: "npx",
+            args: ["@sanctuary-framework/mcp-server"],
+            env: {
+              SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true",
+              SANCTUARY_DASHBOARD_AUTH_TOKEN: "persisted-tok",
+              SANCTUARY_FORTRESS_PATH: "/tmp/original-fortress",
+            },
+          },
+        },
+      },
+    };
+    const config: AgentConfig = {
+      platform: "openclaw",
+      configPath,
+      servers: [],
+      rawConfig,
+    };
+    await writeFile(configPath, JSON.stringify(rawConfig), { mode: 0o600 });
+
+    await rewriteConfigForWrap(config, "npx", ["@sanctuary-framework/mcp-server"]);
+
+    const result = JSON.parse(await readFile(configPath, "utf-8"));
+    const env = result.mcp.servers.sanctuary.env;
+    expect(env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBeUndefined();
+    expect(env.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("persisted-tok");
+    expect(env.SANCTUARY_FORTRESS_PATH).toBe("/tmp/original-fortress");
   });
 
   it("merges entry-persisted env under an explicit env (tenancy re-wrap keeps the dashboard token)", async () => {

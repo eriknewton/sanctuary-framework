@@ -76,11 +76,14 @@ function fakeRequest(): EventEmitter {
 function installHttpsFixture(): void {
   httpsGetMock.mockImplementation(
     (url: unknown, _options: unknown, cb: unknown) => {
-      const u = String(url);
+      // Route on the parsed hostname, not a substring match (CodeQL
+      // js/incomplete-url-substring-sanitization; a fixture is not a
+      // sanitizer, but the exact-host comparison is also simply stricter).
+      const { hostname } = new URL(String(url));
       let body: string;
-      if (u.includes("registry.npmjs.org")) {
+      if (hostname === "registry.npmjs.org") {
         body = JSON.stringify({ version: "9.9.9" });
-      } else if (u.includes("api.github.com")) {
+      } else if (hostname === "api.github.com") {
         body = JSON.stringify({
           assets: [
             {

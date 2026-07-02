@@ -224,14 +224,17 @@ export async function detectWrappedInstall(
  * older unpinned cohort (for whom re-running protect is still correct
  * advice: it upgrades the entry to a pin at the new version).
  *
- * Fortress/tenant wraps: `protect` rebuilds the harness entry's env from the
- * env of the NEW protect run (`buildSanctuaryEnv` in `wrap/cli.ts`), so an
- * operator who originally wrapped with `--fortress` or under
- * SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH and re-runs protect from a
- * fresh shell without them would silently re-point the wrap at the DEFAULT
- * fortress, orphaning their existing identity/custody/policy/audit state.
- * The advice explicitly says to re-run with the same flags and environment
- * as the original wrap.
+ * Fortress/tenant wraps: `protect` builds the harness entry's env from the
+ * NEW protect run (`buildSanctuaryEnv` in `wrap/cli.ts`) and inherits
+ * entry-persisted vars only through the screens in `resolveWrapEntryEnv`
+ * (`wrap/config-reader.ts`). The storage-tenancy pair is caller-authoritative
+ * whenever the new run supplies ANY explicit env, so an operator who
+ * originally wrapped with `--fortress` or under SANCTUARY_FORTRESS_PATH /
+ * SANCTUARY_STORAGE_PATH and re-runs protect from a shell that carries other
+ * SANCTUARY_* vars but not those would silently re-point the wrap at the
+ * DEFAULT fortress, orphaning their existing identity/custody/policy/audit
+ * state. The advice explicitly says to re-run with the same flags and
+ * environment as the original wrap.
  */
 export function formatUpdateMessage(
   current: string,

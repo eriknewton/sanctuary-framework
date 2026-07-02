@@ -45,6 +45,7 @@ import {
   removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
+  resolveWrapEntryEnv,
   getPlatformPaths,
   validateWrapMetaAuxiliary,
   writeFileSafeUnderRoot,
@@ -58,6 +59,7 @@ import {
 import {
   hermesConfigYamlPath,
   planHermesYamlInjection,
+  extractSanctuaryEntryEnv,
   yamlContainsSanctuaryEntry,
   HermesYamlUnsupportedError,
   type HermesYamlPlan,
@@ -443,11 +445,34 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 /**
+ * Entry env for the Hermes config.yaml surface: the SAME merge chokepoint
+ * as the JSON surface (resolveWrapEntryEnv in config-reader.ts), with the
+ * inherited input read from the EXISTING YAML sanctuary entry. config.yaml
+ * is the surface Hermes actually loads MCP servers from (the JSON write is
+ * forward-compat only), so a re-wrap from a shell missing entry-persisted
+ * vars (e.g. SANCTUARY_DASHBOARD_AUTH_TOKEN) must not drop them from the
+ * authoritative surface while the JSON merge keeps them: that split-brain
+ * would silently change dashboard auth on the surface that counts. The
+ * shared chokepoint also applies the never-inherit screen for the
+ * plaintext-remote downgrade flag to the YAML surface.
+ */
+function resolveHermesYamlEnv(
+  existingYaml: string | null,
+  sanctuaryEnv: Record<string, string>
+): Record<string, string> | undefined {
+  return resolveWrapEntryEnv(
+    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
+    extractSanctuaryEntryEnv(existingYaml)
+  );
+}
+
+/**
  * D4 staging, Bugs 1+2: dry-run preview of the Hermes config.yaml
  * injection. Read-only by construction (planHermesYamlInjection is pure;
  * the only filesystem touch is the readFile probe), and previews the
  * exact entry the real run would write because it shares
- * buildSanctuaryEnv / resolveSanctuaryCommand with the write path.
+ * buildSanctuaryEnv / resolveSanctuaryCommand / resolveHermesYamlEnv
+ * with the write path.
  */
 async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const yamlPath = hermesConfigYamlPath();
@@ -460,10 +485,11 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const sanctuaryEnv = buildSanctuaryEnv(options);
   const { command, args } = resolveSanctuaryCommand(options);
   try {
+    const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
       args,
-      ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+      ...(yamlEnv && Object.keys(yamlEnv).length > 0 ? { env: yamlEnv } : {}),
     });
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -1207,10 +1233,15 @@ export async function runWrap(
       // File absent - the plan creates it.
     }
     try {
+      // Env inheritance parity with the JSON surface (see
+      // resolveHermesYamlEnv): the replace-entry write below is wholesale,
+      // so entry-persisted vars on the authoritative YAML surface must be
+      // merged in here or a re-wrap silently drops them.
+      const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv);
       const plan = planHermesYamlInjection(existingYaml, {
         command: sanctuaryCommand,
         args: sanctuaryArgs,
-        ...(Object.keys(sanctuaryEnv).length > 0 ? { env: sanctuaryEnv } : {}),
+        ...(yamlEnv && Object.keys(yamlEnv).length > 0 ? { env: yamlEnv } : {}),
       });
       hermesYaml = { yamlPath, existedBefore: existingYaml !== null, plan };
     } catch (err) {

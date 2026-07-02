@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   planHermesYamlInjection,
+  extractSanctuaryEntryEnv,
   yamlContainsSanctuaryEntry,
   HermesYamlUnsupportedError,
 } from "../../src/wrap/hermes-yaml.js";
@@ -227,6 +228,59 @@ describe("planHermesYamlInjection (pure)", () => {
   });
 });
 
+describe("extractSanctuaryEntryEnv (pure)", () => {
+  it("reads back the env block this module itself serializes", () => {
+    const plan = planHermesYamlInjection(null, {
+      ...ENTRY,
+      env: {
+        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok-123",
+        SANCTUARY_STORAGE_PATH: "/tmp/tenant",
+      },
+    });
+    expect(extractSanctuaryEntryEnv(plan.content)).toEqual({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok-123",
+      SANCTUARY_STORAGE_PATH: "/tmp/tenant",
+    });
+  });
+
+  it("parses hand-authored plain and single-quoted scalars with trailing comments", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    args:",
+      '      - "@sanctuary-framework/mcp-server"',
+      "    env:",
+      "      SANCTUARY_DASHBOARD_AUTH_TOKEN: plain-tok # operator note",
+      "      SANCTUARY_PASSPHRASE: 'it''s quoted'",
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({
+      SANCTUARY_DASHBOARD_AUTH_TOKEN: "plain-tok",
+      SANCTUARY_PASSPHRASE: "it's quoted",
+    });
+  });
+
+  it("resolves null for absent files, missing entries, missing env, and unsupported shapes", () => {
+    expect(extractSanctuaryEntryEnv(null)).toBeNull();
+    expect(extractSanctuaryEntryEnv("model: Hermes-4-405B\n")).toBeNull();
+    expect(
+      extractSanctuaryEntryEnv('mcp_servers:\n  weather:\n    command: "uvx"\n')
+    ).toBeNull();
+    expect(
+      extractSanctuaryEntryEnv('mcp_servers:\n  sanctuary:\n    command: "npx"\n')
+    ).toBeNull();
+    // Flow-form env and unsupported mcp_servers shapes are skipped, not
+    // guessed at.
+    expect(
+      extractSanctuaryEntryEnv(
+        'mcp_servers:\n  sanctuary:\n    command: "npx"\n    env: {A: b}\n'
+      )
+    ).toBeNull();
+    expect(extractSanctuaryEntryEnv("mcp_servers: [1, 2]\n")).toBeNull();
+  });
+});
+
 describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
   let tmpHome: string;
   let originalHome: string | undefined;
@@ -360,6 +414,47 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
 
     await runWrap({ unwrap: true }, makeDeps());
     expect(await readFile(yamlPath, "utf-8")).toBe(originalYaml);
+  });
+
+  it("re-wrap inherits entry-persisted env on the authoritative YAML surface (no JSON/YAML split-brain), never the plaintext-remote flag", async () => {
+    // Regression (harden round): the YAML replace-entry write got its env
+    // ONLY from buildSanctuaryEnv, so a re-wrap from a tenancy-only shell
+    // (this suite sets SANCTUARY_STORAGE_PATH — the upgrade flow the
+    // wrapped-install update advice recommends) dropped entry-persisted
+    // vars like SANCTUARY_DASHBOARD_AUTH_TOKEN from config.yaml — the
+    // surface Hermes actually loads — while the JSON surface kept them.
+    // Both surfaces now resolve through resolveWrapEntryEnv, which also
+    // screens the plaintext-remote downgrade flag from inheritance.
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    const yamlPath = join(hermesDir, "config.yaml");
+    await writeFile(join(hermesDir, "cli-config.json"), "{}");
+    await writeFile(
+      yamlPath,
+      [
+        "mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    args:",
+        '      - "@sanctuary-framework/mcp-server"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "persisted-tok"',
+        '      SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE: "true"',
+        "",
+      ].join("\n")
+    );
+
+    await runWrap({ hermes: true, noOpen: true }, makeDeps());
+
+    const yaml = await readFile(yamlPath, "utf-8");
+    const yamlEnv = extractSanctuaryEntryEnv(yaml);
+    expect(yamlEnv).not.toBeNull();
+    // Entry-persisted token survives on the surface Hermes actually loads.
+    expect(yamlEnv!.SANCTUARY_DASHBOARD_AUTH_TOKEN).toBe("persisted-tok");
+    // The transport downgrade is never inherited; it must be re-asserted.
+    expect(yamlEnv!.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBeUndefined();
+    // The tenancy var from this run's shell is caller-authoritative.
+    expect(yamlEnv!.SANCTUARY_STORAGE_PATH).toBe(join(tmpHome, ".sanctuary"));
   });
 
   it("re-wrap updates the existing sanctuary entry instead of stacking a second one", async () => {

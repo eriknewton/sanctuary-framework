@@ -373,6 +373,105 @@ function ensureTrailingNewline(lines: string[]): string {
 }
 
 /**
+ * Best-effort extraction of the `env:` block persisted on an EXISTING
+ * sanctuary entry in config.yaml, so a re-wrap can inherit entry-persisted
+ * vars (e.g. SANCTUARY_DASHBOARD_AUTH_TOKEN) on the authoritative Hermes
+ * surface exactly like the JSON surface does. The merge itself, including
+ * the never-inherit screen for the plaintext-remote downgrade flag and the
+ * caller-authoritative tenancy rules, lives in ONE place,
+ * `resolveWrapEntryEnv` in wrap/config-reader.ts, and this function only
+ * supplies its `inheritedEnv` input for the YAML surface.
+ *
+ * Parses the block-mapping form this module itself serializes
+ * (double-quoted JSON scalars) plus the common hand-authored forms (plain
+ * and single-quoted scalars, trailing comments). Anything it cannot read
+ * confidently is skipped rather than guessed at; a flow-form `env: {...}`
+ * or an unsupported `mcp_servers` shape resolves null (no inheritance).
+ * That is safe because the injection that consumes this replaces the
+ * entry wholesale anyway and REFUSES unsupported block shapes loudly
+ * (HermesYamlUnsupportedError), so a null here never masks a write.
+ */
+export function extractSanctuaryEntryEnv(
+  existingContent: string | null
+): Record<string, string> | null {
+  if (existingContent === null) return null;
+  const lines = existingContent.split("\n");
+  let block: McpServersBlock | null;
+  try {
+    block = scanMcpServersBlock(lines);
+  } catch {
+    return null;
+  }
+  if (!block) return null;
+  const entry = block.entries.find((e) => e.name.toLowerCase() === "sanctuary");
+  if (!entry) return null;
+
+  // Locate the entry's `env:` field line. The first non-blank content line
+  // after the entry name fixes the field indent; only lines at exactly
+  // that indent are entry fields (deeper lines are nested values).
+  let fieldIndent = -1;
+  let envLine = -1;
+  for (let i = entry.start + 1; i < entry.end; i++) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    const indent = indentOf(line);
+    if (fieldIndent === -1) fieldIndent = indent;
+    if (indent !== fieldIndent) continue;
+    if (/^env\s*:\s*(#.*)?$/.test(line.trim())) {
+      envLine = i;
+      break;
+    }
+  }
+  if (envLine === -1) return null;
+
+  // Collect KEY: value pairs nested under env:.
+  const result: Record<string, string> = {};
+  for (let i = envLine + 1; i < entry.end; i++) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    if (indentOf(line) <= fieldIndent) break;
+    const m = /^(?:"([^"]+)"|'([^']+)'|([^\s:#'"][^:]*?))\s*:\s*(.*)$/.exec(
+      line.trim()
+    );
+    if (!m) continue;
+    const key = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    if (!key) continue;
+    const value = parseYamlScalarValue(m[4] ?? "");
+    if (value === null) continue;
+    result[key] = value;
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+/**
+ * Parse a double-quoted, single-quoted, or plain YAML scalar value.
+ * Returns null when the value cannot be read confidently (multi-line,
+ * malformed quoting, empty); callers skip such vars rather than guess.
+ */
+function parseYamlScalarValue(raw: string): string | null {
+  const t = raw.trim();
+  if (t === "") return null;
+  if (t.startsWith('"')) {
+    const m = /^("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(t);
+    if (!m) return null;
+    try {
+      const parsed: unknown = JSON.parse(m[1]!);
+      return typeof parsed === "string" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (t.startsWith("'")) {
+    const m = /^'((?:[^']|'')*)'\s*(?:#.*)?$/.exec(t);
+    return m ? m[1]!.replace(/''/g, "'") : null;
+  }
+  // Plain scalar: whitespace followed by `#` starts a trailing comment.
+  const commentIdx = t.search(/\s#/);
+  const v = (commentIdx === -1 ? t : t.slice(0, commentIdx)).trim();
+  return v === "" ? null : v;
+}
+
+/**
  * Post-write verification: does the content carry a sanctuary entry under
  * a well-formed top-level `mcp_servers:` block? Mirrors the scan the plan
  * used, so a write that landed corrupted fails verification.
