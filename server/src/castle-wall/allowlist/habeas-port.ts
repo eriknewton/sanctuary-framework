@@ -33,6 +33,10 @@ import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../constants.js";
 import {
   deriveDnsRuleForHostnameRules,
 } from "./dns-derivation.js";
+import {
+  deriveGateAllowRule,
+  type ExclusiveEgressGatePolicy,
+} from "./gate-derivation.js";
 
 /**
  * Every reserved habeas rule id starts with this prefix. Operator-authored
@@ -452,6 +456,13 @@ export interface ComposeEffectiveRulesInput {
   resolvers: readonly unknown[];
   /** Validated distress webhook target, when configured. */
   distressWebhook?: HabeasWebhookTarget | undefined;
+  /**
+   * Validated exclusive-egress gate policy (Unified Protect Slice 1). When
+   * present, the composer injects the derived `.agent`-scoped loopback allow
+   * rule for the gate channel (`127.0.0.1/32`, gate port, TCP). Absent means
+   * no gate rule (the pre-exclusive-egress composition, unchanged).
+   */
+  exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
   /** Timestamp stamped onto every derived rule. */
   createdAt: string;
 }
@@ -486,6 +497,13 @@ export function composeEffectiveRules(input: ComposeEffectiveRulesInput): Allowl
   });
   if (derivedDns) {
     rules.push(derivedDns);
+  }
+  // Exclusive-egress gate channel (Unified Protect Slice 1): a single
+  // derived allow rule pinning the agent's gate channel to loopback TCP on
+  // the gate port. `deriveGateAllowRule` re-validates and throws on a
+  // malformed policy, so a bad config can never sign a malformed rule.
+  if (input.exclusiveEgressGate !== undefined) {
+    rules.push(deriveGateAllowRule(input.exclusiveEgressGate, input.createdAt));
   }
   // Self-check: the composed output must pass the same composed-manifest gate
   // the Linux daemon applies before putting a manifest into force

@@ -19,3 +19,12 @@ export type {
 
 export type { ParseResult, RuleFileBytes } from "./parse.js";
 export { verifyManifestSignature, verifyAndParseRules } from "./parse.js";
+
+export {
+  DERIVED_GATE_RULE_ID,
+  GATE_LOOPBACK_CIDR,
+  EXCLUSIVE_EGRESS_GATE_FILENAME,
+  validateExclusiveEgressGatePolicy,
+  deriveGateAllowRule,
+  type ExclusiveEgressGatePolicy,
+} from "./gate-derivation.js";

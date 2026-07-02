@@ -1,7 +1,7 @@
 # server/src - Module Map
 
 This is the first thing to read before you touch the Sanctuary server. `server/src` is the
-TypeScript MCP server: 55 module directories plus a small set of root files. It is the in-process
+TypeScript MCP server: 56 module directories plus a small set of root files. It is the in-process
 "fortress" runtime - crypto core, the four sovereignty layers, enforcement surfaces, networking,
 identity, and the operator CLI. The native OS-level enforcers (Rust/Swift) live OUTSIDE this tree
 (see "Adjacent out-of-scope systems").
@@ -34,13 +34,13 @@ edit the wire token.
 
 ---
 
-## MODULE INDEX TABLE (55 modules)
+## MODULE INDEX TABLE (56 modules)
 
-All 55 module directories under `server/src` are listed. Status legend: **canonical** = a real,
+All 56 module directories under `server/src` are listed. Status legend: **canonical** = a real,
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =
 a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a thin re-export
-`index.ts` (46 of 54 do today).
+`index.ts` (48 of 56 do today).
 
 | Module | Subject area | Status | What it owns | Distinct from | Barrel? | Do-not-touch |
 |--------|-------------|--------|--------------|---------------|---------|--------------|
@@ -68,6 +68,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | composition | Cross-cutting | default-off-allocated | Opt-in, DEFAULT-OFF Concordia+Verascore composition: sidecar lifecycle manager, degrade monitor, receipt/mandate adapter, verascore hook, pipeline orchestrator. Sidecar crash never halts the fortress | the unrelated `composition` key in index.ts's SIM descriptor (name collision) | Yes | `COMPOSITION_CONFIG_NAMESPACE='_composition'`; HKDF `sanctuary-composition-v1`; `COMPOSITION_EVENT_TYPES` (additive-only per federation §10.3); default-off toggle. NOT dead despite just 1 static importer (`concierge-query-grammar.ts`) |
 | recovery | Cross-cutting | canonical | The guardian-threshold Recovery Cascade (WP-MVP-8): DMswitch operator-absence evaluator, guardian roster, threshold evaluator + signed approvals, cascade state machine, multi-principal boundary | `mesh/recovery-flows` (wire ceremonies); `core/master-rotation` (rotates the key); wrap recovery-key (per-wrap unlock) | Yes | `RECOVERY_SIGNATURE_SCHEME='ed25519-v1'`; `RECOVERY_EVENT_TYPES`; `RECOVERY_ACTIONS`; `RECOVERY_GATE_REASON_CODES`. Imports canonical-JSON + guardian types FROM mesh (a real edge, not a dup) |
 | castle-wall | Enforcement-surface (Cognitive) | canonical | The IN-SERVER (TypeScript) Castle Wall surface: wire constants, allowlist schema, IPC framing, audit-event builder/consumer (producer-sig verify), daemon client/installer, in-process egress CONNECT proxy | the native enforcers castle-wall-daemon/macos/vmm at repo root; fortress (posture); lockdown (flag) | Yes | cross-language wire constants that MUST byte-match the Rust daemon: `CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX`, `..._KEY_ID_V1="cw-audit-producer-v1"`, `CASTLE_WALL_AUDIT_LAYER="l1"`, `CASTLE_WALL_AUDIT_PROVENANCE_KEY/VALUE`, `CASTLE_WALL_IPC_NAMESPACE`, Content-Length header |
+| egress-gate | Enforcement-surface (Cognitive) | canonical (drill-acceptance pending) | The exclusive-egress enforcement core (Unified Protect Slices 1-4+8): loopback-TCP policy gate (reuses the egress-proxy evaluator), per-uid pf loopback anchor + fail-closed liveness check, advisory lsof peer-uid recovery, agent-harness `UserName` LaunchDaemon plumbing, NEFilter/pf policy-parity guard | proxy (MCP-tool proxy, NOT egress); `castle-wall/egress-proxy.ts` (VM/vsock CONNECT evaluator whose DECISION logic this reuses); castle-wall (manifest-side rule derivation lives in its `allowlist/gate-derivation.ts`) | Yes | pf anchor name `sanctuary.egress-gate`; derived rule id `derived_exclusive_egress_gate`; config `policy/egress/exclusive-egress-gate.json`; daemon label `ai.sanctuaryprotocol.agent-harness`; the word "unbypassable" must NOT appear in any user-visible string (honesty bound) |
 | fortress | Cognitive (posture / mode tiers) | canonical | The Fortress Mode state machine: three posture tiers (`tier_1_private`/`tier_2_federated`/`tier_3_interop`) gating which mesh capability bits are live; signed mode-transition events | castle-wall (network enforcement); supervisor (OS process); the operator word "fortress" = the on-disk SANCTUARY_FORTRESS_PATH dir | Yes | `FORTRESS_EVENT_TYPE_PREFIX="fortress_"` + `MODE_TRANSITION="fortress_mode_transition"` (reserved per Federation §10.3); `MODE_TIERS` union (persisted in config, keys `TIER_CAPABILITY_DEFAULTS`) |
 | wrap | CLI (install-time onboarding) | canonical | The `sanctuary wrap`/`init` onboarding CLI: detect + back up + rewrite a harness's MCP config so Sanctuary becomes the upstream gateway; passphrase/recovery-key/keychain custody; Hermes YAML emitter | supervisor (runtime process); the Layer-2 managed-child path (`wrap --tier-b`); castle-wall | Yes | `WRAP_META_FILENAME="wrap-meta.json"` + the legacy read-only `LEGACY_WRAP_META_FILENAME` constant (its value is a retired-vocabulary filename kept read-only for back-compat; the ONLY permitted carrier of the retired term; removing it breaks unwrap of old releases); env `SANCTUARY_FORTRESS_PATH`/`SANCTUARY_STORAGE_PATH`; verbs `wrap`/`init`/`--unwrap` |
 | supervisor | Operational (process lifecycle, Tier-A) | canonical | The split-process supervised daemon (Phase S1): a separate process that launches/monitors/restarts a wrapped child, holding a TRANSIENT master key (survives crash, not reboot); authenticated local-socket protocol | wrap (install-time); castle-wall (egress); fortress (in-process state machine) | Yes | socket constants `SUPERVISOR_PROTOCOL_VERSION=1` (leading frame byte), `MAX_FRAME_BYTES=64KiB`; key-handoff env `SANCTUARY_SUPERVISOR_KEY_FD`; `SUPERVISOR_KNOWN_HARNESSES` |
@@ -100,7 +101,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | reputation | Verifiable-Reputation | canonical | Heralds / Verifiable Reputation: Ed25519-signed EAS-compatible attestations of interaction OUTCOMES; queries return aggregates only; sovereignty-tier weighting; export/import; trust bootstrapping (escrow + guarantees) | l2 audit log (l4 = portable cross-agent; l2 = local operation log); l1 attestations | No | tools reputation_record/query/export/import/query_weighted, bootstrap_create_escrow/provide_guarantee, reputation_publish; HKDF `l4-reputation`/`identity-encryption`; EAS format; `sovereignty_tier` enum + `TIER_WEIGHTS`; `reputation_publish` emits frozen display labels 'L1'..'L4' + 'Cognitive Sovereignty' etc. (user-visible, NOT renamable); queries-return-aggregates invariant |
 | cli | CLI | canonical | The per-subcommand handler library for the `sanctuary` binary: one `run*Command` per subcommand (status, doctor, audit, identity, federation, transparency, secrets, sentinel, anomaly, policy, etc.) + the large `castle-wall.ts` command + the `agents/` multi-tenant sub-CLI | root `cli.ts` (the FILE = the argv router that lazy-imports these handlers) | No (sub-barrels only) | `TOP_LEVEL_SUBCOMMANDS` string array (the public command surface); basename-dispatched bins `verify-exit-bundle`/`import-exit-bundle`/`verify-transparency`; `cli/transparency.ts` anchoring-off-by-default; many dynamic-import path strings `./cli/<name>.js` (a rename grep must cover them) |
 
-Gaps note: none. All 55 module directories under `server/src` (verified by `ls`) have a row above,
+Gaps note: none. All 56 module directories under `server/src` (verified by `ls`) have a row above,
 and every row maps to a real directory (verified by diff). No best-effort placeholder rows were needed.
 
 **Two reading notes.** (1) The `default-off-allocated` modules - `composition`, `substrate`,
@@ -369,7 +370,7 @@ not its internal file layout. Deep imports are the documented exception (used wh
 deliberately partial - e.g. `core/` re-exports only the primitives and keeps the master-key security
 trio out of the barrel on purpose; `contracts/` uses per-version barrels with no top-level barrel).
 
-**Status today: 47 of 55 modules have a barrel** (backfilled 2026-06-14). This is additive (adding a
+**Status today: 48 of 56 modules have a barrel** (backfilled 2026-06-14). This is additive (adding a
 barrel never changes existing deep-import call sites). The 8 without one are intentional or deferred:
 the four layer dirs (`cognitive`, `operational`, `disclosure`, `reputation`) get theirs in a
 follow-up; `operational`'s in particular shrinks that follow-up's blast radius (100+ files reach
