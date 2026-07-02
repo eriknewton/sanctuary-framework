@@ -393,9 +393,12 @@ export async function validateDevDist(devDist: string): Promise<void> {
  * install-path hardening).
  *
  *   - "resolvable":  the registry affirmatively serves the pinned version.
- *   - "unpublished": the registry is reachable and affirmatively does NOT
- *                    have the pinned version - the MCP entry this wrap
- *                    writes would be dead at spawn time.
+ *   - "unpublished": the registry (as resolved at wrap time) is reachable
+ *                    and affirmatively does NOT have the pinned version -
+ *                    the MCP entry this wrap writes would be dead at spawn
+ *                    time, unless the harness's own spawn directory routes
+ *                    the scope to a different registry this probe cannot
+ *                    see. Advisory, never a hard block.
  *   - "unreachable": the registry could not be consulted (offline, DNS,
  *                    timeout), or resolution is indirected through config
  *                    the probe cannot faithfully reproduce (a non-default
@@ -458,12 +461,20 @@ async function readNpmrcRegistryKeys(
 }
 
 /**
- * Best-effort resolution of the npm registry the wrap-written `npx` entry
- * will ACTUALLY consult at spawn time (2026-07-02 fix round). The probe
- * previously hard-coded the public registry, so in a private-mirror /
- * corporate environment (registry override in `.npmrc` or the npm config
- * env) it asked the WRONG registry and rendered a false dead-pin warning
- * for an entry npx would start fine.
+ * Best-effort, WRAP-TIME approximation of the npm registry the
+ * wrap-written `npx` entry will consult at spawn time (2026-07-02 fix
+ * round). The probe previously hard-coded the public registry, so in a
+ * private-mirror / corporate environment (registry override in `.npmrc`
+ * or the npm config env) it asked the WRONG registry and rendered a false
+ * dead-pin warning for an entry npx would start fine.
+ *
+ * Honesty limit: this resolves from the wrap process's OWN env and cwd.
+ * The harness spawns the MCP entry later, possibly from a different
+ * working directory whose project `.npmrc` this probe cannot see (e.g. a
+ * scope override pointing at a private mirror). A direct-default result
+ * here therefore does NOT guarantee spawn-time resolution also hits the
+ * default registry; callers must keep the resulting "unpublished" verdict
+ * advisory, never a hard block.
  *
  * Mirrors npm's per-key precedence approximately: the package-scope key
  * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
@@ -483,13 +494,24 @@ export async function resolveNpmRegistryForProbe(
   seams: { env?: NodeJS.ProcessEnv; cwd?: string; home?: string } = {},
 ): Promise<{ base: string; indirect: boolean }> {
   const env = seams.env ?? process.env;
-  const npmrcPaths = [
-    join(seams.cwd ?? process.cwd(), ".npmrc"),
-    join(seams.home ?? homedir(), ".npmrc"),
-  ];
+  // Guard the cwd lookup: process.cwd() THROWS (uv_cwd ENOENT) when the
+  // wrap runs from a deleted directory (removed worktree, cleaned tmp
+  // dir). This probe's contract is never-throws / never-blocks-the-wrap,
+  // so an unresolvable cwd degrades to user-level config only (same
+  // semantics as an absent project .npmrc) instead of crashing the wrap.
+  let cwd: string | undefined = seams.cwd;
+  if (cwd === undefined) {
+    try {
+      cwd = process.cwd();
+    } catch {
+      cwd = undefined;
+    }
+  }
   const files = [
-    await readNpmrcRegistryKeys(npmrcPaths[0]),
-    await readNpmrcRegistryKeys(npmrcPaths[1]),
+    cwd !== undefined
+      ? await readNpmrcRegistryKeys(join(cwd, ".npmrc"))
+      : { scoped: null as string | null, registry: null as string | null },
+    await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
   ];
   const scoped =
     normalizeRegistryUrl(env["npm_config_@sanctuary-framework:registry"]) ??
@@ -530,8 +552,10 @@ export async function resolveNpmRegistryForProbe(
  * "unreachable". Never throws.
  *
  * 2026-07-02 fix round (registry-config honesty): the probe consults the
- * SAME registry npx will (resolveNpmRegistryForProbe: npm config env,
- * project/user `.npmrc`), and when resolution is `indirect` (non-default
+ * registry npx will most likely use, resolved at WRAP time
+ * (resolveNpmRegistryForProbe: npm config env, project/user `.npmrc`;
+ * the harness's spawn-time cwd can differ, so even an affirmative
+ * "unpublished" stays advisory), and when resolution is `indirect` (non-default
  * registry, which may hide packages from this deliberately unauthenticated
  * probe, or proxy-only egress the bare GET does not traverse) a 404 is NOT
  * affirmative: it maps to "unreachable" (honest could-not-verify) instead
@@ -1420,10 +1444,11 @@ export async function runWrap(
       console.error(
         `\n  WARNING: the harness MCP entry this wrap writes is pinned to` +
           `\n  @sanctuary-framework/mcp-server@${SANCTUARY_VERSION}, but the npm registry` +
-          `\n  does not have that version. The wrapped agent's MCP entry will fail to` +
-          `\n  start until it is published. If you are running an unpublished build,` +
-          `\n  re-run with --dev-dist <path-to-dist/cli.js> to point the entry at your` +
-          `\n  local build instead.`
+          `\n  (as resolved from this directory) does not have that version. Unless your` +
+          `\n  agent's own project config routes the package scope to another registry,` +
+          `\n  the MCP entry will fail to start until it is published. If you are running` +
+          `\n  an unpublished build, re-run with --dev-dist <path-to-dist/cli.js> to point` +
+          `\n  the entry at your local build instead.`
       );
     } else if (pinResolvability === "unreachable") {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -2567,9 +2592,10 @@ function renderPinResolvabilityBannerLines(info: {
       "",
       `  ${w("\u26A0")} The MCP entry this wrap wrote is pinned to ` +
         `@sanctuary-framework/mcp-server@${info.version},`,
-      `    which is not on the npm registry: your agent cannot start it until that`,
-      `    version is published. For an unpublished build, re-run with --dev-dist`,
-      `    <path-to-dist/cli.js> to point the entry at your local build.`,
+      `    which is not on the npm registry (as resolved from this directory): unless`,
+      `    your agent's project config routes the scope to another registry, it cannot`,
+      `    start until that version is published. For an unpublished build, re-run`,
+      `    with --dev-dist <path-to-dist/cli.js> to point the entry at your local build.`,
     ];
   }
   if (info.pinnedVersionResolvability === "unreachable") {

@@ -624,6 +624,30 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         ).toEqual({ base: "https://scoped.example/npm", indirect: true });
       });
 
+      it("a deleted working directory (process.cwd throws) degrades to user config instead of crashing the wrap", async () => {
+        // Fourth round: `sanctuary protect` run from a removed worktree /
+        // cleaned tmp dir makes process.cwd() throw uv_cwd ENOENT. The
+        // probe's contract is never-throws / never-blocks-the-wrap, so
+        // the guard must fall back to user-level config only.
+        const cwdSpy = vi.spyOn(process, "cwd").mockImplementation(() => {
+          const err = new Error(
+            "ENOENT: no such file or directory, uv_cwd",
+          ) as NodeJS.ErrnoException;
+          err.code = "ENOENT";
+          throw err;
+        });
+        try {
+          await expect(
+            resolveNpmRegistryForProbe({ env: {}, home: tmpHome }),
+          ).resolves.toEqual({
+            base: "https://registry.npmjs.org",
+            indirect: false,
+          });
+        } finally {
+          cwdSpy.mockRestore();
+        }
+      });
+
       it("proxy egress config marks even the default registry indirect", async () => {
         expect(
           await resolveNpmRegistryForProbe({
