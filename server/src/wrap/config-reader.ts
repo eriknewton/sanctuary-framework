@@ -887,16 +887,34 @@ async function readWrapMetaFilesRaw(): Promise<Record<string, unknown>[]> {
 }
 
 /**
- * Read the existing wrap-meta (canonical then legacy filename) leniently,
- * for the F6 re-wrap pointer-preservation check in saveWrapMeta. Returns
- * null when absent or unreadable.
+ * Read the existing wrap-meta FOR THIS SURFACE leniently, for the F6
+ * re-wrap pointer-preservation check in saveWrapMeta. Both pointer
+ * filenames (canonical then legacy) are scanned for the first meta whose
+ * `originalPath` resolve()s to the same path - the identical per-surface
+ * discipline hasExistingWrapMeta / removeWrapMeta use. Returns null when
+ * no parseable meta names this surface.
+ *
+ * 2026-07-02 hardening (second round): the previous reader returned the
+ * FIRST parseable meta regardless of surface, so in the mixed state the
+ * module docs call out (legacy meta names surface X with the pristine
+ * pointer, canonical meta names surface Y) a re-wrap of X compared against
+ * Y's meta, failed the same-surface check, and clobbered the canonical
+ * pointer with a fresh backup of the ALREADY-WRAPPED content - orphaning
+ * X's pristine backup.
  */
-async function readExistingWrapMetaRaw(): Promise<Record<
-  string,
-  unknown
-> | null> {
-  const metas = await readWrapMetaFilesRaw();
-  return metas.length > 0 ? metas[0]! : null;
+async function readExistingWrapMetaRawForSurface(
+  originalPath: string,
+): Promise<Record<string, unknown> | null> {
+  const resolved = resolve(originalPath);
+  for (const meta of await readWrapMetaFilesRaw()) {
+    if (
+      typeof meta.originalPath === "string" &&
+      resolve(meta.originalPath) === resolved
+    ) {
+      return meta;
+    }
+  }
+  return null;
 }
 
 /**
@@ -982,15 +1000,15 @@ export async function saveWrapMeta(
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const metaPath = join(dir, WRAP_META_FILENAME);
   const toWrite = { ...meta };
-  const existing = await readExistingWrapMetaRaw();
+  // Surface scoping (2026-07-02 hardening): the lookup itself is per-surface
+  // (resolve()-compare over BOTH pointer filenames, matching removeWrapMeta /
+  // hasExistingWrapMeta), so a legacy meta naming this surface still
+  // preserves the pristine pointer even when the canonical file names a
+  // different surface.
+  const existing = await readExistingWrapMetaRawForSurface(meta.originalPath);
   if (
     (options.configStillWrapped ?? true) &&
     existing !== null &&
-    // Surface scoping (2026-07-02 hardening): resolve()-compare, matching
-    // removeWrapMeta / hasExistingWrapMeta, so a lexically-different spelling
-    // of the same path still preserves the pristine pointer.
-    typeof existing.originalPath === "string" &&
-    resolve(existing.originalPath) === resolve(meta.originalPath) &&
     typeof existing.backupPath === "string" &&
     existing.backupPath.trim() !== "" &&
     (await fileExists(existing.backupPath))

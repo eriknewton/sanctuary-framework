@@ -11,8 +11,13 @@
  *   2. removeWrapMeta never unlinks the pointer on a transient READ error;
  *      only genuinely-absent (ENOENT) or affirmatively-unparseable content
  *      is removable.
- *   3. The MED-1 orphan-wrap guard fires on ALL rollback paths, not just
- *      the meta-write-failure one.
+ *   3. The MED-1 orphan-wrap guard fires beyond the meta-write-failure
+ *      site: pinned here on the primary REWRITE-failure path, the primary
+ *      VERIFY-failure path (the restoredOnFailure plumbing), and the
+ *      Hermes-YAML write-failure rollback. (The remaining site, the
+ *      Hermes-YAML verify-failure rollback, shares the identical
+ *      guard(rollbackWrapSurfaces()) call shape but has no isolated
+ *      trigger seam; it is covered by inspection, not by a test here.)
  *   4. The MED-2 crash-window warning fires for surface X even when a
  *      DIFFERENT surface Y's wrap-meta exists (regression for the
  *      tenant-global suppression).
@@ -22,6 +27,16 @@
  *      downgrade on unpublished/unreachable pins (never blocks the wrap).
  *   7. Unwrap of a wrap-created file preserves its final contents as a
  *      timestamped backup breadcrumb before removal.
+ *
+ * Second-round hardening pinned here (2026-07-02 fix round):
+ *   8. Unwrap tolerates a null-backup auxiliary file that is ALREADY
+ *      absent (ENOENT) instead of counting it as a restore failure — the
+ *      orphan-wrap guard can persist an aux entry for a file the failed
+ *      wrap never created, and treating the phantom as a failure kept the
+ *      wrap-meta alive forever and wedged every --unwrap re-run.
+ *   9. The unpublished/unreachable pin outcome reaches the TERMINAL-FINAL
+ *      success banner (formatWrapSuccess / formatWrapSuccessNoDashboard),
+ *      not only the mid-flow warning that scrolls above it.
  *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
@@ -47,6 +62,8 @@ import {
   runWrap,
   castleWallProtectionConfirmed,
   checkPinnedVersionResolvable,
+  formatWrapSuccess,
+  formatWrapSuccessNoDashboard,
 } from "../../src/wrap/cli.js";
 import {
   backupConfig,
@@ -246,6 +263,95 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     },
   );
 
+  it.skipIf(process.getuid?.() === 0)(
+    "a failed rollback on the VERIFY failure path writes the fallback meta (restoredOnFailure plumbing)",
+    async () => {
+      const settingsDir = join(tmpHome, ".claude");
+      await mkdir(settingsDir, { recursive: true });
+      const settingsPath = join(settingsDir, "settings.json");
+      const pristine = JSON.stringify({ mcpServers: {} }, null, 2);
+      await writeFile(settingsPath, pristine);
+
+      const exitSpy = vi
+        .spyOn(process, "exit")
+        .mockImplementation((code?: string | number | null) => {
+          throw new Error(`process.exit:${code}`);
+        });
+      try {
+        await expect(
+          runWrap(
+            { claudeCode: true, noOpen: true },
+            makeDeps({
+              rewriteConfig: async () => {
+                // Rewrite "succeeds" but leaves invalid JSON behind and a
+                // read-only target, so post-rewrite VERIFICATION fails and
+                // its internal rollback restore ALSO fails. An inverted or
+                // dropped restoredOnFailure boolean would skip the guard
+                // and end wrapped/corrupt with NO meta on disk.
+                await writeFile(settingsPath, "corrupted {{{");
+                await chmod(settingsPath, 0o400);
+              },
+            }),
+          ),
+        ).rejects.toThrow("process.exit:1");
+      } finally {
+        exitSpy.mockRestore();
+      }
+
+      const meta = await findLatestBackup();
+      expect(meta?.originalPath).toBe(settingsPath);
+      expect(await readFile(meta!.backupPath, "utf-8")).toBe(pristine);
+      expect(stderrOutput()).toContain(
+        "Wrap metadata was written after the failed restore",
+      );
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0)(
+    "a failed rollback on the Hermes-YAML write-failure path writes the fallback meta (aux entry included)",
+    async () => {
+      const hermesDir = join(tmpHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      const jsonPath = join(hermesDir, "cli-config.json");
+      const yamlPath = join(hermesDir, "config.yaml");
+      await writeFile(jsonPath, "{}");
+      // Pre-existing, readable-but-unwritable config.yaml: the plan
+      // computes fine, the backup reads fine, then the YAML write fails
+      // (EACCES) and rollbackWrapSurfaces' restore of the same read-only
+      // file fails too — the exact double failure the guard exists for.
+      const pristineYaml = "mcp_servers: {}\n";
+      await writeFile(yamlPath, pristineYaml);
+      await chmod(yamlPath, 0o400);
+
+      const exitSpy = vi
+        .spyOn(process, "exit")
+        .mockImplementation((code?: string | number | null) => {
+          throw new Error(`process.exit:${code}`);
+        });
+      try {
+        await expect(
+          runWrap({ hermes: true, noOpen: true }, makeDeps()),
+        ).rejects.toThrow("process.exit:1");
+      } finally {
+        exitSpy.mockRestore();
+        await chmod(yamlPath, 0o600);
+      }
+
+      // The guard wrote the fallback meta, INCLUDING the auxiliary pointer
+      // at the yaml surface's pre-wrap backup, so --unwrap can find both.
+      const meta = await findLatestBackup();
+      expect(meta?.originalPath).toBe(jsonPath);
+      expect(meta?.auxiliary).toHaveLength(1);
+      expect(meta!.auxiliary![0]!.originalPath).toBe(yamlPath);
+      expect(
+        await readFile(meta!.auxiliary![0]!.backupPath as string, "utf-8"),
+      ).toBe(pristineYaml);
+      expect(stderrOutput()).toContain(
+        "Wrap metadata was written after the failed restore",
+      );
+    },
+  );
+
   it("crash-window warning fires for surface X even when surface Y's wrap-meta exists (MED-2 residual)", async () => {
     // Surface Y: some other config with a live wrap-meta.
     await seedMetaFor(join(tmpHome, "surface-y.json"));
@@ -395,6 +501,17 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     // Availability: the wrap still completed.
     const wrapped = JSON.parse(await readFile(settingsPath, "utf-8"));
     expect(wrapped.mcpServers.sanctuary).toBeDefined();
+
+    // Second round: the mid-flow warning alone is not enough — the
+    // TERMINAL-FINAL success banner (the last thing printed) must carry the
+    // dead-pin warning too, or the run still ends on an unqualified success
+    // surface ~30 lines below the warning.
+    const finalBanner = errSpy.mock.calls
+      .at(-1)!
+      .map(String)
+      .join(" ");
+    expect(finalBanner).toContain("which is not on the npm registry");
+    expect(finalBanner).toContain("--dev-dist");
   });
 
   it("an unreachable registry prints the honest could-not-verify note and does not block the wrap", async () => {
@@ -413,6 +530,71 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     );
     const wrapped = JSON.parse(await readFile(settingsPath, "utf-8"));
     expect(wrapped.mcpServers.sanctuary).toBeDefined();
+  });
+
+  // ── Finding 9 (second round): the pin outcome reaches the final banner ──
+
+  describe("success banner carries the pin-resolvability outcome", () => {
+    const baseInfo = {
+      toolName: "Claude Code",
+      version: "9.9.9",
+      toolCount: 3,
+      serverCount: 2,
+      dashboardUrl: "http://127.0.0.1:3501",
+      browserOpened: false,
+      passphraseLocation: "test-keychain",
+      passphraseSource: "generated",
+    };
+
+    it("an unpublished pin renders a loud warning in BOTH success surfaces", () => {
+      for (const banner of [
+        formatWrapSuccess({
+          ...baseInfo,
+          pinnedVersionResolvability: "unpublished",
+        }),
+        formatWrapSuccessNoDashboard({
+          ...baseInfo,
+          pinnedVersionResolvability: "unpublished",
+        }),
+      ]) {
+        expect(banner).toContain("which is not on the npm registry");
+        expect(banner).toContain("@sanctuary-framework/mcp-server@9.9.9");
+        expect(banner).toContain("--dev-dist");
+      }
+    });
+
+    it("an unreachable registry renders the honest could-not-verify note in both surfaces", () => {
+      for (const banner of [
+        formatWrapSuccess({
+          ...baseInfo,
+          pinnedVersionResolvability: "unreachable",
+        }),
+        formatWrapSuccessNoDashboard({
+          ...baseInfo,
+          pinnedVersionResolvability: "unreachable",
+        }),
+      ]) {
+        expect(banner).toContain("could not verify");
+        expect(banner).toContain("registry was unreachable");
+      }
+    });
+
+    it("resolvable / skipped / absent outcomes leave the banner byte-identical (no noise)", () => {
+      const plain = formatWrapSuccess(baseInfo);
+      expect(
+        formatWrapSuccess({
+          ...baseInfo,
+          pinnedVersionResolvability: "resolvable",
+        }),
+      ).toBe(plain);
+      expect(
+        formatWrapSuccess({
+          ...baseInfo,
+          pinnedVersionResolvability: "skipped",
+        }),
+      ).toBe(plain);
+      expect(plain).not.toContain("npm registry");
+    });
   });
 
   it("a resolvable pin adds no warning noise", async () => {
@@ -464,5 +646,39 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       if (content.includes("operator-added-server")) preserved = true;
     }
     expect(preserved).toBe(true);
+  });
+
+  // ── Finding 8 (second round): phantom null-backup aux never wedges unwrap ──
+
+  it("unwrap completes and retires the meta when a wrap-created config.yaml is ALREADY absent", async () => {
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    const jsonPath = join(hermesDir, "cli-config.json");
+    const yamlPath = join(hermesDir, "config.yaml");
+    await writeFile(jsonPath, "{}");
+    // No config.yaml: wrap creates it fresh (backupPath: null in the meta).
+
+    await runWrap({ hermes: true, noOpen: true }, makeDeps());
+
+    // The file named by the null-backup aux entry is gone while its parent
+    // dir survives (so validate-time `alreadyAbsent` does NOT fire). This
+    // is the state the orphan-wrap guard leaves when the primary rewrite or
+    // verify fails BEFORE the yaml was ever written (or after the rollback
+    // already unlinked it) and the primary restore also fails: the guard's
+    // meta names a file that does not exist.
+    await rm(yamlPath);
+
+    errSpy.mockClear();
+    await runWrap({ unwrap: true }, makeDeps());
+
+    const out = stderrOutput();
+    // Pre-fix: the bare unlink threw ENOENT, counted as an auxiliary
+    // restore failure, and the meta was kept forever — every --unwrap
+    // re-run looped on a cause that is a nonexistent file.
+    expect(out).toContain("already absent");
+    expect(out).not.toContain("could not restore");
+    expect(out).not.toContain("could not snapshot");
+    // The unwrap COMPLETED: the meta pointer was retired.
+    expect(await findLatestBackup()).toBeNull();
   });
 });

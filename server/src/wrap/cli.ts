@@ -1279,9 +1279,16 @@ export async function runWrap(
   // honestly. NEVER blocks the wrap: "unpublished" and "unreachable" both
   // warn and continue (availability); `--dev-dist` entries point at a local
   // build validated above and involve no registry, so they skip the probe.
+  // The outcome is ALSO threaded into the terminal-final success banner
+  // (WrapSuccessInfo.pinnedVersionResolvability): the early warning here
+  // scrolls above dozens of lines of subsequent flow output, and a success
+  // surface that ends byte-identical to the resolvable case would re-create
+  // the exact dead-entry-behind-a-success-banner defect the probe exists to
+  // close.
+  let pinResolvability: PinnedVersionResolvability | undefined;
   if (options.devDist === undefined) {
     const checkPin = deps.checkPinResolvability ?? checkPinnedVersionResolvable;
-    const pinResolvability = await checkPin(SANCTUARY_VERSION);
+    pinResolvability = await checkPin(SANCTUARY_VERSION);
     if (pinResolvability === "unpublished") {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -1493,7 +1500,10 @@ export async function runWrap(
   // at the pre-wrap backup; `--unwrap` would report "No Sanctuary wrap
   // found". A meta pointing at the pre-wrap backup is strictly better than
   // that orphan state (unwrap restores are idempotent, so re-restoring an
-  // already-restored surface is harmless), so write it; if even that fails
+  // already-restored surface is harmless - including a null-backup aux file
+  // this failed wrap never created or already removed, which unwrap's
+  // removal branch tolerates as already-absent ENOENT), so write it; if
+  // even that fails
   // (e.g. disk full), never end silently: spell out exactly what --unwrap
   // will (not) do and the manual restore for every surface.
   const guardOrphanWrapAfterRollback = async (
@@ -1889,6 +1899,9 @@ export async function runWrap(
       // signal below.
       castleWallArmed: castleWallDaemon !== undefined,
       castleWallEnforcementObserved: ndEnforcementObserved,
+      // 2026-07-02 hardening: the dead-pin warning must survive to the
+      // terminal-final success surface, not only the mid-flow warning.
+      pinnedVersionResolvability: pinResolvability,
     });
     return;
   }
@@ -2210,6 +2223,9 @@ export async function runWrap(
     // evidence signal below.
     castleWallArmed: castleWallDaemon !== undefined,
     castleWallEnforcementObserved: enforcementObserved,
+    // 2026-07-02 hardening: the dead-pin warning must survive to the
+    // terminal-final success surface, not only the mid-flow warning.
+    pinnedVersionResolvability: pinResolvability,
   });
 }
 
@@ -2324,6 +2340,17 @@ interface WrapSuccessInfo {
    * policy loads never do.
    */
   castleWallEnforcementObserved?: boolean;
+  /**
+   * Wrap-time registry probe outcome for the version-pinned MCP entry
+   * (2026-07-02 hardening). "unpublished" renders a loud warning INSIDE the
+   * final banner (the entry cannot start until the version is published);
+   * "unreachable" renders an honest could-not-verify note. `undefined`
+   * means the probe did not run (`--dev-dist` local-build entries involve
+   * no registry) and, conservatively, "resolvable"/"skipped" add no noise.
+   * The mid-flow warning alone is NOT enough: it scrolls far above the
+   * banner, and the banner is the success claim the operator acts on.
+   */
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -2388,8 +2415,50 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     lines.push(`    Concierge chat and substrate-driven explanations will not work until this is resolved.`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Banner lines for the pinned-MCP-entry resolvability outcome, shared by
+ * both success surfaces (2026-07-02 hardening). An "unpublished" pin means
+ * the MCP entry this wrap just wrote CANNOT start \u2014 saying so only in a
+ * mid-flow warning that scrolls above the banner left the terminal-final
+ * success surface byte-identical to a working wrap (the dead-entry-behind-
+ * a-success-banner defect the probe exists to close). "unreachable" gets
+ * the honest could-not-verify note; "resolvable"/"skipped"/absent add
+ * nothing.
+ */
+function renderPinResolvabilityBannerLines(info: {
+  version: string;
+  pinnedVersionResolvability?: PinnedVersionResolvability;
+}): string[] {
+  const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`; // dim
+  if (info.pinnedVersionResolvability === "unpublished") {
+    return [
+      "",
+      `  ${w("\u26A0")} The MCP entry this wrap wrote is pinned to ` +
+        `@sanctuary-framework/mcp-server@${info.version},`,
+      `    which is not on the npm registry: your agent cannot start it until that`,
+      `    version is published. For an unpublished build, re-run with --dev-dist`,
+      `    <path-to-dist/cli.js> to point the entry at your local build.`,
+    ];
+  }
+  if (info.pinnedVersionResolvability === "unreachable") {
+    return [
+      "",
+      `  ${d(
+        "Note: the npm registry was unreachable, so this wrap could not verify the",
+      )}`,
+      `  ${d(
+        `pinned MCP entry (v${info.version}) resolves. If the agent fails to start, re-run`,
+      )}`,
+      `  ${d("'sanctuary protect' once the registry is reachable.")}`,
+    ];
+  }
+  return [];
 }
 
 /**
@@ -2458,6 +2527,12 @@ interface WrapSuccessNoDashboardInfo {
    * evidence-only-affirmative discipline.
    */
   castleWallEnforcementObserved?: boolean;
+  /**
+   * See WrapSuccessInfo.pinnedVersionResolvability; same banner-honesty
+   * discipline (an unpublished pin must be visible on the terminal-final
+   * success surface, not only in a mid-flow warning).
+   */
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 /**
@@ -2513,6 +2588,7 @@ export function formatWrapSuccessNoDashboard(
     lines.push(`  ${w("\u26A0")} Sentinels intelligence disabled: ${info.intelligenceError}`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
 }
@@ -2770,25 +2846,57 @@ async function unwrap(dryRun: boolean): Promise<void> {
         try {
           preRemovalBackup = await backupConfig(aux.originalPath);
         } catch (err) {
-          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-          console.error(
-            `  WARNING: could not snapshot ${aux.originalPath} before removal: ` +
-              `${(err as Error).message}`
-          );
+          // ENOENT is silent: the file is already gone (see the removal
+          // carve-out below), so there is nothing to snapshot and a WARNING
+          // would misread as a real failure.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  WARNING: could not snapshot ${aux.originalPath} before removal: ` +
+                `${(err as Error).message}`
+            );
+          }
         }
         // Round-3 P1-A: refuse the unlink if a symlink was raced into the
         // parent dir after validate-time; unlink() does not follow a
         // symlinked leaf, so only the parent walk is needed.
-        await unlinkSafeUnderRoot(aux.originalPath);
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
-        );
-        if (preRemovalBackup) {
+        //
+        // 2026-07-02 hardening (second round): ENOENT means the delete-on-
+        // unwrap end-state ALREADY holds - mirror the rollbackWrapSurfaces
+        // carve-out instead of counting it as an auxiliaryRestoreFailure.
+        // The orphan-wrap guard can persist a null-backup entry for a file
+        // the failed wrap never created (or that its rollback already
+        // removed) while the parent dir still exists (so validate-time
+        // `alreadyAbsent` does not fire); treating that phantom file as a
+        // restore failure kept the wrap-meta alive forever and wedged every
+        // --unwrap re-run on a cause that is a nonexistent file.
+        let removed = true;
+        try {
+          await unlinkSafeUnderRoot(aux.originalPath);
+        } catch (err) {
+          const code =
+            err && typeof err === "object" && "code" in err
+              ? (err as NodeJS.ErrnoException).code
+              : undefined;
+          if (code !== "ENOENT") throw err;
+          removed = false;
+        }
+        if (removed) {
           // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(
-            `  Its final contents were preserved at: ${preRemovalBackup}` +
-              `\n  (in case you added entries to it after the wrap).`
+            `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          );
+          if (preRemovalBackup) {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  Its final contents were preserved at: ${preRemovalBackup}` +
+                `\n  (in case you added entries to it after the wrap).`
+            );
+          }
+        } else {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Skipped ${aux.originalPath} (created by wrap; already absent)`
           );
         }
       }
