@@ -254,7 +254,7 @@ export function formatUpdateMessage(
       `[Sanctuary] Update available: ${current} → ${latest}. ` +
       `This install was wrapped by 'sanctuary protect'; wraps from v1.6.1 onward version-pin the harness entry, so running the server directly does not upgrade it. ` +
       `To upgrade the wrap, re-run protect from the new version with the same flags and environment as the original wrap (e.g. --fortress or SANCTUARY_FORTRESS_PATH/SANCTUARY_STORAGE_PATH, if used): ` +
-      `npx @sanctuary-framework/mcp-server@${latest} protect --<your-harness>`
+      `npx @sanctuary-framework/mcp-server@${latest} protect --claude-code (or your harness flag)`
     );
   }
   return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@${latest}`;
