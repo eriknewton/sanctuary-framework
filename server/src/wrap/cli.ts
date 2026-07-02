@@ -270,8 +270,26 @@ export function formatMcpServerCount(
  * identically, so the spawned MCP server resolves the right storage
  * path on its boot path. Resolved to absolute so subsequent CWD
  * changes do not break the persisted reference.
+ *
+ * SANCTUARY_STORAGE_PATH tenancy (same drift, third precedence rung): a wrap
+ * run under SANCTUARY_STORAGE_PATH with no fortress source honours that path
+ * for every write it performs (promoteFortressToStoragePath leaves it
+ * untouched), so the wrap-meta pointer, custody, and profile all land in the
+ * tenant directory. Pre-fix, the var was never written into the harness
+ * entry, so a harness that does not itself inherit the shell var spawned the
+ * pinned server against the DEFAULT storage path: wrong fortress at runtime,
+ * and the wrapped-install probe in update-check.ts missed the tenant pointer
+ * (permanently printing the non-upgrading bare-npx advice). Persisting it
+ * mirrors the Finding W fortress persistence. The branch is an else-if on
+ * the fortress chain: when a fortress source exists it has already been
+ * promoted ONTO SANCTUARY_STORAGE_PATH by the time this runs, and persisting
+ * SANCTUARY_FORTRESS_PATH alone keeps the entry canonical (the spawned
+ * server re-promotes it at boot).
+ *
+ * Exported for unit tests that pin the persistence precedence without
+ * standing up the whole wrap flow.
  */
-function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
+export function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
   const sanctuaryEnv: Record<string, string> = {};
   if (process.env.SANCTUARY_PASSPHRASE) {
     sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
@@ -293,6 +311,10 @@ function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
   } else if (process.env.SANCTUARY_FORTRESS_PATH) {
     sanctuaryEnv.SANCTUARY_FORTRESS_PATH = resolvePath(
       process.env.SANCTUARY_FORTRESS_PATH,
+    );
+  } else if (process.env.SANCTUARY_STORAGE_PATH) {
+    sanctuaryEnv.SANCTUARY_STORAGE_PATH = resolvePath(
+      process.env.SANCTUARY_STORAGE_PATH,
     );
   }
   return sanctuaryEnv;

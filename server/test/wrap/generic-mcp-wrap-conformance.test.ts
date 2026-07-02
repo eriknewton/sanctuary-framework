@@ -151,6 +151,11 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
       args: PINNED_SANCTUARY_ARGS,
+      // Tenancy persistence: a wrap run under SANCTUARY_STORAGE_PATH writes
+      // the tenant path into the entry env, so a harness that does not
+      // inherit the shell var still spawns the pinned server on the same
+      // fortress the wrap wrote to (buildSanctuaryEnv, wrap/cli.ts).
+      env: { SANCTUARY_STORAGE_PATH: process.env.SANCTUARY_STORAGE_PATH! },
     });
 
     const profile = JSON.parse(
@@ -214,6 +219,11 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
       args: PINNED_SANCTUARY_ARGS,
+      // Tenancy persistence: a wrap run under SANCTUARY_STORAGE_PATH writes
+      // the tenant path into the entry env, so a harness that does not
+      // inherit the shell var still spawns the pinned server on the same
+      // fortress the wrap wrote to (buildSanctuaryEnv, wrap/cli.ts).
+      env: { SANCTUARY_STORAGE_PATH: process.env.SANCTUARY_STORAGE_PATH! },
     });
     expect(
       readPersistedLocalAgents(process.env.SANCTUARY_STORAGE_PATH!)[0]?.harness,
@@ -240,6 +250,8 @@ describe("generic MCP wrap conformance", () => {
       sanctuary: {
         command: "npx",
         args: PINNED_SANCTUARY_ARGS,
+        // Tenancy persistence (see comment in the multi-server test above).
+        env: { SANCTUARY_STORAGE_PATH: process.env.SANCTUARY_STORAGE_PATH! },
       },
     });
     expect(

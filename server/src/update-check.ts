@@ -127,6 +127,16 @@ const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
  *   retired-vocabulary CI gate. Installs old enough to carry only the legacy
  *   pointer predate the version-pinned MCP entry (v1.6.1), so for them the
  *   unwrapped npx advice is exactly today's status-quo behavior.
+ * - Tenant-path wraps by OLDER releases: a wrap run under
+ *   SANCTUARY_STORAGE_PATH tenancy writes the pointer into the tenant
+ *   directory, but wraps performed by releases from before
+ *   `buildSanctuaryEnv` (wrap/cli.ts) persisted that var wrote a harness
+ *   entry without it, so a harness that does not itself inherit the shell
+ *   var spawns the pinned server on the DEFAULT storage path and this probe
+ *   misses the tenant pointer (unwrapped advice; advisory-copy-only, like
+ *   the other limits). Current wraps persist SANCTUARY_STORAGE_PATH (or the
+ *   fortress var, which supersedes it) into the entry env, so the probe and
+ *   the pointer agree.
  * - False POSITIVE on stale pointers: presence-only means an install that was
  *   wrapped and then unwrapped on a release BEFORE `removeWrapMeta` existed
  *   (which left the meta file in place after unwrap; see the stale-meta guard
