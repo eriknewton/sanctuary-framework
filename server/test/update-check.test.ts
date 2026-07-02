@@ -90,7 +90,17 @@ describe("update-check", () => {
       // the mechanism that rewrites the pinned MCP entry. The bare npx server
       // command (which rewrites nothing) must NOT be the advertised action.
       expect(msg).toContain("npx @sanctuary-framework/mcp-server@0.4.0 protect");
+      expect(msg).toMatch(
+        /Claude Code example: npx @sanctuary-framework\/mcp-server@0\.4\.0 protect --claude-code$/
+      );
       expect(msg).not.toContain("@latest");
+    });
+
+    it("wrapped advice does not append shell-metacharacter placeholder text to the example command", () => {
+      const msg = formatUpdateMessage("0.3.1", "0.4.0", true);
+      expect(msg).toContain("Use the matching harness flag for your agent");
+      expect(msg).not.toContain("--<");
+      expect(msg).not.toContain("(or your harness flag)");
     });
 
     it("wrapped advice states pinning as a v1.6.1+ property, not unconditionally", () => {

@@ -595,6 +595,44 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(yamlContainsSanctuaryEntry(nelHidesEnv)).toBe(false);
   });
 
+  it("refuses tab indentation and indented root mappings before choosing the add-key path", () => {
+    const tabHiddenRoot = [
+      "\tmcp_servers:",
+      "\t  sanctuary:",
+      '\t    command: "npx"',
+      "\t    env:",
+      '\t      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(tabHiddenRoot, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(tabHiddenRoot, ENTRY)).toThrow(
+      /tab indentation/
+    );
+
+    // PyYAML accepts a uniformly space-indented document root as a
+    // top-level mapping. The line scanner cannot compare that shape against
+    // column-0 `mcp_servers`, so it must refuse rather than append a second
+    // root key and corrupt the config.
+    const indentedRoot = [
+      "  mcp_servers:",
+      "    sanctuary:",
+      '      command: "npx"',
+      "      env:",
+      '        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(indentedRoot, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(indentedRoot, ENTRY)).toThrow(
+      /indented root mapping/
+    );
+    expect(extractSanctuaryEntryEnv(indentedRoot)).toBeNull();
+    expect(yamlContainsSanctuaryEntry(indentedRoot)).toBe(false);
+  });
+
   it("whitelist-refuses a replace when any env value is a shape the extractor cannot fully read (block scalar, anchor, tag, directive)", () => {
     // Pre-chokepoint these proceeded as skip-with-notice, but the
     // replace-entry write is wholesale, so the skipped var was dropped

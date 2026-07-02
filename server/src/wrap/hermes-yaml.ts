@@ -155,6 +155,23 @@ function isBlankOrComment(line: string): boolean {
   return t === "" || t.startsWith("#");
 }
 
+function hasTabIndent(line: string): boolean {
+  return /^ *\t/.test(line);
+}
+
+function firstNonMarkerContentLine(lines: string[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    const trimmed = line.trim();
+    if (indentOf(line) === 0 && (trimmed === "---" || trimmed === "...")) {
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
 function stripYamlKeyDecorators(
   trimmed: string
 ): { stripped: string; hadDecorator: boolean } {
@@ -228,6 +245,20 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       "config.yaml contains a line-break character (CR, CRLF, NEL, LS, or " +
         "PS) this line-oriented scan cannot read reliably; convert the " +
         "file to plain LF line endings and re-run wrap."
+    );
+  }
+  if (lines.some((l) => hasTabIndent(l))) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml uses tab indentation this scan cannot measure reliably; " +
+        "replace tabs with spaces and re-run wrap."
+    );
+  }
+  const firstContent = firstNonMarkerContentLine(lines);
+  if (firstContent !== -1 && indentOf(lines[firstContent]!) !== 0) {
+    throw new HermesYamlUnsupportedError(
+      `config.yaml has an indented root mapping (line ${firstContent + 1}) ` +
+        "that this line-oriented scan cannot safely compare against " +
+        "`mcp_servers`; move root keys to column 0 and re-run wrap."
     );
   }
   // Top-level key match uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the
@@ -308,7 +339,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   // entry extents) before any per-entry screen could see it. Refuse the
   // block loudly instead of scanning it cross-eyed.
   for (let i = keyLine + 1; i < blockEnd; i++) {
-    if (/^ *\t/.test(lines[i]!)) {
+    if (hasTabIndent(lines[i]!)) {
       throw new HermesYamlUnsupportedError(
         "config.yaml mcp_servers block uses tab indentation this scan " +
           "cannot measure reliably; replace tabs with spaces and re-run wrap."
@@ -648,7 +679,7 @@ function assertReplaceableSanctuaryEntry(
   for (let i = entry.start + 1; i < entry.end; i++) {
     const line = lines[i]!;
     if (isBlankOrComment(line)) continue; // (a)
-    if (/^ *\t/.test(line)) {
+    if (hasTabIndent(line)) {
       refuse(i, "uses tab indentation");
     }
     const indent = indentOf(line);
