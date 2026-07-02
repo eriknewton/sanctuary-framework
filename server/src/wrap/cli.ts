@@ -39,7 +39,10 @@ import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
   saveWrapMeta,
+  hasExistingWrapMeta,
   findLatestBackup,
+  findNewerBackup,
+  removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
   getPlatformPaths,
@@ -512,6 +515,66 @@ export type DashboardStarter = (opts: {
 
 // ── Main: wrap ──────────────────────────────────────────────────────
 
+/**
+ * F4 (v1.6.1 first-run honesty): the affirmative "Your agent is protected. /
+ * Castle Wall Full" hero is reserved for OBSERVED enforcement, judged by the
+ * SAME adjudicated-flow-evidence standard the dashboard uses (feature-health
+ * panel: only fresh, provenance- and producer-signature-gated
+ * egress_allowed / egress_blocked / operator_decision evidence arms the
+ * wall; daemon presence, heartbeats, and policy loads never do). A started
+ * userspace daemon proves nothing about the system extension actually
+ * filtering traffic; on a sysext-less Mac the daemon starts and filters
+ * nothing. Fail-closed: any probe failure reads as not-observed.
+ *
+ * Known bounded staleness (accepted tradeoff, harden round): the panel's
+ * evidence-freshness window is DEFAULT_ENFORCEMENT_FRESHNESS_MS (10
+ * minutes) - the SAME standard the dashboard applies - so adjudicated-flow
+ * evidence written by a PRIOR daemon/extension instance inside that window
+ * still reads "active". An operator who tears enforcement down and re-runs
+ * wrap within minutes can therefore see the one-shot protected banner off
+ * the dead instance's evidence; the dashboard self-corrects when the
+ * window expires, this banner does not. A stricter banner-only window
+ * would diverge from the dashboard standard and false-negative on
+ * genuinely-armed hosts whose most recent adjudicated flow is minutes old.
+ *
+ * Exported (module-level, not a runWrap closure) so the fail-closed gating
+ * is unit-testable against a real audit log without standing up the whole
+ * wrap flow.
+ */
+export async function probeCastleWallEnforcementObserved(
+  auditLog: AuditLog,
+  storagePath: string,
+): Promise<boolean> {
+  try {
+    const { buildFeatureHealthPanel } = await import(
+      "../principal-policy/feature-health.js"
+    );
+    const { loadFortressProducerKey } = await import(
+      "../castle-wall/runtime/producer-signature.js"
+    );
+    const keyLoad = await loadFortressProducerKey(storagePath);
+    // Eager-read scope: same one-verified-view discipline as the dashboard
+    // callers of buildFeatureHealthPanel (H4 chokepoint).
+    const panel = await auditLog.runEagerReads(() =>
+      buildFeatureHealthPanel({
+        auditLog,
+        originMachine: fortressIdFromStoragePath(storagePath),
+        pinnedProducerKeyB64url:
+          keyLoad.status === "present" ? keyLoad.keyB64url : null,
+        ...(keyLoad.status === "unreadable"
+          ? { producerKeyExpectedButUnavailable: true }
+          : {}),
+      }),
+    );
+    const row = panel.rows.find(
+      (r) => r.feature_id === "castle_wall_egress",
+    );
+    return row?.status === "active";
+  } catch {
+    return false;
+  }
+}
+
 export interface RunWrapDeps {
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
@@ -542,6 +605,14 @@ export interface RunWrapDeps {
   ) => Promise<
     import("./claude-code-allowlist.js").InstallClaudeCodeAllowlistResult
   >;
+  /**
+   * Override the wrap-meta persistence (for tests). Production callers
+   * leave this undefined. Tests inject a throwing stub to pin the
+   * meta-write failure paths: full rollback of every wrapped surface, and
+   * the orphan-wrap guard's fallback meta write when a rollback restore
+   * itself fails.
+   */
+  saveWrapMeta?: typeof saveWrapMeta;
 }
 
 export async function runWrap(
@@ -729,14 +800,28 @@ export async function runWrap(
       `\n  Sanctuary already wrapped: updating the existing Sanctuary entry.\n`
     );
   } else if (agentConfig.servers.length === 0) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
-    );
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `  Sanctuary will be installed as the only MCP server.\n`
-    );
+    if (agentConfig.platform === "hermes") {
+      // F7 (v1.6.1 first-run honesty): the empty surface here is the legacy
+      // cli-config.json artifact Hermes does NOT consult for MCP routing
+      // (see the DEBT note in the bootstrap path above). Printing "installed
+      // as the only MCP server" contradicted the config.yaml message printed
+      // moments earlier ("existing MCP servers there are preserved"), so
+      // point at the authoritative YAML surface instead.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Hermes routes MCP traffic through ${hermesConfigYamlPath()}.` +
+          `\n  Sanctuary will be added there; existing MCP entries are preserved.\n`
+      );
+    } else {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Found ${agentConfig.platform} config at ${agentConfig.configPath} with no MCP servers yet.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Sanctuary will be installed as the only MCP server.\n`
+      );
+    }
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1122,6 +1207,43 @@ export async function runWrap(
     }
   }
 
+  // `configStillWrapped` carries the PRE-wrap detection result (did ANY
+  // wrapped surface genuinely still carry the sanctuary entry? for Hermes
+  // that includes the authoritative config.yaml, whose plan action
+  // `replace-entry` means it did). Computed BEFORE the backup below so the
+  // crash-window warning next to it can fire before the already-wrapped
+  // content is captured as "the" backup; consumed by the deferred wrap-meta
+  // write at the end of the wrap.
+  const configStillWrapped =
+    hasSanctuaryInRaw || hermesYaml?.plan.action === "replace-entry";
+
+  // MED-2 (crash-window honesty): a config that already carries the
+  // sanctuary entry while NO wrap-meta exists on disk is exactly what an
+  // interrupted earlier wrap leaves behind (surfaces committed, then a
+  // crash before the deferred meta write). In that state the pristine
+  // pre-wrap config CANNOT be identified: the condition is
+  // indistinguishable from an operator who authored the sanctuary entry by
+  // hand, so no automatic recovery is attempted. The backup this wrap is
+  // about to take captures the CURRENT (already-wrapped) contents, and a
+  // later --unwrap restores THAT. Say so loudly, and point at the backup
+  // directory where an older pristine snapshot from the interrupted wrap
+  // may still exist (findNewerBackup's inverse breadcrumb: backup
+  // filenames embed timestamps, so older snapshots sort below the fresh
+  // one).
+  if (configStillWrapped && !(await hasExistingWrapMeta())) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  WARNING: this config already contains a Sanctuary entry, but no` +
+        `\n  wrap metadata exists, so the pristine pre-wrap config could not` +
+        `\n  be identified. The backup taken by THIS wrap captures the` +
+        `\n  current (already-wrapped) contents, and --unwrap will restore` +
+        `\n  that state. If this follows an interrupted wrap, check` +
+        `\n  ${join(storagePath, "backup")}` +
+        `\n  for an older pristine backup (timestamped config-backup-* files)` +
+        `\n  before relying on --unwrap.`
+    );
+  }
+
   // Back up and rewrite agent config. For Hermes, config.yaml is backed up
   // alongside cli-config.json and recorded in the wrap meta so unwrap
   // restores both surfaces.
@@ -1130,30 +1252,80 @@ export async function runWrap(
   if (hermesYaml?.existedBefore) {
     hermesYamlBackupPath = await backupConfig(hermesYaml.yamlPath);
   }
-  await saveWrapMeta({
-    backupPath,
-    originalPath: agentConfig.configPath,
-    platform: agentConfig.platform,
-    wrappedAt: new Date().toISOString(),
-    ...(hermesYaml
-      ? {
-          auxiliary: [
-            {
-              originalPath: hermesYaml.yamlPath,
-              backupPath: hermesYamlBackupPath,
-            },
-          ] satisfies WrapMetaAuxiliaryFile[],
+
+  // Harden round: the wrap-meta write is DEFERRED until every wrapped
+  // surface below is verified-committed. Writing it here (as earlier
+  // revisions did) violated the F6 invariant ("a wrap-meta exists" means
+  // "currently wrapped"): every rollback path after the write left the
+  // meta behind, and the next SUCCESSFUL wrap then preserved that stale
+  // pristine pointer, so a later --unwrap restored pre-failed-wrap content
+  // and silently discarded operator edits made between the failed wrap and
+  // the retry (worse for the created-fresh Hermes config.yaml, where a
+  // stale `backupPath: null` made unwrap DELETE an operator-authored file).
+
+  // Rollback for every post-rewrite failure: restore the primary config
+  // and, for Hermes, the config.yaml surface (or remove it when this wrap
+  // created it fresh). Defined here so the deferred wrap-meta write below
+  // shares the exact rollback the YAML block uses. Returns false when ANY
+  // surface could not be restored (MED-1: the wrap-meta failure path must
+  // know, because a still-wrapped surface with no meta on disk is an
+  // orphan --unwrap cannot find).
+  const rollbackWrapSurfaces = async (): Promise<boolean> => {
+    let allRestored = true;
+    if (hermesYaml) {
+      if (hermesYamlBackupPath) {
+        if (
+          !(await restoreFromBackup(hermesYaml.yamlPath, hermesYamlBackupPath))
+        ) {
+          allRestored = false;
         }
-      : {}),
-  });
+      } else {
+        try {
+          // Round-3 P1-A: parent-walk-safe even on the rollback path.
+          await unlinkSafeUnderRoot(hermesYaml.yamlPath);
+        } catch (err) {
+          // Best-effort removal of the file this wrap created. ENOENT means
+          // the write itself never landed (the end-state "absent" already
+          // holds); any OTHER failure (a symlink raced into its parent, an
+          // unwritable directory) leaves the created file in place, which
+          // counts as a failed restore for the orphan-wrap guard below.
+          const code =
+            err && typeof err === "object" && "code" in err
+              ? (err as NodeJS.ErrnoException).code
+              : undefined;
+          if (code !== "ENOENT") allRestored = false;
+        }
+      }
+    }
+    if (!(await restoreFromBackup(agentConfig.configPath, backupPath))) {
+      allRestored = false;
+    }
+    return allRestored;
+  };
 
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
-  await rewrite(
-    agentConfig,
-    sanctuaryCommand,
-    sanctuaryArgs,
-    Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-  );
+  // Harden round: the primary rewrite writes the live config IN PLACE
+  // (O_TRUNC via writeFileNoFollow, not temp+rename), so a throw mid-write
+  // (disk full, EIO) can leave the config truncated. With the wrap-meta
+  // write deferred until after verification, an uncaught throw here would
+  // propagate out of runWrap with no rollback AND no meta, so
+  // `--unwrap` would report nothing to restore. Catch, restore the
+  // pre-wrap surfaces, and exit non-zero, matching the YAML-write path.
+  try {
+    await rewrite(
+      agentConfig,
+      sanctuaryCommand,
+      sanctuaryArgs,
+      Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Config rewrite FAILED: ${(err as Error).message}`
+    );
+    await rollbackWrapSurfaces();
+    process.exit(1);
+  }
 
   const verifyOk = await verifyRewrittenConfig(
     agentConfig.configPath,
@@ -1170,21 +1342,6 @@ export async function runWrap(
   // non-zero, so the wrap is atomic: fully applied or fully rolled back.
   if (hermesYaml) {
     const yamlSurface = hermesYaml;
-    const rollbackBothSurfaces = async (): Promise<void> => {
-      if (hermesYamlBackupPath) {
-        await restoreFromBackup(yamlSurface.yamlPath, hermesYamlBackupPath);
-      } else {
-        try {
-          // Round-3 P1-A: parent-walk-safe even on the rollback path.
-          await unlinkSafeUnderRoot(yamlSurface.yamlPath);
-        } catch {
-          // Best-effort removal of the file this wrap created (it may not
-          // exist when the write itself was what failed, or be refused if a
-          // symlink was raced into its parent).
-        }
-      }
-      await restoreFromBackup(agentConfig.configPath, backupPath);
-    };
     let yamlVerified = false;
     try {
       // D4 P2-3 courtesy re-check at write time. Round-2 P1-A: lstat-then-
@@ -1207,7 +1364,7 @@ export async function runWrap(
       console.error(
         `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
       );
-      await rollbackBothSurfaces();
+      await rollbackWrapSurfaces();
       process.exit(1);
     }
     if (!yamlVerified) {
@@ -1215,13 +1372,110 @@ export async function runWrap(
       console.error(
         `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
       );
-      await rollbackBothSurfaces();
+      await rollbackWrapSurfaces();
       process.exit(1);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
     );
+  }
+
+  // F6 + harden round: persist the unwrap pointer ONLY now, after every
+  // wrapped surface is verified-committed, so no failure path can leave a
+  // meta behind for a wrap that did not stick. `configStillWrapped`
+  // (computed pre-backup above) keeps a stale meta left by a pre-1.6.1
+  // unwrap - which never removed metas - or by a by-hand unwrap from
+  // pinning an ancient pristine pointer over a config the operator has
+  // since edited, while a re-wrap over a partially-unwrapped Hermes install
+  // (JSON restored, YAML restore failed and retained the meta) still
+  // preserves the good pristine pointers. If the meta write itself fails,
+  // roll both surfaces back: a wrapped config with no unwrap pointer would
+  // strand --unwrap entirely.
+  //
+  // Honest crash window (MED-2): deferring the meta write opens the inverse
+  // hazard. Between the surface commits above and this write, a crash or
+  // power loss leaves the config WRAPPED with NO meta. A retry wrap then
+  // sees configStillWrapped=true with no existing meta to preserve, so the
+  // fresh pointer wins and the fresh backup captures the ALREADY-WRAPPED
+  // content; the pristine pre-wrap state survives only in the older
+  // timestamped backups nothing points at. Perfect detection is impossible
+  // (that state is indistinguishable from a hand-authored sanctuary entry),
+  // so the wrap prints the loud pre-backup warning above in exactly that
+  // condition instead of guessing.
+  const wrapMetaPayload = {
+    backupPath,
+    originalPath: agentConfig.configPath,
+    platform: agentConfig.platform,
+    wrappedAt: new Date().toISOString(),
+    ...(hermesYaml
+      ? {
+          auxiliary: [
+            {
+              originalPath: hermesYaml.yamlPath,
+              backupPath: hermesYamlBackupPath,
+            },
+          ] satisfies WrapMetaAuxiliaryFile[],
+        }
+      : {}),
+  };
+  const persistWrapMeta = deps.saveWrapMeta ?? saveWrapMeta;
+  try {
+    await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Wrap metadata write FAILED: ${(err as Error).message}`
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Rolling back: a wrapped config without an unwrap pointer would strand --unwrap.`
+    );
+    const fullyRolledBack = await rollbackWrapSurfaces();
+    if (!fullyRolledBack) {
+      // MED-1 (orphan-wrap guard): a surface restore just failed, so the
+      // live config may STILL route traffic through Sanctuary while no
+      // wrap-meta exists; `--unwrap` would report "No Sanctuary wrap
+      // found" and the operator would have no pointer at the good backup.
+      // A meta pointing at the pre-wrap backup is strictly better than
+      // that orphan state (unwrap restores are idempotent, so re-restoring
+      // an already-restored surface is harmless), so retry the meta write
+      // once before giving up.
+      try {
+        await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Wrap metadata was written after the failed restore: run the` +
+            `\n  unwrap command (--unwrap) to retry restoring the pre-wrap config.`
+        );
+      } catch {
+        // Double failure (e.g. disk full): the config is still wrapped and
+        // nothing on disk points at the backup. Never end in this state
+        // silently; spell out exactly what --unwrap will (not) do and the
+        // manual restore for every surface.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  CRITICAL: the config is STILL WRAPPED and no wrap metadata` +
+            `\n  could be written. --unwrap will NOT find this wrap; traffic` +
+            `\n  keeps routing through Sanctuary until you restore manually:`
+        );
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `    cp "${backupPath}" "${agentConfig.configPath}"`
+        );
+        if (hermesYaml) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            hermesYamlBackupPath
+              ? `    cp "${hermesYamlBackupPath}" "${hermesYaml.yamlPath}"`
+              : `    rm "${hermesYaml.yamlPath}" (this wrap created it fresh)`
+          );
+        }
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error("");
+      }
+    }
+    process.exit(1);
   }
 
   // WP-V1.2 reshape: write the broker-tool identifiers to Claude Code's
@@ -1370,6 +1624,10 @@ export async function runWrap(
     // and the auto-open browser path; print a concise success line that
     // points operators at the persistent dashboard.
 
+    // F4: enforcement-evidence signal for the success banner; false unless
+    // the fail-closed probe below observes dashboard-standard evidence.
+    let ndEnforcementObserved = false;
+
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
     // dashboard startup path. Derive the master key and create a default
@@ -1420,6 +1678,12 @@ export async function runWrap(
           });
         }
         await ndAuditLog.flush();
+        // F4: probe for real enforcement evidence (adjudicated flows) so the
+        // banner can distinguish "daemon started" from "observed enforcing".
+        if (castleWallDaemon !== undefined) {
+          ndEnforcementObserved =
+            await probeCastleWallEnforcementObserved(ndAuditLog, storagePath);
+        }
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -1436,12 +1700,16 @@ export async function runWrap(
       version: readPackageVersion(),
       toolCount: countUpstreamTools(upstreamServers),
       serverCount: upstreamServers.length,
+      platform: agentConfig.platform,
       passphraseLocation,
       passphraseSource,
       // Honest arm outcome: castleWallDaemon is only defined when
       // startCastleWallForWrap succeeded; on a start failure the catch above
-      // ran warnCastleWallDaemonNotStarted and left it undefined.
+      // ran warnCastleWallDaemonNotStarted and left it undefined. Daemon
+      // start alone never renders "protected"; that needs the F4 evidence
+      // signal below.
       castleWallArmed: castleWallDaemon !== undefined,
+      castleWallEnforcementObserved: ndEnforcementObserved,
     });
     return;
   }
@@ -1738,11 +2006,19 @@ export async function runWrap(
     await wrapAuditLog.flush();
   }
 
+  // F4: probe for real enforcement evidence (adjudicated flows) so the banner
+  // can distinguish "daemon started" from "observed enforcing". Fail-closed.
+  const enforcementObserved =
+    castleWallDaemon !== undefined && wrapAuditLog !== undefined
+      ? await probeCastleWallEnforcementObserved(wrapAuditLog, storagePath)
+      : false;
+
   printWrapSuccess({
     toolName,
     version: readPackageVersion(),
     toolCount: countUpstreamTools(upstreamServers),
     serverCount: upstreamServers.length,
+    platform: agentConfig.platform,
     dashboardUrl,
     browserOpened: !options.noOpen,
     passphraseLocation,
@@ -1750,7 +2026,10 @@ export async function runWrap(
     intelligenceHealthy,
     intelligenceError,
     // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
+    // Daemon start alone never renders "protected"; that needs the F4
+    // evidence signal below.
     castleWallArmed: castleWallDaemon !== undefined,
+    castleWallEnforcementObserved: enforcementObserved,
   });
 }
 
@@ -1831,6 +2110,13 @@ interface WrapSuccessInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /**
+   * Wrap platform, used for platform-specific banner copy (F7: on Hermes with
+   * an empty legacy JSON surface, the upstream-count line would read
+   * "0 tools registered across 0 upstream servers" and appear to contradict
+   * the authoritative config.yaml routing message).
+   */
+  platform?: AgentPlatform;
   dashboardUrl: string;
   browserOpened: boolean;
   passphraseLocation: string;
@@ -1838,14 +2124,26 @@ interface WrapSuccessInfo {
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
   /**
-   * Whether the Castle Wall enforcement daemon actually armed during this
-   * wrap. `true` => daemon started; `false` => the loud "NOT armed" warning
-   * fired and traffic is not being filtered; `undefined` => no arm signal was
-   * threaded into the banner (treated conservatively as not-confirmed, never
-   * as "Full"). Reserving the affirmative "Castle Wall Full" hero claim for an
-   * observed arm mirrors the existing `intelligenceHealthy` discipline.
+   * Whether the Castle Wall USERSPACE DAEMON started during this wrap.
+   * `true` => daemon started - which says NOTHING about enforcement (on a
+   * Mac with no approved system extension the daemon starts and filters
+   * nothing); `false` => the loud "NOT armed" warning fired and traffic is
+   * not being filtered; `undefined` => no signal was threaded into the
+   * banner (treated conservatively). Daemon start alone NEVER earns the
+   * affirmative "protected / Castle Wall Full" hero; that requires
+   * `castleWallEnforcementObserved` (F4, v1.6.1 first-run honesty).
    */
   castleWallArmed?: boolean;
+  /**
+   * Whether REAL enforcement evidence was observed: fresh adjudicated-flow
+   * evidence (egress_allowed / egress_blocked / operator_decision), judged
+   * by the SAME provenance- and producer-signature-gated standard the
+   * dashboard's feature-health panel uses. ONLY this (together with
+   * `castleWallArmed === true`) earns the affirmative "Your agent is
+   * protected. / Castle Wall Full" hero; daemon presence, heartbeats, and
+   * policy loads never do.
+   */
+  castleWallEnforcementObserved?: boolean;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -1859,9 +2157,7 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${g(check)} Sovereignty Dashboard running at ${b(info.dashboardUrl)}`
   );
@@ -1880,13 +2176,20 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
   // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
-  // affirmative "Castle Wall Full" hero claim for an observed arm. When the
-  // daemon failed to start (`castleWallArmed === false`) or no arm signal was
-  // threaded (`undefined`), do NOT print "Your agent is protected" / "Full" \u2014
-  // that is the exact overclaim the audit flagged (a green hero printed
-  // seconds after the loud "traffic NOT filtered" warning).
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
+  // affirmative "Castle Wall Full" hero claim for OBSERVED ENFORCEMENT
+  // (F4, v1.6.1): fresh adjudicated-flow evidence on the dashboard's
+  // standard, never daemon start alone. A daemon that merely started
+  // (`castleWallArmed === true`, no evidence) renders the honest
+  // "wrapped, but enforcement is not confirmed" hero; a failed start
+  // (`false`) or an absent signal (`undefined`) never renders "Full".
+  const enforcementObserved =
+    info.castleWallArmed === true &&
+    info.castleWallEnforcementObserved === true;
+  const castleWallLabel = renderCastleWallBannerLabel(
+    info.castleWallArmed,
+    enforcementObserved,
+  );
+  const heroPrefix = enforcementObserved
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
@@ -1909,15 +2212,44 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
 }
 
 /**
- * Render the Castle Wall segment of the wrap success banner from the real arm
- * outcome. Honesty discipline: "Castle Wall Full" is only printed when the
- * daemon is observed armed; a failed arm renders a loud "NOT ARMED" and an
- * absent signal renders "status unknown" \u2014 never "Full" on presence alone.
+ * Render the Castle Wall segment of the wrap success banner from the real
+ * outcome. Honesty discipline (F4, v1.6.1): "Castle Wall Full" is only
+ * printed on OBSERVED ENFORCEMENT (fresh adjudicated-flow evidence on the
+ * dashboard's standard). A daemon that merely started renders "daemon
+ * started (enforcement not confirmed)"; a failed start renders a loud
+ * "NOT ARMED"; an absent signal renders "status unknown". Never "Full" on
+ * daemon presence alone.
  */
-function renderCastleWallBannerLabel(armed: boolean | undefined): string {
-  if (armed === true) return "Castle Wall Full";
+function renderCastleWallBannerLabel(
+  armed: boolean | undefined,
+  enforcementObserved: boolean,
+): string {
+  if (armed === true && enforcementObserved) return "Castle Wall Full";
+  if (armed === true) {
+    return "Castle Wall daemon started (enforcement not confirmed)";
+  }
   if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
   return "Castle Wall status unknown (not confirmed armed)";
+}
+
+/**
+ * Render the upstream tools/servers count line. F7 (v1.6.1 first-run
+ * honesty): on Hermes the counts derive from the legacy cli-config.json
+ * surface Hermes does not consult for MCP routing, so a first run would
+ * print "0 tools registered across 0 upstream servers" moments after the
+ * (correct) message that config.yaml entries are preserved. When the
+ * authoritative surface is the Hermes YAML and the legacy surface is empty,
+ * say what actually happened instead.
+ */
+function renderUpstreamCountLine(info: {
+  toolCount: number;
+  serverCount: number;
+  platform?: AgentPlatform;
+}): string {
+  if (info.platform === "hermes" && info.serverCount === 0) {
+    return "Sanctuary MCP routing installed in Hermes config.yaml (existing entries preserved)";
+  }
+  return `${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`;
 }
 
 function printWrapSuccess(info: WrapSuccessInfo): void {
@@ -1930,12 +2262,19 @@ interface WrapSuccessNoDashboardInfo {
   version: string;
   toolCount: number;
   serverCount: number;
+  /** See WrapSuccessInfo.platform; same platform-specific copy rules. */
+  platform?: AgentPlatform;
   passphraseLocation: string;
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
-  /** See WrapSuccessInfo.castleWallArmed; same arm-outcome discipline. */
+  /** See WrapSuccessInfo.castleWallArmed; same daemon-start-only semantics. */
   castleWallArmed?: boolean;
+  /**
+   * See WrapSuccessInfo.castleWallEnforcementObserved; same
+   * evidence-only-affirmative discipline.
+   */
+  castleWallEnforcementObserved?: boolean;
 }
 
 /**
@@ -1958,9 +2297,7 @@ export function formatWrapSuccessNoDashboard(
   lines.push(
     `  ${g(check)} Wrapped ${b(info.toolName)} with Sanctuary v${info.version}`,
   );
-  lines.push(
-    `  ${g(check)} ${info.toolCount} tools registered across ${info.serverCount} upstream server${info.serverCount !== 1 ? "s" : ""}`,
-  );
+  lines.push(`  ${g(check)} ${renderUpstreamCountLine(info)}`);
   lines.push(
     `  ${d("Dashboard spawn skipped per --no-dashboard. Run `sanctuary dashboard` separately for a persistent dashboard.")}`,
   );
@@ -1970,10 +2307,17 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: same arm-outcome discipline as formatWrapSuccess \u2014 reserve the
-  // affirmative "protected" / "Castle Wall Full" hero for an observed arm.
-  const castleWallLabel = renderCastleWallBannerLabel(info.castleWallArmed);
-  const heroPrefix = info.castleWallArmed === true
+  // Honesty: same outcome discipline as formatWrapSuccess (F4, v1.6.1) \u2014
+  // reserve the affirmative "protected" / "Castle Wall Full" hero for
+  // observed enforcement evidence, never daemon start alone.
+  const enforcementObserved =
+    info.castleWallArmed === true &&
+    info.castleWallEnforcementObserved === true;
+  const castleWallLabel = renderCastleWallBannerLabel(
+    info.castleWallArmed,
+    enforcementObserved,
+  );
+  const heroPrefix = enforcementObserved
     ? b("Your agent is protected.")
     : b("Your agent is wrapped, but enforcement is not confirmed.");
   lines.push(
@@ -2045,22 +2389,30 @@ async function verifyRewrittenConfig(
   }
 }
 
+/**
+ * Restore `configPath` from `backupPath`, reporting failure to the operator
+ * without throwing. Returns false when the restore FAILED (the live config
+ * keeps its current, possibly-wrapped contents); callers that must not end
+ * in a wrapped-with-no-meta orphan state (MED-1, the wrap-meta failure
+ * rollback) branch on it. Other callers may ignore the result: the CRITICAL
+ * manual-recovery message has already printed.
+ */
 async function restoreFromBackup(
   configPath: string,
   backupPath: string
-): Promise<void> {
+): Promise<boolean> {
   try {
     await restoreConfig(backupPath, configPath);
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`  Original config restored from backup.`);
     console.error(`  Backup preserved at: ${backupPath}\n`);
+    return true;
   } catch (restoreErr) {
-    console.error(
-      `  CRITICAL: Could not restore backup from ${backupPath}`
-    );
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`  CRITICAL: Could not restore backup from ${backupPath}`);
     console.error(`  Error: ${(restoreErr as Error).message}`);
     console.error(`  Manual recovery: copy ${backupPath} to ${configPath}\n`);
+    return false;
   }
 }
 
@@ -2156,13 +2508,27 @@ async function unwrap(dryRun: boolean): Promise<void> {
   console.error(`\n  Sanctuary: Unwrapped`);
   console.error(`  Original config restored to: ${meta.originalPath}`);
   console.error(`  Backup preserved at: ${meta.backupPath}`);
+  // Harden round (operator breadcrumb): the restored snapshot is the FIRST
+  // pre-wrap backup (F6 pristine-pointer preservation); config edits made
+  // while wrapped survive only in the newer timestamped backups that
+  // nothing points at. Say where they are so the discard is recoverable.
+  const newerPrimaryBackup = await findNewerBackup(meta.backupPath);
+  if (newerPrimaryBackup) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: this restored the pristine pre-wrap snapshot. Newer backups exist;` +
+        `\n  config changes made while wrapped may be recoverable from: ${newerPrimaryBackup}`
+    );
+  }
 
   // D4 staging, Bug 2: restore auxiliary files the wrap touched (the
   // Hermes config.yaml surface). A null backupPath means wrap created the
   // file fresh; restoring the pre-wrap state removes it. Best-effort: the
   // primary config restore above already succeeded, so an auxiliary
   // failure reports loudly with the manual recovery path instead of
-  // aborting the unwrap.
+  // aborting the unwrap. Failures are counted: the wrap-meta retirement
+  // below is gated on ALL restores having succeeded.
+  let auxiliaryRestoreFailures = 0;
   for (const aux of auxiliary) {
     try {
       if (aux.backupPath) {
@@ -2172,6 +2538,14 @@ async function unwrap(dryRun: boolean): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
+        const newerAuxBackup = await findNewerBackup(aux.backupPath);
+        if (newerAuxBackup) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: newer backups of this file exist; changes made while wrapped` +
+              `\n  may be recoverable from: ${newerAuxBackup}`
+          );
+        }
       } else if (aux.alreadyAbsent) {
         // Round-2 P2: created-by-wrap file whose parent directory is gone -
         // the "absent" end-state already holds; informational no-op.
@@ -2190,6 +2564,7 @@ async function unwrap(dryRun: boolean): Promise<void> {
         );
       }
     } catch (err) {
+      auxiliaryRestoreFailures += 1;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  WARNING: could not restore ${aux.originalPath}: ${(err as Error).message}`
@@ -2200,6 +2575,38 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Manual recovery: copy ${aux.backupPath} to ${aux.originalPath}`
         );
       }
+    }
+  }
+
+  // F6 (v1.6.1 wrap safety): a COMPLETED unwrap retires the wrap-meta
+  // pointer files, so "a wrap-meta exists" means "currently wrapped" and a
+  // FUTURE wrap records a fresh pristine backup instead of preserving a
+  // stale pointer (see saveWrapMeta). The backup files themselves stay.
+  //
+  // Harden round: retirement is gated on every auxiliary restore having
+  // succeeded. Removing the meta after a partial restore stranded the CLI
+  // retry path: a re-run of --unwrap reported "No Sanctuary wrap found"
+  // while e.g. the Hermes config.yaml still routed traffic through
+  // Sanctuary, and a subsequent wrap recorded that still-wrapped file as
+  // the new "pristine" backup. Keeping the meta keeps --unwrap re-runnable.
+  // The retirement is also scoped to the originalPath just restored, so a
+  // legacy meta naming a DIFFERENT wrapped surface keeps its pointer.
+  if (auxiliaryRestoreFailures > 0) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  WARNING: ${auxiliaryRestoreFailures} auxiliary ` +
+        `${auxiliaryRestoreFailures === 1 ? "restore" : "restores"} failed; ` +
+        `keeping the wrap metadata so 'sanctuary wrap --unwrap' can be ` +
+        `re-run after fixing the cause above.`
+    );
+  } else {
+    const metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    for (const failedPath of metaRemovalFailures) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
+          `re-wrap may preserve a stale restore pointer. Remove it manually.`
+      );
     }
   }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -2236,12 +2643,17 @@ function warnCastleWallDaemonNotStarted(err: unknown): void {
     lines.push(
       "",
       "  Castle Wall now signs through a root helper by default (A2/B2). To",
-      "  arm the wall, do ONE of:",
+      "  start the userspace daemon, do ONE of:",
       '    1. Install the Castle Wall app (one-time "Allow background item"',
       "       approval), then set SANCTUARY_CASTLE_SIGNER_CLIENT to its shim:",
       "       /Applications/Sanctuary-CastleWall.app/Contents/MacOS/castle-wall-signer-client",
       "    2. To keep the legacy local-signing key, set SANCTUARY_CASTLE_LOCAL_SIGN=1",
       "  then re-run 'sanctuary wrap'.",
+      "",
+      "  NOTE: either option only starts the userspace daemon; that alone does",
+      "  NOT mean traffic is being filtered. Enforcement also needs the approved",
+      "  system extension, and is confirmed only by observed flow evidence on",
+      "  the dashboard's Castle Wall panel.",
     );
   } else {
     lines.push(

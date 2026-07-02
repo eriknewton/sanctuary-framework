@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { writeFile, mkdir, readFile, rm, access, symlink } from "node:fs/promises";
+import { writeFile, mkdir, mkdtemp, readFile, rm, access, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -233,11 +233,8 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
   let originalStoragePath: string | undefined;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-hermes-yaml-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-hermes-yaml-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;
@@ -376,6 +373,37 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
     const yaml = await readFile(join(hermesDir, "config.yaml"), "utf-8");
     expect(yaml.match(/^ {2}sanctuary:/gm)?.length).toBe(1);
   });
+
+  // F7 (v1.6.1 first-run honesty): the empty legacy cli-config.json surface
+  // (which Hermes does not consult for MCP routing) must not make the
+  // first-run output claim "installed as the only MCP server" or "0 tools
+  // registered across 0 upstream servers" moments after the (correct)
+  // config.yaml preservation message.
+  it("first-run output never contradicts the config.yaml preservation message (F7)", async () => {
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    await writeFile(join(hermesDir, "cli-config.json"), "{}");
+    await writeFile(
+      join(hermesDir, "config.yaml"),
+      'mcp_servers:\n  weather:\n    command: "uvx"\n'
+    );
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runWrap({ hermes: true, noOpen: true }, makeDeps());
+      const out = stderrSpy.mock.calls
+        .map((call) => call.map(String).join(" "))
+        .join("\n");
+      expect(out).not.toContain("only MCP server");
+      expect(out).not.toContain(
+        "0 tools registered across 0 upstream servers"
+      );
+      // The honest pointer at the authoritative YAML surface is present.
+      expect(out).toContain("config.yaml");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
 });
 
 describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)", () => {
@@ -386,11 +414,8 @@ describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)"
   let exitSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
-    tmpHome = join(
-      tmpdir(),
-      `sanctuary-hermes-atomic-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    );
-    await mkdir(tmpHome, { recursive: true });
+    // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-hermes-atomic-"));
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     process.env.HOME = tmpHome;

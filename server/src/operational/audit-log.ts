@@ -864,10 +864,13 @@ export class AuditLog {
         AUDIT_WRITE_LOCK_FILE
       );
       // SAFETY: one-time startup announcement of the audit-write coordination
-      // mechanism. Operators need to see this so they can locate the lock file
-      // and inspect lsof on it if writes appear stuck. Goes to stderr-equivalent
-      // console.info, which is operator-facing diagnostic surface, not telemetry.
-      console.info(
+      // mechanism, routed to STDERR via console.error. Operators need to see
+      // this so they can locate the lock file and inspect lsof on it if writes
+      // appear stuck. It must NEVER touch stdout: on an MCP stdio boot stdout
+      // is the JSON-RPC channel, and console.info writes to stdout in Node
+      // (this line was empirically the first stdout byte, ahead of the
+      // initialize response).
+      console.error(
         `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
       );
     }

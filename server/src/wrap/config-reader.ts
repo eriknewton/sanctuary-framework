@@ -8,7 +8,7 @@
  * All original configs are backed up before any modification.
  */
 
-import { mkdir, realpath, open, lstat, unlink } from "node:fs/promises";
+import { mkdir, realpath, open, lstat, unlink, readdir } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
@@ -833,22 +833,232 @@ export async function findLatestBackup(): Promise<{
 }
 
 /**
- * Save wrap metadata (original config path, backup path) for unwrap.
+ * Read the existing wrap-meta (canonical then legacy filename) leniently,
+ * for the F6 re-wrap pointer-preservation check in saveWrapMeta. Returns
+ * null when absent or unreadable; validation still happens on the unwrap
+ * read path (findLatestBackup).
  */
-export async function saveWrapMeta(meta: {
-  backupPath: string;
-  originalPath: string;
-  platform: AgentPlatform;
-  wrappedAt: string;
-  auxiliary?: WrapMetaAuxiliaryFile[];
-}): Promise<void> {
+async function readExistingWrapMetaRaw(): Promise<Record<
+  string,
+  unknown
+> | null> {
+  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+    try {
+      const parsed: unknown = JSON.parse(
+        await readFileCustody(join(backupDir(), filename), {
+          encoding: "utf-8",
+          verifyPathIdentity: true,
+        }),
+      );
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Missing or unreadable: try the next candidate.
+    }
+  }
+  return null;
+}
+
+/**
+ * True when a wrap-meta pointer file (canonical or legacy filename) exists
+ * and parses to an object. Read leniently, like the F6 preservation check.
+ * MED-2 (crash-window honesty): the wrap flow uses this to detect the
+ * "config already carries the sanctuary entry but NO meta exists" state an
+ * interrupted earlier wrap leaves behind, and warns that the pristine
+ * pre-wrap config cannot be identified.
+ */
+export async function hasExistingWrapMeta(): Promise<boolean> {
+  return (await readExistingWrapMetaRaw()) !== null;
+}
+
+/** True when the path names an existing, accessible file. */
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Save wrap metadata (original config path, backup path) for unwrap.
+ *
+ * F6 (v1.6.1 wrap safety): NEVER clobber the pristine pre-wrap backup
+ * pointer on a re-wrap. A second `wrap` run backs up the ALREADY-WRAPPED
+ * config; naively pointing the meta at that newest backup made `--unwrap`
+ * "restore" a file that still contains the sanctuary entry, while the
+ * pristine original survived on disk with nothing pointing at it. When a
+ * wrap-meta already exists for the SAME originalPath (meaning: still
+ * wrapped, since a completed unwrap removes the meta via removeWrapMeta),
+ * the existing backupPath (the pristine one) is preserved; same per-entry
+ * rule for `auxiliary` surfaces, where a preserved `backupPath: null`
+ * keeps meaning "wrap created this file fresh; unwrap removes it".
+ * Degradation: if the pristine backup file itself has been deleted from
+ * disk, the fresh pointer is used (an unwrap that fails on a missing file
+ * would strand the operator with no working pointer at all).
+ *
+ * Harden round (stale-meta guard): meta existence alone is NOT proof of
+ * "still wrapped". Releases before removeWrapMeta existed left the meta in
+ * place after every unwrap, and an operator can also remove the sanctuary
+ * entry by hand. In both states a preserved pointer would pin an ancient
+ * backup over weeks of live edits, and a later --unwrap would silently
+ * restore the ancient content. The caller therefore passes
+ * `configStillWrapped`, computed from the PRE-wrap config content (does it
+ * genuinely contain the sanctuary entry?); when false, the fresh pointer
+ * always wins. Defaults to true so direct callers keep the F6-safe
+ * preservation semantics unless they know better.
+ */
+export async function saveWrapMeta(
+  meta: {
+    backupPath: string;
+    originalPath: string;
+    platform: AgentPlatform;
+    wrappedAt: string;
+    auxiliary?: WrapMetaAuxiliaryFile[];
+  },
+  options: { configStillWrapped?: boolean } = {},
+): Promise<void> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const metaPath = join(dir, WRAP_META_FILENAME);
-  await writeFileCustody(metaPath, JSON.stringify(meta, null, 2), {
+  const toWrite = { ...meta };
+  const existing = await readExistingWrapMetaRaw();
+  if (
+    (options.configStillWrapped ?? true) &&
+    existing !== null &&
+    existing.originalPath === meta.originalPath &&
+    typeof existing.backupPath === "string" &&
+    existing.backupPath.trim() !== "" &&
+    (await fileExists(existing.backupPath))
+  ) {
+    toWrite.backupPath = existing.backupPath;
+    if (meta.auxiliary && Array.isArray(existing.auxiliary)) {
+      const priorAux = existing.auxiliary.filter(
+        (e): e is Record<string, unknown> =>
+          typeof e === "object" && e !== null && !Array.isArray(e),
+      );
+      toWrite.auxiliary = await Promise.all(
+        meta.auxiliary.map(async (aux) => {
+          const prior = priorAux.find(
+            (e) =>
+              e.originalPath === aux.originalPath &&
+              (e.backupPath === null || typeof e.backupPath === "string"),
+          );
+          if (!prior) return aux;
+          if (prior.backupPath === null) {
+            // Wrap created this surface fresh; the pristine state is
+            // "absent", which unwrap honors by removing the file.
+            return { ...aux, backupPath: null };
+          }
+          const priorBackup = prior.backupPath as string;
+          return (await fileExists(priorBackup))
+            ? { ...aux, backupPath: priorBackup }
+            : aux;
+        }),
+      );
+    }
+  }
+  await writeFileCustody(metaPath, JSON.stringify(toWrite, null, 2), {
     mode: 0o600,
     createParent: false,
   });
+}
+
+/**
+ * Remove the wrap-meta pointer files (canonical + legacy) after a completed
+ * unwrap. This makes "a wrap-meta exists" mean "currently wrapped", which
+ * the F6 pristine-pointer preservation in saveWrapMeta relies on: without
+ * it, a wrap AFTER an unwrap would preserve a stale pointer and a later
+ * unwrap would restore a config the operator has since edited. The backup
+ * files themselves are never deleted. Returns the paths that could not be
+ * removed (absent files are not failures) so the caller can warn loudly.
+ *
+ * Harden round (mixed legacy state): a meta file that parses and names a
+ * DIFFERENT originalPath than `restoredOriginalPath` is left in place: it
+ * is the only pointer to that OTHER surface's pristine backup (e.g. a
+ * pre-sweep release wrote the legacy meta for Hermes and a newer wrap
+ * wrote the canonical meta for Claude Code; unwrap restored only the
+ * latter). An unparseable meta file points at nothing restorable and is
+ * still removed. (The parameter is REQUIRED: an earlier optional-argument
+ * "remove unconditionally" mode had no production caller and was deleted.)
+ */
+export async function removeWrapMeta(
+  restoredOriginalPath: string,
+): Promise<string[]> {
+  const failures: string[] = [];
+  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+    const metaPath = join(backupDir(), filename);
+    let pointsAtOtherSurface = false;
+    try {
+      const parsed: unknown = JSON.parse(
+        await readFileCustody(metaPath, {
+          encoding: "utf-8",
+          verifyPathIdentity: true,
+        }),
+      );
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof (parsed as Record<string, unknown>).originalPath === "string" &&
+        resolve((parsed as Record<string, unknown>).originalPath as string) !==
+          resolve(restoredOriginalPath)
+      ) {
+        pointsAtOtherSurface = true;
+      }
+    } catch {
+      // Missing or unparseable: nothing another surface could be restored
+      // from; fall through to the unlink (ENOENT is a no-op there).
+    }
+    if (pointsAtOtherSurface) continue;
+    try {
+      await unlink(metaPath);
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      if (code !== "ENOENT") failures.push(metaPath);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Find the newest wrap backup of the same kind (extension) that is NEWER
+ * than `backupPath`, or null when none exists. Backup filenames embed an
+ * ISO-8601 timestamp (`config-backup-<timestamp><ext>`), so lexical order
+ * on the filename is chronological order.
+ *
+ * Harden round (operator breadcrumb): the F6 pristine-pointer preservation
+ * means an unwrap after a re-wrap restores the FIRST pre-wrap snapshot;
+ * config edits made while wrapped survive only in the newer timestamped
+ * backups nothing points at. Unwrap uses this to print where those edits
+ * can be recovered from. Best-effort: any error reads as "none found".
+ */
+export async function findNewerBackup(
+  backupPath: string,
+): Promise<string | null> {
+  try {
+    const dir = backupDir();
+    const resolved = resolve(backupPath);
+    if (resolve(dirname(resolved)) !== resolve(dir)) return null;
+    const name = basename(resolved);
+    const ext = extname(name);
+    const newer = (await readdir(dir))
+      .filter(
+        (entry) =>
+          entry.startsWith("config-backup-") &&
+          extname(entry) === ext &&
+          entry > name,
+      )
+      .sort();
+    return newer.length > 0 ? join(dir, newer[newer.length - 1]) : null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Config Detection ────────────────────────────────────────────────

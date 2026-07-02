@@ -24,7 +24,11 @@ import {
   runWrap,
   type DashboardStarter,
 } from "../../src/wrap/cli.js";
-import { findLatestBackup, saveWrapMeta } from "../../src/wrap/config-reader.js";
+import {
+  findLatestBackup,
+  removeWrapMeta,
+  saveWrapMeta,
+} from "../../src/wrap/config-reader.js";
 import { discoverTenants } from "../../src/cli/agents/discovery.js";
 
 const LEGACY_PROFILE = "cocoon-profile.json";
@@ -172,6 +176,43 @@ describe("legacy filename compatibility (read-both, write-new)", () => {
 
     const meta = await findLatestBackup();
     expect(meta).toEqual({ backupPath: freshBackup, originalPath: configPath });
+  });
+
+  it("removeWrapMeta scoped to the restored surface leaves a legacy meta naming a DIFFERENT surface", async () => {
+    const tenantDir = join(tempHome, "tenant-mixed-meta");
+    process.env.SANCTUARY_STORAGE_PATH = tenantDir;
+    const backupDir = join(tenantDir, "backup");
+    await mkdir(backupDir, { recursive: true });
+
+    // Legacy meta from a pre-sweep release, pointing at a DIFFERENT wrapped
+    // surface that unwrap did not touch. It is the only pointer to that
+    // surface's pristine backup.
+    const legacyBackup = join(backupDir, "config-backup-legacy.json");
+    await writeFile(legacyBackup, "{}");
+    const otherSurface = join(tempHome, "other-agent-config.json");
+    await writeFile(
+      join(backupDir, LEGACY_META),
+      JSON.stringify({ backupPath: legacyBackup, originalPath: otherSurface })
+    );
+
+    // Canonical meta from a newer wrap of THIS surface.
+    const freshBackup = join(backupDir, "config-backup-fresh.json");
+    await writeFile(freshBackup, "{}");
+    await saveWrapMeta({
+      backupPath: freshBackup,
+      originalPath: configPath,
+      platform: "openclaw",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    // Unwrap of this surface retires ONLY its pointer; the legacy pointer
+    // to the other surface's pristine backup survives.
+    expect(await removeWrapMeta(configPath)).toEqual([]);
+    await expect(access(join(backupDir, "wrap-meta.json"))).rejects.toThrow();
+    const remaining = JSON.parse(
+      await readFile(join(backupDir, LEGACY_META), "utf-8")
+    );
+    expect(remaining.originalPath).toBe(otherSurface);
   });
 
   it("unwraps an install that has only the legacy-named meta pointer", async () => {
