@@ -21,9 +21,11 @@
 
 export {
   PF_ANCHOR_NAME,
+  PF_BASE_CONF_PATH,
   PF_COMMAND_TIMEOUT_MS,
   createExecFilePfRunner,
   renderPfAnchorRules,
+  renderPfMainRulesetHook,
   checkPfAnchorLiveness,
   armPfAnchor,
   disarmPfAnchor,
@@ -54,6 +56,7 @@ export {
 
 export {
   GATE_BIND_HOST,
+  PEER_LOOKUP_MAX_CONCURRENT,
   createExclusiveEgressGate,
   startExclusiveEgressGate,
   type GateLivenessProbe,

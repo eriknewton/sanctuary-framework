@@ -69,15 +69,23 @@ prove this composed build.
   from the SAME policy source as the manifest rule (pass agent-to-gate,
   block-drop all other agent-uid loopback, tcp+udp, v4+v6; the pass rule is
   byte-shaped to the Tahoe drill's captured pfctl output). Arm loads the
-  anchor and enables pf with a reference token; arm is not reported done
-  until a post-arm settle-probe passes the liveness check twice
-  consecutively (the first-arm warmup race from the review); settle failure
-  disarms and throws. Disarm symmetry flushes the anchor and releases the
-  token. The MANDATORY liveness check decides by positive evidence only
-  (pf `Status: Enabled` AND the expected rules printed from the anchor);
-  any pfctl error, timeout, or missing rule is NOT live, and the gate
-  server refuses to proxy (503) on a non-live result. A silently-unloaded
-  anchor therefore surfaces as not-protected instead of green-when-dead.
+  anchor, HOOKS it into the main ruleset when the anchor call rule is
+  absent (rules loaded into a named anchor are inert until the main
+  ruleset calls the anchor; the hook is composed from the operator's base
+  `/etc/pf.conf` plus the Sanctuary call + load lines, the drill-proven
+  shape, so the com.apple anchors are preserved), and enables pf with a
+  reference token; arm is not reported done until a post-arm settle-probe
+  passes the liveness check twice consecutively (the first-arm warmup race
+  from the review); settle failure disarms and throws. Disarm symmetry
+  flushes the anchor and releases the token (the now-inert main-ruleset
+  call rule is deliberately left, documented in-source). The MANDATORY
+  liveness check decides by positive evidence only (pf `Status: Enabled`
+  AND the expected rules printed from the anchor AND the main ruleset
+  printing the anchor call rule -- a loaded-but-unhooked anchor enforces
+  nothing and is NOT live); any pfctl error, timeout, or missing rule is
+  NOT live, and the gate server refuses to proxy (503) on a non-live
+  result. A silently-unloaded OR unhooked anchor therefore surfaces as
+  not-protected instead of green-when-dead.
 - DRILL-OWED: the composed console drill (agent-uid non-gate loopback
   attempt dropped by THIS anchor and captured; agent-to-gate succeeds;
   parity passes), N>=3, on Tahoe AND one non-Tahoe macOS. Durable

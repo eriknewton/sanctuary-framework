@@ -15,6 +15,7 @@ import {
   createExclusiveEgressGate,
   startExclusiveEgressGate,
   GATE_BIND_HOST,
+  PEER_LOOKUP_MAX_CONCURRENT,
   type EgressGateEvent,
   type ExclusiveEgressGateOptions,
   type GateLivenessProbe,
@@ -308,6 +309,99 @@ describe("egress-gate/gate-server", () => {
     await rawConnect(port, `127.0.0.1:${upstream.port}`);
     await rawConnect(port, `127.0.0.1:${upstream.port}`);
     expect(probes).toBe(1);
+  });
+
+  it("shares ONE in-flight liveness probe across concurrent CONNECTs (single-flight, no pfctl amplification)", async () => {
+    // The confined agent can open CONNECTs in a tight loop; each probe
+    // spawns pfctl as the gate's NON-agent uid, so per-request probing
+    // would be a confused-deputy subprocess amplification lever.
+    const upstream = await startUpstream();
+    cleanups.push(upstream.close);
+    let probes = 0;
+    let releaseProbe: (() => void) | null = null;
+    const gated = new Promise<void>((r) => {
+      releaseProbe = r;
+    });
+    const { port } = await startGateOnEphemeralPort({
+      rules: [allowRule("127.0.0.1", upstream.port)],
+      livenessProbe: {
+        check: async () => {
+          probes += 1;
+          await gated;
+          return { live: true, reasons: [] };
+        },
+      },
+    });
+    const connects = Array.from({ length: 5 }, () =>
+      rawConnect(port, `127.0.0.1:${upstream.port}`),
+    );
+    // Let all five handlers reach the liveness await, then release the probe.
+    await new Promise((r) => setTimeout(r, 100));
+    releaseProbe!();
+    const results = await Promise.all(connects);
+    for (const result of results) {
+      expect(result.statusLine).toBe("HTTP/1.1 200 Connection Established");
+    }
+    expect(probes).toBe(1);
+  });
+
+  it("caps concurrent advisory peer lookups and SKIPS (peer_unresolved) at the cap instead of spawning more lsof", async () => {
+    const upstream = await startUpstream();
+    cleanups.push(upstream.close);
+    const total = PEER_LOOKUP_MAX_CONCURRENT + 2;
+    const pending: Array<{
+      args: readonly string[];
+      resolve: (r: { code: number; stdout: string }) => void;
+    }> = [];
+    const peerRunner: PeerCommandRunner = {
+      run: (_c, args) =>
+        new Promise((resolve) => {
+          pending.push({ args, resolve });
+        }),
+    };
+    const { port, events } = await startGateOnEphemeralPort({
+      rules: [allowRule("127.0.0.1", upstream.port)],
+      peerRunner,
+    });
+    const connects = Array.from({ length: total }, () =>
+      rawConnect(port, `127.0.0.1:${upstream.port}`),
+    );
+    // Wait until every handler has passed the peer step: the capped ones
+    // hold a pending lookup, the overflow ones have emitted peer_unresolved.
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const skipped = events.filter((e) => e.kind === "peer_unresolved").length;
+      if (pending.length === PEER_LOOKUP_MAX_CONCURRENT && skipped === total - PEER_LOOKUP_MAX_CONCURRENT) {
+        break;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `peer-lookup cap never settled: ${pending.length} pending, ${skipped} skipped`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // Release the held lookups as non-agent peers (uid 501).
+    for (const held of pending) {
+      const portArg = /:(\d+)$/.exec(held.args[2] ?? "");
+      const clientPort = portArg ? Number(portArg[1]) : 0;
+      held.resolve({
+        code: 0,
+        stdout: [`p777`, `u501`, `n127.0.0.1:${clientPort}->127.0.0.1:x`, ""].join("\n"),
+      });
+    }
+    const results = await Promise.all(connects);
+    for (const result of results) {
+      expect(result.statusLine).toBe("HTTP/1.1 200 Connection Established");
+    }
+    // Exactly the cap's worth of lsof spawns; the rest were skipped loudly.
+    expect(pending.length).toBe(PEER_LOOKUP_MAX_CONCURRENT);
+    expect(events.filter((e) => e.kind === "peer_uid_mismatch").length).toBe(
+      PEER_LOOKUP_MAX_CONCURRENT,
+    );
+    expect(events.filter((e) => e.kind === "peer_unresolved").length).toBe(
+      total - PEER_LOOKUP_MAX_CONCURRENT,
+    );
   });
 
   it("emits a loud peer_uid_mismatch event for a non-agent peer but still evaluates policy (advisory-only)", async () => {

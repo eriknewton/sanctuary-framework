@@ -1,16 +1,23 @@
 /**
  * Tests for the per-uid pf loopback anchor (Unified Protect Slice 3):
- * render shape (drill-parity), the MANDATORY fail-closed liveness check,
- * arm settle-probe semantics (including rollback on settle failure), and
- * disarm symmetry. All pfctl interaction is through a scripted mock runner;
- * no test touches a real pf.
+ * render shape (drill-parity), the MANDATORY fail-closed liveness check
+ * (including the loaded-but-unhooked blind spot: rules in a named anchor
+ * enforce nothing until the MAIN ruleset calls the anchor), arm semantics
+ * (main-ruleset hook install, settle-probe, rollback on settle failure),
+ * and disarm symmetry. All pfctl interaction is through a scripted mock
+ * runner; no test touches a real pf.
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   PF_ANCHOR_NAME,
   renderPfAnchorRules,
+  renderPfMainRulesetHook,
   checkPfAnchorLiveness,
   armPfAnchor,
   disarmPfAnchor,
@@ -34,6 +41,16 @@ const CANONICAL_ANCHOR_PRINT = [
 
 const PF_INFO_ENABLED = "Status: Enabled for 0 days 00:01:02           Debug: Urgent\n";
 const PF_INFO_DISABLED = "Status: Disabled                              Debug: Urgent\n";
+
+/** Main ruleset WITH the Sanctuary anchor call rule hooked in (pfctl print). */
+const MAIN_RULESET_HOOKED = [
+  'anchor "com.apple/*" all',
+  `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+  "",
+].join("\n");
+
+/** Stock main ruleset: com.apple anchors only, Sanctuary anchor NOT called. */
+const MAIN_RULESET_UNHOOKED = 'anchor "com.apple/*" all\n';
 
 interface ScriptedCall {
   match: (command: string, args: readonly string[]) => boolean;
@@ -64,6 +81,11 @@ const rulesCall = (result: PfCommandResult): ScriptedCall => ({
   match: (_c, a) => a[0] === "-a" && a[2] === "-sr",
   result,
 });
+/** Bare `pfctl -sr`: the MAIN ruleset (anchor-call-rule probe). */
+const mainRulesCall = (result: PfCommandResult): ScriptedCall => ({
+  match: (_c, a) => a.length === 1 && a[0] === "-sr",
+  result,
+});
 
 describe("egress-gate/pf-anchor", () => {
   describe("renderPfAnchorRules (single source)", () => {
@@ -85,11 +107,30 @@ describe("egress-gate/pf-anchor", () => {
     });
   });
 
+  describe("renderPfMainRulesetHook (the anchor call that makes rules enforced)", () => {
+    it("renders the drill-proven call + load lines", () => {
+      const hook = renderPfMainRulesetHook(PF_ANCHOR_NAME, "/tmp/x/egress-gate.rules");
+      expect(hook).toContain(`anchor "${PF_ANCHOR_NAME}" on lo0`);
+      expect(hook).toContain(`load anchor "${PF_ANCHOR_NAME}" from "/tmp/x/egress-gate.rules"`);
+    });
+
+    it("refuses a rules-file path that would escape the quoted conf token", () => {
+      expect(() => renderPfMainRulesetHook(PF_ANCHOR_NAME, '/tmp/evil" pass all #')).toThrow(
+        /quote or newline/,
+      );
+    });
+
+    it("refuses an anchor name outside the conservative charset", () => {
+      expect(() => renderPfMainRulesetHook('bad"name', "/tmp/x.rules")).toThrow(/anchor name/);
+    });
+  });
+
   describe("checkPfAnchorLiveness (fail-closed, positive evidence only)", () => {
-    it("is live when pf is enabled and the anchor prints all expected rules", async () => {
+    it("is live when pf is enabled, the anchor prints all expected rules, AND the main ruleset calls the anchor", async () => {
       const runner = scriptedRunner([
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result).toEqual({ live: true, reasons: [] });
@@ -99,15 +140,52 @@ describe("egress-gate/pf-anchor", () => {
       const runner = scriptedRunner([
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(renderPfAnchorRules(POLICY))),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(true);
+    });
+
+    it("accepts the anchor call rule without pfctl's trailing 'all'", async () => {
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(`anchor "${PF_ANCHOR_NAME}" on lo0\n`)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(true);
+    });
+
+    it("is NOT live when the anchor is loaded and pf is enabled but the MAIN ruleset never calls the anchor (loaded-but-unhooked = enforcing nothing)", async () => {
+      // The green-when-dead blind spot: `pfctl -a <name> -sr` prints a
+      // loaded anchor's rules whether or not any call rule transfers
+      // evaluation into it, and `pfctl -s info` is Enabled regardless.
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_UNHOOKED)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toMatch(/main ruleset is missing the anchor call rule/);
+    });
+
+    it("is NOT live when the main-ruleset probe itself fails (fail-closed)", async () => {
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall({ code: 1, stdout: "", stderr: "pfctl: /dev/pf: Permission denied" }),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toContain("pfctl -sr exited 1");
     });
 
     it("is NOT live when pf is disabled", async () => {
       const runner = scriptedRunner([
         infoCall(ok(PF_INFO_DISABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
@@ -115,7 +193,11 @@ describe("egress-gate/pf-anchor", () => {
     });
 
     it("is NOT live when the anchor is empty (silently-unloaded anchor)", async () => {
-      const runner = scriptedRunner([infoCall(ok(PF_INFO_ENABLED)), rulesCall(ok(""))]);
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok("")),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+      ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
       expect(result.reasons.some((r) => r.includes("pass rule"))).toBe(true);
@@ -123,14 +205,22 @@ describe("egress-gate/pf-anchor", () => {
 
     it("is NOT live when the pass rule targets a different port", async () => {
       const wrongPort = CANONICAL_ANCHOR_PRINT.replace("port = 19998", "port = 19999");
-      const runner = scriptedRunner([infoCall(ok(PF_INFO_ENABLED)), rulesCall(ok(wrongPort))]);
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(wrongPort)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+      ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
     });
 
     it("is NOT live when a block rule is missing (partial anchor)", async () => {
       const partial = [PASS_RULE, "block drop quick on lo0 inet proto tcp all user = 502"].join("\n");
-      const runner = scriptedRunner([infoCall(ok(PF_INFO_ENABLED)), rulesCall(ok(partial))]);
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(partial)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+      ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
       expect(result.reasons.some((r) => r.includes("udp"))).toBe(true);
@@ -140,6 +230,7 @@ describe("egress-gate/pf-anchor", () => {
       const runner = scriptedRunner([
         infoCall({ code: 1, stdout: "", stderr: "pfctl: /dev/pf: Permission denied" }),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
@@ -174,12 +265,13 @@ describe("egress-gate/pf-anchor", () => {
       result: { code: 0, stdout: "", stderr: "pf enabled\nToken : 4204204242\n" },
     };
 
-    it("loads, enables, captures the token, and settles on consecutive liveness", async () => {
+    it("loads, enables, captures the token, and settles on consecutive liveness (hook already present: main ruleset NOT reloaded)", async () => {
       const runner = scriptedRunner([
         loadCall,
         enableCall,
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
       ]);
       const result = await armPfAnchor(runner, POLICY, {
         settleDelayMs: 1,
@@ -189,6 +281,75 @@ describe("egress-gate/pf-anchor", () => {
       expect(result.settleProbes).toBeGreaterThanOrEqual(2);
       const loaded = runner.calls.find((c) => c[1] === "-a" && c[3] === "-f");
       expect(loaded?.[2]).toBe(PF_ANCHOR_NAME);
+      // Idempotence: the call rule was already in the main ruleset, so no
+      // bare `pfctl -f <mainfile>` reload happened.
+      expect(runner.calls.some((c) => c[1] === "-f")).toBe(false);
+    });
+
+    it("installs the main-ruleset hook when the call rule is absent (preserving the base config)", async () => {
+      const fixtureDir = await mkdtemp(join(tmpdir(), "sanctuary-pf-test-"));
+      const baseConfPath = join(fixtureDir, "pf.conf");
+      const baseConf = 'anchor "com.apple/*"\nload anchor "com.apple" from "/etc/pf.anchors/com.apple"\n';
+      await writeFile(baseConfPath, baseConf, "utf8");
+      try {
+        let hooked = false;
+        let composed = "";
+        const calls: string[][] = [];
+        const runner: PfCommandRunner = {
+          async run(command, args): Promise<PfCommandResult> {
+            calls.push([command, ...args]);
+            if (args[0] === "-a" && args[2] === "-f") return ok("");
+            if (args.length === 1 && args[0] === "-sr") {
+              return ok(hooked ? MAIN_RULESET_HOOKED : MAIN_RULESET_UNHOOKED);
+            }
+            if (args[0] === "-f") {
+              // The composed main ruleset: capture it at load time (the
+              // temp file is removed after arm returns).
+              composed = readFileSync(args[1]!, "utf8");
+              hooked = true;
+              return ok("");
+            }
+            if (args[0] === "-E") {
+              return { code: 0, stdout: "", stderr: "pf enabled\nToken : 4204204242\n" };
+            }
+            if (args[0] === "-s" && args[1] === "info") return ok(PF_INFO_ENABLED);
+            if (args[0] === "-a" && args[2] === "-sr") return ok(CANONICAL_ANCHOR_PRINT);
+            return { code: 1, stdout: "", stderr: `unscripted: ${command} ${args.join(" ")}` };
+          },
+        };
+        const result = await armPfAnchor(runner, POLICY, {
+          mainConfPath: baseConfPath,
+          settleDelayMs: 1,
+          sleep: () => Promise.resolve(),
+        });
+        expect(result.enableToken).toBe("4204204242");
+        // The composed main ruleset preserves the operator's base config...
+        expect(composed).toContain('anchor "com.apple/*"');
+        expect(composed).toContain('load anchor "com.apple" from "/etc/pf.anchors/com.apple"');
+        // ...and appends the drill-proven hook (call rule + load anchor).
+        expect(composed).toContain(`anchor "${PF_ANCHOR_NAME}" on lo0`);
+        expect(composed).toMatch(new RegExp(`load anchor "${PF_ANCHOR_NAME}" from ".+"`));
+      } finally {
+        await rm(fixtureDir, { recursive: true, force: true });
+      }
+    });
+
+    it("aborts (with rollback) when the hook is needed but the base pf config is unreadable (never hook blind)", async () => {
+      const runner = scriptedRunner([
+        loadCall,
+        mainRulesCall(ok(MAIN_RULESET_UNHOOKED)),
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+      ]);
+      await expect(
+        armPfAnchor(runner, POLICY, {
+          mainConfPath: "/nonexistent/sanctuary-test/pf.conf",
+          settleDelayMs: 1,
+          sleep: () => Promise.resolve(),
+        }),
+      ).rejects.toThrow(/cannot read base pf config/);
+      // pf was never enabled; the half-armed anchor was flushed.
+      expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
+      expect(runner.calls.some((c) => c[1] === "-a" && c[3] === "-F")).toBe(true);
     });
 
     it("disarms and throws when the settle-probe never confirms liveness", async () => {
@@ -196,6 +357,7 @@ describe("egress-gate/pf-anchor", () => {
         loadCall,
         enableCall,
         infoCall(ok(PF_INFO_ENABLED)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
         { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
         { match: (_c, a) => a[0] === "-X", result: ok("") },
         rulesCall(ok("")), // anchor never prints rules: warmup race persists

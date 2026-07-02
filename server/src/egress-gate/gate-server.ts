@@ -27,6 +27,21 @@
  * short TTL cache bounds pfctl load; a cached NEGATIVE result is never
  * served (every request after a failure re-probes).
  *
+ * SUBPROCESS AMPLIFICATION IS BOUNDED (the confined agent is the adversary
+ * on this socket and can open CONNECTs in a tight loop; each probe/lookup
+ * spawns a child as the gate's NON-agent uid, so unbounded concurrency
+ * would let the agent degrade the enforcement host past its own uid's
+ * process limits -- a confused-deputy resource amplification):
+ *   - the liveness probe is SINGLE-FLIGHT: concurrent requests share one
+ *     in-flight probe instead of each spawning pfctl (this also bounds the
+ *     not-live case, where the no-negative-caching rule would otherwise
+ *     make every request pay its own probe);
+ *   - advisory peer lookups are capped at PEER_LOOKUP_MAX_CONCURRENT;
+ *     at the cap the lookup is SKIPPED (peer_unresolved) rather than
+ *     queued, because queuing would just move the amplification into
+ *     memory. Skipping is safe precisely because peer identity is
+ *     advisory-only and never gates the decision.
+ *
  * PEER IDENTITY (Slice 2) is advisory-only: a resolved peer uid that is not
  * the agent uid emits a loud `peer_uid_mismatch` event; it never grants and
  * never (alone) denies. The TOCTOU window is documented in
@@ -59,6 +74,14 @@ import { resolveLoopbackPeer, type PeerCommandRunner } from "./peer-identity.js"
 
 /** The loopback address the gate binds. Never configurable wider. */
 export const GATE_BIND_HOST = "127.0.0.1";
+
+/**
+ * Hard cap on concurrent advisory peer lookups (each spawns one lsof as the
+ * gate's non-agent uid). At the cap a lookup is skipped, not queued: peer
+ * identity is advisory-only, so skipping loses a second-lens audit signal
+ * for that request while denying the agent a subprocess-amplification lever.
+ */
+export const PEER_LOOKUP_MAX_CONCURRENT = 4;
 
 /** A liveness probe the gate consults before proxying (fail-closed). */
 export interface GateLivenessProbe {
@@ -118,6 +141,37 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   const ttlMs = options.livenessTtlMs ?? 5_000;
   const now = options.now ?? Date.now;
   let lastLiveAt: number | null = null;
+  let inflightProbe: Promise<PfLivenessResult> | null = null;
+  let activePeerLookups = 0;
+
+  /**
+   * Single-flight, never-rejecting liveness probe: concurrent requests in
+   * the same uncached window share ONE probe (one pfctl spawn set) instead
+   * of each spawning their own. The shared variable is cleared when the
+   * probe settles so the no-negative-caching contract holds: the next
+   * request AFTER a failure starts a fresh probe.
+   */
+  function probeLiveness(): Promise<PfLivenessResult> {
+    if (inflightProbe === null) {
+      const probe = (async (): Promise<PfLivenessResult> => {
+        try {
+          return await options.livenessProbe.check();
+        } catch (err) {
+          return {
+            live: false,
+            reasons: [`liveness probe threw: ${err instanceof Error ? err.message : String(err)}`],
+          };
+        }
+      })();
+      inflightProbe = probe;
+      void probe.finally(() => {
+        if (inflightProbe === probe) {
+          inflightProbe = null;
+        }
+      });
+    }
+    return inflightProbe;
+  }
 
   const server = http.createServer((_request, response) => {
     // The gate speaks CONNECT only; plain requests get a terse 405 that
@@ -182,20 +236,10 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
 
     // 1. MANDATORY fail-closed liveness gate. A cached result is only ever
     // a cached POSITIVE; any failure clears the cache so the next request
-    // re-probes.
+    // re-probes. The probe itself is single-flight (see probeLiveness).
     const cacheFresh = lastLiveAt !== null && now() - lastLiveAt < ttlMs;
     if (!cacheFresh) {
-      let liveness: PfLivenessResult;
-      try {
-        liveness = await options.livenessProbe.check();
-      } catch (err) {
-        liveness = {
-          live: false,
-          reasons: [
-            `liveness probe threw: ${err instanceof Error ? err.message : String(err)}`,
-          ],
-        };
-      }
+      const liveness = await probeLiveness();
       if (!liveness.live) {
         lastLiveAt = null;
         options.onEvent?.({ kind: "liveness_refused", authority, reasons: liveness.reasons });
@@ -208,24 +252,36 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     }
 
     // 2. Advisory peer identity (never grants, never solely denies).
+    // Lookups are capped: at the cap this request's lookup is skipped
+    // (surfaced as peer_unresolved) instead of spawning another lsof.
     if (options.peerRunner) {
       const socket = clientSocket as net.Socket;
       const clientPort = socket.remotePort;
       if (typeof clientPort === "number") {
-        const peer = await resolveLoopbackPeer({
-          clientPort,
-          runner: options.peerRunner,
-        });
-        if (peer === null) {
+        if (activePeerLookups >= PEER_LOOKUP_MAX_CONCURRENT) {
           options.onEvent?.({ kind: "peer_unresolved", authority });
-        } else if (peer.uid !== options.policy.agent_uid) {
-          options.onEvent?.({
-            kind: "peer_uid_mismatch",
-            authority,
-            peerUid: peer.uid,
-            peerPid: peer.pid,
-            agentUid: options.policy.agent_uid,
-          });
+        } else {
+          activePeerLookups += 1;
+          let peer: Awaited<ReturnType<typeof resolveLoopbackPeer>>;
+          try {
+            peer = await resolveLoopbackPeer({
+              clientPort,
+              runner: options.peerRunner,
+            });
+          } finally {
+            activePeerLookups -= 1;
+          }
+          if (peer === null) {
+            options.onEvent?.({ kind: "peer_unresolved", authority });
+          } else if (peer.uid !== options.policy.agent_uid) {
+            options.onEvent?.({
+              kind: "peer_uid_mismatch",
+              authority,
+              peerUid: peer.uid,
+              peerPid: peer.pid,
+              agentUid: options.policy.agent_uid,
+            });
+          }
         }
       }
     }
