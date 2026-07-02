@@ -390,11 +390,15 @@ const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
  * Refuse `env` field shapes on the EXISTING sanctuary entry that
  * extractSanctuaryEntryEnv cannot faithfully read, before the entry is
  * replaced wholesale:
+ *   - a non-empty inline value on the entry line itself (the one-line
+ *     flow form `sanctuary: {command: ..., env: {...}}` is valid PyYAML
+ *     that Hermes loads, but its fields live in the remainder the
+ *     line-by-line field scan below never visits)
  *   - an inline (flow/scalar) `env:` value (the extractor's env-line
  *     match requires block form)
  *   - duplicate `env` field keys (PyYAML is last-wins; the extractor
  *     reads one line, so it cannot know which set Hermes actually used)
- * Proceeding on either shape would silently drop the operator's
+ * Proceeding on any of these shapes would silently drop the operator's
  * hand-authored vars (e.g. a dashboard auth token) from the rewritten
  * entry, the same silent-drop class the env inheritance exists to
  * prevent. Every field line is scanned (no early return) and quoted
@@ -404,6 +408,25 @@ const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
  * form `env: {}` carries nothing to drop and stays editable.
  */
 function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
+  // The entry line itself: anything after `sanctuary:` other than a
+  // comment or the empty flow mapping `{}` is a flow-form entry whose env
+  // (if any) the field scan below cannot see, so it must refuse rather
+  // than let the replace drop it without notice. `{}` carries nothing.
+  const entryLine = lines[entry.start]!.trim();
+  const nameMatch = /^(['"]?)([^:#'"]+)\1\s*:/.exec(entryLine);
+  const entryRemainder = nameMatch ? entryLine.slice(nameMatch[0].length).trim() : "";
+  if (
+    entryRemainder !== "" &&
+    !entryRemainder.startsWith("#") &&
+    !/^\{\s*\}\s*(#.*)?$/.test(entryRemainder)
+  ) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml sanctuary entry uses an inline (flow-form) value this " +
+        "tool cannot safely edit; convert it to block-mapping form (one " +
+        "field per indented line) and re-run wrap."
+    );
+  }
+
   let fieldIndent = -1;
   let sawEnvField = false;
   for (let i = entry.start + 1; i < entry.end; i++) {
@@ -536,6 +559,11 @@ export function extractSanctuaryEntryEnv(
     if (!key) continue;
     const value = parseYamlScalarValue(m[4] ?? "");
     if (value === null) {
+      // Duplicate keys are last-wins under PyYAML (the parser Hermes
+      // runs), so an unreadable LAST occurrence un-inherits any readable
+      // earlier value: inheriting it would silently REVERT the var to a
+      // stale value Hermes was no longer using. Skip-and-notice instead.
+      delete result[key];
       skipped.add(key);
       continue;
     }
@@ -545,7 +573,8 @@ export function extractSanctuaryEntryEnv(
   }
   if (skippedKeys) {
     // Name only vars that genuinely carry no inherited value (a duplicate
-    // key with one readable spelling still inherits, so it is not named).
+    // key whose LAST occurrence is readable still inherits, matching
+    // PyYAML last-wins, so it is not named).
     for (const key of skipped) {
       if (!(key in result)) skippedKeys.push(key);
     }

@@ -258,6 +258,37 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses a one-line flow-form sanctuary entry instead of silently dropping the env buried inside it", () => {
+    // Valid PyYAML that Hermes loads; the entry spans a single line, so
+    // the field-by-field env screen never sees the inline env. The entry
+    // line itself must refuse.
+    const existing = [
+      "mcp_servers:",
+      '  sanctuary: {command: "npx", env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok, SANCTUARY_FORTRESS_PATH: /x}}',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // Env-free flow form still refuses (conservative: this scanner cannot
+    // prove the flow value carries no env without parsing flow YAML).
+    const envFree = ["mcp_servers:", '  sanctuary: {command: "npx"}', ""].join("\n");
+    expect(() => planHermesYamlInjection(envFree, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // The empty flow mapping carries nothing to drop and stays editable,
+    // as does a trailing comment on the entry line.
+    const emptyFlow = ["mcp_servers:", "  sanctuary: {}", ""].join("\n");
+    expect(planHermesYamlInjection(emptyFlow, ENTRY).action).toBe("replace-entry");
+    const comment = [
+      "mcp_servers:",
+      "  sanctuary: # managed by wrap",
+      '    command: "npx"',
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(comment, ENTRY).action).toBe("replace-entry");
+  });
+
   it('refuses an inline sanctuary env behind a QUOTED field key (PyYAML reads `"env":` as the same key)', () => {
     const existing = [
       "mcp_servers:",
@@ -434,6 +465,25 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
       TOK: "readable",
     });
     expect(skippedKeys).toEqual([]);
+  });
+
+  it("un-inherits a duplicate key whose LAST occurrence is unreadable (PyYAML last-wins) and names it, instead of reverting to the stale first value", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      TOK: "stale-readable"',
+      "      TOK: |",
+      "        the-secret-hermes-actually-used",
+      '      GOOD: "kept"',
+      "",
+    ].join("\n");
+    const skippedKeys: string[] = [];
+    expect(extractSanctuaryEntryEnv(yaml, skippedKeys)).toEqual({
+      GOOD: "kept",
+    });
+    expect(skippedKeys).toEqual(["TOK"]);
   });
 
   it("un-inherits a var whose plain scalar continues on a deeper-indented line instead of truncating it", () => {
