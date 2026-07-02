@@ -214,6 +214,43 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses to replace a sanctuary entry carrying an inline env value the extractor cannot inherit", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok, SANCTUARY_FORTRESS_PATH: /x}",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("still replaces a sanctuary entry whose env is block-form or the empty flow `{}`, and ignores inline env on OTHER entries", () => {
+    const blockForm = [
+      "mcp_servers:",
+      "  weather:",
+      '    command: "uvx"',
+      "    env: {WEATHER_KEY: k}",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env: # inherited below",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(blockForm, ENTRY).action).toBe("replace-entry");
+
+    const emptyFlow = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env: {}",
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(emptyFlow, ENTRY).action).toBe("replace-entry");
+  });
+
   it("refuses duplicate top-level mcp_servers keys", () => {
     const existing = "mcp_servers:\n  a:\n    command: \"x\"\nmcp_servers:\n  b:\n    command: \"y\"\n";
     expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
@@ -277,6 +314,43 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
       GOOD: "val",
       ALSO_GOOD: "kept",
     });
+  });
+
+  it("skips block-scalar, anchored, aliased, tagged, and flow values instead of inheriting corrupted literals", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      BLOCK_TOK: |",
+      "        secret-line",
+      "      FOLDED_TOK: >",
+      "        folded-line",
+      "      ANCHORED: &a val",
+      "      ALIASED: *a",
+      "      TAGGED: !!str hello",
+      "      FLOW_SEQ: [a, b]",
+      "      FLOW_MAP: {k: v}",
+      '      GOOD: "kept"',
+      "",
+    ].join("\n");
+    // PyYAML (which Hermes actually uses) gives every skipped value a
+    // structural meaning; a single-line raw read would corrupt it.
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({ GOOD: "kept" });
+  });
+
+  it("un-inherits a var whose plain scalar continues on a deeper-indented line instead of truncating it", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      MULTI_TOK: first line",
+      "        continued here",
+      '      GOOD: "kept"',
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({ GOOD: "kept" });
   });
 
   it("resolves null for absent files, missing entries, missing env, and unsupported shapes", () => {

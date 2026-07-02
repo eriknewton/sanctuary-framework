@@ -24,6 +24,9 @@
  *     merging a mapping entry into it would emit mixed sequence+mapping
  *     YAML that PyYAML rejects, breaking Hermes startup
  *   - duplicate top-level `mcp_servers:` keys
+ *   - an existing sanctuary entry carrying an inline `env:` value (e.g.
+ *     `env: {TOK: v}`): the replace-entry write cannot inherit vars it
+ *     cannot read, so proceeding would silently drop them
  * The empty flow form `mcp_servers: {}` IS supported (rewritten to block
  * form, any trailing comment preserved), since fresh installs commonly
  * ship it.
@@ -349,6 +352,7 @@ export function planHermesYamlInjection(
   const entryLines = serializeSanctuaryEntry(entry, block.entryIndent);
 
   if (existing) {
+    refuseInlineSanctuaryEnv(lines, existing);
     const out = [
       ...lines.slice(0, existing.start),
       ...entryLines,
@@ -373,6 +377,39 @@ function ensureTrailingNewline(lines: string[]): string {
 }
 
 /**
+ * Refuse an inline (flow/scalar) `env:` value on the EXISTING sanctuary
+ * entry before it is replaced wholesale. extractSanctuaryEntryEnv cannot
+ * read that shape (its env-line match requires block form), so proceeding
+ * would silently drop the operator's hand-authored vars (e.g. a dashboard
+ * auth token) from the rewritten entry, the same silent-drop class the
+ * env inheritance exists to prevent. Refusing loudly here keeps the
+ * extractor's contract honest: a null from it never masks a write. The
+ * empty flow form `env: {}` carries nothing to drop and stays editable.
+ */
+function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
+  let fieldIndent = -1;
+  for (let i = entry.start + 1; i < entry.end; i++) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    const indent = indentOf(line);
+    if (fieldIndent === -1) fieldIndent = indent;
+    if (indent !== fieldIndent) continue;
+    const m = /^env\s*:\s*(.*)$/.exec(line.trim());
+    if (!m) continue;
+    const remainder = m[1]!.trim();
+    // Block form (empty remainder or trailing comment) is the readable
+    // shape; the empty flow mapping `{}` has nothing to inherit.
+    if (remainder === "" || remainder.startsWith("#")) return;
+    if (/^\{\s*\}\s*(#.*)?$/.test(remainder)) return;
+    throw new HermesYamlUnsupportedError(
+      "config.yaml sanctuary entry carries an inline env value this tool " +
+        "cannot safely inherit; convert it to block-mapping form (one " +
+        "`KEY: value` line per var under `env:`) and re-run wrap."
+    );
+  }
+}
+
+/**
  * Best-effort extraction of the `env:` block persisted on an EXISTING
  * sanctuary entry in config.yaml, so a re-wrap can inherit entry-persisted
  * vars (e.g. SANCTUARY_DASHBOARD_AUTH_TOKEN) on the authoritative Hermes
@@ -385,11 +422,14 @@ function ensureTrailingNewline(lines: string[]): string {
  * Parses the block-mapping form this module itself serializes
  * (double-quoted JSON scalars) plus the common hand-authored forms (plain
  * and single-quoted scalars, trailing comments). Anything it cannot read
- * confidently is skipped rather than guessed at; a flow-form `env: {...}`
- * or an unsupported `mcp_servers` shape resolves null (no inheritance).
- * That is safe because the injection that consumes this replaces the
- * entry wholesale anyway and REFUSES unsupported block shapes loudly
- * (HermesYamlUnsupportedError), so a null here never masks a write.
+ * confidently is skipped rather than guessed at: block scalars, anchors,
+ * aliases, tags, flow collections, and multi-line plain scalars all
+ * resolve to no inheritance for that var (never a corrupted literal), and
+ * a flow-form `env: {...}` or an unsupported `mcp_servers` shape resolves
+ * null. Null never masks a write: the consuming injection REFUSES both
+ * unsupported block shapes and an inline sanctuary `env:` value loudly
+ * (HermesYamlUnsupportedError, see refuseInlineSanctuaryEnv) before any
+ * replace-entry write proceeds.
  */
 export function extractSanctuaryEntryEnv(
   existingContent: string | null
@@ -431,13 +471,25 @@ export function extractSanctuaryEntryEnv(
   // phantom vars; "cannot read confidently" means skip, not guess.
   const result: Record<string, string> = {};
   let varIndent = -1;
+  let lastInheritedKey: string | null = null;
   for (let i = envLine + 1; i < entry.end; i++) {
     const line = lines[i]!;
     if (isBlankOrComment(line)) continue;
     const indent = indentOf(line);
     if (indent <= fieldIndent) break;
     if (varIndent === -1) varIndent = indent;
-    if (indent !== varIndent) continue;
+    if (indent !== varIndent) {
+      // A deeper-indented content line directly under an inherited var is
+      // a multi-line plain-scalar continuation: the single-line read above
+      // captured only a truncated first line, so un-inherit the var
+      // (skip, not guess) rather than write a wrong value back.
+      if (indent > varIndent && lastInheritedKey !== null) {
+        delete result[lastInheritedKey];
+      }
+      lastInheritedKey = null;
+      continue;
+    }
+    lastInheritedKey = null;
     const m = /^(?:"([^"]+)"|'([^']+)'|([^\s:#'"][^:]*?))\s*:\s*(.*)$/.exec(
       line.trim()
     );
@@ -447,6 +499,7 @@ export function extractSanctuaryEntryEnv(
     const value = parseYamlScalarValue(m[4] ?? "");
     if (value === null) continue;
     result[key] = value;
+    lastInheritedKey = key;
   }
   return Object.keys(result).length > 0 ? result : null;
 }
@@ -455,10 +508,16 @@ export function extractSanctuaryEntryEnv(
  * Parse a double-quoted, single-quoted, or plain YAML scalar value.
  * Returns null when the value cannot be read confidently (multi-line,
  * malformed quoting, empty); callers skip such vars rather than guess.
+ * Values opening with a YAML indicator the single-line plain read cannot
+ * represent (block scalars | >, anchors/aliases & *, tags !, flow
+ * collections [ {) also resolve null: PyYAML (the parser Hermes
+ * actually uses) gives them structural meaning, so inheriting the raw
+ * text would write a corrupted literal in place of the operator's value.
  */
 function parseYamlScalarValue(raw: string): string | null {
   const t = raw.trim();
   if (t === "") return null;
+  if ("|>&*![{".includes(t[0]!)) return null;
   if (t.startsWith('"')) {
     const m = /^("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(t);
     if (!m) return null;
