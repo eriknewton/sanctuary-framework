@@ -24,8 +24,10 @@
  * `checkPfAnchorLiveness`). If the pf anchor is absent, unloaded, or the
  * probe errors, the gate REFUSES to proxy (503) and emits a
  * `liveness_refused` event so posture surfaces report not-protected. A
- * short TTL cache bounds pfctl load; a cached NEGATIVE result is never
- * served (every request after a failure re-probes).
+ * positive result is NEVER cached across requests: a stale positive would
+ * allow the gate to proxy after the anchor was silently flushed. Concurrent
+ * requests still share one in-flight probe, so the confined agent cannot
+ * amplify one traffic burst into one pfctl subprocess tree per socket.
  *
  * SUBPROCESS AMPLIFICATION IS BOUNDED (the confined agent is the adversary
  * on this socket and can open CONNECTs in a tight loop; each probe/lookup
@@ -108,8 +110,6 @@ export interface ExclusiveEgressGateOptions {
    * no default that answers "live".
    */
   livenessProbe: GateLivenessProbe;
-  /** TTL for caching a POSITIVE liveness result (default 5000ms). */
-  livenessTtlMs?: number;
   /** Advisory peer-identity runner; omit to skip peer resolution. */
   peerRunner?: PeerCommandRunner;
   /** Event sink for audit/posture wiring. */
@@ -117,8 +117,6 @@ export interface ExclusiveEgressGateOptions {
   /** Pass-through to the destination evaluator (tests). */
   resolver?: EgressProxyResolver;
   isRoutable?: (address: string) => boolean;
-  /** Injected clock (tests). */
-  now?: () => number;
 }
 
 /** A running gate handle. */
@@ -138,15 +136,12 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   if (validateExclusiveEgressGatePolicy(options.policy) === null) {
     throw new Error("createExclusiveEgressGate: malformed exclusive-egress gate policy");
   }
-  const ttlMs = options.livenessTtlMs ?? 5_000;
-  const now = options.now ?? Date.now;
-  let lastLiveAt: number | null = null;
   let inflightProbe: Promise<PfLivenessResult> | null = null;
   let activePeerLookups = 0;
 
   /**
    * Single-flight, never-rejecting liveness probe: concurrent requests in
-   * the same uncached window share ONE probe (one pfctl spawn set) instead
+   * the same decision window share ONE probe (one pfctl spawn set) instead
    * of each spawning their own. The shared variable is cleared when the
    * probe settles so the no-negative-caching contract holds: the next
    * request AFTER a failure starts a fresh probe.
@@ -234,21 +229,16 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       upstream?.destroy();
     });
 
-    // 1. MANDATORY fail-closed liveness gate. A cached result is only ever
-    // a cached POSITIVE; any failure clears the cache so the next request
-    // re-probes. The probe itself is single-flight (see probeLiveness).
-    const cacheFresh = lastLiveAt !== null && now() - lastLiveAt < ttlMs;
-    if (!cacheFresh) {
-      const liveness = await probeLiveness();
-      if (!liveness.live) {
-        lastLiveAt = null;
-        options.onEvent?.({ kind: "liveness_refused", authority, reasons: liveness.reasons });
-        clientSocket.end(
-          "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
-        );
-        return;
-      }
-      lastLiveAt = now();
+    // 1. MANDATORY fail-closed liveness gate. Every request requires fresh
+    // positive evidence; concurrent requests share one in-flight probe (see
+    // probeLiveness), but no positive verdict survives into a later request.
+    const liveness = await probeLiveness();
+    if (!liveness.live) {
+      options.onEvent?.({ kind: "liveness_refused", authority, reasons: liveness.reasons });
+      clientSocket.end(
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+      );
+      return;
     }
 
     // 2. Advisory peer identity (never grants, never solely denies).

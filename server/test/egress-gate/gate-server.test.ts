@@ -292,23 +292,27 @@ describe("egress-gate/gate-server", () => {
     expect(probes).toBe(2);
   });
 
-  it("caches a POSITIVE liveness result inside the TTL", async () => {
+  it("never caches a POSITIVE liveness result across requests (no stale-live proxy window)", async () => {
     const upstream = await startUpstream();
     cleanups.push(upstream.close);
     let probes = 0;
+    let live = true;
     const { port } = await startGateOnEphemeralPort({
       rules: [allowRule("127.0.0.1", upstream.port)],
-      livenessTtlMs: 60_000,
       livenessProbe: {
         check: () => {
           probes += 1;
-          return Promise.resolve({ live: true, reasons: [] });
+          return Promise.resolve({ live, reasons: live ? [] : ["anchor flushed"] });
         },
       },
     });
-    await rawConnect(port, `127.0.0.1:${upstream.port}`);
-    await rawConnect(port, `127.0.0.1:${upstream.port}`);
-    expect(probes).toBe(1);
+    const first = await rawConnect(port, `127.0.0.1:${upstream.port}`);
+    expect(first.statusLine).toBe("HTTP/1.1 200 Connection Established");
+
+    live = false;
+    const second = await rawConnect(port, `127.0.0.1:${upstream.port}`);
+    expect(second.statusLine).toBe("HTTP/1.1 503 Service Unavailable");
+    expect(probes).toBe(2);
   });
 
   it("shares ONE in-flight liveness probe across concurrent CONNECTs (single-flight, no pfctl amplification)", async () => {
