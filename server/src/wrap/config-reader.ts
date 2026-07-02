@@ -1143,6 +1143,22 @@ const WRAP_META_LOCK_STALE_MS = 60_000;
 const WRAP_META_LOCK_WAIT_MS = 15_000;
 const WRAP_META_LOCK_RETRY_MS = 50;
 
+/**
+ * Test-only injection seam (same idiom as dashboard-standalone's
+ * `__testFaultAfterLoads`). `onStaleLockObserved` runs after a waiter has
+ * stat()ed the lock and judged it stale, BEFORE its rename-based break -
+ * the exact TOCTOU window the rename-then-verify mechanism closes. The
+ * cooperative single-process scheduling of the two-waiter Promise.all
+ * test almost never lands in this window naturally, so a regression back
+ * to a blind unlink would still pass end-state assertions; the seam lets
+ * the deterministic pin in wrap-surface-scoped-meta.test.ts substitute a
+ * FRESH lock inside the window and assert it survives. Always undefined
+ * in production.
+ */
+export const __wrapMetaLockTestHooks: {
+  onStaleLockObserved?: (lockPath: string) => void | Promise<void>;
+} = {};
+
 async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -1181,6 +1197,9 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
         // instead: only one contender can take a given lock file, and
         // identity is verified AFTER the take (same inode + mtime as the
         // stale lock observed above) before anything is destroyed.
+        if (__wrapMetaLockTestHooks.onStaleLockObserved) {
+          await __wrapMetaLockTestHooks.onStaleLockObserved(lockPath);
+        }
         const breakPath =
           `${lockPath}.break-${process.pid}-` + randomBytes(6).toString("hex");
         try {
@@ -1513,7 +1532,19 @@ async function removeWrapMetaLocked(
   restoredOriginalPath: string,
 ): Promise<WrapMetaRemovalFailure[]> {
   const failures: WrapMetaRemovalFailure[] = [];
-  for (const filename of await listWrapMetaFilenames()) {
+  // Deterministic surface-slot candidate (needs no directory read): the
+  // lenient listing (strict defaults false) degrades to the two fixed
+  // filenames on a non-ENOENT readdir failure, hiding the scoped slots. When
+  // the restored surface's ONLY pointer lives in its scoped slot (exactly
+  // the state a relocation leaves after the canonical slot is retired),
+  // that degradation used to return [] - clean success - while the stale
+  // pointer survived, so a LATER --unwrap could silently re-restore
+  // ancient content over post-unwrap operator edits. The scoped filename
+  // is derivable from restoredOriginalPath alone, so always include it.
+  const candidates = await listWrapMetaFilenames();
+  const scopedSlot = wrapMetaSurfaceFilename(restoredOriginalPath);
+  if (!candidates.includes(scopedSlot)) candidates.push(scopedSlot);
+  for (const filename of candidates) {
     const metaPath = join(backupDir(), filename);
     let raw: string;
     try {

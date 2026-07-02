@@ -61,6 +61,16 @@
  *      never lingers after release, and a stale lock from a crashed
  *      holder is broken instead of wedging every future wrap.
  *
+ * Eighth-round hardening pinned here (2026-07-02 fix round 4):
+ *  14. removeWrapMeta consults the restored surface's own scoped slot as a
+ *      DETERMINISTIC candidate (derived from the path, no readdir), so a
+ *      degraded directory listing cannot leave a stale scoped pointer
+ *      behind under a clean-success report.
+ *  15. The stale-lock break's rename-then-verify guard has a DETERMINISTIC
+ *      TOCTOU pin: a fresh lock substituted inside the stat-to-break
+ *      window (via the __wrapMetaLockTestHooks seam) must survive; a
+ *      regression to a blind unlink destroys it and fails the test.
+ *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
  */
@@ -76,6 +86,7 @@ import {
   access,
   readdir,
   utimes,
+  unlink,
 } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
@@ -98,6 +109,7 @@ import {
   removeWrapMeta,
   saveWrapMeta,
   WrapMetaUnreadableError,
+  __wrapMetaLockTestHooks,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
@@ -464,6 +476,60 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     },
   );
 
+  // ── Eighth round: removal consults the scoped slot without a readdir ───
+
+  it.skipIf(process.getuid?.() === 0)(
+    "removeWrapMeta retires the restored surface's scoped-slot pointer even when the directory cannot be LISTED",
+    async () => {
+      const surfaceA = join(tmpHome, "remove-listing-a.json");
+      const surfaceB = join(tmpHome, "remove-listing-b.json");
+      await writeFile(surfaceA, '{"a":"pristine"}');
+      await writeFile(surfaceB, '{"b":"pristine"}');
+
+      // Wrap A, wrap B (relocates A's pointer into its scoped slot), then
+      // unwrap B (retires the canonical pointer): A's ONLY pointer now
+      // lives in the scoped slot.
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceA),
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceB),
+        originalPath: surfaceB,
+        platform: "hermes",
+        wrappedAt: new Date().toISOString(),
+      });
+      expect(await removeWrapMeta(surfaceB)).toEqual([]);
+      const slotsBefore = (await readdir(backupDirPath())).filter((name) =>
+        /^wrap-meta-[0-9a-f]{12}\.json$/.test(name),
+      );
+      expect(slotsBefore).toHaveLength(1);
+
+      // Write+execute but NOT read on the dir: per-file lookups (reads,
+      // creations, unlinks) still succeed while readdir fails. The lenient
+      // listing degrades to the two fixed filenames, so pre-fix the scoped
+      // slot was invisible, removeWrapMeta returned [] (clean success),
+      // and the stale pointer survived - a LATER --unwrap would silently
+      // re-restore ancient content over post-unwrap operator edits. The
+      // scoped filename is derivable from the restored path alone, so the
+      // deterministic candidate retires it with no readdir at all.
+      await chmod(backupDirPath(), 0o300);
+      try {
+        expect(await removeWrapMeta(surfaceA)).toEqual([]);
+      } finally {
+        await chmod(backupDirPath(), 0o700);
+      }
+      const slotsAfter = (await readdir(backupDirPath())).filter((name) =>
+        /^wrap-meta-[0-9a-f]{12}\.json$/.test(name),
+      );
+      expect(slotsAfter).toEqual([]);
+      // No pointer of any kind survives: a later --unwrap finds nothing.
+      expect(await findLatestBackup()).toBeNull();
+    },
+  );
+
   // ── Fifth round: cross-process wrap-meta lock ──────────────────────────
 
   it("concurrent saveWrapMeta calls for different surfaces serialize; neither pointer is orphaned", async () => {
@@ -528,6 +594,13 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     // lock and enter the critical section alongside it, reproducing the
     // unserialized canonical-slot clobber. The rename-then-verify break
     // destroys only the exact stale lock it observed.
+    //
+    // Honesty note: this is an END-STATE sanity test; single-process
+    // cooperative scheduling rarely lands both waiters inside the
+    // stat-to-break window, so it does not by itself falsify a blind
+    // unlink. The deterministic pin for that regression is the
+    // injected-interleaving test below (fresh lock substituted via
+    // __wrapMetaLockTestHooks must survive the break attempt).
     const surfaceA = join(tmpHome, "stale-race-a.json");
     const surfaceB = join(tmpHome, "stale-race-b.json");
     await writeFile(surfaceA, '{"a":"pristine"}');
@@ -559,6 +632,68 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     // the lock nor any break-name residue survives.
     expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
     expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+    const residue = (await readdir(backupDirPath())).filter((entry) =>
+      entry.includes("wrap-meta.lock"),
+    );
+    expect(residue).toEqual([]);
+  });
+
+  it("stale-break TOCTOU pin: a FRESH lock substituted inside the stat-to-break window survives; a blind unlink would destroy it", async () => {
+    const configPath = join(tmpHome, "toctou-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+    await writeFile(lockPath, "999999\n");
+    const past = new Date(Date.now() - 10 * 60_000);
+    await utimes(lockPath, past, past);
+
+    // Inject EXACTLY the interleaving the rename-then-verify break closes:
+    // after this waiter stats the stale lock (and judges it stale) but
+    // before its break, "another waiter" breaks the stale lock and a NEW
+    // holder acquires (fresh file, fresh mtime, new inode). A blind unlink
+    // regression destroys the fresh lock and enters the critical section
+    // alongside the live holder; the verified break must take the fresh
+    // lock, fail the inode+mtime identity check, link() it back, and keep
+    // waiting.
+    let fired = false;
+    __wrapMetaLockTestHooks.onStaleLockObserved = async () => {
+      if (fired) return;
+      fired = true;
+      await unlink(lockPath);
+      await writeFile(lockPath, "fresh-holder\n");
+    };
+    try {
+      let saveSettled = false;
+      const savePromise = saveWrapMeta({
+        backupPath: backup,
+        originalPath: configPath,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      }).then(() => {
+        saveSettled = true;
+      });
+
+      // Give the waiter time to run its break attempt against the fresh
+      // lock (retry cadence is 50ms; 500ms covers many rounds).
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 500));
+      expect(fired).toBe(true);
+
+      // The FRESH lock survived the break attempt (blind unlink would
+      // have removed it and completed the save already), and the waiter
+      // is still honoring it.
+      expect(await readFile(lockPath, "utf-8")).toBe("fresh-holder\n");
+      expect(saveSettled).toBe(false);
+      expect(await hasExistingWrapMeta(configPath)).toBe(false);
+
+      // The live holder releases; the waiter acquires and completes.
+      await unlink(lockPath);
+      await savePromise;
+    } finally {
+      delete __wrapMetaLockTestHooks.onStaleLockObserved;
+    }
+
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
     const residue = (await readdir(backupDirPath())).filter((entry) =>
       entry.includes("wrap-meta.lock"),
     );
