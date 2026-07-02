@@ -108,8 +108,6 @@ export function hermesConfigYamlPath(): string {
 
 // ── Block scanning ──────────────────────────────────────────────────
 
-const MCP_SERVERS_KEY_RE = /^(['"]?)mcp_servers\1\s*:(.*)$/;
-
 /**
  * Line-break code points PyYAML's scanner (scan_line_break, YAML 1.1)
  * treats as line breaks beyond the plain "\n" this module splits on: CR
@@ -180,18 +178,44 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
         "file to plain LF line endings and re-run wrap."
     );
   }
+  // Top-level key match uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the
+  // SAME decode the field-header and entry-name scans below use, rather
+  // than a bare-literal regex. PyYAML resolves a double-quoted escape
+  // spelling like `"mcp_servers":` to the literal key `mcp_servers`
+  // just as it resolves the bare or plain-quoted spellings; a literal-only
+  // match would miss it, take the add-key path, and append a SECOND
+  // top-level `mcp_servers:` block that PyYAML last-wins resolves by
+  // silently dropping the operator's original block (same silent-drop
+  // class as the CR/NEL/LS/PS guard above).
   let keyLine = -1;
   let remainder = "";
   for (let i = 0; i < lines.length; i++) {
-    const m = MCP_SERVERS_KEY_RE.exec(lines[i]!);
+    if (indentOf(lines[i]!) !== 0) continue;
+    const m = RECOGNIZED_FIELD_RE.exec(lines[i]!);
     if (!m) continue;
+    if (m[2] !== undefined && canonicalFieldKey(m) === null) {
+      // A double-quoted top-level key whose escape sequence canonicalFieldKey
+      // cannot decode (e.g. a `\xXX`/`\UXXXXXXXX` YAML hex escape, which
+      // PyYAML decodes but JSON.parse does not). We cannot rule out that
+      // PyYAML would resolve it to `mcp_servers`, and silently treating it
+      // as "some other key" risks the exact add-key duplicate this decode
+      // exists to prevent, so refuse loudly instead of guessing.
+      throw new HermesYamlUnsupportedError(
+        `config.yaml has a top-level key (line ${i + 1}) with an escape ` +
+          "sequence this tool cannot decode, so it cannot confirm whether " +
+          "the key is `mcp_servers`; refusing to edit. Rewrite the key in " +
+          "bare or plain-quoted form and re-run wrap."
+      );
+    }
+    const key = canonicalFieldKey(m);
+    if (key !== "mcp_servers") continue;
     if (keyLine !== -1) {
       throw new HermesYamlUnsupportedError(
         "config.yaml has duplicate top-level mcp_servers keys; refusing to edit."
       );
     }
     keyLine = i;
-    remainder = m[2]!.trim();
+    remainder = (m[4] ?? "").trim();
   }
   if (keyLine === -1) return null;
 
@@ -242,7 +266,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   // Block-SEQUENCE form (`mcp_servers:\n  - name: weather`): upstream
   // Hermes documents mcp_servers as a block MAPPING, and merging a mapping
   // entry into a sequence would emit mixed sequence+mapping YAML that
-  // PyYAML rejects — breaking Hermes startup. The first content line in
+  // PyYAML rejects, breaking Hermes startup. The first content line in
   // the block decides the form; a dash means sequence, so refuse loudly
   // with the file untouched.
   for (let i = keyLine + 1; i < blockEnd; i++) {
@@ -273,9 +297,37 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       sawFirstEntry = true;
     }
     if (indent !== entryIndent) continue;
-    const m = /^(['"]?)([^:#'"]+)\1\s*:/.exec(line.trim());
+    // Entry-name match uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the
+    // SAME decode the top-level key and field-header scans use. A raw
+    // literal-only match would miss an escaped spelling like
+    // `"sanctuary":` (PyYAML decodes it to the literal name
+    // `sanctuary`), recording the entry under its raw, undecoded name
+    // instead of its true identity, so the later `name.toLowerCase() ===
+    // "sanctuary"` lookup below misses an existing sanctuary entry and
+    // the caller appends a SECOND one, which PyYAML last-wins resolves by
+    // silently dropping the operator's original entry (and its env vars).
+    const m = RECOGNIZED_FIELD_RE.exec(line.trim());
     if (!m) continue;
-    entries.push({ name: m[2]!.trim(), start: i, end: entryEnd(lines, i, entryIndent, blockEnd) });
+    if (m[2] !== undefined && canonicalFieldKey(m) === null) {
+      // A double-quoted entry name whose escape sequence canonicalFieldKey
+      // cannot decode (e.g. a YAML hex escape JSON.parse does not support).
+      // We cannot rule out that PyYAML would resolve it to `sanctuary`, and
+      // recording it under its raw undecoded spelling risks the exact
+      // append-entry duplicate this decode exists to prevent, so refuse
+      // loudly instead of guessing.
+      throw new HermesYamlUnsupportedError(
+        `config.yaml mcp_servers entry (line ${i + 1}) has a name with an ` +
+          "escape sequence this tool cannot decode, so it cannot confirm " +
+          "whether the entry is `sanctuary`; refusing to edit. Rewrite the " +
+          "entry name in bare or plain-quoted form and re-run wrap."
+      );
+    }
+    const decoded = canonicalFieldKey(m)!;
+    entries.push({
+      name: decoded,
+      start: i,
+      end: entryEnd(lines, i, entryIndent, blockEnd),
+    });
   }
 
   return { keyLine, blockEnd, flowEmpty, flowEmptyComment, entryIndent, entries };

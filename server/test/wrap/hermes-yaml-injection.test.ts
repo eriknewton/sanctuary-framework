@@ -680,6 +680,76 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(yamlContainsSanctuaryEntry("mcp_servers:\n  weather:\n    command: \"uvx\"\n")).toBe(false);
     expect(yamlContainsSanctuaryEntry("model: Hermes-4-405B\n")).toBe(false);
   });
+
+  // The append/add-key decision hinges on two structural anchors: the
+  // top-level `mcp_servers:` key match and the entry-name match against
+  // `sanctuary`. Both now decode escaped key spellings via the SAME
+  // RECOGNIZED_FIELD_RE + canonicalFieldKey path the env-field and env-var
+  // scans already used, so an escaped spelling at either anchor is
+  // recognized instead of silently missed — which previously caused a
+  // SECOND `mcp_servers:` block or a SECOND `sanctuary:` entry to be
+  // appended, silently dropped by PyYAML's last-wins duplicate-key
+  // resolution along with the operator's original entry and its env vars.
+  it("JSON-decodable escaped top-level mcp_servers key (\\u) is recognized: appends into the EXISTING block instead of a duplicate add-key block", () => {
+    const yaml = [
+      '"mcp_server\\u0073":',
+      "  other:",
+      '    command: "uvx"',
+      "",
+    ].join("\n");
+    const plan = planHermesYamlInjection(yaml, ENTRY);
+    expect(plan.action).toBe("append-entry");
+    expect(plan.content.match(/mcp_server/g)?.length).toBe(1);
+    expect(plan.content).toContain("other:");
+    expect(plan.content).toContain("sanctuary:");
+  });
+
+  it("JSON-decodable escaped sanctuary entry name (\\u) is recognized: replaces in place instead of appending a duplicate entry", () => {
+    const yaml = [
+      "mcp_servers:",
+      '  "sanctuar\\u0079":',
+      '    command: "old-command"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "should-survive"',
+      "",
+    ].join("\n");
+    const plan = planHermesYamlInjection(yaml, ENTRY);
+    expect(plan.action).toBe("replace-entry");
+    // Exactly one entry-name line under mcp_servers, and the replacement
+    // carries the NEW command, proving the old entry was replaced (not
+    // left stale alongside a second appended entry).
+    const nameLines = plan.content
+      .split("\n")
+      .filter((l) => /sanctuar/i.test(l) && /:\s*$/.test(l.trim()));
+    expect(nameLines.length).toBe(1);
+    expect(plan.content).toContain(ENTRY.command);
+  });
+
+  it("non-JSON-decodable escaped top-level key (\\x, a YAML hex escape JSON.parse cannot read) REFUSES rather than risking a silent duplicate mcp_servers block", () => {
+    const yaml = [
+      '"mcp_server\\x73":',
+      "  other:",
+      '    command: "uvx"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(yaml, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("non-JSON-decodable escaped sanctuary entry name (\\x) REFUSES rather than risking a silent duplicate entry that drops the operator's env vars", () => {
+    const yaml = [
+      "mcp_servers:",
+      '  "sanctuar\\x79":',
+      '    command: "old-command"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "must-not-be-dropped"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(yaml, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
 });
 
 describe("extractSanctuaryEntryEnv (pure)", () => {
