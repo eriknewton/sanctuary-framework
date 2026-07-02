@@ -82,10 +82,19 @@ prove this composed build.
   liveness check decides by positive evidence only (pf `Status: Enabled`
   AND the expected rules printed from the anchor AND the main ruleset
   printing the anchor call rule -- a loaded-but-unhooked anchor enforces
-  nothing and is NOT live); any pfctl error, timeout, or missing rule is
-  NOT live, and the gate server refuses to proxy (503) on a non-live
-  result. A silently-unloaded OR unhooked anchor therefore surfaces as
-  not-protected instead of green-when-dead.
+  nothing and is NOT live -- AND nothing voids the call rule: pf must not
+  be set to skip filtering on loopback (`pfctl -v -s Interfaces` must not
+  flag `lo0`/`lo` as skip; `set skip on lo0` is a common operator pf.conf
+  idiom that leaves the other probes green while pf never evaluates lo0)
+  and no earlier `pass ... quick` main-ruleset rule may match lo0 traffic
+  (quick terminates evaluation before the anchor call is reached)); any
+  pfctl error, timeout, or missing rule is NOT live, and the gate server
+  refuses to proxy (503) on a non-live result. A silently-unloaded,
+  unhooked, skipped, or preempted anchor therefore surfaces as
+  not-protected instead of green-when-dead. Arm additionally refuses to
+  hook through a base config containing a loopback `set skip` line
+  (fail-closed with an actionable error instead of a settle-probe
+  timeout).
 - DRILL-OWED: the composed console drill (agent-uid non-gate loopback
   attempt dropped by THIS anchor and captured; agent-to-gate succeeds;
   parity passes), N>=3, on Tahoe AND one non-Tahoe macOS. Durable
@@ -155,3 +164,15 @@ prove this composed build.
    If the gate is compromised, kernel enforcement still confines the agent
    uid off-box, but per-action policy is gone. Routing honesty vs
    destination honesty per the design HIGH-3.
+6. The liveness check's anchor-void detection is TEXTUAL AND CONSERVATIVE,
+   not a pf-semantics model. The skip probe reads the `(skip)` flag from
+   `pfctl -v -s Interfaces` (authoritative runtime state); the preemption
+   scan flags any earlier quick pass rule not positively bound off
+   loopback, WITHOUT modeling the rule's own uid/port/af narrowing, so an
+   exotic-but-harmless earlier quick pass on lo0 reads not-live (fail
+   closed, never fail open). Not detected: a custom operator interface
+   GROUP containing lo0 under a name other than `lo` that is skipped by
+   name only (pfctl's per-interface skip flag is expected to surface
+   group-driven skips on the member; the composed drill must include one
+   `set skip on lo0` negative leg to confirm the probe on the platform
+   that matters).

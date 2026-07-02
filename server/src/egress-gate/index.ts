@@ -27,6 +27,8 @@ export {
   renderPfAnchorRules,
   renderPfMainRulesetHook,
   checkPfAnchorLiveness,
+  findPreemptingQuickPassRules,
+  findLoopbackSkipLines,
   armPfAnchor,
   disarmPfAnchor,
   type PfCommandRunner,

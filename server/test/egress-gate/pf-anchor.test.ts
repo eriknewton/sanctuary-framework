@@ -19,6 +19,8 @@ import {
   renderPfAnchorRules,
   renderPfMainRulesetHook,
   checkPfAnchorLiveness,
+  findPreemptingQuickPassRules,
+  findLoopbackSkipLines,
   armPfAnchor,
   disarmPfAnchor,
   type PfCommandResult,
@@ -52,6 +54,13 @@ const MAIN_RULESET_HOOKED = [
 /** Stock main ruleset: com.apple anchors only, Sanctuary anchor NOT called. */
 const MAIN_RULESET_UNHOOKED = 'anchor "com.apple/*" all\n';
 
+/** `pfctl -v -s Interfaces` with NO skip flag on loopback (healthy). */
+const PF_IFACES_CLEAN = ["all", "en0", "lo0", "utun0", ""].join("\n");
+/** Loopback interface flagged skip (`set skip on lo0`): pf never filters lo0. */
+const PF_IFACES_LO0_SKIP = ["all", "en0", "lo0 (skip)", "utun0", ""].join("\n");
+/** The `lo` interface GROUP flagged skip (`set skip on lo`): same void. */
+const PF_IFACES_LO_GROUP_SKIP = ["all", "en0", "lo (skip)", "lo0", "utun0", ""].join("\n");
+
 interface ScriptedCall {
   match: (command: string, args: readonly string[]) => boolean;
   result: PfCommandResult;
@@ -84,6 +93,11 @@ const rulesCall = (result: PfCommandResult): ScriptedCall => ({
 /** Bare `pfctl -sr`: the MAIN ruleset (anchor-call-rule probe). */
 const mainRulesCall = (result: PfCommandResult): ScriptedCall => ({
   match: (_c, a) => a.length === 1 && a[0] === "-sr",
+  result,
+});
+/** `pfctl -v -s Interfaces`: the loopback skip-flag probe. */
+const ifacesCall = (result: PfCommandResult): ScriptedCall => ({
+  match: (_c, a) => a[0] === "-v" && a[1] === "-s" && a[2] === "Interfaces",
   result,
 });
 
@@ -126,11 +140,12 @@ describe("egress-gate/pf-anchor", () => {
   });
 
   describe("checkPfAnchorLiveness (fail-closed, positive evidence only)", () => {
-    it("is live when pf is enabled, the anchor prints all expected rules, AND the main ruleset calls the anchor", async () => {
+    it("is live when pf is enabled, the anchor prints all expected rules, the main ruleset calls the anchor, AND loopback is not skipped", async () => {
       const runner = scriptedRunner([
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result).toEqual({ live: true, reasons: [] });
@@ -141,6 +156,7 @@ describe("egress-gate/pf-anchor", () => {
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(renderPfAnchorRules(POLICY))),
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(true);
@@ -151,6 +167,7 @@ describe("egress-gate/pf-anchor", () => {
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
         mainRulesCall(ok(`anchor "${PF_ANCHOR_NAME}" on lo0\n`)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(true);
@@ -168,6 +185,115 @@ describe("egress-gate/pf-anchor", () => {
       const result = await checkPfAnchorLiveness(runner, POLICY);
       expect(result.live).toBe(false);
       expect(result.reasons.join(" ")).toMatch(/main ruleset is missing the anchor call rule/);
+    });
+
+    it("is NOT live when pf skips filtering on lo0 ('set skip on lo0': hooked but SKIPPED = enforcing nothing)", async () => {
+      // The hooked-but-skipped blind spot: all three earlier probes pass
+      // (pf Enabled, anchor rules print, call rule prints) while pf never
+      // evaluates a single lo0 packet.
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall(ok(PF_IFACES_LO0_SKIP)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toMatch(/hooked but SKIPPED/);
+    });
+
+    it("is NOT live when the 'lo' interface GROUP is skipped ('set skip on lo')", async () => {
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall(ok(PF_IFACES_LO_GROUP_SKIP)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toMatch(/hooked but SKIPPED/);
+    });
+
+    it("is NOT live when the interfaces probe itself fails (fail-closed)", async () => {
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall({ code: 1, stdout: "", stderr: "pfctl: /dev/pf: Permission denied" }),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toContain("pfctl -v -s Interfaces exited 1");
+    });
+
+    it("is NOT live when an earlier 'pass quick on lo0' rule preempts the anchor call (hooked but PREEMPTED)", async () => {
+      // pf quick semantics: a matching earlier quick pass terminates
+      // evaluation before the (last-position, non-quick) anchor call rule.
+      const preempted = [
+        'anchor "com.apple/*" all',
+        "pass in quick on lo0 all flags any keep state",
+        `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+        "",
+      ].join("\n");
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(preempted)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toMatch(/hooked but PREEMPTED/);
+    });
+
+    it("is NOT live when an earlier interface-less 'pass quick' rule preempts (matches every interface incl lo0)", async () => {
+      const preempted = [
+        "pass quick all flags S/SA keep state",
+        `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+        "",
+      ].join("\n");
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(preempted)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result.live).toBe(false);
+      expect(result.reasons.join(" ")).toMatch(/hooked but PREEMPTED/);
+    });
+
+    it("stays live when earlier quick pass rules are positively bound off-loopback or explicitly exclude it", async () => {
+      const benign = [
+        "pass in quick on en0 all flags S/SA keep state",
+        "pass out quick on ! lo0 inet all",
+        `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+        "",
+      ].join("\n");
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(benign)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result).toEqual({ live: true, reasons: [] });
+    });
+
+    it("stays live when a quick pass rule appears AFTER the anchor call (cannot preempt: the anchor's quick rules match first)", async () => {
+      const afterCall = [
+        `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+        "pass in quick on lo0 all",
+        "",
+      ].join("\n");
+      const runner = scriptedRunner([
+        infoCall(ok(PF_INFO_ENABLED)),
+        rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
+        mainRulesCall(ok(afterCall)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      const result = await checkPfAnchorLiveness(runner, POLICY);
+      expect(result).toEqual({ live: true, reasons: [] });
     });
 
     it("is NOT live when the main-ruleset probe itself fails (fail-closed)", async () => {
@@ -255,6 +381,43 @@ describe("egress-gate/pf-anchor", () => {
     });
   });
 
+  describe("findLoopbackSkipLines (arm-time base-config guard)", () => {
+    it("detects the bare, braced-list, and group spellings", () => {
+      expect(findLoopbackSkipLines("set skip on lo0\n")).toEqual(["set skip on lo0"]);
+      expect(findLoopbackSkipLines("set skip on { lo0 en0 }\n")).toHaveLength(1);
+      expect(findLoopbackSkipLines("set skip on { lo0, en0 }\n")).toHaveLength(1);
+      expect(findLoopbackSkipLines("  set skip on lo\n")).toHaveLength(1);
+    });
+
+    it("ignores non-loopback skips, comments, and lookalike interface names", () => {
+      expect(findLoopbackSkipLines("set skip on en0\n")).toEqual([]);
+      expect(findLoopbackSkipLines("# set skip on lo0\n")).toEqual([]);
+      expect(findLoopbackSkipLines("set skip on lo1\n")).toEqual([]);
+      expect(findLoopbackSkipLines('anchor "com.apple/*"\npass in all\n')).toEqual([]);
+    });
+  });
+
+  describe("findPreemptingQuickPassRules (main-ruleset preemption scan)", () => {
+    it("flags only quick PASS rules before the anchor call that can match lo0", () => {
+      const text = [
+        "block drop quick on lo0 all",
+        "pass in on lo0 all",
+        "pass in quick on en1 all",
+        "pass out quick inet proto tcp all",
+        `anchor "${PF_ANCHOR_NAME}" on lo0 all`,
+        "pass in quick on lo0 all",
+        "",
+      ].join("\n");
+      // block quick: not a pass; non-quick pass: last-match loses to the
+      // anchor's quick rules; en1-bound quick pass: cannot match lo0;
+      // post-call quick pass: never reached first. Only the interface-less
+      // quick pass preempts.
+      expect(findPreemptingQuickPassRules(text)).toEqual([
+        "pass out quick inet proto tcp all",
+      ]);
+    });
+  });
+
   describe("armPfAnchor (settle-probe before 'armed')", () => {
     const loadCall: ScriptedCall = {
       match: (_c, a) => a[0] === "-a" && a[2] === "-f",
@@ -272,6 +435,7 @@ describe("egress-gate/pf-anchor", () => {
         infoCall(ok(PF_INFO_ENABLED)),
         rulesCall(ok(CANONICAL_ANCHOR_PRINT)),
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       const result = await armPfAnchor(runner, POLICY, {
         settleDelayMs: 1,
@@ -314,6 +478,9 @@ describe("egress-gate/pf-anchor", () => {
             }
             if (args[0] === "-s" && args[1] === "info") return ok(PF_INFO_ENABLED);
             if (args[0] === "-a" && args[2] === "-sr") return ok(CANONICAL_ANCHOR_PRINT);
+            if (args[0] === "-v" && args[1] === "-s" && args[2] === "Interfaces") {
+              return ok(PF_IFACES_CLEAN);
+            }
             return { code: 1, stdout: "", stderr: `unscripted: ${command} ${args.join(" ")}` };
           },
         };
@@ -329,6 +496,36 @@ describe("egress-gate/pf-anchor", () => {
         // ...and appends the drill-proven hook (call rule + load anchor).
         expect(composed).toContain(`anchor "${PF_ANCHOR_NAME}" on lo0`);
         expect(composed).toMatch(new RegExp(`load anchor "${PF_ANCHOR_NAME}" from ".+"`));
+      } finally {
+        await rm(fixtureDir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses to hook through a base pf config that skips loopback ('set skip on lo0' would void the anchor)", async () => {
+      const fixtureDir = await mkdtemp(join(tmpdir(), "sanctuary-pf-test-"));
+      const baseConfPath = join(fixtureDir, "pf.conf");
+      await writeFile(
+        baseConfPath,
+        'set skip on lo0\nanchor "com.apple/*"\n',
+        "utf8",
+      );
+      try {
+        const runner = scriptedRunner([
+          loadCall,
+          mainRulesCall(ok(MAIN_RULESET_UNHOOKED)),
+          { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+        ]);
+        await expect(
+          armPfAnchor(runner, POLICY, {
+            mainConfPath: baseConfPath,
+            settleDelayMs: 1,
+            sleep: () => Promise.resolve(),
+          }),
+        ).rejects.toThrow(/skip filtering on\s+loopback/);
+        // pf was never enabled; the half-armed anchor was flushed (rollback).
+        expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
+        expect(runner.calls.some((c) => c[1] === "-f" && c[0] === "pfctl" && c.length === 3)).toBe(false);
+        expect(runner.calls.some((c) => c[1] === "-a" && c[3] === "-F")).toBe(true);
       } finally {
         await rm(fixtureDir, { recursive: true, force: true });
       }

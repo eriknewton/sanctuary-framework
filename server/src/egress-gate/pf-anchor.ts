@@ -32,7 +32,13 @@
  * POSITIVE EVIDENCE ONLY: pf reports Status: Enabled AND the anchor prints
  * the expected pass + block rules AND the MAIN ruleset prints the anchor
  * call rule (a loaded-but-unhooked anchor passes the first two probes while
- * enforcing nothing). Any pfctl error, timeout, missing rule, or
+ * enforcing nothing) AND nothing voids the call rule's evaluation: pf must
+ * NOT be set to skip filtering on loopback (`set skip on lo0`/`lo`, a very
+ * common operator pf.conf idiom, leaves all three earlier probes green
+ * while pf never evaluates a single lo0 packet -- hooked-but-SKIPPED), and
+ * no `pass ... quick` rule earlier in the main ruleset may match lo0
+ * traffic (quick terminates evaluation before the anchor call is reached
+ * -- hooked-but-PREEMPTED). Any pfctl error, timeout, missing rule, or
  * unparseable output is NOT live. The gate server refuses to proxy when
  * this check fails, and posture surfaces MUST report not-protected.
  *
@@ -109,6 +115,72 @@ function anchorCallRuleRe(anchorName: string): RegExp {
   return new RegExp(`^anchor "${escapeRegExp(anchorName)}" on lo0( all)?$`, "m");
 }
 
+/**
+ * A skipped loopback interface in `pfctl -v -s Interfaces` output: pf
+ * prints ` (skip)` after an interface (or interface-group) name whose
+ * PFI_IFLAG_SKIP flag is set by `set skip on ...`. Both the `lo0`
+ * interface and the `lo` group line are checked; skip on either means pf
+ * never evaluates lo0 packets, voiding the anchor entirely.
+ */
+const LOOPBACK_SKIP_LINE_RE = /^lo0?\s*\(skip\)/m;
+
+/**
+ * Scan the printed MAIN ruleset for `pass ... quick` rules that appear
+ * BEFORE the anchor call rule and could match lo0 traffic. pf evaluation
+ * is last-match-wins EXCEPT `quick`, which terminates evaluation at that
+ * rule: a matching earlier `pass quick` means the packet never reaches the
+ * anchor call, so the anchor enforces nothing for that flow even though it
+ * is loaded AND hooked (hooked-but-preempted). Deliberately conservative
+ * (positive evidence only): any earlier quick pass rule not positively
+ * bound to a non-loopback interface is treated as preempting; the rule's
+ * own uid/port/af narrowing is NOT modeled.
+ */
+export function findPreemptingQuickPassRules(
+  mainRulesetText: string,
+  anchorName: string = PF_ANCHOR_NAME,
+): string[] {
+  const callRe = anchorCallRuleRe(anchorName);
+  const preempting: string[] = [];
+  for (const rawLine of mainRulesetText.split("\n")) {
+    const line = rawLine.trim();
+    if (callRe.test(line)) break;
+    if (!/^pass\b/.test(line) || !/\bquick\b/.test(line)) continue;
+    const onClause = /\bon\s+(!\s*)?([\w.:-]+)/.exec(line);
+    if (onClause) {
+      const negated = onClause[1] !== undefined;
+      const iface = onClause[2] ?? "";
+      const isLoopback = iface === "lo0" || iface === "lo";
+      if (!negated && !isLoopback) continue; // positively bound off-loopback
+      if (negated && isLoopback) continue; // explicitly excludes loopback
+    }
+    preempting.push(line);
+  }
+  return preempting;
+}
+
+/**
+ * Detect `set skip on ...` lines in pf config TEXT that cover the loopback
+ * interface (`lo0`) or its interface group (`lo`). Used by the arm path to
+ * refuse hooking through a base config that would make pf skip all lo0
+ * filtering (silently voiding the anchor it just hooked). Macro-valued
+ * skip lists (`set skip on $ifs`) are not resolved here; the RUNTIME
+ * probe in {@link checkPfAnchorLiveness} (`pfctl -v -s Interfaces`) is the
+ * authoritative catch for those and for skip flags set outside this file.
+ */
+export function findLoopbackSkipLines(pfConfText: string): string[] {
+  const hits: string[] = [];
+  for (const rawLine of pfConfText.split("\n")) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+    const m = /^set\s+skip\s+on\s+(.+)$/.exec(line);
+    if (m === null) continue;
+    const tokens = (m[1] ?? "").split(/[{},\s]+/).filter((t) => t.length > 0);
+    if (tokens.some((t) => t === "lo0" || t === "lo")) {
+      hits.push(rawLine.trim());
+    }
+  }
+  return hits;
+}
+
 /** Result of one command the runner executed. */
 export interface PfCommandResult {
   code: number;
@@ -180,8 +252,9 @@ export interface PfLivenessResult {
 
 /**
  * Check, by positive evidence, that the per-uid anchor is loaded AND pf is
- * enabled AND the MAIN ruleset actually calls the anchor. Fail-closed: any
- * error, non-zero exit, or missing expected rule yields `live: false`.
+ * enabled AND the MAIN ruleset actually calls the anchor AND pf actually
+ * evaluates lo0 packets through that call. Fail-closed: any error,
+ * non-zero exit, or missing expected rule yields `live: false`.
  *
  * The third probe (`pfctl -sr`, the main ruleset) exists because the first
  * two are blind to the loaded-but-unhooked state: `pfctl -a <name> -sr`
@@ -189,6 +262,14 @@ export interface PfLivenessResult {
  * evaluation into it, and `pfctl -s info` reports Enabled regardless. An
  * anchor in that state enforces NOTHING; reporting it live would be the
  * green-when-dead fail-open this check is mandated to prevent.
+ *
+ * The fourth probe (`pfctl -v -s Interfaces`) plus the main-ruleset
+ * preemption scan exist because the first three are in turn blind to two
+ * hooked-but-VOID states: `set skip on lo0` (or the `lo` group) makes pf
+ * skip all filtering on loopback while every rule still prints, and an
+ * earlier `pass ... quick` rule matching lo0 terminates evaluation before
+ * the anchor call rule is reached (pf quick semantics). Either state is
+ * the same fail-open through a different door; both are NOT live.
  *
  * pfctl prints rules in its own canonical form; the pass rule matches the
  * drill-captured printed form exactly, the block rules accept both the
@@ -274,6 +355,38 @@ export async function checkPfAnchorLiveness(
       `main ruleset is missing the anchor call rule for ${anchorName} on lo0 ` +
         "(anchor is loaded but NOT hooked into packet evaluation)",
     );
+  } else {
+    const preempting = findPreemptingQuickPassRules(mainRules.stdout, anchorName);
+    if (preempting.length > 0) {
+      reasons.push(
+        `main ruleset has ${preempting.length} 'pass ... quick' rule(s) before the ` +
+          `${anchorName} anchor call that can match lo0 traffic and terminate evaluation ` +
+          `first (anchor is hooked but PREEMPTED); first: ${preempting[0]}`,
+      );
+    }
+  }
+
+  // Positive evidence that pf EVALUATES lo0 at all: `set skip on lo0` (or
+  // the `lo` group) leaves every probe above green while pf never runs a
+  // single lo0 packet through the ruleset (anchor is hooked but SKIPPED).
+  let ifaces: PfCommandResult;
+  try {
+    ifaces = await runner.run("pfctl", ["-v", "-s", "Interfaces"]);
+  } catch (err) {
+    reasons.push(
+      `pfctl -v -s Interfaces failed to run: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { live: false, reasons };
+  }
+  if (ifaces.code !== 0) {
+    reasons.push(`pfctl -v -s Interfaces exited ${ifaces.code}`);
+    return { live: false, reasons };
+  }
+  if (LOOPBACK_SKIP_LINE_RE.test(ifaces.stdout)) {
+    reasons.push(
+      "pf is set to skip filtering on loopback ('set skip' covers lo0 or the lo group); " +
+        "the anchor call rule prints but is never evaluated (anchor is hooked but SKIPPED)",
+    );
   }
 
   return { live: reasons.length === 0, reasons };
@@ -334,7 +447,12 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
  * ruleset. HONESTY BOUND: when the hook IS installed, any rules a third
  * party added to the RUNNING main ruleset without persisting them to the
  * base config are replaced by base-config + hook; an unreadable base config
- * aborts the arm (never hook blind).
+ * aborts the arm (never hook blind), and a base config that sets pf to
+ * skip filtering on loopback (`set skip on lo0`/`lo`) also aborts: loading
+ * it would hook an anchor pf never evaluates (silently unenforced). Void
+ * states that arise anyway (skip set outside the base config, an earlier
+ * preempting quick pass rule) are caught by the settle-probe, which runs
+ * the full liveness check including the skip and preemption probes.
  *
  * Requires root (production callers run inside the privileged install/arm
  * ceremony). Drill acceptance for the composed arm path is PENDING.
@@ -381,6 +499,15 @@ export async function armPfAnchor(
             `(${err instanceof Error ? err.message : String(err)}); ` +
             "refusing to hook the anchor without preserving the operator's base ruleset",
           { cause: err },
+        );
+      }
+      const skipLines = findLoopbackSkipLines(baseConf);
+      if (skipLines.length > 0) {
+        throw new Error(
+          `armPfAnchor: base pf config ${mainConfPath} sets pf to skip filtering on ` +
+            `loopback (${skipLines.join("; ")}); hooking the anchor through it would load ` +
+            "a ruleset pf never evaluates on lo0 (silently unenforced). Remove lo0/lo from " +
+            "'set skip' and re-arm; refusing to arm a void anchor",
         );
       }
       const mainFile = join(dir, "main.conf");
