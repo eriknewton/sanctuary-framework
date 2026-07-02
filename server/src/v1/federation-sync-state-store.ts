@@ -251,6 +251,30 @@ export class FederationSyncStateStore {
   }
 
   /**
+   * Existence probe for the at-rest sync-state record, WITHOUT decrypting it.
+   * Returns true when the record blob is physically present at (`namespace`,
+   * `recordKey`), false when it is absent (`read` yields null).
+   *
+   * This exists to let the caller DISTINGUISH the two cases {@link load}
+   * deliberately collapses into `emptyFederationSyncState()`:
+   *
+   *   - a genuinely fresh fortress that has NEVER persisted sync-state, versus
+   *   - a fortress whose record was DELETED out of band (an attacker with local
+   *     storage write erasing the blob to reset revocation memory).
+   *
+   * `load`'s `raw === null -> empty` contract is FROZEN and unchanged (a fresh
+   * fortress still loads empty). The provisioned-vs-not decision about whether an
+   * ABSENT record is anomalous is made by the caller, which alone knows whether
+   * the fortress is federation-provisioned; the store only reports presence.
+   * A read error (not a null) propagates so the caller fails closed rather than
+   * mis-reading a transient backend fault as "absent".
+   */
+  async recordExists(): Promise<boolean> {
+    const raw = await this.storage.read(this.namespace, this.recordKey);
+    return raw !== null;
+  }
+
+  /**
    * Load the persisted sync-state snapshot. Returns {@link
    * emptyFederationSyncState} ONLY when no record exists yet (`raw === null`, a
    * fresh fortress). THROWS {@link FederationSyncStateStoreError} when a record
