@@ -3,8 +3,11 @@
  * (Unified Protect Slice 1).
  *
  * GREENFIELD (design HIGH-2): this is NOT `server/src/proxy/` (the MCP-tool
- * proxy) and NOT `castle-wall/egress-proxy.ts` (the VM/vsock-coupled
- * CONNECT evaluator). It is the local policy gate the confined agent talks
+ * proxy), NOT `castle-wall/egress-proxy.ts` (the VM/vsock-coupled
+ * CONNECT evaluator), and NOT `policy-engine/egress-gate.ts` (the
+ * compiled-policy per-agent egress allowlist gate, `evaluateEgressGate`,
+ * which shares this module's name but runs inside the policy engine's gate
+ * hierarchy). It is the local policy gate the confined agent talks
  * to: the agent's off-box egress is denied at the kernel (proven per-uid
  * floor), its loopback reach is confined to this gate's port by the pf
  * anchor (Slice 3), and this gate applies per-action destination policy and
@@ -67,7 +70,8 @@ export type EgressGateEvent =
   | { kind: "liveness_refused"; authority: string; reasons: string[] }
   | { kind: "peer_uid_mismatch"; authority: string; peerUid: number; peerPid: number; agentUid: number }
   | { kind: "peer_unresolved"; authority: string }
-  | { kind: "decision"; authority: string; decision: EgressProxyDecision };
+  | { kind: "decision"; authority: string; decision: EgressProxyDecision }
+  | { kind: "gate_error"; authority: string; message: string };
 
 /** Options for {@link createExclusiveEgressGate}. */
 export interface ExclusiveEgressGateOptions {
@@ -124,7 +128,26 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   });
 
   server.on("connect", (request, clientSocket, head) => {
-    void handleGateConnect(request, clientSocket, head);
+    handleGateConnect(request, clientSocket, head).catch((err: unknown) => {
+      // Defense-in-depth backstop (deny-direction): no rejection out of the
+      // decision path may escape as an unhandledRejection, because Node's
+      // default handler would kill the whole gate process -- letting the
+      // agent kill its own enforcement gate. `decideEgressProxyConnect` is
+      // contract-bound never to reject; this catches any future edit that
+      // breaks that contract.
+      try {
+        options.onEvent?.({
+          kind: "gate_error",
+          authority: request.url ?? "",
+          message: err instanceof Error ? err.message : String(err),
+        });
+        if (!clientSocket.destroyed) {
+          clientSocket.end("HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n");
+        }
+      } catch {
+        // The backstop itself must never throw.
+      }
+    });
   });
 
   async function handleGateConnect(

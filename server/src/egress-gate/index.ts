@@ -9,9 +9,12 @@
  * the gate applies per-destination policy in userspace before egressing as
  * a non-agent uid.
  *
- * Distinct from `proxy/` (the MCP-tool proxy) and from
+ * Distinct from `proxy/` (the MCP-tool proxy), from
  * `castle-wall/egress-proxy.ts` (the VM/vsock CONNECT evaluator, whose
- * decision logic this module REUSES). The manifest-side rule derivation
+ * decision logic this module REUSES), and from
+ * `policy-engine/egress-gate.ts` (the EXACT-NAME confusable: the
+ * compiled-policy per-agent egress allowlist gate inside the policy
+ * engine). The manifest-side rule derivation
  * lives in `castle-wall/allowlist/gate-derivation.ts` (single source with
  * the pf anchor here; see `parity.ts`).
  */

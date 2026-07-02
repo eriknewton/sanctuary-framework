@@ -149,6 +149,34 @@ describe("egress-gate/gate-server", () => {
     expect(result.body).toContain("upstream-hello");
   });
 
+  it("survives a CONNECT to an allowlisted name whose DNS resolution fails (deny, not a gate-process crash)", async () => {
+    // Regression: with any hostname allow rule the confined agent can issue
+    // CONNECT to an allowlisted-but-unresolvable name (or hit a transient
+    // DNS outage); the resolver rejection must become a 403 DENY, never an
+    // unhandledRejection that kills the gate process.
+    const upstream = await startUpstream();
+    cleanups.push(upstream.close);
+    const { port, events } = await startGateOnEphemeralPort({
+      rules: [allowRule("no-such-host.example", 443)],
+      resolver: {
+        resolve: () => Promise.reject(new Error("getaddrinfo ENOTFOUND no-such-host.example")),
+      },
+    });
+    const denied = await rawConnect(port, "no-such-host.example:443");
+    expect(denied.statusLine).toBe("HTTP/1.1 403 Forbidden");
+    const decision = events.find((e) => e.kind === "decision");
+    expect(
+      decision &&
+        decision.kind === "decision" &&
+        decision.decision.disposition === "deny" &&
+        decision.decision.reason,
+    ).toBe("resolution_failed");
+    // The gate survived: a fresh CONNECT still gets answered (default deny
+    // for the unlisted loopback upstream, but the process is alive).
+    const followUp = await rawConnect(port, `127.0.0.1:${upstream.port}`);
+    expect(followUp.statusLine).toBe("HTTP/1.1 403 Forbidden");
+  });
+
   it("denies an allowlist miss with 403 (default deny)", async () => {
     const upstream = await startUpstream();
     cleanups.push(upstream.close);

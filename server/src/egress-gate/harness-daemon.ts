@@ -223,13 +223,27 @@ export async function installAgentHarnessDaemon(
   }
 }
 
-/** Tear down: boot out of the system domain, then remove the plist. */
+/**
+ * Tear down: boot out of the system domain, then remove the plist.
+ *
+ * `launchctl bootout` exits non-zero with ESRCH (3, "No such process") when
+ * the service is simply not loaded; that is fine for an idempotent
+ * teardown. Any OTHER bootout failure means the service may STILL BE
+ * RUNNING, and removing the plist anyway would leave a live confined
+ * harness with no unit file behind it while the ceremony reports success --
+ * a silently-failed teardown. Fail loudly instead, before touching the
+ * plist (same fail-closed teardown semantics as `disarmPfAnchor`).
+ */
 export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promise<void> {
-  const result = await ops.runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  // launchctl bootout exits non-zero when the service is not loaded; that is
-  // fine for an uninstall (idempotent teardown), but any OTHER stderr noise
-  // still surfaces via the removal below going ahead regardless.
-  void result;
+  const label = `system/${AGENT_HARNESS_DAEMON_LABEL}`;
+  const result = await ops.runLaunchctl(["bootout", label]);
+  const notLoaded =
+    result.code === 3 || /no such (process|service)|service not loaded/i.test(result.stderr);
+  if (result.code !== 0 && !notLoaded) {
+    throw new Error(
+      `launchctl bootout ${label} exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
   await ops.removeFile(AGENT_HARNESS_DAEMON_PLIST_PATH);
 }
 

@@ -42,6 +42,7 @@ export type EgressProxyDecision =
       reason:
         | "canonicalization_failed"
         | "allowlist_miss"
+        | "resolution_failed"
         | "non_public_resolved_address"
         | "plugin_decision"
         | "audit_failed";
@@ -170,6 +171,15 @@ export function allowlistAllowsTarget(rules: AllowlistRule[], target: CanonicalC
   return rules.some((rule) => rule.disposition === "allow" && ruleMatchesTarget(rule, target));
 }
 
+/**
+ * Decide one CONNECT request. CONTRACT: this function NEVER rejects; every
+ * failure mode resolves to a deny decision. Both CONNECT handlers (the
+ * castle-wall proxy below and `egress-gate/gate-server.ts`) invoke it from a
+ * void-discarded async path, so an escaping rejection would become an
+ * unhandledRejection that kills the whole enforcement process -- and a
+ * rejecting DNS lookup (ENOTFOUND on an allowlisted-but-unresolvable name,
+ * or a transient outage on a legit one) is agent-triggerable at will.
+ */
 export async function decideEgressProxyConnect(
   authority: string,
   options: EgressProxyOptions
@@ -185,9 +195,23 @@ export async function decideEgressProxyConnect(
     return applyEgressPlugins(authority, { disposition: "deny", reason: "allowlist_miss" }, target, options);
   }
 
-  const addresses = target.isIpLiteral
-    ? [target.host]
-    : await (options.resolver ?? defaultResolver).resolve(target.host);
+  let addresses: string[];
+  if (target.isIpLiteral) {
+    addresses = [target.host];
+  } else {
+    try {
+      addresses = await (options.resolver ?? defaultResolver).resolve(target.host);
+    } catch {
+      // Fail-closed chokepoint (see the never-rejects contract above): a
+      // resolver rejection is a DENY, never an escaping rejection.
+      return applyEgressPlugins(
+        authority,
+        { disposition: "deny", reason: "resolution_failed" },
+        target,
+        options
+      );
+    }
+  }
   const routableCheck = options.isRoutable ?? isPublicRoutableIp;
   const publicAddress = addresses.find(routableCheck);
   if (!publicAddress) {

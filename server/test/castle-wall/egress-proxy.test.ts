@@ -68,6 +68,20 @@ describe("castle-wall/egress-proxy", () => {
     expect(decision).toEqual({ disposition: "deny", reason: "non_public_resolved_address" });
   });
 
+  it("resolves a rejecting resolver to a DENY, never an escaping rejection (fail-closed chokepoint)", async () => {
+    // Regression: a DNS failure on an allowlisted name (ENOTFOUND, timeout,
+    // SERVFAIL) is agent-triggerable; both CONNECT handlers invoke this
+    // evaluator from a void async path, so a rejection here would become an
+    // unhandledRejection that kills the enforcement process.
+    const decision = await decideEgressProxyConnect("api.example.com:443", {
+      rules: [allowHost("api.example.com")],
+      resolver: {
+        resolve: () => Promise.reject(new Error("getaddrinfo ENOTFOUND api.example.com")),
+      },
+    });
+    expect(decision).toEqual({ disposition: "deny", reason: "resolution_failed" });
+  });
+
   it("allows an allowlisted host only after a public post-resolve address", async () => {
     const decision = await decideEgressProxyConnect("api.example.com:443", {
       rules: [allowHost("api.example.com")],

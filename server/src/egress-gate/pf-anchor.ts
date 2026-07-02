@@ -27,10 +27,11 @@
  * so the logic is unit-testable without root or a real pf.
  */
 
-import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { createExecFileRunner } from "./exec-runner.js";
 
 import {
   validateExclusiveEgressGatePolicy,
@@ -64,29 +65,10 @@ export const PF_COMMAND_TIMEOUT_MS = 10_000;
  * Production runner: execFile with a hard timeout, never a shell (no
  * interpolation surface). Timeout or spawn failure resolves as a non-zero
  * synthetic result so every caller stays on the fail-closed path instead of
- * having to catch.
+ * having to catch. Shared implementation: `exec-runner.ts`.
  */
 export function createExecFilePfRunner(timeoutMs: number = PF_COMMAND_TIMEOUT_MS): PfCommandRunner {
-  return {
-    run(command: string, args: readonly string[]): Promise<PfCommandResult> {
-      return new Promise((resolve) => {
-        execFile(
-          command,
-          [...args],
-          { timeout: timeoutMs, encoding: "utf8" },
-          (error, stdout, stderr) => {
-            if (error && typeof (error as NodeJS.ErrnoException).code !== "number") {
-              // Spawn failure / timeout / signal: synthesize a non-zero exit.
-              resolve({ code: 127, stdout: stdout ?? "", stderr: `${stderr ?? ""}${error.message}` });
-              return;
-            }
-            const code = error ? ((error as NodeJS.ErrnoException).code as unknown as number) : 0;
-            resolve({ code: typeof code === "number" ? code : 127, stdout, stderr });
-          },
-        );
-      });
-    },
-  };
+  return createExecFileRunner(timeoutMs);
 }
 
 /**

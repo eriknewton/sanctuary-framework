@@ -38,7 +38,7 @@
  * N>=3) is PENDING.
  */
 
-import { execFile } from "node:child_process";
+import { createExecFileRunner } from "./exec-runner.js";
 
 /** A resolved loopback peer. */
 export interface LoopbackPeerIdentity {
@@ -54,24 +54,15 @@ export interface PeerCommandRunner {
 /** Default hard timeout for one lsof invocation. */
 export const PEER_LOOKUP_TIMEOUT_MS = 2_000;
 
-/** Production runner: execFile with a hard timeout, argv only (no shell). */
+/**
+ * Production runner: execFile with a hard timeout, argv only (no shell).
+ * Shared implementation: `exec-runner.ts` (peer callers read code/stdout
+ * only; the extra stderr field is ignored).
+ */
 export function createExecFilePeerRunner(
   timeoutMs: number = PEER_LOOKUP_TIMEOUT_MS,
 ): PeerCommandRunner {
-  return {
-    run(command: string, args: readonly string[]): Promise<{ code: number; stdout: string }> {
-      return new Promise((resolve) => {
-        execFile(command, [...args], { timeout: timeoutMs, encoding: "utf8" }, (error, stdout) => {
-          if (error && typeof (error as NodeJS.ErrnoException).code !== "number") {
-            resolve({ code: 127, stdout: stdout ?? "" });
-            return;
-          }
-          const code = error ? ((error as NodeJS.ErrnoException).code as unknown as number) : 0;
-          resolve({ code: typeof code === "number" ? code : 127, stdout });
-        });
-      });
-    },
-  };
+  return createExecFileRunner(timeoutMs);
 }
 
 /**
