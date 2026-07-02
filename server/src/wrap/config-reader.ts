@@ -861,12 +861,21 @@ export async function validateWrapMetaAuxiliary(
 }
 
 /**
- * Find the most recent backup.
+ * Find a restorable backup: the first wrap-meta pointer that reads and
+ * parses, scanning the canonical meta filename, then the legacy name (so
+ * installs wrapped by earlier releases can still unwrap), then any
+ * surface-scoped wrap-meta-<tag>.json slots in deterministic name-sorted
+ * order (see listWrapMetaFilenames).
  *
- * Read-both, write-new: prefers the canonical meta filename, then falls
- * back to the legacy name so installs wrapped by earlier releases can
- * still unwrap. The `auxiliary` list is absent from metas written by
- * earlier releases; callers must treat it as optional.
+ * "First that reads", NOT "most recent": the canonical slot does hold the
+ * most recently written wrap (saveWrapMeta relocates a different surface's
+ * canonical meta into its scoped slot before writing), but once an unwrap
+ * retires it, the remaining scoped slots are ordered by surface-tag
+ * filename, not by wrappedAt. With 3+ surfaces wrapped, sequential
+ * --unwrap runs restore EVERY wrapped surface (pinned by test) and each
+ * run names exactly which surface it restored, but the order among the
+ * scoped slots is not chronological. The `auxiliary` list is absent from
+ * metas written by earlier releases; callers must treat it as optional.
  *
  * D4 P1-2: `auxiliary` entries are validated here on read (and again by
  * the unwrap path before use). A meta whose auxiliary list fails
@@ -1240,8 +1249,13 @@ export async function saveWrapMeta(
  * the F6 pristine-pointer preservation in saveWrapMeta relies on: without
  * it, a wrap AFTER an unwrap would preserve a stale pointer and a later
  * unwrap would restore a config the operator has since edited. The backup
- * files themselves are never deleted. Returns the paths that could not be
- * removed (absent files are not failures) so the caller can warn loudly.
+ * files themselves are never deleted. Returns the pointers that could not
+ * be retired (absent files are not failures), tagged by failure class so
+ * the caller can warn with class-appropriate advice: an "unreadable"
+ * pointer could not be READ and may name a DIFFERENT wrapped surface (a
+ * successful read would have skipped it), so it must NOT be deleted; an
+ * "unremovable" pointer was read, names the restored surface, and only
+ * the unlink failed, so removing it manually is safe.
  *
  * Harden round (mixed legacy state): a meta file that parses and names a
  * DIFFERENT originalPath than `restoredOriginalPath` is left in place: it
@@ -1261,10 +1275,24 @@ export async function saveWrapMeta(
  * restorable backup on an error path; it now leaves the pointer in place
  * and reports the path as a failure the caller warns about.
  */
+export interface WrapMetaRemovalFailure {
+  /** Full path of the wrap-meta pointer file that could not be retired. */
+  path: string;
+  /**
+   * "unreadable": the pointer could not be READ (EACCES, EIO, a custody
+   * path-identity refusal). Had it been readable it might have named a
+   * DIFFERENT wrapped surface and been skipped, so the caller's advice
+   * must be "fix the read failure", never "delete it".
+   * "unremovable": the pointer was read, names the restored surface, and
+   * only the unlink failed; removing it manually is safe.
+   */
+  reason: "unreadable" | "unremovable";
+}
+
 export async function removeWrapMeta(
   restoredOriginalPath: string,
-): Promise<string[]> {
-  const failures: string[] = [];
+): Promise<WrapMetaRemovalFailure[]> {
+  const failures: WrapMetaRemovalFailure[] = [];
   for (const filename of await listWrapMetaFilenames()) {
     const metaPath = join(backupDir(), filename);
     let raw: string;
@@ -1280,9 +1308,9 @@ export async function removeWrapMeta(
           : undefined;
       if (code === "ENOENT") continue; // Genuinely absent: nothing to remove.
       // Transient/permission read failure: the file may still be the only
-      // pointer at a restorable backup. Never unlink on an error path;
-      // report it so the caller warns loudly.
-      failures.push(metaPath);
+      // pointer at a restorable backup (possibly another surface's). Never
+      // unlink on an error path; report it so the caller warns loudly.
+      failures.push({ path: metaPath, reason: "unreadable" });
       continue;
     }
     let pointsAtOtherSurface = false;
@@ -1310,7 +1338,9 @@ export async function removeWrapMeta(
         err && typeof err === "object" && "code" in err
           ? (err as NodeJS.ErrnoException).code
           : undefined;
-      if (code !== "ENOENT") failures.push(metaPath);
+      if (code !== "ENOENT") {
+        failures.push({ path: metaPath, reason: "unremovable" });
+      }
     }
   }
   return failures;

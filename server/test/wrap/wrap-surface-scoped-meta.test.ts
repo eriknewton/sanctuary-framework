@@ -209,7 +209,13 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       await chmod(metaPath, 0o000);
       try {
         const failures = await removeWrapMeta(configPath);
-        expect(failures).toContain(metaPath);
+        // Read failures are tagged "unreadable" so the unwrap caller can
+        // print do-NOT-delete advice (the file might be another surface's
+        // only restore pointer) instead of "remove it manually".
+        expect(failures).toContainEqual({
+          path: metaPath,
+          reason: "unreadable",
+        });
       } finally {
         await chmod(metaPath, 0o600);
       }
@@ -847,9 +853,14 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       makeDeps({ checkPinResolvability: async () => "unreachable" }),
     );
 
-    expect(stderrOutput()).toContain(
-      "could not reach the npm registry to confirm the pinned version",
+    // The note must not claim the registry "could not be reached": the
+    // outcome also covers a REACHED custom registry whose unauthenticated
+    // 404 the probe declines to trust.
+    const noteOut = stderrOutput();
+    expect(noteOut).toContain(
+      "could not confirm with the npm registry that the pinned version",
     );
+    expect(noteOut).not.toContain("could not reach the npm registry");
     const wrapped = JSON.parse(await readFile(settingsPath, "utf-8"));
     expect(wrapped.mcpServers.sanctuary).toBeDefined();
   });
@@ -897,7 +908,9 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         }),
       ]) {
         expect(banner).toContain("could not verify");
-        expect(banner).toContain("registry was unreachable");
+        expect(banner).toContain("could not confirm the pinned MCP entry");
+        // Cause wording stays honest for the custom-registry-404 subcase.
+        expect(banner).not.toContain("registry was unreachable");
       }
     });
 
@@ -932,7 +945,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
 
     const out = stderrOutput();
     expect(out).not.toContain("does not have that version");
-    expect(out).not.toContain("could not reach the npm registry");
+    expect(out).not.toContain("could not confirm with the npm registry");
   });
 
   // ── Finding 7: recovery breadcrumb for wrap-created files on unwrap ──

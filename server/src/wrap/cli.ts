@@ -1485,12 +1485,18 @@ export async function runWrap(
           `\n  the entry at your local build instead.`
       );
     } else if (pinResolvability === "unreachable") {
+      // "unreachable" also covers a REACHED custom registry whose
+      // unauthenticated 404 the probe declines to treat as authoritative
+      // (see checkPinnedVersionResolvable), so the stated cause must not
+      // claim the registry could not be reached.
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        `\n  Note: could not reach the npm registry to confirm the pinned version` +
-          `\n  ${SANCTUARY_VERSION} resolves (offline or blocked), so this wrap cannot` +
-          `\n  verify the MCP entry it writes will start. If the agent fails to start,` +
-          `\n  re-run 'sanctuary protect' once the registry is reachable.`
+        `\n  Note: could not confirm with the npm registry that the pinned version` +
+          `\n  ${SANCTUARY_VERSION} resolves: the registry was unreachable (offline or` +
+          `\n  blocked), or a custom registry gave an answer this unauthenticated probe` +
+          `\n  cannot treat as authoritative. This wrap cannot verify the MCP entry it` +
+          `\n  writes will start; if the agent fails to start, re-run 'sanctuary protect'` +
+          `\n  once the registry confirms the version.`
       );
     }
   }
@@ -2633,15 +2639,21 @@ function renderPinResolvabilityBannerLines(info: {
     ];
   }
   if (info.pinnedVersionResolvability === "unreachable") {
+    // "unreachable" also covers a REACHED custom registry whose 404 the
+    // unauthenticated probe declines to trust, so the cause line says
+    // "could not confirm", never "could not be reached".
     return [
       "",
       `  ${d(
-        "Note: the npm registry was unreachable, so this wrap could not verify the",
+        `Note: the npm registry could not confirm the pinned MCP entry (v${info.version})`,
       )}`,
       `  ${d(
-        `pinned MCP entry (v${info.version}) resolves. If the agent fails to start, re-run`,
+        "resolves (unreachable, or a custom registry this probe cannot verify against),",
       )}`,
-      `  ${d("'sanctuary protect' once the registry is reachable.")}`,
+      `  ${d(
+        "so this wrap could not verify it. If the agent fails to start, re-run",
+      )}`,
+      `  ${d("'sanctuary protect' once the registry confirms the version.")}`,
     ];
   }
   return [];
@@ -3124,12 +3136,28 @@ async function unwrap(dryRun: boolean): Promise<void> {
     );
   } else {
     const metaRemovalFailures = await removeWrapMeta(meta.originalPath);
-    for (const failedPath of metaRemovalFailures) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
-          `re-wrap may preserve a stale restore pointer. Remove it manually.`
-      );
+    for (const failure of metaRemovalFailures) {
+      // The advice must match the failure class: an UNREADABLE pointer may
+      // be a DIFFERENT wrapped surface's only restore pointer (a successful
+      // read would have skipped it), so telling the operator to delete it
+      // could orphan that surface's pristine backup.
+      if (failure.reason === "unreadable") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not read wrap metadata ${failure.path}; it was ` +
+            `left in place because it may be another wrapped surface's only ` +
+            `restore pointer. Do NOT delete it; fix the read failure (for ` +
+            `example file permissions) and re-run 'sanctuary wrap --unwrap' ` +
+            `if a surface remains wrapped.`
+        );
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not remove wrap metadata ${failure.path}; a ` +
+            `future re-wrap may preserve a stale restore pointer. Remove it ` +
+            `manually.`
+        );
+      }
     }
   }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
