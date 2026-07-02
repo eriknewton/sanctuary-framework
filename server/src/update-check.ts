@@ -127,6 +127,15 @@ const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
  *   retired-vocabulary CI gate. Installs old enough to carry only the legacy
  *   pointer predate the version-pinned MCP entry (v1.6.1), so for them the
  *   unwrapped npx advice is exactly today's status-quo behavior.
+ * - False POSITIVE on stale pointers: presence-only means an install that was
+ *   wrapped and then unwrapped on a release BEFORE `removeWrapMeta` existed
+ *   (which left the meta file in place after unwrap; see the stale-meta guard
+ *   note in `wrap/config-reader.ts`) gets the wrapped advice despite being
+ *   genuinely unwrapped today. Impact is advisory-copy-only (misleading
+ *   upgrade wording; following it re-runs protect, i.e. wraps at the new
+ *   version); no state or enforcement decision keys off this bit. All
+ *   current-version unwrap paths delete the pointer via `removeWrapMeta`,
+ *   so the mainline is clean.
  * - Never throws: any filesystem error resolves false (unwrapped advice).
  *
  * @param storagePath - instance storage root (tests inject a temp dir;
