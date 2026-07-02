@@ -79,7 +79,7 @@ Any framework that supports MCP stdio transport can spawn Sanctuary:
 import subprocess
 
 sanctuary_process = subprocess.Popen(
-    ["npx", "@sanctuary-framework/mcp-server"],
+    ["npx", "-y", "@sanctuary-framework/mcp-server"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
