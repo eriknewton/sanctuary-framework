@@ -421,6 +421,22 @@ describe("planHermesYamlInjection (pure)", () => {
     // block and PyYAML last-wins would drop the operator's original entry.
     for (const existing of [
       [
+        "! mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      [
+        '! "mcp_servers":',
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      [
         "!!str mcp_servers:",
         "  sanctuary:",
         '    command: "npx"',
@@ -445,6 +461,52 @@ describe("planHermesYamlInjection (pure)", () => {
         "      env:",
         '        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
         "<<: *defaults",
+        "",
+      ].join("\n"),
+    ]) {
+      expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+        HermesYamlUnsupportedError
+      );
+    }
+  });
+
+  it("refuses hidden sanctuary entries synthesized by YAML constructs inside mcp_servers", () => {
+    // PyYAML loads each of these as `mcp_servers.sanctuary`, but a plain
+    // name scanner cannot see the entry. Taking append-entry would add a
+    // second `sanctuary:` key and PyYAML last-wins would drop the original
+    // entry and its persisted env.
+    for (const existing of [
+      [
+        "mcp_servers:",
+        "  ! sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      [
+        "mcp_servers:",
+        "  ? sanctuary",
+        "  : {command: npx, env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok}}",
+        "",
+      ].join("\n"),
+      [
+        "key: &s sanctuary",
+        "mcp_servers:",
+        "  *s:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      [
+        "defaults: &defaults",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "mcp_servers:",
+        "  <<: *defaults",
         "",
       ].join("\n"),
     ]) {

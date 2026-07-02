@@ -161,7 +161,7 @@ function stripYamlKeyDecorators(
   let stripped = trimmed;
   let hadDecorator = false;
   for (;;) {
-    const m = /^(?:![^\s]+|&[^\s]+)\s+(.+)$/.exec(stripped);
+    const m = /^(?:!(?:[^\s]+)?|&[^\s]+)\s+(.+)$/.exec(stripped);
     if (!m) return { stripped, hadDecorator };
     hadDecorator = true;
     stripped = m[1]!.trimStart();
@@ -360,7 +360,13 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
     // the caller appends a SECOND one, which PyYAML last-wins resolves by
     // silently dropping the operator's original entry (and its env vars).
     const m = RECOGNIZED_FIELD_RE.exec(line.trim());
-    if (!m) continue;
+    if (!m) {
+      throw new HermesYamlUnsupportedError(
+        `config.yaml mcp_servers has an entry line (line ${i + 1}) this ` +
+          "scan cannot recognize as `name:`; refusing to edit. Rewrite " +
+          "mcp_servers as a plain block mapping and re-run wrap."
+      );
+    }
     if (m[2] !== undefined && canonicalFieldKey(m) === null) {
       // A double-quoted entry name whose escape sequence canonicalFieldKey
       // cannot decode (e.g. a YAML hex escape JSON.parse does not support).
