@@ -428,7 +428,7 @@ export function extractSanctuaryEntryEnv(
   // the var indent; only lines at exactly that indent are env vars. Deeper
   // lines are nested values of a preceding key (whose own scalar parse
   // already resolved null), so they are skipped rather than flattened into
-  // phantom vars — "cannot read confidently" means skip, not guess.
+  // phantom vars; "cannot read confidently" means skip, not guess.
   const result: Record<string, string> = {};
   let varIndent = -1;
   for (let i = envLine + 1; i < entry.end; i++) {
