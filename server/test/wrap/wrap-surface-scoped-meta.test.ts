@@ -71,6 +71,13 @@
  *      window (via the __wrapMetaLockTestHooks seam) must survive; a
  *      regression to a blind unlink destroys it and fails the test.
  *
+ * Ninth-round hardening pinned here (2026-07-02 fix round 10):
+ *  16. Displaced holders fail CLOSED: a holder whose lock was
+ *      staleness-broken out from under it mid-critical-section (the
+ *      third-contender residual of the rename-then-verify break) refuses
+ *      to write/retire wrap metadata instead of mutating alongside the
+ *      successor, and its release still never evicts the successor's lock.
+ *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
  */
@@ -714,17 +721,17 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(residue).toEqual([]);
   });
 
-  it("verified release: a holder whose lock was staleness-broken mid-section does not evict its successor's lock", async () => {
-    // Eighth round: the release in withWrapMetaLock's finally must not be
-    // an unconditional unlink. If a holder stalls past the 60s stale
-    // threshold inside the critical section (sleep/suspend, a long hang),
-    // a waiter legitimately breaks its lock and a SUCCESSOR acquires; the
-    // stalled holder then finishes fn() and a blind release would unlink
-    // the successor's LIVE lock, letting a third contender run the meta
-    // critical section alongside it. Inject exactly that state via the
-    // onLockAcquired seam: the holder's own lock is replaced by a
-    // successor's before fn() runs, and the successor's lock must survive
-    // the holder's release.
+  it("displaced holder fails CLOSED: a save whose lock was staleness-broken mid-section refuses to write and does not evict its successor's lock", async () => {
+    // Eighth round pinned the verified RELEASE (no successor eviction);
+    // ninth round pins the fail-closed MUTATION guard. If a holder stalls
+    // past the 60s stale threshold inside the critical section
+    // (sleep/suspend, a long hang), a waiter legitimately breaks its lock
+    // and a SUCCESSOR acquires; the stalled holder then finishes fn() and
+    // would clobber the pointer the successor just wrote. The
+    // assertLockHeld gate before every destructive write must refuse
+    // instead, and the release must still leave the successor's lock
+    // alone. Inject exactly that state via the onLockAcquired seam: the
+    // holder's own lock is replaced by a successor's before fn() runs.
     const configPath = join(tmpHome, "release-verify-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
@@ -743,23 +750,63 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       await utimes(lock, past, past);
     };
     try {
-      await saveWrapMeta({
-        backupPath: backup,
-        originalPath: configPath,
-        platform: "claude-code",
-        wrappedAt: new Date().toISOString(),
-      });
+      await expect(
+        saveWrapMeta({
+          backupPath: backup,
+          originalPath: configPath,
+          platform: "claude-code",
+          wrappedAt: new Date().toISOString(),
+        }),
+      ).rejects.toThrow(/wrap-meta lock/);
     } finally {
       delete __wrapMetaLockTestHooks.onLockAcquired;
     }
 
-    // The write itself completed (the holder was already inside its
-    // critical section) but the successor's lock survived the release.
+    // The displaced holder wrote NOTHING (fail closed, no concurrent
+    // mutator), and the successor's lock survived its release.
     expect(fired).toBe(true);
-    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+    expect(await hasExistingWrapMeta(configPath)).toBe(false);
     expect(await readFile(lockPath, "utf-8")).toBe("successor-holder\n");
     // Clean up the injected successor lock so later tests contend fresh.
     await unlink(lockPath);
+  });
+
+  it("displaced holder fails CLOSED on the unwrap side: removeWrapMeta refuses to retire pointers after its lock vanished mid-section", async () => {
+    // Same ninth-round guard, remove path + the lock-destroyed (ENOENT)
+    // branch: the finding's worst endpoint leaves the displaced holder's
+    // lock with NO name at all (a breaker renamed it away and unlinked the
+    // break name after a failed link()-restore). The holder must detect
+    // the vanished lock before its first unlink and refuse, leaving every
+    // pointer in place for the operator's re-run.
+    const configPath = join(tmpHome, "remove-displaced-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+    await saveWrapMeta({
+      backupPath: backup,
+      originalPath: configPath,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+
+    let fired = false;
+    __wrapMetaLockTestHooks.onLockAcquired = async (lock) => {
+      if (fired) return;
+      fired = true;
+      await unlink(lock);
+    };
+    try {
+      await expect(removeWrapMeta(configPath)).rejects.toThrow(
+        /wrap-meta lock/,
+      );
+    } finally {
+      delete __wrapMetaLockTestHooks.onLockAcquired;
+    }
+
+    expect(fired).toBe(true);
+    // Nothing was retired after the lock was lost; the pointer survives
+    // and a later (serialized) unwrap can still find it.
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
   });
 
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──

@@ -1162,9 +1162,22 @@ async function fileExists(path: string): Promise<boolean> {
  * The stale break is rename-then-verify, not a blind unlink (sixth round):
  * the breaker atomically renames the lock to a waiter-unique name, checks
  * the taken file IS the stale lock it observed (inode + mtime), and only
- * then destroys it. Two waiters racing over the same stale lock therefore
- * cannot end up both inside the critical section via one of them unlinking
- * the other's freshly acquired lock.
+ * then destroys it. That closes the DIRECT two-waiter race (one waiter
+ * unlinking the other's freshly acquired lock) but not every interleaving:
+ * a breaker that stalls between its staleness stat and its rename can take
+ * a FRESH successor lock by mistake, and between that rename and the
+ * link()-restore the slot is briefly empty, so a third contender can
+ * acquire while the displaced holder is still inside its critical section.
+ * Path-named lockfiles offer no compare-and-swap over directory entries
+ * that could close that window outright, so the MUTATION is guarded
+ * instead (ninth round): fn receives an assertLockHeld callback and the
+ * meta critical sections call it immediately before every destructive
+ * write/unlink, failing CLOSED (refuse + advise re-run) when the slot no
+ * longer holds the lock this holder created. A displaced holder therefore
+ * aborts before it can clobber a pointer; the residual assert-to-write gap
+ * is a few syscalls wide (versus the whole critical section), and its
+ * worst case remains recoverable from the timestamped backup files, which
+ * are never deleted.
  */
 const WRAP_META_LOCK_FILENAME = "wrap-meta.lock";
 const WRAP_META_LOCK_STALE_MS = 60_000;
@@ -1183,17 +1196,21 @@ const WRAP_META_LOCK_RETRY_MS = 50;
  * FRESH lock inside the window and assert it survives.
  *
  * `onLockAcquired` runs after a holder acquires the lock, BEFORE the
- * critical section - the seam the verified-release pin uses to simulate a
+ * critical section - the seam the displaced-holder pins use to simulate a
  * holder that stalled past the stale threshold and was legitimately
- * broken by a waiter (its lock replaced by a successor's) while it was
- * still inside fn(). Both hooks are always undefined in production.
+ * broken by a waiter (its lock replaced by a successor's, or destroyed
+ * outright) while it was still inside fn(); the pins assert the displaced
+ * holder fails CLOSED before mutating and that its release never evicts
+ * the successor's lock. Both hooks are always undefined in production.
  */
 export const __wrapMetaLockTestHooks: {
   onStaleLockObserved?: (lockPath: string) => void | Promise<void>;
   onLockAcquired?: (lockPath: string) => void | Promise<void>;
 } = {};
 
-async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withWrapMetaLock<T>(
+  fn: (assertLockHeld: () => Promise<void>) => Promise<T>,
+): Promise<T> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const lockPath = join(dir, WRAP_META_LOCK_FILENAME);
@@ -1317,8 +1334,37 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
   if (__wrapMetaLockTestHooks.onLockAcquired) {
     await __wrapMetaLockTestHooks.onLockAcquired(lockPath);
   }
+  // Ninth round (fail-closed displaced holder): the rename-then-verify
+  // break above still has a third-contender window (see the lock
+  // docstring), so holding-the-lock is re-proven at every destructive
+  // step, not assumed for the whole section. The callback throws when the
+  // slot no longer holds the lock THIS holder created (vanished, or
+  // replaced by a successor's), so a holder displaced during a
+  // mid-section stall refuses the mutation instead of clobbering a
+  // pointer the successor may have just written. When the acquisition
+  // identity could not be captured, this degrades to a no-op, matching
+  // the release path's degradation below.
+  const assertLockHeld = async (): Promise<void> => {
+    if (acquired === undefined) return;
+    const displacedMessage =
+      `another sanctuary wrap/unwrap broke this process's wrap-meta lock ` +
+      `(${lockPath}) as stale during a stall and may have taken over; ` +
+      `refusing to modify the wrap metadata. Re-run the command.`;
+    let current: Stats;
+    try {
+      current = await lstat(lockPath);
+    } catch (err) {
+      throw new Error(displacedMessage, { cause: err });
+    }
+    if (
+      current.ino !== acquired.ino ||
+      current.mtimeMs !== acquired.mtimeMs
+    ) {
+      throw new Error(displacedMessage);
+    }
+  };
   try {
-    return await fn();
+    return await fn(assertLockHeld);
   } finally {
     // Eighth round (verified release): never evict a SUCCESSOR's lock. If
     // this holder stalls past the stale threshold mid-critical-section
@@ -1397,10 +1443,17 @@ export async function saveWrapMeta(
   },
   options: { configStillWrapped?: boolean } = {},
 ): Promise<void> {
-  await withWrapMetaLock(() => saveWrapMetaLocked(meta, options));
+  await withWrapMetaLock((assertLockHeld) =>
+    saveWrapMetaLocked(meta, options, assertLockHeld),
+  );
 }
 
-/** saveWrapMeta's body; runs with the wrap-meta lock already held. */
+/**
+ * saveWrapMeta's body; runs with the wrap-meta lock already held.
+ * `assertLockHeld` fails CLOSED (ninth round) when the lock was
+ * staleness-broken out from under this holder mid-section; it gates every
+ * destructive write below so a displaced holder never clobbers a pointer.
+ */
 async function saveWrapMetaLocked(
   meta: {
     backupPath: string;
@@ -1409,7 +1462,8 @@ async function saveWrapMetaLocked(
     wrappedAt: string;
     auxiliary?: WrapMetaAuxiliaryFile[];
   },
-  options: { configStillWrapped?: boolean } = {},
+  options: { configStillWrapped?: boolean },
+  assertLockHeld: () => Promise<void>,
 ): Promise<void> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -1462,6 +1516,7 @@ async function saveWrapMetaLocked(
       // Unparseable canonical content: nothing restorable to relocate.
     }
     if (otherSurfacePath !== null) {
+      await assertLockHeld();
       await writeFileCustody(
         join(dir, wrapMetaSurfaceFilename(otherSurfacePath)),
         canonicalRaw,
@@ -1523,6 +1578,7 @@ async function saveWrapMetaLocked(
       );
     }
   }
+  await assertLockHeld();
   await writeFileCustody(metaPath, JSON.stringify(toWrite, null, 2), {
     mode: 0o600,
     createParent: false,
@@ -1537,10 +1593,17 @@ async function saveWrapMetaLocked(
   // stale by the stale-meta guard's own rule. Best effort: a survivor is
   // harmless, since every reader prefers the canonical slot and
   // removeWrapMeta retires all pointers naming this surface on unwrap.
+  // The assertLockHeld here sits INSIDE the best-effort catch: the
+  // canonical write above already durably succeeded, so a lock lost
+  // during this trailing cleanup must skip the unlink (a successor may
+  // have relocated a fresh pointer into that very slot), never misreport
+  // the completed save as failed.
   try {
+    await assertLockHeld();
     await unlink(join(dir, wrapMetaSurfaceFilename(meta.originalPath)));
   } catch {
-    // Absent (the common case) or unremovable; nothing to do either way.
+    // Absent (the common case), unremovable, or the lock was lost;
+    // nothing to do either way.
   }
 }
 
@@ -1597,12 +1660,21 @@ export async function removeWrapMeta(
   // Fifth round: serialized against saveWrapMeta (and other unwraps) via
   // the cross-process wrap-meta lock, so the read-classify-unlink sequence
   // cannot interleave with a concurrent wrap's read-relocate-write.
-  return withWrapMetaLock(() => removeWrapMetaLocked(restoredOriginalPath));
+  return withWrapMetaLock((assertLockHeld) =>
+    removeWrapMetaLocked(restoredOriginalPath, assertLockHeld),
+  );
 }
 
-/** removeWrapMeta's body; runs with the wrap-meta lock already held. */
+/**
+ * removeWrapMeta's body; runs with the wrap-meta lock already held.
+ * `assertLockHeld` fails CLOSED (ninth round) when the lock was
+ * staleness-broken out from under this holder mid-section; it gates every
+ * unlink below so a displaced holder never retires a pointer a successor
+ * may have just written.
+ */
 async function removeWrapMetaLocked(
   restoredOriginalPath: string,
+  assertLockHeld: () => Promise<void>,
 ): Promise<WrapMetaRemovalFailure[]> {
   const failures: WrapMetaRemovalFailure[] = [];
   // Deterministic surface-slot candidate (needs no directory read): the
@@ -1655,6 +1727,11 @@ async function removeWrapMetaLocked(
       // nothing restorable; fall through to the unlink.
     }
     if (pointsAtOtherSurface) continue;
+    // Ninth round: deliberately OUTSIDE the try below, so a lock lost
+    // mid-section propagates fail-closed (the unwrap reports the error and
+    // advises a re-run) instead of being softened into an "unremovable"
+    // warning while the loop keeps retiring pointers unserialized.
+    await assertLockHeld();
     try {
       await unlink(metaPath);
     } catch (err) {
