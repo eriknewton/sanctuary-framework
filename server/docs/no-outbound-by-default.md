@@ -8,16 +8,20 @@
 ## The rule
 
 Sanctuary initiates no network connection except to operator-configured
-endpoints. Specifically, the server runtime, dashboard, MCP servers,
-broker, and hub MUST NOT:
+endpoints, **with the documented default-on exceptions below** (all
+disabled by `SANCTUARY_NO_UPDATE_CHECK=1`). Specifically, the server
+runtime, dashboard, MCP servers, broker, and hub MUST NOT:
 
-- Phone home for telemetry, version checks, or analytics.
+- Phone home for telemetry, version checks, or analytics, **except the
+  documented default-on version-check exceptions below**.
 - Run a Sanctuary-hosted SMTP relay or any other Sanctuary-hosted
   outbound channel.
 - Open any connection to a destination the operator did not explicitly
-  configure (substrate endpoint, webhook URL, federation peer, etc.).
+  configure (substrate endpoint, webhook URL, federation peer, etc.),
+  **except the documented default-on exceptions below**.
 
-The only outbound destinations a fresh Sanctuary install reaches are:
+The only outbound destinations a fresh Sanctuary install reaches,
+**other than the documented default-on exceptions below**, are:
 
 1. **localhost** (broker stdio, dashboard, local-Ollama if the operator
    selected it as substrate).
