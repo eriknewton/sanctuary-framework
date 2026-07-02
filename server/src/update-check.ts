@@ -114,11 +114,19 @@ const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
  * surface keeps per-surface pointers in these scoped slots, so after the
  * canonical pointer is consumed by an unwrap of ONE surface, a still-wrapped
  * install may hold ONLY scoped slots. The probe must consult them or such an
- * install gets the non-upgrading bare-npx advice. Pattern duplicated (like the
- * canonical filename above) as a presence probe only; it must stay in sync with
- * `WRAP_META_SURFACE_PATTERN` in `wrap/config-reader.ts` (the surface-scoped
- * meta change; until that lands, no writer produces this shape and the extra
- * probe is a harmless no-op, so this is safe regardless of merge order).
+ * install gets the non-upgrading bare-npx advice.
+ *
+ * NO WRITER PRODUCES THIS SHAPE YET: `wrap/config-reader.ts` does not
+ * currently define a surface-scoped meta pattern or writer, so this pattern
+ * is forward scaffolding for that unbuilt change, and the extra probe is a
+ * harmless no-op today (this is safe regardless of merge order). When the
+ * scoped-slot writer lands, it MUST either import this same pattern (so the
+ * two can never drift) or add a cross-module equality test pinning the two
+ * literals together; a bare duplicated-literal comment reference is not
+ * enough once a real writer exists on the other side, because a shape
+ * mismatch (hex case, tag length, filename prefix) would leave this probe
+ * silently never matching, reintroducing the bare-npx false-negative for
+ * multi-surface installs it exists to close.
  */
 const WRAP_META_SURFACE_SLOT_PATTERN = /^wrap-meta-[0-9a-f]{12}\.json$/;
 
