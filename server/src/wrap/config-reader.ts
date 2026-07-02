@@ -895,10 +895,11 @@ export async function validateWrapMetaAuxiliary(
  * most recently written wrap (saveWrapMeta relocates a different surface's
  * canonical meta into its scoped slot before writing), but once an unwrap
  * retires it, the remaining scoped slots are ordered by surface-tag
- * filename, not by wrappedAt. With 3+ surfaces wrapped, sequential
- * --unwrap runs restore EVERY wrapped surface (pinned by test) and each
- * run names exactly which surface it restored, but the order among the
- * scoped slots is not chronological. The `auxiliary` list is absent from
+ * filename, not by wrappedAt. Sequential --unwrap runs restore every
+ * wrapped surface and each run names exactly which surface it restored
+ * (the two-surface case is pinned by test; with 3+ surfaces the same
+ * scan applies but the order among the scoped slots is not
+ * chronological). The `auxiliary` list is absent from
  * metas written by earlier releases; callers must treat it as optional.
  *
  * D4 P1-2: `auxiliary` entries are validated here on read (and again by
@@ -1055,12 +1056,15 @@ async function readExistingWrapMetaRawForSurface(
 }
 
 /**
- * True when a wrap-meta pointer (canonical or legacy filename) exists FOR
- * THIS SURFACE: it parses to an object whose `originalPath` resolve()s to
- * the same path as `originalPath` (the scoping discipline removeWrapMeta
- * already uses). Read leniently, like the F6 preservation check; BOTH
- * pointer filenames are consulted, so a legacy meta for this surface still
- * counts even when a canonical meta for a different surface exists.
+ * True when a wrap-meta pointer (canonical, legacy, or surface-scoped
+ * wrap-meta-<tag>.json filename) exists FOR THIS SURFACE: it parses to an
+ * object whose `originalPath` resolve()s to the same path as
+ * `originalPath` (the scoping discipline removeWrapMeta already uses).
+ * Read leniently, like the F6 preservation check; ALL pointer filenames
+ * are consulted, so a legacy meta for this surface still counts even when
+ * a canonical meta for a different surface exists, and a meta relocated
+ * into this surface's scoped slot by a later wrap of another surface
+ * still suppresses the crash-window warning on re-wrap.
  *
  * MED-2 (crash-window honesty): the wrap flow uses this to detect the
  * "config already carries the sanctuary entry but NO meta exists" state an
@@ -1212,12 +1216,17 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
  * always wins. Defaults to true so direct callers keep the F6-safe
  * preservation semantics unless they know better.
  *
- * Throws {@link WrapMetaUnreadableError} when preservation is live but an
- * existing pointer file could not be read (non-ENOENT): overwriting a
- * pointer that could not be inspected would silently orphan the pristine
- * backup on a transient error path. The wrap CLI's deferred meta write
- * already treats any throw here as "roll back the wrapped surfaces and
- * exit non-zero", which is exactly the fail-closed behavior wanted.
+ * Throws {@link WrapMetaUnreadableError} when an existing pointer file
+ * could not be read (non-ENOENT). Two read sites can throw: the
+ * relocation check always reads the canonical slot (REGARDLESS of
+ * `configStillWrapped` - "it names no other surface" cannot be proven
+ * about a file that cannot be read), and when preservation is live the
+ * per-surface F6 lookup reads the remaining pointer files. Either way,
+ * overwriting a pointer that could not be inspected would silently orphan
+ * a pristine backup on a transient error path. The wrap CLI's deferred
+ * meta write already treats any throw here as "roll back the wrapped
+ * surfaces and exit non-zero", which is exactly the fail-closed behavior
+ * wanted.
  *
  * Fifth round: the whole read-relocate-write-cleanup sequence runs under
  * the cross-process wrap-meta lock (see withWrapMetaLock), so a concurrent
@@ -1319,7 +1328,9 @@ async function saveWrapMetaLocked(
   // treating "unreadable" as "absent" and clobbering what may be the only
   // pristine pointer, mirroring removeWrapMeta's never-destroy-on-a-read-
   // error rule. When configStillWrapped is false the fresh pointer wins
-  // unconditionally, so the existing meta is not consulted at all.
+  // unconditionally, so this preservation lookup is skipped entirely (the
+  // relocation read of the canonical slot above still ran, and still
+  // throws on a non-ENOENT read failure, even in that case).
   const existing = (options.configStillWrapped ?? true)
     ? await readExistingWrapMetaRawForSurface(meta.originalPath)
     : null;
