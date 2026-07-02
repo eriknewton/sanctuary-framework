@@ -521,6 +521,50 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     await expect(access(lockPath)).rejects.toThrow();
   });
 
+  it("TWO waiters contending over the same stale lock still serialize; neither pointer is orphaned and no lock lingers", async () => {
+    // Sixth round (stale-break TOCTOU guard): with a blind unlink, a
+    // second waiter that observed the stale lock before the first
+    // waiter's break could unlink the first waiter's FRESHLY acquired
+    // lock and enter the critical section alongside it, reproducing the
+    // unserialized canonical-slot clobber. The rename-then-verify break
+    // destroys only the exact stale lock it observed.
+    const surfaceA = join(tmpHome, "stale-race-a.json");
+    const surfaceB = join(tmpHome, "stale-race-b.json");
+    await writeFile(surfaceA, '{"a":"pristine"}');
+    await writeFile(surfaceB, '{"b":"pristine"}');
+    const backupA = await backupConfig(surfaceA);
+    const backupB = await backupConfig(surfaceB);
+
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+    await writeFile(lockPath, "999999\n");
+    const past = new Date(Date.now() - 10 * 60_000);
+    await utimes(lockPath, past, past);
+
+    await Promise.all([
+      saveWrapMeta({
+        backupPath: backupA,
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      }),
+      saveWrapMeta({
+        backupPath: backupB,
+        originalPath: surfaceB,
+        platform: "hermes",
+        wrappedAt: new Date().toISOString(),
+      }),
+    ]);
+
+    // Both surfaces keep a live unwrap pointer (no clobber), and neither
+    // the lock nor any break-name residue survives.
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+    const residue = (await readdir(backupDirPath())).filter((entry) =>
+      entry.includes("wrap-meta.lock"),
+    );
+    expect(residue).toEqual([]);
+  });
+
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──
 
   it.skipIf(process.getuid?.() === 0)(

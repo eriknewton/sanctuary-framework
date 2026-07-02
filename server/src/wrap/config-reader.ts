@@ -8,9 +8,18 @@
  * All original configs are backed up before any modification.
  */
 
-import { mkdir, realpath, open, lstat, unlink, readdir } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import { createHash } from "node:crypto";
+import {
+  mkdir,
+  realpath,
+  open,
+  lstat,
+  unlink,
+  readdir,
+  rename,
+  link,
+} from "node:fs/promises";
+import { constants as fsConstants, type Stats } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
@@ -1121,6 +1130,13 @@ async function fileExists(path: string): Promise<boolean> {
  * timeout: an unacquirable lock refuses the mutation with recovery advice
  * rather than proceeding unserialized. Release is best-effort in finally;
  * an unreleased lock ages into the stale break.
+ *
+ * The stale break is rename-then-verify, not a blind unlink (sixth round):
+ * the breaker atomically renames the lock to a waiter-unique name, checks
+ * the taken file IS the stale lock it observed (inode + mtime), and only
+ * then destroys it. Two waiters racing over the same stale lock therefore
+ * cannot end up both inside the critical section via one of them unlinking
+ * the other's freshly acquired lock.
  */
 const WRAP_META_LOCK_FILENAME = "wrap-meta.lock";
 const WRAP_META_LOCK_STALE_MS = 60_000;
@@ -1147,19 +1163,65 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
           ? (err as NodeJS.ErrnoException).code
           : undefined;
       if (code !== "EEXIST") throw err;
-      let stale: boolean;
+      let observed: Stats;
       try {
-        const st = await lstat(lockPath);
-        stale = Date.now() - st.mtimeMs > WRAP_META_LOCK_STALE_MS;
+        observed = await lstat(lockPath);
       } catch {
         // The holder released between our attempt and the stat; retry now.
         continue;
       }
-      if (stale) {
+      if (Date.now() - observed.mtimeMs > WRAP_META_LOCK_STALE_MS) {
+        // Sixth round (stale-break TOCTOU guard): a blind unlink here
+        // could remove a FRESH lock. Between this waiter's staleness stat
+        // and its unlink, another waiter can break the same stale lock
+        // and a new holder can acquire; unlinking then evicts that live
+        // holder and lets two mutators run the meta critical section
+        // concurrently (the exact unserialized clobber this lock exists
+        // to prevent). Break by atomic rename to a waiter-unique name
+        // instead: only one contender can take a given lock file, and
+        // identity is verified AFTER the take (same inode + mtime as the
+        // stale lock observed above) before anything is destroyed.
+        const breakPath =
+          `${lockPath}.break-${process.pid}-` + randomBytes(6).toString("hex");
         try {
-          await unlink(lockPath);
+          await rename(lockPath, breakPath);
         } catch {
-          // Another waiter broke it first; the retry below contends fresh.
+          // Another waiter took it (or the holder released) first; the
+          // retry below contends fresh.
+          continue;
+        }
+        let tookStaleLock = false;
+        try {
+          const taken = await lstat(breakPath);
+          tookStaleLock =
+            taken.ino === observed.ino && taken.mtimeMs === observed.mtimeMs;
+        } catch {
+          // Cannot prove what was taken is the stale lock; restore it
+          // below rather than destroy it.
+        }
+        if (tookStaleLock) {
+          try {
+            await unlink(breakPath);
+          } catch {
+            // The unique break name is exclusively ours; best-effort.
+          }
+        } else {
+          // A live lock was taken by mistake (another waiter broke the
+          // stale lock and a new holder acquired between our stat and
+          // our rename). Put it back with link(), which fails EEXIST
+          // rather than clobbering an even newer lock, then drop the
+          // break name (link + unlink, not rename, so a newer lock is
+          // never overwritten).
+          try {
+            await link(breakPath, lockPath);
+          } catch {
+            // A newer lock already occupies the slot; leave it alone.
+          }
+          try {
+            await unlink(breakPath);
+          } catch {
+            // Best-effort cleanup of the unique break name.
+          }
         }
         continue;
       }
