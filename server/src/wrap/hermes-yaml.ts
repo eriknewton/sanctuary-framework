@@ -19,12 +19,14 @@
  *
  * Fail-closed contract (HermesYamlUnsupportedError, so wrap fails loudly
  * with the file untouched rather than risking corruption):
- *   - Any CR byte in the file refuses at scan entry. split("\n") line
- *     handling and JS `.` (which never matches \r) blind every regex in
- *     this module to CR/CRLF line breaks that PyYAML honors, so scanning
+ *   - Any CR, NEL (U+0085), LS (U+2028), or PS (U+2029) byte in the file
+ *     refuses at scan entry. split("\n") line handling and JS `.` (which
+ *     never matches any of these) blind every regex in this module to
+ *     line breaks that PyYAML (YAML 1.1) honors just like \n, so scanning
  *     such a file would misread it wholesale (verified: it appended a
  *     duplicate top-level mcp_servers key, silently dropping the
- *     operator's entries under PyYAML last-wins).
+ *     operator's entries under PyYAML last-wins, for CR and separately
+ *     for each of NEL/LS/PS).
  *   - `mcp_servers:` carrying a non-empty flow mapping or scalar value,
  *     a block SEQUENCE (`- name: ...` items), or duplicate top-level
  *     `mcp_servers:` keys refuses. Tab indentation inside the block
@@ -108,6 +110,17 @@ export function hermesConfigYamlPath(): string {
 
 const MCP_SERVERS_KEY_RE = /^(['"]?)mcp_servers\1\s*:(.*)$/;
 
+/**
+ * Line-break code points PyYAML's scanner (scan_line_break, YAML 1.1)
+ * treats as line breaks beyond the plain "\n" this module splits on: CR
+ * (used bare or as CRLF), NEL (U+0085), LS (U+2028), and PS (U+2029). Any
+ * of these embedded in a line survives split("\n") and is invisible to
+ * JS `.` (which matches none of them), so a line carrying one hides its
+ * real structure from every anchored `(.*)$` regex in this module while
+ * PyYAML reads the break and sees different structure underneath.
+ */
+const PYYAML_EXTRA_LINE_BREAK_RE = /[\r\u0085\u2028\u2029]/;
+
 interface EntryLocation {
   /** Entry name with surrounding quotes stripped. */
   name: string;
@@ -149,19 +162,22 @@ function isBlankOrComment(line: string): boolean {
  * Returns null when the key is absent; throws on unsupported shapes.
  */
 function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
-  // CR / CRLF refusal, checked before anything else: the caller split on
-  // "\n", so CR bytes remain embedded in lines, and JS `.` never matches
-  // \r, so every anchored `(.*)$` regex below silently fails on a CR-ended
-  // line. A CRLF (or lone-CR) file therefore hides its real structure
-  // from this scan while PyYAML reads \r and \r\n as line breaks; the
-  // observed failure was an add-key append of a DUPLICATE top-level
-  // mcp_servers key that PyYAML last-wins resolved by dropping the
-  // operator's original entries. Refuse the whole file loudly instead.
-  if (lines.some((l) => l.includes("\r"))) {
+  // Extra-line-break refusal, checked before anything else: the caller
+  // split on "\n", so CR, NEL (U+0085), LS (U+2028), and PS (U+2029) bytes
+  // remain embedded in lines, and JS `.` never matches any of them, so
+  // every anchored `(.*)$` regex below silently fails on a line carrying
+  // one. A file using any of these therefore hides its real structure
+  // from this scan while PyYAML (YAML 1.1) reads all four as line breaks
+  // exactly like \n; the observed failure was an add-key append of a
+  // DUPLICATE top-level mcp_servers key that PyYAML last-wins resolved by
+  // dropping the operator's original entries — reproduced with CR and,
+  // separately, with each of NEL/LS/PS. Refuse the whole file loudly
+  // instead.
+  if (lines.some((l) => PYYAML_EXTRA_LINE_BREAK_RE.test(l))) {
     throw new HermesYamlUnsupportedError(
-      "config.yaml contains CR or CRLF line endings this line-oriented " +
-        "scan cannot read reliably; convert the file to LF line endings " +
-        "and re-run wrap."
+      "config.yaml contains a line-break character (CR, CRLF, NEL, LS, or " +
+        "PS) this line-oriented scan cannot read reliably; convert the " +
+        "file to plain LF line endings and re-run wrap."
     );
   }
   let keyLine = -1;
@@ -650,7 +666,7 @@ export function extractSanctuaryEntryEnv(
   //
   // Header detection uses RECOGNIZED_FIELD_RE + canonicalFieldKey, the
   // SAME decode assertReplaceableSanctuaryEntry uses to recognize the
-  // `env` field header, rather than the narrower raw-literal ENV_FIELD_RE.
+  // `env` field header, rather than a narrower raw-literal match.
   // A quoted key that decodes to `env` under PyYAML but is not the exact
   // bare/`"env"`/`'env'` spelling (an escaped-quote or unicode-escape
   // spelling, e.g. `"env":`) is a shape the whitelist screen already

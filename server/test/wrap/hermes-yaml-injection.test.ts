@@ -444,6 +444,55 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(yamlContainsSanctuaryEntry(crlf)).toBe(false);
   });
 
+  it("refuses NEL/LS/PS line breaks the same way as CR, instead of silently dropping entries or env vars", () => {
+    // PyYAML (YAML 1.1) treats NEL (U+0085), LS (U+2028), and PS (U+2029)
+    // as line breaks exactly like CR/CRLF, but split("\n") leaves them
+    // embedded in a "line" and JS `.` never matches them either, so this
+    // scan is blind to them the same way it was blind to bare CR before
+    // the CR guard. Each must refuse rather than misread.
+    const NEL = "\u0085";
+    const LS = "\u2028";
+    const PS = "\u2029";
+
+    // A NEL inside an existing sanctuary entry's command value hides a
+    // real `env:` header from the scan; extraction sees no env (correct
+    // skip) but the plan must REFUSE the write rather than replace the
+    // entry with content that drops the operator's persisted env var.
+    const nelHidesEnv =
+      `mcp_servers:\n  sanctuary:\n    command: old${NEL}    env:${NEL}` +
+      `      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"\n`;
+    expect(extractSanctuaryEntryEnv(nelHidesEnv)).toBeNull();
+    expect(() => planHermesYamlInjection(nelHidesEnv, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+
+    // A NEL can also hide a second top-level server entry inside what the
+    // blind scan reads as the sanctuary entry's command value; a replace
+    // must never silently delete the operator's other MCP server.
+    const nelHidesVictim =
+      `mcp_servers:\n  sanctuary:\n    command: old${NEL}  victim:${NEL}` +
+      `    command: "keepme"\n`;
+    expect(() => planHermesYamlInjection(nelHidesVictim, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+
+    // LS/PS separating an entire file hides the existing `mcp_servers:`
+    // key from the scan entirely, which would otherwise append a SECOND
+    // top-level mcp_servers key (PyYAML last-wins, dropping the
+    // operator's original entries) via the add-key path.
+    const lsWholeFile = `foo: bar${LS}mcp_servers:${LS}  sanctuary:${LS}    command: "old"${LS}`;
+    expect(() => planHermesYamlInjection(lsWholeFile, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    const psWholeFile = `foo: bar${PS}mcp_servers:${PS}  sanctuary:${PS}    command: "old"${PS}`;
+    expect(() => planHermesYamlInjection(psWholeFile, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+
+    expect(extractSanctuaryEntryEnv(nelHidesEnv)).toBeNull();
+    expect(yamlContainsSanctuaryEntry(nelHidesEnv)).toBe(false);
+  });
+
   it("whitelist-refuses a replace when any env value is a shape the extractor cannot fully read (block scalar, anchor, tag, directive)", () => {
     // Pre-chokepoint these proceeded as skip-with-notice, but the
     // replace-entry write is wholesale, so the skipped var was dropped
