@@ -155,6 +155,58 @@ function isBlankOrComment(line: string): boolean {
   return t === "" || t.startsWith("#");
 }
 
+function stripYamlKeyDecorators(
+  trimmed: string
+): { stripped: string; hadDecorator: boolean } {
+  let stripped = trimmed;
+  let hadDecorator = false;
+  for (;;) {
+    const m = /^(?:![^\s]+|&[^\s]+)\s+(.+)$/.exec(stripped);
+    if (!m) return { stripped, hadDecorator };
+    hadDecorator = true;
+    stripped = m[1]!.trimStart();
+  }
+}
+
+function assertNoHiddenTopLevelMcpServersKey(line: string, lineIdx: number): void {
+  const trimmed = line.trim();
+  if (trimmed === "" || trimmed.startsWith("#")) return;
+  if (/^<<\s*:/.test(trimmed)) {
+    throw new HermesYamlUnsupportedError(
+      `config.yaml has a top-level YAML merge key (line ${lineIdx + 1}) ` +
+        "whose merged fields this scan cannot read; refusing to edit. " +
+        "Rewrite mcp_servers as a plain top-level block key and re-run wrap."
+    );
+  }
+  if (trimmed.startsWith("?")) {
+    throw new HermesYamlUnsupportedError(
+      `config.yaml has an explicit/complex top-level YAML key (line ${lineIdx + 1}) ` +
+        "this line-oriented scan cannot resolve; refusing to edit. Rewrite " +
+        "mcp_servers as a plain top-level block key and re-run wrap."
+    );
+  }
+  if (trimmed.startsWith("*")) {
+    throw new HermesYamlUnsupportedError(
+      `config.yaml has a top-level YAML alias key (line ${lineIdx + 1}) ` +
+        "this line-oriented scan cannot resolve; refusing to edit. Rewrite " +
+        "mcp_servers as a plain top-level block key and re-run wrap."
+    );
+  }
+
+  const decorated = stripYamlKeyDecorators(trimmed);
+  if (!decorated.hadDecorator) return;
+  const m = RECOGNIZED_FIELD_RE.exec(decorated.stripped);
+  const key = m ? canonicalFieldKey(m) : null;
+  if (m === null || key === null || key === "mcp_servers") {
+    throw new HermesYamlUnsupportedError(
+      `config.yaml has a tagged or anchored top-level key (line ${lineIdx + 1}) ` +
+        "this scan cannot safely compare against `mcp_servers`; refusing " +
+        "to edit. Rewrite mcp_servers as a plain top-level block key and " +
+        "re-run wrap."
+    );
+  }
+}
+
 /**
  * Locate the top-level `mcp_servers:` block and its entries.
  * Returns null when the key is absent; throws on unsupported shapes.
@@ -168,7 +220,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   // from this scan while PyYAML (YAML 1.1) reads all four as line breaks
   // exactly like \n; the observed failure was an add-key append of a
   // DUPLICATE top-level mcp_servers key that PyYAML last-wins resolved by
-  // dropping the operator's original entries — reproduced with CR and,
+  // dropping the operator's original entries, reproduced with CR and,
   // separately, with each of NEL/LS/PS. Refuse the whole file loudly
   // instead.
   if (lines.some((l) => PYYAML_EXTRA_LINE_BREAK_RE.test(l))) {
@@ -191,6 +243,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   let remainder = "";
   for (let i = 0; i < lines.length; i++) {
     if (indentOf(lines[i]!) !== 0) continue;
+    assertNoHiddenTopLevelMcpServersKey(lines[i]!, i);
     const m = RECOGNIZED_FIELD_RE.exec(lines[i]!);
     if (!m) continue;
     if (m[2] !== undefined && canonicalFieldKey(m) === null) {

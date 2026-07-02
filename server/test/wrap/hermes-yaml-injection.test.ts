@@ -414,6 +414,46 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses top-level YAML constructs that can hide or synthesize mcp_servers from the line scan", () => {
+    // PyYAML loads each of these as a top-level `mcp_servers` key, but the
+    // line-oriented scanner cannot safely locate the block or mirror the
+    // merge. Taking the add-key path would append a duplicate `mcp_servers`
+    // block and PyYAML last-wins would drop the operator's original entry.
+    for (const existing of [
+      [
+        "!!str mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      [
+        "&mcp mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "",
+      ].join("\n"),
+      ["? mcp_servers", ": {sanctuary: {command: npx}}", ""].join("\n"),
+      [
+        "defaults: &defaults",
+        "  mcp_servers:",
+        "    sanctuary:",
+        '      command: "npx"',
+        "      env:",
+        '        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+        "<<: *defaults",
+        "",
+      ].join("\n"),
+    ]) {
+      expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+        HermesYamlUnsupportedError
+      );
+    }
+  });
+
   it("refuses CR/CRLF line endings instead of misreading the file and appending a duplicate mcp_servers key", () => {
     // Reproduced pre-fix: JS `.` never matches \r, so every anchored
     // `(.*)$` regex in the scan missed the CR-ended `mcp_servers:` key
