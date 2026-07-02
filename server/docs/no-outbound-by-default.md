@@ -107,30 +107,48 @@ outbound channels by configuring them:
   never state content, counts, policy data, or fortress identifiers.
   See `docs/transparency-checkpoints.md`, "External anchoring".
 
-### Documented default-on exceptions (install/wrap-time only)
+### Documented default-on exceptions
 
-These are the two known deviations from strict zero-outbound: neither
-runs in the server/dashboard/broker/hub runtime the rule above governs;
-both are CLI-invocation-time-only checks against the public npm
-registry, unauthenticated, status-code-only, and both are disabled by
-the same operator knob.
+These are the known deviations from strict zero-outbound. All are
+unauthenticated (no credential is ever attached) and all are disabled
+by the same operator knob, `SANCTUARY_NO_UPDATE_CHECK=1`. Only the
+first is wrap/install-time-only; the other two run inside the MCP
+server process itself on every stdio boot.
 
 - **`checkPinnedVersionResolvable` (wrap-time pin-resolvability probe,**
   `server/src/wrap/cli.ts`): during `sanctuary protect` / `sanctuary
   wrap` (skipped for dev-dist installs), an unauthenticated HEAD-class
   GET to the resolved npm registry checks whether the version being
   pinned still resolves, so the operator gets an honest warning instead
-  of a silently dead pin. Default ON; disabled by
-  `SANCTUARY_NO_UPDATE_CHECK=1` (the documented zero-outbound knob).
-  No credential is ever attached to the request; only the response
-  status code is consulted.
-- **`update-check.ts`** (pre-existing): a similar unauthenticated
-  registry check for a newer published version. Default ON; also
-  disabled by `SANCTUARY_NO_UPDATE_CHECK=1`.
+  of a silently dead pin. Status-code-only: no response body is read.
+  Default ON; disabled by `SANCTUARY_NO_UPDATE_CHECK=1`. This is the
+  only exception in this list that is install/wrap-time-only; it never
+  runs inside the server/dashboard/broker/hub runtime.
+- **`checkForUpdate`** (`server/src/update-check.ts`, invoked from
+  `server/src/cli.ts` immediately after `server.connect()` on the
+  stdio path): runs **inside the running MCP server process on every
+  stdio boot**, not just at install/wrap-time. Fire-and-forget, never
+  blocks startup. Fetches a fixed public-npm-registry URL
+  (`https://registry.npmjs.org/...`, not npmrc-resolved) and parses
+  the JSON response body to read the `version` field, so this is not
+  status-code-only. Default ON; disabled by
+  `SANCTUARY_NO_UPDATE_CHECK=1`.
+- **`checkForSignedUpdate`** (`server/src/update-check.ts`, invoked
+  alongside `checkForUpdate` from the same `cli.ts` stdio boot path):
+  also runs inside the running MCP server process on every stdio boot.
+  Egresses to the **GitHub Releases API**
+  (`https://api.github.com/repos/eriknewton/sanctuary-framework/releases/latest`)
+  and, to fetch the signed release-manifest asset, an
+  allowlist-redirect-gated follow to `*.githubusercontent.com`. Reads
+  and parses the full manifest body (not status-code-only) and
+  verifies it against the pinned release-signing key before advising;
+  fails closed (silent) on any unsigned/wrong-key/tampered/absent
+  manifest. Default ON; disabled by `SANCTUARY_NO_UPDATE_CHECK=1`.
 
-Operators who require strict zero-outbound at wrap/install time set
-`SANCTUARY_NO_UPDATE_CHECK=1` in the environment before running
-`sanctuary protect` / `sanctuary wrap`.
+Operators who require strict zero-outbound set
+`SANCTUARY_NO_UPDATE_CHECK=1` in the environment. This disables all
+three checks above: the wrap-time probe, and both server-boot-time
+update checks.
 
 Each escape hatch must be:
 
