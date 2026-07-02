@@ -147,6 +147,7 @@ $SANCTUARY_STORAGE_PATH/
 └── backup/
     ├── wrap-meta.json            # unwrap pointer for the most recently wrapped surface (legacy-named pointers from earlier releases still readable)
     ├── wrap-meta-<tag>.json      # per-surface unwrap pointers once a second surface is wrapped on the same tenant (tag = short hex hash of that config's path)
+    ├── wrap-meta.lock            # transient advisory lock held while wrap/unwrap updates the pointers above; a leftover from a crashed run makes wrap/unwrap refuse with instructions to remove it manually
     └── config-backup-*           # original agent configs, named config-backup-<timestamp>-<surface-tag><ext> (.json or .yaml; earlier releases used config-backup-<timestamp>.json)
 ```
 

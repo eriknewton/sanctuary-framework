@@ -15,11 +15,9 @@ import {
   lstat,
   unlink,
   readdir,
-  rename,
-  link,
 } from "node:fs/promises";
 import { constants as fsConstants, type Stats } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
@@ -1199,73 +1197,83 @@ async function fileExists(path: string): Promise<boolean> {
  * relocating it - recreating under concurrency the orphaned-pointer state
  * the relocation mechanism eliminates sequentially.
  *
- * Mechanics: O_EXCL creation of `wrap-meta.lock` in the backup dir (O_EXCL
- * also refuses a pre-placed symlink), short bounded retry while a live
- * holder finishes (these sections take milliseconds), a stale-age break so
- * a crashed holder cannot wedge every future wrap, and a fail-CLOSED
- * timeout: an unacquirable lock refuses the mutation with recovery advice
- * rather than proceeding unserialized (eighth round: the deadline gates
- * EVERY retry path, including the stale-break failure paths, so nothing
- * can spin past it). Release in finally is identity-verified (inode +
- * mtime captured at acquisition) and best-effort: a holder whose lock was
- * legitimately staleness-broken during a mid-section stall never evicts
- * its successor's live lock, and an unreleased lock ages into the stale
- * break.
+ * Mechanics (thirteenth round, simplified to fail-closed MANUAL break):
+ * O_EXCL creation of `wrap-meta.lock` in the backup dir (O_EXCL also
+ * refuses a pre-placed symlink), a short bounded retry while a live holder
+ * finishes (these sections take milliseconds), and a fail-CLOSED deadline:
+ * when the lock file persists past the wait (a live contender still
+ * running, or a stale lock left behind by a crashed holder), the mutation
+ * is REFUSED with explicit operator recovery advice (verify no sanctuary
+ * wrap/unwrap is running, then remove the named lock file and re-run)
+ * rather than proceeding unserialized or breaking the lock automatically.
  *
- * The stale break is rename-then-verify, not a blind unlink (sixth round):
- * the breaker atomically renames the lock to a waiter-unique name, checks
- * the taken file IS the stale lock it observed (inode + mtime), and only
- * then destroys it. That closes the DIRECT two-waiter race (one waiter
- * unlinking the other's freshly acquired lock) but not every interleaving:
- * a breaker that stalls between its staleness stat and its rename can take
- * a FRESH successor lock by mistake, and between that rename and the
- * link()-restore the slot is briefly empty, so a third contender can
- * acquire while the displaced holder is still inside its critical section.
- * Path-named lockfiles offer no compare-and-swap over directory entries
- * that could close that window outright, so the MUTATION is guarded
- * instead (ninth round): fn receives an assertLockHeld callback and the
- * meta critical sections call it immediately before every destructive
- * write/unlink, failing CLOSED (refuse + advise re-run) when the slot no
- * longer holds the lock this holder created. A displaced holder therefore
- * aborts before it can clobber a pointer; the residual assert-to-write gap
- * is a few syscalls wide (versus the whole critical section), and its
- * worst case remains recoverable from the timestamped backup files, which
- * are never deleted.
+ * Rounds 5-12 carried an AUTO-break-stale mechanism here (stale-age
+ * detection, rename-then-verify break, link()-restore of a mistakenly
+ * taken live lock, displaced-holder re-verification). Each hardening round
+ * narrowed but never closed its race family: the two-waiter blind unlink,
+ * the breaker that stalls between its staleness stat and its rename and
+ * takes a FRESH successor lock, the third-contender acquisition inside the
+ * rename-to-restore empty-slot window, and the transient vacate of a LIVE
+ * lock during the restore. Path-named lockfiles offer no compare-and-swap
+ * over directory entries, so the break dance could only ever shrink those
+ * windows, never remove them. The whole mechanism was therefore deleted
+ * (whack-a-mole/chokepoint rule): NO code path here ever unlinks or
+ * renames a lock file it did not create; a crashed holder's stale lock is
+ * cleared by the operator following the refusal's instructions, never by a
+ * guessing peer process.
+ *
+ * Release in the finally is identity-verified (inode + mtime captured at
+ * acquisition) and best-effort: if this holder's lock was removed out from
+ * under it (the operator's documented manual step, applied while it was
+ * stalled mid-section) and another process acquired, the release never
+ * evicts that successor's lock. The same displaced state is why fn still
+ * receives an assertLockHeld callback: the meta critical sections call it
+ * immediately before every destructive write/unlink, failing CLOSED
+ * (refuse + advise re-run) when the slot no longer holds the lock this
+ * holder created, so a displaced holder aborts before it can clobber a
+ * pointer a successor may have just written.
+ *
+ * DEBT (round-13 reviewer ruling, pre-existing class): this lock covers
+ * the wrap-META mutation only, not the caller's config-file mutation
+ * window (rewriteConfigForWrap / restoreConfig run in the CLI flows before
+ * saveWrapMeta / removeWrapMeta acquire), so a concurrent wrap and unwrap
+ * of the SAME surface can still interleave their config writes. Widening
+ * the hold to span the caller's whole config-mutation + meta-write
+ * sequence would need new acquisition points in the CLI flows plus
+ * re-entrant acquisition (saveWrapMeta acquires internally) - exactly the
+ * complexity class this round removed. Accepted as debt: same-surface
+ * interactive-CLI concurrency is rare, and the worst case is recoverable
+ * from the timestamped backup files, which are never deleted.
  */
 const WRAP_META_LOCK_FILENAME = "wrap-meta.lock";
-const WRAP_META_LOCK_STALE_MS = 60_000;
 const WRAP_META_LOCK_WAIT_MS = 15_000;
 const WRAP_META_LOCK_RETRY_MS = 50;
 
 /**
  * Test-only injection seam (same idiom as dashboard-standalone's
- * `__testFaultAfterLoads`). `onStaleLockObserved` runs after a waiter has
- * stat()ed the lock and judged it stale, BEFORE its rename-based break -
- * the exact TOCTOU window the rename-then-verify mechanism closes. The
- * cooperative single-process scheduling of the two-waiter Promise.all
- * test almost never lands in this window naturally, so a regression back
- * to a blind unlink would still pass end-state assertions; the seam lets
- * the deterministic pin in wrap-surface-scoped-meta.test.ts substitute a
- * FRESH lock inside the window and assert it survives.
+ * `__testFaultAfterLoads`).
  *
  * `onLockAcquired` runs after a holder acquires the lock, BEFORE the
  * critical section - the seam the displaced-holder pins use to simulate a
- * holder that stalled past the stale threshold and was legitimately
- * broken by a waiter (its lock replaced by a successor's, or destroyed
- * outright) while it was still inside fn(); the pins assert the displaced
- * holder fails CLOSED before mutating and that its release never evicts
- * the successor's lock.
+ * holder whose lock was manually removed (the operator's documented
+ * recovery step, applied while the holder was stalled mid-section) and
+ * possibly replaced by a successor's while it was still inside fn(); the
+ * pins assert the displaced holder fails CLOSED before mutating and that
+ * its release never evicts the successor's lock.
  *
  * `onLockCreated` runs after the O_EXCL create succeeds, BEFORE the pid
  * write completes the acquisition; a throwing hook simulates the
  * mid-acquisition failure (ENOSPC on the write, EIO on close) whose
- * leaked lock file used to wedge every later wrap/unwrap into the 60s
- * stale break. All hooks are always undefined in production.
+ * leaked lock file used to wedge every later wrap/unwrap on the tenant.
+ *
+ * `waitMs` overrides the bounded acquisition deadline so the fail-closed
+ * refusal on a persisting lock file can be pinned without a 15-second
+ * test. All hooks are always undefined in production.
  */
 export const __wrapMetaLockTestHooks: {
-  onStaleLockObserved?: (lockPath: string) => void | Promise<void>;
   onLockAcquired?: (lockPath: string) => void | Promise<void>;
   onLockCreated?: (lockPath: string) => void | Promise<void>;
+  waitMs?: number;
 } = {};
 
 async function withWrapMetaLock<T>(
@@ -1274,7 +1282,8 @@ async function withWrapMetaLock<T>(
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const lockPath = join(dir, WRAP_META_LOCK_FILENAME);
-  const deadline = Date.now() + WRAP_META_LOCK_WAIT_MS;
+  const deadline =
+    Date.now() + (__wrapMetaLockTestHooks.waitMs ?? WRAP_META_LOCK_WAIT_MS);
   // Identity of the lock THIS holder created (inode + mtime captured from
   // the open handle), consumed by the verified release in the finally.
   let acquired: { ino: number; mtimeMs: number } | undefined;
@@ -1298,13 +1307,14 @@ async function withWrapMetaLock<T>(
           await handle.close();
         }
       } catch (postCreateErr) {
-        // Tenth+ round (no lock leak on a failed acquisition): the O_EXCL
-        // create SUCCEEDED but finishing the acquisition failed (ENOSPC on
-        // the pid write, EIO on close). Rethrowing with the just-created
-        // lock file left behind wedged every other wrap/unwrap on the
-        // tenant for up to the 60s stale break, and made each of them
-        // fail with "another sanctuary wrap/unwrap appears to be
-        // updating the wrap metadata" when nothing else was running.
+        // Twelfth round (no lock leak on a failed acquisition), kept in
+        // the thirteenth: the O_EXCL create SUCCEEDED but finishing the
+        // acquisition failed. The failing step can be the pid write
+        // (ENOSPC, EIO) or the close() itself - the close runs in the
+        // finally above, so a close failure lands in this same catch.
+        // Rethrowing with the just-created lock file left behind would
+        // wedge every other wrap/unwrap on the tenant into the
+        // manual-removal refusal below when nothing else was running.
         // This process created the file an instant ago and never entered
         // the critical section, so unlinking it here cannot evict a
         // legitimate holder.
@@ -1312,7 +1322,8 @@ async function withWrapMetaLock<T>(
         try {
           await unlink(lockPath);
         } catch {
-          // Best-effort; a survivor ages into the stale break.
+          // Best-effort; a survivor is cleared by the operator per the
+          // fail-closed refusal below.
         }
         throw postCreateErr;
       }
@@ -1323,91 +1334,21 @@ async function withWrapMetaLock<T>(
           ? (err as NodeJS.ErrnoException).code
           : undefined;
       if (code !== "EEXIST") throw err;
-      // Eighth round (bounded acquisition on EVERY retry path): the
-      // deadline gates each iteration, so the stale-break failure paths
-      // below can no longer spin past the documented fail-closed cap. A
-      // persistently unrenameable stale lock (e.g. an immutable flag)
-      // previously looped bare `continue`s forever, with neither the
-      // deadline check nor the retry sleep - both lived only on the
-      // fresh-lock wait path.
+      // Fail CLOSED on a persisting lock file (thirteenth round: this
+      // refusal replaces the auto-break-stale machinery). The lock may be
+      // held by a live wrap/unwrap still running, or left behind by one
+      // that crashed; this process cannot tell the difference safely, so
+      // it never removes a lock file it did not create. The operator can:
+      // the message names the path and the exact recovery step.
       if (Date.now() >= deadline) {
         throw new Error(
-          `another sanctuary wrap/unwrap appears to be updating the wrap ` +
-            `metadata (lock held: ${lockPath}). Re-run in a moment; if no ` +
-            `other sanctuary process is running, delete the lock file and ` +
-            `re-run.`,
+          `the wrap-meta lock is held: ${lockPath}. Another sanctuary ` +
+            `wrap/unwrap may be running, or a previous wrap/unwrap crashed ` +
+            `and left the lock file behind. Refusing to modify the wrap ` +
+            `metadata. Verify no sanctuary wrap/unwrap process is running, ` +
+            `then remove ${lockPath} and re-run.`,
           { cause: err },
         );
-      }
-      let observed: Stats;
-      try {
-        observed = await lstat(lockPath);
-      } catch {
-        // The holder released between our attempt and the stat; retry now.
-        continue;
-      }
-      if (Date.now() - observed.mtimeMs > WRAP_META_LOCK_STALE_MS) {
-        // Sixth round (stale-break TOCTOU guard): a blind unlink here
-        // could remove a FRESH lock. Between this waiter's staleness stat
-        // and its unlink, another waiter can break the same stale lock
-        // and a new holder can acquire; unlinking then evicts that live
-        // holder and lets two mutators run the meta critical section
-        // concurrently (the exact unserialized clobber this lock exists
-        // to prevent). Break by atomic rename to a waiter-unique name
-        // instead: only one contender can take a given lock file, and
-        // identity is verified AFTER the take (same inode + mtime as the
-        // stale lock observed above) before anything is destroyed.
-        if (__wrapMetaLockTestHooks.onStaleLockObserved) {
-          await __wrapMetaLockTestHooks.onStaleLockObserved(lockPath);
-        }
-        const breakPath =
-          `${lockPath}.break-${process.pid}-` + randomBytes(6).toString("hex");
-        let renamed = false;
-        try {
-          await rename(lockPath, breakPath);
-          renamed = true;
-        } catch {
-          // Another waiter took it (or the holder released) first, or the
-          // lock cannot be renamed at all; fall through to the bounded
-          // sleep below instead of hot-spinning.
-        }
-        if (renamed) {
-          let tookStaleLock = false;
-          try {
-            const taken = await lstat(breakPath);
-            tookStaleLock =
-              taken.ino === observed.ino && taken.mtimeMs === observed.mtimeMs;
-          } catch {
-            // Cannot prove what was taken is the stale lock; restore it
-            // below rather than destroy it.
-          }
-          if (tookStaleLock) {
-            try {
-              await unlink(breakPath);
-            } catch {
-              // The unique break name is exclusively ours; best-effort.
-            }
-            // The slot is genuinely vacated; contend for it immediately.
-            continue;
-          }
-          // A live lock was taken by mistake (another waiter broke the
-          // stale lock and a new holder acquired between our stat and
-          // our rename). Put it back with link(), which fails EEXIST
-          // rather than clobbering an even newer lock, then drop the
-          // break name (link + unlink, not rename, so a newer lock is
-          // never overwritten).
-          try {
-            await link(breakPath, lockPath);
-          } catch {
-            // A newer lock already occupies the slot; leave it alone.
-          }
-          try {
-            await unlink(breakPath);
-          } catch {
-            // Best-effort cleanup of the unique break name.
-          }
-          // A live holder occupies the slot; wait like the fresh-lock path.
-        }
       }
       await new Promise((resolveSleep) =>
         setTimeout(resolveSleep, WRAP_META_LOCK_RETRY_MS),
@@ -1417,22 +1358,25 @@ async function withWrapMetaLock<T>(
   if (__wrapMetaLockTestHooks.onLockAcquired) {
     await __wrapMetaLockTestHooks.onLockAcquired(lockPath);
   }
-  // Ninth round (fail-closed displaced holder): the rename-then-verify
-  // break above still has a third-contender window (see the lock
-  // docstring), so holding-the-lock is re-proven at every destructive
-  // step, not assumed for the whole section. The callback throws when the
-  // slot no longer holds the lock THIS holder created (vanished, or
-  // replaced by a successor's), so a holder displaced during a
-  // mid-section stall refuses the mutation instead of clobbering a
-  // pointer the successor may have just written. When the acquisition
-  // identity could not be captured, this degrades to a no-op, matching
-  // the release path's degradation below.
+  // Ninth round (fail-closed displaced holder), kept in the thirteenth:
+  // with the auto-break deleted, the only way a live holder loses its lock
+  // is the operator's documented manual removal (applied while this
+  // process was stalled mid-section and presumed crashed), after which
+  // another wrap/unwrap can acquire. Holding-the-lock is therefore still
+  // re-proven at every destructive step, not assumed for the whole
+  // section. The callback throws when the slot no longer holds the lock
+  // THIS holder created (vanished, or replaced by a successor's), so a
+  // displaced holder refuses the mutation instead of clobbering a pointer
+  // the successor may have just written. When the acquisition identity
+  // could not be captured, this degrades to a no-op, matching the release
+  // path's degradation below.
   const assertLockHeld = async (): Promise<void> => {
     if (acquired === undefined) return;
     const displacedMessage =
-      `another sanctuary wrap/unwrap broke this process's wrap-meta lock ` +
-      `(${lockPath}) as stale during a stall and may have taken over; ` +
-      `refusing to modify the wrap metadata. Re-run the command.`;
+      `this process's wrap-meta lock (${lockPath}) was removed or replaced ` +
+      `while it was still working (a manual lock removal, or another ` +
+      `sanctuary wrap/unwrap taking over); refusing to modify the wrap ` +
+      `metadata. Re-run the command.`;
     let current: Stats;
     try {
       current = await lstat(lockPath);
@@ -1449,14 +1393,14 @@ async function withWrapMetaLock<T>(
   try {
     return await fn(assertLockHeld);
   } finally {
-    // Eighth round (verified release): never evict a SUCCESSOR's lock. If
-    // this holder stalls past the stale threshold mid-critical-section
-    // (sleep/suspend, a 60s hang), a waiter legitimately breaks its lock
-    // and a new holder acquires; an unconditional unlink here would then
-    // remove that successor's LIVE lock and let a third contender run the
-    // critical section alongside it. Release only a lock whose identity
-    // matches the one this holder created, mirroring the
-    // rename-then-verify stale break above.
+    // Eighth round (verified release), kept in the thirteenth: never evict
+    // a SUCCESSOR's lock. If the operator manually removed this holder's
+    // lock mid-critical-section (the documented recovery step, applied to
+    // a stall they judged crashed) and another wrap/unwrap acquired, an
+    // unconditional unlink here would remove that successor's LIVE lock
+    // and let a third contender run the critical section alongside it.
+    // Release only a lock whose identity matches the one this holder
+    // created.
     try {
       const current = await lstat(lockPath);
       if (
@@ -1466,7 +1410,8 @@ async function withWrapMetaLock<T>(
         await unlink(lockPath);
       }
     } catch {
-      // Best-effort release; a survivor ages into the stale break above.
+      // Best-effort release; a survivor is cleared by the operator per
+      // the fail-closed acquisition refusal above.
     }
   }
 }
@@ -1533,8 +1478,9 @@ export async function saveWrapMeta(
 
 /**
  * saveWrapMeta's body; runs with the wrap-meta lock already held.
- * `assertLockHeld` fails CLOSED (ninth round) when the lock was
- * staleness-broken out from under this holder mid-section; it gates every
+ * `assertLockHeld` fails CLOSED (ninth round) when the lock was removed
+ * out from under this holder mid-section (a manual operator lock removal,
+ * possibly followed by a successor's acquisition); it gates every
  * destructive write below so a displaced holder never clobbers a pointer.
  */
 async function saveWrapMetaLocked(
@@ -1750,10 +1696,11 @@ export async function removeWrapMeta(
 
 /**
  * removeWrapMeta's body; runs with the wrap-meta lock already held.
- * `assertLockHeld` fails CLOSED (ninth round) when the lock was
- * staleness-broken out from under this holder mid-section; it gates every
- * unlink below so a displaced holder never retires a pointer a successor
- * may have just written.
+ * `assertLockHeld` fails CLOSED (ninth round) when the lock was removed
+ * out from under this holder mid-section (a manual operator lock removal,
+ * possibly followed by a successor's acquisition); it gates every unlink
+ * below so a displaced holder never retires a pointer a successor may
+ * have just written.
  */
 async function removeWrapMetaLocked(
   restoredOriginalPath: string,

@@ -57,26 +57,32 @@
  *      unconsulted pristine pointer.
  *  13. saveWrapMeta / removeWrapMeta serialize under the cross-process
  *      advisory lock (wrap-meta.lock): concurrent wraps of different
- *      surfaces cannot clobber each other's canonical pointer, the lock
- *      never lingers after release, and a stale lock from a crashed
- *      holder is broken instead of wedging every future wrap.
+ *      surfaces cannot clobber each other's canonical pointer and the
+ *      lock never lingers after release.
  *
  * Eighth-round hardening pinned here (2026-07-02 fix round 4):
  *  14. removeWrapMeta consults the restored surface's own scoped slot as a
  *      DETERMINISTIC candidate (derived from the path, no readdir), so a
  *      degraded directory listing cannot leave a stale scoped pointer
  *      behind under a clean-success report.
- *  15. The stale-lock break's rename-then-verify guard has a DETERMINISTIC
- *      TOCTOU pin: a fresh lock substituted inside the stat-to-break
- *      window (via the __wrapMetaLockTestHooks seam) must survive; a
- *      regression to a blind unlink destroys it and fails the test.
  *
  * Ninth-round hardening pinned here (2026-07-02 fix round 10):
- *  16. Displaced holders fail CLOSED: a holder whose lock was
- *      staleness-broken out from under it mid-critical-section (the
- *      third-contender residual of the rename-then-verify break) refuses
- *      to write/retire wrap metadata instead of mutating alongside the
- *      successor, and its release still never evicts the successor's lock.
+ *  16. Displaced holders fail CLOSED: a holder whose lock was removed out
+ *      from under it mid-critical-section (the operator's manual lock
+ *      removal against a presumed-crashed stall) refuses to write/retire
+ *      wrap metadata instead of mutating alongside the successor, and its
+ *      release still never evicts the successor's lock.
+ *
+ * Thirteenth-round simplification pinned here (2026-07-02 fix round 13):
+ *  17. The auto-break-stale machinery is GONE (chokepoint rule): a lock
+ *      file that persists past the bounded wait - live contender or
+ *      crashed holder's leftover - expires into a fail-closed refusal
+ *      naming the lock path with manual recovery advice. No code path
+ *      ever unlinks or renames a lock file it did not create: a live
+ *      holder's lock is never touched by a waiter, and a pre-placed stale
+ *      lock survives the refusal untouched. (These convert the former
+ *      round 5-12 stale-break pins, items 13/15 of earlier rounds, into
+ *      pins of the replacement behavior.)
  *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
@@ -633,16 +639,58 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     ).rejects.toThrow();
   });
 
-  it("a STALE wrap-meta lock (crashed holder) is broken instead of wedging every future wrap", async () => {
+  it("a persisting STALE lock (crashed holder) is NEVER auto-broken: the bounded deadline expires into a fail-closed refusal with manual recovery advice", async () => {
+    // Thirteenth round (chokepoint rule): rounds 5-12 auto-broke a stale
+    // lock (stale-age detection, rename-then-verify, link()-restore), and
+    // every round found a narrower residual race in the break dance. The
+    // machinery is deleted: a lock file that persists past the bounded
+    // wait - whatever left it there - expires into an explicit refusal
+    // that names the lock path and the operator's exact recovery step.
+    // This test doubles as the bounded-deadline pin: with the wait
+    // shortened via the seam, the refusal arrives instead of an
+    // indefinite wedge.
     const configPath = join(tmpHome, "stale-lock-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
 
     const lockPath = join(backupDirPath(), "wrap-meta.lock");
     await writeFile(lockPath, "999999\n");
+    // A crashed holder's leftover: minutes old, no live process behind it.
     const past = new Date(Date.now() - 10 * 60_000);
     await utimes(lockPath, past, past);
 
+    __wrapMetaLockTestHooks.waitMs = 250;
+    let refusal: Error | null = null;
+    try {
+      await saveWrapMeta({
+        backupPath: backup,
+        originalPath: configPath,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      refusal = err as Error;
+    } finally {
+      delete __wrapMetaLockTestHooks.waitMs;
+    }
+
+    // Fail closed, with the full operator runbook in the message: the
+    // lock path, the two possible causes, and the manual step.
+    expect(refusal).not.toBeNull();
+    expect(refusal!.message).toContain(lockPath);
+    expect(refusal!.message).toContain("wrap-meta lock is held");
+    expect(refusal!.message).toContain(
+      "Verify no sanctuary wrap/unwrap process is running",
+    );
+    expect(refusal!.message).toContain(`remove ${lockPath} and re-run`);
+
+    // Nothing was mutated, and the lock file this process did NOT create
+    // was never unlinked or renamed (byte-identical survivor).
+    expect(await hasExistingWrapMeta(configPath)).toBe(false);
+    expect(await readFile(lockPath, "utf-8")).toBe("999999\n");
+
+    // The operator's documented manual step unwedges the tenant.
+    await unlink(lockPath);
     await saveWrapMeta({
       backupPath: backup,
       originalPath: configPath,
@@ -650,23 +698,14 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       wrappedAt: new Date().toISOString(),
     });
     expect(await hasExistingWrapMeta(configPath)).toBe(true);
-    await expect(access(lockPath)).rejects.toThrow();
   });
 
-  it("TWO waiters contending over the same stale lock still serialize; neither pointer is orphaned and no lock lingers", async () => {
-    // Sixth round (stale-break TOCTOU guard): with a blind unlink, a
-    // second waiter that observed the stale lock before the first
-    // waiter's break could unlink the first waiter's FRESHLY acquired
-    // lock and enter the critical section alongside it, reproducing the
-    // unserialized canonical-slot clobber. The rename-then-verify break
-    // destroys only the exact stale lock it observed.
-    //
-    // Honesty note: this is an END-STATE sanity test; single-process
-    // cooperative scheduling rarely lands both waiters inside the
-    // stat-to-break window, so it does not by itself falsify a blind
-    // unlink. The deterministic pin for that regression is the
-    // injected-interleaving test below (fresh lock substituted via
-    // __wrapMetaLockTestHooks must survive the break attempt).
+  it("TWO waiters behind the same stale lock BOTH refuse fail-closed; neither breaks the lock and nothing is written", async () => {
+    // Round 5-12 behavior was "one waiter breaks the stale lock, both
+    // serialize through". Round 13 converts the pin: with the auto-break
+    // deleted, BOTH waiters expire into the manual-recovery refusal, the
+    // stale lock survives untouched, and no pointer is written - strictly
+    // fail-closed, never unserialized.
     const surfaceA = join(tmpHome, "stale-race-a.json");
     const surfaceB = join(tmpHome, "stale-race-b.json");
     await writeFile(surfaceA, '{"a":"pristine"}');
@@ -679,85 +718,80 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     const past = new Date(Date.now() - 10 * 60_000);
     await utimes(lockPath, past, past);
 
-    await Promise.all([
-      saveWrapMeta({
-        backupPath: backupA,
-        originalPath: surfaceA,
-        platform: "claude-code",
-        wrappedAt: new Date().toISOString(),
-      }),
-      saveWrapMeta({
-        backupPath: backupB,
-        originalPath: surfaceB,
-        platform: "hermes",
-        wrappedAt: new Date().toISOString(),
-      }),
-    ]);
+    __wrapMetaLockTestHooks.waitMs = 250;
+    let outcomes: PromiseSettledResult<void>[];
+    try {
+      outcomes = await Promise.allSettled([
+        saveWrapMeta({
+          backupPath: backupA,
+          originalPath: surfaceA,
+          platform: "claude-code",
+          wrappedAt: new Date().toISOString(),
+        }),
+        saveWrapMeta({
+          backupPath: backupB,
+          originalPath: surfaceB,
+          platform: "hermes",
+          wrappedAt: new Date().toISOString(),
+        }),
+      ]);
+    } finally {
+      delete __wrapMetaLockTestHooks.waitMs;
+    }
 
-    // Both surfaces keep a live unwrap pointer (no clobber), and neither
-    // the lock nor any break-name residue survives.
-    expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
-    expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe("rejected");
+      expect(
+        ((outcome as PromiseRejectedResult).reason as Error).message,
+      ).toContain("wrap-meta lock is held");
+    }
+    // No pointer was written, the stale lock survived untouched, and no
+    // break-name residue exists (there is no break machinery to leave any).
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(false);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(false);
     const residue = (await readdir(backupDirPath())).filter((entry) =>
       entry.includes("wrap-meta.lock"),
     );
-    expect(residue).toEqual([]);
+    expect(residue).toEqual(["wrap-meta.lock"]);
+    expect(await readFile(lockPath, "utf-8")).toBe("999999\n");
+    await unlink(lockPath);
   });
 
-  it("stale-break TOCTOU pin: a FRESH lock substituted inside the stat-to-break window survives; a blind unlink would destroy it", async () => {
-    const configPath = join(tmpHome, "toctou-config.json");
+  it("a LIVE holder's lock is never touched by a waiter: the waiter waits, then acquires and completes after the holder releases", async () => {
+    // Converts the former stale-break TOCTOU pin (a fresh lock substituted
+    // inside the stat-to-break window had to survive the verified break).
+    // Round 13 makes the property unconditional: there is no code path
+    // that unlinks or renames a lock this process did not create, so a
+    // live holder's lock survives by construction and the waiter honors
+    // it until the holder releases.
+    const configPath = join(tmpHome, "live-lock-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
 
     const lockPath = join(backupDirPath(), "wrap-meta.lock");
-    await writeFile(lockPath, "999999\n");
-    const past = new Date(Date.now() - 10 * 60_000);
-    await utimes(lockPath, past, past);
+    await writeFile(lockPath, "live-holder\n");
 
-    // Inject EXACTLY the interleaving the rename-then-verify break closes:
-    // after this waiter stats the stale lock (and judges it stale) but
-    // before its break, "another waiter" breaks the stale lock and a NEW
-    // holder acquires (fresh file, fresh mtime, new inode). A blind unlink
-    // regression destroys the fresh lock and enters the critical section
-    // alongside the live holder; the verified break must take the fresh
-    // lock, fail the inode+mtime identity check, link() it back, and keep
-    // waiting.
-    let fired = false;
-    __wrapMetaLockTestHooks.onStaleLockObserved = async () => {
-      if (fired) return;
-      fired = true;
-      await unlink(lockPath);
-      await writeFile(lockPath, "fresh-holder\n");
-    };
-    try {
-      let saveSettled = false;
-      const savePromise = saveWrapMeta({
-        backupPath: backup,
-        originalPath: configPath,
-        platform: "claude-code",
-        wrappedAt: new Date().toISOString(),
-      }).then(() => {
-        saveSettled = true;
-      });
+    let saveSettled = false;
+    const savePromise = saveWrapMeta({
+      backupPath: backup,
+      originalPath: configPath,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    }).then(() => {
+      saveSettled = true;
+    });
 
-      // Give the waiter time to run its break attempt against the fresh
-      // lock (retry cadence is 50ms; 500ms covers many rounds).
-      await new Promise((resolveSleep) => setTimeout(resolveSleep, 500));
-      expect(fired).toBe(true);
+    // Many retry rounds (cadence 50ms): the live lock must survive them
+    // all, byte-identical, with the waiter still pending and nothing
+    // written.
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 400));
+    expect(await readFile(lockPath, "utf-8")).toBe("live-holder\n");
+    expect(saveSettled).toBe(false);
+    expect(await hasExistingWrapMeta(configPath)).toBe(false);
 
-      // The FRESH lock survived the break attempt (blind unlink would
-      // have removed it and completed the save already), and the waiter
-      // is still honoring it.
-      expect(await readFile(lockPath, "utf-8")).toBe("fresh-holder\n");
-      expect(saveSettled).toBe(false);
-      expect(await hasExistingWrapMeta(configPath)).toBe(false);
-
-      // The live holder releases; the waiter acquires and completes.
-      await unlink(lockPath);
-      await savePromise;
-    } finally {
-      delete __wrapMetaLockTestHooks.onStaleLockObserved;
-    }
+    // The live holder releases; the waiter acquires and completes.
+    await unlink(lockPath);
+    await savePromise;
 
     expect(await hasExistingWrapMeta(configPath)).toBe(true);
     const residue = (await readdir(backupDirPath())).filter((entry) =>
@@ -766,17 +800,19 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(residue).toEqual([]);
   });
 
-  it("displaced holder fails CLOSED: a save whose lock was staleness-broken mid-section refuses to write and does not evict its successor's lock", async () => {
+  it("displaced holder fails CLOSED: a save whose lock was removed out from under it mid-section refuses to write and does not evict its successor's lock", async () => {
     // Eighth round pinned the verified RELEASE (no successor eviction);
-    // ninth round pins the fail-closed MUTATION guard. If a holder stalls
-    // past the 60s stale threshold inside the critical section
-    // (sleep/suspend, a long hang), a waiter legitimately breaks its lock
-    // and a SUCCESSOR acquires; the stalled holder then finishes fn() and
-    // would clobber the pointer the successor just wrote. The
-    // assertLockHeld gate before every destructive write must refuse
-    // instead, and the release must still leave the successor's lock
-    // alone. Inject exactly that state via the onLockAcquired seam: the
-    // holder's own lock is replaced by a successor's before fn() runs.
+    // ninth round pins the fail-closed MUTATION guard; round 13 keeps
+    // both. With the auto-break deleted, the displaced state arises from
+    // the operator's documented manual recovery step: a holder stalls
+    // inside the critical section (sleep/suspend, a long hang), the
+    // operator judges it crashed and removes the lock, and a SUCCESSOR
+    // acquires; the stalled holder then finishes fn() and would clobber
+    // the pointer the successor just wrote. The assertLockHeld gate
+    // before every destructive write must refuse instead, and the release
+    // must still leave the successor's lock alone. Inject exactly that
+    // state via the onLockAcquired seam: the holder's own lock is
+    // replaced by a successor's before fn() runs.
     const configPath = join(tmpHome, "release-verify-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
@@ -817,12 +853,11 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
   });
 
   it("displaced holder fails CLOSED on the unwrap side: removeWrapMeta refuses to retire pointers after its lock vanished mid-section", async () => {
-    // Same ninth-round guard, remove path + the lock-destroyed (ENOENT)
-    // branch: the finding's worst endpoint leaves the displaced holder's
-    // lock with NO name at all (a breaker renamed it away and unlinked the
-    // break name after a failed link()-restore). The holder must detect
-    // the vanished lock before its first unlink and refuse, leaving every
-    // pointer in place for the operator's re-run.
+    // Same ninth-round guard, remove path + the lock-vanished (ENOENT)
+    // branch: the operator's manual lock removal against a stalled holder
+    // leaves that holder's lock with no name at all. The holder must
+    // detect the vanished lock before its first unlink and refuse,
+    // leaving every pointer in place for the operator's re-run.
     const configPath = join(tmpHome, "remove-displaced-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
@@ -855,11 +890,12 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
   });
 
   it("a failed acquisition AFTER the O_EXCL create (ENOSPC-class) removes the just-created lock instead of leaking it", async () => {
-    // The pid write (or close) can fail after the lock file was created
-    // (disk full, EIO). Rethrowing with the lock left on disk wedged every
-    // later wrap/unwrap on the tenant for up to the 60s stale break, each
-    // failing with the false "another sanctuary wrap/unwrap appears to be
-    // updating the wrap metadata" cause while nothing else was running.
+    // The acquisition can fail after the lock file was created: the pid
+    // write (ENOSPC, EIO) or the close() itself - both land in the same
+    // single post-create catch that owns the cleanup, so this one seam
+    // covers the whole class. Rethrowing with the lock left on disk would
+    // wedge every later wrap/unwrap on the tenant into the false
+    // manual-removal refusal while nothing else was running.
     const configPath = join(tmpHome, "enospc-config.json");
     await writeFile(configPath, "{}");
     const backup = await backupConfig(configPath);
@@ -950,6 +986,44 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(exitCodeAfter).toBe(1);
     // The meta survives, so a re-run can retire it.
     expect(await hasExistingWrapMeta(settingsPath)).toBe(true);
+  });
+
+  it("a successful unwrap prints the survivor note when another wrapped surface remains (success-path multi-surface honesty)", async () => {
+    // Eighth-round behavior, pinned in round 13 (the refusal-path twin is
+    // the wedged-pointer test above): with surface-scoped meta slots, one
+    // --unwrap run restores exactly ONE surface. Ending on an unqualified
+    // "Unwrapped" while another surface still routes traffic through
+    // Sanctuary is the dead-entry-behind-a-success-banner class, so the
+    // clean-retirement path must enumerate the survivor and the re-run
+    // step.
+    const surfaceA = join(tmpHome, "survivor-surface-a.json");
+    const surfaceB = join(tmpHome, "survivor-surface-b.json");
+    await seedMetaFor(surfaceA);
+    await seedMetaFor(surfaceB);
+    // B holds the canonical (first-scanned) pointer; A's pointer was
+    // relocated into its scoped slot by B's save.
+
+    errSpy.mockClear();
+    await runWrap({ unwrap: true }, makeDeps());
+    const out = stderrOutput();
+
+    // The restore itself succeeded and says so...
+    expect(out).toContain("Sanctuary: Unwrapped");
+    expect(out).toContain(`Original config restored to: ${surfaceB}`);
+    // ...and the survivor note names the remaining wrapped surface with
+    // the path forward.
+    expect(out).toContain(`another wrapped surface remains (${surfaceA})`);
+    expect(out).toContain("Re-run 'sanctuary wrap --unwrap' to restore it.");
+
+    // A's pointer is still live, so the advertised re-run works.
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(false);
+    errSpy.mockClear();
+    await runWrap({ unwrap: true }, makeDeps());
+    expect(stderrOutput()).toContain(
+      `Original config restored to: ${surfaceA}`,
+    );
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(false);
   });
 
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──
