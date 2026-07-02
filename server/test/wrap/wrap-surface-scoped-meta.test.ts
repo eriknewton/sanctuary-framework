@@ -889,6 +889,46 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(await hasExistingWrapMeta(configPath)).toBe(true);
   });
 
+  it("fourteenth round: when post-write identity capture fails, the release fails CLOSED (leaves the lock file) instead of an unconditional unlink", async () => {
+    // Closes a round-13 overclaim: the release used to fall back to an
+    // UNCONDITIONAL unlink whenever `acquired` was undefined at release
+    // time, which this holder can also reach via a failed post-write
+    // fstat (not just the ENOSPC-class create failure below, which
+    // rethrows before ever entering the critical section). That fallback
+    // could evict a live SUCCESSOR's lock if the operator manually removed
+    // this holder's lock mid-section and another wrap/unwrap acquired
+    // meanwhile - exactly the property this release exists to prevent.
+    // The fix: skip the unlink entirely when identity was never captured,
+    // leaving the file for the operator's manual-break runbook, same as an
+    // ordinary crash would.
+    const configPath = join(tmpHome, "stat-fail-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+
+    __wrapMetaLockTestHooks.failStatAfterWrite = true;
+    try {
+      await saveWrapMeta({
+        backupPath: backup,
+        originalPath: configPath,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+    } finally {
+      delete __wrapMetaLockTestHooks.failStatAfterWrite;
+    }
+    // The mutation itself still succeeded (identity loss degrades
+    // assertLockHeld to a no-op, matching the release's degradation).
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+    // The lock file was NOT unlinked: the release failed closed rather
+    // than falling back to the old unconditional unlink.
+    await expect(access(lockPath)).resolves.toBeUndefined();
+
+    // Clean up the surviving lock (the operator's manual-break step) so
+    // later tests in this file are not affected by lock-directory state.
+    await unlink(lockPath);
+  });
+
   it("a failed acquisition AFTER the O_EXCL create (ENOSPC-class) removes the just-created lock instead of leaking it", async () => {
     // The acquisition can fail after the lock file was created: the pid
     // write (ENOSPC, EIO) or the close() itself - both land in the same
@@ -1281,6 +1321,62 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
           timeoutMs: 500,
         }),
       ).toBe("unreachable");
+    });
+
+    it("fourteenth round: a responder that trickles the HTTP status line one byte at a time keeps resetting the inactivity timer forever, but the probe still resolves within a bounded wall-clock deadline", async () => {
+      // The `timeout` request option is a socket INACTIVITY timer: Node
+      // resets it on every byte received, so req.on("timeout") only fires
+      // after a gap with NO bytes. A tarpit / misbehaving proxy that
+      // dribbles one byte on an interval shorter than the timeout, forever,
+      // keeps re-arming that timer and the inactivity timeout never fires -
+      // stalling the probe indefinitely and contradicting the documented
+      // "never blocks the wrap" contract. Simulate that honestly: emit
+      // "HTTP/1.1 200 " (a valid, syntactically INCOMPLETE status-line
+      // prefix - no terminating \r\n yet) and then dribble additional
+      // spaces forever, which stay valid inside an arbitrarily long reason
+      // phrase without ever completing the line or desyncing the HTTP
+      // parser (a raw byte like "H" instead would trip a parse-error
+      // req.on("error") almost immediately, which is a DIFFERENT code path
+      // and would not exercise the inactivity-timer gap this test targets).
+      // Only a hard wall-clock deadline - not the inactivity timer, which
+      // every tick keeps "fed" - can end this probe within a bounded time.
+      const timeoutMs = 200;
+      const statusPrefix = "HTTP/1.1 200 ";
+      const drip = createServer();
+      const dripIntervals: ReturnType<typeof setInterval>[] = [];
+      drip.on("connection", (socket) => {
+        let i = 0;
+        const tickMs = Math.max(10, Math.floor(timeoutMs / 4));
+        const interval = setInterval(() => {
+          if (socket.destroyed) return;
+          const byte = i < statusPrefix.length ? statusPrefix[i] : " ";
+          socket.write(byte);
+          i++;
+        }, tickMs);
+        dripIntervals.push(interval);
+        socket.on("close", () => clearInterval(interval));
+      });
+      await new Promise<void>((resolve) =>
+        drip.listen(0, "127.0.0.1", () => resolve()),
+      );
+      const { port } = drip.address() as AddressInfo;
+      try {
+        const started = Date.now();
+        const result = await checkPinnedVersionResolvable("9.9.9", {
+          registryBaseUrl: `http://127.0.0.1:${port}`,
+          timeoutMs,
+        });
+        const elapsedMs = Date.now() - started;
+        expect(result).toBe("unreachable");
+        // Without a wall-clock deadline this drip runs forever (each tick
+        // re-arms the inactivity timer indefinitely); a fixed deadline must
+        // resolve near the single timeoutMs window instead. Generous slack
+        // for CI scheduling jitter, still far short of "runs forever".
+        expect(elapsedMs).toBeLessThan(timeoutMs * 6);
+      } finally {
+        for (const interval of dripIntervals) clearInterval(interval);
+        await new Promise<void>((resolve) => drip.close(() => resolve()));
+      }
     });
 
     it("SANCTUARY_NO_UPDATE_CHECK=1 skips the probe entirely (zero outbound)", async () => {

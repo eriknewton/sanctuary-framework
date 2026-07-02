@@ -704,26 +704,49 @@ export async function checkPinnedVersionResolvable(
   const url = `${base}/@sanctuary-framework/mcp-server/${encodeURIComponent(version)}`;
   const getFn = base.startsWith("http://") ? httpGet : httpsGet;
   return new Promise((resolve) => {
+    // 2026-07-02 hardening (round 14): `timeout` on the request options
+    // below is a socket INACTIVITY timer (Node resets it on every byte
+    // received), not a wall-clock deadline. A responder that dribbles the
+    // HTTP status line slowly enough to keep beating that timer - a
+    // tarpit, a misbehaving proxy, an attacker on the network path - would
+    // otherwise stall this probe indefinitely, contradicting the "never
+    // blocks the wrap" contract this function documents. `deadline` is the
+    // hard wall-clock cap: it fires exactly once, destroys the in-flight
+    // request, and resolves "unreachable" regardless of subsequent socket
+    // activity. `settled` guards against a double-resolve if the deadline
+    // and a request event race.
+    let settled = false;
+    const settle = (result: PinnedVersionResolvability) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    };
+    const deadline = setTimeout(() => {
+      req?.destroy();
+      settle("unreachable");
+    }, timeoutMs);
+    let req: ReturnType<typeof httpGet> | undefined;
     try {
-      const req = getFn(
+      req = getFn(
         url,
         { headers: { Accept: "application/json" }, timeout: timeoutMs },
         (res) => {
           // Only the response STATUS is consulted; drain the body.
           res.resume();
-          if (res.statusCode === 200) resolve("resolvable");
+          if (res.statusCode === 200) settle("resolvable");
           else if (res.statusCode === 404)
-            resolve(notFoundIsAffirmative ? "unpublished" : "unreachable");
-          else resolve("unreachable");
+            settle(notFoundIsAffirmative ? "unpublished" : "unreachable");
+          else settle("unreachable");
         },
       );
-      req.on("error", () => resolve("unreachable"));
+      req.on("error", () => settle("unreachable"));
       req.on("timeout", () => {
-        req.destroy();
-        resolve("unreachable");
+        req?.destroy();
+        settle("unreachable");
       });
     } catch {
-      resolve("unreachable");
+      settle("unreachable");
     }
   });
 }

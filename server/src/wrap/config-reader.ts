@@ -1269,11 +1269,19 @@ const WRAP_META_LOCK_RETRY_MS = 50;
  * `waitMs` overrides the bounded acquisition deadline so the fail-closed
  * refusal on a persisting lock file can be pinned without a 15-second
  * test. All hooks are always undefined in production.
+ *
+ * `failStatAfterWrite` simulates the post-write `handle.stat()` failing
+ * (fstat EIO and similar): identity is never captured, so this holder
+ * enters the critical section without proof of which lock file is
+ * "theirs". The pin this seam exists for asserts the release then fails
+ * CLOSED (skips the unlink) rather than falling back to an unconditional
+ * unlink that could evict a live successor's lock.
  */
 export const __wrapMetaLockTestHooks: {
   onLockAcquired?: (lockPath: string) => void | Promise<void>;
   onLockCreated?: (lockPath: string) => void | Promise<void>;
   waitMs?: number;
+  failStatAfterWrite?: boolean;
 } = {};
 
 async function withWrapMetaLock<T>(
@@ -1287,6 +1295,21 @@ async function withWrapMetaLock<T>(
   // Identity of the lock THIS holder created (inode + mtime captured from
   // the open handle), consumed by the verified release in the finally.
   let acquired: { ino: number; mtimeMs: number } | undefined;
+  // 2026-07-02 hardening (round 14): distinct from `acquired === undefined`
+  // via the postCreateErr path below, where the O_EXCL create is known to
+  // have just been THIS process's and the function rethrows before ever
+  // entering the critical section (unlinking there is safe). This flag
+  // marks the narrower case: the create + pid write succeeded but the
+  // follow-up fstat failed, so identity could not be captured yet the
+  // function proceeds into the critical section. The release below must
+  // not fall back to an unconditional unlink in that case - the PR-13
+  // invariant is "no code path unlinks a lock file it did not create", and
+  // an unconditional unlink here could evict a successor's live lock if
+  // the operator manually removed this holder's lock mid-section (the
+  // documented recovery step) and another wrap/unwrap acquired meanwhile.
+  // The release instead fails closed: it leaves the lock file in place for
+  // the operator's manual-removal runbook, same as an ordinary crash would.
+  let identityUnavailableAfterAcquire = false;
   for (;;) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
@@ -1297,11 +1320,18 @@ async function withWrapMetaLock<T>(
           }
           await handle.writeFile(`${process.pid}\n`);
           try {
+            if (__wrapMetaLockTestHooks.failStatAfterWrite) {
+              throw new Error("simulated fstat failure (test seam)");
+            }
             const written = await handle.stat();
             acquired = { ino: written.ino, mtimeMs: written.mtimeMs };
           } catch {
-            // Identity unavailable; the release below degrades to the
-            // pre-verify unconditional unlink rather than leaking the lock.
+            // Identity unavailable; the release below fails CLOSED (skips
+            // the unlink, leaving the file for the operator's manual-break
+            // runbook) rather than blind-unlinking, which could otherwise
+            // evict a successor's live lock. See
+            // `identityUnavailableAfterAcquire` above.
+            identityUnavailableAfterAcquire = true;
           }
         } finally {
           await handle.close();
@@ -1401,14 +1431,27 @@ async function withWrapMetaLock<T>(
     // and let a third contender run the critical section alongside it.
     // Release only a lock whose identity matches the one this holder
     // created.
+    //
+    // Fourteenth round: when identity could not be captured
+    // (`identityUnavailableAfterAcquire`), this holder cannot prove the
+    // lock file on disk is still the one it created, so it fails CLOSED
+    // and skips the unlink entirely rather than falling back to the old
+    // unconditional unlink - that fallback could otherwise evict a live
+    // successor's lock, which is exactly the property this release exists
+    // to prevent. The file is left for the operator's manual-break
+    // runbook, same as an ordinary crash would leave it.
     try {
-      const current = await lstat(lockPath);
-      if (
-        acquired === undefined ||
-        (current.ino === acquired.ino && current.mtimeMs === acquired.mtimeMs)
-      ) {
-        await unlink(lockPath);
+      // `identityUnavailableAfterAcquire` is the only way `acquired` can be
+      // undefined at this point (the postCreateErr path above always
+      // rethrows before `break`, so it never reaches this finally block).
+      if (!identityUnavailableAfterAcquire && acquired !== undefined) {
+        const current = await lstat(lockPath);
+        if (current.ino === acquired.ino && current.mtimeMs === acquired.mtimeMs) {
+          await unlink(lockPath);
+        }
       }
+      // else: best-effort no-op, leaving the lock file for the operator's
+      // manual-break runbook.
     } catch {
       // Best-effort release; a survivor is cleared by the operator per
       // the fail-closed acquisition refusal above.
