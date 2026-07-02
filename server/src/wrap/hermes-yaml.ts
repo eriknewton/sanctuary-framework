@@ -273,10 +273,26 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   let keyLine = -1;
   let remainder = "";
   for (let i = 0; i < lines.length; i++) {
-    if (indentOf(lines[i]!) !== 0) continue;
-    assertNoHiddenTopLevelMcpServersKey(lines[i]!, i);
-    const m = RECOGNIZED_FIELD_RE.exec(lines[i]!);
-    if (!m) continue;
+    const line = lines[i]!;
+    if (indentOf(line) !== 0) continue;
+    const trimmed = line.trim();
+    if (
+      trimmed === "" ||
+      trimmed.startsWith("#") ||
+      trimmed === "---" ||
+      trimmed === "..."
+    ) {
+      continue;
+    }
+    assertNoHiddenTopLevelMcpServersKey(line, i);
+    const m = RECOGNIZED_FIELD_RE.exec(line);
+    if (!m) {
+      throw new HermesYamlUnsupportedError(
+        `config.yaml has column-0 content this line-oriented scan cannot ` +
+          `classify as a plain \`key:\` (line ${i + 1}); refusing to edit. ` +
+          "Rewrite mcp_servers as a plain top-level block mapping and re-run wrap."
+      );
+    }
     if (m[2] !== undefined && canonicalFieldKey(m) === null) {
       // A double-quoted top-level key whose escape sequence canonicalFieldKey
       // cannot decode (e.g. a `\xXX`/`\UXXXXXXXX` YAML hex escape, which

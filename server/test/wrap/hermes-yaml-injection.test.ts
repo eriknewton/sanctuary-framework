@@ -414,6 +414,94 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses a fully flow-style top-level mcp_servers config instead of adding a duplicate key", () => {
+    const existing = [
+      '{mcp_servers: {sanctuary: {command: "npx", env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok}}}}',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      /column-0 content/
+    );
+  });
+
+  it("refuses top-level flow mappings and sequences at column 0", () => {
+    for (const existing of [
+      ["{model: Hermes-4-405B}", ""].join("\n"),
+      ["- model: Hermes-4-405B", ""].join("\n"),
+    ]) {
+      expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+        HermesYamlUnsupportedError
+      );
+      expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+        /column-0 content/
+      );
+    }
+  });
+
+  it("handles a normal multi-key block config without false-refusing", () => {
+    const existing = [
+      "model: Hermes-4-405B",
+      "logging:",
+      "  level: info",
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "old-command"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("replace-entry");
+    expect(plan.content).toContain("model: Hermes-4-405B");
+    expect(plan.content).toContain("logging:\n  level: info");
+    expect(plan.content).toContain('command: "npx"');
+    expect(plan.content).not.toContain("old-command");
+  });
+
+  it("skips leading and trailing YAML document markers without false-refusing", () => {
+    const existing = [
+      "---",
+      "model: Hermes-4-405B",
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "old-command"',
+      "...",
+      "",
+    ].join("\n");
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("replace-entry");
+    expect(plan.content.startsWith("---\n")).toBe(true);
+    expect(plan.content).toContain("\n...\n");
+    expect(plan.content).toContain('command: "npx"');
+  });
+
+  it("handles comment-and-blank-line-rich configs without false-refusing", () => {
+    const existing = [
+      "# Hermes config",
+      "",
+      "model: Hermes-4-405B",
+      "",
+      "# MCP servers",
+      "mcp_servers:",
+      "",
+      "  # existing user entry",
+      "  weather:",
+      '    command: "uvx"',
+      "",
+      "# end of config",
+      "",
+    ].join("\n");
+    const plan = planHermesYamlInjection(existing, ENTRY);
+    expect(plan.action).toBe("append-entry");
+    expect(plan.preservedEntryNames).toEqual(["weather"]);
+    expect(plan.content).toContain("# Hermes config");
+    expect(plan.content).toContain("  sanctuary:");
+    expect(plan.content).toContain("# end of config");
+  });
+
   it("refuses top-level YAML constructs that can hide or synthesize mcp_servers from the line scan", () => {
     // PyYAML loads each of these as a top-level `mcp_servers` key, but the
     // line-oriented scanner cannot safely locate the block or mirror the
