@@ -289,6 +289,87 @@ describe("planHermesYamlInjection (pure)", () => {
     expect(planHermesYamlInjection(comment, ENTRY).action).toBe("replace-entry");
   });
 
+  it("refuses a block-form env whose value is a flow mapping opening on the NEXT line (valid PyYAML the var scan would misread)", () => {
+    // PyYAML loads env.SECRET_TOKEN = "real-value"; the line-per-var
+    // extractor would flatten it into a phantom `{SECRET_TOKEN` var.
+    const flowMapping = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      {SECRET_TOKEN: real-value}",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(flowMapping, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A flow sequence opener under env: is equally unreadable.
+    const flowSequence = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      [SECRET_TOKEN]",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(flowSequence, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // Blank and comment lines between `env:` and its block vars are fine.
+    const commented = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "",
+      "      # dashboard token",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(commented, ENTRY).action).toBe("replace-entry");
+  });
+
+  it("refuses a sanctuary entry carrying a YAML merge key (PyYAML folds the anchor's fields, possibly env, into the entry)", () => {
+    const merged = [
+      "defaults: &defaults",
+      "  env:",
+      '    SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok"',
+      "mcp_servers:",
+      "  sanctuary:",
+      "    <<: *defaults",
+      '    command: "npx"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(merged, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A QUOTED "<<" is a literal string key under PyYAML, not a merge, so
+    // it must NOT refuse (nothing is folded in that the scan cannot see).
+    const quoted = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    "<<": literal',
+      '    command: "npx"',
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(quoted, ENTRY).action).toBe("replace-entry");
+    // Merge keys on OTHER entries are untouched surface; only the
+    // sanctuary entry is replaced wholesale.
+    const otherEntry = [
+      "defaults: &defaults",
+      "  env:",
+      '    WEATHER_KEY: "k"',
+      "mcp_servers:",
+      "  weather:",
+      "    <<: *defaults",
+      '    command: "uvx"',
+      "  sanctuary:",
+      '    command: "npx"',
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(otherEntry, ENTRY).action).toBe("replace-entry");
+  });
+
   it('refuses an inline sanctuary env behind a QUOTED field key (PyYAML reads `"env":` as the same key)', () => {
     const existing = [
       "mcp_servers:",
@@ -403,6 +484,30 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
       GOOD: "val",
       ALSO_GOOD: "kept",
     });
+  });
+
+  it("resolves null for a flow mapping opening on the line AFTER `env:` instead of flattening it into a phantom corrupted var", () => {
+    // PyYAML loads env.SECRET_TOKEN = "real-value"; the line-per-var read
+    // must not inherit a phantom `{SECRET_TOKEN: "real-value}"` pair. The
+    // consuming injection refuses this shape, so null never masks a write.
+    const flowMapping = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      {SECRET_TOKEN: real-value}",
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(flowMapping)).toBeNull();
+    const flowSequence = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      [SECRET_TOKEN]",
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(flowSequence)).toBeNull();
   });
 
   it("skips block-scalar, anchored, aliased, tagged, and flow values instead of inheriting corrupted literals", () => {

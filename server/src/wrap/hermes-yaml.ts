@@ -387,6 +387,17 @@ function ensureTrailingNewline(lines: string[]): string {
 const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
 
 /**
+ * Shared refusal copy for every env value shape that is valid PyYAML but
+ * unreadable by the line-per-var extractor: an inline flow/scalar value on
+ * the `env:` line itself, or a flow collection opening on the next line.
+ * One constant so the two throw sites cannot drift apart.
+ */
+const INLINE_ENV_REFUSAL_MESSAGE =
+  "config.yaml sanctuary entry carries an inline env value this tool " +
+  "cannot safely inherit; convert it to block-mapping form (one " +
+  "`KEY: value` line per var under `env:`) and re-run wrap.";
+
+/**
  * Refuse `env` field shapes on the EXISTING sanctuary entry that
  * extractSanctuaryEntryEnv cannot faithfully read, before the entry is
  * replaced wholesale:
@@ -396,8 +407,16 @@ const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
  *     line-by-line field scan below never visits)
  *   - an inline (flow/scalar) `env:` value (the extractor's env-line
  *     match requires block form)
+ *   - a block-form `env:` whose value is a flow collection opening on
+ *     the NEXT line (`env:` then an indented `{KEY: v}` is valid PyYAML
+ *     the extractor's line-per-var read would flatten into a phantom
+ *     corrupted var)
  *   - duplicate `env` field keys (PyYAML is last-wins; the extractor
  *     reads one line, so it cannot know which set Hermes actually used)
+ *   - a YAML merge key (`<<: *anchor`): PyYAML folds the anchored
+ *     mapping's fields, possibly including env vars, into the entry, but
+ *     this line-oriented scan cannot resolve anchors, so replacing the
+ *     entry would silently drop whatever the merge carried
  * Proceeding on any of these shapes would silently drop the operator's
  * hand-authored vars (e.g. a dashboard auth token) from the rewritten
  * entry, the same silent-drop class the env inheritance exists to
@@ -435,7 +454,20 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
     const indent = indentOf(line);
     if (fieldIndent === -1) fieldIndent = indent;
     if (indent !== fieldIndent) continue;
-    const m = ENV_FIELD_RE.exec(line.trim());
+    const trimmed = line.trim();
+    // A plain `<<` key is the YAML merge key: PyYAML (the parser Hermes
+    // runs) folds the anchored mapping's fields into this entry, so it
+    // may genuinely feed Hermes env vars this scan cannot see. (A QUOTED
+    // "<<" is a literal string key under PyYAML, not a merge, so only
+    // the plain spelling refuses.)
+    if (/^<<\s*:/.test(trimmed)) {
+      throw new HermesYamlUnsupportedError(
+        "config.yaml sanctuary entry uses a YAML merge key (<<) whose " +
+          "merged fields this tool cannot read; inline the merged fields " +
+          "and re-run wrap."
+      );
+    }
+    const m = ENV_FIELD_RE.exec(trimmed);
     if (!m) continue;
     if (sawEnvField) {
       throw new HermesYamlUnsupportedError(
@@ -449,13 +481,25 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
     // Block form (empty remainder or trailing comment) is the readable
     // shape; the empty flow mapping `{}` has nothing to inherit. Keep
     // scanning: a LATER duplicate env field must still refuse.
-    if (remainder === "" || remainder.startsWith("#")) continue;
+    if (remainder === "" || remainder.startsWith("#")) {
+      // Block-form field line, but the VALUE may still be a flow
+      // collection opening on the NEXT line (`env:` then an indented
+      // `{KEY: v}` is valid PyYAML), which the extractor's line-per-var
+      // read would flatten into a phantom corrupted var. Only the first
+      // nested content line can open the value node, so peek at it.
+      for (let j = i + 1; j < entry.end; j++) {
+        const nested = lines[j]!;
+        if (isBlankOrComment(nested)) continue;
+        if (indentOf(nested) <= fieldIndent) break;
+        if (/^[[{]/.test(nested.trim())) {
+          throw new HermesYamlUnsupportedError(INLINE_ENV_REFUSAL_MESSAGE);
+        }
+        break;
+      }
+      continue;
+    }
     if (/^\{\s*\}\s*(#.*)?$/.test(remainder)) continue;
-    throw new HermesYamlUnsupportedError(
-      "config.yaml sanctuary entry carries an inline env value this tool " +
-        "cannot safely inherit; convert it to block-mapping form (one " +
-        "`KEY: value` line per var under `env:`) and re-run wrap."
-    );
+    throw new HermesYamlUnsupportedError(INLINE_ENV_REFUSAL_MESSAGE);
   }
 }
 
@@ -475,10 +519,12 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
  * confidently is skipped rather than guessed at: block scalars, anchors,
  * aliases, tags, flow collections, and multi-line plain scalars all
  * resolve to no inheritance for that var (never a corrupted literal), and
- * a flow-form `env: {...}` or an unsupported `mcp_servers` shape resolves
- * null. Null never masks a write: the consuming injection REFUSES
- * unsupported block shapes, an inline sanctuary `env:` value, and
- * duplicate sanctuary `env` fields loudly (HermesYamlUnsupportedError,
+ * a flow-form `env: {...}` (inline on the field line or opening on the
+ * next line) or an unsupported `mcp_servers` shape resolves null. Null
+ * never masks a write: the consuming injection REFUSES unsupported block
+ * shapes, an inline or next-line flow sanctuary `env:` value, duplicate
+ * sanctuary `env` fields, and a YAML merge key on the entry loudly
+ * (HermesYamlUnsupportedError,
  * see refuseInlineSanctuaryEnv) before any replace-entry write proceeds;
  * both screens match quoted `env` keys, so no PyYAML-valid spelling of
  * the field escapes the refusal while eluding this read.
@@ -551,8 +597,16 @@ export function extractSanctuaryEntryEnv(
       continue;
     }
     lastInheritedKey = null;
+    const trimmed = line.trim();
+    // A flow-collection opener here means the env value is a flow mapping
+    // on its own line(s) (`env:` then an indented `{KEY: v}`, which is
+    // valid PyYAML), not a block of var lines; the single-line read would
+    // flatten it into a phantom corrupted var (`{KEY` inheriting `v}`).
+    // The whole env block is unreadable, so resolve null (skip, not
+    // guess); the consuming injection's refusal screen blocks the write.
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) return null;
     const m = /^(?:"([^"]+)"|'([^']+)'|([^\s:#'"][^:]*?))\s*:\s*(.*)$/.exec(
-      line.trim()
+      trimmed
     );
     if (!m) continue;
     const key = (m[1] ?? m[2] ?? m[3] ?? "").trim();
