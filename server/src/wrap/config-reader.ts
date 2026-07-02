@@ -860,6 +860,18 @@ async function readExistingWrapMetaRaw(): Promise<Record<
   return null;
 }
 
+/**
+ * True when a wrap-meta pointer file (canonical or legacy filename) exists
+ * and parses to an object. Read leniently, like the F6 preservation check.
+ * MED-2 (crash-window honesty): the wrap flow uses this to detect the
+ * "config already carries the sanctuary entry but NO meta exists" state an
+ * interrupted earlier wrap leaves behind, and warns that the pristine
+ * pre-wrap config cannot be identified.
+ */
+export async function hasExistingWrapMeta(): Promise<boolean> {
+  return (await readExistingWrapMetaRaw()) !== null;
+}
+
 /** True when the path names an existing, accessible file. */
 async function fileExists(path: string): Promise<boolean> {
   try {
