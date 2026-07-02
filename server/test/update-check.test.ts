@@ -91,8 +91,31 @@ describe("update-check", () => {
       // command (which rewrites nothing) must NOT be the advertised action.
       expect(msg).toContain("npx @sanctuary-framework/mcp-server@0.4.0 protect");
       expect(msg).not.toContain("@latest");
-      // Honesty: it says the pin exists and that a direct run does not upgrade.
-      expect(msg).toContain("version-pinned");
+    });
+
+    it("wrapped advice states pinning as a v1.6.1+ property, not unconditionally", () => {
+      const msg = formatUpdateMessage("0.3.1", "0.4.0", true);
+      // Honesty: v1.5.0-v1.6.0 wraps wrote an UNPINNED harness entry (pinning
+      // arrived in v1.6.1 via #846), so the copy must scope the pin claim to
+      // the v1.6.1+ cohort rather than asserting every wrapped install is
+      // pinned.
+      expect(msg).toContain("v1.6.1");
+      expect(msg).toContain("version-pin");
+      expect(msg).not.toContain("This install is version-pinned");
+    });
+
+    it("wrapped advice tells fortress/tenant operators to reuse the original wrap's flags and environment", () => {
+      const msg = formatUpdateMessage("0.3.1", "0.4.0", true);
+      // protect rebuilds the harness entry env from the NEW run's process.env
+      // (buildSanctuaryEnv, wrap/cli.ts); re-running from a fresh shell
+      // without the original --fortress / tenancy vars would silently
+      // re-point the wrap at the default fortress, orphaning the existing
+      // identity/custody/policy/audit state. The advice must say to re-run
+      // with the same flags and environment.
+      expect(msg).toContain("same flags and environment");
+      expect(msg).toContain("--fortress");
+      expect(msg).toContain("SANCTUARY_FORTRESS_PATH");
+      expect(msg).toContain("SANCTUARY_STORAGE_PATH");
     });
 
     it("wrapped advice is a single [Sanctuary]-prefixed line", () => {
@@ -143,6 +166,44 @@ describe("update-check", () => {
     it("returns false when the pointer path is a directory, not a file", async () => {
       const storage = await tempStorage();
       await mkdir(join(storage, "backup", "wrap-meta.json"), {
+        recursive: true,
+      });
+      expect(await detectWrappedInstall(storage)).toBe(false);
+    });
+
+    it("returns true when only a surface-scoped wrap-meta slot exists", async () => {
+      // Multi-surface installs: after wrap A -> wrap B -> unwrap B, the only
+      // remaining pointer can be A's surface-scoped slot
+      // (wrap-meta-<12-hex-tag>.json); the probe must see it or a
+      // still-wrapped install gets the non-upgrading bare-npx advice.
+      const storage = await tempStorage();
+      await mkdir(join(storage, "backup"), { recursive: true });
+      await writeFile(
+        join(storage, "backup", "wrap-meta-0123456789ab.json"),
+        JSON.stringify({ backupPath: "/x", originalPath: "/y" })
+      );
+      expect(await detectWrappedInstall(storage)).toBe(true);
+    });
+
+    it("ignores files that do not match the scoped-slot shape", async () => {
+      const storage = await tempStorage();
+      await mkdir(join(storage, "backup"), { recursive: true });
+      // Wrong tag length, non-hex tag, wrong extension, and unrelated files
+      // must not count as wrap evidence.
+      for (const name of [
+        "wrap-meta-0123.json",
+        "wrap-meta-ZZZZZZZZZZZZ.json",
+        "wrap-meta-0123456789ab.txt",
+        "settings.json.bak",
+      ]) {
+        await writeFile(join(storage, "backup", name), "{}");
+      }
+      expect(await detectWrappedInstall(storage)).toBe(false);
+    });
+
+    it("returns false when a scoped-slot name is a directory, not a file", async () => {
+      const storage = await tempStorage();
+      await mkdir(join(storage, "backup", "wrap-meta-0123456789ab.json"), {
         recursive: true,
       });
       expect(await detectWrappedInstall(storage)).toBe(false);

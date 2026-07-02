@@ -17,7 +17,7 @@
 
 import { get as httpsGet } from "node:https";
 import { get as httpGet } from "node:http";
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveStoragePath } from "./paths.js";
 import {
@@ -109,24 +109,44 @@ export function isNewerVersion(current: string, latest: string): boolean {
 const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
 
 /**
+ * Surface-scoped wrap-meta slot filenames: `wrap-meta-<12-hex-surface-tag>.json`.
+ * On a multi-surface install (e.g. wrap claude-code, then wrap hermes) the wrap
+ * surface keeps per-surface pointers in these scoped slots, so after the
+ * canonical pointer is consumed by an unwrap of ONE surface, a still-wrapped
+ * install may hold ONLY scoped slots. The probe must consult them or such an
+ * install gets the non-upgrading bare-npx advice. Pattern duplicated (like the
+ * canonical filename above) as a presence probe only; it must stay in sync with
+ * `WRAP_META_SURFACE_PATTERN` in `wrap/config-reader.ts` (the surface-scoped
+ * meta change; until that lands, no writer produces this shape and the extra
+ * probe is a harmless no-op, so this is safe regardless of merge order).
+ */
+const WRAP_META_SURFACE_SLOT_PATTERN = /^wrap-meta-[0-9a-f]{12}\.json$/;
+
+/**
  * Minimal, independent presence check: was this install wrapped by
- * `sanctuary protect`? True when the canonical wrap-meta pointer file exists
- * under the instance's backup directory.
+ * `sanctuary protect`? True when the canonical wrap-meta pointer file OR any
+ * surface-scoped wrap-meta slot exists under the instance's backup directory
+ * (multi-surface installs can hold only scoped slots after one surface
+ * unwraps; see WRAP_META_SURFACE_SLOT_PATTERN).
  *
  * Why not reuse `hasExistingWrapMeta` from `wrap/config-reader.ts`: that
  * module is the heavy, CLI-side wrap surface (custody reads, path-identity
  * verification); pulling it into this light startup-path module would couple
  * server boot to the wrap import graph for a one-bit answer. A stat of the
- * pointer file is enough here: the update notice only needs to know WHICH
- * upgrade advice to print, and a false negative safely degrades to the
- * unwrapped advice.
+ * pointer file (plus a directory listing for scoped slots) is enough here:
+ * the update notice only needs to know WHICH upgrade advice to print, and a
+ * false negative safely degrades to the unwrapped advice.
  *
  * Deliberate scope limits (honest, documented):
  * - The legacy pre-vocabulary-sweep pointer filename is NOT probed; its
  *   literal is confined to the wrap fallback-read module by the
  *   retired-vocabulary CI gate. Installs old enough to carry only the legacy
- *   pointer predate the version-pinned MCP entry (v1.6.1), so for them the
- *   unwrapped npx advice is exactly today's status-quo behavior.
+ *   pointer predate version pinning entirely, so for them the unwrapped npx
+ *   advice is exactly today's status-quo behavior. (Note the converse does
+ *   NOT hold: canonical-pointer wraps performed by v1.5.0-v1.6.0 also
+ *   predate the version-PINNED MCP entry, which arrived in v1.6.1; the
+ *   wrapped advice copy therefore states pinning as a v1.6.1+ property
+ *   rather than asserting it for every wrapped install.)
  * - Tenant-path wraps by OLDER releases: a wrap run under
  *   SANCTUARY_STORAGE_PATH tenancy writes the pointer into the tenant
  *   directory, but wraps performed by releases from before
@@ -144,8 +164,15 @@ const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
  *   genuinely unwrapped today. Impact is advisory-copy-only (misleading
  *   upgrade wording; following it re-runs protect, i.e. wraps at the new
  *   version); no state or enforcement decision keys off this bit. All
- *   current-version unwrap paths delete the pointer via `removeWrapMeta`,
- *   so the mainline is clean.
+ *   current-version unwrap paths delete the pointer via `removeWrapMeta`.
+ * - False NEGATIVE on pre-scoped-slot multi-surface leftovers: a second
+ *   surface wrapped by a release whose saveWrapMeta still clobbered the
+ *   single canonical pointer, followed by an unwrap of the surface the
+ *   pointer named, leaves the other surface wrapped with NO pointer file at
+ *   all; nothing on disk records it, so the probe cannot see it (unwrapped
+ *   advice; advisory-copy-only). Wraps performed after the surface-scoped
+ *   slots landed keep a per-surface pointer and are covered by the scoped
+ *   probe above.
  * - Never throws: any filesystem error resolves false (unwrapped advice).
  *
  * @param storagePath - instance storage root (tests inject a temp dir;
@@ -154,12 +181,28 @@ const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
 export async function detectWrappedInstall(
   storagePath: string = resolveStoragePath(),
 ): Promise<boolean> {
+  const backupDir = join(storagePath, "backup");
   try {
-    const s = await stat(join(storagePath, "backup", WRAP_META_POINTER_FILENAME));
-    return s.isFile();
+    const s = await stat(join(backupDir, WRAP_META_POINTER_FILENAME));
+    if (s.isFile()) return true;
   } catch {
-    return false;
+    // Canonical pointer absent/unreadable; fall through to the scoped slots.
   }
+  try {
+    const entries = await readdir(backupDir);
+    for (const name of entries) {
+      if (!WRAP_META_SURFACE_SLOT_PATTERN.test(name)) continue;
+      try {
+        const s = await stat(join(backupDir, name));
+        if (s.isFile()) return true;
+      } catch {
+        // Unreadable slot: keep scanning; any remaining slot can still match.
+      }
+    }
+  } catch {
+    // Absent/unreadable backup dir resolves false (unwrapped advice).
+  }
+  return false;
 }
 
 /**
@@ -169,13 +212,26 @@ export async function detectWrappedInstall(
  * (v1.6.1 install-path hardening): the operator runs precisely what was
  * advertised, not whatever `latest` resolves to by the time they act.
  *
- * Wrapped installs (`wrapped = true`): a `sanctuary protect` wrap writes a
- * version-PINNED MCP entry into the harness config, so running the bare npx
+ * Wrapped installs (`wrapped = true`): a `sanctuary protect` wrap from v1.6.1
+ * onward writes a version-PINNED MCP entry into the harness config (#846;
+ * v1.5.0-v1.6.0 wraps wrote an unpinned entry), so running the bare npx
  * command would only start a transient foreground server and rewrite nothing;
- * the harness would keep spawning the old pinned version while the operator
- * believes they upgraded. The wrapped advice therefore points at re-running
- * `protect` FROM the new version, which is the mechanism that rewrites the
- * pin (see `resolveSanctuaryCommand` in `wrap/cli.ts`).
+ * a v1.6.1+ harness would keep spawning the old pinned version while the
+ * operator believes they upgraded. The wrapped advice therefore points at
+ * re-running `protect` FROM the new version, which is the mechanism that
+ * rewrites the entry (see `resolveSanctuaryCommand` in `wrap/cli.ts`), and it
+ * states pinning as a v1.6.1+ property so the copy stays honest for the
+ * older unpinned cohort (for whom re-running protect is still correct
+ * advice: it upgrades the entry to a pin at the new version).
+ *
+ * Fortress/tenant wraps: `protect` rebuilds the harness entry's env from the
+ * env of the NEW protect run (`buildSanctuaryEnv` in `wrap/cli.ts`), so an
+ * operator who originally wrapped with `--fortress` or under
+ * SANCTUARY_FORTRESS_PATH / SANCTUARY_STORAGE_PATH and re-runs protect from a
+ * fresh shell without them would silently re-point the wrap at the DEFAULT
+ * fortress, orphaning their existing identity/custody/policy/audit state.
+ * The advice explicitly says to re-run with the same flags and environment
+ * as the original wrap.
  */
 export function formatUpdateMessage(
   current: string,
@@ -185,8 +241,8 @@ export function formatUpdateMessage(
   if (wrapped) {
     return (
       `[Sanctuary] Update available: ${current} → ${latest}. ` +
-      `This install is version-pinned by 'sanctuary protect'; running the server directly does not upgrade it. ` +
-      `To upgrade the pin, re-run protect from the new version: ` +
+      `This install was wrapped by 'sanctuary protect'; wraps from v1.6.1 onward version-pin the harness entry, so running the server directly does not upgrade it. ` +
+      `To upgrade the wrap, re-run protect from the new version with the same flags and environment as the original wrap (e.g. --fortress or SANCTUARY_FORTRESS_PATH/SANCTUARY_STORAGE_PATH, if used): ` +
       `npx @sanctuary-framework/mcp-server@${latest} protect --<your-harness>`
     );
   }
