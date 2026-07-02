@@ -15,10 +15,10 @@ per the thesis-gate rule).
   TypeScript evaluator; it is NOT kernel-backed).
 - Loopback confinement is pf-enforced; the per-uid pf mechanism is
   drill-proven on Tahoe (macOS 26.5.1) only, N=3, 2026-07-02.
-- The word "unbypassable" must NOT appear in any user-visible string, MCP
-  tool description, README, or docs page for this feature. No external
-  "unbypassable / exclusive-egress" claim ships until the cross-OS-family
-  leg below is captured.
+- Do not make absolute bypass-resistance claims in any user-visible string,
+  MCP tool description, README, or docs page for this feature. No external
+  exclusive-egress claim ships until the cross-OS-family leg below is
+  captured.
 
 ## Keystone evidence pointer
 
