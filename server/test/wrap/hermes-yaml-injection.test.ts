@@ -261,6 +261,24 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
     });
   });
 
+  it("skips nested mappings under env: instead of flattening their children into phantom vars", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      GOOD: val",
+      "      NESTED:",
+      "        inner: oops",
+      "      ALSO_GOOD: kept",
+      "",
+    ].join("\n");
+    expect(extractSanctuaryEntryEnv(yaml)).toEqual({
+      GOOD: "val",
+      ALSO_GOOD: "kept",
+    });
+  });
+
   it("resolves null for absent files, missing entries, missing env, and unsupported shapes", () => {
     expect(extractSanctuaryEntryEnv(null)).toBeNull();
     expect(extractSanctuaryEntryEnv("model: Hermes-4-405B\n")).toBeNull();
