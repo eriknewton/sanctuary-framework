@@ -732,8 +732,15 @@ export async function checkPinnedVersionResolvable(
         url,
         { headers: { Accept: "application/json" }, timeout: timeoutMs },
         (res) => {
-          // Only the response STATUS is consulted; drain the body.
-          res.resume();
+          // Only the response STATUS is consulted. Destroy the request
+          // (not just res.resume()-drain) before settling: a drained-but-
+          // open socket still has Node's per-byte inactivity timer backing
+          // it, so a tarpit that dribbles the body one byte at a time
+          // forever keeps that socket - and the event loop - alive even
+          // after this promise has resolved. req.destroy() releases the
+          // handle outright so a slow/hostile body can't outlive the
+          // decision that already stopped needing it.
+          req?.destroy();
           if (res.statusCode === 200) settle("resolvable");
           else if (res.statusCode === 404)
             settle(notFoundIsAffirmative ? "unpublished" : "unreachable");

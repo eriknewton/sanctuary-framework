@@ -1385,6 +1385,60 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       }
     });
 
+    it("sixteenth round: a responder that sends status+headers promptly then dribbles the body forever does not leak an open socket past settle", async () => {
+      // Round 14 closed the PRE-settle tarpit window (a slow STATUS line).
+      // This closes the POST-settle window: once status is consulted the
+      // function only needs to decide resolvable/unreachable, but the
+      // production code used to only res.resume()-drain the body instead
+      // of destroying the request. A drained-but-open socket still has
+      // Node's per-byte inactivity timer backing it, so a responder that
+      // completes headers/status immediately and then dribbles the BODY
+      // one byte at a time forever keeps that socket - and the process
+      // event loop - alive indefinitely even though the promise already
+      // resolved. Assert directly on the socket instead of only on timing:
+      // the promise resolving fast was never the bug, the leaked handle
+      // was.
+      const dripIntervals: ReturnType<typeof setInterval>[] = [];
+      const sockets: import("node:net").Socket[] = [];
+      const drip = createServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write("{");
+        const interval = setInterval(() => {
+          if (res.destroyed) return;
+          res.write(" ");
+        }, 20);
+        dripIntervals.push(interval);
+        res.socket?.on("close", () => clearInterval(interval));
+      });
+      drip.on("connection", (socket) => sockets.push(socket));
+      await new Promise<void>((resolve) =>
+        drip.listen(0, "127.0.0.1", () => resolve()),
+      );
+      const { port } = drip.address() as AddressInfo;
+      try {
+        const result = await checkPinnedVersionResolvable("9.9.9", {
+          registryBaseUrl: `http://127.0.0.1:${port}`,
+          timeoutMs: 2000,
+        });
+        expect(result).toBe("resolvable");
+        // The server-side socket for this request must observe the client
+        // tearing down its end once settle() has decided the outcome, not
+        // merely draining - otherwise the still-dribbling body keeps
+        // resetting the client socket's inactivity timer and the handle
+        // (and the event loop) never frees.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(sockets.length).toBeGreaterThan(0);
+        for (const socket of sockets) {
+          expect(socket.destroyed || socket.readyState === "closed").toBe(
+            true,
+          );
+        }
+      } finally {
+        for (const interval of dripIntervals) clearInterval(interval);
+        await new Promise<void>((resolve) => drip.close(() => resolve()));
+      }
+    });
+
     it("SANCTUARY_NO_UPDATE_CHECK=1 skips the probe entirely (zero outbound)", async () => {
       process.env.SANCTUARY_NO_UPDATE_CHECK = "1";
       expect(
