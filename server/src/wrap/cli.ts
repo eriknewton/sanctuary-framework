@@ -455,14 +455,48 @@ async function pathExists(path: string): Promise<boolean> {
  * would silently change dashboard auth on the surface that counts. The
  * shared chokepoint also applies the never-inherit screen for the
  * plaintext-remote downgrade flag to the YAML surface.
+ *
+ * `skippedEnvKeys` (optional out-param) receives the names of existing
+ * sanctuary-entry env vars whose YAML value shape the extractor could not
+ * read (block scalars, anchors, tags, flow collections, multi-line plain
+ * scalars) AND that no other source re-supplied, i.e. exactly the vars the
+ * rewritten entry will not carry. Callers print a one-line notice naming
+ * them so the skip-not-guess tradeoff is never silent at the operator
+ * surface.
  */
 function resolveHermesYamlEnv(
   existingYaml: string | null,
-  sanctuaryEnv: Record<string, string>
+  sanctuaryEnv: Record<string, string>,
+  skippedEnvKeys?: string[]
 ): Record<string, string> | undefined {
-  return resolveWrapEntryEnv(
+  const skipped: string[] = [];
+  const resolved = resolveWrapEntryEnv(
     Object.keys(sanctuaryEnv).length > 0 ? sanctuaryEnv : undefined,
-    extractSanctuaryEntryEnv(existingYaml)
+    extractSanctuaryEntryEnv(existingYaml, skipped)
+  );
+  if (skippedEnvKeys) {
+    for (const key of skipped) {
+      // A var re-supplied by this run's shell (or a critical-var backstop)
+      // IS carried on the rewritten entry, so it is not reported as lost.
+      if (!resolved || !(key in resolved)) skippedEnvKeys.push(key);
+    }
+  }
+  return resolved;
+}
+
+/**
+ * One-line operator notice naming existing sanctuary-entry env vars the
+ * re-wrap will NOT carry forward because their YAML value shape is one the
+ * scoped reader skips rather than guesses at (see extractSanctuaryEntryEnv).
+ * Returns null when nothing was skipped.
+ */
+function formatSkippedHermesEnvNotice(skippedEnvKeys: string[]): string | null {
+  if (skippedEnvKeys.length === 0) return null;
+  return (
+    `  Hermes MCP routing: NOT inheriting ${skippedEnvKeys.length} env var(s) ` +
+    `whose YAML value shape this tool cannot read confidently ` +
+    `(${skippedEnvKeys.join(", ")}); re-add them under the sanctuary entry's ` +
+    `env: block by hand if still needed.`
   );
 }
 
@@ -485,7 +519,8 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const sanctuaryEnv = buildSanctuaryEnv(options);
   const { command, args } = resolveSanctuaryCommand(options);
   try {
-    const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv);
+    const skippedEnvKeys: string[] = [];
+    const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv, skippedEnvKeys);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
       args,
@@ -495,6 +530,11 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
     console.error(
       `  Hermes MCP routing: would ${formatHermesYamlAction(plan, yamlPath)}`
     );
+    const skipNotice = formatSkippedHermesEnvNotice(skippedEnvKeys);
+    if (skipNotice) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(skipNotice);
+    }
   } catch (err) {
     if (err instanceof HermesYamlUnsupportedError) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1210,7 +1250,12 @@ export async function runWrap(
   // untouched; the JSON write is kept for forward-compat with the
   // documented cli-config.json surface.
   let hermesYaml:
-    | { yamlPath: string; existedBefore: boolean; plan: HermesYamlPlan }
+    | {
+        yamlPath: string;
+        existedBefore: boolean;
+        plan: HermesYamlPlan;
+        skippedEnvKeys: string[];
+      }
     | undefined;
   if (agentConfig.platform === "hermes") {
     const yamlPath = hermesConfigYamlPath();
@@ -1237,13 +1282,19 @@ export async function runWrap(
       // resolveHermesYamlEnv): the replace-entry write below is wholesale,
       // so entry-persisted vars on the authoritative YAML surface must be
       // merged in here or a re-wrap silently drops them.
-      const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv);
+      const skippedEnvKeys: string[] = [];
+      const yamlEnv = resolveHermesYamlEnv(existingYaml, sanctuaryEnv, skippedEnvKeys);
       const plan = planHermesYamlInjection(existingYaml, {
         command: sanctuaryCommand,
         args: sanctuaryArgs,
         ...(yamlEnv && Object.keys(yamlEnv).length > 0 ? { env: yamlEnv } : {}),
       });
-      hermesYaml = { yamlPath, existedBefore: existingYaml !== null, plan };
+      hermesYaml = {
+        yamlPath,
+        existedBefore: existingYaml !== null,
+        plan,
+        skippedEnvKeys,
+      };
     } catch (err) {
       if (err instanceof HermesYamlUnsupportedError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1432,6 +1483,11 @@ export async function runWrap(
     console.error(
       `  Hermes MCP routing: ${formatHermesYamlAction(yamlSurface.plan, yamlSurface.yamlPath)}`
     );
+    const skipNotice = formatSkippedHermesEnvNotice(yamlSurface.skippedEnvKeys);
+    if (skipNotice) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(skipNotice);
+    }
   }
 
   // F6 + harden round: persist the unwrap pointer ONLY now, after every

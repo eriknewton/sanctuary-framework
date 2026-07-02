@@ -397,6 +397,45 @@ describe("extractSanctuaryEntryEnv (pure)", () => {
     expect(extractSanctuaryEntryEnv(yaml)).toEqual({ GOOD: "kept" });
   });
 
+  it("names every skipped var in the optional skippedKeys collector so wrap can warn instead of dropping silently", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      BLOCK_TOK: |",
+      "        secret-line",
+      "      ANCHORED: &a val",
+      "      MULTI_TOK: first line",
+      "        continued here",
+      '      GOOD: "kept"',
+      "",
+    ].join("\n");
+    const skippedKeys: string[] = [];
+    expect(extractSanctuaryEntryEnv(yaml, skippedKeys)).toEqual({
+      GOOD: "kept",
+    });
+    expect(skippedKeys.sort()).toEqual(["ANCHORED", "BLOCK_TOK", "MULTI_TOK"]);
+  });
+
+  it("does not name a duplicate key that still inherited a readable value", () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      TOK: |",
+      "        unreadable",
+      '      TOK: "readable"',
+      "",
+    ].join("\n");
+    const skippedKeys: string[] = [];
+    expect(extractSanctuaryEntryEnv(yaml, skippedKeys)).toEqual({
+      TOK: "readable",
+    });
+    expect(skippedKeys).toEqual([]);
+  });
+
   it("un-inherits a var whose plain scalar continues on a deeper-indented line instead of truncating it", () => {
     const yaml = [
       "mcp_servers:",
@@ -605,6 +644,50 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
     expect(yamlEnv!.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE).toBeUndefined();
     // The tenancy var from this run's shell is caller-authoritative.
     expect(yamlEnv!.SANCTUARY_STORAGE_PATH).toBe(join(tmpHome, ".sanctuary"));
+  });
+
+  it("re-wrap prints a notice naming env vars it cannot inherit instead of dropping them silently", async () => {
+    // Harden-review round: skip-not-guess is the documented tradeoff for
+    // unreadable YAML value shapes (block scalars, anchors, multi-line
+    // plain scalars), but the skip must be LOUD at the operator surface:
+    // a one-line stderr notice names each un-inherited var so the
+    // operator can re-add it by hand.
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    const yamlPath = join(hermesDir, "config.yaml");
+    await writeFile(join(hermesDir, "cli-config.json"), "{}");
+    await writeFile(
+      yamlPath,
+      [
+        "mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    args:",
+        '      - "@sanctuary-framework/mcp-server"',
+        "    env:",
+        "      OPERATOR_BLOCK_TOK: |",
+        "        multi-line secret",
+        '      READABLE_TOK: "kept"',
+        "",
+      ].join("\n")
+    );
+
+    const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runWrap({ hermes: true, noOpen: true }, makeDeps());
+      const out = stderrSpy.mock.calls
+        .map((call) => call.map(String).join(" "))
+        .join("\n");
+      expect(out).toContain("NOT inheriting 1 env var(s)");
+      expect(out).toContain("OPERATOR_BLOCK_TOK");
+      // The readable sibling inherited fine, so it is not named.
+      expect(out).not.toContain("READABLE_TOK,");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    const yamlEnv = extractSanctuaryEntryEnv(await readFile(yamlPath, "utf-8"));
+    expect(yamlEnv!.READABLE_TOK).toBe("kept");
+    expect(yamlEnv!.OPERATOR_BLOCK_TOK).toBeUndefined();
   });
 
   it("re-wrap updates the existing sanctuary entry instead of stacking a second one", async () => {

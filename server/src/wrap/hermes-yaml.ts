@@ -459,9 +459,15 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
  * see refuseInlineSanctuaryEnv) before any replace-entry write proceeds;
  * both screens match quoted `env` keys, so no PyYAML-valid spelling of
  * the field escapes the refusal while eluding this read.
+ *
+ * Skip-not-guess is deliberate, but it must not be SILENT at the operator
+ * surface: pass `skippedKeys` and every named var whose value was skipped
+ * (and did not end up inherited) is appended to it, so wrap can print a
+ * one-line notice naming the vars the rewritten entry will not carry.
  */
 export function extractSanctuaryEntryEnv(
-  existingContent: string | null
+  existingContent: string | null,
+  skippedKeys?: string[]
 ): Record<string, string> | null {
   if (existingContent === null) return null;
   const lines = existingContent.split("\n");
@@ -500,6 +506,7 @@ export function extractSanctuaryEntryEnv(
   // already resolved null), so they are skipped rather than flattened into
   // phantom vars; "cannot read confidently" means skip, not guess.
   const result: Record<string, string> = {};
+  const skipped = new Set<string>();
   let varIndent = -1;
   let lastInheritedKey: string | null = null;
   for (let i = envLine + 1; i < entry.end; i++) {
@@ -515,6 +522,7 @@ export function extractSanctuaryEntryEnv(
       // (skip, not guess) rather than write a wrong value back.
       if (indent > varIndent && lastInheritedKey !== null) {
         delete result[lastInheritedKey];
+        skipped.add(lastInheritedKey);
       }
       lastInheritedKey = null;
       continue;
@@ -527,9 +535,20 @@ export function extractSanctuaryEntryEnv(
     const key = (m[1] ?? m[2] ?? m[3] ?? "").trim();
     if (!key) continue;
     const value = parseYamlScalarValue(m[4] ?? "");
-    if (value === null) continue;
+    if (value === null) {
+      skipped.add(key);
+      continue;
+    }
     result[key] = value;
+    skipped.delete(key);
     lastInheritedKey = key;
+  }
+  if (skippedKeys) {
+    // Name only vars that genuinely carry no inherited value (a duplicate
+    // key with one readable spelling still inherits, so it is not named).
+    for (const key of skipped) {
+      if (!(key in result)) skippedKeys.push(key);
+    }
   }
   return Object.keys(result).length > 0 ? result : null;
 }
