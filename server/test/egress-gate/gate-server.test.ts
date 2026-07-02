@@ -115,6 +115,40 @@ describe("egress-gate/gate-server", () => {
     expect(decision && decision.kind === "decision" && decision.decision.disposition).toBe("allow");
   });
 
+  it("survives a client reset during the async decision window (no process-killing uncaughtException)", async () => {
+    // Regression: the confined agent is the party on the client socket and
+    // can RST mid-decision (liveness probe / peer resolution / policy). A
+    // listener-less 'error' event would crash the gate process; before the
+    // fix this test killed the vitest worker with an uncaught ECONNRESET.
+    const upstream = await startUpstream();
+    cleanups.push(upstream.close);
+    const slowProbe: GateLivenessProbe = {
+      check: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ live: true, reasons: [] }), 150)),
+    };
+    const { port } = await startGateOnEphemeralPort({
+      rules: [allowRule("127.0.0.1", upstream.port)],
+      livenessProbe: slowProbe,
+    });
+    // Send CONNECT, then reset the connection while the probe is in flight.
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write(`CONNECT 127.0.0.1:${upstream.port} HTTP/1.1\r\nHost: x\r\n\r\n`);
+        setTimeout(() => {
+          socket.resetAndDestroy();
+          resolve();
+        }, 50);
+      });
+      socket.on("error", () => {});
+    });
+    // Let the in-flight handler run past every await with the dead client.
+    await new Promise((r) => setTimeout(r, 300));
+    // The gate survived: a fresh CONNECT still tunnels.
+    const result = await rawConnect(port, `127.0.0.1:${upstream.port}`);
+    expect(result.statusLine).toBe("HTTP/1.1 200 Connection Established");
+    expect(result.body).toContain("upstream-hello");
+  });
+
   it("denies an allowlist miss with 403 (default deny)", async () => {
     const upstream = await startUpstream();
     cleanups.push(upstream.close);

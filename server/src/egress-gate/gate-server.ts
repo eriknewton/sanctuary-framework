@@ -134,6 +134,18 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   ): Promise<void> {
     const authority = request.url ?? "";
 
+    // 0. Swallow client-socket errors BEFORE the first await. The confined
+    // agent is the party on this socket and can reset the connection at any
+    // point during the async decision window below (liveness probe, peer
+    // resolution, destination policy); a listener-less 'error' event would
+    // crash the whole gate process (uncaughtException), letting the agent
+    // kill its own enforcement gate at will. The handler also tears down
+    // the upstream leg once one exists.
+    let upstream: net.Socket | null = null;
+    clientSocket.on("error", () => {
+      upstream?.destroy();
+    });
+
     // 1. MANDATORY fail-closed liveness gate. A cached result is only ever
     // a cached POSITIVE; any failure clears the cache so the next request
     // re-probes.
@@ -200,20 +212,23 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       return;
     }
 
-    const upstream = net.connect({ host: decision.address, port: decision.target.port });
-    upstream.once("connect", () => {
+    // The client may have reset during the async window above; don't dial
+    // the upstream for a dead client leg.
+    if (clientSocket.destroyed) {
+      return;
+    }
+    const upstreamSocket = net.connect({ host: decision.address, port: decision.target.port });
+    upstream = upstreamSocket;
+    upstreamSocket.once("connect", () => {
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) {
-        upstream.write(head);
+        upstreamSocket.write(head);
       }
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
+      upstreamSocket.pipe(clientSocket);
+      clientSocket.pipe(upstreamSocket);
     });
-    upstream.once("error", () => {
+    upstreamSocket.once("error", () => {
       clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
-    });
-    clientSocket.once("error", () => {
-      upstream.destroy();
     });
   }
 
