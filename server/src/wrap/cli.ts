@@ -1584,6 +1584,13 @@ export async function runWrap(
   // surface (resolve()d configPath). The previous tenant-global check let a
   // wrap-meta belonging to a DIFFERENT surface suppress the warning while
   // this surface was in exactly the crash-window state.
+  //
+  // Copy honesty (fifth round): hasExistingWrapMeta deliberately reads an
+  // UNREADABLE pointer as false (failing toward this warning), so the text
+  // says "no READABLE wrap metadata" - in the unreadable-pointer state the
+  // meta likely IS on disk and the deferred meta write later in this same
+  // run will refuse with "wrap metadata exists but could not be read";
+  // the unhedged wording flatly contradicted that message.
   if (
     configStillWrapped &&
     !(await hasExistingWrapMeta(agentConfig.configPath))
@@ -1591,10 +1598,10 @@ export async function runWrap(
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  WARNING: this config already contains a Sanctuary entry, but no` +
-        `\n  wrap metadata exists, so the pristine pre-wrap config could not` +
-        `\n  be identified. The backup taken by THIS wrap captures the` +
-        `\n  current (already-wrapped) contents, and --unwrap will restore` +
-        `\n  that state. If this follows an interrupted wrap, check` +
+        `\n  readable wrap metadata exists for it, so the pristine pre-wrap` +
+        `\n  config could not be identified. The backup taken by THIS wrap` +
+        `\n  captures the current (already-wrapped) contents, and --unwrap` +
+        `\n  will restore that state. If this follows an interrupted wrap, check` +
         `\n  ${join(storagePath, "backup")}` +
         `\n  for an older pristine backup (timestamped config-backup-* files)` +
         `\n  before relying on --unwrap.`
@@ -2965,9 +2972,15 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Would skip ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
+        // Fifth round (preview parity): the real unwrap snapshots this
+        // file's final contents into a timestamped backup BEFORE removing
+        // it (the recovery breadcrumb below); a dry run that omitted the
+        // snapshot read scarier than reality for an operator judging
+        // whether post-wrap edits would be lost.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed;` +
+            `\n  its final contents would first be preserved as a timestamped backup)`
         );
       }
     }

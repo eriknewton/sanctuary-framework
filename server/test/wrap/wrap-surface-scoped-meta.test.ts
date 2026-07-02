@@ -50,6 +50,17 @@
  *      a 404 maps to honest-unknown "unreachable" instead of the loud
  *      false "unpublished" dead-pin warning.
  *
+ * Fifth-round hardening pinned here (2026-07-02 fix round 3):
+ *  12. A degraded backup-dir LISTING (non-ENOENT readdir failure) on the
+ *      strict write path throws WrapMetaUnreadableError instead of hiding
+ *      the scoped slots and letting saveWrapMeta's slot-cleanup unlink an
+ *      unconsulted pristine pointer.
+ *  13. saveWrapMeta / removeWrapMeta serialize under the cross-process
+ *      advisory lock (wrap-meta.lock): concurrent wraps of different
+ *      surfaces cannot clobber each other's canonical pointer, the lock
+ *      never lingers after release, and a stale lock from a crashed
+ *      holder is broken instead of wedging every future wrap.
+ *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
  */
@@ -64,6 +75,7 @@ import {
   chmod,
   access,
   readdir,
+  utimes,
 } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
@@ -376,6 +388,138 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       expect(await hasExistingWrapMeta(configPath)).toBe(true);
     },
   );
+
+  // ── Fifth round: degraded directory LISTING must not destroy a pointer ──
+
+  it.skipIf(process.getuid?.() === 0)(
+    "saveWrapMeta refuses when the backup dir cannot be LISTED instead of deleting a relocated pristine pointer",
+    async () => {
+      const surfaceA = join(tmpHome, "listing-a.json");
+      const surfaceB = join(tmpHome, "listing-b.json");
+      await writeFile(surfaceA, '{"a":"pristine"}');
+      await writeFile(surfaceB, '{"b":"pristine"}');
+
+      const pristineA = await backupConfig(surfaceA);
+      await saveWrapMeta({
+        backupPath: pristineA,
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+      // Wrapping B relocates A's pointer into its scoped slot (canonical
+      // now names B); unwrapping B then retires the canonical pointer, so
+      // A's ONLY pointer lives in the scoped slot the directory listing
+      // must surface.
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceB),
+        originalPath: surfaceB,
+        platform: "hermes",
+        wrappedAt: new Date().toISOString(),
+      });
+      expect(await removeWrapMeta(surfaceB)).toEqual([]);
+      const slots = (await readdir(backupDirPath())).filter((name) =>
+        /^wrap-meta-[0-9a-f]{12}\.json$/.test(name),
+      );
+      expect(slots).toHaveLength(1);
+      const slotPath = join(backupDirPath(), slots[0]!);
+
+      // Write+execute but NOT read on the dir: per-file lookups (reads,
+      // creations, unlinks) all still succeed while readdir fails - the
+      // degraded state where the scoped slots turn invisible without any
+      // per-file read error. Pre-fix, a re-wrap of A here saw "no meta
+      // names A", skipped F6 preservation, and its slot-cleanup unlink
+      // (which needs no directory read) destroyed A's only pristine
+      // pointer.
+      await chmod(backupDirPath(), 0o300);
+      try {
+        await expect(
+          saveWrapMeta({
+            backupPath: join(backupDirPath(), "already-wrapped-a.json"),
+            originalPath: surfaceA,
+            platform: "claude-code",
+            wrappedAt: new Date().toISOString(),
+          }),
+        ).rejects.toThrow(WrapMetaUnreadableError);
+      } finally {
+        await chmod(backupDirPath(), 0o700);
+      }
+
+      // A's only pristine pointer survived in its scoped slot.
+      const relocated = JSON.parse(await readFile(slotPath, "utf-8"));
+      expect(relocated.originalPath).toBe(surfaceA);
+      expect(relocated.backupPath).toBe(pristineA);
+
+      // Once the listing works again, the re-wrap preserves it (F6).
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceA),
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+      const canonical = JSON.parse(
+        await readFile(join(backupDirPath(), "wrap-meta.json"), "utf-8"),
+      );
+      expect(canonical.originalPath).toBe(surfaceA);
+      expect(canonical.backupPath).toBe(pristineA);
+    },
+  );
+
+  // ── Fifth round: cross-process wrap-meta lock ──────────────────────────
+
+  it("concurrent saveWrapMeta calls for different surfaces serialize; neither pointer is orphaned", async () => {
+    const surfaceA = join(tmpHome, "race-a.json");
+    const surfaceB = join(tmpHome, "race-b.json");
+    await writeFile(surfaceA, '{"a":"pristine"}');
+    await writeFile(surfaceB, '{"b":"pristine"}');
+    const backupA = await backupConfig(surfaceA);
+    const backupB = await backupConfig(surfaceB);
+
+    // Pre-lock, both writers could read the canonical slot before either
+    // wrote, so the loser overwrote the winner's pointer WITHOUT relocating
+    // it. With the advisory lock, the interleaving is serialized and both
+    // surfaces keep a live pointer.
+    await Promise.all([
+      saveWrapMeta({
+        backupPath: backupA,
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      }),
+      saveWrapMeta({
+        backupPath: backupB,
+        originalPath: surfaceB,
+        platform: "hermes",
+        wrappedAt: new Date().toISOString(),
+      }),
+    ]);
+
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+    // The lock file itself never lingers after release.
+    await expect(
+      access(join(backupDirPath(), "wrap-meta.lock")),
+    ).rejects.toThrow();
+  });
+
+  it("a STALE wrap-meta lock (crashed holder) is broken instead of wedging every future wrap", async () => {
+    const configPath = join(tmpHome, "stale-lock-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+    await writeFile(lockPath, "999999\n");
+    const past = new Date(Date.now() - 10 * 60_000);
+    await utimes(lockPath, past, past);
+
+    await saveWrapMeta({
+      backupPath: backup,
+      originalPath: configPath,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+    await expect(access(lockPath)).rejects.toThrow();
+  });
 
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──
 

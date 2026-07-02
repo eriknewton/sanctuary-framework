@@ -576,16 +576,40 @@ function wrapMetaSurfaceFilename(originalPath: string): string {
 /**
  * Every wrap-meta pointer filename to consult, in read priority order:
  * canonical, legacy, then any surface-scoped slots found on disk (sorted
- * for determinism). Best-effort on the directory listing: an unreadable
- * or absent backup dir degrades to the two fixed filenames, whose own
- * reads classify their errors (ENOENT vs unreadable) at the call sites.
+ * for determinism).
+ *
+ * Listing-error policy mirrors the per-file read policy (fifth round): an
+ * ABSENT backup dir (ENOENT) genuinely holds no scoped slots and degrades
+ * to the two fixed filenames, but any other readdir failure (EACCES,
+ * EMFILE, EIO) makes the scoped slots INVISIBLE, not absent. On the
+ * lenient read paths (`strict: false`, the default) that still degrades
+ * best-effort. On the strict WRITE path (`strict: true`,
+ * readWrapMetaFilesRaw -> saveWrapMeta's F6 preservation) it throws
+ * WrapMetaUnreadableError: a degraded listing there made
+ * readExistingWrapMetaRawForSurface answer "no meta names this surface"
+ * while the surface's only pristine pointer sat in an unlisted scoped
+ * slot, so saveWrapMeta skipped preservation AND its slot-cleanup unlink
+ * (which needs no directory read) then deleted that pointer - the exact
+ * never-destroy-on-a-read-error violation the per-file carve-outs closed.
  */
-async function listWrapMetaFilenames(): Promise<string[]> {
+async function listWrapMetaFilenames(
+  options: { strict?: boolean } = {},
+): Promise<string[]> {
   const filenames = [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME];
   let entries: string[];
   try {
     entries = await readdir(backupDir());
-  } catch {
+  } catch (err) {
+    const code =
+      err && typeof err === "object" && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+    if (code !== "ENOENT" && options.strict) {
+      throw new WrapMetaUnreadableError([
+        `${backupDir()} (directory listing failed; surface-scoped ` +
+          `wrap-meta slots could not be enumerated)`,
+      ]);
+    }
     return filenames;
   }
   return filenames.concat(
@@ -946,6 +970,12 @@ export class WrapMetaUnreadableError extends Error {
  * blanket catch here previously made the F6 preservation in saveWrapMeta
  * see "no existing meta" on a transient read error and clobber the pristine
  * pointer, the exact defect class removeWrapMeta's ENOENT carve-out closed.
+ *
+ * Fifth round: the directory LISTING gets the same discipline. This
+ * collector feeds the strict write path, so a non-ENOENT readdir failure
+ * throws WrapMetaUnreadableError (via `strict: true`) instead of silently
+ * hiding the scoped slots and letting saveWrapMeta unlink an unconsulted
+ * pristine pointer.
  */
 async function readWrapMetaFilesRaw(): Promise<{
   metas: Record<string, unknown>[];
@@ -953,7 +983,7 @@ async function readWrapMetaFilesRaw(): Promise<{
 }> {
   const metas: Record<string, unknown>[] = [];
   const unreadablePaths: string[] = [];
-  for (const filename of await listWrapMetaFilenames()) {
+  for (const filename of await listWrapMetaFilenames({ strict: true })) {
     const metaPath = join(backupDir(), filename);
     let raw: string;
     try {
@@ -1071,6 +1101,90 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
+ * Cross-process advisory lock serializing wrap-meta MUTATIONS (fifth
+ * round). saveWrapMeta's read-relocate-write-cleanup and removeWrapMeta's
+ * read-classify-unlink are multi-step sequences over shared pointer files;
+ * two concurrent `sanctuary wrap` runs for DIFFERENT surfaces on the same
+ * tenant could both read the canonical slot before either wrote, so the
+ * second writer overwrote the first surface's just-written pointer WITHOUT
+ * relocating it - recreating under concurrency the orphaned-pointer state
+ * the relocation mechanism eliminates sequentially.
+ *
+ * Mechanics: O_EXCL creation of `wrap-meta.lock` in the backup dir (O_EXCL
+ * also refuses a pre-placed symlink), short bounded retry while a live
+ * holder finishes (these sections take milliseconds), a stale-age break so
+ * a crashed holder cannot wedge every future wrap, and a fail-CLOSED
+ * timeout: an unacquirable lock refuses the mutation with recovery advice
+ * rather than proceeding unserialized. Release is best-effort in finally;
+ * an unreleased lock ages into the stale break.
+ */
+const WRAP_META_LOCK_FILENAME = "wrap-meta.lock";
+const WRAP_META_LOCK_STALE_MS = 60_000;
+const WRAP_META_LOCK_WAIT_MS = 15_000;
+const WRAP_META_LOCK_RETRY_MS = 50;
+
+async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
+  const dir = backupDir();
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const lockPath = join(dir, WRAP_META_LOCK_FILENAME);
+  const deadline = Date.now() + WRAP_META_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try {
+        await handle.writeFile(`${process.pid}\n`);
+      } finally {
+        await handle.close();
+      }
+      break;
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      if (code !== "EEXIST") throw err;
+      let stale: boolean;
+      try {
+        const st = await lstat(lockPath);
+        stale = Date.now() - st.mtimeMs > WRAP_META_LOCK_STALE_MS;
+      } catch {
+        // The holder released between our attempt and the stat; retry now.
+        continue;
+      }
+      if (stale) {
+        try {
+          await unlink(lockPath);
+        } catch {
+          // Another waiter broke it first; the retry below contends fresh.
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `another sanctuary wrap/unwrap appears to be updating the wrap ` +
+            `metadata (lock held: ${lockPath}). Re-run in a moment; if no ` +
+            `other sanctuary process is running, delete the lock file and ` +
+            `re-run.`,
+          { cause: err },
+        );
+      }
+      await new Promise((resolveSleep) =>
+        setTimeout(resolveSleep, WRAP_META_LOCK_RETRY_MS),
+      );
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      await unlink(lockPath);
+    } catch {
+      // Best-effort release; a survivor ages into the stale break above.
+    }
+  }
+}
+
+/**
  * Save wrap metadata (original config path, backup path) for unwrap.
  *
  * F6 (v1.6.1 wrap safety): NEVER clobber the pristine pre-wrap backup
@@ -1104,8 +1218,27 @@ async function fileExists(path: string): Promise<boolean> {
  * backup on a transient error path. The wrap CLI's deferred meta write
  * already treats any throw here as "roll back the wrapped surfaces and
  * exit non-zero", which is exactly the fail-closed behavior wanted.
+ *
+ * Fifth round: the whole read-relocate-write-cleanup sequence runs under
+ * the cross-process wrap-meta lock (see withWrapMetaLock), so a concurrent
+ * wrap of a DIFFERENT surface cannot interleave its canonical read before
+ * this write and clobber the pointer without relocating it.
  */
 export async function saveWrapMeta(
+  meta: {
+    backupPath: string;
+    originalPath: string;
+    platform: AgentPlatform;
+    wrappedAt: string;
+    auxiliary?: WrapMetaAuxiliaryFile[];
+  },
+  options: { configStillWrapped?: boolean } = {},
+): Promise<void> {
+  await withWrapMetaLock(() => saveWrapMetaLocked(meta, options));
+}
+
+/** saveWrapMeta's body; runs with the wrap-meta lock already held. */
+async function saveWrapMetaLocked(
   meta: {
     backupPath: string;
     originalPath: string;
@@ -1230,11 +1363,15 @@ export async function saveWrapMeta(
     createParent: false,
   });
   // The canonical slot now names this surface, so a scoped slot left over
-  // from an earlier relocation of THIS surface is a stale duplicate (the
-  // per-surface preservation lookup above already consulted it). Best
-  // effort: a survivor is harmless, since every reader prefers the
-  // canonical slot and removeWrapMeta retires all pointers naming this
-  // surface on unwrap.
+  // from an earlier relocation of THIS surface is a stale duplicate: when
+  // preservation ran, the per-surface lookup above consulted it (and its
+  // strict listing THREW rather than degrade, so "consulted" is guaranteed,
+  // not assumed - a silently-degraded readdir previously made this unlink
+  // delete an unconsulted pristine pointer); when configStillWrapped is
+  // false, the surface is provably no longer wrapped and any old pointer is
+  // stale by the stale-meta guard's own rule. Best effort: a survivor is
+  // harmless, since every reader prefers the canonical slot and
+  // removeWrapMeta retires all pointers naming this surface on unwrap.
   try {
     await unlink(join(dir, wrapMetaSurfaceFilename(meta.originalPath)));
   } catch {
@@ -1290,6 +1427,16 @@ export interface WrapMetaRemovalFailure {
 }
 
 export async function removeWrapMeta(
+  restoredOriginalPath: string,
+): Promise<WrapMetaRemovalFailure[]> {
+  // Fifth round: serialized against saveWrapMeta (and other unwraps) via
+  // the cross-process wrap-meta lock, so the read-classify-unlink sequence
+  // cannot interleave with a concurrent wrap's read-relocate-write.
+  return withWrapMetaLock(() => removeWrapMetaLocked(restoredOriginalPath));
+}
+
+/** removeWrapMeta's body; runs with the wrap-meta lock already held. */
+async function removeWrapMetaLocked(
   restoredOriginalPath: string,
 ): Promise<WrapMetaRemovalFailure[]> {
   const failures: WrapMetaRemovalFailure[] = [];
