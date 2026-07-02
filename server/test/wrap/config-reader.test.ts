@@ -649,7 +649,7 @@ describe("Config Reader", () => {
       expect(rewritten.mcp.servers.concordia.env).toEqual({ CONCORDIA_KEY: "ckey123" });
     });
 
-    it("explicit sanctuaryEnv overrides inherited env vars", async () => {
+    it("explicit sanctuaryEnv keys win; entry-persisted keys absent from it survive", async () => {
       const configPath = join(tmpDir, "openclaw.json");
       const original = {
         mcp: {
@@ -669,7 +669,11 @@ describe("Config Reader", () => {
 
       const agentConfig = await detectAgentConfig("openclaw", configPath);
 
-      // Call WITH explicit sanctuaryEnv — should override, not inherit
+      // Call WITH explicit sanctuaryEnv — explicit keys win, but
+      // entry-persisted keys absent from it survive the re-wrap (a
+      // tenancy-only shell must not clobber a previously persisted
+      // dashboard token; only the storage-tenancy pair is caller-
+      // authoritative and never inherited).
       await rewriteConfigForWrap(
         agentConfig!,
         "npx",
@@ -679,9 +683,9 @@ describe("Config Reader", () => {
 
       const rewritten = JSON.parse(await readFile(configPath, "utf-8"));
 
-      // Only the explicitly passed env vars, not the old ones
       expect(rewritten.mcp.servers.sanctuary.env).toEqual({
         SANCTUARY_PASSPHRASE: "new-secret",
+        SANCTUARY_DASHBOARD_ENABLED: "true",
       });
     });
 

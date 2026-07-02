@@ -1380,14 +1380,34 @@ export async function rewriteConfigForWrap(
     existingServers = (raw.mcpServers as Record<string, unknown>) ?? {};
   }
 
-  // If no explicit env was passed, inherit env vars from the existing sanctuary entry,
-  // then fall back to process.env for the critical vars.
-  let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv;
-  if (!resolvedEnv) {
-    const existingSanctuary = existingServers.sanctuary as Record<string, unknown> | undefined;
-    if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
-      const extracted = extractEnv(existingSanctuary.env);
-      if (extracted) resolvedEnv = extracted;
+  // Inherit env vars from the existing sanctuary entry, then fall back to
+  // process.env for the critical vars. When an explicit env was passed, its
+  // keys win and inherited keys fill the gaps: a re-wrap in a shell that
+  // sets only SANCTUARY_STORAGE_PATH (the wrapped-install upgrade path)
+  // must not clobber entry-persisted vars an earlier wrap wrote (e.g.
+  // SANCTUARY_DASHBOARD_AUTH_TOKEN) that are absent from the current shell.
+  // The storage-tenancy pair is the exception: it is never inherited on the
+  // explicit path, because the caller's env reflects the wrap run's own
+  // storage resolution (the run just wrote wrap-meta/custody/profile
+  // against it), and a stale SANCTUARY_FORTRESS_PATH from the old entry
+  // would win the spawned server's boot-time re-promotion and point it at
+  // a different fortress than the one this wrap run populated.
+  const TENANCY_VARS = ["SANCTUARY_FORTRESS_PATH", "SANCTUARY_STORAGE_PATH"];
+  let resolvedEnv: Record<string, string> | undefined = sanctuaryEnv
+    ? { ...sanctuaryEnv }
+    : undefined;
+  const existingSanctuary = existingServers.sanctuary as Record<string, unknown> | undefined;
+  if (existingSanctuary?.env && typeof existingSanctuary.env === "object") {
+    const inherited = extractEnv(existingSanctuary.env);
+    if (inherited) {
+      if (!resolvedEnv) {
+        resolvedEnv = inherited;
+      } else {
+        for (const [key, value] of Object.entries(inherited)) {
+          if (TENANCY_VARS.includes(key)) continue;
+          if (!(key in resolvedEnv)) resolvedEnv[key] = value;
+        }
+      }
     }
   }
   // Ensure the critical env vars survive the rewrite even when
