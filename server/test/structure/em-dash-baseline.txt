@@ -239,7 +239,7 @@
 10	server/src/workload-lifecycle/host-attestation.ts
 8	server/src/workload-lifecycle/payload.ts
 3	server/src/workload-lifecycle/undeclared-finding.ts
-24	server/src/wrap/config-reader.ts
+22	server/src/wrap/config-reader.ts
 2	server/src/wrap/custody-flow.ts
 1	server/src/wrap/fortress-view.ts
 3	server/src/wrap/hermes-yaml.ts

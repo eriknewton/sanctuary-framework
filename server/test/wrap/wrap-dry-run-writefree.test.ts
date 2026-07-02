@@ -268,6 +268,12 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
     await expect(stat(yamlPath)).resolves.toBeDefined();
     const output = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(output).toContain(`Would remove ${yamlPath}`);
+    // Fifth round (preview parity): the real unwrap snapshots the file's
+    // final contents into a timestamped backup before removal, so the dry
+    // run must say so instead of previewing a scarier-than-real removal.
+    expect(output).toContain(
+      "its final contents would first be preserved as a timestamped backup",
+    );
     expect(output).toContain("Dry run. No changes made.");
   });
 });

@@ -32,9 +32,11 @@
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
-import { platform } from "node:os";
+import { platform, homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { get as httpsGet } from "node:https";
+import { get as httpGet } from "node:http";
 import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
@@ -42,6 +44,7 @@ import {
   hasExistingWrapMeta,
   findLatestBackup,
   findNewerBackup,
+  listWrapMetaPointerSummaries,
   removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
@@ -50,6 +53,8 @@ import {
   writeFileSafeUnderRoot,
   unlinkSafeUnderRoot,
   WrapMetaValidationError,
+  WrapMetaUnreadableError,
+  type WrapMetaRemovalFailure,
   type AgentPlatform,
   type MCPServerEntry,
   type WrapMetaAuxiliaryFile,
@@ -386,6 +391,399 @@ export async function validateDevDist(devDist: string): Promise<void> {
   }
 }
 
+/**
+ * Outcome of the wrap-time pinned-version resolvability probe (2026-07-02
+ * install-path hardening).
+ *
+ *   - "resolvable":  the registry affirmatively serves the pinned version.
+ *   - "unpublished": the registry (as resolved at wrap time) is reachable
+ *                    and affirmatively does NOT have the pinned version -
+ *                    the MCP entry this wrap writes would be dead at spawn
+ *                    time, unless the harness's own spawn directory routes
+ *                    the scope to a different registry this probe cannot
+ *                    see. Advisory, never a hard block.
+ *   - "unreachable": the registry could not be consulted (offline, DNS,
+ *                    timeout), or resolution is indirected through config
+ *                    the probe cannot faithfully reproduce (a non-default
+ *                    registry that may hide packages from unauthenticated
+ *                    requests, or proxy-only egress) and the answer was
+ *                    not an affirmative 200. Honest-unknown, never treated
+ *                    as either of the affirmative outcomes.
+ *   - "skipped":     the probe was disabled (SANCTUARY_NO_UPDATE_CHECK=1,
+ *                    the documented zero-outbound knob - this probe is the
+ *                    same registry-metadata class of egress as the update
+ *                    check, so the one knob silences both).
+ */
+export type PinnedVersionResolvability =
+  | "resolvable"
+  | "unpublished"
+  | "unreachable"
+  | "skipped";
+
+/** The registry `npx` consults when nothing overrides it. */
+const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
+
+interface NormalizedRegistryUrl {
+  /** Registry base URL with trailing slashes and userinfo removed. */
+  base: string;
+  /** True when the source URL carried username/password userinfo. */
+  strippedCredentials: boolean;
+}
+
+/** Trim + validate an npm registry URL; strip trailing slashes and userinfo. */
+function normalizeRegistryUrl(
+  value: string | undefined,
+): NormalizedRegistryUrl | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const strippedCredentials =
+      parsed.username !== "" || parsed.password !== "";
+    parsed.username = "";
+    parsed.password = "";
+    return {
+      base: parsed.toString().replace(/\/+$/, ""),
+      strippedCredentials,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Lenient `.npmrc` scan for the two registry keys the probe cares about. */
+async function readNpmrcRegistryKeys(
+  npmrcPath: string,
+): Promise<{ scoped: string | null; registry: string | null }> {
+  let raw: string;
+  try {
+    raw = await readFile(npmrcPath, "utf-8");
+  } catch {
+    return { scoped: null, registry: null };
+  }
+  let scoped: string | null = null;
+  let registry: string | null = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    // Last occurrence wins, matching npm's ini semantics: a first-wins scan
+    // here read the OLD value of a key that tooling later re-appended
+    // (`registry=` twice in one file), probed the wrong registry, and could
+    // re-create the false-affirmative "unpublished" dead-pin warning.
+    if (key === "@sanctuary-framework:registry") {
+      scoped = value;
+    } else if (key === "registry") {
+      registry = value;
+    }
+  }
+  return { scoped, registry };
+}
+
+/**
+ * Walk up from `cwd` to npm's PROJECT ROOT: the nearest directory (cwd
+ * included) containing `package.json` or `node_modules`, mirroring npm's
+ * localPrefix resolution. npm reads the project `.npmrc` at that root,
+ * not at the literal cwd, so a probe that read only `<cwd>/.npmrc` missed
+ * a repo-root registry override whenever the wrap ran from a subdirectory
+ * (a corporate mirror-only package then 404ed on the DEFAULT registry,
+ * resolved direct, and rendered the false-affirmative "unpublished"
+ * dead-pin warning npx disproves at spawn time - the same class the
+ * wrong-registry and duplicate-key fixes closed). Falls back to `cwd`
+ * itself when no marker exists on the walk, matching npm's default
+ * localPrefix. Never throws; an unreadable candidate just keeps the walk
+ * going.
+ */
+async function findNpmProjectRoot(cwd: string): Promise<string> {
+  let dir = resolvePath(cwd);
+  for (;;) {
+    for (const marker of ["package.json", "node_modules"]) {
+      try {
+        await access(join(dir, marker));
+        return dir;
+      } catch {
+        // Marker absent (or unreadable): keep walking up.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return resolvePath(cwd);
+    dir = parent;
+  }
+}
+
+/**
+ * Best-effort path of npm's GLOBAL config file (`$PREFIX/etc/npmrc`, the
+ * file `npm config set --location=global registry=...` writes). Mirrors
+ * npm's own derivation approximately: an explicit globalconfig override in
+ * the npm config env wins, then a prefix override, then node's install
+ * prefix (the executable's grandparent directory on POSIX, its directory
+ * on Windows). Never throws; the caller treats an absent/unreadable file
+ * as "no keys", so an imprecise path only degrades to the pre-fix
+ * behavior.
+ */
+function defaultGlobalNpmrcPath(env: NodeJS.ProcessEnv): string {
+  const explicit = env.npm_config_globalconfig ?? env.NPM_CONFIG_GLOBALCONFIG;
+  if (typeof explicit === "string" && explicit.trim() !== "") {
+    return explicit.trim();
+  }
+  const prefixOverride =
+    env.npm_config_prefix ?? env.NPM_CONFIG_PREFIX ?? env.PREFIX;
+  const prefix =
+    typeof prefixOverride === "string" && prefixOverride.trim() !== ""
+      ? prefixOverride.trim()
+      : platform() === "win32"
+        ? dirname(process.execPath)
+        : resolvePath(process.execPath, "..", "..");
+  return join(prefix, "etc", "npmrc");
+}
+
+/**
+ * Best-effort, WRAP-TIME approximation of the npm registry the
+ * wrap-written `npx` entry will consult at spawn time (2026-07-02 fix
+ * round). The probe previously hard-coded the public registry, so in a
+ * private-mirror / corporate environment (registry override in `.npmrc`
+ * or the npm config env) it asked the WRONG registry and rendered a false
+ * dead-pin warning for an entry npx would start fine.
+ *
+ * Honesty limit: this resolves from the wrap process's OWN env and cwd.
+ * The harness spawns the MCP entry later, possibly from a different
+ * working directory whose project `.npmrc` this probe cannot see (e.g. a
+ * scope override pointing at a private mirror). A direct-default result
+ * here therefore does NOT guarantee spawn-time resolution also hits the
+ * default registry; callers must keep the resulting "unpublished" verdict
+ * advisory, never a hard block.
+ *
+ * Mirrors npm's per-key precedence approximately: the package-scope key
+ * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
+ * within each key the env override beats the project `.npmrc` beats the
+ * user `~/.npmrc` beats npm's GLOBAL npmrc (`$PREFIX/etc/npmrc`, resolved
+ * by defaultGlobalNpmrcPath - a mirror configured only via `npm config
+ * set --location=global` previously resolved default+direct and rendered
+ * the same false-affirmative "unpublished" warning the other levels'
+ * fixes closed); duplicate keys within one file are last-wins, matching
+ * npm's ini semantics. The project `.npmrc` is read at the PROJECT ROOT
+ * (findNpmProjectRoot's upward walk from cwd), matching where npm reads
+ * it - the literal cwd alone missed a repo-root override when the wrap
+ * ran from a subdirectory. Never throws; a winning override this probe cannot
+ * interpret (npm env-var expansion like `registry=${NPM_MIRROR}`, or a
+ * non-http(s) value) falls back to the public default marked `indirect`,
+ * so a 404 stays honest-unknown instead of the affirmative "unpublished".
+ *
+ * `indirect` is true when resolution goes through machinery this bare
+ * node:http(s) probe cannot faithfully reproduce - a non-default registry
+ * (which may require auth npx has and the probe deliberately never sends)
+ * or proxy egress (npx honors HTTPS_PROXY/HTTP_PROXY; node:https does not).
+ * The caller then treats a 404 as honest-unknown instead of affirmative.
+ *
+ * `seams` (env/cwd/home/globalNpmrcPath) exist for tests; production
+ * callers pass nothing. `globalNpmrcPath: null` means "no global npmrc"
+ * (keeps hermetic tests off the host's real `$PREFIX/etc/npmrc`).
+ */
+export async function resolveNpmRegistryForProbe(
+  seams: {
+    env?: NodeJS.ProcessEnv;
+    cwd?: string;
+    home?: string;
+    globalNpmrcPath?: string | null;
+  } = {},
+): Promise<{ base: string; indirect: boolean }> {
+  const env = seams.env ?? process.env;
+  // Guard the cwd lookup: process.cwd() THROWS (uv_cwd ENOENT) when the
+  // wrap runs from a deleted directory (removed worktree, cleaned tmp
+  // dir). This probe's contract is never-throws / never-blocks-the-wrap,
+  // so an unresolvable cwd degrades to user-level config only (same
+  // semantics as an absent project .npmrc) instead of crashing the wrap.
+  let cwd: string | undefined = seams.cwd;
+  if (cwd === undefined) {
+    try {
+      cwd = process.cwd();
+    } catch {
+      cwd = undefined;
+    }
+  }
+  const globalNpmrcPath =
+    seams.globalNpmrcPath !== undefined
+      ? seams.globalNpmrcPath
+      : defaultGlobalNpmrcPath(env);
+  const files = [
+    cwd !== undefined
+      ? await readNpmrcRegistryKeys(
+          join(await findNpmProjectRoot(cwd), ".npmrc"),
+        )
+      : { scoped: null as string | null, registry: null as string | null },
+    await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
+    globalNpmrcPath !== null
+      ? await readNpmrcRegistryKeys(globalNpmrcPath)
+      : { scoped: null as string | null, registry: null as string | null },
+  ];
+  // Per-key precedence: first PRESENT raw value wins (env beats project
+  // .npmrc beats user ~/.npmrc), and only then is the winner normalized.
+  // Normalizing each candidate and taking the first that PARSED silently
+  // skipped a higher-precedence override this probe cannot faithfully
+  // reproduce (npm env-var expansion like `registry=${NPM_MIRROR}`) and
+  // fell back to default+direct, where a 404 reads as the affirmative
+  // "unpublished". A present-but-unnormalizable winner now resolves to the
+  // default registry marked `indirect`, so a 404 stays honest-unknown.
+  const firstPresent = (
+    ...candidates: Array<string | null | undefined>
+  ): string | null => {
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim() !== "") {
+        return candidate;
+      }
+    }
+    return null;
+  };
+  const scopedRaw = firstPresent(
+    env["npm_config_@sanctuary-framework:registry"],
+    files[0].scoped,
+    files[1].scoped,
+    files[2].scoped,
+  );
+  const plainRaw = firstPresent(
+    env.npm_config_registry,
+    env.NPM_CONFIG_REGISTRY,
+    files[0].registry,
+    files[1].registry,
+    files[2].registry,
+  );
+  const winningRaw = scopedRaw ?? plainRaw;
+  const normalized = normalizeRegistryUrl(winningRaw ?? undefined);
+  const unresolvableOverride = winningRaw !== null && normalized === null;
+  const base = normalized?.base ?? DEFAULT_NPM_REGISTRY;
+  const credentialedOverride = normalized?.strippedCredentials === true;
+  const proxied = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ].some((key) => {
+    const value = env[key];
+    return typeof value === "string" && value.trim() !== "";
+  });
+  return {
+    base,
+    indirect:
+      proxied ||
+      unresolvableOverride ||
+      credentialedOverride ||
+      base !== DEFAULT_NPM_REGISTRY,
+  };
+}
+
+/**
+ * Wrap-time check that the version-pinned MCP entry
+ * (`-p @sanctuary-framework/mcp-server@<version> sanctuary`) actually
+ * resolves on the npm registry (2026-07-02 hardening): an unpublished pin
+ * - e.g. a wrap run from a not-yet-published release build without
+ * `--dev-dist` - writes a dead MCP entry behind a success banner, and the
+ * harness only discovers it at spawn time.
+ *
+ * Fail HONEST, not fail-open and not fail-closed: the caller never blocks
+ * the wrap on this probe (an unreachable registry must not take wrap
+ * availability down), but it downgrades the success claim with an explicit
+ * warning on "unpublished" and an honest could-not-verify note on
+ * "unreachable". Never throws.
+ *
+ * 2026-07-02 fix round (registry-config honesty): the probe consults the
+ * registry npx will most likely use, resolved at WRAP time
+ * (resolveNpmRegistryForProbe: npm config env, project/user/global npmrc;
+ * the harness's spawn-time cwd can differ, so even an affirmative
+ * "unpublished" stays advisory), and when resolution is `indirect` (non-default
+ * registry, which may hide packages from this deliberately unauthenticated
+ * probe, or proxy-only egress the bare GET does not traverse) a 404 is NOT
+ * affirmative: it maps to "unreachable" (honest could-not-verify) instead
+ * of the loud "unpublished" dead-pin warning. Only the public default
+ * registry, consulted directly, can affirm "unpublished". No credential is
+ * ever attached to the probe request.
+ *
+ * `registryBaseUrl` / `timeoutMs` are test seams; production callers use
+ * the defaults. An explicit `registryBaseUrl` is treated as authoritative
+ * (404 stays affirmative), preserving the seam's stub-registry semantics.
+ */
+export async function checkPinnedVersionResolvable(
+  version: string,
+  opts: { registryBaseUrl?: string; timeoutMs?: number } = {},
+): Promise<PinnedVersionResolvability> {
+  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") return "skipped";
+  let base: string;
+  let notFoundIsAffirmative: boolean;
+  if (opts.registryBaseUrl !== undefined) {
+    base = opts.registryBaseUrl;
+    notFoundIsAffirmative = true;
+  } else {
+    const resolved = await resolveNpmRegistryForProbe();
+    base = resolved.base;
+    notFoundIsAffirmative = !resolved.indirect;
+  }
+  const timeoutMs = opts.timeoutMs ?? 3000;
+  const url = `${base}/@sanctuary-framework/mcp-server/${encodeURIComponent(version)}`;
+  const getFn = base.startsWith("http://") ? httpGet : httpsGet;
+  return new Promise((resolve) => {
+    // 2026-07-02 hardening (round 14): `timeout` on the request options
+    // below is a socket INACTIVITY timer (Node resets it on every byte
+    // received), not a wall-clock deadline. A responder that dribbles the
+    // HTTP status line slowly enough to keep beating that timer - a
+    // tarpit, a misbehaving proxy, an attacker on the network path - would
+    // otherwise stall this probe indefinitely, contradicting the "never
+    // blocks the wrap" contract this function documents. `deadline` is the
+    // hard wall-clock cap: it fires exactly once, destroys the in-flight
+    // request, and resolves "unreachable" regardless of subsequent socket
+    // activity. `settled` guards against a double-resolve if the deadline
+    // and a request event race.
+    let settled = false;
+    const settle = (result: PinnedVersionResolvability) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      resolve(result);
+    };
+    const deadline = setTimeout(() => {
+      req?.destroy();
+      settle("unreachable");
+    }, timeoutMs);
+    let req: ReturnType<typeof httpGet> | undefined;
+    try {
+      req = getFn(
+        url,
+        { headers: { Accept: "application/json" }, timeout: timeoutMs },
+        (res) => {
+          // Only the response STATUS is consulted. Destroy the request
+          // (not just res.resume()-drain) before settling: a drained-but-
+          // open socket still has Node's per-byte inactivity timer backing
+          // it, so a tarpit that dribbles the body one byte at a time
+          // forever keeps that socket - and the event loop - alive even
+          // after this promise has resolved. req.destroy() releases the
+          // handle outright so a slow/hostile body can't outlive the
+          // decision that already stopped needing it.
+          req?.destroy();
+          if (res.statusCode === 200) settle("resolvable");
+          else if (res.statusCode === 404)
+            settle(notFoundIsAffirmative ? "unpublished" : "unreachable");
+          else settle("unreachable");
+        },
+      );
+      req.on("error", () => settle("unreachable"));
+      req.on("timeout", () => {
+        req?.destroy();
+        settle("unreachable");
+      });
+    } catch {
+      settle("unreachable");
+    }
+  });
+}
+
 /** Operator-facing one-liner for what the YAML injection did / would do. */
 function formatHermesYamlAction(plan: HermesYamlPlan, yamlPath: string): string {
   const preserved =
@@ -575,6 +973,43 @@ export async function probeCastleWallEnforcementObserved(
   }
 }
 
+/**
+ * THE banner honesty gate (F4, v1.6.1 first-run honesty), deduplicated
+ * (2026-07-02 hardening: the same predicate was hand-computed in four
+ * places, so a future edit could weaken one copy and desynchronize the
+ * banners). The affirmative "Your agent is protected. / Castle Wall Full"
+ * hero is earned ONLY when BOTH hold:
+ *   - the Castle Wall daemon started during this wrap (`armed === true`), AND
+ *   - real enforcement evidence was observed (`enforcementObserved === true`,
+ *     per probeCastleWallEnforcementObserved's fail-closed standard).
+ * Anything else (false, undefined, or an absent signal) reads NOT
+ * confirmed. SECURITY/HONESTY INVARIANT: refactor-only; never weaken this
+ * predicate (truth table pinned in test/wrap/wrap-surface-scoped-meta.test.ts;
+ * the rendered-banner combinations are pinned in test/wrap/wrap-cli.test.ts).
+ */
+export function castleWallProtectionConfirmed(
+  armed: boolean | undefined,
+  enforcementObserved: boolean | undefined,
+): boolean {
+  return armed === true && enforcementObserved === true;
+}
+
+/**
+ * The evidence-probe half of the banner honesty gate, shared by the
+ * dashboard and --no-dashboard wrap paths (2026-07-02 dedupe): the F4
+ * probe only runs when the daemon actually started this wrap AND an audit
+ * log is available to read evidence from; every other state is fail-closed
+ * false (never "observed").
+ */
+async function probeEnforcementObservedIfArmed(
+  daemon: { stop(): Promise<void> } | undefined,
+  auditLog: AuditLog | undefined,
+  storagePath: string,
+): Promise<boolean> {
+  if (daemon === undefined || auditLog === undefined) return false;
+  return probeCastleWallEnforcementObserved(auditLog, storagePath);
+}
+
 export interface RunWrapDeps {
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
@@ -613,6 +1048,15 @@ export interface RunWrapDeps {
    * itself fails.
    */
   saveWrapMeta?: typeof saveWrapMeta;
+  /**
+   * Override the wrap-time pinned-version resolvability probe (for tests).
+   * Production callers leave this undefined and get
+   * `checkPinnedVersionResolvable` (a real registry-metadata HEAD-class
+   * probe with a short timeout).
+   */
+  checkPinResolvability?: (
+    version: string,
+  ) => Promise<PinnedVersionResolvability>;
 }
 
 export async function runWrap(
@@ -1152,6 +1596,51 @@ export async function runWrap(
   const { command: sanctuaryCommand, args: sanctuaryArgs } =
     resolveSanctuaryCommand(options);
 
+  // 2026-07-02 hardening: the MCP entry written below is PINNED to
+  // SANCTUARY_VERSION with no prior guarantee that version is actually
+  // published - an unpublished pin yields a dead entry behind a success
+  // banner. Probe the registry (short timeout) and downgrade the claim
+  // honestly. NEVER blocks the wrap: "unpublished" and "unreachable" both
+  // warn and continue (availability); `--dev-dist` entries point at a local
+  // build validated above and involve no registry, so they skip the probe.
+  // The outcome is ALSO threaded into the terminal-final success banner
+  // (WrapSuccessInfo.pinnedVersionResolvability): the early warning here
+  // scrolls above dozens of lines of subsequent flow output, and a success
+  // surface that ends byte-identical to the resolvable case would re-create
+  // the exact dead-entry-behind-a-success-banner defect the probe exists to
+  // close.
+  let pinResolvability: PinnedVersionResolvability | undefined;
+  if (options.devDist === undefined) {
+    const checkPin = deps.checkPinResolvability ?? checkPinnedVersionResolvable;
+    pinResolvability = await checkPin(SANCTUARY_VERSION);
+    if (pinResolvability === "unpublished") {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  WARNING: the harness MCP entry this wrap writes is pinned to` +
+          `\n  @sanctuary-framework/mcp-server@${SANCTUARY_VERSION}, but the npm registry` +
+          `\n  (as resolved from this directory) does not have that version. Unless your` +
+          `\n  agent's own project config routes the package scope to another registry,` +
+          `\n  the MCP entry will fail to start until it is published. If you are running` +
+          `\n  an unpublished build, re-run with --dev-dist <path-to-dist/cli.js> to point` +
+          `\n  the entry at your local build instead.`
+      );
+    } else if (pinResolvability === "unreachable") {
+      // "unreachable" also covers a REACHED custom registry whose
+      // unauthenticated 404 the probe declines to treat as authoritative
+      // (see checkPinnedVersionResolvable), so the stated cause must not
+      // claim the registry could not be reached.
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  Note: could not confirm with the npm registry that the pinned version` +
+          `\n  ${SANCTUARY_VERSION} resolves: the registry was unreachable (offline or` +
+          `\n  blocked), or a custom registry gave an answer this unauthenticated probe` +
+          `\n  cannot treat as authoritative. This wrap cannot verify the MCP entry it` +
+          `\n  writes will start; if the agent fails to start, re-run 'sanctuary protect'` +
+          `\n  once the registry confirms the version.`
+      );
+    }
+  }
+
   // D4 staging, Bug 2: Hermes v0.16.0 loads MCP servers from
   // ~/.hermes/config.yaml (`mcp_servers:` key, upstream
   // hermes_cli/mcp_config.py and mcp_startup.py), not from the JSON
@@ -1230,14 +1719,29 @@ export async function runWrap(
   // may still exist (findNewerBackup's inverse breadcrumb: backup
   // filenames embed timestamps, so older snapshots sort below the fresh
   // one).
-  if (configStillWrapped && !(await hasExistingWrapMeta())) {
+  //
+  // 2026-07-02 hardening (MED-2 residual): the meta check is scoped to THIS
+  // surface (resolve()d configPath). The previous tenant-global check let a
+  // wrap-meta belonging to a DIFFERENT surface suppress the warning while
+  // this surface was in exactly the crash-window state.
+  //
+  // Copy honesty (fifth round): hasExistingWrapMeta deliberately reads an
+  // UNREADABLE pointer as false (failing toward this warning), so the text
+  // says "no READABLE wrap metadata" - in the unreadable-pointer state the
+  // meta likely IS on disk and the deferred meta write later in this same
+  // run will refuse with "wrap metadata exists but could not be read";
+  // the unhedged wording flatly contradicted that message.
+  if (
+    configStillWrapped &&
+    !(await hasExistingWrapMeta(agentConfig.configPath))
+  ) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  WARNING: this config already contains a Sanctuary entry, but no` +
-        `\n  wrap metadata exists, so the pristine pre-wrap config could not` +
-        `\n  be identified. The backup taken by THIS wrap captures the` +
-        `\n  current (already-wrapped) contents, and --unwrap will restore` +
-        `\n  that state. If this follows an interrupted wrap, check` +
+        `\n  readable wrap metadata exists for it, so the pristine pre-wrap` +
+        `\n  config could not be identified. The backup taken by THIS wrap` +
+        `\n  captures the current (already-wrapped) contents, and --unwrap` +
+        `\n  will restore that state. If this follows an interrupted wrap, check` +
         `\n  ${join(storagePath, "backup")}` +
         `\n  for an older pristine backup (timestamped config-backup-* files)` +
         `\n  before relying on --unwrap.`
@@ -1303,6 +1807,79 @@ export async function runWrap(
     return allRestored;
   };
 
+  // The unwrap pointer this wrap will persist once every surface verifies
+  // (see the deferred-write rationale at the persist site below). Built
+  // here, right after the backups, so the orphan-wrap guard can fall back
+  // to writing it from EVERY rollback path, not just the meta-write-failure
+  // one.
+  const wrapMetaPayload = {
+    backupPath,
+    originalPath: agentConfig.configPath,
+    platform: agentConfig.platform,
+    wrappedAt: new Date().toISOString(),
+    ...(hermesYaml
+      ? {
+          auxiliary: [
+            {
+              originalPath: hermesYaml.yamlPath,
+              backupPath: hermesYamlBackupPath,
+            },
+          ] satisfies WrapMetaAuxiliaryFile[],
+        }
+      : {}),
+  };
+  const persistWrapMeta = deps.saveWrapMeta ?? saveWrapMeta;
+
+  // MED-1 orphan-wrap guard, extended to ALL rollback paths (2026-07-02
+  // hardening; the #843 fix covered only the meta-write-failure rollback,
+  // leaving the three earlier rollback call sites able to end
+  // wrapped-with-no-meta). When ANY surface restore fails, the live config
+  // may STILL route traffic through Sanctuary while nothing on disk points
+  // at the pre-wrap backup; `--unwrap` would report "No Sanctuary wrap
+  // found". A meta pointing at the pre-wrap backup is strictly better than
+  // that orphan state (unwrap restores are idempotent, so re-restoring an
+  // already-restored surface is harmless - including a null-backup aux file
+  // this failed wrap never created or already removed, which unwrap's
+  // removal branch tolerates as already-absent ENOENT), so write it; if
+  // even that fails
+  // (e.g. disk full), never end silently: spell out exactly what --unwrap
+  // will (not) do and the manual restore for every surface.
+  const guardOrphanWrapAfterRollback = async (
+    fullyRolledBack: boolean,
+  ): Promise<void> => {
+    if (fullyRolledBack) return;
+    try {
+      await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Wrap metadata was written after the failed restore: run the` +
+          `\n  unwrap command (--unwrap) to retry restoring the pre-wrap config.`
+      );
+    } catch (retryErr) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\n  CRITICAL: the config is STILL WRAPPED and no wrap metadata` +
+          `\n  could be written: ${(retryErr as Error).message}` +
+          `\n  --unwrap will NOT find this wrap; traffic keeps routing` +
+          `\n  through Sanctuary until you restore manually:`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `    cp "${backupPath}" "${agentConfig.configPath}"`
+      );
+      if (hermesYaml) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          hermesYamlBackupPath
+            ? `    cp "${hermesYamlBackupPath}" "${hermesYaml.yamlPath}"`
+            : `    rm "${hermesYaml.yamlPath}" (this wrap created it fresh)`
+        );
+      }
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error("");
+    }
+  };
+
   const rewrite = deps.rewriteConfig ?? rewriteConfigForWrap;
   // Harden round: the primary rewrite writes the live config IN PLACE
   // (O_TRUNC via writeFileNoFollow, not temp+rename), so a throw mid-write
@@ -1323,15 +1900,21 @@ export async function runWrap(
     console.error(
       `\n  Config rewrite FAILED: ${(err as Error).message}`
     );
-    await rollbackWrapSurfaces();
+    await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
     process.exit(1);
   }
 
-  const verifyOk = await verifyRewrittenConfig(
+  const verifyResult = await verifyRewrittenConfig(
     agentConfig.configPath,
     backupPath
   );
-  if (!verifyOk) process.exit(1);
+  if (!verifyResult.verified) {
+    // 2026-07-02 hardening: verification failure rolls back internally; if
+    // THAT restore failed, the live config is in an unknown (possibly still
+    // wrapped) state with no meta - run the orphan-wrap guard here too.
+    await guardOrphanWrapAfterRollback(verifyResult.restoredOnFailure);
+    process.exit(1);
+  }
 
   // D4 staging, Bug 2: apply the precomputed config.yaml injection now that
   // the JSON surface verified. D4 P1-1: the ENTIRE write+verify is inside
@@ -1364,7 +1947,7 @@ export async function runWrap(
       console.error(
         `\n  Hermes config.yaml write FAILED: ${(err as Error).message}`
       );
-      await rollbackWrapSurfaces();
+      await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
       process.exit(1);
     }
     if (!yamlVerified) {
@@ -1372,7 +1955,7 @@ export async function runWrap(
       console.error(
         `\n  Verification FAILED: No sanctuary entry in rewritten ${yamlSurface.yamlPath}.`
       );
-      await rollbackWrapSurfaces();
+      await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
       process.exit(1);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1403,23 +1986,6 @@ export async function runWrap(
   // (that state is indistinguishable from a hand-authored sanctuary entry),
   // so the wrap prints the loud pre-backup warning above in exactly that
   // condition instead of guessing.
-  const wrapMetaPayload = {
-    backupPath,
-    originalPath: agentConfig.configPath,
-    platform: agentConfig.platform,
-    wrappedAt: new Date().toISOString(),
-    ...(hermesYaml
-      ? {
-          auxiliary: [
-            {
-              originalPath: hermesYaml.yamlPath,
-              backupPath: hermesYamlBackupPath,
-            },
-          ] satisfies WrapMetaAuxiliaryFile[],
-        }
-      : {}),
-  };
-  const persistWrapMeta = deps.saveWrapMeta ?? saveWrapMeta;
   try {
     await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
   } catch (err) {
@@ -1431,50 +1997,11 @@ export async function runWrap(
     console.error(
       `  Rolling back: a wrapped config without an unwrap pointer would strand --unwrap.`
     );
-    const fullyRolledBack = await rollbackWrapSurfaces();
-    if (!fullyRolledBack) {
-      // MED-1 (orphan-wrap guard): a surface restore just failed, so the
-      // live config may STILL route traffic through Sanctuary while no
-      // wrap-meta exists; `--unwrap` would report "No Sanctuary wrap
-      // found" and the operator would have no pointer at the good backup.
-      // A meta pointing at the pre-wrap backup is strictly better than
-      // that orphan state (unwrap restores are idempotent, so re-restoring
-      // an already-restored surface is harmless), so retry the meta write
-      // once before giving up.
-      try {
-        await persistWrapMeta(wrapMetaPayload, { configStillWrapped });
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Wrap metadata was written after the failed restore: run the` +
-            `\n  unwrap command (--unwrap) to retry restoring the pre-wrap config.`
-        );
-      } catch {
-        // Double failure (e.g. disk full): the config is still wrapped and
-        // nothing on disk points at the backup. Never end in this state
-        // silently; spell out exactly what --unwrap will (not) do and the
-        // manual restore for every surface.
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `\n  CRITICAL: the config is STILL WRAPPED and no wrap metadata` +
-            `\n  could be written. --unwrap will NOT find this wrap; traffic` +
-            `\n  keeps routing through Sanctuary until you restore manually:`
-        );
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `    cp "${backupPath}" "${agentConfig.configPath}"`
-        );
-        if (hermesYaml) {
-          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-          console.error(
-            hermesYamlBackupPath
-              ? `    cp "${hermesYamlBackupPath}" "${hermesYaml.yamlPath}"`
-              : `    rm "${hermesYaml.yamlPath}" (this wrap created it fresh)`
-          );
-        }
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error("");
-      }
-    }
+    // MED-1 (orphan-wrap guard): when a surface restore fails here, the
+    // guard retries the meta write once before giving up (a meta pointing
+    // at the pre-wrap backup beats the orphan state), then prints the
+    // CRITICAL manual-restore message on a double failure.
+    await guardOrphanWrapAfterRollback(await rollbackWrapSurfaces());
     process.exit(1);
   }
 
@@ -1680,10 +2207,11 @@ export async function runWrap(
         await ndAuditLog.flush();
         // F4: probe for real enforcement evidence (adjudicated flows) so the
         // banner can distinguish "daemon started" from "observed enforcing".
-        if (castleWallDaemon !== undefined) {
-          ndEnforcementObserved =
-            await probeCastleWallEnforcementObserved(ndAuditLog, storagePath);
-        }
+        ndEnforcementObserved = await probeEnforcementObservedIfArmed(
+          castleWallDaemon,
+          ndAuditLog,
+          storagePath,
+        );
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -1710,6 +2238,9 @@ export async function runWrap(
       // signal below.
       castleWallArmed: castleWallDaemon !== undefined,
       castleWallEnforcementObserved: ndEnforcementObserved,
+      // 2026-07-02 hardening: the dead-pin warning must survive to the
+      // terminal-final success surface, not only the mid-flow warning.
+      pinnedVersionResolvability: pinResolvability,
     });
     return;
   }
@@ -2008,10 +2539,11 @@ export async function runWrap(
 
   // F4: probe for real enforcement evidence (adjudicated flows) so the banner
   // can distinguish "daemon started" from "observed enforcing". Fail-closed.
-  const enforcementObserved =
-    castleWallDaemon !== undefined && wrapAuditLog !== undefined
-      ? await probeCastleWallEnforcementObserved(wrapAuditLog, storagePath)
-      : false;
+  const enforcementObserved = await probeEnforcementObservedIfArmed(
+    castleWallDaemon,
+    wrapAuditLog,
+    storagePath,
+  );
 
   printWrapSuccess({
     toolName,
@@ -2030,6 +2562,9 @@ export async function runWrap(
     // evidence signal below.
     castleWallArmed: castleWallDaemon !== undefined,
     castleWallEnforcementObserved: enforcementObserved,
+    // 2026-07-02 hardening: the dead-pin warning must survive to the
+    // terminal-final success surface, not only the mid-flow warning.
+    pinnedVersionResolvability: pinResolvability,
   });
 }
 
@@ -2144,6 +2679,17 @@ interface WrapSuccessInfo {
    * policy loads never do.
    */
   castleWallEnforcementObserved?: boolean;
+  /**
+   * Wrap-time registry probe outcome for the version-pinned MCP entry
+   * (2026-07-02 hardening). "unpublished" renders a loud warning INSIDE the
+   * final banner (the entry cannot start until the version is published);
+   * "unreachable" renders an honest could-not-verify note. `undefined`
+   * means the probe did not run (`--dev-dist` local-build entries involve
+   * no registry) and, conservatively, "resolvable"/"skipped" add no noise.
+   * The mid-flow warning alone is NOT enough: it scrolls far above the
+   * banner, and the banner is the success claim the operator acts on.
+   */
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 export function formatWrapSuccess(info: WrapSuccessInfo): string {
@@ -2182,9 +2728,10 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   // (`castleWallArmed === true`, no evidence) renders the honest
   // "wrapped, but enforcement is not confirmed" hero; a failed start
   // (`false`) or an absent signal (`undefined`) never renders "Full".
-  const enforcementObserved =
-    info.castleWallArmed === true &&
-    info.castleWallEnforcementObserved === true;
+  const enforcementObserved = castleWallProtectionConfirmed(
+    info.castleWallArmed,
+    info.castleWallEnforcementObserved,
+  );
   const castleWallLabel = renderCastleWallBannerLabel(
     info.castleWallArmed,
     enforcementObserved,
@@ -2207,8 +2754,57 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
     lines.push(`    Concierge chat and substrate-driven explanations will not work until this is resolved.`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
+}
+
+/**
+ * Banner lines for the pinned-MCP-entry resolvability outcome, shared by
+ * both success surfaces (2026-07-02 hardening). An "unpublished" pin means
+ * the MCP entry this wrap just wrote CANNOT start \u2014 saying so only in a
+ * mid-flow warning that scrolls above the banner left the terminal-final
+ * success surface byte-identical to a working wrap (the dead-entry-behind-
+ * a-success-banner defect the probe exists to close). "unreachable" gets
+ * the honest could-not-verify note; "resolvable"/"skipped"/absent add
+ * nothing.
+ */
+function renderPinResolvabilityBannerLines(info: {
+  version: string;
+  pinnedVersionResolvability?: PinnedVersionResolvability;
+}): string[] {
+  const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`; // dim
+  if (info.pinnedVersionResolvability === "unpublished") {
+    return [
+      "",
+      `  ${w("\u26A0")} The MCP entry this wrap wrote is pinned to ` +
+        `@sanctuary-framework/mcp-server@${info.version},`,
+      `    which is not on the npm registry (as resolved from this directory): unless`,
+      `    your agent's project config routes the scope to another registry, it cannot`,
+      `    start until that version is published. For an unpublished build, re-run`,
+      `    with --dev-dist <path-to-dist/cli.js> to point the entry at your local build.`,
+    ];
+  }
+  if (info.pinnedVersionResolvability === "unreachable") {
+    // "unreachable" also covers a REACHED custom registry whose 404 the
+    // unauthenticated probe declines to trust, so the cause line says
+    // "could not confirm", never "could not be reached".
+    return [
+      "",
+      `  ${d(
+        `Note: the npm registry could not confirm the pinned MCP entry (v${info.version})`,
+      )}`,
+      `  ${d(
+        "resolves (unreachable, or a custom registry this probe cannot verify against),",
+      )}`,
+      `  ${d(
+        "so this wrap could not verify it. If the agent fails to start, re-run",
+      )}`,
+      `  ${d("'sanctuary protect' once the registry confirms the version.")}`,
+    ];
+  }
+  return [];
 }
 
 /**
@@ -2224,7 +2820,9 @@ function renderCastleWallBannerLabel(
   armed: boolean | undefined,
   enforcementObserved: boolean,
 ): string {
-  if (armed === true && enforcementObserved) return "Castle Wall Full";
+  if (castleWallProtectionConfirmed(armed, enforcementObserved)) {
+    return "Castle Wall Full";
+  }
   if (armed === true) {
     return "Castle Wall daemon started (enforcement not confirmed)";
   }
@@ -2275,6 +2873,12 @@ interface WrapSuccessNoDashboardInfo {
    * evidence-only-affirmative discipline.
    */
   castleWallEnforcementObserved?: boolean;
+  /**
+   * See WrapSuccessInfo.pinnedVersionResolvability; same banner-honesty
+   * discipline (an unpublished pin must be visible on the terminal-final
+   * success surface, not only in a mid-flow warning).
+   */
+  pinnedVersionResolvability?: PinnedVersionResolvability;
 }
 
 /**
@@ -2310,9 +2914,10 @@ export function formatWrapSuccessNoDashboard(
   // Honesty: same outcome discipline as formatWrapSuccess (F4, v1.6.1) \u2014
   // reserve the affirmative "protected" / "Castle Wall Full" hero for
   // observed enforcement evidence, never daemon start alone.
-  const enforcementObserved =
-    info.castleWallArmed === true &&
-    info.castleWallEnforcementObserved === true;
+  const enforcementObserved = castleWallProtectionConfirmed(
+    info.castleWallArmed,
+    info.castleWallEnforcementObserved,
+  );
   const castleWallLabel = renderCastleWallBannerLabel(
     info.castleWallArmed,
     enforcementObserved,
@@ -2329,6 +2934,7 @@ export function formatWrapSuccessNoDashboard(
     lines.push(`  ${w("\u26A0")} Sentinels intelligence disabled: ${info.intelligenceError}`);
     lines.push(`    Run 'sanctuary intelligence diagnose' to inspect substrate config.`);
   }
+  lines.push(...renderPinResolvabilityBannerLines(info));
   lines.push("");
   return lines.join("\n");
 }
@@ -2342,10 +2948,17 @@ function printWrapSuccessNoDashboard(
 
 // ── Post-wrap verification ──────────────────────────────────────────
 
+/**
+ * Verify the rewritten primary config and roll it back on failure.
+ * `restoredOnFailure` reports whether the internal rollback restore
+ * succeeded (meaningful only when `verified` is false) so the caller's
+ * orphan-wrap guard can detect a failed restore (2026-07-02 hardening;
+ * previously the restore result was discarded here).
+ */
 async function verifyRewrittenConfig(
   configPath: string,
   backupPath: string
-): Promise<boolean> {
+): Promise<{ verified: boolean; restoredOnFailure: boolean }> {
   try {
     const raw = await readFile(configPath, "utf-8");
     let parsed: Record<string, unknown>;
@@ -2355,8 +2968,10 @@ async function verifyRewrittenConfig(
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Rewritten config is not valid JSON.`);
       console.error(`  Error: ${(err as Error).message}`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
     const servers =
@@ -2368,24 +2983,30 @@ async function verifyRewrittenConfig(
     if (!servers.sanctuary) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: No sanctuary entry in rewritten config.`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
     const sanctuaryEntry = servers.sanctuary as Record<string, unknown>;
     if (!sanctuaryEntry.command || typeof sanctuaryEntry.command !== "string") {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Verification FAILED: Sanctuary entry has no command.`);
-      await restoreFromBackup(configPath, backupPath);
-      return false;
+      return {
+        verified: false,
+        restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+      };
     }
 
-    return true;
+    return { verified: true, restoredOnFailure: true };
   } catch (err) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Verification FAILED: ${(err as Error).message}`);
-    await restoreFromBackup(configPath, backupPath);
-    return false;
+    return {
+      verified: false,
+      restoredOnFailure: await restoreFromBackup(configPath, backupPath),
+    };
   }
 }
 
@@ -2428,7 +3049,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
   try {
     meta = await findLatestBackup();
   } catch (err) {
-    if (err instanceof WrapMetaValidationError) {
+    if (
+      err instanceof WrapMetaValidationError ||
+      err instanceof WrapMetaUnreadableError
+    ) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary: Unwrap REFUSED`);
       console.error(`  ${err.message}`);
@@ -2452,6 +3076,49 @@ async function unwrap(dryRun: boolean): Promise<void> {
   } catch {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Backup file not found: ${meta.backupPath}`);
+    // Multi-surface honesty on the REFUSAL path (matches the eighth-round
+    // survivor note on the success path): findLatestBackup returns the
+    // FIRST readable pointer, so a wedged first pointer (its backup file
+    // pruned) blocks every later scoped slot - ending here silently would
+    // hide any other surface that remains wrapped behind it. Enumerate the
+    // other readable pointers and say what unblocks them. Advisory output
+    // only; the refusal itself (exit 1, nothing modified) is unchanged.
+    const resolvedWedged = resolvePath(meta.originalPath);
+    const pointers = await listWrapMetaPointerSummaries();
+    const wedgedPointer = pointers.find(
+      (p) => resolvePath(p.originalPath) === resolvedWedged,
+    );
+    const survivors = Array.from(
+      new Set(
+        pointers
+          .map((p) => resolvePath(p.originalPath))
+          .filter((p) => p !== resolvedWedged),
+      ),
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  This wrap metadata pointer` +
+        `${wedgedPointer ? ` (${wedgedPointer.metaPath})` : ""} names ` +
+        `${meta.originalPath}\n  but its backup file is gone. Restore the ` +
+        `backup file if you can; if it is gone\n  for good, remove the ` +
+        `pointer file manually (the config it names stays wrapped\n  and ` +
+        `must then be restored by hand).`
+    );
+    if (survivors.length > 0) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Note: ${
+          survivors.length === 1
+            ? "another wrapped surface remains"
+            : "other wrapped surfaces remain"
+        } behind this pointer:` +
+          survivors.map((p) => `\n    ${p}`).join("") +
+          `\n  Re-run 'sanctuary wrap --unwrap' after this pointer is ` +
+          `repaired or removed\n  to restore ${
+            survivors.length === 1 ? "it" : "them"
+          }.`
+      );
+    }
     process.exit(1);
   }
 
@@ -2492,9 +3159,15 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Would skip ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
+        // Fifth round (preview parity): the real unwrap snapshots this
+        // file's final contents into a timestamped backup BEFORE removing
+        // it (the recovery breadcrumb below); a dry run that omitted the
+        // snapshot read scarier than reality for an operator judging
+        // whether post-wrap edits would be lost.
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          `  Would remove ${aux.originalPath} (created by wrap; no pre-wrap version existed;` +
+            `\n  its final contents would first be preserved as a timestamped backup)`
         );
       }
     }
@@ -2512,7 +3185,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
   // pre-wrap backup (F6 pristine-pointer preservation); config edits made
   // while wrapped survive only in the newer timestamped backups that
   // nothing points at. Say where they are so the discard is recoverable.
-  const newerPrimaryBackup = await findNewerBackup(meta.backupPath);
+  const newerPrimaryBackup = await findNewerBackup(
+    meta.backupPath,
+    meta.originalPath,
+  );
   if (newerPrimaryBackup) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
@@ -2538,7 +3214,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(`  Original config restored to: ${aux.originalPath}`);
         console.error(`  Backup preserved at: ${aux.backupPath}`);
-        const newerAuxBackup = await findNewerBackup(aux.backupPath);
+        const newerAuxBackup = await findNewerBackup(
+          aux.backupPath,
+          aux.originalPath,
+        );
         if (newerAuxBackup) {
           // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(
@@ -2554,14 +3233,70 @@ async function unwrap(dryRun: boolean): Promise<void> {
           `  Skipped ${aux.originalPath} (created by wrap; already absent)`
         );
       } else {
+        // 2026-07-02 hardening (recovery breadcrumb): a created-by-wrap file
+        // (e.g. the Hermes config.yaml) is removed wholesale here, but the
+        // operator may have added their own MCP entries to it AFTER the
+        // wrap. Preserve the file's final contents as a timestamped backup
+        // before removing it and say where it is. Best-effort: a failed
+        // pre-removal snapshot warns but does not change the restore
+        // semantics (the file is still removed, exactly as before).
+        let preRemovalBackup: string | null = null;
+        try {
+          preRemovalBackup = await backupConfig(aux.originalPath);
+        } catch (err) {
+          // ENOENT is silent: the file is already gone (see the removal
+          // carve-out below), so there is nothing to snapshot and a WARNING
+          // would misread as a real failure.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  WARNING: could not snapshot ${aux.originalPath} before removal: ` +
+                `${(err as Error).message}`
+            );
+          }
+        }
         // Round-3 P1-A: refuse the unlink if a symlink was raced into the
         // parent dir after validate-time; unlink() does not follow a
         // symlinked leaf, so only the parent walk is needed.
-        await unlinkSafeUnderRoot(aux.originalPath);
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
-        );
+        //
+        // 2026-07-02 hardening (second round): ENOENT means the delete-on-
+        // unwrap end-state ALREADY holds - mirror the rollbackWrapSurfaces
+        // carve-out instead of counting it as an auxiliaryRestoreFailure.
+        // The orphan-wrap guard can persist a null-backup entry for a file
+        // the failed wrap never created (or that its rollback already
+        // removed) while the parent dir still exists (so validate-time
+        // `alreadyAbsent` does not fire); treating that phantom file as a
+        // restore failure kept the wrap-meta alive forever and wedged every
+        // --unwrap re-run on a cause that is a nonexistent file.
+        let removed = true;
+        try {
+          await unlinkSafeUnderRoot(aux.originalPath);
+        } catch (err) {
+          const code =
+            err && typeof err === "object" && "code" in err
+              ? (err as NodeJS.ErrnoException).code
+              : undefined;
+          if (code !== "ENOENT") throw err;
+          removed = false;
+        }
+        if (removed) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Removed ${aux.originalPath} (created by wrap; no pre-wrap version existed)`
+          );
+          if (preRemovalBackup) {
+            // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+            console.error(
+              `  Its final contents were preserved at: ${preRemovalBackup}` +
+                `\n  (in case you added entries to it after the wrap).`
+            );
+          }
+        } else {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Skipped ${aux.originalPath} (created by wrap; already absent)`
+          );
+        }
       }
     } catch (err) {
       auxiliaryRestoreFailures += 1;
@@ -2600,13 +3335,88 @@ async function unwrap(dryRun: boolean): Promise<void> {
         `re-run after fixing the cause above.`
     );
   } else {
-    const metaRemovalFailures = await removeWrapMeta(meta.originalPath);
-    for (const failedPath of metaRemovalFailures) {
+    // 2026-07-02 hardening (honest failure surface): removeWrapMeta can now
+    // THROW - its wrap-meta lock acquisition is bounded + fail-closed (the
+    // 15s timeout while another sanctuary wrap/unwrap holds the lock, and
+    // the displaced-holder mutation guard). Uncaught, that throw fell
+    // through runWrap to the CLI's top-level catch, which printed
+    // "Sanctuary MCP Server failed to start:" plus a raw error AFTER the
+    // "Sanctuary: Unwrapped" success lines - a server-boot banner for a
+    // wrap subcommand whose restore had already succeeded. State is safe
+    // either way (config restored, meta retained, a re-run recovers), so
+    // report the failure in the retirement-warning voice with re-run
+    // advice and exit non-zero without the misleading banner.
+    let metaRemovalFailures: WrapMetaRemovalFailure[];
+    try {
+      metaRemovalFailures = await removeWrapMeta(meta.originalPath);
+    } catch (err) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        `  WARNING: could not remove wrap metadata ${failedPath}; a future ` +
-          `re-wrap may preserve a stale restore pointer. Remove it manually.`
+        `  WARNING: could not retire the wrap metadata: ${(err as Error).message}`
       );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  The restore above succeeded; the wrap metadata was left in place` +
+          `\n  so 'sanctuary wrap --unwrap' can be re-run to retire it once no` +
+          `\n  other sanctuary wrap/unwrap is running.`
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error("");
+      process.exitCode = 1;
+      return;
+    }
+    for (const failure of metaRemovalFailures) {
+      // The advice must match the failure class: an UNREADABLE pointer may
+      // be a DIFFERENT wrapped surface's only restore pointer (a successful
+      // read would have skipped it), so telling the operator to delete it
+      // could orphan that surface's pristine backup.
+      if (failure.reason === "unreadable") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not read wrap metadata ${failure.path}; it was ` +
+            `left in place because it may be another wrapped surface's only ` +
+            `restore pointer. Do NOT delete it; fix the read failure (for ` +
+            `example file permissions) and re-run 'sanctuary wrap --unwrap' ` +
+            `if a surface remains wrapped.`
+        );
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  WARNING: could not remove wrap metadata ${failure.path}; a ` +
+            `future re-wrap may preserve a stale restore pointer. Remove it ` +
+            `manually.`
+        );
+      }
+    }
+    // Eighth round (multi-surface honesty): surface-scoped meta slots mean
+    // OTHER surfaces wrapped on this tenant keep their own live pointers,
+    // and this run restored exactly ONE surface. Ending on an unqualified
+    // "Unwrapped" while e.g. ~/.claude/settings.json still routes traffic
+    // through Sanctuary is the same dead-entry-behind-a-success-banner
+    // class the wrap banner fix closed, so enumerate the survivors and say
+    // so. Scoped to the clean-retirement path: the failure branches above
+    // already print their own re-run guidance, and a surviving pointer for
+    // THIS surface (unreadable/unremovable) would otherwise misread here as
+    // "another wrapped surface".
+    if (metaRemovalFailures.length === 0) {
+      try {
+        const remaining = await findLatestBackup();
+        if (remaining) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: another wrapped surface remains (${remaining.originalPath}).` +
+              `\n  Re-run 'sanctuary wrap --unwrap' to restore it.`
+          );
+        }
+      } catch {
+        // A surviving pointer exists but failed validation on read; a
+        // re-run surfaces the precise refusal with nothing modified.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Note: wrap metadata for another surface remains but could not ` +
+            `be validated. Re-run 'sanctuary wrap --unwrap' to inspect it.`
+        );
+      }
     }
   }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.

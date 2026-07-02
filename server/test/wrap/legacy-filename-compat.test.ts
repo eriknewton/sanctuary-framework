@@ -215,6 +215,56 @@ describe("legacy filename compatibility (read-both, write-new)", () => {
     expect(remaining.originalPath).toBe(otherSurface);
   });
 
+  it("F6 re-wrap preservation consults the LEGACY pointer when the canonical meta names a DIFFERENT surface", async () => {
+    const tenantDir = join(tempHome, "tenant-mixed-rewrap");
+    process.env.SANCTUARY_STORAGE_PATH = tenantDir;
+    const backupDir = join(tenantDir, "backup");
+    await mkdir(backupDir, { recursive: true });
+
+    // Legacy meta from a pre-sweep release: the ONLY pointer at surface X's
+    // pristine pre-wrap backup.
+    const pristineBackup = join(backupDir, "config-backup-2020-01-01-x.json");
+    await writeFile(pristineBackup, '{"pristine":true}');
+    await writeFile(
+      join(backupDir, LEGACY_META),
+      JSON.stringify({ backupPath: pristineBackup, originalPath: configPath })
+    );
+
+    // Canonical meta from a newer wrap of a DIFFERENT surface Y.
+    const otherSurface = join(tempHome, "other-agent-config.json");
+    const otherBackup = join(backupDir, "config-backup-2025-01-01-y.json");
+    await writeFile(otherBackup, "{}");
+    await saveWrapMeta({
+      backupPath: otherBackup,
+      originalPath: otherSurface,
+      platform: "openclaw",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    // Re-wrap of X: the fresh backup captures the ALREADY-WRAPPED content.
+    // The preservation scan must find X's legacy pointer across BOTH meta
+    // files; the first-parseable-file reader compared against Y's canonical
+    // meta, failed the same-surface check, and pointed the meta at the
+    // fresh (wrapped) backup — orphaning X's pristine one.
+    const freshWrappedBackup = join(
+      backupDir,
+      "config-backup-2026-01-01-x.json"
+    );
+    await writeFile(freshWrappedBackup, '{"wrapped":true}');
+    await saveWrapMeta({
+      backupPath: freshWrappedBackup,
+      originalPath: configPath,
+      platform: "openclaw",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    const canonical = JSON.parse(
+      await readFile(join(backupDir, "wrap-meta.json"), "utf-8")
+    );
+    expect(canonical.originalPath).toBe(configPath);
+    expect(canonical.backupPath).toBe(pristineBackup);
+  });
+
   it("unwraps an install that has only the legacy-named meta pointer", async () => {
     const tenantDir = join(tempHome, "tenant-legacy-unwrap");
     process.env.SANCTUARY_STORAGE_PATH = tenantDir;

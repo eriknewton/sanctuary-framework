@@ -145,8 +145,10 @@ $SANCTUARY_STORAGE_PATH/
 │   ├── _context_gate_policies/   # Operational context-gating policies
 │   └── <user-namespace>/*.enc    # state_write values
 └── backup/
-    ├── wrap-meta.json            # unwrap pointer (legacy-named pointers from earlier releases still readable)
-    └── config-backup-*.json      # original agent config
+    ├── wrap-meta.json            # unwrap pointer for the most recently wrapped surface (legacy-named pointers from earlier releases still readable)
+    ├── wrap-meta-<tag>.json      # per-surface unwrap pointers once a second surface is wrapped on the same tenant (tag = short hex hash of that config's path)
+    ├── wrap-meta.lock            # transient advisory lock held while wrap/unwrap updates the pointers above; a leftover from a crashed run makes wrap/unwrap refuse with instructions to remove it manually
+    └── config-backup-*           # original agent configs, named config-backup-<timestamp>-<surface-tag><ext> (.json or .yaml; earlier releases used config-backup-<timestamp>.json)
 ```
 
 Nothing lives outside this directory for a wrapped agent except the
