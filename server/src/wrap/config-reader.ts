@@ -927,13 +927,20 @@ export async function validateWrapMetaAuxiliary(
  * validation throws WrapMetaValidationError — it is NOT swallowed like a
  * missing file, because silently falling through would hide a forged or
  * corrupted meta from the operator.
+ *
+ * Surface-scoped slots make directory listing load-bearing for unwrap:
+ * once the canonical pointer is retired, another wrapped surface may be
+ * discoverable only through `wrap-meta-<tag>.json`. A non-ENOENT listing
+ * failure therefore fails closed with WrapMetaUnreadableError instead of
+ * returning null and making `--unwrap` say "No Sanctuary wrap found" while
+ * a scoped restore pointer still exists.
  */
 export async function findLatestBackup(): Promise<{
   backupPath: string;
   originalPath: string;
   auxiliary?: ValidatedWrapMetaAuxiliaryFile[];
 } | null> {
-  for (const filename of await listWrapMetaFilenames()) {
+  for (const filename of await listWrapMetaFilenames({ strict: true })) {
     const metaPath = join(backupDir(), filename);
     let meta: Record<string, unknown>;
     try {

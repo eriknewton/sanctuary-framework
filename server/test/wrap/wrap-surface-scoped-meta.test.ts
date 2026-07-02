@@ -602,6 +602,59 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     },
   );
 
+  it.skipIf(process.getuid?.() === 0)(
+    "unwrap refuses instead of reporting no wrap when scoped pointers cannot be listed",
+    async () => {
+      const surfaceA = join(tmpHome, "hidden-listing-a.json");
+      const surfaceB = join(tmpHome, "hidden-listing-b.json");
+      await writeFile(surfaceA, '{"a":"pristine"}');
+      await writeFile(surfaceB, '{"b":"pristine"}');
+
+      // Wrap A, then B. B is canonical; A is relocated into a scoped slot.
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceA),
+        originalPath: surfaceA,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+      await saveWrapMeta({
+        backupPath: await backupConfig(surfaceB),
+        originalPath: surfaceB,
+        platform: "hermes",
+        wrappedAt: new Date().toISOString(),
+      });
+      expect(await removeWrapMeta(surfaceB)).toEqual([]);
+
+      // A's only pointer is now a scoped filename. If the directory cannot be
+      // listed, unwrap must fail closed instead of treating the hidden slot as
+      // absent and printing "No Sanctuary wrap found".
+      const exitSpy = vi
+        .spyOn(process, "exit")
+        .mockImplementation(((code?: number) => {
+          throw new Error(`process.exit:${code}`);
+        }) as never);
+      await chmod(backupDirPath(), 0o300);
+      try {
+        errSpy.mockClear();
+        await expect(runWrap({ unwrap: true }, makeDeps())).rejects.toThrow(
+          "process.exit:1",
+        );
+        const out = stderrOutput();
+        expect(out).toContain("Sanctuary: Unwrap REFUSED");
+        expect(out).toContain(
+          "surface-scoped wrap-meta slots could not be enumerated",
+        );
+        expect(out).not.toContain("No Sanctuary wrap found");
+      } finally {
+        await chmod(backupDirPath(), 0o700);
+        exitSpy.mockRestore();
+      }
+
+      expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+      expect(await hasExistingWrapMeta(surfaceB)).toBe(false);
+    },
+  );
+
   // ── Fifth round: cross-process wrap-meta lock ──────────────────────────
 
   it("concurrent saveWrapMeta calls for different surfaces serialize; neither pointer is orphaned", async () => {

@@ -53,6 +53,7 @@ import {
   writeFileSafeUnderRoot,
   unlinkSafeUnderRoot,
   WrapMetaValidationError,
+  WrapMetaUnreadableError,
   type WrapMetaRemovalFailure,
   type AgentPlatform,
   type MCPServerEntry,
@@ -3023,7 +3024,10 @@ async function unwrap(dryRun: boolean): Promise<void> {
   try {
     meta = await findLatestBackup();
   } catch (err) {
-    if (err instanceof WrapMetaValidationError) {
+    if (
+      err instanceof WrapMetaValidationError ||
+      err instanceof WrapMetaUnreadableError
+    ) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary: Unwrap REFUSED`);
       console.error(`  ${err.message}`);
