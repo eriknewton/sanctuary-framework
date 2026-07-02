@@ -127,6 +127,17 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     response.end("Sanctuary egress gate: use HTTP CONNECT via your configured proxy.");
   });
 
+  server.on("error", (err) => {
+    // Accept-time server errors (canonically EMFILE under FD exhaustion,
+    // which the confined agent can drive by opening unbounded concurrent
+    // tunnels) must not crash the gate: an 'error' event with no listener
+    // throws -> uncaughtException -> the agent kills its own enforcement
+    // gate. Deny-direction: the affected accept is lost; the gate keeps
+    // serving. Listen-time bind failures are still surfaced to callers by
+    // the one-shot reject listener in startExclusiveEgressGate.
+    options.onEvent?.({ kind: "gate_error", authority: "", message: err.message });
+  });
+
   server.on("connect", (request, clientSocket, head) => {
     handleGateConnect(request, clientSocket, head).catch((err: unknown) => {
       // Defense-in-depth backstop (deny-direction): no rejection out of the
@@ -242,7 +253,9 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     }
     const upstreamSocket = net.connect({ host: decision.address, port: decision.target.port });
     upstream = upstreamSocket;
+    let established = false;
     upstreamSocket.once("connect", () => {
+      established = true;
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) {
         upstreamSocket.write(head);
@@ -251,7 +264,15 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       clientSocket.pipe(upstreamSocket);
     });
     upstreamSocket.once("error", () => {
-      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      // Pre-establishment: report a clean 502. Post-establishment the
+      // client treats the stream as raw tunneled bytes (e.g. mid-TLS);
+      // injecting an HTTP status line would be in-band garbage, so just
+      // drop the client leg.
+      if (established) {
+        clientSocket.destroy();
+      } else {
+        clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      }
     });
   }
 

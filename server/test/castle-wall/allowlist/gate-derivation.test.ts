@@ -13,8 +13,9 @@ import {
   deriveGateAllowRule,
   validateExclusiveEgressGatePolicy,
 } from "../../../src/castle-wall/allowlist/gate-derivation.js";
-import { validateRule } from "../../../src/castle-wall/allowlist/schema.js";
+import { validateRule, type AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { composeEffectiveRules } from "../../../src/castle-wall/allowlist/habeas-port.js";
+import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../../../src/castle-wall/constants.js";
 
 const VALID_POLICY = { agent_uid: 502, gate_port: 19998 };
 const CREATED_AT = "2026-07-02T00:00:00Z";
@@ -115,6 +116,46 @@ describe("castle-wall/allowlist/gate-derivation", () => {
       // The always-on local habeas lane must still be present exactly once.
       const habeas = composed.filter((r) => r.id === "reserved_habeas_distress_local");
       expect(habeas).toHaveLength(1);
+    });
+
+    it("REJECTS an operator rule claiming the reserved derived gate id (never a duplicate-id signed manifest)", () => {
+      // Like the habeas reserved ids: derived, never authored. Pushing a
+      // second rule with the same id would wedge the Slice-8 parity gate
+      // (which requires EXACTLY one) and break id-keyed introspection.
+      const impostor: AllowlistRule = {
+        id: DERIVED_GATE_RULE_ID,
+        schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+        created_at: CREATED_AT,
+        match: { cidr: "0.0.0.0/0", port: [443], protocol: "tcp" },
+        scope: {},
+        disposition: "allow",
+      };
+      expect(() =>
+        composeEffectiveRules({
+          operatorRules: [impostor],
+          resolvers: [],
+          exclusiveEgressGate: VALID_POLICY,
+          createdAt: CREATED_AT,
+        }),
+      ).toThrow(/reserved for the .*exclusive-egress gate/);
+    });
+
+    it("REJECTS the reserved gate id even when no gate policy is configured (a derived-looking rule is never operator-authored)", () => {
+      const impostor: AllowlistRule = {
+        id: DERIVED_GATE_RULE_ID,
+        schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
+        created_at: CREATED_AT,
+        match: { cidr: "127.0.0.1/32", port: [19998], protocol: "tcp" },
+        scope: {},
+        disposition: "allow",
+      };
+      expect(() =>
+        composeEffectiveRules({
+          operatorRules: [impostor],
+          resolvers: [],
+          createdAt: CREATED_AT,
+        }),
+      ).toThrow(/reserved for the .*exclusive-egress gate/);
     });
 
     it("throws (fail-closed) when handed a malformed policy object", () => {

@@ -34,6 +34,7 @@ import {
   deriveDnsRuleForHostnameRules,
 } from "./dns-derivation.js";
 import {
+  DERIVED_GATE_RULE_ID,
   deriveGateAllowRule,
   type ExclusiveEgressGatePolicy,
 } from "./gate-derivation.js";
@@ -479,6 +480,22 @@ export interface ComposeEffectiveRulesInput {
  * testable; the daemon supplies resolvers/config.
  */
 export function composeEffectiveRules(input: ComposeEffectiveRulesInput): AllowlistRule[] {
+  // Reserved derived-gate id (Unified Protect Slice 1): like the habeas
+  // reserved ids, "derived_exclusive_egress_gate" is derived, never
+  // authored. An operator rule claiming it would either duplicate the id in
+  // the signed manifest (wedging the Slice-8 parity gate, which requires
+  // EXACTLY one) or, when no gate policy is configured, plant a
+  // derived-looking rule the parity/introspection surfaces would
+  // misattribute. Rejected up front whether or not a gate policy is present.
+  // (Contrast with the DNS derivation, where an operator override wins:
+  // that rule is a convenience derivation, not a parity-checked enforcement
+  // surface.)
+  if (input.operatorRules.some((rule) => rule.id === DERIVED_GATE_RULE_ID)) {
+    throw new Error(
+      `Castle Wall policy rejected: rule id "${DERIVED_GATE_RULE_ID}" is reserved for the ` +
+        "derived exclusive-egress gate rule; reserved rules are derived, never authored.",
+    );
+  }
   const issues = findHabeasConflicts(input.operatorRules, input.distressWebhook);
   if (issues.length > 0) {
     throw new HabeasConflictError(issues);

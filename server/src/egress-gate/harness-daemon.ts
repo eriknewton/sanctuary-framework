@@ -206,17 +206,41 @@ export function planAgentHarnessDaemonInstall(
 /**
  * Execute an install plan: write the plist (0o644: launchd requires it
  * readable, and it carries no secret by construction), then bootstrap it
- * into the system domain. Throws on launchctl failure AFTER removing the
- * just-written plist (no half-installed unit left behind).
+ * into the system domain.
+ *
+ * IDEMPOTENT RE-INSTALL: `launchctl bootstrap` exits non-zero when the
+ * service is ALREADY bootstrapped (a routine retry / re-run of the
+ * ceremony). A naive write-then-rollback would overwrite the working unit
+ * file and then delete it -- the running confined harness keeps running
+ * until reboot, but its unit is gone and confinement silently does NOT
+ * survive the next boot. So: when launchd already knows the service, this
+ * refreshes the plist bytes and succeeds WITHOUT a second bootstrap
+ * (applying changed plist content to the LIVE service still requires an
+ * explicit uninstall + install ceremony).
+ *
+ * Rollback on a genuine bootstrap failure removes the plist ONLY when
+ * launchd (re-checked after the failure) does not know the service, so the
+ * "no half-installed unit left behind" promise can never strand a
+ * bootstrapped service without its unit file.
  */
 export async function installAgentHarnessDaemon(
   plan: HarnessDaemonInstallPlan,
   ops: HarnessDaemonOps,
 ): Promise<void> {
+  const existing = await agentHarnessDaemonStatus(ops);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
+  if (existing.installed) {
+    return;
+  }
   const result = await ops.runLaunchctl(plan.bootstrapArgs);
   if (result.code !== 0) {
-    await ops.removeFile(plan.plistPath).catch(() => undefined);
+    // Belt-and-suspenders for the pre-check racing or erring fail-closed:
+    // if launchd NOW reports the service bootstrapped, the plist we just
+    // wrote is the unit a live service depends on -- leave it in place.
+    const after = await agentHarnessDaemonStatus(ops);
+    if (!after.installed) {
+      await ops.removeFile(plan.plistPath).catch(() => undefined);
+    }
     throw new Error(
       `launchctl ${plan.bootstrapArgs.join(" ")} exited ${result.code}: ${result.stderr.trim()}`,
     );

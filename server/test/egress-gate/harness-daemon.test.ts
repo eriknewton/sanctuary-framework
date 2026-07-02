@@ -50,6 +50,10 @@ function mockOps(overrides: Partial<HarnessDaemonOps> = {}): HarnessDaemonOps & 
     },
     runLaunchctl(args) {
       launchctl.push([...args]);
+      if (args[0] === "print") {
+        // Default: launchd does not know the service (fresh-install path).
+        return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+      }
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     },
     ...overrides,
@@ -147,19 +151,24 @@ describe("egress-gate/harness-daemon", () => {
       expect(plan.plistContent).toContain("<key>UserName</key>");
     });
 
-    it("writes the plist 0o644 then bootstraps", async () => {
+    it("writes the plist 0o644 then bootstraps (after the not-installed pre-check)", async () => {
       const ops = mockOps();
       await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
       expect(ops.writes).toHaveLength(1);
       expect(ops.writes[0]!.path).toBe(AGENT_HARNESS_DAEMON_PLIST_PATH);
       expect(ops.writes[0]!.mode).toBe(0o644);
-      expect(ops.launchctl).toEqual([["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH]]);
+      expect(ops.launchctl).toEqual([
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+      ]);
     });
 
-    it("removes the just-written plist when bootstrap fails (no half-installed unit)", async () => {
+    it("removes the just-written plist when a fresh-install bootstrap fails (no half-installed unit)", async () => {
       const ops = mockOps({
         runLaunchctl: (args) => {
-          void args;
+          if (args[0] === "print") {
+            return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+          }
           return Promise.resolve({ code: 5, stdout: "", stderr: "Bootstrap failed" });
         },
       });
@@ -167,6 +176,69 @@ describe("egress-gate/harness-daemon", () => {
         installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
       ).rejects.toThrow(/exited 5/);
       expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
+    it("re-install over an already-bootstrapped service refreshes the plist and never bootstraps or rolls back (boot persistence preserved)", async () => {
+      // Regression: `launchctl bootstrap` exits non-zero when the service is
+      // ALREADY bootstrapped (a routine ceremony re-run), so the old
+      // write-then-rollback deleted the unit file a LIVE confined harness
+      // depended on -- confinement silently lost at the next boot.
+      const calls: string[][] = [];
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          calls.push([...args]);
+          if (args[0] === "print") {
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
+              stderr: "",
+            });
+          }
+          return Promise.resolve({
+            code: 5,
+            stdout: "",
+            stderr: "Bootstrap failed: 5: Input/output error",
+          });
+        },
+      });
+      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
+      // Plist bytes refreshed, no second bootstrap attempted, nothing removed.
+      expect(ops.writes).toHaveLength(1);
+      expect(calls).toEqual([["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`]]);
+      expect(ops.removals).toEqual([]);
+    });
+
+    it("never removes the plist when a failed bootstrap turns out to be an already-bootstrapped service (post-check belt-and-suspenders)", async () => {
+      // The pre-check is fail-closed (an erring `launchctl print` reports
+      // not-installed), so a bootstrap can still fail against an
+      // already-bootstrapped service. The rollback must then leave the unit
+      // file in place: removing it would strand the live service with no
+      // boot persistence.
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.reject(new Error("launchctl print flaked"));
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
+              stderr: "",
+            });
+          }
+          return Promise.resolve({
+            code: 5,
+            stdout: "",
+            stderr: "Bootstrap failed: 5: Input/output error",
+          });
+        },
+      });
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/exited 5/);
+      expect(ops.removals).toEqual([]);
     });
 
     it("uninstall boots out then removes the plist (idempotent when not loaded)", async () => {

@@ -177,6 +177,60 @@ describe("egress-gate/gate-server", () => {
     expect(followUp.statusLine).toBe("HTTP/1.1 403 Forbidden");
   });
 
+  it("survives a server-level 'error' event (accept-time EMFILE class) and emits gate_error instead of crashing", async () => {
+    // Regression: the confined agent is pf-allowed unbounded concurrent
+    // connections to the gate port, so it can drive the gate process to its
+    // FD limit; the resulting accept-time 'error' with no listener would be
+    // an uncaughtException that kills the enforcement gate.
+    const upstream = await startUpstream();
+    cleanups.push(upstream.close);
+    const events: EgressGateEvent[] = [];
+    const server = createExclusiveEgressGate({
+      policy: { agent_uid: 502, gate_port: 19998 },
+      rules: [allowRule("127.0.0.1", upstream.port)],
+      livenessProbe: liveProbe,
+      onEvent: (e) => events.push(e),
+      isRoutable: () => true,
+    });
+    await new Promise<void>((resolve) => server.listen(0, GATE_BIND_HOST, resolve));
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    const port = (server.address() as AddressInfo).port;
+    server.emit("error", new Error("accept EMFILE: too many open files"));
+    const gateError = events.find((e) => e.kind === "gate_error");
+    expect(gateError && gateError.kind === "gate_error" && gateError.message).toContain("EMFILE");
+    // The gate keeps serving.
+    const result = await rawConnect(port, `127.0.0.1:${upstream.port}`);
+    expect(result.statusLine).toBe("HTTP/1.1 200 Connection Established");
+  });
+
+  it("never injects an HTTP status line into an ESTABLISHED tunnel when the upstream errors mid-stream", async () => {
+    // Once "200 Connection Established" is written the client treats the
+    // stream as raw tunneled bytes (e.g. mid-TLS); a mid-stream upstream RST
+    // must drop the client leg, not write "HTTP/1.1 502 ..." into the tunnel.
+    const upstream = net.createServer((socket) => {
+      setTimeout(() => socket.resetAndDestroy(), 50);
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", () => resolve()));
+    cleanups.push(() => new Promise<void>((r) => upstream.close(() => r())));
+    const upstreamPort = (upstream.address() as AddressInfo).port;
+    const { port } = await startGateOnEphemeralPort({
+      rules: [allowRule("127.0.0.1", upstreamPort)],
+    });
+    const received = await new Promise<string>((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write(`CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: x\r\n\r\n`);
+      });
+      let data = "";
+      socket.on("data", (c) => (data += c.toString("utf8")));
+      socket.on("close", () => resolve(data));
+      // The dropped client leg may surface as ECONNRESET; only bytes matter.
+      socket.on("error", () => {});
+      setTimeout(() => socket.destroy(), 5_000).unref();
+    });
+    expect(received).toContain("200 Connection Established");
+    expect(received).not.toContain("502 Bad Gateway");
+  });
+
   it("denies an allowlist miss with 403 (default deny)", async () => {
     const upstream = await startUpstream();
     cleanups.push(upstream.close);
