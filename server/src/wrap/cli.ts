@@ -1799,12 +1799,13 @@ export async function runWrap(
         `  Wrap metadata was written after the failed restore: run the` +
           `\n  unwrap command (--unwrap) to retry restoring the pre-wrap config.`
       );
-    } catch {
+    } catch (retryErr) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `\n  CRITICAL: the config is STILL WRAPPED and no wrap metadata` +
-          `\n  could be written. --unwrap will NOT find this wrap; traffic` +
-          `\n  keeps routing through Sanctuary until you restore manually:`
+          `\n  could be written: ${(retryErr as Error).message}` +
+          `\n  --unwrap will NOT find this wrap; traffic keeps routing` +
+          `\n  through Sanctuary until you restore manually:`
       );
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(

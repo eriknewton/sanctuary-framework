@@ -107,6 +107,31 @@ outbound channels by configuring them:
   never state content, counts, policy data, or fortress identifiers.
   See `docs/transparency-checkpoints.md`, "External anchoring".
 
+### Documented default-on exceptions (install/wrap-time only)
+
+These are the two known deviations from strict zero-outbound: neither
+runs in the server/dashboard/broker/hub runtime the rule above governs;
+both are CLI-invocation-time-only checks against the public npm
+registry, unauthenticated, status-code-only, and both are disabled by
+the same operator knob.
+
+- **`checkPinnedVersionResolvable` (wrap-time pin-resolvability probe,**
+  `server/src/wrap/cli.ts`): during `sanctuary protect` / `sanctuary
+  wrap` (skipped for dev-dist installs), an unauthenticated HEAD-class
+  GET to the resolved npm registry checks whether the version being
+  pinned still resolves, so the operator gets an honest warning instead
+  of a silently dead pin. Default ON; disabled by
+  `SANCTUARY_NO_UPDATE_CHECK=1` (the documented zero-outbound knob).
+  No credential is ever attached to the request; only the response
+  status code is consulted.
+- **`update-check.ts`** (pre-existing): a similar unauthenticated
+  registry check for a newer published version. Default ON; also
+  disabled by `SANCTUARY_NO_UPDATE_CHECK=1`.
+
+Operators who require strict zero-outbound at wrap/install time set
+`SANCTUARY_NO_UPDATE_CHECK=1` in the environment before running
+`sanctuary protect` / `sanctuary wrap`.
+
 Each escape hatch must be:
 
 1. Configured by the operator (no Sanctuary-shipped default endpoint).

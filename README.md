@@ -389,7 +389,7 @@ For AI coding agents handling install failures, here are the common cases.
 - Confirm `npm bin -g` is on the PATH. On macOS with nvm, this typically lives at `~/.nvm/versions/node/<version>/bin/`.
 
 **Existing harness config overwritten:**
-- The original is at `~/.sanctuary/backup/config-backup-<timestamp>-<surface-tag><ext>` (the surface tag is a short hex hash of the config file's path, and the extension matches the source config: `.json` for most harnesses, `.yaml` for Hermes). Backups written by earlier releases use the older `config-backup-<timestamp>.json` name and remain restorable. Restore with `sanctuary protect --unwrap` from the same fortress/storage context.
+- The original is at `~/.sanctuary/backup/config-backup-<timestamp>-<surface-tag><ext>` (the surface tag is a short hex hash of the config file's path, and the extension matches the source config: `.json` for most harnesses; Hermes wraps two surfaces and backs up both, `.json` for the primary `~/.hermes/cli-config.json` and `.yaml` for the auxiliary `~/.hermes/config.yaml`). Backups written by earlier releases use the older `config-backup-<timestamp>.json` name and remain restorable. Restore with `sanctuary protect --unwrap` from the same fortress/storage context.
 
 For anything not on this list, run `sovereignty_audit` and surface the report to the operator.
 
