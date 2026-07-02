@@ -6,16 +6,34 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sanctuary — Principal Dashboard</title>
   <style>
+    /* v1.1 "paper/ink" design tokens. Canonical source of truth is the
+       dashboard board at server/src/dashboard/v1_1/html.ts (:root at :47).
+       These are a scoped mirror (Option A) of the subset this page uses;
+       do not diverge the values. A shared tokens module is a logged
+       follow-up. */
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text-primary: #e6edf3;
-      --text-secondary: #8b949e;
-      --green: #3fb950;
-      --amber: #d29922;
-      --red: #f85149;
-      --blue: #58a6ff;
+      --paper: #f7f5f0;
+      --paper-2: #efece5;
+      --ink: #1a1a17;
+      --ink-2: #39362f;
+      --ink-3: #6a6659;
+      --ink-4: #9a9585;
+      --rule: #d8d4c8;
+      --surface: #fdfcf8;
+      --surface-2: #f1eee6;
+      --rust: oklch(55% 0.11 35);
+      --rust-bg: oklch(94% 0.03 35);
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+      --rad: 6px;
+      --rad-lg: 10px;
+      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+      --text-xs: 11px;
+      --text-sm: 12px;
+      --text-md: 14px;
+      --text-base: 13px;
+      --text-lg: 16px;
     }
 
     * {
@@ -25,9 +43,11 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background-color: var(--bg);
-      color: var(--text-primary);
+      font-family: var(--sans);
+      font-size: var(--text-md);
+      background-color: var(--paper);
+      color: var(--ink);
+      line-height: 1.45;
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -42,10 +62,10 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     .login-card {
       background-color: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
       padding: 40px 32px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      box-shadow: var(--shadow);
     }
 
     .login-header {
@@ -56,9 +76,10 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     .logo {
+      font-family: var(--serif);
       font-size: 24px;
-      font-weight: 700;
-      color: var(--blue);
+      font-weight: 500;
+      color: var(--ink);
     }
 
     .logo-text {
@@ -67,15 +88,23 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
     }
 
     .logo-text .title {
-      font-size: 18px;
-      font-weight: 600;
-      letter-spacing: -0.5px;
+      font-family: var(--serif);
+      font-size: var(--text-lg);
+      font-weight: 500;
+      letter-spacing: -0.3px;
     }
 
     .logo-text .version {
-      font-size: 12px;
-      color: var(--text-secondary);
-      margin-top: 2px;
+      display: inline-block;
+      align-self: flex-start;
+      margin-top: 4px;
+      padding: 2px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
     }
 
     .form-group {
@@ -84,40 +113,46 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     label {
       display: block;
-      font-size: 14px;
+      font-family: var(--sans);
+      font-size: var(--text-md);
       font-weight: 500;
       margin-bottom: 8px;
-      color: var(--text-primary);
+      color: var(--ink);
     }
 
     input[type="text"],
     input[type="password"] {
       width: 100%;
       padding: 10px 12px;
-      background-color: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: 'JetBrains Mono', monospace;
-      transition: border-color 0.2s;
+      background-color: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      color: var(--ink);
+      font-size: var(--text-md);
+      font-family: var(--mono);
+      transition: border-color 0.15s;
+    }
+
+    input[type="text"]::placeholder,
+    input[type="password"]::placeholder {
+      color: var(--ink-4);
     }
 
     input[type="text"]:focus,
     input[type="password"]:focus {
-      outline: none;
-      border-color: var(--blue);
-      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.1);
+      outline: 2px solid var(--ink-3);
+      outline-offset: 1px;
+      border-color: var(--ink-3);
     }
 
     .error-message {
       display: none;
-      background-color: rgba(248, 81, 73, 0.1);
-      border: 1px solid var(--red);
-      color: #ff9999;
+      background-color: var(--rust-bg);
+      border: 1px solid var(--rust);
+      color: var(--rust);
       padding: 12px;
-      border-radius: 6px;
-      font-size: 13px;
+      border-radius: var(--rad);
+      font-size: var(--text-base);
       margin-bottom: 20px;
     }
 
@@ -127,34 +162,43 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
     button {
       width: 100%;
-      padding: 10px 16px;
-      background-color: var(--blue);
-      color: var(--bg);
-      border: none;
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
+      padding: 8px 18px;
+      background-color: var(--ink);
+      color: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      font-weight: 500;
       cursor: pointer;
-      transition: background-color 0.2s;
+      transition: background-color 0.15s, border-color 0.15s;
     }
 
     button:hover {
-      background-color: #79c0ff;
+      background-color: var(--ink-2);
+      border-color: var(--ink-2);
     }
 
     button:active {
-      background-color: #4184e4;
+      background-color: var(--ink-2);
     }
 
     button:disabled {
-      background-color: var(--text-secondary);
+      background-color: var(--surface-2);
+      border-color: var(--rule);
+      color: var(--ink-4);
       cursor: not-allowed;
-      opacity: 0.5;
+      opacity: 0.7;
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--ink-3);
+      outline-offset: 2px;
     }
 
     .info-text {
-      font-size: 12px;
-      color: var(--text-secondary);
+      font-size: var(--text-sm);
+      color: var(--ink-3);
       margin-top: 16px;
       text-align: center;
     }
@@ -227,9 +271,15 @@ export function generateLoginHTML(options: { serverVersion: string }): string {
 
         if (response.ok) {
           const data = await response.json();
+          // Live credential fallback: the board client (dashboard/v1_1/client.ts)
+          // and the legacy /v1.0 board read sessionStorage.authToken as their API
+          // bearer under loopback auto-auth. Not dead; keep it.
           sessionStorage.setItem('authToken', token);
           window.location.href = '/'; // Dashboard is served at root path
         } else if (response.status === 401) {
+          // Client-only hardening: clear any stale session cookie so a
+          // previously valid login cannot mask a just-rejected token.
+          document.cookie = 'sanctuary_session=; Max-Age=0; Path=/';
           showError('Invalid token. Please check and try again.');
         } else {
           showError('Authentication failed. Please try again.');
@@ -3228,148 +3278,218 @@ export function generateFleetSwitcherHTML(options: {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sanctuary Fleet Switcher</title>
   <style>
+    /* v1.1 "paper/ink" design tokens. Canonical source of truth is the
+       dashboard board at server/src/dashboard/v1_1/html.ts (:root at :47).
+       These are a scoped mirror (Option A) of the subset this page uses;
+       do not diverge the values. A shared tokens module is a logged
+       follow-up. */
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --text-primary: #e6edf3;
-      --text-secondary: #8b949e;
-      --green: #3fb950;
-      --amber: #d29922;
-      --red: #f85149;
-      --blue: #58a6ff;
+      --paper: #f7f5f0;
+      --paper-2: #efece5;
+      --ink: #1a1a17;
+      --ink-2: #39362f;
+      --ink-3: #6a6659;
+      --ink-4: #9a9585;
+      --rule: #d8d4c8;
+      --surface: #fdfcf8;
+      --surface-2: #f1eee6;
+      --sage: oklch(62% 0.07 145);
+      --sage-bg: oklch(94% 0.02 145);
+      --ochre: oklch(68% 0.09 75);
+      --rust: oklch(55% 0.11 35);
+      --rust-bg: oklch(94% 0.03 35);
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      --serif: "Iowan Old Style", "Charter", "Georgia", serif;
+      --rad: 6px;
+      --rad-lg: 10px;
+      --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
+      --text-xs: 11px;
+      --text-sm: 12px;
+      --text-base: 13px;
+      --text-md: 14px;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background-color: var(--bg);
-      color: var(--text-primary);
+      font-family: var(--sans);
+      font-size: var(--text-md);
+      background-color: var(--paper);
+      color: var(--ink);
+      line-height: 1.45;
       min-height: 100vh;
       padding: 20px;
     }
+    .fleet-wrap { max-width: 980px; margin: 0 auto; }
     .header {
       display: flex;
       align-items: center;
       gap: 12px;
       margin-bottom: 24px;
       padding-bottom: 16px;
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid var(--rule);
     }
-    .header h1 { font-size: 20px; font-weight: 600; }
-    .header .version { color: var(--text-secondary); font-size: 13px; }
+    .header h1 { font-family: var(--serif); font-size: 28px; font-weight: 400; letter-spacing: -0.3px; }
+    .header .version {
+      padding: 2px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
+    }
     .back-link {
-      color: var(--blue);
+      color: var(--ink-2);
       text-decoration: none;
-      font-size: 14px;
+      font-size: var(--text-md);
       margin-left: auto;
     }
-    .back-link:hover { text-decoration: underline; }
+    .back-link:hover { color: var(--ink); text-decoration: underline; }
 
     .add-form {
       background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
+      box-shadow: var(--shadow);
       padding: 16px;
       margin-bottom: 24px;
       display: flex;
       gap: 8px;
       align-items: end;
     }
-    .add-form .field { flex: 1; }
+    .add-form .field { flex: 1; min-width: 0; }
     .add-form label {
       display: block;
-      font-size: 12px;
-      color: var(--text-secondary);
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-3);
       margin-bottom: 4px;
     }
     .add-form input {
       width: 100%;
       padding: 8px 12px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-size: 14px;
+      background: var(--surface);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: var(--text-md);
     }
-    .add-form input:focus { outline: none; border-color: var(--blue); }
+    .add-form input#machine-url { font-family: var(--mono); }
+    .add-form input::placeholder { color: var(--ink-4); }
+    .add-form input:focus { outline: 2px solid var(--ink-3); outline-offset: 1px; border-color: var(--ink-3); }
+    .add-form input.invalid { border-color: var(--rust); }
     .add-form button {
-      padding: 8px 16px;
-      background: var(--blue);
-      color: #fff;
-      border: none;
-      border-radius: 6px;
-      font-size: 14px;
+      padding: 8px 18px;
+      background: var(--ink);
+      color: var(--paper);
+      border: 1px solid var(--ink);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
+      font-weight: 500;
       cursor: pointer;
       white-space: nowrap;
     }
-    .add-form button:hover { opacity: 0.9; }
+    .add-form button:hover { background: var(--ink-2); border-color: var(--ink-2); }
+    .add-form button:focus-visible { outline: 2px solid var(--ink-3); outline-offset: 2px; }
+    .form-hint {
+      display: none;
+      color: var(--rust);
+      font-size: var(--text-sm);
+      margin: -16px 0 24px;
+    }
+    .form-hint.show { display: block; }
 
     .machine-list { display: flex; flex-direction: column; gap: 8px; }
     .machine-card {
       background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border: 1px solid var(--rule);
+      border-radius: var(--rad-lg);
+      box-shadow: var(--shadow);
       padding: 16px;
       display: flex;
       align-items: center;
       gap: 12px;
     }
-    .machine-card.current { border-color: var(--green); }
+    .machine-card.current { border-color: var(--sage); }
     .machine-card .status-dot {
       width: 10px; height: 10px;
       border-radius: 50%;
-      background: var(--text-secondary);
+      background: var(--ink-4);
       flex-shrink: 0;
     }
-    .machine-card .status-dot.online { background: var(--green); }
-    .machine-card .status-dot.offline { background: var(--red); }
-    .machine-card .status-dot.checking { background: var(--amber); }
-    .machine-card .info { flex: 1; }
-    .machine-card .name { font-weight: 600; font-size: 15px; }
+    .machine-card .status-dot.online { background: var(--sage); }
+    .machine-card .status-dot.offline { background: var(--rust); }
+    .machine-card .status-dot.checking { background: var(--ochre); }
+    .machine-card .status-label {
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      color: var(--ink-3);
+      flex-shrink: 0;
+      min-width: 56px;
+    }
+    .machine-card .info { flex: 1; min-width: 0; }
+    .machine-card .name {
+      font-weight: 600;
+      font-size: 15px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .machine-card .url {
-      color: var(--text-secondary);
-      font-size: 13px;
-      font-family: monospace;
+      color: var(--ink-3);
+      font-size: var(--text-base);
+      font-family: var(--mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .machine-card .current-badge {
-      font-size: 11px;
-      background: var(--green);
-      color: #000;
+      font-family: var(--mono);
+      font-size: var(--text-xs);
+      background: var(--sage-bg);
+      color: var(--sage);
+      border: 1px solid var(--sage);
       padding: 2px 8px;
-      border-radius: 10px;
-      font-weight: 600;
+      border-radius: 12px;
     }
-    .machine-card .actions { display: flex; gap: 8px; }
+    .machine-card .actions { display: flex; gap: 8px; flex-shrink: 0; }
     .machine-card .btn-open {
       padding: 6px 14px;
-      background: var(--blue);
-      color: #fff;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
+      background: var(--surface);
+      color: var(--ink);
+      border: 1px solid var(--rule);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
       cursor: pointer;
       text-decoration: none;
     }
-    .machine-card .btn-open:hover { opacity: 0.9; }
+    .machine-card .btn-open:hover { background: var(--surface-2); }
     .machine-card .btn-remove {
       padding: 6px 10px;
-      background: transparent;
-      color: var(--red);
-      border: 1px solid var(--red);
-      border-radius: 6px;
-      font-size: 13px;
+      background: var(--rust-bg);
+      color: var(--rust);
+      border: 1px solid var(--rust);
+      border-radius: var(--rad);
+      font-family: var(--sans);
+      font-size: var(--text-base);
       cursor: pointer;
     }
-    .machine-card .btn-remove:hover { background: rgba(248,81,73,0.1); }
+    .machine-card .btn-remove:hover { background: var(--rust-bg); filter: brightness(0.97); }
     .empty-state {
       text-align: center;
-      color: var(--text-secondary);
+      color: var(--ink-3);
       padding: 40px;
-      font-size: 14px;
+      font-size: var(--text-md);
     }
   </style>
 </head>
 <body>
+  <div class="fleet-wrap">
   <div class="header">
     <h1>Fleet Switcher</h1>
     <span class="version">v${serverVersion}</span>
@@ -3387,8 +3507,10 @@ export function generateFleetSwitcherHTML(options: {
     </div>
     <button onclick="addMachine()">Add Machine</button>
   </div>
+  <div id="form-hint" class="form-hint"></div>
 
   <div id="machine-list" class="machine-list"></div>
+  </div>
 
   <script>
     const STORAGE_KEY = 'sanctuary_fleet_machines';
@@ -3404,12 +3526,31 @@ export function generateFleetSwitcherHTML(options: {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(machines));
     }
 
+    function showFormHint(message) {
+      const hint = document.getElementById('form-hint');
+      hint.textContent = message;
+      hint.classList.add('show');
+    }
+
+    function clearFormHint() {
+      const hint = document.getElementById('form-hint');
+      hint.classList.remove('show');
+      document.getElementById('machine-name').classList.remove('invalid');
+      document.getElementById('machine-url').classList.remove('invalid');
+    }
+
     function addMachine() {
       const nameEl = document.getElementById('machine-name');
       const urlEl = document.getElementById('machine-url');
       const name = nameEl.value.trim();
       let url = urlEl.value.trim();
-      if (!name || !url) return;
+      clearFormHint();
+      if (!name || !url) {
+        nameEl.classList.toggle('invalid', !name);
+        urlEl.classList.toggle('invalid', !url);
+        showFormHint('Enter both a name and a dashboard URL.');
+        return;
+      }
 
       // Normalize: strip trailing slash
       url = url.replace(/\\/+$/, '');
@@ -3457,9 +3598,11 @@ export function generateFleetSwitcherHTML(options: {
 
       list.innerHTML = machines.map(m => {
         const isCurrent = m.url === CURRENT_ENDPOINT || m.url === location.origin;
+        const key = btoa(m.url).replace(/=/g,'');
         return \`
           <div class="machine-card \${isCurrent ? 'current' : ''}" data-url="\${m.url}">
-            <div class="status-dot checking" id="dot-\${btoa(m.url).replace(/=/g,'')}"></div>
+            <div class="status-dot checking" id="dot-\${key}"></div>
+            <div class="status-label" id="label-\${key}">Checking</div>
             <div class="info">
               <div class="name">\${escapeHtml(m.name)}\${isCurrent ? ' <span class="current-badge">CURRENT</span>' : ''}</div>
               <div class="url">\${escapeHtml(m.url)}</div>
@@ -3474,11 +3617,13 @@ export function generateFleetSwitcherHTML(options: {
 
       // Check health for each machine
       machines.forEach(async (m) => {
-        const dotId = 'dot-' + btoa(m.url).replace(/=/g,'');
-        const dot = document.getElementById(dotId);
+        const key = btoa(m.url).replace(/=/g,'');
+        const dot = document.getElementById('dot-' + key);
+        const label = document.getElementById('label-' + key);
         if (!dot) return;
         const status = await checkHealth(m.url);
         dot.className = 'status-dot ' + status;
+        if (label) label.textContent = status === 'online' ? 'Online' : 'Offline';
       });
     }
 
@@ -3501,6 +3646,11 @@ export function generateFleetSwitcherHTML(options: {
         saveMachines(machines);
       }
     })();
+
+    // Clear the validation hint once the operator starts correcting the fields.
+    ['machine-name', 'machine-url'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', clearFormHint);
+    });
 
     render();
   </script>

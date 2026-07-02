@@ -1986,6 +1986,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   async setFederationGuardianRevocationRequirement(
     requirement: GuardianRevocationRequirement | null,
   ): Promise<void> {
+    // ATOMIC mutation (F2). Capture the prior values of all three live fields so
+    // we can ROLL BACK if the durable persist throws. Without this rollback a
+    // failed persist would leave in-memory state advanced (possibly DISABLED)
+    // while the durable store still holds the prior value: a subsequent
+    // in-process revoke would read the mutated requirement while a restart would
+    // read the prior one, diverging until reboot. The rule (AGENTS.md 5) is that
+    // a security-state advance is never acknowledged unless it durably committed,
+    // so on a persist failure the live state must snap back to the durable value.
+    const priorRequirement = this._federationGuardianRevocationRequirement;
+    const priorInvalid = this._federationGuardianRevocationRequirementInvalid;
+    const priorGeneration = this._federationGuardianRevocationRequirementGeneration;
+
     this._federationGuardianRevocationRequirement = requirement;
     // An explicit operator (re-)pin or clear supersedes any prior fail-closed
     // latch: the operator is asserting the current requirement directly.
@@ -1993,7 +2005,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // Bump the monotonic generation on EVERY set (enable, re-pin, OR clear) so a
     // stale cross-process writer (the rotate-root CLI) can never clobber this
     // change in the durable-store merge.
-    this._federationGuardianRevocationRequirementGeneration += 1;
+    this._federationGuardianRevocationRequirementGeneration = priorGeneration + 1;
     // LOUD, DURABLE audit on every call. Turning the fleet-kill guard OFF
     // (`set(null)`) is a Tier-1-class relaxation and MUST be as loud as enabling
     // it; it is emitted as a critical audit event, never silent. Emitted BEFORE
@@ -2024,7 +2036,34 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // guarantee would evaporate on the next reboot and silently revert to
     // single-operator kill. THROWS on a durable-write failure so the operator's
     // opt-in is not acknowledged unless it durably committed (fail-closed write).
-    await this.persistFederationSyncState();
+    try {
+      await this.persistFederationSyncState();
+    } catch (err) {
+      // ROLL BACK all three live fields to their prior values so in-memory state
+      // == durable state (the prior value) after a failed write. Note the safe
+      // direction: an ENABLE that fails to persist rolls back to the PRIOR guard
+      // (stays as it was); a DISABLE that fails to persist rolls back to ENABLED
+      // (the guard stays ON). Emit a SECOND critical audit recording the
+      // rollback so the trail shows both the intent (above) and that it did NOT
+      // durably take effect, then re-throw so the caller sees the failure.
+      this._federationGuardianRevocationRequirement = priorRequirement;
+      this._federationGuardianRevocationRequirementInvalid = priorInvalid;
+      this._federationGuardianRevocationRequirementGeneration = priorGeneration;
+      await this.auditLog?.appendCritical({
+        layer: "l2",
+        operation: "federation_guardian_revocation_requirement_persist_failed",
+        identity_id: "dashboard",
+        result: "failure",
+        details: {
+          // The intent that failed to commit, and the fact that the live state
+          // was rolled back to the prior (durable) value.
+          attempted_enabled: requirement !== null,
+          rolled_back_to_enabled: priorRequirement !== null,
+          rolled_back_generation: priorGeneration,
+        },
+      });
+      throw err;
+    }
   }
 
   /** True when federation materials are bound (issuer or joiner context). */
@@ -2086,6 +2125,63 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private async hydrateFederationSyncState(): Promise<void> {
     const store = this._federationSyncStateStore;
     if (store === null) return;
+    // Deleted-record handling (F3). `load()` deliberately collapses an ABSENT
+    // record into an empty snapshot (its FROZEN `raw === null -> empty` contract,
+    // correct for a genuinely fresh fortress). But an absent record can ALSO mean
+    // the record was DELETED out of band by an attacker with local storage write,
+    // to silently un-revoke evicted nodes and drop a configured guardian
+    // requirement. We must fail closed on the deletion case WITHOUT bricking a
+    // legitimately fresh-provisioned fortress.
+    //
+    // Brick-safety (VERIFIED against the boot + ceremony paths): provisioning
+    // (mint / join / setFederationContext) does NOT itself persist a sync-state
+    // record. The FIRST persist happens on the first accepted sync, the first
+    // node eviction, or the first setFederationGuardianRevocationRequirement. So
+    // "provisioned + no sync-state record" is a LEGITIMATE, common state on a
+    // freshly-federated fortress's first boot: it must be able to accept that
+    // first sync/eviction, which itself writes the record. A blanket
+    // "provisioned + absent -> latch" would DENY that first sync and brick every
+    // fresh federated fortress. Therefore we do NOT treat provisioned+absent as
+    // anomalous on its own.
+    //
+    // The signal we CAN trust is POSITIVE INDEPENDENT EVIDENCE of prior
+    // federation security activity that lives OUTSIDE the deleted sync-state
+    // record: the durable TRUST-ROOT record carries the revoked-root set + the
+    // root-revocation serial, which setFederationContext already loaded into
+    // `_federationRevokedRoots` / `_federationHighestRevocationSerial`. If that
+    // independent evidence shows the fortress HAS revocation history but the
+    // sync-state record is absent, the record was deleted (a fresh fortress has
+    // an empty revoked-root set and a zero serial). Only THEN do we latch. This
+    // never trips on a fresh fortress and never bricks the first sync.
+    //
+    // Documented residual: a fortress whose ONLY revocation history is NODE
+    // evictions (which live solely in the deleted sync-state record, with no
+    // independent trust-root witness) cannot be distinguished from fresh after a
+    // deletion, so its node-revocation memory still resets to empty on that boot
+    // (the pre-existing status quo). Deleting a root-revocation-bearing fortress's
+    // record IS caught. Closing the node-eviction residual would require
+    // provisioning to write a baseline record (a ceremony change across the mesh
+    // trust-root stores, out of this fix's scope); tracked as follow-up.
+    let recordPresent: boolean;
+    try {
+      recordPresent = await store.recordExists();
+    } catch {
+      // A read fault (not a clean absence) is treated as unavailable: fail
+      // closed rather than mis-classify a transient backend error as "fresh".
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    if (
+      !recordPresent &&
+      this.isFederationProvisioned() &&
+      this.hasIndependentFederationRevocationHistory()
+    ) {
+      // Provisioned + record absent + independent evidence of prior revocation
+      // history -> the record was DELETED. Fail closed. Do NOT touch the live
+      // fields (no half-applied state); latch so every sync/revoke path denies.
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
     let snapshot: FederationSyncStateSnapshot;
     try {
       snapshot = await store.load();
@@ -2145,6 +2241,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     this.rehydrateGuardianRevocationRequirement(
       snapshot.guardianRevocationRequirement,
       snapshot.guardianRevocationRequirementGeneration,
+    );
+  }
+
+  /**
+   * F3 deletion-latch signal: does this fortress carry POSITIVE, INDEPENDENT
+   * evidence of prior federation revocation activity that lives OUTSIDE the
+   * durable sync-state record?
+   *
+   * The evidence is the durable TRUST-ROOT record's revoked-root projection: the
+   * revoked-root set and the root-revocation serial, which setFederationContext
+   * loads from the trust root (a SEPARATE at-rest record from the sync-state
+   * blob). A genuinely fresh fortress has an EMPTY revoked-root set and a ZERO
+   * serial; a fortress that has performed a compromise root rotation has a
+   * non-empty set / non-zero serial. When that evidence is present but the
+   * sync-state record is ABSENT, the sync-state record was deleted (the two
+   * records cannot legitimately disagree that way), so the caller fails closed.
+   * When the evidence is empty, absence is indistinguishable from a fresh
+   * fortress and we do NOT latch (never brick the first sync/eviction).
+   */
+  private hasIndependentFederationRevocationHistory(): boolean {
+    return (
+      this._federationRevokedRoots.size > 0 ||
+      this._federationHighestRevocationSerial > 0
     );
   }
 
@@ -2255,11 +2374,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * when no durable store is wired (in-memory rigs). THROWS on a store write
    * failure so the caller can fail closed: a security-state advance MUST NOT be
    * acknowledged unless it durably committed.
+   *
+   * A SUCCESSFUL persist clears the {@link _federationSyncStateUnavailable}
+   * latch: the record is now durably present + clean, and the live fields we
+   * just wrote ARE the durable truth, so the sync/revoke paths may serve again.
+   * This is the operator's recovery path out of the F3 deleted-record latch (and
+   * the fresh-provisioned-but-never-persisted residual): any successful persist
+   * (a revoke, an accepted high-water, or an explicit
+   * setFederationGuardianRevocationRequirement re-pin) re-establishes the record.
+   * It CANNOT falsely clear a present-but-corrupt latch: writeNow's own
+   * read-modify-write re-reads the at-rest blob and THROWS on a corrupt record,
+   * so a persist over a corrupt record fails and the latch stays set.
    */
   private async persistFederationSyncState(): Promise<void> {
     const store = this._federationSyncStateStore;
     if (store === null) return;
     await store.persist(this.snapshotFederationSyncState());
+    this._federationSyncStateUnavailable = false;
   }
 
   /** RR-1 (Federation 3/3b P0): is this fortress-master (root) pubkey revoked? */
@@ -2406,7 +2537,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // FAILS CLOSED (refuses every revocation) instead of dropping to
       // single-operator kill.
       requireGuardianRevocationSignOff: () => {
-        if (this._federationGuardianRevocationRequirementInvalid) {
+        // Fail closed when the durable sync-state record is unavailable
+        // (present-but-corrupt OR deleted-while-provisioned, F3): a revoke must
+        // not proceed on revocation/guardian memory we could not trust on boot.
+        // Returning the sentinel makes the revoke handler refuse rather than
+        // drop to single-operator kill on an empty/untrusted requirement.
+        if (
+          this._federationSyncStateUnavailable ||
+          this._federationGuardianRevocationRequirementInvalid
+        ) {
           return { unavailable: true };
         }
         return this._federationGuardianRevocationRequirement;
