@@ -906,6 +906,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     const backup = await backupConfig(configPath);
     const lockPath = join(backupDirPath(), "wrap-meta.lock");
 
+    errSpy.mockClear();
     __wrapMetaLockTestHooks.failStatAfterWrite = true;
     try {
       await saveWrapMeta({
@@ -923,6 +924,11 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     // The lock file was NOT unlinked: the release failed closed rather
     // than falling back to the old unconditional unlink.
     await expect(access(lockPath)).resolves.toBeUndefined();
+    // Round 15: the run that orphaned the lock prints a contemporaneous
+    // warning naming the lock path, so the operator learns of the wedge
+    // from THIS run rather than only from the next run's refusal.
+    expect(stderrOutput()).toContain(lockPath);
+    expect(stderrOutput()).toMatch(/wrap-meta lock/);
 
     // Clean up the surviving lock (the operator's manual-break step) so
     // later tests in this file are not affected by lock-directory state.

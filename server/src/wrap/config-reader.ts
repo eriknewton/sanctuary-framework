@@ -1275,7 +1275,12 @@ const WRAP_META_LOCK_RETRY_MS = 50;
  * enters the critical section without proof of which lock file is
  * "theirs". The pin this seam exists for asserts the release then fails
  * CLOSED (skips the unlink) rather than falling back to an unconditional
- * unlink that could evict a live successor's lock.
+ * unlink that could evict a live successor's lock, AND asserts the release
+ * prints a one-line stderr warning naming the orphaned lock path (round 15:
+ * without it, a successful mutation left a clean success banner with no
+ * contemporaneous sign the NEXT wrap/unwrap on the tenant will stall the
+ * full bounded wait and then refuse until the operator manually removes
+ * the file).
  */
 export const __wrapMetaLockTestHooks: {
   onLockAcquired?: (lockPath: string) => void | Promise<void>;
@@ -1449,6 +1454,24 @@ async function withWrapMetaLock<T>(
         if (current.ino === acquired.ino && current.mtimeMs === acquired.mtimeMs) {
           await unlink(lockPath);
         }
+      } else if (identityUnavailableAfterAcquire) {
+        // The mutation above may have SUCCEEDED even though identity could
+        // not be captured, so a clean success banner can otherwise reach
+        // the operator while this orphaned lock silently wedges the next
+        // wrap/unwrap for the full bounded wait. Surface the wedge from the
+        // run that caused it rather than leaving it to the next run's
+        // fail-closed refusal to explain. stderr, not stdout: this module
+        // is also imported on MCP stdio server paths (posture routes, the
+        // agent-contract SDK adapter), and MCP frames stdout, not stderr.
+        // SAFETY: stderr is the operator-facing diagnostic channel here;
+        // no logger module is in scope in this shared module.
+        console.error(
+          `warning: the wrap-meta lock (${lockPath}) could not be verified ` +
+            `and was left in place after this operation completed; a later ` +
+            `sanctuary wrap/unwrap will wait then refuse until it is ` +
+            `manually removed. Verify no sanctuary wrap/unwrap process is ` +
+            `running, then remove ${lockPath}.`,
+        );
       }
       // else: best-effort no-op, leaving the lock file for the operator's
       // manual-break runbook.
