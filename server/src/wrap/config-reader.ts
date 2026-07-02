@@ -10,6 +10,7 @@
 
 import { mkdir, realpath, open, lstat, unlink, readdir } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, extname, resolve, dirname, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import { resolveStoragePath } from "../paths.js";
@@ -169,20 +170,47 @@ function backupDir(): string {
 }
 
 /**
+ * Short, stable per-surface tag embedded in backup filenames so backups in
+ * the shared per-tenant backup dir can be attributed to the config file
+ * they were taken from (2026-07-02 hardening, surface-scoped breadcrumbs).
+ * Keyed on the resolve()d source path - the same scoping discipline
+ * removeWrapMeta / saveWrapMeta use for the wrap-meta pointer. A content
+ * hash would NOT work here: two surfaces can hold identical bytes.
+ */
+function backupSurfaceTag(originalPath: string): string {
+  return createHash("sha256")
+    .update(resolve(originalPath))
+    .digest("hex")
+    .slice(0, 12);
+}
+
+/**
  * Back up a config file before modification.
  * Returns the backup path.
  *
  * The backup keeps the source file's extension (D4 staging, Bug 2: the
  * Hermes wrap now also backs up ~/.hermes/config.yaml, and a .yaml backup
- * named .json would mislead manual recovery). JSON configs keep the
- * historical `config-backup-<timestamp>.json` name unchanged.
+ * named .json would mislead manual recovery).
+ *
+ * 2026-07-02 hardening (surface-scoped breadcrumbs): the filename embeds a
+ * short hash of the resolve()d source path
+ * (`config-backup-<timestamp>-<surface-tag><ext>`), so consumers that scan
+ * the shared backup dir (findNewerBackup) can discriminate by SURFACE
+ * instead of by extension alone - two wrapped .json configs previously
+ * cross-matched each other's backups. The `config-backup-` prefix and the
+ * embedded ISO timestamp (lexical order = chronological order) are
+ * unchanged; wrap-meta pointers store the full path, so backups written by
+ * earlier releases stay restorable.
  */
 export async function backupConfig(configPath: string): Promise<string> {
   const dir = backupDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const extension = extname(configPath) || ".json";
-  const backupPath = join(dir, `config-backup-${timestamp}${extension}`);
+  const backupPath = join(
+    dir,
+    `config-backup-${timestamp}-${backupSurfaceTag(configPath)}${extension}`,
+  );
   const data = await readFileCustody(configPath, { verifyPathIdentity: true });
   await writeFileCustody(backupPath, data, { mode: 0o600, createParent: false });
   return backupPath;
@@ -833,15 +861,13 @@ export async function findLatestBackup(): Promise<{
 }
 
 /**
- * Read the existing wrap-meta (canonical then legacy filename) leniently,
- * for the F6 re-wrap pointer-preservation check in saveWrapMeta. Returns
- * null when absent or unreadable; validation still happens on the unwrap
- * read path (findLatestBackup).
+ * Read every parseable wrap-meta pointer file (canonical then legacy
+ * filename) leniently. Missing/unreadable/unparseable candidates are
+ * skipped; validation still happens on the unwrap read path
+ * (findLatestBackup).
  */
-async function readExistingWrapMetaRaw(): Promise<Record<
-  string,
-  unknown
-> | null> {
+async function readWrapMetaFilesRaw(): Promise<Record<string, unknown>[]> {
+  const metas: Record<string, unknown>[] = [];
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     try {
       const parsed: unknown = JSON.parse(
@@ -851,25 +877,57 @@ async function readExistingWrapMetaRaw(): Promise<Record<
         }),
       );
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
+        metas.push(parsed as Record<string, unknown>);
       }
     } catch {
       // Missing or unreadable: try the next candidate.
     }
   }
-  return null;
+  return metas;
 }
 
 /**
- * True when a wrap-meta pointer file (canonical or legacy filename) exists
- * and parses to an object. Read leniently, like the F6 preservation check.
+ * Read the existing wrap-meta (canonical then legacy filename) leniently,
+ * for the F6 re-wrap pointer-preservation check in saveWrapMeta. Returns
+ * null when absent or unreadable.
+ */
+async function readExistingWrapMetaRaw(): Promise<Record<
+  string,
+  unknown
+> | null> {
+  const metas = await readWrapMetaFilesRaw();
+  return metas.length > 0 ? metas[0]! : null;
+}
+
+/**
+ * True when a wrap-meta pointer (canonical or legacy filename) exists FOR
+ * THIS SURFACE: it parses to an object whose `originalPath` resolve()s to
+ * the same path as `originalPath` (the scoping discipline removeWrapMeta
+ * already uses). Read leniently, like the F6 preservation check; BOTH
+ * pointer filenames are consulted, so a legacy meta for this surface still
+ * counts even when a canonical meta for a different surface exists.
+ *
  * MED-2 (crash-window honesty): the wrap flow uses this to detect the
  * "config already carries the sanctuary entry but NO meta exists" state an
  * interrupted earlier wrap leaves behind, and warns that the pristine
- * pre-wrap config cannot be identified.
+ * pre-wrap config cannot be identified. 2026-07-02 hardening: the check
+ * was previously tenant-global (any meta, for any surface, suppressed the
+ * warning), so a wrap-meta for surface Y silently hid the crash-window
+ * state of surface X.
  */
-export async function hasExistingWrapMeta(): Promise<boolean> {
-  return (await readExistingWrapMetaRaw()) !== null;
+export async function hasExistingWrapMeta(
+  originalPath: string,
+): Promise<boolean> {
+  const resolved = resolve(originalPath);
+  for (const meta of await readWrapMetaFilesRaw()) {
+    if (
+      typeof meta.originalPath === "string" &&
+      resolve(meta.originalPath) === resolved
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** True when the path names an existing, accessible file. */
@@ -928,7 +986,11 @@ export async function saveWrapMeta(
   if (
     (options.configStillWrapped ?? true) &&
     existing !== null &&
-    existing.originalPath === meta.originalPath &&
+    // Surface scoping (2026-07-02 hardening): resolve()-compare, matching
+    // removeWrapMeta / hasExistingWrapMeta, so a lexically-different spelling
+    // of the same path still preserves the pristine pointer.
+    typeof existing.originalPath === "string" &&
+    resolve(existing.originalPath) === resolve(meta.originalPath) &&
     typeof existing.backupPath === "string" &&
     existing.backupPath.trim() !== "" &&
     (await fileExists(existing.backupPath))
@@ -943,7 +1005,8 @@ export async function saveWrapMeta(
         meta.auxiliary.map(async (aux) => {
           const prior = priorAux.find(
             (e) =>
-              e.originalPath === aux.originalPath &&
+              typeof e.originalPath === "string" &&
+              resolve(e.originalPath) === resolve(aux.originalPath) &&
               (e.backupPath === null || typeof e.backupPath === "string"),
           );
           if (!prior) return aux;
@@ -983,6 +1046,15 @@ export async function saveWrapMeta(
  * latter). An unparseable meta file points at nothing restorable and is
  * still removed. (The parameter is REQUIRED: an earlier optional-argument
  * "remove unconditionally" mode had no production caller and was deleted.)
+ *
+ * 2026-07-02 hardening (non-destructive on a read error): the pointer file
+ * is only unlinked when it is genuinely absent-of-restorable-content: it
+ * does not exist (ENOENT), or its content was successfully READ and is
+ * affirmatively unparseable or names THIS surface. A transient read
+ * failure (EACCES, EIO, a custody path-identity refusal) previously fell
+ * through to the unlink, destroying what may be the only pointer to a
+ * restorable backup on an error path; it now leaves the pointer in place
+ * and reports the path as a failure the caller warns about.
  */
 export async function removeWrapMeta(
   restoredOriginalPath: string,
@@ -990,14 +1062,27 @@ export async function removeWrapMeta(
   const failures: string[] = [];
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
     const metaPath = join(backupDir(), filename);
+    let raw: string;
+    try {
+      raw = await readFileCustody(metaPath, {
+        encoding: "utf-8",
+        verifyPathIdentity: true,
+      });
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      if (code === "ENOENT") continue; // Genuinely absent: nothing to remove.
+      // Transient/permission read failure: the file may still be the only
+      // pointer at a restorable backup. Never unlink on an error path;
+      // report it so the caller warns loudly.
+      failures.push(metaPath);
+      continue;
+    }
     let pointsAtOtherSurface = false;
     try {
-      const parsed: unknown = JSON.parse(
-        await readFileCustody(metaPath, {
-          encoding: "utf-8",
-          verifyPathIdentity: true,
-        }),
-      );
+      const parsed: unknown = JSON.parse(raw);
       if (
         parsed &&
         typeof parsed === "object" &&
@@ -1009,8 +1094,8 @@ export async function removeWrapMeta(
         pointsAtOtherSurface = true;
       }
     } catch {
-      // Missing or unparseable: nothing another surface could be restored
-      // from; fall through to the unlink (ENOENT is a no-op there).
+      // Affirmatively unparseable content (successfully read): it points at
+      // nothing restorable; fall through to the unlink.
     }
     if (pointsAtOtherSurface) continue;
     try {
@@ -1027,19 +1112,29 @@ export async function removeWrapMeta(
 }
 
 /**
- * Find the newest wrap backup of the same kind (extension) that is NEWER
- * than `backupPath`, or null when none exists. Backup filenames embed an
- * ISO-8601 timestamp (`config-backup-<timestamp><ext>`), so lexical order
- * on the filename is chronological order.
+ * Find the newest wrap backup OF THE SAME SURFACE that is NEWER than
+ * `backupPath`, or null when none exists. Backup filenames embed an
+ * ISO-8601 timestamp (`config-backup-<timestamp>-<surface-tag><ext>`), so
+ * lexical order on the filename is chronological order.
  *
  * Harden round (operator breadcrumb): the F6 pristine-pointer preservation
  * means an unwrap after a re-wrap restores the FIRST pre-wrap snapshot;
  * config edits made while wrapped survive only in the newer timestamped
  * backups nothing points at. Unwrap uses this to print where those edits
  * can be recovered from. Best-effort: any error reads as "none found".
+ *
+ * 2026-07-02 hardening (surface-scoped breadcrumbs): candidates are
+ * filtered by the surface tag derived from `originalPath` (the resolve()d
+ * config path this backup chain belongs to), not by extension alone -
+ * prefix+extension matching in the shared per-tenant backup dir could point
+ * the "recoverable from" breadcrumb at a DIFFERENT config file's backup.
+ * Backups written by earlier releases carry no surface tag and cannot be
+ * attributed to a surface, so they are excluded: a missing breadcrumb is
+ * honest, a wrong-surface breadcrumb is the bug this fixes.
  */
 export async function findNewerBackup(
   backupPath: string,
+  originalPath: string,
 ): Promise<string | null> {
   try {
     const dir = backupDir();
@@ -1047,11 +1142,12 @@ export async function findNewerBackup(
     if (resolve(dirname(resolved)) !== resolve(dir)) return null;
     const name = basename(resolved);
     const ext = extname(name);
+    const surfaceSuffix = `-${backupSurfaceTag(originalPath)}${ext}`;
     const newer = (await readdir(dir))
       .filter(
         (entry) =>
           entry.startsWith("config-backup-") &&
-          extname(entry) === ext &&
+          entry.endsWith(surfaceSuffix) &&
           entry > name,
       )
       .sort();
