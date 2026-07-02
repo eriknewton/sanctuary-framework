@@ -231,6 +231,99 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     await expect(access(metaPath)).rejects.toThrow();
   });
 
+  // ── Fourth round: write-side surface scoping (no single-slot clobber) ──
+
+  it("wrapping a SECOND surface relocates the first surface's pointer instead of clobbering it; sequential unwraps find both", async () => {
+    const surfaceA = join(tmpHome, "claude-settings.json");
+    const surfaceB = join(tmpHome, "hermes-cli-config.json");
+    await writeFile(surfaceA, '{"a":"pristine"}');
+    await writeFile(surfaceB, '{"b":"pristine"}');
+
+    const backupA = await backupConfig(surfaceA);
+    await saveWrapMeta({
+      backupPath: backupA,
+      originalPath: surfaceA,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+    const backupB = await backupConfig(surfaceB);
+    await saveWrapMeta({
+      backupPath: backupB,
+      originalPath: surfaceB,
+      platform: "hermes",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    // Pre-fix, B's canonical write silently destroyed A's only pointer.
+    expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+
+    // First unwrap restores the newest wrap (B) and retires only B's pointer.
+    const first = await findLatestBackup();
+    expect(first?.originalPath).toBe(surfaceB);
+    expect(first?.backupPath).toBe(backupB);
+    expect(await removeWrapMeta(surfaceB)).toEqual([]);
+
+    // Second unwrap finds A via the relocated scoped slot. Pre-fix this
+    // returned null ("No Sanctuary wrap found") while A stayed wrapped and
+    // A's pristine backup was orphaned.
+    const second = await findLatestBackup();
+    expect(second?.originalPath).toBe(surfaceA);
+    expect(second?.backupPath).toBe(backupA);
+    expect(await removeWrapMeta(surfaceA)).toEqual([]);
+    expect(await findLatestBackup()).toBeNull();
+  });
+
+  it("a re-wrap of a relocated surface preserves its pristine pointer from the scoped slot (F6 across slots) and cleans the stale slot", async () => {
+    const surfaceA = join(tmpHome, "surface-slot-a.json");
+    const surfaceB = join(tmpHome, "surface-slot-b.json");
+    await writeFile(surfaceA, '{"a":"pristine"}');
+    await writeFile(surfaceB, '{"b":"pristine"}');
+
+    const pristineA = await backupConfig(surfaceA);
+    await saveWrapMeta({
+      backupPath: pristineA,
+      originalPath: surfaceA,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+    // Wrapping B relocates A's canonical meta into A's scoped slot.
+    await saveWrapMeta({
+      backupPath: await backupConfig(surfaceB),
+      originalPath: surfaceB,
+      platform: "hermes",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    // Re-wrap A: the fresh backup captures ALREADY-WRAPPED content, so the
+    // F6 preservation must find A's pristine pointer in the scoped slot,
+    // and B's canonical meta must be relocated in turn, never clobbered.
+    await saveWrapMeta({
+      backupPath: await backupConfig(surfaceA),
+      originalPath: surfaceA,
+      platform: "claude-code",
+      wrappedAt: new Date().toISOString(),
+    });
+
+    const canonical = JSON.parse(
+      await readFile(join(backupDirPath(), "wrap-meta.json"), "utf-8"),
+    );
+    expect(canonical.originalPath).toBe(surfaceA);
+    expect(canonical.backupPath).toBe(pristineA);
+
+    // Exactly ONE scoped slot remains (B's); A's stale slot was cleaned
+    // after its content merged back into the canonical file.
+    const slots = (await readdir(backupDirPath())).filter((name) =>
+      /^wrap-meta-[0-9a-f]{12}\.json$/.test(name),
+    );
+    expect(slots).toHaveLength(1);
+    const relocated = JSON.parse(
+      await readFile(join(backupDirPath(), slots[0]!), "utf-8"),
+    );
+    expect(relocated.originalPath).toBe(surfaceB);
+    expect(await hasExistingWrapMeta(surfaceB)).toBe(true);
+  });
+
   // ── Third round: F6 preservation fails CLOSED on an unreadable pointer ──
 
   it.skipIf(process.getuid?.() === 0)(
@@ -670,6 +763,45 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         const base = await startRegistryStub(200);
         process.env.npm_config_registry = base;
         expect(await checkPinnedVersionResolvable("9.9.9")).toBe("resolvable");
+      });
+
+      it("duplicate registry keys in one .npmrc are last-wins (npm ini semantics)", async () => {
+        // First-wins reading kept the OLD value of a key that tooling later
+        // re-appended, probed the wrong registry, and could re-create the
+        // false-affirmative "unpublished" warning for an entry npx starts.
+        await writeFile(
+          join(tmpHome, ".npmrc"),
+          [
+            "registry=https://registry.npmjs.org",
+            "registry=https://npm.corp.example/",
+            "",
+          ].join("\n"),
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://npm.corp.example", indirect: true });
+      });
+
+      it("a winning override the probe cannot interpret resolves default + INDIRECT, never default + direct", async () => {
+        // npm expands ${VAR} in .npmrc values; this probe deliberately does
+        // not. The winning-but-uninterpretable override must NOT silently
+        // fall back to default+direct, where a 404 reads as the affirmative
+        // "unpublished"; indirect keeps a 404 honest-unknown.
+        await writeFile(
+          join(tmpHome, ".npmrc"),
+          "registry=${NPM_MIRROR}\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://registry.npmjs.org", indirect: true });
       });
     });
   });

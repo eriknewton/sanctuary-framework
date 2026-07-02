@@ -551,6 +551,49 @@ const WRAP_META_FILENAME = "wrap-meta.json";
 const LEGACY_WRAP_META_FILENAME = "cocoon-meta.json";
 
 /**
+ * Surface-scoped wrap-meta slot: `wrap-meta-<surface-tag>.json`, keyed on
+ * the same resolve()d-path hash the backup filenames embed.
+ *
+ * Fourth round (write-side surface scoping): every meta READ became
+ * per-surface earlier in this sweep, but the WRITE still had exactly one
+ * canonical slot - so wrapping a SECOND surface on the same tenant
+ * silently overwrote the first surface's only unwrap pointer (wrap
+ * claude-code, then wrap hermes: the hermes meta clobbered the claude-code
+ * meta, a later second --unwrap reported "No Sanctuary wrap found" while
+ * settings.json still routed traffic through Sanctuary). saveWrapMeta now
+ * RELOCATES a canonical meta that names a different surface into that
+ * surface's scoped slot before writing, and every reader scans the scoped
+ * slots after the canonical + legacy filenames, so each wrapped surface
+ * keeps a live pointer and sequential --unwrap runs restore them all.
+ */
+const WRAP_META_SURFACE_PREFIX = "wrap-meta-";
+const WRAP_META_SURFACE_PATTERN = /^wrap-meta-[0-9a-f]{12}\.json$/;
+
+function wrapMetaSurfaceFilename(originalPath: string): string {
+  return `${WRAP_META_SURFACE_PREFIX}${backupSurfaceTag(originalPath)}.json`;
+}
+
+/**
+ * Every wrap-meta pointer filename to consult, in read priority order:
+ * canonical, legacy, then any surface-scoped slots found on disk (sorted
+ * for determinism). Best-effort on the directory listing: an unreadable
+ * or absent backup dir degrades to the two fixed filenames, whose own
+ * reads classify their errors (ENOENT vs unreadable) at the call sites.
+ */
+async function listWrapMetaFilenames(): Promise<string[]> {
+  const filenames = [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME];
+  let entries: string[];
+  try {
+    entries = await readdir(backupDir());
+  } catch {
+    return filenames;
+  }
+  return filenames.concat(
+    entries.filter((name) => WRAP_META_SURFACE_PATTERN.test(name)).sort(),
+  );
+}
+
+/**
  * A secondary file the wrap modified or created alongside the primary
  * harness config. D4 staging, Bug 2: the Hermes wrap also edits
  * ~/.hermes/config.yaml, and unwrap must restore it too.
@@ -836,7 +879,7 @@ export async function findLatestBackup(): Promise<{
   originalPath: string;
   auxiliary?: ValidatedWrapMetaAuxiliaryFile[];
 } | null> {
-  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+  for (const filename of await listWrapMetaFilenames()) {
     const metaPath = join(backupDir(), filename);
     let meta: Record<string, unknown>;
     try {
@@ -883,8 +926,8 @@ export class WrapMetaUnreadableError extends Error {
 }
 
 /**
- * Read every parseable wrap-meta pointer file (canonical then legacy
- * filename). Genuinely-absent (ENOENT) and affirmatively-unparseable
+ * Read every parseable wrap-meta pointer file (canonical, legacy, then any
+ * surface-scoped slots). Genuinely-absent (ENOENT) and affirmatively-unparseable
  * (successfully read, invalid JSON) candidates are skipped leniently;
  * validation still happens on the unwrap read path (findLatestBackup).
  *
@@ -901,7 +944,7 @@ async function readWrapMetaFilesRaw(): Promise<{
 }> {
   const metas: Record<string, unknown>[] = [];
   const unreadablePaths: string[] = [];
-  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+  for (const filename of await listWrapMetaFilenames()) {
     const metaPath = join(backupDir(), filename);
     let raw: string;
     try {
@@ -934,8 +977,8 @@ async function readWrapMetaFilesRaw(): Promise<{
 
 /**
  * Read the existing wrap-meta FOR THIS SURFACE leniently, for the F6
- * re-wrap pointer-preservation check in saveWrapMeta. Both pointer
- * filenames (canonical then legacy) are scanned for the first meta whose
+ * re-wrap pointer-preservation check in saveWrapMeta. All pointer
+ * filenames (canonical, legacy, then scoped slots) are scanned for the first meta whose
  * `originalPath` resolve()s to the same path - the identical per-surface
  * discipline hasExistingWrapMeta / removeWrapMeta use. Returns null when
  * no parseable meta names this surface.
@@ -1067,6 +1110,60 @@ export async function saveWrapMeta(
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const metaPath = join(dir, WRAP_META_FILENAME);
   const toWrite = { ...meta };
+  // Fourth round (write-side surface scoping): the canonical slot is about
+  // to be overwritten. When it holds a parseable meta naming a DIFFERENT
+  // surface, that meta is the only unwrap pointer to the other surface's
+  // pristine backup; RELOCATE it into that surface's scoped slot before
+  // writing instead of silently clobbering it (wrap claude-code then wrap
+  // hermes previously orphaned the claude-code pointer, and the second
+  // --unwrap reported "No Sanctuary wrap found" while settings.json still
+  // routed traffic through Sanctuary). Runs regardless of
+  // configStillWrapped: that flag is about THIS surface's staleness, not
+  // about what the canonical slot currently points at. An unreadable
+  // canonical (non-ENOENT) fails closed - "it names no other surface"
+  // cannot be proven about a file that cannot be read - and a relocation
+  // write failure propagates, which the wrap CLI's deferred meta write
+  // already treats as roll-back-and-exit-non-zero. An affirmatively
+  // unparseable canonical points at nothing restorable and may be
+  // overwritten, matching removeWrapMeta's judgment.
+  let canonicalRaw: string | null = null;
+  try {
+    canonicalRaw = await readFileCustody(metaPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
+  } catch (err) {
+    const code =
+      err && typeof err === "object" && "code" in err
+        ? (err as NodeJS.ErrnoException).code
+        : undefined;
+    if (code !== "ENOENT") throw new WrapMetaUnreadableError([metaPath]);
+  }
+  if (canonicalRaw !== null) {
+    let otherSurfacePath: string | null = null;
+    try {
+      const parsed: unknown = JSON.parse(canonicalRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const existingOriginal = (parsed as Record<string, unknown>)
+          .originalPath;
+        if (
+          typeof existingOriginal === "string" &&
+          resolve(existingOriginal) !== resolve(meta.originalPath)
+        ) {
+          otherSurfacePath = existingOriginal;
+        }
+      }
+    } catch {
+      // Unparseable canonical content: nothing restorable to relocate.
+    }
+    if (otherSurfacePath !== null) {
+      await writeFileCustody(
+        join(dir, wrapMetaSurfaceFilename(otherSurfacePath)),
+        canonicalRaw,
+        { mode: 0o600, createParent: false },
+      );
+    }
+  }
   // Surface scoping (2026-07-02 hardening): the lookup itself is per-surface
   // (resolve()-compare over BOTH pointer filenames, matching removeWrapMeta /
   // hasExistingWrapMeta), so a legacy meta naming this surface still
@@ -1123,11 +1220,23 @@ export async function saveWrapMeta(
     mode: 0o600,
     createParent: false,
   });
+  // The canonical slot now names this surface, so a scoped slot left over
+  // from an earlier relocation of THIS surface is a stale duplicate (the
+  // per-surface preservation lookup above already consulted it). Best
+  // effort: a survivor is harmless, since every reader prefers the
+  // canonical slot and removeWrapMeta retires all pointers naming this
+  // surface on unwrap.
+  try {
+    await unlink(join(dir, wrapMetaSurfaceFilename(meta.originalPath)));
+  } catch {
+    // Absent (the common case) or unremovable; nothing to do either way.
+  }
 }
 
 /**
- * Remove the wrap-meta pointer files (canonical + legacy) after a completed
- * unwrap. This makes "a wrap-meta exists" mean "currently wrapped", which
+ * Remove the wrap-meta pointer files (canonical + legacy + any scoped slot)
+ * naming the restored surface after a completed unwrap. This makes "a
+ * wrap-meta exists" mean "currently wrapped", which
  * the F6 pristine-pointer preservation in saveWrapMeta relies on: without
  * it, a wrap AFTER an unwrap would preserve a stale pointer and a later
  * unwrap would restore a config the operator has since edited. The backup
@@ -1156,7 +1265,7 @@ export async function removeWrapMeta(
   restoredOriginalPath: string,
 ): Promise<string[]> {
   const failures: string[] = [];
-  for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+  for (const filename of await listWrapMetaFilenames()) {
     const metaPath = join(backupDir(), filename);
     let raw: string;
     try {

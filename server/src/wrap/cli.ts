@@ -451,9 +451,13 @@ async function readNpmrcRegistryKeys(
     if (eq === -1) continue;
     const key = trimmed.slice(0, eq).trim();
     const value = trimmed.slice(eq + 1).trim();
-    if (key === "@sanctuary-framework:registry" && scoped === null) {
+    // Last occurrence wins, matching npm's ini semantics: a first-wins scan
+    // here read the OLD value of a key that tooling later re-appended
+    // (`registry=` twice in one file), probed the wrong registry, and could
+    // re-create the false-affirmative "unpublished" dead-pin warning.
+    if (key === "@sanctuary-framework:registry") {
       scoped = value;
-    } else if (key === "registry" && registry === null) {
+    } else if (key === "registry") {
       registry = value;
     }
   }
@@ -479,8 +483,11 @@ async function readNpmrcRegistryKeys(
  * Mirrors npm's per-key precedence approximately: the package-scope key
  * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
  * within each key the env override beats the project `.npmrc` beats the
- * user `~/.npmrc`. Never throws; unparseable config falls back to the
- * public default.
+ * user `~/.npmrc`; duplicate keys within one file are last-wins, matching
+ * npm's ini semantics. Never throws; a winning override this probe cannot
+ * interpret (npm env-var expansion like `registry=${NPM_MIRROR}`, or a
+ * non-http(s) value) falls back to the public default marked `indirect`,
+ * so a 404 stays honest-unknown instead of the affirmative "unpublished".
  *
  * `indirect` is true when resolution goes through machinery this bare
  * node:http(s) probe cannot faithfully reproduce - a non-default registry
@@ -513,16 +520,39 @@ export async function resolveNpmRegistryForProbe(
       : { scoped: null as string | null, registry: null as string | null },
     await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
   ];
-  const scoped =
-    normalizeRegistryUrl(env["npm_config_@sanctuary-framework:registry"]) ??
-    normalizeRegistryUrl(files[0].scoped ?? undefined) ??
-    normalizeRegistryUrl(files[1].scoped ?? undefined);
-  const plain =
-    normalizeRegistryUrl(env.npm_config_registry) ??
-    normalizeRegistryUrl(env.NPM_CONFIG_REGISTRY) ??
-    normalizeRegistryUrl(files[0].registry ?? undefined) ??
-    normalizeRegistryUrl(files[1].registry ?? undefined);
-  const base = scoped ?? plain ?? DEFAULT_NPM_REGISTRY;
+  // Per-key precedence: first PRESENT raw value wins (env beats project
+  // .npmrc beats user ~/.npmrc), and only then is the winner normalized.
+  // Normalizing each candidate and taking the first that PARSED silently
+  // skipped a higher-precedence override this probe cannot faithfully
+  // reproduce (npm env-var expansion like `registry=${NPM_MIRROR}`) and
+  // fell back to default+direct, where a 404 reads as the affirmative
+  // "unpublished". A present-but-unnormalizable winner now resolves to the
+  // default registry marked `indirect`, so a 404 stays honest-unknown.
+  const firstPresent = (
+    ...candidates: Array<string | null | undefined>
+  ): string | null => {
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim() !== "") {
+        return candidate;
+      }
+    }
+    return null;
+  };
+  const scopedRaw = firstPresent(
+    env["npm_config_@sanctuary-framework:registry"],
+    files[0].scoped,
+    files[1].scoped,
+  );
+  const plainRaw = firstPresent(
+    env.npm_config_registry,
+    env.NPM_CONFIG_REGISTRY,
+    files[0].registry,
+    files[1].registry,
+  );
+  const winningRaw = scopedRaw ?? plainRaw;
+  const normalized = normalizeRegistryUrl(winningRaw ?? undefined);
+  const unresolvableOverride = winningRaw !== null && normalized === null;
+  const base = normalized ?? DEFAULT_NPM_REGISTRY;
   const proxied = [
     "HTTPS_PROXY",
     "https_proxy",
@@ -534,7 +564,11 @@ export async function resolveNpmRegistryForProbe(
     const value = env[key];
     return typeof value === "string" && value.trim() !== "";
   });
-  return { base, indirect: proxied || base !== DEFAULT_NPM_REGISTRY };
+  return {
+    base,
+    indirect:
+      proxied || unresolvableOverride || base !== DEFAULT_NPM_REGISTRY,
+  };
 }
 
 /**
