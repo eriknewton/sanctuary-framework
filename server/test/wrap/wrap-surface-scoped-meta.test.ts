@@ -1565,6 +1565,26 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         ).toEqual({ base: "https://npm.corp.example", indirect: true });
       });
 
+      it("registry URL userinfo is stripped and marked indirect before probing", async () => {
+        // The probe is intentionally unauthenticated. npm registry URLs can
+        // carry userinfo, and Node would otherwise convert that into a Basic
+        // Authorization header on http(s).get.
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {
+              npm_config_registry:
+                "https://user:pass@registry.npmjs.org/",
+            },
+            cwd: tmpHome,
+            home: tmpHome,
+            globalNpmrcPath: null,
+          }),
+        ).toEqual({
+          base: "https://registry.npmjs.org",
+          indirect: true,
+        });
+      });
+
       it("a registry= line in the user ~/.npmrc is honored; the scoped key beats the plain key", async () => {
         await writeFile(
           join(tmpHome, ".npmrc"),

@@ -423,14 +423,35 @@ export type PinnedVersionResolvability =
 /** The registry `npx` consults when nothing overrides it. */
 const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
 
-/** Trim + validate an npm registry URL; strip trailing slashes. */
-function normalizeRegistryUrl(value: string | undefined): string | null {
+interface NormalizedRegistryUrl {
+  /** Registry base URL with trailing slashes and userinfo removed. */
+  base: string;
+  /** True when the source URL carried username/password userinfo. */
+  strippedCredentials: boolean;
+}
+
+/** Trim + validate an npm registry URL; strip trailing slashes and userinfo. */
+function normalizeRegistryUrl(
+  value: string | undefined,
+): NormalizedRegistryUrl | null {
   const trimmed = value?.trim();
   if (!trimmed) return null;
   if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
     return null;
   }
-  return trimmed.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    const strippedCredentials =
+      parsed.username !== "" || parsed.password !== "";
+    parsed.username = "";
+    parsed.password = "";
+    return {
+      base: parsed.toString().replace(/\/+$/, ""),
+      strippedCredentials,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Lenient `.npmrc` scan for the two registry keys the probe cares about. */
@@ -637,7 +658,8 @@ export async function resolveNpmRegistryForProbe(
   const winningRaw = scopedRaw ?? plainRaw;
   const normalized = normalizeRegistryUrl(winningRaw ?? undefined);
   const unresolvableOverride = winningRaw !== null && normalized === null;
-  const base = normalized ?? DEFAULT_NPM_REGISTRY;
+  const base = normalized?.base ?? DEFAULT_NPM_REGISTRY;
+  const credentialedOverride = normalized?.strippedCredentials === true;
   const proxied = [
     "HTTPS_PROXY",
     "https_proxy",
@@ -652,7 +674,10 @@ export async function resolveNpmRegistryForProbe(
   return {
     base,
     indirect:
-      proxied || unresolvableOverride || base !== DEFAULT_NPM_REGISTRY,
+      proxied ||
+      unresolvableOverride ||
+      credentialedOverride ||
+      base !== DEFAULT_NPM_REGISTRY,
   };
 }
 
