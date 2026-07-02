@@ -17,8 +17,12 @@
 
 import { get as httpsGet } from "node:https";
 import { get as httpGet } from "node:http";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
+import { resolveStoragePath } from "./paths.js";
 import {
   verifyReleaseManifest,
+  RELEASE_VERSION_SHAPE_RE,
   type ManifestVerificationResult,
 } from "./release-manifest.js";
 
@@ -29,6 +33,7 @@ export {
   loadPinnedReleaseKey,
   PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL,
   RELEASE_MANIFEST_DOMAIN,
+  RELEASE_VERSION_SHAPE_RE,
   type ReleaseManifestBody,
   type SignedReleaseManifest,
   type ManifestVerificationResult,
@@ -96,17 +101,112 @@ export function isNewerVersion(current: string, latest: string): boolean {
 }
 
 /**
+ * Canonical wrap-meta pointer filename written into `<storage>/backup/` by
+ * `sanctuary protect` (see `wrap/config-reader.ts`, which owns the write and
+ * unwrap-read paths). Only the FILENAME is duplicated here, as a presence
+ * probe; all reads of the file's CONTENT stay in the wrap module.
+ */
+const WRAP_META_POINTER_FILENAME = "wrap-meta.json";
+
+/**
+ * Minimal, independent presence check: was this install wrapped by
+ * `sanctuary protect`? True when the canonical wrap-meta pointer file exists
+ * under the instance's backup directory.
+ *
+ * Why not reuse `hasExistingWrapMeta` from `wrap/config-reader.ts`: that
+ * module is the heavy, CLI-side wrap surface (custody reads, path-identity
+ * verification); pulling it into this light startup-path module would couple
+ * server boot to the wrap import graph for a one-bit answer. A stat of the
+ * pointer file is enough here: the update notice only needs to know WHICH
+ * upgrade advice to print, and a false negative safely degrades to the
+ * unwrapped advice.
+ *
+ * Deliberate scope limits (honest, documented):
+ * - The legacy pre-vocabulary-sweep pointer filename is NOT probed; its
+ *   literal is confined to the wrap fallback-read module by the
+ *   retired-vocabulary CI gate. Installs old enough to carry only the legacy
+ *   pointer predate the version-pinned MCP entry (v1.6.1), so for them the
+ *   unwrapped npx advice is exactly today's status-quo behavior.
+ * - Never throws: any filesystem error resolves false (unwrapped advice).
+ *
+ * @param storagePath - instance storage root (tests inject a temp dir;
+ *   production uses the same `resolveStoragePath()` the wrap surface uses)
+ */
+export async function detectWrappedInstall(
+  storagePath: string = resolveStoragePath(),
+): Promise<boolean> {
+  try {
+    const s = await stat(join(storagePath, "backup", WRAP_META_POINTER_FILENAME));
+    return s.isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Format the update notification message.
  *
  * The suggested command pins the exact version the message announces
  * (v1.6.1 install-path hardening): the operator runs precisely what was
  * advertised, not whatever `latest` resolves to by the time they act.
+ *
+ * Wrapped installs (`wrapped = true`): a `sanctuary protect` wrap writes a
+ * version-PINNED MCP entry into the harness config, so running the bare npx
+ * command would only start a transient foreground server and rewrite nothing;
+ * the harness would keep spawning the old pinned version while the operator
+ * believes they upgraded. The wrapped advice therefore points at re-running
+ * `protect` FROM the new version, which is the mechanism that rewrites the
+ * pin (see `resolveSanctuaryCommand` in `wrap/cli.ts`).
  */
 export function formatUpdateMessage(
   current: string,
-  latest: string
+  latest: string,
+  wrapped = false
 ): string {
+  if (wrapped) {
+    return (
+      `[Sanctuary] Update available: ${current} → ${latest}. ` +
+      `This install is version-pinned by 'sanctuary protect'; running the server directly does not upgrade it. ` +
+      `To upgrade the pin, re-run protect from the new version: ` +
+      `npx @sanctuary-framework/mcp-server@${latest} protect --<your-harness>`
+    );
+  }
   return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@${latest}`;
+}
+
+/**
+ * Parse an npm-registry `.../latest` response body and return the advertised
+ * version IFF it is acceptable to advise: a string, a clean semver shape, and
+ * strictly newer than `currentVersion`. Anything else returns null.
+ *
+ * The semver-shape guard (`RELEASE_VERSION_SHAPE_RE`) is defense-in-depth
+ * against a tampered registry / TLS-MITM response: the accepted string is
+ * interpolated into a copy-paste command the operator is told to run, so a
+ * shell-injection-shaped "version" must never be accepted, regardless of how
+ * the version comparison happens to treat it.
+ *
+ * Extracted from the response handler so the acceptance rule is testable
+ * without a network.
+ */
+export function extractNewerRegistryVersion(
+  currentVersion: string,
+  data: string
+): string | null {
+  try {
+    const json: unknown = JSON.parse(data);
+    if (typeof json !== "object" || json === null) return null;
+    const latest = (json as { version?: unknown }).version;
+    if (
+      typeof latest === "string" &&
+      RELEASE_VERSION_SHAPE_RE.test(latest) &&
+      isNewerVersion(currentVersion, latest)
+    ) {
+      return latest;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -142,20 +242,7 @@ export function fetchLatestVersion(
           }
         });
         res.on("end", () => {
-          try {
-            const json = JSON.parse(data);
-            const latest = json.version;
-            if (
-              typeof latest === "string" &&
-              isNewerVersion(currentVersion, latest)
-            ) {
-              resolve(latest);
-            } else {
-              resolve(null);
-            }
-          } catch {
-            resolve(null);
-          }
+          resolve(extractNewerRegistryVersion(currentVersion, data));
         });
       }
     );
@@ -465,8 +552,12 @@ export async function checkForSignedUpdate(
 
     const outcome = await verifyAndAdviseUpdate(manifestValue, audit);
     if (outcome.advise && isNewerVersion(currentVersion, outcome.version)) {
+      // Wrapped installs get the protect-based upgrade advice (the bare npx
+      // command would not rewrite the pinned MCP entry). Detection never
+      // throws; a false negative degrades to the unwrapped advice.
+      const wrapped = await detectWrappedInstall();
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this authenticated advisory.
-      console.error(formatUpdateMessage(currentVersion, outcome.version));
+      console.error(formatUpdateMessage(currentVersion, outcome.version, wrapped));
     }
     // On refusal, or on a verified-but-not-newer manifest, stay silent.
   } catch {
@@ -489,8 +580,12 @@ export async function checkForUpdate(currentVersion: string): Promise<void> {
   try {
     const latest = await fetchLatestVersion(currentVersion);
     if (latest) {
+      // Wrapped installs get the protect-based upgrade advice (the bare npx
+      // command would not rewrite the pinned MCP entry). Detection never
+      // throws; a false negative degrades to the unwrapped advice.
+      const wrapped = await detectWrappedInstall();
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(formatUpdateMessage(currentVersion, latest));
+      console.error(formatUpdateMessage(currentVersion, latest, wrapped));
     }
   } catch {
     // Never fail the server over an update check

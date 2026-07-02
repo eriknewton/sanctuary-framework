@@ -127,6 +127,20 @@ export function buildReleaseManifestMessage(
 }
 
 /**
+ * Shape guard for a release version string: MAJOR.MINOR.PATCH with an
+ * optional prerelease suffix (e.g. "1.6.1", "1.7.0-rc.1").
+ *
+ * Defense-in-depth: version strings from update channels end up interpolated
+ * into an operator-facing copy-paste command (see `formatUpdateMessage` in
+ * `update-check.ts`), so both the npm-registry path and the signed-manifest
+ * path restrict the string to a semver shape before accepting it. On the
+ * signed path the signature already authenticates the bytes; the shape guard
+ * additionally caps what a compromised SIGNER (or a future verifier bug)
+ * could put into a command the operator is told to run.
+ */
+export const RELEASE_VERSION_SHAPE_RE = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
+
+/**
  * Narrow an untrusted value to a well-formed `SignedReleaseManifest`.
  * Returns null on any structural problem (this is the "unsigned" / malformed
  * refusal path — a value missing a signature can never be accepted).
@@ -142,7 +156,12 @@ function parseSignedManifest(value: unknown): SignedReleaseManifest | null {
   if (typeof body !== "object" || body === null) return null;
   const b = body as Record<string, unknown>;
 
-  if (typeof b.version !== "string" || b.version.length === 0) return null;
+  // Semver-shape guard (subsumes the old non-empty check): a version that is
+  // not a clean X.Y.Z[-prerelease] string is refused as malformed, so a
+  // shell-injection-shaped "version" can never reach the update advisory.
+  if (typeof b.version !== "string" || !RELEASE_VERSION_SHAPE_RE.test(b.version)) {
+    return null;
+  }
 
   const hashes = b.artifact_hashes;
   if (typeof hashes !== "object" || hashes === null || Array.isArray(hashes)) {
