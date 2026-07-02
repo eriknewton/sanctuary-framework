@@ -959,6 +959,59 @@ export async function findLatestBackup(): Promise<{
   return null;
 }
 
+/** A readable wrap-meta pointer file and the surface it names. */
+export interface WrapMetaPointerSummary {
+  /** Path of the pointer file itself (inside the backup directory). */
+  metaPath: string;
+  /** The wrapped config file this pointer would restore. */
+  originalPath: string;
+}
+
+/**
+ * Lenient, never-throws enumeration of every READABLE wrap-meta pointer,
+ * in the same scan order findLatestBackup uses (canonical, legacy, then
+ * scoped slots). Advisory-only, for refusal paths: with surface-scoped
+ * slots, a wedged FIRST pointer (e.g. its backup file was pruned) blocks
+ * every later slot in findLatestBackup's scan, so the refusal must be able
+ * to name which OTHER surfaces remain wrapped behind it instead of ending
+ * on output that hides a still-wrapped surface. Unreadable or unparseable
+ * pointers are skipped here (they cannot name a surface); the strict
+ * fail-closed read discipline stays on the mutation paths (saveWrapMeta /
+ * removeWrapMeta), and no caller may use this listing to decide a
+ * destructive action.
+ */
+export async function listWrapMetaPointerSummaries(): Promise<
+  WrapMetaPointerSummary[]
+> {
+  const summaries: WrapMetaPointerSummary[] = [];
+  for (const filename of await listWrapMetaFilenames()) {
+    const metaPath = join(backupDir(), filename);
+    try {
+      const parsed: unknown = JSON.parse(
+        await readFileCustody(metaPath, {
+          encoding: "utf-8",
+          verifyPathIdentity: true,
+        }),
+      );
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof (parsed as Record<string, unknown>).originalPath === "string"
+      ) {
+        summaries.push({
+          metaPath,
+          originalPath: (parsed as Record<string, unknown>)
+            .originalPath as string,
+        });
+      }
+    } catch {
+      // Missing, unreadable, or unparseable - advisory scan skips it.
+    }
+  }
+  return summaries;
+}
+
 /**
  * A wrap-meta pointer file exists on disk but could not be READ (a
  * non-ENOENT failure: EACCES, EIO, a custody path-identity refusal). The

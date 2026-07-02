@@ -311,6 +311,51 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(await findLatestBackup()).toBeNull();
   });
 
+  it("a wedged first pointer (backup file missing) refuses loudly, names the surviving wrapped surface, and never hides it", async () => {
+    const surfaceA = join(tmpHome, "wedge-surface-a.json");
+    const surfaceB = join(tmpHome, "wedge-surface-b.json");
+    await seedMetaFor(surfaceA);
+    await seedMetaFor(surfaceB);
+
+    // B holds the canonical (first-scanned) pointer; prune its backup
+    // file - the operator-cleaned-the-backup-dir state.
+    const first = await findLatestBackup();
+    expect(first?.originalPath).toBe(surfaceB);
+    await rm(first!.backupPath);
+
+    const exitSpy = vi
+      .spyOn(process, "exit")
+      .mockImplementation(((code?: number) => {
+        throw new Error(`process.exit:${code}`);
+      }) as never);
+    try {
+      // Every run wedges on the same first pointer. Pre-fix, BOTH runs
+      // ended on the bare "Backup file not found" line - exit 1 with no
+      // mention that surface A remained wrapped behind the wedge, the
+      // still-wrapped-surface-hidden output class the eighth-round
+      // survivor note closed on the success path.
+      for (let run = 0; run < 2; run++) {
+        errSpy.mockClear();
+        await expect(
+          runWrap({ unwrap: true }, makeDeps()),
+        ).rejects.toThrow("process.exit:1");
+        const out = stderrOutput();
+        expect(out).toContain(`Backup file not found: ${first!.backupPath}`);
+        // The wedged pointer gets manual remediation advice...
+        expect(out).toContain("remove the pointer file manually");
+        // ...and the surviving wrapped surface is enumerated with a path
+        // forward.
+        expect(out).toContain("another wrapped surface remains");
+        expect(out).toContain(surfaceA);
+        expect(out).toContain("repaired or removed");
+        // Nothing was modified: A's pointer is still live.
+        expect(await hasExistingWrapMeta(surfaceA)).toBe(true);
+      }
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+
   it("a re-wrap of a relocated surface preserves its pristine pointer from the scoped slot (F6 across slots) and cleans the stale slot", async () => {
     const surfaceA = join(tmpHome, "surface-slot-a.json");
     const surfaceB = join(tmpHome, "surface-slot-b.json");
@@ -1240,6 +1285,46 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
             home: tmpHome,
           }),
         ).toEqual({ base: "https://registry.npmjs.org", indirect: true });
+      });
+
+      it("the probe reads the PROJECT-ROOT .npmrc (upward walk), not just the literal cwd", async () => {
+        // npm resolves the project config at the nearest ancestor holding
+        // package.json or node_modules (localPrefix). A corporate operator
+        // running the wrap from a SUBDIRECTORY of a repo whose root .npmrc
+        // points at a mirror must not get the default registry resolved
+        // direct - a mirror-only package then 404s into the loud false
+        // "unpublished" dead-pin warning npx disproves at spawn time.
+        const projectRoot = join(tmpHome, "repo");
+        const subDir = join(projectRoot, "packages", "app");
+        await mkdir(subDir, { recursive: true });
+        await writeFile(join(projectRoot, "package.json"), "{}");
+        await writeFile(
+          join(projectRoot, ".npmrc"),
+          "registry=https://mirror.corp.example/npm\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: subDir,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://mirror.corp.example/npm", indirect: true });
+      });
+
+      it("with no project marker anywhere up the walk, the literal cwd .npmrc still applies (npm's localPrefix fallback)", async () => {
+        const bareDir = join(tmpHome, "bare", "dir");
+        await mkdir(bareDir, { recursive: true });
+        await writeFile(
+          join(bareDir, ".npmrc"),
+          "registry=https://fallback.example/npm\n",
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: bareDir,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://fallback.example/npm", indirect: true });
       });
     });
   });

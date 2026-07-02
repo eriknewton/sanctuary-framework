@@ -44,6 +44,7 @@ import {
   hasExistingWrapMeta,
   findLatestBackup,
   findNewerBackup,
+  listWrapMetaPointerSummaries,
   removeWrapMeta,
   restoreConfig,
   rewriteConfigForWrap,
@@ -465,6 +466,37 @@ async function readNpmrcRegistryKeys(
 }
 
 /**
+ * Walk up from `cwd` to npm's PROJECT ROOT: the nearest directory (cwd
+ * included) containing `package.json` or `node_modules`, mirroring npm's
+ * localPrefix resolution. npm reads the project `.npmrc` at that root,
+ * not at the literal cwd, so a probe that read only `<cwd>/.npmrc` missed
+ * a repo-root registry override whenever the wrap ran from a subdirectory
+ * (a corporate mirror-only package then 404ed on the DEFAULT registry,
+ * resolved direct, and rendered the false-affirmative "unpublished"
+ * dead-pin warning npx disproves at spawn time - the same class the
+ * wrong-registry and duplicate-key fixes closed). Falls back to `cwd`
+ * itself when no marker exists on the walk, matching npm's default
+ * localPrefix. Never throws; an unreadable candidate just keeps the walk
+ * going.
+ */
+async function findNpmProjectRoot(cwd: string): Promise<string> {
+  let dir = resolvePath(cwd);
+  for (;;) {
+    for (const marker of ["package.json", "node_modules"]) {
+      try {
+        await access(join(dir, marker));
+        return dir;
+      } catch {
+        // Marker absent (or unreadable): keep walking up.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return resolvePath(cwd);
+    dir = parent;
+  }
+}
+
+/**
  * Best-effort, WRAP-TIME approximation of the npm registry the
  * wrap-written `npx` entry will consult at spawn time (2026-07-02 fix
  * round). The probe previously hard-coded the public registry, so in a
@@ -484,7 +516,10 @@ async function readNpmrcRegistryKeys(
  * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
  * within each key the env override beats the project `.npmrc` beats the
  * user `~/.npmrc`; duplicate keys within one file are last-wins, matching
- * npm's ini semantics. Never throws; a winning override this probe cannot
+ * npm's ini semantics. The project `.npmrc` is read at the PROJECT ROOT
+ * (findNpmProjectRoot's upward walk from cwd), matching where npm reads
+ * it - the literal cwd alone missed a repo-root override when the wrap
+ * ran from a subdirectory. Never throws; a winning override this probe cannot
  * interpret (npm env-var expansion like `registry=${NPM_MIRROR}`, or a
  * non-http(s) value) falls back to the public default marked `indirect`,
  * so a 404 stays honest-unknown instead of the affirmative "unpublished".
@@ -516,7 +551,9 @@ export async function resolveNpmRegistryForProbe(
   }
   const files = [
     cwd !== undefined
-      ? await readNpmrcRegistryKeys(join(cwd, ".npmrc"))
+      ? await readNpmrcRegistryKeys(
+          join(await findNpmProjectRoot(cwd), ".npmrc"),
+        )
       : { scoped: null as string | null, registry: null as string | null },
     await readNpmrcRegistryKeys(join(seams.home ?? homedir(), ".npmrc")),
   ];
@@ -2932,6 +2969,49 @@ async function unwrap(dryRun: boolean): Promise<void> {
   } catch {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Backup file not found: ${meta.backupPath}`);
+    // Multi-surface honesty on the REFUSAL path (matches the eighth-round
+    // survivor note on the success path): findLatestBackup returns the
+    // FIRST readable pointer, so a wedged first pointer (its backup file
+    // pruned) blocks every later scoped slot - ending here silently would
+    // hide any other surface that remains wrapped behind it. Enumerate the
+    // other readable pointers and say what unblocks them. Advisory output
+    // only; the refusal itself (exit 1, nothing modified) is unchanged.
+    const resolvedWedged = resolvePath(meta.originalPath);
+    const pointers = await listWrapMetaPointerSummaries();
+    const wedgedPointer = pointers.find(
+      (p) => resolvePath(p.originalPath) === resolvedWedged,
+    );
+    const survivors = Array.from(
+      new Set(
+        pointers
+          .map((p) => resolvePath(p.originalPath))
+          .filter((p) => p !== resolvedWedged),
+      ),
+    );
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  This wrap metadata pointer` +
+        `${wedgedPointer ? ` (${wedgedPointer.metaPath})` : ""} names ` +
+        `${meta.originalPath}\n  but its backup file is gone. Restore the ` +
+        `backup file if you can; if it is gone\n  for good, remove the ` +
+        `pointer file manually (the config it names stays wrapped\n  and ` +
+        `must then be restored by hand).`
+    );
+    if (survivors.length > 0) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `  Note: ${
+          survivors.length === 1
+            ? "another wrapped surface remains"
+            : "other wrapped surfaces remain"
+        } behind this pointer:` +
+          survivors.map((p) => `\n    ${p}`).join("") +
+          `\n  Re-run 'sanctuary wrap --unwrap' after this pointer is ` +
+          `repaired or removed\n  to restore ${
+            survivors.length === 1 ? "it" : "them"
+          }.`
+      );
+    }
     process.exit(1);
   }
 
