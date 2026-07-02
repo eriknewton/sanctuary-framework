@@ -730,8 +730,10 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
         .join("\n");
       expect(out).toContain("NOT inheriting 1 env var(s)");
       expect(out).toContain("OPERATOR_BLOCK_TOK");
-      // The readable sibling inherited fine, so it is not named.
-      expect(out).not.toContain("READABLE_TOK,");
+      // The readable sibling inherited fine, so it is not named anywhere in
+      // the notice (position-independent: a trailing-list entry would render
+      // as "READABLE_TOK)" and dodge a comma-suffixed substring check).
+      expect(out).not.toContain("READABLE_TOK");
     } finally {
       stderrSpy.mockRestore();
     }
