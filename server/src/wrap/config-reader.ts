@@ -614,10 +614,23 @@ async function listWrapMetaFilenames(
         ? (err as NodeJS.ErrnoException).code
         : undefined;
     if (code !== "ENOENT" && options.strict) {
-      throw new WrapMetaUnreadableError([
-        `${backupDir()} (directory listing failed; surface-scoped ` +
-          `wrap-meta slots could not be enumerated)`,
-      ]);
+      throw new WrapMetaUnreadableError(
+        [
+          `${backupDir()} (directory listing failed; surface-scoped ` +
+            `wrap-meta slots could not be enumerated)`,
+        ],
+        {
+          // Class-appropriate advice: the failing path here is the backup
+          // DIRECTORY holding every pristine backup and restore pointer;
+          // the default file-oriented "remove it if you are certain it is
+          // stale" would aim the operator at the exact asset this
+          // fail-closed refusal protects.
+          advice:
+            `Fix the directory's permissions (it must be readable so the ` +
+            `wrap-meta slots can be enumerated) and re-run. Do NOT remove ` +
+            `the directory: it holds every pristine pre-wrap backup.`,
+        },
+      );
     }
     return filenames;
   }
@@ -956,12 +969,22 @@ export async function findLatestBackup(): Promise<{
  */
 export class WrapMetaUnreadableError extends Error {
   readonly unreadablePaths: string[];
-  constructor(unreadablePaths: string[]) {
+  /**
+   * `options.advice` overrides the default file-oriented remediation tail.
+   * The default's hedged "remove it if you are certain it is stale" is
+   * only safe when the unreadable path IS a single pointer file; the
+   * directory-listing failure path (listWrapMetaFilenames strict) reports
+   * the backup DIRECTORY itself, where "remove it" would point the
+   * operator at every pristine backup this refusal exists to protect.
+   */
+  constructor(unreadablePaths: string[], options?: { advice?: string }) {
     super(
       `wrap metadata exists but could not be read: ` +
         `${unreadablePaths.join(", ")}. Refusing to overwrite it: it may be ` +
-        `the only pointer to the pristine pre-wrap backup. Fix the file's ` +
-        `permissions (or remove it if you are certain it is stale) and re-run.`,
+        `the only pointer to the pristine pre-wrap backup. ` +
+        (options?.advice ??
+          `Fix the file's permissions (or remove it if you are certain it ` +
+            `is stale) and re-run.`),
     );
     this.name = "WrapMetaUnreadableError";
     this.unreadablePaths = unreadablePaths;
@@ -1128,8 +1151,13 @@ async function fileExists(path: string): Promise<boolean> {
  * holder finishes (these sections take milliseconds), a stale-age break so
  * a crashed holder cannot wedge every future wrap, and a fail-CLOSED
  * timeout: an unacquirable lock refuses the mutation with recovery advice
- * rather than proceeding unserialized. Release is best-effort in finally;
- * an unreleased lock ages into the stale break.
+ * rather than proceeding unserialized (eighth round: the deadline gates
+ * EVERY retry path, including the stale-break failure paths, so nothing
+ * can spin past it). Release in finally is identity-verified (inode +
+ * mtime captured at acquisition) and best-effort: a holder whose lock was
+ * legitimately staleness-broken during a mid-section stall never evicts
+ * its successor's live lock, and an unreleased lock ages into the stale
+ * break.
  *
  * The stale break is rename-then-verify, not a blind unlink (sixth round):
  * the breaker atomically renames the lock to a waiter-unique name, checks
@@ -1152,11 +1180,17 @@ const WRAP_META_LOCK_RETRY_MS = 50;
  * test almost never lands in this window naturally, so a regression back
  * to a blind unlink would still pass end-state assertions; the seam lets
  * the deterministic pin in wrap-surface-scoped-meta.test.ts substitute a
- * FRESH lock inside the window and assert it survives. Always undefined
- * in production.
+ * FRESH lock inside the window and assert it survives.
+ *
+ * `onLockAcquired` runs after a holder acquires the lock, BEFORE the
+ * critical section - the seam the verified-release pin uses to simulate a
+ * holder that stalled past the stale threshold and was legitimately
+ * broken by a waiter (its lock replaced by a successor's) while it was
+ * still inside fn(). Both hooks are always undefined in production.
  */
 export const __wrapMetaLockTestHooks: {
   onStaleLockObserved?: (lockPath: string) => void | Promise<void>;
+  onLockAcquired?: (lockPath: string) => void | Promise<void>;
 } = {};
 
 async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -1164,11 +1198,21 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const lockPath = join(dir, WRAP_META_LOCK_FILENAME);
   const deadline = Date.now() + WRAP_META_LOCK_WAIT_MS;
+  // Identity of the lock THIS holder created (inode + mtime captured from
+  // the open handle), consumed by the verified release in the finally.
+  let acquired: { ino: number; mtimeMs: number } | undefined;
   for (;;) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
       try {
         await handle.writeFile(`${process.pid}\n`);
+        try {
+          const written = await handle.stat();
+          acquired = { ino: written.ino, mtimeMs: written.mtimeMs };
+        } catch {
+          // Identity unavailable; the release below degrades to the
+          // pre-verify unconditional unlink rather than leaking the lock.
+        }
       } finally {
         await handle.close();
       }
@@ -1179,6 +1223,22 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
           ? (err as NodeJS.ErrnoException).code
           : undefined;
       if (code !== "EEXIST") throw err;
+      // Eighth round (bounded acquisition on EVERY retry path): the
+      // deadline gates each iteration, so the stale-break failure paths
+      // below can no longer spin past the documented fail-closed cap. A
+      // persistently unrenameable stale lock (e.g. an immutable flag)
+      // previously looped bare `continue`s forever, with neither the
+      // deadline check nor the retry sleep - both lived only on the
+      // fresh-lock wait path.
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `another sanctuary wrap/unwrap appears to be updating the wrap ` +
+            `metadata (lock held: ${lockPath}). Re-run in a moment; if no ` +
+            `other sanctuary process is running, delete the lock file and ` +
+            `re-run.`,
+          { cause: err },
+        );
+      }
       let observed: Stats;
       try {
         observed = await lstat(lockPath);
@@ -1202,29 +1262,34 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
         }
         const breakPath =
           `${lockPath}.break-${process.pid}-` + randomBytes(6).toString("hex");
+        let renamed = false;
         try {
           await rename(lockPath, breakPath);
+          renamed = true;
         } catch {
-          // Another waiter took it (or the holder released) first; the
-          // retry below contends fresh.
-          continue;
+          // Another waiter took it (or the holder released) first, or the
+          // lock cannot be renamed at all; fall through to the bounded
+          // sleep below instead of hot-spinning.
         }
-        let tookStaleLock = false;
-        try {
-          const taken = await lstat(breakPath);
-          tookStaleLock =
-            taken.ino === observed.ino && taken.mtimeMs === observed.mtimeMs;
-        } catch {
-          // Cannot prove what was taken is the stale lock; restore it
-          // below rather than destroy it.
-        }
-        if (tookStaleLock) {
+        if (renamed) {
+          let tookStaleLock = false;
           try {
-            await unlink(breakPath);
+            const taken = await lstat(breakPath);
+            tookStaleLock =
+              taken.ino === observed.ino && taken.mtimeMs === observed.mtimeMs;
           } catch {
-            // The unique break name is exclusively ours; best-effort.
+            // Cannot prove what was taken is the stale lock; restore it
+            // below rather than destroy it.
           }
-        } else {
+          if (tookStaleLock) {
+            try {
+              await unlink(breakPath);
+            } catch {
+              // The unique break name is exclusively ours; best-effort.
+            }
+            // The slot is genuinely vacated; contend for it immediately.
+            continue;
+          }
           // A live lock was taken by mistake (another waiter broke the
           // stale lock and a new holder acquired between our stat and
           // our rename). Put it back with link(), which fails EEXIST
@@ -1241,28 +1306,36 @@ async function withWrapMetaLock<T>(fn: () => Promise<T>): Promise<T> {
           } catch {
             // Best-effort cleanup of the unique break name.
           }
+          // A live holder occupies the slot; wait like the fresh-lock path.
         }
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `another sanctuary wrap/unwrap appears to be updating the wrap ` +
-            `metadata (lock held: ${lockPath}). Re-run in a moment; if no ` +
-            `other sanctuary process is running, delete the lock file and ` +
-            `re-run.`,
-          { cause: err },
-        );
       }
       await new Promise((resolveSleep) =>
         setTimeout(resolveSleep, WRAP_META_LOCK_RETRY_MS),
       );
     }
   }
+  if (__wrapMetaLockTestHooks.onLockAcquired) {
+    await __wrapMetaLockTestHooks.onLockAcquired(lockPath);
+  }
   try {
     return await fn();
   } finally {
+    // Eighth round (verified release): never evict a SUCCESSOR's lock. If
+    // this holder stalls past the stale threshold mid-critical-section
+    // (sleep/suspend, a 60s hang), a waiter legitimately breaks its lock
+    // and a new holder acquires; an unconditional unlink here would then
+    // remove that successor's LIVE lock and let a third contender run the
+    // critical section alongside it. Release only a lock whose identity
+    // matches the one this holder created, mirroring the
+    // rename-then-verify stale break above.
     try {
-      await unlink(lockPath);
+      const current = await lstat(lockPath);
+      if (
+        acquired === undefined ||
+        (current.ino === acquired.ino && current.mtimeMs === acquired.mtimeMs)
+      ) {
+        await unlink(lockPath);
+      }
     } catch {
       // Best-effort release; a survivor ages into the stale break above.
     }

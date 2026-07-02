@@ -444,14 +444,28 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       // pointer.
       await chmod(backupDirPath(), 0o300);
       try {
-        await expect(
-          saveWrapMeta({
-            backupPath: join(backupDirPath(), "already-wrapped-a.json"),
-            originalPath: surfaceA,
-            platform: "claude-code",
-            wrappedAt: new Date().toISOString(),
-          }),
-        ).rejects.toThrow(WrapMetaUnreadableError);
+        const refusal = await saveWrapMeta({
+          backupPath: join(backupDirPath(), "already-wrapped-a.json"),
+          originalPath: surfaceA,
+          platform: "claude-code",
+          wrappedAt: new Date().toISOString(),
+        }).then(
+          () => null,
+          (err: unknown) => err,
+        );
+        expect(refusal).toBeInstanceOf(WrapMetaUnreadableError);
+        // Eighth round: the refusal's remediation advice must match the
+        // failure class. Here the unreadable path is the backup DIRECTORY
+        // itself (it holds every pristine backup and restore pointer), so
+        // the default file-oriented "remove it if you are certain it is
+        // stale" would aim the operator at the exact asset this refusal
+        // protects.
+        expect((refusal as Error).message).toContain(
+          "Do NOT remove the directory",
+        );
+        expect((refusal as Error).message).not.toContain(
+          "remove it if you are certain",
+        );
       } finally {
         await chmod(backupDirPath(), 0o700);
       }
@@ -698,6 +712,54 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       entry.includes("wrap-meta.lock"),
     );
     expect(residue).toEqual([]);
+  });
+
+  it("verified release: a holder whose lock was staleness-broken mid-section does not evict its successor's lock", async () => {
+    // Eighth round: the release in withWrapMetaLock's finally must not be
+    // an unconditional unlink. If a holder stalls past the 60s stale
+    // threshold inside the critical section (sleep/suspend, a long hang),
+    // a waiter legitimately breaks its lock and a SUCCESSOR acquires; the
+    // stalled holder then finishes fn() and a blind release would unlink
+    // the successor's LIVE lock, letting a third contender run the meta
+    // critical section alongside it. Inject exactly that state via the
+    // onLockAcquired seam: the holder's own lock is replaced by a
+    // successor's before fn() runs, and the successor's lock must survive
+    // the holder's release.
+    const configPath = join(tmpHome, "release-verify-config.json");
+    await writeFile(configPath, "{}");
+    const backup = await backupConfig(configPath);
+    const lockPath = join(backupDirPath(), "wrap-meta.lock");
+
+    let fired = false;
+    __wrapMetaLockTestHooks.onLockAcquired = async (lock) => {
+      if (fired) return;
+      fired = true;
+      await unlink(lock);
+      await writeFile(lock, "successor-holder\n");
+      // Force a distinct mtime so the identity check cannot collide with
+      // the holder's capture even under inode reuse + same-millisecond
+      // timestamps on a fast filesystem.
+      const past = new Date(Date.now() - 5_000);
+      await utimes(lock, past, past);
+    };
+    try {
+      await saveWrapMeta({
+        backupPath: backup,
+        originalPath: configPath,
+        platform: "claude-code",
+        wrappedAt: new Date().toISOString(),
+      });
+    } finally {
+      delete __wrapMetaLockTestHooks.onLockAcquired;
+    }
+
+    // The write itself completed (the holder was already inside its
+    // critical section) but the successor's lock survived the release.
+    expect(fired).toBe(true);
+    expect(await hasExistingWrapMeta(configPath)).toBe(true);
+    expect(await readFile(lockPath, "utf-8")).toBe("successor-holder\n");
+    // Clean up the injected successor lock so later tests contend fresh.
+    await unlink(lockPath);
   });
 
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──

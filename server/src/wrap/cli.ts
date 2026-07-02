@@ -3172,6 +3172,36 @@ async function unwrap(dryRun: boolean): Promise<void> {
         );
       }
     }
+    // Eighth round (multi-surface honesty): surface-scoped meta slots mean
+    // OTHER surfaces wrapped on this tenant keep their own live pointers,
+    // and this run restored exactly ONE surface. Ending on an unqualified
+    // "Unwrapped" while e.g. ~/.claude/settings.json still routes traffic
+    // through Sanctuary is the same dead-entry-behind-a-success-banner
+    // class the wrap banner fix closed, so enumerate the survivors and say
+    // so. Scoped to the clean-retirement path: the failure branches above
+    // already print their own re-run guidance, and a surviving pointer for
+    // THIS surface (unreadable/unremovable) would otherwise misread here as
+    // "another wrapped surface".
+    if (metaRemovalFailures.length === 0) {
+      try {
+        const remaining = await findLatestBackup();
+        if (remaining) {
+          // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+          console.error(
+            `  Note: another wrapped surface remains (${remaining.originalPath}).` +
+              `\n  Re-run 'sanctuary wrap --unwrap' to restore it.`
+          );
+        }
+      } catch {
+        // A surviving pointer exists but failed validation on read; a
+        // re-run surfaces the precise refusal with nothing modified.
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `  Note: wrap metadata for another surface remains but could not ` +
+            `be validated. Re-run 'sanctuary wrap --unwrap' to inspect it.`
+        );
+      }
+    }
   }
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("");
