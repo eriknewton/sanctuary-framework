@@ -38,6 +38,18 @@
  *      success banner (formatWrapSuccess / formatWrapSuccessNoDashboard),
  *      not only the mid-flow warning that scrolls above it.
  *
+ * Third-round hardening pinned here (2026-07-02 fix round 2):
+ *  10. F6 preservation fails CLOSED on a transient wrap-meta read error:
+ *      saveWrapMeta refuses (WrapMetaUnreadableError) instead of treating
+ *      "unreadable" as "absent" and clobbering what may be the only
+ *      pristine pointer; hasExistingWrapMeta stays deliberately lenient
+ *      (unreadable reads false, failing toward the crash-window warning).
+ *  11. The pin probe consults the registry npx will actually use
+ *      (resolveNpmRegistryForProbe: npm config env + project/user .npmrc)
+ *      and, when resolution is indirect (custom registry or proxy egress),
+ *      a 404 maps to honest-unknown "unreachable" instead of the loud
+ *      false "unpublished" dead-pin warning.
+ *
  * Isolation: temp HOME + SANCTUARY_STORAGE_PATH (never the real
  * ~/.sanctuary), per the existing wrap-test idiom.
  */
@@ -62,6 +74,7 @@ import {
   runWrap,
   castleWallProtectionConfirmed,
   checkPinnedVersionResolvable,
+  resolveNpmRegistryForProbe,
   formatWrapSuccess,
   formatWrapSuccessNoDashboard,
 } from "../../src/wrap/cli.js";
@@ -72,6 +85,7 @@ import {
   hasExistingWrapMeta,
   removeWrapMeta,
   saveWrapMeta,
+  WrapMetaUnreadableError,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
 
@@ -216,6 +230,53 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(await removeWrapMeta(join(tmpHome, "whatever.json"))).toEqual([]);
     await expect(access(metaPath)).rejects.toThrow();
   });
+
+  // ── Third round: F6 preservation fails CLOSED on an unreadable pointer ──
+
+  it.skipIf(process.getuid?.() === 0)(
+    "saveWrapMeta refuses (WrapMetaUnreadableError) instead of clobbering the pointer on a transient read error",
+    async () => {
+      const configPath = join(tmpHome, "f6-unreadable-config.json");
+      await seedMetaFor(configPath);
+      const metaPath = join(backupDirPath(), "wrap-meta.json");
+      const pristinePointer = await readFile(metaPath, "utf-8");
+
+      await chmod(metaPath, 0o000);
+      try {
+        // A re-wrap while the meta is unreadable must NOT overwrite the
+        // pointer with a fresh backup of already-wrapped content.
+        await expect(
+          saveWrapMeta({
+            backupPath: join(backupDirPath(), "wrapped-content-backup.json"),
+            originalPath: configPath,
+            platform: "claude-code",
+            wrappedAt: new Date().toISOString(),
+          }),
+        ).rejects.toThrow(WrapMetaUnreadableError);
+      } finally {
+        await chmod(metaPath, 0o600);
+      }
+      // The only pointer to the pristine backup survived byte-for-byte.
+      expect(await readFile(metaPath, "utf-8")).toBe(pristinePointer);
+    },
+  );
+
+  it.skipIf(process.getuid?.() === 0)(
+    "hasExistingWrapMeta reads false on an unreadable pointer (fails toward the crash-window warning, never suppression)",
+    async () => {
+      const configPath = join(tmpHome, "unreadable-has-config.json");
+      await seedMetaFor(configPath);
+      const metaPath = join(backupDirPath(), "wrap-meta.json");
+
+      await chmod(metaPath, 0o000);
+      try {
+        expect(await hasExistingWrapMeta(configPath)).toBe(false);
+      } finally {
+        await chmod(metaPath, 0o600);
+      }
+      expect(await hasExistingWrapMeta(configPath)).toBe(true);
+    },
+  );
 
   // ── Findings 3 + 4: orphan guard on all rollbacks, crash-window scope ──
 
@@ -481,6 +542,111 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
           registryBaseUrl: "http://127.0.0.1:1",
         }),
       ).toBe("skipped");
+    });
+
+    // ── Third round: the probe honors the registry npx actually uses ──
+
+    describe("registry-config awareness (custom registry / proxy honesty)", () => {
+      const ENV_KEYS = [
+        "npm_config_registry",
+        "NPM_CONFIG_REGISTRY",
+        "npm_config_@sanctuary-framework:registry",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+      ];
+      let savedEnv: Record<string, string | undefined>;
+
+      beforeEach(() => {
+        savedEnv = {};
+        for (const key of ENV_KEYS) {
+          savedEnv[key] = process.env[key];
+          delete process.env[key];
+        }
+      });
+
+      afterEach(() => {
+        for (const key of ENV_KEYS) {
+          if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key]!;
+          else delete process.env[key];
+        }
+      });
+
+      it("no overrides resolves the public default registry, direct", async () => {
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://registry.npmjs.org", indirect: false });
+      });
+
+      it("the default registry with a trailing slash still reads as direct (npx sets npm_config_registry even unconfigured)", async () => {
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: { npm_config_registry: "https://registry.npmjs.org/" },
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://registry.npmjs.org", indirect: false });
+      });
+
+      it("a custom registry in the npm config env is used and marked indirect", async () => {
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: { npm_config_registry: "https://npm.corp.example/" },
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://npm.corp.example", indirect: true });
+      });
+
+      it("a registry= line in the user ~/.npmrc is honored; the scoped key beats the plain key", async () => {
+        await writeFile(
+          join(tmpHome, ".npmrc"),
+          [
+            "; comment",
+            "registry=https://mirror.example/npm/",
+            "@sanctuary-framework:registry = https://scoped.example/npm",
+            "",
+          ].join("\n"),
+        );
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: {},
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://scoped.example/npm", indirect: true });
+      });
+
+      it("proxy egress config marks even the default registry indirect", async () => {
+        expect(
+          await resolveNpmRegistryForProbe({
+            env: { HTTPS_PROXY: "http://proxy.corp.example:8080" },
+            cwd: tmpHome,
+            home: tmpHome,
+          }),
+        ).toEqual({ base: "https://registry.npmjs.org", indirect: true });
+      });
+
+      it("a 404 from a CUSTOM registry reads honest-unknown unreachable, never the loud false unpublished", async () => {
+        const base = await startRegistryStub(404);
+        process.env.npm_config_registry = base;
+        expect(await checkPinnedVersionResolvable("9.9.9")).toBe(
+          "unreachable",
+        );
+      });
+
+      it("a custom registry that serves the version still reads resolvable", async () => {
+        const base = await startRegistryStub(200);
+        process.env.npm_config_registry = base;
+        expect(await checkPinnedVersionResolvable("9.9.9")).toBe("resolvable");
+      });
     });
   });
 

@@ -861,29 +861,75 @@ export async function findLatestBackup(): Promise<{
 }
 
 /**
- * Read every parseable wrap-meta pointer file (canonical then legacy
- * filename) leniently. Missing/unreadable/unparseable candidates are
- * skipped; validation still happens on the unwrap read path
- * (findLatestBackup).
+ * A wrap-meta pointer file exists on disk but could not be READ (a
+ * non-ENOENT failure: EACCES, EIO, a custody path-identity refusal). The
+ * F6 pristine-pointer preservation in saveWrapMeta refuses to proceed in
+ * this state rather than treat "unreadable" as "absent" and overwrite what
+ * may be the only pointer to the pristine pre-wrap backup: the same
+ * never-destroy-on-a-read-error discipline removeWrapMeta applies.
  */
-async function readWrapMetaFilesRaw(): Promise<Record<string, unknown>[]> {
+export class WrapMetaUnreadableError extends Error {
+  readonly unreadablePaths: string[];
+  constructor(unreadablePaths: string[]) {
+    super(
+      `wrap metadata exists but could not be read: ` +
+        `${unreadablePaths.join(", ")}. Refusing to overwrite it: it may be ` +
+        `the only pointer to the pristine pre-wrap backup. Fix the file's ` +
+        `permissions (or remove it if you are certain it is stale) and re-run.`,
+    );
+    this.name = "WrapMetaUnreadableError";
+    this.unreadablePaths = unreadablePaths;
+  }
+}
+
+/**
+ * Read every parseable wrap-meta pointer file (canonical then legacy
+ * filename). Genuinely-absent (ENOENT) and affirmatively-unparseable
+ * (successfully read, invalid JSON) candidates are skipped leniently;
+ * validation still happens on the unwrap read path (findLatestBackup).
+ *
+ * 2026-07-02 hardening (third round): a candidate whose READ fails with
+ * anything other than ENOENT (EACCES, EIO, a custody path-identity refusal)
+ * is reported in `unreadablePaths` instead of being silently skipped: the
+ * blanket catch here previously made the F6 preservation in saveWrapMeta
+ * see "no existing meta" on a transient read error and clobber the pristine
+ * pointer, the exact defect class removeWrapMeta's ENOENT carve-out closed.
+ */
+async function readWrapMetaFilesRaw(): Promise<{
+  metas: Record<string, unknown>[];
+  unreadablePaths: string[];
+}> {
   const metas: Record<string, unknown>[] = [];
+  const unreadablePaths: string[] = [];
   for (const filename of [WRAP_META_FILENAME, LEGACY_WRAP_META_FILENAME]) {
+    const metaPath = join(backupDir(), filename);
+    let raw: string;
     try {
-      const parsed: unknown = JSON.parse(
-        await readFileCustody(join(backupDir(), filename), {
-          encoding: "utf-8",
-          verifyPathIdentity: true,
-        }),
-      );
+      raw = await readFileCustody(metaPath, {
+        encoding: "utf-8",
+        verifyPathIdentity: true,
+      });
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      // ENOENT is genuinely absent; anything else is an unreadable pointer
+      // the caller must not treat as "no meta".
+      if (code !== "ENOENT") unreadablePaths.push(metaPath);
+      continue;
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         metas.push(parsed as Record<string, unknown>);
       }
     } catch {
-      // Missing or unreadable: try the next candidate.
+      // Affirmatively unparseable content (successfully read): it points at
+      // nothing restorable; skip it, matching removeWrapMeta's judgment.
     }
   }
-  return metas;
+  return { metas, unreadablePaths };
 }
 
 /**
@@ -901,12 +947,21 @@ async function readWrapMetaFilesRaw(): Promise<Record<string, unknown>[]> {
  * Y's meta, failed the same-surface check, and clobbered the canonical
  * pointer with a fresh backup of the ALREADY-WRAPPED content - orphaning
  * X's pristine backup.
+ *
+ * Third round: throws {@link WrapMetaUnreadableError} when ANY pointer
+ * file exists but could not be read (non-ENOENT). In that state "no meta
+ * names this surface" cannot be proven, and answering null would let
+ * saveWrapMeta overwrite what may be the only pristine pointer.
  */
 async function readExistingWrapMetaRawForSurface(
   originalPath: string,
 ): Promise<Record<string, unknown> | null> {
+  const { metas, unreadablePaths } = await readWrapMetaFilesRaw();
+  if (unreadablePaths.length > 0) {
+    throw new WrapMetaUnreadableError(unreadablePaths);
+  }
   const resolved = resolve(originalPath);
-  for (const meta of await readWrapMetaFilesRaw()) {
+  for (const meta of metas) {
     if (
       typeof meta.originalPath === "string" &&
       resolve(meta.originalPath) === resolved
@@ -932,20 +987,25 @@ async function readExistingWrapMetaRawForSurface(
  * was previously tenant-global (any meta, for any surface, suppressed the
  * warning), so a wrap-meta for surface Y silently hid the crash-window
  * state of surface X.
+ *
+ * Third round: this is a thin wrapper over
+ * readExistingWrapMetaRawForSurface, so the per-surface match predicate has
+ * exactly ONE implementation and the crash-window warning can never
+ * disagree with the F6 preservation about whether a surface is wrapped.
+ * The read-ERROR policy deliberately differs from the write path: an
+ * unreadable pointer reads as `false` here, failing toward the loud
+ * crash-window warning (which points the operator at the timestamped
+ * backups), while saveWrapMeta fails closed by refusing to overwrite.
  */
 export async function hasExistingWrapMeta(
   originalPath: string,
 ): Promise<boolean> {
-  const resolved = resolve(originalPath);
-  for (const meta of await readWrapMetaFilesRaw()) {
-    if (
-      typeof meta.originalPath === "string" &&
-      resolve(meta.originalPath) === resolved
-    ) {
-      return true;
-    }
+  try {
+    return (await readExistingWrapMetaRawForSurface(originalPath)) !== null;
+  } catch (err) {
+    if (err instanceof WrapMetaUnreadableError) return false;
+    throw err;
   }
-  return false;
 }
 
 /** True when the path names an existing, accessible file. */
@@ -985,6 +1045,13 @@ async function fileExists(path: string): Promise<boolean> {
  * genuinely contain the sanctuary entry?); when false, the fresh pointer
  * always wins. Defaults to true so direct callers keep the F6-safe
  * preservation semantics unless they know better.
+ *
+ * Throws {@link WrapMetaUnreadableError} when preservation is live but an
+ * existing pointer file could not be read (non-ENOENT): overwriting a
+ * pointer that could not be inspected would silently orphan the pristine
+ * backup on a transient error path. The wrap CLI's deferred meta write
+ * already treats any throw here as "roll back the wrapped surfaces and
+ * exit non-zero", which is exactly the fail-closed behavior wanted.
  */
 export async function saveWrapMeta(
   meta: {
@@ -1005,7 +1072,18 @@ export async function saveWrapMeta(
   // hasExistingWrapMeta), so a legacy meta naming this surface still
   // preserves the pristine pointer even when the canonical file names a
   // different surface.
-  const existing = await readExistingWrapMetaRawForSurface(meta.originalPath);
+  //
+  // Third round (fail closed on an unreadable pointer): when preservation is
+  // live (configStillWrapped) and a pointer file exists but cannot be READ
+  // (non-ENOENT: EACCES, EIO, a custody path-identity refusal), the lookup
+  // throws WrapMetaUnreadableError and this save REFUSES rather than
+  // treating "unreadable" as "absent" and clobbering what may be the only
+  // pristine pointer, mirroring removeWrapMeta's never-destroy-on-a-read-
+  // error rule. When configStillWrapped is false the fresh pointer wins
+  // unconditionally, so the existing meta is not consulted at all.
+  const existing = (options.configStillWrapped ?? true)
+    ? await readExistingWrapMetaRawForSurface(meta.originalPath)
+    : null;
   if (
     (options.configStillWrapped ?? true) &&
     existing !== null &&

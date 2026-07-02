@@ -32,7 +32,7 @@
 import { writeFile, readFile, mkdir, access, lstat } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Writable } from "node:stream";
-import { platform } from "node:os";
+import { platform, homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { get as httpsGet } from "node:https";
@@ -397,8 +397,12 @@ export async function validateDevDist(devDist: string): Promise<void> {
  *                    have the pinned version - the MCP entry this wrap
  *                    writes would be dead at spawn time.
  *   - "unreachable": the registry could not be consulted (offline, DNS,
- *                    timeout). Honest-unknown, never treated as either of
- *                    the affirmative outcomes.
+ *                    timeout), or resolution is indirected through config
+ *                    the probe cannot faithfully reproduce (a non-default
+ *                    registry that may hide packages from unauthenticated
+ *                    requests, or proxy-only egress) and the answer was
+ *                    not an affirmative 200. Honest-unknown, never treated
+ *                    as either of the affirmative outcomes.
  *   - "skipped":     the probe was disabled (SANCTUARY_NO_UPDATE_CHECK=1,
  *                    the documented zero-outbound knob - this probe is the
  *                    same registry-metadata class of egress as the update
@@ -409,6 +413,107 @@ export type PinnedVersionResolvability =
   | "unpublished"
   | "unreachable"
   | "skipped";
+
+/** The registry `npx` consults when nothing overrides it. */
+const DEFAULT_NPM_REGISTRY = "https://registry.npmjs.org";
+
+/** Trim + validate an npm registry URL; strip trailing slashes. */
+function normalizeRegistryUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
+    return null;
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+/** Lenient `.npmrc` scan for the two registry keys the probe cares about. */
+async function readNpmrcRegistryKeys(
+  npmrcPath: string,
+): Promise<{ scoped: string | null; registry: string | null }> {
+  let raw: string;
+  try {
+    raw = await readFile(npmrcPath, "utf-8");
+  } catch {
+    return { scoped: null, registry: null };
+  }
+  let scoped: string | null = null;
+  let registry: string | null = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (key === "@sanctuary-framework:registry" && scoped === null) {
+      scoped = value;
+    } else if (key === "registry" && registry === null) {
+      registry = value;
+    }
+  }
+  return { scoped, registry };
+}
+
+/**
+ * Best-effort resolution of the npm registry the wrap-written `npx` entry
+ * will ACTUALLY consult at spawn time (2026-07-02 fix round). The probe
+ * previously hard-coded the public registry, so in a private-mirror /
+ * corporate environment (registry override in `.npmrc` or the npm config
+ * env) it asked the WRONG registry and rendered a false dead-pin warning
+ * for an entry npx would start fine.
+ *
+ * Mirrors npm's per-key precedence approximately: the package-scope key
+ * (`@sanctuary-framework:registry`) beats the plain `registry` key, and
+ * within each key the env override beats the project `.npmrc` beats the
+ * user `~/.npmrc`. Never throws; unparseable config falls back to the
+ * public default.
+ *
+ * `indirect` is true when resolution goes through machinery this bare
+ * node:http(s) probe cannot faithfully reproduce - a non-default registry
+ * (which may require auth npx has and the probe deliberately never sends)
+ * or proxy egress (npx honors HTTPS_PROXY/HTTP_PROXY; node:https does not).
+ * The caller then treats a 404 as honest-unknown instead of affirmative.
+ *
+ * `seams` (env/cwd/home) exist for tests; production callers pass nothing.
+ */
+export async function resolveNpmRegistryForProbe(
+  seams: { env?: NodeJS.ProcessEnv; cwd?: string; home?: string } = {},
+): Promise<{ base: string; indirect: boolean }> {
+  const env = seams.env ?? process.env;
+  const npmrcPaths = [
+    join(seams.cwd ?? process.cwd(), ".npmrc"),
+    join(seams.home ?? homedir(), ".npmrc"),
+  ];
+  const files = [
+    await readNpmrcRegistryKeys(npmrcPaths[0]),
+    await readNpmrcRegistryKeys(npmrcPaths[1]),
+  ];
+  const scoped =
+    normalizeRegistryUrl(env["npm_config_@sanctuary-framework:registry"]) ??
+    normalizeRegistryUrl(files[0].scoped ?? undefined) ??
+    normalizeRegistryUrl(files[1].scoped ?? undefined);
+  const plain =
+    normalizeRegistryUrl(env.npm_config_registry) ??
+    normalizeRegistryUrl(env.NPM_CONFIG_REGISTRY) ??
+    normalizeRegistryUrl(files[0].registry ?? undefined) ??
+    normalizeRegistryUrl(files[1].registry ?? undefined);
+  const base = scoped ?? plain ?? DEFAULT_NPM_REGISTRY;
+  const proxied = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ].some((key) => {
+    const value = env[key];
+    return typeof value === "string" && value.trim() !== "";
+  });
+  return { base, indirect: proxied || base !== DEFAULT_NPM_REGISTRY };
+}
 
 /**
  * Wrap-time check that the version-pinned MCP entry
@@ -424,15 +529,35 @@ export type PinnedVersionResolvability =
  * warning on "unpublished" and an honest could-not-verify note on
  * "unreachable". Never throws.
  *
+ * 2026-07-02 fix round (registry-config honesty): the probe consults the
+ * SAME registry npx will (resolveNpmRegistryForProbe: npm config env,
+ * project/user `.npmrc`), and when resolution is `indirect` (non-default
+ * registry, which may hide packages from this deliberately unauthenticated
+ * probe, or proxy-only egress the bare GET does not traverse) a 404 is NOT
+ * affirmative: it maps to "unreachable" (honest could-not-verify) instead
+ * of the loud "unpublished" dead-pin warning. Only the public default
+ * registry, consulted directly, can affirm "unpublished". No credential is
+ * ever attached to the probe request.
+ *
  * `registryBaseUrl` / `timeoutMs` are test seams; production callers use
- * the defaults.
+ * the defaults. An explicit `registryBaseUrl` is treated as authoritative
+ * (404 stays affirmative), preserving the seam's stub-registry semantics.
  */
 export async function checkPinnedVersionResolvable(
   version: string,
   opts: { registryBaseUrl?: string; timeoutMs?: number } = {},
 ): Promise<PinnedVersionResolvability> {
   if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") return "skipped";
-  const base = opts.registryBaseUrl ?? "https://registry.npmjs.org";
+  let base: string;
+  let notFoundIsAffirmative: boolean;
+  if (opts.registryBaseUrl !== undefined) {
+    base = opts.registryBaseUrl;
+    notFoundIsAffirmative = true;
+  } else {
+    const resolved = await resolveNpmRegistryForProbe();
+    base = resolved.base;
+    notFoundIsAffirmative = !resolved.indirect;
+  }
   const timeoutMs = opts.timeoutMs ?? 3000;
   const url = `${base}/@sanctuary-framework/mcp-server/${encodeURIComponent(version)}`;
   const getFn = base.startsWith("http://") ? httpGet : httpsGet;
@@ -445,7 +570,8 @@ export async function checkPinnedVersionResolvable(
           // Only the response STATUS is consulted; drain the body.
           res.resume();
           if (res.statusCode === 200) resolve("resolvable");
-          else if (res.statusCode === 404) resolve("unpublished");
+          else if (res.statusCode === 404)
+            resolve(notFoundIsAffirmative ? "unpublished" : "unreachable");
           else resolve("unreachable");
         },
       );
