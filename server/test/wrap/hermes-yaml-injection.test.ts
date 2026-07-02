@@ -414,6 +414,218 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses CR/CRLF line endings instead of misreading the file and appending a duplicate mcp_servers key", () => {
+    // Reproduced pre-fix: JS `.` never matches \r, so every anchored
+    // `(.*)$` regex in the scan missed the CR-ended `mcp_servers:` key
+    // line and the plan appended a SECOND top-level mcp_servers block.
+    // PyYAML (which reads both \r\n and lone \r as line breaks) is
+    // last-wins on duplicate keys, so the operator's original entries,
+    // env vars included, were silently dropped from Hermes's view.
+    const crlf = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      TOK: "secret"',
+      "",
+    ].join("\r\n");
+    expect(() => planHermesYamlInjection(crlf, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(crlf, ENTRY)).toThrow(/line endings/);
+    const loneCR = 'model: x\rmcp_servers:\r  weather:\r    command: "uvx"\r';
+    expect(() => planHermesYamlInjection(loneCR, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // The extractor resolves null on the same file (never a misread), and
+    // the post-write verifier reports no entry rather than trusting a
+    // blinded scan.
+    expect(extractSanctuaryEntryEnv(crlf)).toBeNull();
+    expect(yamlContainsSanctuaryEntry(crlf)).toBe(false);
+  });
+
+  it("whitelist-refuses a replace when any env value is a shape the extractor cannot fully read (block scalar, anchor, tag, directive)", () => {
+    // Pre-chokepoint these proceeded as skip-with-notice, but the
+    // replace-entry write is wholesale, so the skipped var was dropped
+    // from the rewritten entry regardless of the notice.
+    for (const envLines of [
+      ["      TOK: |", "        multi-line secret"],
+      ["      TOK: &a val"],
+      ["      TOK: !!str hello"],
+      ["      TOK: %weird"],
+    ]) {
+      const existing = [
+        "mcp_servers:",
+        "  sanctuary:",
+        '    command: "npx"',
+        "    env:",
+        ...envLines,
+        "",
+      ].join("\n");
+      expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+        HermesYamlUnsupportedError
+      );
+    }
+  });
+
+  it("whitelist-refuses multi-line plain-scalar continuations and nested mappings under env", () => {
+    const continuation = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      MULTI_TOK: first line",
+      "        continued here",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(continuation, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    const nestedMapping = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      "      NESTED:",
+      "        inner: oops",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(nestedMapping, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("whitelist-refuses duplicate env var keys instead of inheriting either occurrence (PyYAML last-wins is not mirrorable line-by-line)", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      TOK: "stale-first"',
+      '      TOK: "last-wins"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // Quoted spellings of the same var collide too, as PyYAML resolves
+    // them to the same key.
+    const quoted = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    env:",
+      '      TOK: "first"',
+      '      "TOK": "second"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(quoted, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("whitelist-refuses duplicate field keys and field lines it does not recognize", () => {
+    const duplicateField = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      '    command: "node"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(duplicateField, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A field whose value opens a shape the scan cannot read.
+    const blockScalarField = [
+      "mcp_servers:",
+      "  sanctuary:",
+      "    command: |",
+      "      npx",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(blockScalarField, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A line that is not `key: value` at all (a stray plain scalar).
+    const strayLine = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    stray plain scalar line",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(strayLine, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A flow-collection field value (previously only screened on env).
+    const flowArgs = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      '    args: ["-y", "pkg"]',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(flowArgs, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("whitelist-refuses tab indentation and ragged indents inside the sanctuary entry", () => {
+    const tabbed = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '\t\tcommand: "npx"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(tabbed, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    // A nested line shallower than the entry's field indent but deeper
+    // than the entry name: attributable to nothing the scan can read.
+    const ragged = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '      command: "npx"',
+      "    env:",
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(ragged, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
+  it("whitelist recognizes the module's own serialized output including env (re-wrap stays green)", () => {
+    const entryWithEnv = {
+      ...ENTRY,
+      env: {
+        SANCTUARY_DASHBOARD_AUTH_TOKEN: "tok-123",
+        SANCTUARY_STORAGE_PATH: "/tmp/tenant",
+      },
+    };
+    const first = planHermesYamlInjection(null, entryWithEnv);
+    const again = planHermesYamlInjection(first.content, entryWithEnv);
+    expect(again.action).toBe("replace-entry");
+    expect(again.content).toBe(first.content);
+    // Common hand-authored readable shapes also pass the whitelist:
+    // plain and single-quoted scalars, trailing comments, comment lines.
+    const handAuthored = [
+      "mcp_servers:",
+      "  sanctuary:",
+      "    # wired up by hand",
+      "    command: npx # plain scalar",
+      "    args:",
+      "      - -y",
+      '      - "@sanctuary-framework/mcp-server"',
+      "    env:",
+      "      SANCTUARY_PASSPHRASE: 'it''s quoted'",
+      "      SANCTUARY_DASHBOARD_AUTH_TOKEN: plain-tok # note",
+      "",
+    ].join("\n");
+    expect(planHermesYamlInjection(handAuthored, ENTRY).action).toBe(
+      "replace-entry"
+    );
+  });
+
   it("yamlContainsSanctuaryEntry is false for configs without the entry", () => {
     expect(yamlContainsSanctuaryEntry("")).toBe(false);
     expect(yamlContainsSanctuaryEntry("mcp_servers:\n  weather:\n    command: \"uvx\"\n")).toBe(false);
@@ -801,50 +1013,56 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
     expect(yamlEnv!.SANCTUARY_STORAGE_PATH).toBe(join(tmpHome, ".sanctuary"));
   });
 
-  it("re-wrap prints a notice naming env vars it cannot inherit instead of dropping them silently", async () => {
-    // Harden-review round: skip-not-guess is the documented tradeoff for
-    // unreadable YAML value shapes (block scalars, anchors, multi-line
-    // plain scalars), but the skip must be LOUD at the operator surface:
-    // a one-line stderr notice names each un-inherited var so the
-    // operator can re-add it by hand.
+  it("re-wrap REFUSES an entry carrying an env value it cannot fully read, leaving both surfaces untouched (whitelist chokepoint)", async () => {
+    // Chokepoint round: skip-not-guess used to proceed with a stderr
+    // notice, but the replace-entry write is wholesale, so the skipped
+    // var (a multi-line operator secret here) WAS dropped from the
+    // rewritten entry. The whitelist screen now refuses the write
+    // outright: reads are total or the write does not happen, and the
+    // operator's file survives byte-for-byte.
     const hermesDir = join(tmpHome, ".hermes");
     await mkdir(hermesDir, { recursive: true });
     const yamlPath = join(hermesDir, "config.yaml");
-    await writeFile(join(hermesDir, "cli-config.json"), "{}");
-    await writeFile(
-      yamlPath,
-      [
-        "mcp_servers:",
-        "  sanctuary:",
-        '    command: "npx"',
-        "    args:",
-        '      - "@sanctuary-framework/mcp-server"',
-        "    env:",
-        "      OPERATOR_BLOCK_TOK: |",
-        "        multi-line secret",
-        '      READABLE_TOK: "kept"',
-        "",
-      ].join("\n")
-    );
+    const jsonPath = join(hermesDir, "cli-config.json");
+    await writeFile(jsonPath, "{}");
+    const originalYaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "npx"',
+      "    args:",
+      '      - "@sanctuary-framework/mcp-server"',
+      "    env:",
+      "      OPERATOR_BLOCK_TOK: |",
+      "        multi-line secret",
+      '      READABLE_TOK: "kept"',
+      "",
+    ].join("\n");
+    await writeFile(yamlPath, originalYaml);
 
     const stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi
+      .spyOn(process, "exit")
+      .mockImplementation((code?: string | number | null) => {
+        throw new Error(`process.exit:${code}`);
+      });
     try {
-      await runWrap({ hermes: true, noOpen: true }, makeDeps());
+      await expect(
+        runWrap({ hermes: true, noOpen: true }, makeDeps())
+      ).rejects.toThrow("process.exit:1");
       const out = stderrSpy.mock.calls
         .map((call) => call.map(String).join(" "))
         .join("\n");
-      expect(out).toContain("NOT inheriting 1 env var(s)");
-      expect(out).toContain("OPERATOR_BLOCK_TOK");
-      // The readable sibling inherited fine, so it is not named anywhere in
-      // the notice (position-independent: a trailing-list entry would render
-      // as "READABLE_TOK)" and dodge a comma-suffixed substring check).
-      expect(out).not.toContain("READABLE_TOK");
+      // The refusal is loud, names the surface, and points at the fix.
+      expect(out).toContain("Hermes config.yaml Not Editable");
+      expect(out).toContain("cannot fully read");
+      expect(out).toContain("Nothing was modified");
     } finally {
+      exitSpy.mockRestore();
       stderrSpy.mockRestore();
     }
-    const yamlEnv = extractSanctuaryEntryEnv(await readFile(yamlPath, "utf-8"));
-    expect(yamlEnv!.READABLE_TOK).toBe("kept");
-    expect(yamlEnv!.OPERATOR_BLOCK_TOK).toBeUndefined();
+    // Both surfaces are byte-identical: the plan refused before any write.
+    expect(await readFile(yamlPath, "utf-8")).toBe(originalYaml);
+    expect(await readFile(jsonPath, "utf-8")).toBe("{}");
   });
 
   it("re-wrap updates the existing sanctuary entry instead of stacking a second one", async () => {

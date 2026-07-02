@@ -459,10 +459,11 @@ async function pathExists(path: string): Promise<boolean> {
  * `skippedEnvKeys` (optional out-param) receives the names of existing
  * sanctuary-entry env vars whose YAML value shape the extractor could not
  * read (block scalars, anchors, tags, flow collections, multi-line plain
- * scalars) AND that no other source re-supplied, i.e. exactly the vars the
- * rewritten entry will not carry. Callers print a one-line notice naming
- * them so the skip-not-guess tradeoff is never silent at the operator
- * surface.
+ * scalars) AND that no other source re-supplied. Since the plan-time
+ * whitelist screen (assertReplaceableSanctuaryEntry in hermes-yaml.ts)
+ * refuses every such shape before a replace-entry write, a non-empty list
+ * here coincides with a refused plan; the notice callers print from it is
+ * a defense-in-depth backstop, not the primary guard against silent drops.
  */
 function resolveHermesYamlEnv(
   existingYaml: string | null,
@@ -485,10 +486,11 @@ function resolveHermesYamlEnv(
 }
 
 /**
- * One-line operator notice naming existing sanctuary-entry env vars the
- * re-wrap will NOT carry forward because their YAML value shape is one the
- * scoped reader skips rather than guesses at (see extractSanctuaryEntryEnv).
- * Returns null when nothing was skipped.
+ * One-line operator notice naming existing sanctuary-entry env vars whose
+ * YAML value shape the scoped reader skipped rather than guessed at (see
+ * extractSanctuaryEntryEnv). Returns null when nothing was skipped. With
+ * the plan-time whitelist refusing every skippable shape before a
+ * replace-entry write, this notice is a defense-in-depth backstop.
  */
 function formatSkippedHermesEnvNotice(skippedEnvKeys: string[]): string | null {
   if (skippedEnvKeys.length === 0) return null;

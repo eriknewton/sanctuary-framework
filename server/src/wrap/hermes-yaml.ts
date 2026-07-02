@@ -17,18 +17,27 @@
  * unknown keys, existing user entries — is preserved verbatim, which a
  * parse-reserialize round trip through a library could not guarantee.
  *
- * Shapes this module refuses to edit (HermesYamlUnsupportedError, so wrap
- * fails loudly with the file untouched rather than risking corruption):
- *   - `mcp_servers:` carrying a non-empty flow mapping or scalar value
- *   - `mcp_servers:` carrying a block SEQUENCE (`- name: ...` items) —
- *     merging a mapping entry into it would emit mixed sequence+mapping
- *     YAML that PyYAML rejects, breaking Hermes startup
- *   - duplicate top-level `mcp_servers:` keys
- *   - an existing sanctuary entry carrying an inline `env:` value (e.g.
- *     `env: {TOK: v}`) or duplicate `env` field keys: the replace-entry
- *     write cannot inherit vars it cannot read (PyYAML is last-wins on
- *     duplicates), so proceeding would silently drop them; quoted field
- *     keys (`"env":`) count, since PyYAML reads them as the same key
+ * Fail-closed contract (HermesYamlUnsupportedError, so wrap fails loudly
+ * with the file untouched rather than risking corruption):
+ *   - Any CR byte in the file refuses at scan entry. split("\n") line
+ *     handling and JS `.` (which never matches \r) blind every regex in
+ *     this module to CR/CRLF line breaks that PyYAML honors, so scanning
+ *     such a file would misread it wholesale (verified: it appended a
+ *     duplicate top-level mcp_servers key, silently dropping the
+ *     operator's entries under PyYAML last-wins).
+ *   - `mcp_servers:` carrying a non-empty flow mapping or scalar value,
+ *     a block SEQUENCE (`- name: ...` items), or duplicate top-level
+ *     `mcp_servers:` keys refuses. Tab indentation inside the block
+ *     refuses too: YAML forbids it, and indentOf() would miscount the
+ *     block's structure.
+ *   - Before an existing sanctuary entry is REPLACED, every line of it
+ *     must be affirmatively recognized against the whitelist of shapes
+ *     this module can fully read (see assertReplaceableSanctuaryEntry).
+ *     The screen is a whitelist, not a blacklist: a shape nobody thought
+ *     of refuses by default instead of slipping through. The invariant is
+ *     that there is NO input for which the replace-entry write proceeds
+ *     while this module's read of the entry was partial: reads are total
+ *     or the write is refused.
  * The empty flow form `mcp_servers: {}` IS supported (rewritten to block
  * form, any trailing comment preserved), since fresh installs commonly
  * ship it.
@@ -140,6 +149,21 @@ function isBlankOrComment(line: string): boolean {
  * Returns null when the key is absent; throws on unsupported shapes.
  */
 function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
+  // CR / CRLF refusal, checked before anything else: the caller split on
+  // "\n", so CR bytes remain embedded in lines, and JS `.` never matches
+  // \r, so every anchored `(.*)$` regex below silently fails on a CR-ended
+  // line. A CRLF (or lone-CR) file therefore hides its real structure
+  // from this scan while PyYAML reads \r and \r\n as line breaks; the
+  // observed failure was an add-key append of a DUPLICATE top-level
+  // mcp_servers key that PyYAML last-wins resolved by dropping the
+  // operator's original entries. Refuse the whole file loudly instead.
+  if (lines.some((l) => l.includes("\r"))) {
+    throw new HermesYamlUnsupportedError(
+      "config.yaml contains CR or CRLF line endings this line-oriented " +
+        "scan cannot read reliably; convert the file to LF line endings " +
+        "and re-run wrap."
+    );
+  }
   let keyLine = -1;
   let remainder = "";
   for (let i = 0; i < lines.length; i++) {
@@ -183,6 +207,20 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       break;
     }
     blockEnd++;
+  }
+
+  // Tab refusal for the block region: YAML forbids tabs in indentation,
+  // and indentOf() counts a tab as one indent column, so a tab-indented
+  // line would corrupt every indent comparison below (entry detection,
+  // entry extents) before any per-entry screen could see it. Refuse the
+  // block loudly instead of scanning it cross-eyed.
+  for (let i = keyLine + 1; i < blockEnd; i++) {
+    if (/^ *\t/.test(lines[i]!)) {
+      throw new HermesYamlUnsupportedError(
+        "config.yaml mcp_servers block uses tab indentation this scan " +
+          "cannot measure reliably; replace tabs with spaces and re-run wrap."
+      );
+    }
   }
 
   // Block-SEQUENCE form (`mcp_servers:\n  - name: weather`): upstream
@@ -354,7 +392,7 @@ export function planHermesYamlInjection(
   const entryLines = serializeSanctuaryEntry(entry, block.entryIndent);
 
   if (existing) {
-    refuseInlineSanctuaryEnv(lines, existing);
+    assertReplaceableSanctuaryEntry(lines, existing);
     const out = [
       ...lines.slice(0, existing.start),
       ...entryLines,
@@ -386,120 +424,183 @@ function ensureTrailingNewline(lines: string[]): string {
  */
 const ENV_FIELD_RE = /^(["']?)env\1\s*:\s*(.*)$/;
 
-/**
- * Shared refusal copy for every env value shape that is valid PyYAML but
- * unreadable by the line-per-var extractor: an inline flow/scalar value on
- * the `env:` line itself, or a flow collection opening on the next line.
- * One constant so the two throw sites cannot drift apart.
- */
-const INLINE_ENV_REFUSAL_MESSAGE =
-  "config.yaml sanctuary entry carries an inline env value this tool " +
-  "cannot safely inherit; convert it to block-mapping form (one " +
-  "`KEY: value` line per var under `env:`) and re-run wrap.";
+/** The empty flow mapping `{}`, optionally followed by a comment. */
+const EMPTY_FLOW_RE = /^\{\s*\}\s*(#.*)?$/;
 
 /**
- * Refuse `env` field shapes on the EXISTING sanctuary entry that
- * extractSanctuaryEntryEnv cannot faithfully read, before the entry is
- * replaced wholesale:
- *   - a non-empty inline value on the entry line itself (the one-line
- *     flow form `sanctuary: {command: ..., env: {...}}` is valid PyYAML
- *     that Hermes loads, but its fields live in the remainder the
- *     line-by-line field scan below never visits)
- *   - an inline (flow/scalar) `env:` value (the extractor's env-line
- *     match requires block form)
- *   - a block-form `env:` whose value is a flow collection opening on
- *     the NEXT line (`env:` then an indented `{KEY: v}` is valid PyYAML
- *     the extractor's line-per-var read would flatten into a phantom
- *     corrupted var)
- *   - duplicate `env` field keys (PyYAML is last-wins; the extractor
- *     reads one line, so it cannot know which set Hermes actually used)
- *   - a YAML merge key (`<<: *anchor`): PyYAML folds the anchored
- *     mapping's fields, possibly including env vars, into the entry, but
- *     this line-oriented scan cannot resolve anchors, so replacing the
- *     entry would silently drop whatever the merge carried
- * Proceeding on any of these shapes would silently drop the operator's
- * hand-authored vars (e.g. a dashboard auth token) from the rewritten
- * entry, the same silent-drop class the env inheritance exists to
- * prevent. Every field line is scanned (no early return) and quoted
- * `env` keys count, so nothing PyYAML would treat as the env field can
- * slip past the screen. Refusing loudly here keeps the extractor's
- * contract honest: a null from it never masks a write. The empty flow
- * form `env: {}` carries nothing to drop and stays editable.
+ * A `key: value` line whose key is a bare plain-safe token, a
+ * double-quoted string, or a single-quoted string, and whose value (if
+ * any) is separated from the colon by whitespace, as YAML block mappings
+ * require. Anything that does not match is NOT a recognized field line.
  */
-function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
-  // The entry line itself: anything after `sanctuary:` other than a
-  // comment or the empty flow mapping `{}` is a flow-form entry whose env
-  // (if any) the field scan below cannot see, so it must refuse rather
-  // than let the replace drop it without notice. `{}` carries nothing.
+const RECOGNIZED_FIELD_RE =
+  /^(?:([A-Za-z0-9_.-]+)|"((?:[^"\\]|\\.)*)"|'((?:[^']|'')*)')\s*:(?:[ \t]+(.*))?$/;
+
+/**
+ * Canonical key of a RECOGNIZED_FIELD_RE match: the string PyYAML would
+ * resolve the key to, so quoted spellings ("env", 'env') collide with the
+ * bare one. Returns null when a double-quoted key carries an escape
+ * sequence JSON cannot decode (then the line is not recognized).
+ */
+function canonicalFieldKey(m: RegExpExecArray): string | null {
+  if (m[1] !== undefined) return m[1];
+  if (m[2] !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(`"${m[2]}"`);
+      return typeof parsed === "string" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return m[3]!.replace(/''/g, "'");
+}
+
+/**
+ * WHITELIST screen guarding every replace-entry write: each line of the
+ * EXISTING sanctuary entry, from its name line through the entry's end,
+ * must be AFFIRMATIVELY recognized as a shape this module can fully read:
+ *
+ *   (a) blank and comment-only lines;
+ *   (b) the entry name line with an empty remainder, a trailing comment,
+ *       or the empty flow mapping `{}` (which carries nothing to drop);
+ *   (c) block-form `key: value` field lines at one consistent indent,
+ *       where the key is bare plain-safe or quoted (no duplicates, no
+ *       plain `<<` merge key) and the value is a single-line plain or
+ *       quoted scalar with no YAML indicator (| > & * ! [ { %), plus the
+ *       empty flow `env: {}`;
+ *   (d) under a valueless header field: for `env:`, `KEY: scalar` var
+ *       lines at one consistent indent with no duplicate keys; for any
+ *       other header (e.g. `args:`), `- scalar` block-sequence items at
+ *       one consistent indent.
+ *
+ * ANY other line refuses (HermesYamlUnsupportedError), including tab
+ * indentation, ragged indents, deeper continuations of a scalar-valued
+ * field (multi-line plain scalars), nested collections under env vars,
+ * and every shape nobody has thought of yet. This inverts the older
+ * per-shape blacklist: four adversarial rounds each found a NEW
+ * hand-authored PyYAML shape (flow-form entries, quoted env keys, merge
+ * keys, next-line flow values, duplicate keys, CR line endings) that a
+ * blacklist missed while the wholesale replace silently dropped operator
+ * env vars. Under the whitelist the invariant is structural: there is no
+ * input for which the replace-entry write proceeds while this module's
+ * read of the entry was partial: reads are total or the write refuses
+ * loudly with the file untouched.
+ */
+function refuse(lineIdx: number, why: string): never {
+  throw new HermesYamlUnsupportedError(
+    `config.yaml sanctuary entry (line ${lineIdx + 1}) ${why}, so this ` +
+      "tool cannot fully read the entry it would replace and refuses to " +
+      "edit the file. Rewrite the entry in plain block-mapping form " +
+      "(one `key: value` field per line with single-line plain or " +
+      "quoted scalar values, `args:` as a `- value` list, `env:` as " +
+      "`KEY: value` lines) and re-run wrap."
+  );
+}
+
+function assertReplaceableSanctuaryEntry(
+  lines: string[],
+  entry: EntryLocation
+): void {
+  // (b) The entry name line: anything after `sanctuary:` other than a
+  // comment or the empty flow mapping `{}` is a flow-form entry whose
+  // fields (env included) live in a remainder the line walk below never
+  // visits.
   const entryLine = lines[entry.start]!.trim();
   const nameMatch = /^(['"]?)([^:#'"]+)\1\s*:/.exec(entryLine);
-  const entryRemainder = nameMatch ? entryLine.slice(nameMatch[0].length).trim() : "";
+  const entryRemainder = nameMatch
+    ? entryLine.slice(nameMatch[0].length).trim()
+    : "";
   if (
     entryRemainder !== "" &&
     !entryRemainder.startsWith("#") &&
-    !/^\{\s*\}\s*(#.*)?$/.test(entryRemainder)
+    !EMPTY_FLOW_RE.test(entryRemainder)
   ) {
-    throw new HermesYamlUnsupportedError(
-      "config.yaml sanctuary entry uses an inline (flow-form) value this " +
-        "tool cannot safely edit; convert it to block-mapping form (one " +
-        "field per indented line) and re-run wrap."
-    );
+    refuse(entry.start, "carries an inline (flow-form) value");
   }
 
   let fieldIndent = -1;
-  let sawEnvField = false;
+  const seenFieldKeys = new Set<string>();
+  const seenEnvKeys = new Set<string>();
+  // What a deeper-indented line under the most recent field line would
+  // mean: nothing readable ("refuse"), env vars, or sequence items.
+  let nested: "refuse" | "env" | "seq" = "refuse";
+  let nestedIndent = -1;
+
   for (let i = entry.start + 1; i < entry.end; i++) {
     const line = lines[i]!;
-    if (isBlankOrComment(line)) continue;
+    if (isBlankOrComment(line)) continue; // (a)
+    if (/^ *\t/.test(line)) {
+      refuse(i, "uses tab indentation");
+    }
     const indent = indentOf(line);
     if (fieldIndent === -1) fieldIndent = indent;
-    if (indent !== fieldIndent) continue;
     const trimmed = line.trim();
-    // A plain `<<` key is the YAML merge key: PyYAML (the parser Hermes
-    // runs) folds the anchored mapping's fields into this entry, so it
-    // may genuinely feed Hermes env vars this scan cannot see. (A QUOTED
-    // "<<" is a literal string key under PyYAML, not a merge, so only
-    // the plain spelling refuses.)
-    if (/^<<\s*:/.test(trimmed)) {
-      throw new HermesYamlUnsupportedError(
-        "config.yaml sanctuary entry uses a YAML merge key (<<) whose " +
-          "merged fields this tool cannot read; inline the merged fields " +
-          "and re-run wrap."
-      );
-    }
-    const m = ENV_FIELD_RE.exec(trimmed);
-    if (!m) continue;
-    if (sawEnvField) {
-      throw new HermesYamlUnsupportedError(
-        "config.yaml sanctuary entry carries duplicate env fields this " +
-          "tool cannot safely inherit (Hermes keeps only the last one); " +
-          "remove the duplicate and re-run wrap."
-      );
-    }
-    sawEnvField = true;
-    const remainder = m[2]!.trim();
-    // Block form (empty remainder or trailing comment) is the readable
-    // shape; the empty flow mapping `{}` has nothing to inherit. Keep
-    // scanning: a LATER duplicate env field must still refuse.
-    if (remainder === "" || remainder.startsWith("#")) {
-      // Block-form field line, but the VALUE may still be a flow
-      // collection opening on the NEXT line (`env:` then an indented
-      // `{KEY: v}` is valid PyYAML), which the extractor's line-per-var
-      // read would flatten into a phantom corrupted var. Only the first
-      // nested content line can open the value node, so peek at it.
-      for (let j = i + 1; j < entry.end; j++) {
-        const nested = lines[j]!;
-        if (isBlankOrComment(nested)) continue;
-        if (indentOf(nested) <= fieldIndent) break;
-        if (/^[[{]/.test(nested.trim())) {
-          throw new HermesYamlUnsupportedError(INLINE_ENV_REFUSAL_MESSAGE);
-        }
-        break;
+
+    if (indent === fieldIndent) {
+      // (c) A field line of the entry.
+      nested = "refuse";
+      nestedIndent = -1;
+      // A plain `<<` key is the YAML merge key: PyYAML (the parser Hermes
+      // runs) folds the anchored mapping's fields, possibly env vars,
+      // into this entry, which this line-oriented scan cannot resolve.
+      // (A QUOTED "<<" is a literal string key under PyYAML, not a
+      // merge, and is recognized as an ordinary field below.)
+      if (/^<<\s*:/.test(trimmed)) {
+        refuse(i, "uses a YAML merge key (<<) whose merged fields this scan cannot read");
       }
-      continue;
+      const m = RECOGNIZED_FIELD_RE.exec(trimmed);
+      const key = m ? canonicalFieldKey(m) : null;
+      if (m === null || key === null) {
+        refuse(i, "has a field line this scan does not recognize as `key: value`");
+      }
+      if (seenFieldKeys.has(key)) {
+        refuse(i, "carries a duplicate field key (PyYAML keeps only the last occurrence, which this scan cannot mirror)");
+      }
+      seenFieldKeys.add(key);
+      const remainder = (m[4] ?? "").trim();
+      if (remainder === "" || remainder.startsWith("#")) {
+        // A valueless header: nested lines are env vars or seq items (d).
+        nested = key === "env" ? "env" : "seq";
+      } else if (key === "env" && EMPTY_FLOW_RE.test(remainder)) {
+        // `env: {}` carries nothing to inherit and stays editable.
+      } else if (parseYamlScalarValue(remainder) === null) {
+        refuse(i, "carries a field value this scan cannot read as a single-line scalar");
+      }
+      // A readable scalar value leaves nested = "refuse": any deeper
+      // line after it would be a multi-line plain-scalar continuation.
+    } else if (indent > fieldIndent) {
+      // (d) Nested content under the most recent header field.
+      if (nested === "refuse") {
+        refuse(i, "nests content under a field whose value this scan already read as a single line");
+      }
+      if (nestedIndent === -1) nestedIndent = indent;
+      if (indent !== nestedIndent) {
+        refuse(i, "has an indentation shape this scan cannot follow");
+      }
+      if (nested === "env") {
+        const m = RECOGNIZED_FIELD_RE.exec(trimmed);
+        const key = m ? canonicalFieldKey(m) : null;
+        if (m === null || key === null) {
+          refuse(i, "has an env line this scan does not recognize as `KEY: value`");
+        }
+        if (seenEnvKeys.has(key)) {
+          refuse(i, "carries a duplicate env var key (PyYAML keeps only the last occurrence, which this scan cannot mirror)");
+        }
+        seenEnvKeys.add(key);
+        if (parseYamlScalarValue((m[4] ?? "").trim()) === null) {
+          refuse(i, "carries an env value this scan cannot read as a single-line scalar");
+        }
+      } else {
+        const item = /^-[ \t]+(.*)$/.exec(trimmed);
+        if (item === null || parseYamlScalarValue(item[1]!.trim()) === null) {
+          refuse(i, "has a nested line this scan does not recognize as a `- value` list item with a single-line scalar");
+        }
+      }
+    } else {
+      // Shallower than the entry's fields but still inside the entry
+      // region: a ragged indent this scan cannot attribute.
+      refuse(i, "has an indentation shape this scan cannot follow");
     }
-    if (/^\{\s*\}\s*(#.*)?$/.test(remainder)) continue;
-    throw new HermesYamlUnsupportedError(INLINE_ENV_REFUSAL_MESSAGE);
   }
 }
 
@@ -520,19 +621,20 @@ function refuseInlineSanctuaryEnv(lines: string[], entry: EntryLocation): void {
  * aliases, tags, flow collections, and multi-line plain scalars all
  * resolve to no inheritance for that var (never a corrupted literal), and
  * a flow-form `env: {...}` (inline on the field line or opening on the
- * next line) or an unsupported `mcp_servers` shape resolves null. Null
- * never masks a write: the consuming injection REFUSES unsupported block
- * shapes, an inline or next-line flow sanctuary `env:` value, duplicate
- * sanctuary `env` fields, and a YAML merge key on the entry loudly
- * (HermesYamlUnsupportedError,
- * see refuseInlineSanctuaryEnv) before any replace-entry write proceeds;
- * both screens match quoted `env` keys, so no PyYAML-valid spelling of
- * the field escapes the refusal while eluding this read.
+ * next line) or an unsupported `mcp_servers` shape resolves null.
+ *
+ * Neither a skip nor a null ever masks a write: before any replace-entry
+ * write proceeds, assertReplaceableSanctuaryEntry re-walks the entry
+ * against a WHITELIST of fully readable line shapes and refuses loudly
+ * (HermesYamlUnsupportedError) on anything else, including every shape
+ * this extractor skips. A skipped var can therefore only occur on a plan
+ * that was refused, never on one that writes.
  *
  * Skip-not-guess is deliberate, but it must not be SILENT at the operator
  * surface: pass `skippedKeys` and every named var whose value was skipped
- * (and did not end up inherited) is appended to it, so wrap can print a
- * one-line notice naming the vars the rewritten entry will not carry.
+ * (and did not end up inherited) is appended to it, so callers can name
+ * the vars involved. With the whitelist screen in front, this is a
+ * defense-in-depth reporting channel rather than the primary guard.
  */
 export function extractSanctuaryEntryEnv(
   existingContent: string | null,
@@ -642,14 +744,15 @@ export function extractSanctuaryEntryEnv(
  * malformed quoting, empty); callers skip such vars rather than guess.
  * Values opening with a YAML indicator the single-line plain read cannot
  * represent (block scalars | >, anchors/aliases & *, tags !, flow
- * collections [ {) also resolve null: PyYAML (the parser Hermes
- * actually uses) gives them structural meaning, so inheriting the raw
- * text would write a corrupted literal in place of the operator's value.
+ * collections [ {, directives %) also resolve null: PyYAML (the parser
+ * Hermes actually uses) gives them structural meaning, so inheriting the
+ * raw text would write a corrupted literal in place of the operator's
+ * value.
  */
 function parseYamlScalarValue(raw: string): string | null {
   const t = raw.trim();
   if (t === "") return null;
-  if ("|>&*![{".includes(t[0]!)) return null;
+  if ("|>&*![{%".includes(t[0]!)) return null;
   if (t.startsWith('"')) {
     const m = /^("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(t);
     if (!m) return null;
