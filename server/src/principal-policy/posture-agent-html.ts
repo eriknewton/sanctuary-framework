@@ -29,7 +29,7 @@
  * `renderPostureHomeHTML`).
  */
 
-import { AGENT_PILL_FN_SOURCE } from "./posture-html-shared.js";
+import { AGENT_PILL_FN_SOURCE, POSTURE_ROOT_TOKENS_CSS } from "./posture-html-shared.js";
 
 export function renderPostureAgentHTML(): string {
   // Inline everything (no external assets) so the page works on a locked-down
@@ -41,11 +41,7 @@ export function renderPostureAgentHTML(): string {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sanctuary - Agent posture</title>
 <style>
-  :root {
-    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
-    --text: #e6edf3; --muted: #9aa6b2; --green: #2ea043; --amber: #d29922;
-    --red: #f85149; --accent: #58a6ff;
-  }
+  ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
