@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
+import { agreeingHermesParity } from "../helpers/hermes-parity.js";
 
 /** Recursive content+mtime snapshot of every file under root. */
 async function snapshotTree(root: string): Promise<Map<string, string>> {
@@ -83,6 +84,11 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
       resolvePassphrase: async () => {
         throw new Error("dry-run must not resolve or generate a passphrase");
       },
+      // The parse-parity guard runs in the dry-run preview too; agree with
+      // the scanner so these write-free mechanics tests do not depend on the
+      // CI host carrying PyYAML. (One test below asserts a genuine sidecar
+      // refusal by NOT using these deps.)
+      hermesParity: agreeingHermesParity,
     };
   }
 

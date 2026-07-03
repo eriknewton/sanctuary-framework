@@ -26,6 +26,7 @@ import { runWrap } from "../../src/wrap/cli.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
 import { findLatestBackup } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
+import { agreeingHermesParity } from "../helpers/hermes-parity.js";
 
 const ENTRY = {
   command: "npx",
@@ -268,6 +269,7 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
         location: "test-keychain",
         source: "generated",
       }),
+      hermesParity: agreeingHermesParity,
     };
   }
 
@@ -458,6 +460,7 @@ describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)"
         location: "test-keychain",
         source: "generated",
       }),
+      hermesParity: agreeingHermesParity,
     };
   }
 

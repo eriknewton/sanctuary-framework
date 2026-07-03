@@ -68,6 +68,10 @@ import {
   type HermesYamlPlan,
 } from "./hermes-yaml.js";
 import {
+  assertHermesYamlParseParity,
+  HermesYamlParityRefusedError,
+} from "./hermes-yaml-parse-parity.js";
+import {
   getOrCreatePassphrase,
   persistUserProvidedPassphrase,
   isOsKeyringLocation,
@@ -826,7 +830,10 @@ async function pathExists(path: string): Promise<boolean> {
  * exact entry the real run would write because it shares
  * buildSanctuaryEnv / resolveSanctuaryCommand with the write path.
  */
-async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
+async function reportHermesYamlDryRun(
+  options: WrapOptions,
+  parity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions
+): Promise<void> {
   const yamlPath = hermesConfigYamlPath();
   let existingYaml: string | null = null;
   try {
@@ -837,6 +844,10 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const sanctuaryEnv = buildSanctuaryEnv(options);
   const { command, args } = resolveSanctuaryCommand(options);
   try {
+    // Preview the parse-parity guard too: a dry run should report that the
+    // real run would refuse (disagreement or PyYAML-unavailable) rather than
+    // previewing an edit that would not actually happen.
+    await assertHermesYamlParseParity(existingYaml, parity);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
       args,
@@ -847,7 +858,10 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
       `  Hermes MCP routing: would ${formatHermesYamlAction(plan, yamlPath)}`
     );
   } catch (err) {
-    if (err instanceof HermesYamlUnsupportedError) {
+    if (
+      err instanceof HermesYamlUnsupportedError ||
+      err instanceof HermesYamlParityRefusedError
+    ) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
         `  Hermes MCP routing: wrap would FAIL before modifying anything: ${err.message}`
@@ -1058,6 +1072,16 @@ export interface RunWrapDeps {
   checkPinResolvability?: (
     version: string,
   ) => Promise<PinnedVersionResolvability>;
+  /**
+   * Override the Hermes config.yaml parse-parity guard's PyYAML sidecar
+   * (for tests). Production callers leave this undefined and get a real
+   * one-shot `python3` PyYAML parse; the guard refuses to edit config.yaml
+   * when the line-scanner's view disagrees with that parse or when the
+   * parser cannot run (fail-closed). Tests inject an agreeing exec so a
+   * legitimate wrap does not depend on the CI host carrying PyYAML, or a
+   * refusing exec to pin the disagreement / sidecar-unavailable paths.
+   */
+  hermesParity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions;
 }
 
 export async function runWrap(
@@ -1149,7 +1173,7 @@ export async function runWrap(
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
       if (platformHint === "hermes") {
-        await reportHermesYamlDryRun(options);
+        await reportHermesYamlDryRun(options, deps.hermesParity);
       }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Dry run. No changes made.\n`);
@@ -1293,7 +1317,7 @@ export async function runWrap(
     // keeps this path guaranteed write-free (the gate sits above every
     // write: config bootstrap, fortress state, agent-record persistence).
     if (agentConfig.platform === "hermes") {
-      await reportHermesYamlDryRun(options);
+      await reportHermesYamlDryRun(options, deps.hermesParity);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Dry run. No changes made.\n`);
@@ -1675,6 +1699,16 @@ export async function runWrap(
       // File absent - the plan creates it.
     }
     try {
+      // Parse-parity guard (Erik-ratified 2026-07-03, Option A): before the
+      // line-scanner's plan is allowed to drive a mutation, validate the
+      // scanner's view against a REAL PyYAML parse of the same bytes. Refuse
+      // on any disagreement, and refuse (fail-closed) if the PyYAML validator
+      // cannot run at all. This supersedes trusting the scanner's fidelity;
+      // it does not claim the scanner is correct, only that a real parser and
+      // the scanner agree on the facts this edit depends on. Runs BEFORE any
+      // surface is backed up or rewritten, so a refusal leaves everything
+      // untouched.
+      await assertHermesYamlParseParity(existingYaml, deps.hermesParity);
       const plan = planHermesYamlInjection(existingYaml, {
         command: sanctuaryCommand,
         args: sanctuaryArgs,
@@ -1690,6 +1724,17 @@ export async function runWrap(
           `  Nothing was modified. Hermes routes MCP traffic through ${yamlPath};` +
             `\n  wrap will not proceed without updating it (a JSON-only wrap would` +
             `\n  silently leave Hermes traffic outside the Sanctuary proxy).\n`
+        );
+        process.exit(1);
+      }
+      if (err instanceof HermesYamlParityRefusedError) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(`\n  Sanctuary: Hermes config.yaml Not Editable`);
+        console.error(`  ${err.message}`);
+        console.error(
+          `  Nothing was modified. The line-scanner that edits config.yaml is ` +
+            `checked\n  against the real PyYAML parser Hermes uses; wrap refuses to ` +
+            `edit when\n  they disagree or when that parser cannot run.\n`
         );
         process.exit(1);
       }

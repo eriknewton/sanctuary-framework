@@ -43,6 +43,7 @@ import {
   saveWrapMeta,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
+import { agreeingHermesParity } from "../helpers/hermes-parity.js";
 
 describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", () => {
   let tmpHome: string;
@@ -91,6 +92,10 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
         location: "test-keychain",
         source: "generated" as const,
       }),
+      // Agree with the scanner so these Hermes rewrap/unwrap mechanics tests
+      // do not depend on the CI host carrying PyYAML (the parse-parity guard
+      // is proven separately in hermes-yaml-parse-parity.test.ts).
+      hermesParity: agreeingHermesParity,
     };
   }
 

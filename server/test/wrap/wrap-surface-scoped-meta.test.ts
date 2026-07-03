@@ -125,6 +125,7 @@ import {
   __wrapMetaLockTestHooks,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
+import { agreeingHermesParity } from "../helpers/hermes-parity.js";
 
 const CRASH_WINDOW_MARKER = "already contains a Sanctuary entry";
 
@@ -173,6 +174,11 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
         location: "test-keychain",
         source: "generated" as const,
       }),
+      // Agree with the scanner so these Hermes surface-scoped meta mechanics
+      // tests do not depend on the CI host carrying PyYAML (the parse-parity
+      // guard is proven separately in hermes-yaml-parse-parity.test.ts). Kept
+      // before the spread so a test may still override it.
+      hermesParity: agreeingHermesParity,
       ...overrides,
     };
   }
