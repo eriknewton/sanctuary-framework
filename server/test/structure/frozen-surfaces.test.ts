@@ -116,6 +116,21 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   // cross-cutting crypto labels + signing domains:
   "intelligence-substrate-config",
   "sanctuary-fed-v0.1-transport",
+  // mesh (Sanctuary Federation Protocol v0.1) libp2p transport wire contract +
+  // the remaining federation HKDF domain-separation labels. The transport is
+  // parked-but-intended (built + tested, no live caller yet); these strings are
+  // still on-wire / at-rest contracts a future mesh peer and existing wrapped
+  // payloads depend on. The protocol IDs are template-composed
+  // (`${STREAM_PREFIX}/<class>/1.0.0`), so the prefix + each class suffix are
+  // frozen separately (the assembled literal never appears verbatim in source).
+  // A reorg / "it looks unused, delete it" pass must NEVER touch these.
+  "/sanctuary/fed/v0.1",
+  "/sync/1.0.0",
+  "/agent-state/1.0.0",
+  "/unicast/1.0.0",
+  "sanctuary-fed-v0.1-audit-chain",
+  "sanctuary-fed-v0.1-lifecycle-node-key-wrap",
+  "sanctuary-fed-v0.1-lifecycle-agent-state-transfer",
   "cw-audit-producer-v1",
   "sanctuary.enforcement-checkpoint.v1",
   "sanctuary.audit-checkpoint.v1",

@@ -4,6 +4,12 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    // No network egress from unit tests: the wrap-time pinned-version
+    // resolvability probe (wrap/cli.ts) and the startup update check both
+    // honor this documented zero-outbound knob. Tests that exercise the
+    // probe itself either delete the var locally and point the probe at a
+    // loopback server, or inject a stub via RunWrapDeps.
+    env: { SANCTUARY_NO_UPDATE_CHECK: "1" },
     include: ["test/**/*.test.ts", "../scripts/synthetic-coverage/test/**/*.test.ts"],
     coverage: {
       provider: "v8",

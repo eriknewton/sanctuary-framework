@@ -1,6 +1,6 @@
 # Unified Protect Enforcement Core: Built vs Drill-Owed Status
 
-Status date: 2026-07-02. Owner: Sanctuary coordinator. This document is the
+Status date: 2026-07-03. Owner: Sanctuary coordinator. This document is the
 honesty ledger for the exclusive-egress enforcement core (Unified Protect
 Slices 1, 2, 3, 4, 8). It states, per slice, what is BUILT (code merged,
 unit/integration tested) versus what is DRILL-OWED (no capability claim until
@@ -13,8 +13,10 @@ per the thesis-gate rule).
   proven 5/5 per-uid deny floor).
 - Destination policy at the gate is userspace-enforced (the gate process's
   TypeScript evaluator; it is NOT kernel-backed).
-- Loopback confinement is pf-enforced; the per-uid pf mechanism is
-  drill-proven on Tahoe (macOS 26.5.1) only, N=3, 2026-07-02.
+- Loopback confinement is pf-enforced; the per-uid pf mechanism AND the
+  composed build's pf-anchor + fail-closed gate-liveness are drill-proven on
+  BOTH macOS families: Tahoe (26.5.1, arm64) and Sonoma (14.6.1, x86_64),
+  N=3 each, 2026-07-03, coordinator-verified.
 - Do not make absolute bypass-resistance claims in any user-visible string,
   MCP tool description, README, or docs page for this feature. No external
   exclusive-egress claim ships until the cross-OS-family leg below is
@@ -29,6 +31,31 @@ coordinator-verified). A per-uid pf anchor on `lo0` dropped agent-uid
 connections to a non-gate loopback port while allowing agent-to-gate, with
 state-table corroboration. That drill proves the MECHANISM; it does not
 prove this composed build.
+
+## Composed-build drill-acceptance (2026-07-03) — BOTH OS families
+
+The BUILT enforcement-core code (`armPfAnchor` / `checkPfAnchorLiveness` /
+`disarmPfAnchor` / `startExclusiveEgressGate`) was drilled end-to-end, N=3
+each, coordinator-verified, on BOTH macOS families:
+- Tahoe: MBA, macOS 26.5.1 (arm64) -
+  `Review/Sanctuary/drill-evidence-2026-07-03/unified-protect-enforcement-core/RESULTS.md`
+- Non-Tahoe: aubries-macbook-pro-2, macOS 14.6.1 Sonoma (x86_64) -
+  `.../RESULTS-nontahoe-sonoma.md`
+
+Proven both hosts: P1 the CODE-GENERATED per-uid pf anchor confines the agent
+to the gate port (agent->gate CONNECTED, agent->non-gate BLOCKED,
+state-table corroborated); P2 the gate FAILS CLOSED the instant the anchor is
+flushed (next CONNECT = 503 liveness_refused, re-probed every CONNECT, no
+stale-positive cache); recovery clean; pf restored. Cross-version pfctl-format
+robustness proven (matchers work on both 14 and 26).
+
+SCOPE OF THIS EVIDENCE (do NOT overclaim): it proves the pf-confinement +
+fail-closed-gate-liveness layer of the composed build, cross-OS. It does NOT
+cover, and these remain OWED before any external exclusive-egress claim: the
+sysext-armed full-design console drills (Slice 1, wall armed), Slice 4
+harness self-confinement via the `UserName=<agent>` LaunchDaemon (an
+Erik-present arming ceremony), and the kernel off-box wall (Castle Wall
+NEFilter) on a second OS family.
 
 ## Per-slice status
 

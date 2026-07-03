@@ -874,7 +874,9 @@ Environment variables:
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
-  SANCTUARY_NO_UPDATE_CHECK         "1" to disable startup update check
+  SANCTUARY_NO_UPDATE_CHECK         "1" to disable the startup update check
+                                      and wrap's pinned-version registry probe
+                                      (the zero-outbound knob)
 
 For more info: https://github.com/eriknewton/sanctuary-framework
 `);
