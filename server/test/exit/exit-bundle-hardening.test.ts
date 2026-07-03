@@ -16,6 +16,7 @@ import {
   verifyExitBundle,
   ExitBundleImportError,
 } from "../../src/exit/index.js";
+import { EXIT_BUNDLE_DID_WEB_AUDIT_OPS } from "../../src/exit/bundle.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import {
@@ -301,6 +302,120 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       await destinationDry.storage.list("_audit")
     ).length;
     expect(auditAfter).toBe(auditBefore);
+  });
+
+  it("#55/B2 did:web branch: dry-run import of a did:web bundle with an unverifiable reputation signer stays before the did:web block (no fetcher call, zero reputation + zero audit writes)", async () => {
+    // The strict reputation-signature gate runs BEFORE the did:web
+    // cross-check block. This test proves that ordering on a bundle
+    // that carries BOTH a did:web identity binding AND an unverifiable
+    // reputation signer. If the gate were (re)moved to AFTER the
+    // did:web block, the did:web audit appends and the fetcher would
+    // fire before the reputation refusal returned, so this test would
+    // fail. It is the did:web-branch counterpart to the #55/B2 dry-run
+    // test above, which used a NON-did:web fixture and therefore never
+    // exercised the did:web audit path.
+    const AUTHORITY_HOST = "b2-didweb.example.com";
+    const DID_URI = `did:web:${AUTHORITY_HOST}:fortress:b2rep:agent:default`;
+
+    const source = await makeHarness();
+    await callTool(source.tools, "identity_create", {
+      label: "b2-didweb-primary",
+    });
+    // Record reputation under a SECONDARY identity so the signer DID is
+    // absent from the bundle's published identity material: the
+    // attestation is unverifiable, exactly the #55 laundering shape.
+    const secondary = await callTool(source.tools, "identity_create", {
+      label: "b2-didweb-secondary",
+    });
+    await callTool(source.tools, "reputation_record", {
+      interaction_id: "b2-didweb-unverifiable-001",
+      counterparty_did: "did:key:counterparty",
+      outcome: {
+        type: "transaction",
+        result: "completed",
+        metrics: { score: 100 },
+      },
+      context: "b2-didweb",
+      identity_id: secondary.identity_id as string,
+    });
+
+    const bundleDir = await mkdtemp(
+      join(tmpdir(), "sanctuary-exit-hardening-b2-didweb-")
+    );
+    tempDirs.push(bundleDir);
+    // Export WITH a did:web binding so the manifest carries an
+    // identity_binding.did_web the import path would otherwise resolve.
+    await exportExitBundle({
+      unpartitionedLegacyExport: true,
+      bundleDir,
+      storage: source.storage,
+      masterKey: source.masterKey,
+      identityManager: source.identityManager,
+      auditLog: source.auditLog,
+      reputationStore: source.reputationStore,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateNamespaces: [],
+      keySource: "recovery-key",
+      didWeb: { identifier: DID_URI, authority_host: AUTHORITY_HOST },
+    });
+
+    const destination = await makeHarness();
+    // Capture the audit-entry count BEFORE the import: the harness may
+    // have written setup markers, so assert the import ADDS zero rather
+    // than assuming the namespace starts empty.
+    await destination.auditLog.flush();
+    const auditBefore = (await destination.storage.list("_audit")).length;
+
+    // Configure a did:web fetcher and an allowed host: if control ever
+    // reached the did:web block, the fetcher WOULD be invoked. It must
+    // not be, because the strict reputation gate returns first.
+    let fetcherInvoked = false;
+    const result = await importExitBundle({
+      bundleDir,
+      storage: destination.storage,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: false,
+      didWebAllowedHosts: [AUTHORITY_HOST],
+      didWebFetcher: async () => {
+        fetcherInvoked = true;
+        return { ok: true, status: 200, json: async () => ({}) };
+      },
+    });
+
+    // (1) Refused: not verified, not activated, nothing staged.
+    expect(result.verified).toBe(false);
+    expect(result.activated).toBe(false);
+    expect(result.staged_artifacts).toEqual([]);
+
+    // (2) Zero reputation writes.
+    await expect(
+      destination.storage.list("_reputation")
+    ).resolves.toHaveLength(0);
+
+    // (3) Zero new audit entries: the strict gate returned before any
+    // did:web audit append could be scheduled.
+    await destination.auditLog.flush();
+    const auditAfter = (await destination.storage.list("_audit")).length;
+    expect(auditAfter).toBe(auditBefore);
+
+    // (4) The did:web fetcher was never called, and no did:web audit
+    // op (AUTHORITY_HOST / IMPORT_VERIFIED) was emitted. This is the
+    // load-bearing assertion: it proves control never entered the
+    // did:web block. If the strict gate moved to after the did:web
+    // block, these would flip.
+    expect(fetcherInvoked).toBe(false);
+    const q = await destination.auditLog.query({ layer: "l1", limit: 200 });
+    expect(
+      q.entries.some(
+        (e) =>
+          e.operation === EXIT_BUNDLE_DID_WEB_AUDIT_OPS.AUTHORITY_HOST ||
+          e.operation === EXIT_BUNDLE_DID_WEB_AUDIT_OPS.IMPORT_VERIFIED
+      )
+    ).toBe(false);
   });
 
   // Per full-sweep #77: helpers for tampering with internal artifact
