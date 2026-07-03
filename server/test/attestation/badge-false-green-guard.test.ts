@@ -24,16 +24,22 @@
  * unrecognized input; it makes no hardware / TEE guarantee.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   deriveGlobalBadge,
   deriveAgentBadge,
   deriveActionBadge,
+  applyAttestationEvent,
+  clearAllBadgeStores,
 } from "../../src/attestation/badge-state.js";
-import { BADGE_STATES } from "../../src/attestation/constants.js";
+import {
+  BADGE_STATES,
+  SIGNATURE_SCHEME_V1,
+} from "../../src/attestation/constants.js";
 import type {
   ActionLayerContext,
   AgentLayerContext,
+  AttestationEvent,
   GlobalLayerContext,
 } from "../../src/attestation/types.js";
 
@@ -283,5 +289,218 @@ describe("false-green guard: derivation only ever emits a known badge state", ()
         expect(BADGE_STATES).toContain(badge);
       }
     }
+  });
+});
+
+// -----------------------------------------------------------------------
+// B4 finding #1: a signed attestation_failure event with a failure_mode must
+// never store a badge state inconsistent with that failure_mode's catalog
+// badge_result. fromSignedEvent only enum-validates resulting_state; without
+// reconciliation, a signature-verified {failure_mode: <critical>, resulting_
+// state: 'green'} event from a buggy or compromised producer stores GREEN
+// with a failure explanation -- a false-green.
+// -----------------------------------------------------------------------
+
+function failureEvent(
+  overrides?: Partial<AttestationEvent>
+): AttestationEvent {
+  return {
+    event_id: "attest-b4f1",
+    event_type: "attestation_failure_detected",
+    signature_scheme: SIGNATURE_SCHEME_V1,
+    target_layer: "global",
+    scope_id: "f-1",
+    resulting_state: "green",
+    failure_mode: "sovereign_node_attestation_fail",
+    emitted_at: new Date().toISOString(),
+    explanation: "Sovereign node attestation failure",
+    ...overrides,
+  };
+}
+
+describe("false-green guard: signed failure event reconciles against catalog", () => {
+  beforeEach(() => {
+    clearAllBadgeStores();
+  });
+
+  it("failure_mode with a red catalog result overrides a claimed green (was false-green)", () => {
+    // sovereign_node_attestation_fail -> catalog badge_result "red".
+    // Pre-fix applyAttestationEvent trusted resulting_state and stored "green".
+    const badge = applyAttestationEvent(failureEvent());
+    expect(badge.state).not.toBe("green");
+    expect(badge.state).toBe("red");
+    // Explanation still points at the failure so the operator sees the cause.
+    expect(badge.explanation_key).toBe(
+      "failure.sovereign_node_attestation_fail"
+    );
+  });
+
+  it("failure_mode with a yellow catalog result overrides a claimed green", () => {
+    // tcb_drift_annex -> catalog badge_result "yellow".
+    const badge = applyAttestationEvent(
+      failureEvent({
+        failure_mode: "tcb_drift_annex",
+        target_layer: "per_agent",
+        scope_id: "a-1",
+        resulting_state: "green",
+      })
+    );
+    expect(badge.state).not.toBe("green");
+    expect(badge.state).toBe("yellow");
+  });
+
+  it("failure_mode with a local_only catalog result overrides a claimed green", () => {
+    // local_only_mode -> catalog badge_result "local_only" (a nominal steady
+    // state, but still NOT green when the event carries a failure_mode).
+    const badge = applyAttestationEvent(
+      failureEvent({
+        failure_mode: "local_only_mode",
+        target_layer: "per_agent",
+        scope_id: "a-2",
+        resulting_state: "green",
+      })
+    );
+    expect(badge.state).not.toBe("green");
+    expect(badge.state).toBe("local_only");
+  });
+
+  it("a producer that reports a WORSE state than catalog is honored (no over-relax)", () => {
+    // policy_sync_lag -> catalog "yellow"; a producer legitimately escalating
+    // to red must be kept, not softened back to the catalog baseline.
+    const badge = applyAttestationEvent(
+      failureEvent({
+        failure_mode: "policy_sync_lag",
+        resulting_state: "red",
+      })
+    );
+    expect(badge.state).toBe("red");
+  });
+
+  it("any present failure_mode never yields green, even an unknown code", () => {
+    const badge = applyAttestationEvent(
+      failureEvent({
+        // Cast: an off-catalog failure_mode from a buggy producer. The hard
+        // floor must still refuse green.
+        failure_mode: "not_a_real_code" as never,
+        resulting_state: "green",
+      })
+    );
+    expect(badge.state).not.toBe("green");
+  });
+
+  it("a clean recovery (no failure_mode) still renders green (no over-degrade)", () => {
+    const badge = applyAttestationEvent(
+      failureEvent({
+        event_type: "attestation_recovered",
+        failure_mode: undefined,
+        resulting_state: "green",
+        explanation: "Attestation recovered",
+      })
+    );
+    expect(badge.state).toBe("green");
+  });
+});
+
+// -----------------------------------------------------------------------
+// B4 finding #2: deriveAgentBadge must positively EARN the local_only steady
+// state. Pre-fix it returned local_only from a clean local_only node before
+// checking identity_valid / policy_pinned / egress_enforcing, so those
+// failures were silently dropped under a trusted-looking local_only badge.
+// -----------------------------------------------------------------------
+
+describe("false-green guard: local_only is positively earned (finding #2)", () => {
+  // Sanity: a fully-nominal local_only agent still earns local_only.
+  it("clean local_only agent still earns local_only (no over-degrade)", () => {
+    const badge = deriveAgentBadge(
+      allGreenAgent({ node_attestation_state: "local_only" })
+    );
+    expect(badge).toBe("local_only");
+  });
+
+  it("local_only node with INVALID identity is red, not local_only (was masked)", () => {
+    const badge = deriveAgentBadge(
+      allGreenAgent({
+        node_attestation_state: "local_only",
+        identity_valid: false,
+      })
+    );
+    expect(badge).not.toBe("local_only");
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("red");
+  });
+
+  it("local_only node with UNPINNED policy degrades, not local_only (was masked)", () => {
+    const badge = deriveAgentBadge(
+      allGreenAgent({
+        node_attestation_state: "local_only",
+        policy_pinned: false,
+      })
+    );
+    expect(badge).not.toBe("local_only");
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("yellow");
+  });
+
+  it("local_only node with NON-ENFORCING egress degrades, not local_only (was masked)", () => {
+    const badge = deriveAgentBadge(
+      allGreenAgent({
+        node_attestation_state: "local_only",
+        egress_enforcing: false,
+      })
+    );
+    expect(badge).not.toBe("local_only");
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("yellow");
+  });
+});
+
+// -----------------------------------------------------------------------
+// B4 finding #3: local_only is nominal only for posture fields (node / agent
+// attestation state), NOT for the GLOBAL subsystem fields (audit chain,
+// policy sync, guardian presence). Pre-fix classifyInput treated local_only
+// as nominal for every field, so a local_only on a global subsystem earned a
+// green fortress badge even though local_only is not a source-verified
+// nominal state for those fortress-wide signals.
+// -----------------------------------------------------------------------
+
+describe("false-green guard: global subsystem local_only degrades (finding #3)", () => {
+  it("audit chain local_only does not render green (was false-green)", () => {
+    const badge = deriveGlobalBadge(
+      allGreenGlobal({ audit_chain_state: "local_only" })
+    );
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("yellow");
+  });
+
+  it("policy sync local_only does not render green (was false-green)", () => {
+    const badge = deriveGlobalBadge(
+      allGreenGlobal({ policy_sync_state: "local_only" })
+    );
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("yellow");
+  });
+
+  it("guardian local_only does not render green (was false-green)", () => {
+    const badge = deriveGlobalBadge(
+      allGreenGlobal({ guardian_state: "local_only" })
+    );
+    expect(badge).not.toBe("green");
+    expect(badge).toBe("yellow");
+  });
+
+  // Legitimately-local_only fields must still work: a node or per-agent state
+  // of local_only is a valid nominal steady state and must NOT over-degrade.
+  it("node local_only remains nominal (posture field, not over-degraded)", () => {
+    const badge = deriveGlobalBadge(
+      allGreenGlobal({ node_states: { "node-1": "local_only" } })
+    );
+    expect(badge).toBe("green");
+  });
+
+  it("per-agent local_only remains nominal (posture field, not over-degraded)", () => {
+    const badge = deriveGlobalBadge(
+      allGreenGlobal({ agent_badge_states: { "agent-1": "local_only" } })
+    );
+    expect(badge).toBe("green");
   });
 });
