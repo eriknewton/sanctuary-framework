@@ -366,6 +366,11 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       // Without this label a fortress that ever persisted sync-state would
       // strand it and rotateMaster would abort. MUST equal
       // FEDERATION_SYNC_STATE_STORE_HKDF_INFO (asserted in master-rotation.test).
+      // NOTE: the B1 provisioning-baseline SENTINEL record
+      // (FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY, "sync-state-baseline-v1")
+      // rides under THIS SAME label - a second at-rest record key encrypted with
+      // the same purpose key - so the no-AAD candidate re-wraps BOTH records on
+      // rotation with no new label needed.
       "federation-sync-state",
       // Operator Cloud (Slice 3 boot-wire): the cloud node's at-rest joined-node
       // record (non-issuer scoped-custody runtime state), persisted under

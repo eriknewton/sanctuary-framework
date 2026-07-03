@@ -2154,17 +2154,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // an empty revoked-root set and a zero serial). Only THEN do we latch. This
     // never trips on a fresh fortress and never bricks the first sync.
     //
-    // Documented residual: a fortress whose ONLY revocation history is NODE
-    // evictions (which live solely in the deleted sync-state record, with no
-    // independent trust-root witness) cannot be distinguished from fresh after a
-    // deletion, so its node-revocation memory still resets to empty on that boot
-    // (the pre-existing status quo). Deleting a root-revocation-bearing fortress's
-    // record IS caught. Closing the node-eviction residual would require
-    // provisioning to write a baseline record (a ceremony change across the mesh
-    // trust-root stores, out of this fix's scope); tracked as follow-up.
+    // F3 residual close (B1): a durable PROVISIONING BASELINE SENTINEL is a
+    // SECOND, independent per-fortress witness (a separate at-rest record under
+    // the SAME purpose key) that a sync-state baseline WAS provisioned. It closes
+    // the node-eviction-only residual the trust-root witness could not: the two
+    // records are written TOGETHER at provisioning and only an out-of-band delete
+    // of the main record can leave the sentinel present with the record absent.
+    // So the deletion signal is now the UNION of two independent witnesses:
+    //   - the trust-root revoked-root evidence (catches root-revocation history),
+    //   - the baseline sentinel (catches ANY provisioned fortress, incl. a
+    //     node-eviction-only one, once its baseline is provisioned).
+    // On a genuinely fresh fortress NEITHER witness is present, so the first boot
+    // is never bricked; instead it PROVISIONS the baseline (writes both records)
+    // so every subsequent deletion is caught.
     let recordPresent: boolean;
+    let sentinelPresent: boolean;
     try {
       recordPresent = await store.recordExists();
+      sentinelPresent = await store.baselineSentinelExists();
     } catch {
       // A read fault (not a clean absence) is treated as unavailable: fail
       // closed rather than mis-classify a transient backend error as "fresh".
@@ -2174,13 +2181,35 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (
       !recordPresent &&
       this.isFederationProvisioned() &&
-      this.hasIndependentFederationRevocationHistory()
+      (sentinelPresent || this.hasIndependentFederationRevocationHistory())
     ) {
-      // Provisioned + record absent + independent evidence of prior revocation
-      // history -> the record was DELETED. Fail closed. Do NOT touch the live
-      // fields (no half-applied state); latch so every sync/revoke path denies.
+      // Provisioned + main record absent + an independent witness (baseline
+      // sentinel OR trust-root revocation evidence) shows a baseline once existed
+      // -> the record was DELETED. Fail closed. Do NOT touch the live fields (no
+      // half-applied state); latch so every sync/revoke path denies.
       this._federationSyncStateUnavailable = true;
       return;
+    }
+    if (
+      !recordPresent &&
+      !sentinelPresent &&
+      this.isFederationProvisioned() &&
+      !this.hasIndependentFederationRevocationHistory()
+    ) {
+      // Genuinely fresh provisioned fortress, first boot: NO record, NO sentinel,
+      // NO independent revocation history. PROVISION the baseline now - write the
+      // empty baseline record AND the sentinel (idempotently, under a lock) - so
+      // that from this boot on, absence of the main record means DELETION and is
+      // caught (even for a fortress whose only later history is node evictions).
+      // This does NOT latch and does NOT brick the first sync: the record now
+      // exists (empty), and the first accepted sync folds over it monotonically.
+      // A provisioning write failure fails closed (latch), never silently serves.
+      try {
+        await store.provisionBaselineIfAbsent();
+      } catch {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
     }
     let snapshot: FederationSyncStateSnapshot;
     try {

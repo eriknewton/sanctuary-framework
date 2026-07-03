@@ -92,6 +92,7 @@ import {
   FEDERATION_SYNC_STATE_STORE_NAMESPACE,
   FEDERATION_SYNC_STATE_STORE_KEY,
   FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+  FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
 import {
   OPERATOR_CLOUD_JOINED_NODE_NAMESPACE,
@@ -763,7 +764,7 @@ describe("master rotation — fail-closed coverage", () => {
     ).toEqual(joinerPayload);
   });
 
-  it("rotates ALL SEVEN _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state, operator-cloud joined-node, reissue challenge set) without strand", async () => {
+  it("rotates ALL EIGHT _federation records (trust-root, joiner, spent-nonce set, provision-claim set, sync-state, sync-state baseline sentinel, operator-cloud joined-node, reissue challenge set) without strand", async () => {
     // Anti-strand for the durable single-use replay stores, the Federation 3/3b
     // P0 durable sync-state store, AND the Operator Cloud Slice 3 joined-node
     // store: each persists a blob into _federation under a NEW HKDF label.
@@ -829,6 +830,14 @@ describe("master rotation — fail-closed coverage", () => {
         key: OPERATOR_CLOUD_JOINED_NODE_KEY,
         info: OPERATOR_CLOUD_JOINED_NODE_HKDF_INFO,
         payload: { record_version: "operator-cloud-joined-node-v1", marker: "oc-joined-node" },
+      },
+      {
+        // B1 provisioning-baseline SENTINEL: a SECOND _federation record encrypted
+        // under the SAME federation-sync-state label; it must re-wrap on rotation
+        // exactly like the main sync-state record (no new label, no strand).
+        key: FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY,
+        info: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+        payload: { v: 1, provisioned_at: "2026-07-04T00:00:00.000Z" },
       },
       {
         key: FEDERATION_REISSUE_CHALLENGE_STORE_KEY,

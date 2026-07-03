@@ -88,6 +88,49 @@ export const FEDERATION_SYNC_STATE_STORE_HKDF_INFO =
  */
 export const FEDERATION_SYNC_STATE_LOCK_FILE = ".sync-state.lock";
 
+/**
+ * At-rest key (in the SAME `_federation` namespace, encrypted under the SAME
+ * `federation-sync-state` purpose key as the main sync-state record) for the
+ * durable PROVISIONING BASELINE SENTINEL (F3 residual close).
+ *
+ * ADDITIVE + FROZEN at-rest key. It carries NO secret material and NO grow-only
+ * security state - only a tiny "this fortress was federation-provisioned and its
+ * sync-state baseline was written" marker (a format version + an ISO timestamp).
+ * It is written ONCE, idempotently, when the durable sync-state store is first
+ * wired on a provisioned fortress, and is never mutated afterward.
+ *
+ * Why a SEPARATE record from the sync-state blob: it is the independent,
+ * per-fortress witness that a baseline WAS provisioned. It lets the boot path
+ * distinguish the two cases the main record's `raw === null -> empty` contract
+ * collapses:
+ *
+ *   - sentinel ABSENT + main record absent -> genuinely fresh first boot: write
+ *     BOTH (baseline record + sentinel) and serve empty (NEVER brick the first
+ *     sync);
+ *   - sentinel PRESENT + main record absent -> the main record was DELETED out of
+ *     band AFTER a baseline was provisioned: fail closed (this now covers a
+ *     node-eviction-only history, which has no independent trust-root witness).
+ *
+ * It is encrypted under the EXISTING `federation-sync-state` label (NO new HKDF
+ * label, NO new store, NO new rotation-recipe entry): the master-rotation
+ * `_federation` recipe re-wraps every purpose-encrypted record under that label,
+ * so this second record rotates with the first. Being a proper AES-256-GCM
+ * payload (not a plaintext marker) is REQUIRED - the rotation preflight rejects
+ * any non-encrypted record under `_federation`.
+ */
+export const FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY =
+  "sync-state-baseline-v1";
+
+/**
+ * Lockfile name for the cross-process advisory lock that serializes the
+ * idempotent read-check-write of the baseline sentinel + baseline record in
+ * {@link FederationSyncStateStore.provisionBaselineIfAbsent}. Distinct from the
+ * sync-state write lock so a boot-time provisioning write never contends with a
+ * concurrent sync persist on the SAME lock (which is non-reentrant).
+ */
+export const FEDERATION_SYNC_STATE_BASELINE_LOCK_FILE =
+  ".sync-state-baseline.lock";
+
 /** The derived security state this store persists and rehydrates. */
 export interface FederationSyncStateSnapshot {
   /** Per-sender accepted high-water: senderNodeId -> highest accepted value. */
@@ -178,6 +221,16 @@ interface PersistedSyncState {
    * higher generation so a stale writer cannot clobber a fresher requirement.
    */
   guardian_revocation_requirement_generation?: number;
+}
+
+/**
+ * At-rest form of the provisioning baseline sentinel. Carries NO security state,
+ * only a format version + the ISO timestamp the baseline was provisioned. Its
+ * mere PRESENCE (decrypted or not) is the signal; the fields are informational.
+ */
+interface PersistedBaselineSentinel {
+  v: 1;
+  provisioned_at: string;
 }
 
 interface PersistedAppliedPolicyVersion {
@@ -272,6 +325,109 @@ export class FederationSyncStateStore {
   async recordExists(): Promise<boolean> {
     const raw = await this.storage.read(this.namespace, this.recordKey);
     return raw !== null;
+  }
+
+  /**
+   * Existence probe for the durable PROVISIONING BASELINE SENTINEL, WITHOUT
+   * decrypting it. Returns true when the sentinel blob is physically present at
+   * (`namespace`, `FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY`), false when it
+   * is absent. A read error propagates so the caller fails closed rather than
+   * mis-reading a transient backend fault as "no baseline provisioned".
+   *
+   * This is the independent witness the F3 deletion latch consults: a sentinel
+   * that is PRESENT while the main sync-state record is ABSENT proves the record
+   * was deleted AFTER a baseline was provisioned (the two records are written
+   * together and only an out-of-band delete can separate them), so the caller
+   * fails closed even when the only prior revocation history is node evictions
+   * (which leave no independent trust-root witness).
+   */
+  async baselineSentinelExists(): Promise<boolean> {
+    const raw = await this.storage.read(
+      this.namespace,
+      FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY,
+    );
+    return raw !== null;
+  }
+
+  /**
+   * Idempotently establish the provisioning baseline: under a cross-process
+   * lock, if EITHER the sentinel or the main sync-state record is absent, write
+   * whichever is missing (the sentinel marker AND an empty baseline sync-state
+   * record). A no-op when both are already present.
+   *
+   * Returns `true` when this call WROTE the baseline (the first-boot provisioning
+   * case), `false` when both records already existed (nothing written). The
+   * caller uses the return to distinguish "I just provisioned the baseline on a
+   * genuinely fresh fortress" (serve empty, never brick the first sync) from
+   * "the baseline was already there" (normal load).
+   *
+   * FAIL-SAFE ORDERING (non-destructive): the empty baseline sync-state record is
+   * written FIRST, then the sentinel. So the sentinel is never present without a
+   * sync-state record behind it; a crash between the two writes leaves
+   * "record-present, sentinel-absent", which the next boot repairs (writes the
+   * missing sentinel) rather than mis-latching. The baseline sync-state write
+   * goes through the normal locked, MONOTONIC-MERGE {@link persist} of an EMPTY
+   * snapshot, so if a real record somehow already exists it is folded over (never
+   * clobbered) - the empty snapshot cannot lower any floor or drop any revocation.
+   *
+   * THROWS on any lock/read/write/encrypt failure so the caller fails closed
+   * rather than proceeding as if a baseline were durably committed.
+   */
+  async provisionBaselineIfAbsent(): Promise<boolean> {
+    let wrote = false;
+    await withCrossProcessLock(
+      this.storage,
+      this.namespace,
+      FEDERATION_SYNC_STATE_BASELINE_LOCK_FILE,
+      async () => {
+        const recordPresent =
+          (await this.storage.read(this.namespace, this.recordKey)) !== null;
+        const sentinelPresent =
+          (await this.storage.read(
+            this.namespace,
+            FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY,
+          )) !== null;
+        if (recordPresent && sentinelPresent) return;
+        // Record first (fail-safe ordering: never a sentinel without a record).
+        // persist() re-reads + monotonically merges under its OWN lock, so an
+        // empty baseline written over a pre-existing real record is a no-op fold,
+        // never a downgrade. We only need to (re)write the record if it is
+        // absent; if it is present we leave the committed state untouched.
+        if (!recordPresent) {
+          await this.persist(emptyFederationSyncState());
+        }
+        if (!sentinelPresent) {
+          await this.writeBaselineSentinel();
+        }
+        wrote = true;
+      },
+    );
+    return wrote;
+  }
+
+  /**
+   * Encrypt + write the baseline sentinel marker (format version + provisioning
+   * timestamp) under the shared `federation-sync-state` purpose key. Internal to
+   * {@link provisionBaselineIfAbsent} (called while the baseline lock is held).
+   * A proper AES-256-GCM payload so the master-rotation `_federation` recipe
+   * re-wraps it under the same label as the main record.
+   */
+  private async writeBaselineSentinel(): Promise<void> {
+    const marker: PersistedBaselineSentinel = {
+      v: 1,
+      provisioned_at: new Date().toISOString(),
+    };
+    const serialized = stringToBytes(JSON.stringify(marker));
+    try {
+      const encrypted = encrypt(serialized, this.encryptionKey);
+      await this.storage.write(
+        this.namespace,
+        FEDERATION_SYNC_STATE_BASELINE_SENTINEL_KEY,
+        stringToBytes(JSON.stringify(encrypted)),
+      );
+    } finally {
+      serialized.fill(0);
+    }
   }
 
   /**
