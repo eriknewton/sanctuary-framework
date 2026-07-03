@@ -223,6 +223,11 @@ export function resolveEntitlement(
       return deny("bad_signature");
     }
 
+    // A non-finite clock (NaN/Infinity/undefined coerced to NaN) makes both
+    // window comparisons false, which would let an out-of-window token slip
+    // through. Deny before the window checks so the in-window guarantee holds
+    // for every clock input, not just finite ones.
+    if (!Number.isFinite(now)) return deny("expired");
     if (now < claims.notBefore) return deny("not_yet_valid");
     if (now > claims.notAfter) return deny("expired");
 

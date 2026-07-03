@@ -183,6 +183,44 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
     });
   }
 
+  it("denies an otherwise-valid token on a non-finite clock (NaN)", () => {
+    // Regression: a NaN clock makes both `now < notBefore` and
+    // `now > notAfter` false, so without an explicit finite-clock guard an
+    // out-of-window (or any) token would be granted. The window guarantee
+    // must hold for every clock input.
+    const result = resolveEntitlement({
+      token: signToken(paidClaims()),
+      issuerPublicKey: issuer.publicKey,
+      now: Number.NaN,
+    });
+    expect(result.granted).toBe(false);
+    expect(result.tier).toBe(COMMUNITY_TIER);
+    expect(result.reason).toBe("expired");
+  });
+
+  it("denies an otherwise-valid token when the clock is undefined", () => {
+    // `undefined` coerces to NaN in the numeric comparisons, so it must be
+    // denied for the same reason as NaN.
+    const result = resolveEntitlement({
+      token: signToken(paidClaims()),
+      issuerPublicKey: issuer.publicKey,
+      now: undefined as unknown as number,
+    });
+    expect(result.granted).toBe(false);
+    expect(result.tier).toBe(COMMUNITY_TIER);
+    expect(result.reason).toBe("expired");
+  });
+
+  it("denies an otherwise-valid token on a positive-infinity clock", () => {
+    const result = resolveEntitlement({
+      token: signToken(paidClaims()),
+      issuerPublicKey: issuer.publicKey,
+      now: Number.POSITIVE_INFINITY,
+    });
+    expect(result.granted).toBe(false);
+    expect(result.tier).toBe(COMMUNITY_TIER);
+  });
+
   it("a boundary flip of one second past notAfter expires the grant", () => {
     const claims = paidClaims({ notBefore: NOW - 100, notAfter: NOW });
     const valid = resolveEntitlement({
