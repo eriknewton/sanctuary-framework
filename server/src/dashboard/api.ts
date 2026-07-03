@@ -33,6 +33,8 @@ import {
   POSTURE_EVIDENCE_PATH,
   POSTURE_HOME_PATH,
 } from "../principal-policy/posture-routes.js";
+import { absentFleetRoster } from "../principal-policy/fleet-roster.js";
+import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export { constantTimeEquals };
 
@@ -102,6 +104,24 @@ export interface APIDeps {
    * "unwired", never "n/a".) NEVER exposed on `/api/health`.
    */
   supervisorStatus?: () => "wired" | "unwired" | "n/a";
+  /**
+   * Read-only fleet-roster provider for the wrap ("Protect") dashboard's
+   * fleet-roster panel (`GET /api/fleet/roster`). Returns the presenter output
+   * of `buildFleetRoster` over this process's federation read-seam.
+   *
+   * The dashboard owns the federation deps and the eviction-serial / operator-
+   * policy projection; this provider is the ONLY seam the route touches. It is
+   * strictly read-only: there is no admit/revoke/rotate route here (those are a
+   * later, deliberately separate slice), so the panel SEES and monitors the
+   * fleet, it never manages trust. No key material crosses this seam - the
+   * roster shape carries only public identifiers and posture metadata.
+   *
+   * When omitted (the common single-machine wrap install with no federation
+   * wired), the route serves `absentFleetRoster()` - the honest "no fleet
+   * configured" shape - never a fabricated roster or a greyed-green "all
+   * admitted" shell. It must report REAL federation state, never a guess.
+   */
+  fleetRoster?: () => FleetRoster;
 }
 
 export interface DashboardSession {
@@ -451,6 +471,24 @@ export async function handleRequest(
 
   if (method === "GET" && path === "/api/pending") {
     writeJSON(res, 200, deps.sources.pendingApprovals ?? []);
+    return true;
+  }
+
+  // ── Fleet roster (read-only; SEE-not-manage) ────────────────────────
+  // The wrap ("Protect") dashboard's fleet-roster panel. This is the auth-gated
+  // (the shared gate above already ran and 401'd an unauthenticated caller
+  // before reaching here), STRICTLY read-only view of the fleet: it SEES and
+  // monitors the machines the federation layer knows, and never manages trust
+  // (there is no admit/revoke/rotate route here - that is a later slice). It
+  // carries no key material.
+  //
+  // When no federation read-seam is wired on this process (the common
+  // single-machine install), it serves the honest `absentFleetRoster()` shape -
+  // `available: false`, empty nodes, all-zero summaries - never a fabricated
+  // roster or a greyed-green "all admitted" shell over a fortress with no fleet.
+  if (method === "GET" && path === "/api/fleet/roster") {
+    const roster = deps.fleetRoster ? deps.fleetRoster() : absentFleetRoster();
+    writeJSON(res, 200, roster);
     return true;
   }
 
