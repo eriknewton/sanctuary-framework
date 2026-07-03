@@ -28,6 +28,7 @@ import { randomBytes } from "../core/random.js";
 import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type { SovereigntyTier } from "./tiers.js";
+import { clampImportedSovereigntyTier } from "./tiers.js";
 import { hashToString } from "../core/hashing.js";
 import { verifyBridgeCommitment } from "../bridge/bridge.js";
 import type { BridgeCommitment, ConcordiaOutcome } from "../bridge/types.js";
@@ -77,6 +78,18 @@ export interface StoredAttestation {
   counterparty_attestation?: string;
   counterparty_confirmed: boolean;
   recorded_at: string;
+  /**
+   * True when this attestation was accepted via importBundle rather than
+   * recorded locally. Imported attestations carry a self-asserted
+   * sovereignty_tier the importing instance cannot corroborate, so tier-weighted
+   * reads clamp their trusted tier to MAX_IMPORTED_SOVEREIGNTY_TIER. The signed
+   * attestation.data is left byte-intact so re-export signatures still verify;
+   * this marker drives the trust clamp at the consumption boundary instead.
+   * Absent (undefined) on legacy stored attestations, which predate the marker
+   * and are treated as locally recorded (their tier already came from a local
+   * handshake, so no clamp is needed).
+   */
+  imported?: boolean;
 }
 
 /** Aggregated metric statistics */
@@ -207,6 +220,27 @@ export interface Guarantee {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * The sovereignty tier that may be TRUSTED for weighting from a stored
+ * attestation, as opposed to the raw self-asserted tier in the signed data.
+ *
+ * For a locally recorded attestation this is the recorded tier verbatim (it was
+ * set from a handshake this instance witnessed). For an IMPORTED attestation it
+ * is the recorded tier clamped to MAX_IMPORTED_SOVEREIGNTY_TIER, because a
+ * foreign signer's privileged tier claim cannot be corroborated locally.
+ *
+ * This is the single chokepoint every tier-weighted read must go through so a
+ * forged import cannot inflate its scoring weight. It never RAISES a tier.
+ */
+export function trustedSovereigntyTier(
+  stored: StoredAttestation
+): SovereigntyTier | undefined {
+  const declared = stored.attestation.data.sovereignty_tier;
+  return stored.imported === true
+    ? clampImportedSovereigntyTier(declared)
+    : declared;
+}
 
 function computeMedian(values: number[]): number {
   if (values.length === 0) return 0;
@@ -876,11 +910,15 @@ export class ReputationStore {
 
     for (const attestation of bundle.attestations) {
       // Store the imported attestation only after all bundle-level and
-      // per-attestation validation succeeds.
+      // per-attestation validation succeeds. Mark it imported so tier-weighted
+      // reads clamp its self-asserted sovereignty_tier to the non-privileged
+      // import ceiling: a foreign signer's "verified-sovereign" claim is not
+      // trustworthy on this instance, which never witnessed that handshake.
       const stored: StoredAttestation = {
         attestation,
         counterparty_confirmed: false,
         recorded_at: new Date().toISOString(),
+        imported: true,
       };
 
       const serialized = stringToBytes(JSON.stringify(stored));
@@ -1472,7 +1510,9 @@ export class ReputationStore {
     let disputeCount = 0;
 
     for (const a of filtered) {
-      const tier = a.attestation.data.sovereignty_tier;
+      // Trust-clamped tier: an imported attestation cannot claim a privileged
+      // tier this instance never witnessed (see trustedSovereigntyTier).
+      const tier = trustedSovereigntyTier(a);
       if (tier) tierDist[tier]++;
 
       const ctx = a.attestation.data.context;

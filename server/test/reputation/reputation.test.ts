@@ -17,6 +17,7 @@ import {
   ReputationStore,
   buildReputationCompletenessManifest,
   reputationBundleSigningBytes,
+  trustedSovereigntyTier,
   verifyReputationBundleCompleteness,
   type Attestation,
   type ReputationBundle,
@@ -1902,6 +1903,198 @@ describe("L4 Reputation Store", () => {
       // Summary for the actual participant returns the record
       const self = await store.summarizeForSHR(identity.did);
       expect(self.attestation_count).toBe(1);
+    });
+  });
+
+  // ── Attestation-trust hardening (Heralds reputation import path) ─────────
+  describe("import-trust hardening", () => {
+    // Re-seal a tampered bundle so the completeness manifest and the BUNDLE
+    // signature both pass, isolating the per-attestation signature-verification
+    // layer as the thing that must reject the forgery. Without this the manifest
+    // checksum would trip first (also a valid rejection, but a different layer).
+    function resealManifestAndBundle(
+      bundle: ReputationBundle,
+      exporter: ReturnType<typeof setupIdentity>["identity"],
+      exporterKey: Uint8Array
+    ): ReputationBundle {
+      const rebuilt = cloneBundle(bundle);
+      rebuilt.completeness_manifest = buildReputationCompletenessManifest(
+        rebuilt.exported_at,
+        rebuilt.attestations
+      );
+      rebuilt.bundle_signature = toBase64url(
+        sign(
+          reputationBundleSigningBytes(rebuilt),
+          exporter.encrypted_private_key,
+          exporterKey
+        )
+      );
+      return rebuilt;
+    }
+
+    // (1) FORGED IMPORT: a bundle whose per-attestation signature does not match
+    // the claimed signer must be REJECTED, not credited, EVEN when the bundle
+    // and its completeness manifest are internally consistent.
+    it("rejects a forged import whose attestation signature is invalid", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "forge-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 0.9 } },
+        "commerce", identity, encryptionKey
+      );
+
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Attacker tampers the signed metric value but leaves the OLD per-att
+      // signature, then re-seals the manifest + bundle signature so only the
+      // per-attestation signature is now wrong.
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.data.metrics.rate = 1.0;
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity);
+
+      // FAIL-BEFORE (regression anchor): must throw, never silently import.
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    it("rejects a forged import whose signer does not match participant_did", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey, "victim");
+      const { identity: attacker } = setupIdentity(masterKey, "attacker");
+
+      await store.record(
+        "forge-2", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+
+      // Attacker rewrites the signer to their own DID while participant_did stays
+      // the victim's, then re-seals so signer !== participant_did is the only
+      // defect left for the signature layer to catch.
+      const forged = cloneBundle(bundle);
+      forged.attestations[0]!.signer = attacker.did;
+      const resealed = resealManifestAndBundle(forged, identity, encryptionKey);
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const publicKeys = publicKeysFor(identity, attacker);
+
+      await expect(
+        store2.importBundle(resealed, true, publicKeys)
+      ).rejects.toThrow(/invalid or unverifiable signatures/);
+      await expect(storage2.list("_reputation")).resolves.toHaveLength(0);
+    });
+
+    // (3) CRAFTED TIER: a self-signed "verified-sovereign" attestation is a valid
+    // signature over a self-asserted tier. Import must accept the signature but
+    // must NOT trust the privileged tier: weighted scoring / SHR summary must
+    // clamp it to the non-privileged import ceiling (self-attested).
+    it("clamps a self-asserted verified-sovereign tier on import so it cannot inflate weight", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      // Attacker self-signs an attestation CLAIMING the top tier.
+      await store.record(
+        "tier-forge-1", "did:key:cp",
+        { type: "transaction", result: "completed", metrics: { rate: 1.0 } },
+        "commerce", identity, encryptionKey,
+        undefined,
+        "verified-sovereign"
+      );
+      const bundle = await store.exportBundle(identity, encryptionKey);
+      // Sanity: the exported claim is indeed the privileged tier.
+      expect(bundle.attestations[0]!.data.sovereignty_tier).toBe(
+        "verified-sovereign"
+      );
+
+      const storage2 = new MemoryStorage();
+      const store2 = new ReputationStore(storage2, masterKey);
+      const result = await store2.importBundle(
+        bundle, true, publicKeysFor(identity)
+      );
+      expect(result.imported).toBe(1);
+      expect(result.invalid).toBe(0);
+
+      // FAIL-BEFORE: summary tier distribution would have counted this as
+      // verified-sovereign. PASS-AFTER: it is clamped to self-attested.
+      const summary = await store2.summarizeForSHR();
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(summary.tier_distribution["self-attested"]).toBe(1);
+
+      // Tier scoring sees the clamped tier, not the forged claim.
+      const stored = await store2.loadAllForTierScoring({});
+      expect(stored).toHaveLength(1);
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+    });
+
+    it("does NOT clamp a locally recorded verified-sovereign tier", async () => {
+      // Regression guard: the clamp must apply ONLY to imported attestations.
+      // A locally recorded tier came from a handshake this instance witnessed.
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "local-1", "did:key:cp",
+        { type: "transaction", result: "completed" },
+        "commerce", identity, encryptionKey,
+        undefined,
+        "verified-sovereign"
+      );
+
+      const summary = await store.summarizeForSHR();
+      expect(summary.tier_distribution["verified-sovereign"]).toBe(1);
+      const stored = await store.loadAllForTierScoring({});
+      expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
+    });
+
+    // (2) AGGREGATES-ONLY: query must expose aggregate shape only, never raw
+    // interaction rows (interaction_id, counterparty DIDs, per-attestation
+    // signatures, timestamps of individual interactions).
+    it("query returns aggregates only, never raw attestation rows", async () => {
+      const storage = new MemoryStorage();
+      const masterKey = generateRandomKey();
+      const store = new ReputationStore(storage, masterKey);
+      const { identity, encryptionKey } = setupIdentity(masterKey);
+
+      await store.record(
+        "secret-interaction-42", "did:key:secret-counterparty",
+        { type: "transaction", result: "completed", metrics: { rate: 0.77 } },
+        "commerce", identity, encryptionKey
+      );
+
+      const summary = await store.query({ metrics: ["rate"] });
+      const serialized = JSON.stringify(summary);
+
+      // No raw identifiers or per-row provenance leak through the aggregate.
+      expect(serialized).not.toContain("secret-interaction-42");
+      expect(serialized).not.toContain("secret-counterparty");
+      expect(serialized).not.toContain(identity.did);
+      expect(serialized).not.toContain("signature");
+      expect(serialized).not.toContain("attestation_id");
+
+      // The aggregate shape is present.
+      expect(summary.total_interactions).toBe(1);
+      expect(summary.aggregate_metrics.rate?.mean).toBeCloseTo(0.77);
+      expect(Object.keys(summary.aggregate_metrics.rate ?? {}).sort()).toEqual([
+        "count", "max", "mean", "median", "min",
+      ]);
     });
   });
 });
