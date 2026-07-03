@@ -10,6 +10,8 @@ import {
   resolveTierByDid,
   computeWeightedScore,
   tierDistribution,
+  clampImportedSovereigntyTier,
+  MAX_IMPORTED_SOVEREIGNTY_TIER,
   TIER_WEIGHTS,
   type SovereigntyTier,
   type TieredAttestation,
@@ -292,6 +294,53 @@ describe("Sovereignty-Gated Reputation Tiers", () => {
         expect(w).toBeGreaterThan(0);
         expect(w).toBeLessThanOrEqual(1);
       }
+    });
+  });
+
+  describe("clampImportedSovereigntyTier (imported-tier trust ceiling)", () => {
+    it("lowers a privileged verified-sovereign claim to the import ceiling", () => {
+      // FAIL-BEFORE would have returned "verified-sovereign" (weight 1.0);
+      // a forged import must never keep top weight it cannot corroborate.
+      expect(clampImportedSovereigntyTier("verified-sovereign")).toBe(
+        MAX_IMPORTED_SOVEREIGNTY_TIER
+      );
+      expect(MAX_IMPORTED_SOVEREIGNTY_TIER).toBe("self-attested");
+    });
+
+    it("lowers a privileged verified-degraded claim to the import ceiling", () => {
+      expect(clampImportedSovereigntyTier("verified-degraded")).toBe(
+        "self-attested"
+      );
+    });
+
+    it("passes tiers at or below the ceiling through unchanged", () => {
+      expect(clampImportedSovereigntyTier("self-attested")).toBe("self-attested");
+      expect(clampImportedSovereigntyTier("unverified")).toBe("unverified");
+      expect(clampImportedSovereigntyTier(undefined)).toBeUndefined();
+    });
+
+    it("never raises a tier and never yields more than self-attested weight", () => {
+      const ceilingWeight = TIER_WEIGHTS[MAX_IMPORTED_SOVEREIGNTY_TIER];
+      for (const tier of [
+        "verified-sovereign",
+        "verified-degraded",
+        "self-attested",
+        "unverified",
+      ] as SovereigntyTier[]) {
+        const clamped = clampImportedSovereigntyTier(tier);
+        expect(clamped).toBeDefined();
+        expect(TIER_WEIGHTS[clamped!]).toBeLessThanOrEqual(ceilingWeight);
+        // Clamp is monotone-down: the result never outranks the input.
+        expect(TIER_WEIGHTS[clamped!]).toBeLessThanOrEqual(TIER_WEIGHTS[tier]);
+      }
+    });
+
+    it("does not trust an unknown/out-of-enum tier above the ceiling", () => {
+      // A crafted bundle could carry a bogus tier string; it must be clamped,
+      // not passed through as if it were a known, weightable tier.
+      expect(
+        clampImportedSovereigntyTier("super-sovereign" as SovereigntyTier)
+      ).toBe("self-attested");
     });
   });
 });
