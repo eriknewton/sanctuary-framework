@@ -2211,6 +2211,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         return;
       }
     }
+    if (recordPresent && !sentinelPresent && this.isFederationProvisioned()) {
+      // Crash-window self-repair (B1 F3 residual). The baseline is provisioned
+      // record-FIRST, sentinel-second (see provisionBaselineIfAbsent). A crash
+      // between those two writes leaves "record-present, sentinel-absent" - a
+      // provisioned fortress that is missing its independent deletion witness.
+      // Without this repair that state persists across every boot (the fresh-
+      // provisioning branch above never fires because the record IS present),
+      // so a later attacker who deletes ONLY the main record leaves NO witness
+      // and the fortress silently re-provisions empty and un-revokes evicted
+      // nodes - the exact eviction-only fail-open the sentinel exists to close.
+      // Repair it now: provisionBaselineIfAbsent is idempotent and folds an
+      // EMPTY baseline over the existing real record MONOTONICALLY (it cannot
+      // lower a floor or drop a revocation), writing ONLY the missing sentinel.
+      // A repair write failure fails closed (latch), never serves half-repaired.
+      try {
+        await store.provisionBaselineIfAbsent();
+      } catch {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+    }
     let snapshot: FederationSyncStateSnapshot;
     try {
       snapshot = await store.load();

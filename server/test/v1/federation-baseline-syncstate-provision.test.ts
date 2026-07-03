@@ -315,6 +315,104 @@ describe("B1: an eviction-only history whose record is deleted now fails closed"
   });
 });
 
+describe("B1: crash-mid-provisioning (record-present, sentinel-absent) self-repairs on boot", () => {
+  // The baseline is provisioned record-FIRST, sentinel-second. A crash between
+  // those two writes leaves a provisioned fortress with its main record present
+  // but its independent deletion WITNESS (the sentinel) absent. The store
+  // doc-comment claims "the next boot repairs (writes the missing sentinel)";
+  // this suite proves that claim - and proves the security consequence of the
+  // repair NOT existing (the eviction-only fail-open reopened).
+
+  it("(F FAIL-BEFORE surface) without repair, a crash-window fortress stays sentinel-absent and a later main-record delete un-revokes an evicted node", async () => {
+    // We drive the pre-repair world by writing the record + a real eviction but
+    // NO sentinel (the crash window), then delete ONLY the main record. With no
+    // sentinel witness and no trust-root history the boot cannot distinguish the
+    // deletion from a fresh fortress: it re-provisions empty and SERVES, silently
+    // un-revoking the evicted node. This is the residual the repair closes; we
+    // reproduce it by never letting the repair see the crash-window state (we
+    // delete the record before boot so the crash-window branch has nothing to
+    // repair), pinning the attack the PASS-AFTER test defeats.
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, randomBytes(32));
+
+    // Crash window: record written (with an eviction), sentinel never written.
+    const withEviction = emptyFederationSyncState();
+    withEviction.revokedNodeIds.add("evicted-node");
+    withEviction.highestEvictionSerial = 2;
+    await newStore(storage).persist(withEviction);
+    expect(await recordPresent(storage)).toBe(true);
+    expect(await sentinelPresent(storage)).toBe(false);
+
+    // Attacker deletes ONLY the main record BEFORE any repairing boot runs.
+    await storage.delete(
+      FEDERATION_SYNC_STATE_STORE_NAMESPACE,
+      FEDERATION_SYNC_STATE_STORE_KEY,
+    );
+    expect(await recordPresent(storage)).toBe(false);
+    expect(await sentinelPresent(storage)).toBe(false);
+
+    // Boot: no record, no sentinel, no trust-root history -> treated as fresh,
+    // re-provisions and serves; the evicted node is silently un-revoked.
+    const after = await buildDashboard(fortress, "mini-1", storage, auditLog);
+    await expect(
+      after.buildV1FederationDeps().recordAcceptedHighWater("mini-1", 1),
+    ).resolves.toBe(true);
+    expect(
+      after.buildV1FederationDeps().isNodeRevoked("evicted-node"),
+    ).toBe(false);
+  });
+
+  it("(F PASS-AFTER) a crash-window boot WRITES the missing sentinel, so a later main-record delete now LATCHES (deny, never un-revoke)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, randomBytes(32));
+
+    // Crash window: record present (with a real eviction), sentinel absent.
+    const withEviction = emptyFederationSyncState();
+    withEviction.revokedNodeIds.add("rogue-node");
+    withEviction.highestEvictionSerial = 1;
+    await newStore(storage).persist(withEviction);
+    expect(await recordPresent(storage)).toBe(true);
+    expect(await sentinelPresent(storage)).toBe(false);
+
+    // Boot the crash-window fortress. The repair branch fires: record present +
+    // sentinel absent + provisioned -> provisionBaselineIfAbsent writes ONLY the
+    // missing sentinel and folds the empty baseline over the real record
+    // monotonically (the eviction is preserved, not clobbered).
+    const repaired = await buildDashboard(fortress, "mini-1", storage, auditLog);
+    expect(await sentinelPresent(storage)).toBe(true);
+    // The eviction survived the repair fold (no downgrade).
+    expect(
+      repaired.buildV1FederationDeps().isNodeRevoked("rogue-node"),
+    ).toBe(true);
+    // Not latched: the repaired fortress still serves normally.
+    await expect(
+      repaired.buildV1FederationDeps().recordAcceptedHighWater("mini-1", 1),
+    ).resolves.toBe(true);
+
+    // ATTACK: now delete ONLY the main record. The repaired sentinel survives.
+    await storage.delete(
+      FEDERATION_SYNC_STATE_STORE_NAMESPACE,
+      FEDERATION_SYNC_STATE_STORE_KEY,
+    );
+    expect(await recordPresent(storage)).toBe(false);
+    expect(await sentinelPresent(storage)).toBe(true);
+
+    // Restart: provisioned + main record absent + sentinel PRESENT -> DELETION.
+    // Fail closed, even with NO trust-root witness.
+    const after = await buildDashboard(fortress, "mini-1", storage, auditLog);
+    await expect(
+      after.buildV1FederationDeps().recordAcceptedHighWater("mini-1", 1),
+    ).resolves.toBe(false);
+    expect(
+      after.buildV1FederationDeps().acceptedHighWaterFor("mini-1"),
+    ).toBeNull();
+    // No silent reset-to-empty-then-serve.
+    expect(await recordPresent(storage)).toBe(false);
+  });
+});
+
 describe("B1: brick-safety - a fresh provisioned fortress's first sync is not bricked", () => {
   it("(D) fresh fortress accepts its first sync after baseline provisioning", async () => {
     const fortress = makeMultiNodeFortress(["mini-1"]);
