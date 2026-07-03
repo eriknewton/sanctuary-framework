@@ -379,6 +379,28 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
     expect(tierAtLeast(result.tier, "team")).toBe(false);
   });
 
+  it("resolveEntitlement(undefined) fails closed to community and never throws", () => {
+    // MED regression: options used to be destructured BEFORE the fail-closed
+    // try/catch, so an absent/malformed options bag raised a TypeError instead
+    // of degrading to community. The whole options read now lives inside the
+    // guard: any non-object options resolves to the community floor, granted
+    // false, and NEVER throws.
+    expect(() =>
+      resolveEntitlement(undefined as unknown as Parameters<
+        typeof resolveEntitlement
+      >[0]),
+    ).not.toThrow();
+
+    for (const bad of [undefined, null, 42, "x", true] as const) {
+      const result = resolveEntitlement(
+        bad as unknown as Parameters<typeof resolveEntitlement>[0],
+      );
+      expect(result.granted).toBe(false);
+      expect(result.tier).toBe(COMMUNITY_TIER);
+      expect(tierAtLeast(result.tier, "team")).toBe(false);
+    }
+  });
+
   it("a boundary flip of one second past notAfter expires the grant", () => {
     const claims = paidClaims({ notBefore: NOW - 100, notAfter: NOW });
     const valid = resolveEntitlement({
@@ -417,6 +439,40 @@ describe("tierAtLeast - fails closed on malformed operands", () => {
     expect(tierAtLeast("fleet", "team")).toBe(true);
     expect(tierAtLeast("community", "fleet")).toBe(false);
     expect(tierAtLeast("team", "team")).toBe(true);
+  });
+
+  it("a public sort/mutation of ENTITLEMENT_TIERS cannot change tierAtLeast (frozen lattice)", () => {
+    // HIGH regression: the capability lattice used to be READ from the live
+    // exported array via indexOf, so a consumer could reorder it and make a
+    // lower tier satisfy a higher-tier gate. The array is now frozen AND the
+    // ranks come from a private frozen index map captured at load, so neither a
+    // sort nor a splice can move the lattice.
+    const before = tierAtLeast("fleet", "enterprise");
+    expect(before).toBe(false);
+
+    // Attempting to mutate the frozen array must throw (or no-op) and, either
+    // way, must not perturb the ranking used by tierAtLeast.
+    expect(() => {
+      (ENTITLEMENT_TIERS as unknown as string[]).sort();
+    }).toThrow();
+    expect(() => {
+      (ENTITLEMENT_TIERS as unknown as string[]).reverse();
+    }).toThrow();
+    expect(() => {
+      (ENTITLEMENT_TIERS as unknown as string[]).push("attacker" as never);
+    }).toThrow();
+
+    // The lattice is unchanged: fleet still does NOT satisfy an enterprise gate,
+    // enterprise still outranks fleet, and the canonical order is intact.
+    expect(tierAtLeast("fleet", "enterprise")).toBe(false);
+    expect(tierAtLeast("enterprise", "fleet")).toBe(true);
+    expect(tierAtLeast("community", "team")).toBe(false);
+    expect(Array.from(ENTITLEMENT_TIERS)).toEqual([
+      "community",
+      "team",
+      "fleet",
+      "enterprise",
+    ]);
   });
 
   it("does NOT export the raw fail-open tierRank primitive (chokepoint)", async () => {

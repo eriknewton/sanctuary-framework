@@ -13,15 +13,24 @@
  */
 
 /**
- * The closed set of entitlement tiers, lowest capability first. The array
- * order IS the capability ordering; index 0 is the safe floor.
+ * The closed set of entitlement tiers, lowest capability first. This array is
+ * the tier vocabulary and its canonical declaration order; index 0 is the safe
+ * floor.
+ *
+ * FROZEN ON PURPOSE. The exported array is `Object.freeze`d so a consumer
+ * cannot `sort()`, reverse, or splice it. Critically, the capability lattice
+ * is NOT read from this live array at comparison time: `tierAtLeast` ranks via
+ * a private frozen index map (`TIER_RANK`) captured once at module load, so
+ * even if a future refactor handed out a mutable copy, reordering it could not
+ * change which tier satisfies a higher-tier gate. The freeze is defense in
+ * depth; the private rank map is the actual chokepoint.
  */
-export const ENTITLEMENT_TIERS = [
+export const ENTITLEMENT_TIERS = Object.freeze([
   "community",
   "team",
   "fleet",
   "enterprise",
-] as const;
+] as const);
 
 /** A single entitlement tier. */
 export type EntitlementTier = (typeof ENTITLEMENT_TIERS)[number];
@@ -41,20 +50,31 @@ export function isEntitlementTier(value: unknown): value is EntitlementTier {
 }
 
 /**
- * Capability rank of a known tier: the higher the number, the more capability.
- * COMMUNITY is 0.
+ * The capability lattice, captured ONCE at module load into a private frozen
+ * tier -> rank map. The higher the number, the more capability; COMMUNITY is 0.
+ *
+ * This map, NOT the live `ENTITLEMENT_TIERS` array, is the source of truth for
+ * ordering. It is built from the declaration order at load time and frozen, so
+ * no later mutation of the exported array (a `sort()`, reverse, or splice by a
+ * consumer) can change any tier's rank. Reordering the public array after load
+ * cannot make a lower tier satisfy a higher-tier gate.
+ */
+const TIER_RANK: Readonly<Record<EntitlementTier, number>> = Object.freeze(
+  Object.fromEntries(ENTITLEMENT_TIERS.map((tier, index) => [tier, index])),
+) as Readonly<Record<EntitlementTier, number>>;
+
+/**
+ * Capability rank of a known tier from the frozen lattice.
  *
  * MODULE-PRIVATE ON PURPOSE. This is NOT a gating primitive and is not
- * exported. `indexOf` returns -1 for an unknown string, and a naive
- * `rank(a) >= rank(b)` fails OPEN when the REQUIRED tier `b` is a typo:
- * `rank("community")` (0) >= `rank("fleeet")` (-1) is true, granting the floor
- * tier a paid gate. Every capability comparison MUST go through `tierAtLeast`,
- * which validates both operands first; this helper is only ever called on
- * inputs already proven to be known tiers, so its -1 branch is unreachable
- * from the public surface.
+ * exported. It reads `TIER_RANK` (a frozen snapshot), never the live array, so
+ * it is immune to post-load reordering. An unknown string yields `undefined`,
+ * and a naive `rank(a) >= rank(b)` would fail OPEN on a typo'd required tier;
+ * every capability comparison MUST go through `tierAtLeast`, which validates
+ * both operands first, so this helper only ever sees known tiers.
  */
 function tierRank(tier: EntitlementTier): number {
-  return (ENTITLEMENT_TIERS as readonly string[]).indexOf(tier);
+  return TIER_RANK[tier];
 }
 
 /**

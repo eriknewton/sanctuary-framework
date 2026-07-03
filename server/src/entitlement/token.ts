@@ -241,11 +241,18 @@ function deny(reason: EntitlementDenyReason): EntitlementResolution {
 export function resolveEntitlement(
   options: ResolveEntitlementOptions,
 ): EntitlementResolution {
-  const { token, issuerPublicKey, now } = options;
-
-  if (token === null || token === undefined) return deny("absent");
-
   try {
+    // Read the options bag INSIDE the guarded path. An absent or non-object
+    // options argument (undefined/null/primitive) must resolve to the community
+    // floor, never throw: `resolveEntitlement` is contracted to never throw and
+    // to fail closed. Destructuring before the try would raise a TypeError on
+    // `undefined`, escaping the fail-closed contract.
+    if (typeof options !== "object" || options === null) {
+      return deny("malformed");
+    }
+    const { token, issuerPublicKey, now } = options;
+
+    if (token === null || token === undefined) return deny("absent");
     if (typeof token !== "object") return deny("malformed");
     if (typeof (token as EntitlementToken).signature !== "string") {
       return deny("malformed");
