@@ -4,6 +4,7 @@ import {
   concatBytes,
   constantTimeEqual,
   fromBase64url,
+  fromBase64urlStrict,
   stringToBytes,
   toBase64url,
 } from "../../../src/core/encoding.js";
@@ -221,6 +222,65 @@ describe("encoding utilities", () => {
           Uint8Array.from([1, 2, 3, 4])
         )
       ).toBe(false);
+    });
+  });
+
+  describe("fromBase64urlStrict", () => {
+    // 64 bytes, the entitlement-signature size, exercised end to end.
+    const sig = new Uint8Array(64).map((_, i) => (i * 37 + 11) & 0xff);
+    const canonical = toBase64url(sig);
+
+    it("round-trips canonical no-padding base64url", () => {
+      expect(byteValues(fromBase64urlStrict(canonical))).toEqual(
+        byteValues(sig)
+      );
+    });
+
+    it("decodes an empty string to an empty array", () => {
+      expect(byteValues(fromBase64urlStrict(""))).toEqual([]);
+    });
+
+    it("rejects a trailing '!' that a lenient decoder would drop", () => {
+      // fromBase64url is lenient: it decodes to the same bytes.
+      expect(byteValues(fromBase64url(canonical + "!"))).toEqual(
+        byteValues(sig)
+      );
+      // fromBase64urlStrict rejects it.
+      expect(() => fromBase64urlStrict(canonical + "!")).toThrow();
+    });
+
+    it("rejects '=' / '==' padding (canonical form is no-padding)", () => {
+      expect(() => fromBase64urlStrict(canonical + "=")).toThrow();
+      expect(() => fromBase64urlStrict(canonical + "==")).toThrow();
+    });
+
+    it("rejects embedded ASCII whitespace", () => {
+      const mid = canonical.slice(0, 4) + "\n" + canonical.slice(4);
+      expect(() => fromBase64urlStrict(mid)).toThrow();
+      expect(() =>
+        fromBase64urlStrict(canonical.slice(0, 4) + " " + canonical.slice(4))
+      ).toThrow();
+    });
+
+    it("rejects standard-base64 '+' and '/' (base64url alphabet only)", () => {
+      const std = Buffer.from(sig).toString("base64").replace(/=+$/, "");
+      if (/[+/]/.test(std)) {
+        expect(() => fromBase64urlStrict(std)).toThrow();
+      }
+    });
+
+    it("rejects a length of 1 mod 4 (never a legal base64 length)", () => {
+      expect(() => fromBase64urlStrict("A")).toThrow();
+      expect(() => fromBase64urlStrict("AAAAA")).toThrow();
+    });
+
+    it("rejects non-canonical trailing bits in the final quad", () => {
+      // "QQ" is the canonical encoding of the single byte 0x41. "QR" decodes
+      // (leniently) to the same 0x41 but is non-canonical: its discarded
+      // low bits are non-zero, so re-encode-equality must reject it.
+      expect(byteValues(fromBase64urlStrict("QQ"))).toEqual([0x41]);
+      expect(byteValues(fromBase64url("QR"))).toEqual([0x41]);
+      expect(() => fromBase64urlStrict("QR")).toThrow();
     });
   });
 });
