@@ -26,6 +26,19 @@ import { runWrap } from "../../src/wrap/cli.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
 import { findLatestBackup } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
+
+// The parse-parity sidecar seam is a test-only module hook, not a public
+// runWrap dep (DI-bypass closed 2026-07-03). These end-to-end mechanics tests
+// install an agreeing parity via makeDeps() and clear it here after EVERY
+// test so it never leaks into a test expecting the real sidecar.
+afterEach(() => {
+  clearHermesParityHook();
+});
 
 const ENTRY = {
   command: "npx",
@@ -253,6 +266,9 @@ describe("Wrap --hermes writes config.yaml end-to-end (D4 Bug 2)", () => {
   });
 
   function makeDeps() {
+    // Install the agreeing parity into the test-only sidecar hook so these
+    // mechanics tests do not depend on the CI host carrying PyYAML.
+    installHermesParityHook(agreeingHermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
@@ -443,6 +459,9 @@ describe("Wrap --hermes config.yaml atomicity + symlink refusal (D4 P1-1, P2-3)"
   });
 
   function makeDeps() {
+    // Install the agreeing parity into the test-only sidecar hook so these
+    // mechanics tests do not depend on the CI host carrying PyYAML.
+    installHermesParityHook(agreeingHermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
