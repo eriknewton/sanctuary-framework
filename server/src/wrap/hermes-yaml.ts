@@ -387,3 +387,63 @@ export function yamlContainsSanctuaryEntry(content: string): boolean {
   if (!block) return false;
   return block.entries.some((e) => e.name.toLowerCase() === "sanctuary");
 }
+
+/**
+ * The line-scanner's understanding of a config.yaml, reduced to the two
+ * facts every injection edit depends on: whether the scanner sees a
+ * top-level `mcp_servers:` block, and the ordered list of entry names it
+ * believes live under that block. The parse-parity guard
+ * (hermes-yaml-parse-parity.ts) compares THIS against a real PyYAML parse
+ * and refuses to edit on any disagreement, so the scanner's guesses can
+ * never silently drive a mutation that a real parser would read
+ * differently.
+ *
+ * `unsupported` mirrors the shapes scanMcpServersBlock refuses outright
+ * (duplicate keys, block sequence, inline flow); those already abort the
+ * wrap via HermesYamlUnsupportedError, but exposing the flag lets the
+ * parity guard reason about them without re-throwing.
+ */
+export interface ScannerMcpServersView {
+  /** True when the scanner located a top-level `mcp_servers:` block. */
+  hasBlock: boolean;
+  /**
+   * Entry names the scanner sees under the block, in scan order, with
+   * surrounding quotes stripped (the same names planHermesYamlInjection
+   * reasons about for append/replace/preserve).
+   */
+  entryNames: string[];
+  /** True when the scan threw HermesYamlUnsupportedError. */
+  unsupported: boolean;
+}
+
+/**
+ * Compute the line-scanner's view of a config.yaml for parity checking.
+ * Never throws: an unsupported shape (which the real plan would reject
+ * loudly) is reported via `unsupported: true` so the parity guard can make
+ * a single fail-closed decision rather than racing two throw sites.
+ *
+ * @param existingContent  Current file content, or null when absent (an
+ *                         absent file has no block and no entries).
+ */
+export function scannerMcpServersView(
+  existingContent: string | null
+): ScannerMcpServersView {
+  if (existingContent === null) {
+    return { hasBlock: false, entryNames: [], unsupported: false };
+  }
+  let block: McpServersBlock | null;
+  try {
+    block = scanMcpServersBlock(existingContent.split("\n"));
+  } catch (err) {
+    if (err instanceof HermesYamlUnsupportedError) {
+      return { hasBlock: false, entryNames: [], unsupported: true };
+    }
+    throw err;
+  }
+  if (!block) return { hasBlock: false, entryNames: [], unsupported: false };
+  return {
+    hasBlock: true,
+    entryNames: block.entries.map((e) => e.name),
+    unsupported: false,
+  };
+}

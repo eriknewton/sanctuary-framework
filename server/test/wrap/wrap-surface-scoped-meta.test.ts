@@ -125,8 +125,21 @@ import {
   __wrapMetaLockTestHooks,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
 
 const CRASH_WINDOW_MARKER = "already contains a Sanctuary entry";
+
+// The parse-parity sidecar seam is a test-only module hook, not a public
+// runWrap dep (DI-bypass closed 2026-07-03). makeDeps() installs an agreeing
+// parity; clear it after EVERY test in this file (nested describe blocks have
+// their own afterEach, so a single file-level one guarantees no leak).
+afterEach(() => {
+  clearHermesParityHook();
+});
 
 describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin probe", () => {
   let tmpHome: string;
@@ -158,6 +171,12 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
   });
 
   function makeDeps(overrides: Record<string, unknown> = {}) {
+    // Agree with the scanner via the test-only sidecar hook so these Hermes
+    // surface-scoped meta mechanics tests do not depend on the CI host
+    // carrying PyYAML (the parse-parity guard is proven separately in
+    // hermes-yaml-parse-parity.test.ts). The sidecar seam is NOT a public
+    // runWrap dep (DI-bypass closed 2026-07-03).
+    installHermesParityHook(agreeingHermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
