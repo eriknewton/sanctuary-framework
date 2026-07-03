@@ -24,6 +24,43 @@ import {
 import type { GuardianApproval } from "./types.js";
 
 /**
+ * Bind check: the signing input a quorum is verified against MUST describe the
+ * same roster version as the roster whose public keys are used to verify it.
+ *
+ * Without this bind, a quorum of signatures produced under an earlier roster
+ * version (for example one that still counted a now-revoked guardian) would
+ * verify byte-for-byte against a later roster as long as the overlapping
+ * guardian keys are unchanged. The signature payload carries roster_version,
+ * but the verifier previously never compared it to the roster it trusted. This
+ * closes that specific cross-version signature-reuse path, fail closed: on any
+ * mismatch every approval is treated as invalid so the threshold cannot be met.
+ */
+function rosterVersionBinds(
+  signing_input: ApprovalSigningInput,
+  roster: GuardianRoster
+): boolean {
+  return signing_input.roster_version === roster.version;
+}
+
+/**
+ * Bind check: an approval object's self-declared cascade_id and recovery_action
+ * are unauthenticated metadata (the Ed25519 signature covers only the canonical
+ * signing input, not these envelope fields). A caller or audit reader that
+ * trusts approval.recovery_action / approval.cascade_id must not be handed an
+ * approval whose declared target disagrees with the input it was actually
+ * signed over. Any disagreement is treated as invalid, fail closed.
+ */
+function approvalDeclaresSameTarget(
+  approval: GuardianApproval,
+  signing_input: ApprovalSigningInput
+): boolean {
+  return (
+    approval.cascade_id === signing_input.cascade_id &&
+    approval.recovery_action === signing_input.recovery_action
+  );
+}
+
+/**
  * The canonical body a guardian signs when approving a recovery action.
  * This shape is deterministic under canonical-JSON so all nodes compute
  * the same hash.
@@ -94,6 +131,21 @@ export function evaluateThreshold(params: {
 }): ThresholdEvaluationResult {
   const { approvals, roster, signing_input } = params;
 
+  // Fail-closed bind: the roster the quorum is verified against MUST be the
+  // same version the approvals were signed over. On a version mismatch no
+  // approval can be valid, so the threshold cannot be met (quorum bypass via
+  // cross-version signature reuse is closed here).
+  if (!rosterVersionBinds(signing_input, roster)) {
+    return {
+      threshold_met: false,
+      valid_count: 0,
+      threshold_m: roster.m,
+      total_n: roster.n,
+      valid_guardian_ids: [],
+      invalid_guardian_ids: approvals.map((a) => a.guardian_id),
+    };
+  }
+
   const guardianMap = new Map(
     roster.guardians.map((g) => [g.guardian_id, g])
   );
@@ -113,6 +165,15 @@ export function evaluateThreshold(params: {
 
     // Scheme check.
     if (approval.signature_scheme !== SIGNATURE_SCHEME_V1) {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+
+    // Fail-closed bind: the approval's self-declared target (cascade_id +
+    // recovery_action) must match the input it is being verified against.
+    // These envelope fields are not covered by the signature, so an approval
+    // that declares a different target is rejected rather than counted.
+    if (!approvalDeclaresSameTarget(approval, signing_input)) {
       invalidIds.push(approval.guardian_id);
       continue;
     }
@@ -171,6 +232,18 @@ export function enforceThreshold(params: {
     throw new RosterStaleError({
       expected_version: params.roster.version,
       actual_version: params.expected_roster_version,
+    });
+  }
+
+  // Fail-closed bind (failure mode d, unconditional): the signing input the
+  // quorum was produced against must describe the roster we are verifying
+  // with. This holds even when the caller does not pass expected_roster_version,
+  // so a quorum signed under an older roster cannot authorize against a newer
+  // one. Surfaced as RosterStaleError for a precise operator signal.
+  if (params.roster.version !== params.signing_input.roster_version) {
+    throw new RosterStaleError({
+      expected_version: params.roster.version,
+      actual_version: params.signing_input.roster_version,
     });
   }
 

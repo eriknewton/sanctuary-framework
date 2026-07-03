@@ -146,6 +146,15 @@ export function registerApproval(
       `approval cascade_id "${approval.cascade_id}" does not match cascade "${cascade.cascade_id}"`
     );
   }
+  // Reject an approval whose declared recovery_action does not match this
+  // cascade's action. The declared action is unauthenticated envelope metadata;
+  // binding it here keeps a guardian's approval for one action from being
+  // parked on a cascade for a different action (fail closed).
+  if (approval.recovery_action !== cascade.action) {
+    throw new CascadeStateError(
+      `approval recovery_action "${approval.recovery_action}" does not match cascade action "${cascade.action}"`
+    );
+  }
   // Reject duplicate guardian.
   if (cascade.approvals.some((a) => a.guardian_id === approval.guardian_id)) {
     throw new CascadeStateError(

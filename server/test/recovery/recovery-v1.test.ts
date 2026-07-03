@@ -1339,3 +1339,241 @@ describe("no LLM at gate (structural)", () => {
     expect(result.triggered).toBe(true);
   });
 });
+
+// ===================================================================
+// Harden wave A3 (2026-07-04): recovery-cascade trust-boundary
+// regression tests. Each test in this block fails on the pre-harden
+// code and passes after the fix (fail-before / pass-after).
+//
+// Defect classes confirmed by adversarial audit:
+//   A. cross-roster-version signature reuse (quorum bypass): a quorum
+//      signed under roster vN verified against roster vM (N != M).
+//   B. unauthenticated approval envelope-field confusion: an approval's
+//      self-declared cascade_id / recovery_action were never bound to the
+//      input the signature actually covered, nor to the cascade action.
+//
+// Classes that yielded NO real defect after audit (stated for the record):
+//   - cross-cascade replay: already blocked; cascade_id is inside the
+//     signed canonical input, so a signature for cascade A does not verify
+//     against cascade B.
+//   - execute-time raised threshold: executeCascade re-evaluates against
+//     the current roster and fails closed when M was raised.
+//   - m=0 / empty partial set: issueGuardianRoster rejects m<1 at issuance.
+//   - DMswitch false-trigger: the evaluator is pure "elapsed >= window"
+//     arithmetic and only gates cascade ENTRY, never the guardian threshold.
+// ===================================================================
+
+describe("harden A3: cross-roster-version signature reuse is closed", () => {
+  it("evaluateThreshold does not count a v1-signed quorum against a v2 roster", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    // Roster v2 (e.g., after a guardian was revoked and version bumped).
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+
+    // A quorum signed under roster_version = 1 (stale).
+    const cascadeId = "cascade-stale-roster";
+    const staleApprovals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const signingInputV1 = buildApprovalSigningInput({
+      cascade_id: cascadeId,
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+
+    const result = evaluateThreshold({
+      approvals: staleApprovals,
+      roster: rosterV2,
+      signing_input: signingInputV1,
+    });
+
+    // Fail closed: a stale-version quorum must not meet threshold.
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("enforceThreshold throws RosterStaleError when signing input version != roster version, even without expected_roster_version", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+
+    const cascadeId = "cascade-stale-enforce";
+    const staleApprovals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    expect(() =>
+      enforceThreshold({
+        approvals: staleApprovals,
+        roster: rosterV2,
+        signing_input: buildApprovalSigningInput({
+          cascade_id: cascadeId,
+          recovery_action: "key_rotation",
+          fortress_id: fix.fortressId,
+          roster_version: 1,
+        }),
+      })
+    ).toThrow(RosterStaleError);
+  });
+
+  it("a matched-version quorum still succeeds (bind does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+    const cascadeId = "cascade-matched-version";
+    const approvals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      2
+    );
+    const result = evaluateThreshold({
+      approvals,
+      roster: rosterV2,
+      signing_input: buildApprovalSigningInput({
+        cascade_id: cascadeId,
+        recovery_action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster_version: 2,
+      }),
+    });
+    expect(result.threshold_met).toBe(true);
+    expect(result.valid_count).toBe(3);
+  });
+});
+
+describe("harden A3: unauthenticated approval-envelope fields are bound", () => {
+  it("evaluateThreshold does not count an approval whose declared recovery_action differs from the signing input", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const cascadeId = "cascade-field-confusion";
+    // Guardians sign the canonical input for key_rotation, but the approval
+    // objects declare recovery_action = emergency_freeze in their envelope.
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: cascadeId,
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const lyingApprovals = guardians.slice(0, 3).map((g) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.kp.privateKey,
+        recovery_action: "emergency_freeze",
+        cascade_id: cascadeId,
+      })
+    );
+
+    const result = evaluateThreshold({
+      approvals: lyingApprovals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    // Fail closed: mismatched declared action must not count.
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("evaluateThreshold does not count an approval whose declared cascade_id differs from the signing input", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "real-cascade",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const lyingApprovals = guardians.slice(0, 3).map((g) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "some-other-cascade",
+      })
+    );
+
+    const result = evaluateThreshold({
+      approvals: lyingApprovals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("registerApproval rejects an approval whose recovery_action does not match the cascade action", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    let cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+    });
+    cascade = beginAwaitingThreshold(cascade);
+
+    // An approval that targets this cascade_id but declares emergency_freeze.
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: cascade.cascade_id,
+      recovery_action: "emergency_freeze",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const mismatchedApproval = signApproval({
+      signing_input: signingInput,
+      guardian_id: guardians[0]!.identity.guardian_id,
+      guardian_private_key: guardians[0]!.kp.privateKey,
+      recovery_action: "emergency_freeze",
+      cascade_id: cascade.cascade_id,
+    });
+
+    expect(() => registerApproval(cascade, mismatchedApproval)).toThrow(
+      CascadeStateError
+    );
+  });
+
+  it("registerApproval still accepts a correctly-actioned approval (bind does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    let cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+    });
+    cascade = beginAwaitingThreshold(cascade);
+    const [approval] = buildSignedApprovals(
+      guardians,
+      1,
+      cascade.cascade_id,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+    const next = registerApproval(cascade, approval!);
+    expect(next.approvals.length).toBe(1);
+  });
+});
