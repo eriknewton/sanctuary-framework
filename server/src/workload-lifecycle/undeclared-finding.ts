@@ -252,20 +252,57 @@ export async function buildUndeclaredFinding(
 }
 
 /**
- * Offline-verify a signed undeclared finding against an explicit public key.
+ * Optional trust constraints for {@link verifyUndeclaredFinding}. Absent keeps
+ * the legacy 2-arg behavior (self-consistency only). Present ALSO pins the
+ * accepted signer, closing the self-signed-forgery fail-open (mirrors #513 FIX-4).
+ */
+export interface UndeclaredFindingTrust {
+  /**
+   * The out-of-band trusted public key the signature MUST verify under. When set,
+   * verification uses THIS key and IGNORES the envelope's self-declared
+   * `public_key`, so a finding forged under an attacker's OWN keypair (and
+   * self-declared) is rejected. Base64url string or raw 32 bytes.
+   */
+  trustedPublicKey?: string | Uint8Array;
+  /**
+   * The expected signer kid. When set, the finding's bound `signer_kid` MUST
+   * match it, so a bundle from an unexpected signer identity is rejected even if
+   * self-consistent.
+   */
+  expectedSignerKid?: string;
+}
+
+/**
+ * Offline-verify a signed undeclared finding.
+ *
+ * The 2-arg form verifies SELF-CONSISTENCY only: passing `finding.public_key`
+ * proves the envelope is internally consistent, NOT that the signer is trusted
+ * (a forger can self-sign under their own key and self-declare it). To
+ * authenticate the ORIGIN a caller MUST pin the fortress's out-of-band key via
+ * `trust.trustedPublicKey` (and/or `trust.expectedSignerKid`), see
+ * {@link UndeclaredFindingTrust} (mirrors #513 FIX-4).
+ *
  * Returns false (never throws) on any malformed input or signature mismatch.
  *
  * Mirrors #513's FIX-3 verifier: it (a) rejects an unexpected
  * `signature_algorithm` / `payload_encoding` on either the envelope or the
  * signed body, and (b) cross-checks the envelope's `signer_kid` /
  * `signature_algorithm` / `payload_encoding` against the copies bound INSIDE the
- * signed body, rejecting any mismatch — so an offline tamperer who swaps the
+ * signed body, rejecting any mismatch, so an offline tamperer who swaps the
  * envelope `signer_kid` (without re-signing, which they cannot do without the
  * private key) fails this cross-check AND the signature recomputation.
+ *
+ * FIX 4 expected-signer pinning. When `trust.trustedPublicKey` is set the
+ * signature is checked against THAT key (not the envelope's self-declared one);
+ * when `trust.expectedSignerKid` is set the bound `signer_kid` must equal it.
+ * This closes the self-signed-forgery fail-open (a forged suppression finding
+ * minted under an attacker key is rejected because it does not verify under the
+ * pinned key).
  */
 export function verifyUndeclaredFinding(
   finding: SignedUndeclaredFinding,
   publicKey: string | Uint8Array,
+  trust?: UndeclaredFindingTrust,
 ): boolean {
   try {
     const body = finding.body;
@@ -289,8 +326,22 @@ export function verifyUndeclaredFinding(
     if (finding.signature_algorithm !== body.signature_algorithm) return false;
     if (finding.payload_encoding !== body.payload_encoding) return false;
 
+    // (c) FIX 4 expected-signer pinning. An expected kid must match the bound
+    // signer_kid; a pinned trusted key REPLACES the caller's key for the check,
+    // so the envelope's self-declared public_key cannot authenticate a forgery.
+    if (
+      trust?.expectedSignerKid !== undefined &&
+      body.signer_kid !== trust.expectedSignerKid
+    ) {
+      return false;
+    }
+    const effectiveKey =
+      trust?.trustedPublicKey !== undefined ? trust.trustedPublicKey : publicKey;
+
     const keyBytes =
-      typeof publicKey === "string" ? fromBase64url(publicKey) : publicKey;
+      typeof effectiveKey === "string"
+        ? fromBase64url(effectiveKey)
+        : effectiveKey;
     if (keyBytes.length !== 32) return false;
     return verifyEd25519(
       undeclaredFindingSigningBytes(body),

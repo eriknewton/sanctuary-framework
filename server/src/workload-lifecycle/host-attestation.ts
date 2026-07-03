@@ -375,7 +375,37 @@ export async function buildHostWorkloadAttestation(
 }
 
 /**
- * Offline-verify a signed host attestation against an explicit public key.
+ * Optional trust constraints for {@link verifyHostWorkloadAttestation}. Absent
+ * keeps the legacy 2-arg behavior (self-consistency only). Present ALSO pins the
+ * accepted signer, closing the self-signed-forgery fail-open (FIX 4).
+ */
+export interface HostWorkloadAttestationTrust {
+  /**
+   * The out-of-band trusted public key the signature MUST verify under. When set,
+   * verification uses THIS key and IGNORES the envelope's self-declared
+   * `public_key`, so an attacker who signs a forged body under their OWN keypair
+   * (and self-declares it) is rejected. Base64url string or raw 32 bytes.
+   */
+  trustedPublicKey?: string | Uint8Array;
+  /**
+   * The expected signer kid. When set, the attestation's `signer_kid` (envelope
+   * and body, forced equal by the FIX-3 cross-check) MUST match it, so a bundle
+   * from an unexpected signer identity is rejected even if self-consistent.
+   */
+  expectedSignerKid?: string;
+}
+
+/**
+ * Offline-verify a signed host attestation.
+ *
+ * The 2-arg form verifies SELF-CONSISTENCY only: the signature verifies under the
+ * supplied key and the FIX-3 cross-checks hold. Passing `attestation.public_key`
+ * as that key therefore only proves the envelope is internally consistent; it
+ * does NOT prove the signer is trusted (a forger can self-sign under their own
+ * key and self-declare it). To authenticate the ORIGIN, a caller MUST pin the
+ * fortress's out-of-band key via `trust.trustedPublicKey` (and/or
+ * `trust.expectedSignerKid`), see {@link HostWorkloadAttestationTrust} (FIX 4).
+ *
  * Returns false (never throws) on any malformed input or signature mismatch.
  *
  * FIX 3 — signer-identity binding. Before the Ed25519 check this:
@@ -386,12 +416,19 @@ export async function buildHostWorkloadAttestation(
  *       rejects any mismatch. Because the body copies are under the signature, an
  *       offline tamperer who swaps the envelope `signer_kid` (without re-signing,
  *       which they cannot do without the private key) now fails this cross-check
- *       AND the signature recomputation — closing the offline-swap gap the chain
+ *       AND the signature recomputation, closing the offline-swap gap the chain
  *       seal alone covered.
+ *
+ * FIX 4 expected-signer pinning. When `trust.trustedPublicKey` is set the
+ * signature is checked against THAT key (not the envelope's self-declared one);
+ * when `trust.expectedSignerKid` is set the bound `signer_kid` must equal it.
+ * This closes the self-signed-forgery fail-open: a bundle minted under an
+ * attacker key is rejected because it does not verify under the pinned key.
  */
 export function verifyHostWorkloadAttestation(
   attestation: SignedHostWorkloadAttestation,
-  publicKey: string | Uint8Array
+  publicKey: string | Uint8Array,
+  trust?: HostWorkloadAttestationTrust
 ): boolean {
   try {
     const body = attestation.body;
@@ -417,8 +454,22 @@ export function verifyHostWorkloadAttestation(
     }
     if (attestation.payload_encoding !== body.payload_encoding) return false;
 
+    // (c) FIX 4 expected-signer pinning. An expected kid must match the bound
+    // signer_kid; a pinned trusted key REPLACES the caller's key for the check,
+    // so the envelope's self-declared public_key cannot authenticate a forgery.
+    if (
+      trust?.expectedSignerKid !== undefined &&
+      body.signer_kid !== trust.expectedSignerKid
+    ) {
+      return false;
+    }
+    const effectiveKey =
+      trust?.trustedPublicKey !== undefined ? trust.trustedPublicKey : publicKey;
+
     const keyBytes =
-      typeof publicKey === "string" ? fromBase64url(publicKey) : publicKey;
+      typeof effectiveKey === "string"
+        ? fromBase64url(effectiveKey)
+        : effectiveKey;
     if (keyBytes.length !== 32) return false;
     return verifyEd25519(
       hostAttestationSigningBytes(body),
