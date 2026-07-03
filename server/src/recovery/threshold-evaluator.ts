@@ -16,12 +16,53 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
+import {
+  canonicalGuardianKey,
+  isValidRosterShape,
+} from "../mesh/guardian/guardian-roster.js";
 import type { GuardianRoster } from "../mesh/guardian/types.js";
 import {
   RosterStaleError,
   ThresholdNotMetError,
 } from "./errors.js";
 import type { GuardianApproval } from "./types.js";
+
+/**
+ * Bind check: the signing input a quorum is verified against MUST describe the
+ * same roster version as the roster whose public keys are used to verify it.
+ *
+ * Without this bind, a quorum of signatures produced under an earlier roster
+ * version (for example one that still counted a now-revoked guardian) would
+ * verify byte-for-byte against a later roster as long as the overlapping
+ * guardian keys are unchanged. The signature payload carries roster_version,
+ * but the verifier previously never compared it to the roster it trusted. This
+ * closes that specific cross-version signature-reuse path, fail closed: on any
+ * mismatch every approval is treated as invalid so the threshold cannot be met.
+ */
+function rosterVersionBinds(
+  signing_input: ApprovalSigningInput,
+  roster: GuardianRoster
+): boolean {
+  return signing_input.roster_version === roster.version;
+}
+
+/**
+ * Bind check: an approval object's self-declared cascade_id and recovery_action
+ * are unauthenticated metadata (the Ed25519 signature covers only the canonical
+ * signing input, not these envelope fields). A caller or audit reader that
+ * trusts approval.recovery_action / approval.cascade_id must not be handed an
+ * approval whose declared target disagrees with the input it was actually
+ * signed over. Any disagreement is treated as invalid, fail closed.
+ */
+function approvalDeclaresSameTarget(
+  approval: GuardianApproval,
+  signing_input: ApprovalSigningInput
+): boolean {
+  return (
+    approval.cascade_id === signing_input.cascade_id &&
+    approval.recovery_action === signing_input.recovery_action
+  );
+}
 
 /**
  * The canonical body a guardian signs when approving a recovery action.
@@ -94,11 +135,47 @@ export function evaluateThreshold(params: {
 }): ThresholdEvaluationResult {
   const { approvals, roster, signing_input } = params;
 
+  // Fail-closed shape gate: a threshold decision compares a validated-approval
+  // count against roster.m, so a structurally invalid roster must be rejected
+  // BEFORE that comparison, not assumed to have been screened at issuance. A
+  // degenerate roster (for example m=0, or m>n, or guardians.length !== n)
+  // would otherwise report threshold_met with too few or zero real approvals:
+  // m=0 with an empty approval set yields validIds.length (0) >= m (0) = true,
+  // authorizing a cascade with no guardian signatures. This runs first so even
+  // a version-matched malformed roster cannot be trusted; on any shape
+  // violation every approval is treated as invalid and the threshold is unmet.
+  if (!isValidRosterShape({ m: roster.m, n: roster.n, guardians: roster.guardians })) {
+    return {
+      threshold_met: false,
+      valid_count: 0,
+      threshold_m: roster.m,
+      total_n: roster.n,
+      valid_guardian_ids: [],
+      invalid_guardian_ids: approvals.map((a) => a.guardian_id),
+    };
+  }
+
+  // Fail-closed bind: the roster the quorum is verified against MUST be the
+  // same version the approvals were signed over. On a version mismatch no
+  // approval can be valid, so the threshold cannot be met (quorum bypass via
+  // cross-version signature reuse is closed here).
+  if (!rosterVersionBinds(signing_input, roster)) {
+    return {
+      threshold_met: false,
+      valid_count: 0,
+      threshold_m: roster.m,
+      total_n: roster.n,
+      valid_guardian_ids: [],
+      invalid_guardian_ids: approvals.map((a) => a.guardian_id),
+    };
+  }
+
   const guardianMap = new Map(
     roster.guardians.map((g) => [g.guardian_id, g])
   );
 
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   const validIds: string[] = [];
   const invalidIds: string[] = [];
   const signedBytes = canonicalizeToBytes(signing_input);
@@ -117,12 +194,45 @@ export function evaluateThreshold(params: {
       continue;
     }
 
+    // Fail-closed bind: the approval's self-declared target (cascade_id +
+    // recovery_action) must match the input it is being verified against.
+    // These envelope fields are not covered by the signature, so an approval
+    // that declares a different target is rejected rather than counted.
+    if (!approvalDeclaresSameTarget(approval, signing_input)) {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+
     // Roster lookup.
     const guardian = guardianMap.get(approval.guardian_id);
     if (!guardian) {
       invalidIds.push(approval.guardian_id);
       continue;
     }
+
+    // Fail-closed bind: a guardian public key must not be counted toward the
+    // threshold more than once. verifyGuardianRoster already rejects a roster
+    // that assigns one key to multiple guardian_ids, but this is defense in
+    // depth for an evaluation run against a roster that skipped that check: one
+    // key holder occupying multiple slots under distinct ids must not satisfy
+    // M-of-N alone. The approval signature binds the signing input and the key,
+    // not the guardian_id, so distinct-id + shared-key approvals all verify;
+    // counting only the first per key preserves quorum independence. The
+    // uniqueness key is the CANONICAL decoded form so a non-canonical spelling
+    // of one roster key cannot be counted as a second, independent slot; a
+    // malformed/non-canonical roster key fails closed (approval discarded).
+    let canonicalKey: string;
+    try {
+      canonicalKey = canonicalGuardianKey(guardian.public_key);
+    } catch {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+    if (seenKeys.has(canonicalKey)) {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+    seenKeys.add(canonicalKey);
 
     // Signature verification.
     try {
@@ -171,6 +281,18 @@ export function enforceThreshold(params: {
     throw new RosterStaleError({
       expected_version: params.roster.version,
       actual_version: params.expected_roster_version,
+    });
+  }
+
+  // Fail-closed bind (failure mode d, unconditional): the signing input the
+  // quorum was produced against must describe the roster we are verifying
+  // with. This holds even when the caller does not pass expected_roster_version,
+  // so a quorum signed under an older roster cannot authorize against a newer
+  // one. Surfaced as RosterStaleError for a precise operator signal.
+  if (params.roster.version !== params.signing_input.roster_version) {
+    throw new RosterStaleError({
+      expected_version: params.roster.version,
+      actual_version: params.signing_input.roster_version,
     });
   }
 
