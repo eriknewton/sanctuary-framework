@@ -1,0 +1,43 @@
+{
+  "descriptor": {
+    "schema": "sanctuary.plugin.bundle/v1",
+    "alg": "ed25519",
+    "signer_id": "ai.sanctuary.first-party",
+    "key_id": "hosts-blocklist-v1",
+    "plugin_id": "ai.sanctuary.hosts-blocklist",
+    "version": "1.0.0",
+    "channel": "stable",
+    "governance_hash": "5820a5b2e22f237a79fc375f842256ea199fee940886e582c0092b3eb74abcd0",
+    "files": [
+      {
+        "path": "bin/hosts-blocklist.mjs",
+        "type": "file",
+        "mode_exec": true,
+        "size": 9311,
+        "sha256": "1ff17715249b6ea16773df9d4447e915371722884aabd5f484d2596e94bc7042"
+      },
+      {
+        "path": "first-party-signer.json",
+        "type": "file",
+        "mode_exec": false,
+        "size": 148,
+        "sha256": "7c4c7eeeb923dc8c30473522e6bf7ef88d49a76b89b3d6e0623467f607c34ffb"
+      },
+      {
+        "path": "governance.yaml",
+        "type": "file",
+        "mode_exec": false,
+        "size": 1299,
+        "sha256": "5820a5b2e22f237a79fc375f842256ea199fee940886e582c0092b3eb74abcd0"
+      },
+      {
+        "path": "rules/hosts-blocklist.hosts",
+        "type": "file",
+        "mode_exec": false,
+        "size": 1242,
+        "sha256": "ee07ce6d2d2140d8ccf368f9a3cbc39d0ace96088b9e3807ade5392d22e11b15"
+      }
+    ]
+  },
+  "signature": "Ug+29GjDKi/ZaNS+w4rez+q12zsytp+qZ2pF7vfmEgvA3cw0fy9b+NffD4gVD5UvBEiTl0GQFWiaxefufgGUAQ=="
+}

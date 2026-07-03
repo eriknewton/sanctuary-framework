@@ -1,0 +1,28 @@
+# Sanctuary plugin vendor contract declaration (governance.yaml).
+#
+# SECOND first-party bundled reference plugin: a Pi-hole / hosts-format egress
+# denylist. It exists to prove the plugin host handles n>1 bundled plugins under
+# supervisor isolation. This is a FIRST-PARTY BUNDLED reference plugin, NOT a
+# third-party or marketplace plugin; third-party install stays F1-gated.
+#
+# The host parses this file under the same restricted-YAML profile (no anchors/
+# aliases/tags/merge keys/duplicate keys) against the same recursively-closed schema
+# as the first reference plugin. Its declaration surface is identical in shape to the
+# first plugin: it binds the egress_decision hook only, requests the same two Low-tier
+# fields (egress.host, egress.port), never a Sensitive field, never raw state. Its
+# fail_mode is "deny": if this plugin crashes or times out, the host denies the egress
+# (the wall's default-deny stands). An enforcement hook may not declare a fail-open
+# fail_mode; "deny" is the strictest and is correct for a blocklist.
+plugin_id: ai.sanctuary.hosts-blocklist
+version: 1.0.0
+channel: stable
+entry: bin/hosts-blocklist.mjs
+hooks:
+  - hook_class: egress_decision
+    fields:
+      - egress.host
+      - egress.port
+    fail_mode: deny
+endpoints: []
+signal_keys:
+  - blocked_rule
