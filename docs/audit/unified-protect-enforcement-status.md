@@ -32,7 +32,7 @@ connections to a non-gate loopback port while allowing agent-to-gate, with
 state-table corroboration. That drill proves the MECHANISM; it does not
 prove this composed build.
 
-## Composed-build drill-acceptance (2026-07-03) — BOTH OS families
+## Composed-build drill-acceptance (2026-07-03): both OS families
 
 The BUILT enforcement-core code (`armPfAnchor` / `checkPfAnchorLiveness` /
 `disarmPfAnchor` / `startExclusiveEgressGate`) was drilled end-to-end, N=3
