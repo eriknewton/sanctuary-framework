@@ -37,7 +37,11 @@ import { tmpdir } from "node:os";
 import { runWrap } from "../../src/wrap/cli.js";
 import { saveWrapMeta } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
-import { agreeingHermesParity } from "../helpers/hermes-parity.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
 
 describe("wrap-meta write failure: rollback + orphan-wrap guard", () => {
   let tmpHome: string;
@@ -62,6 +66,7 @@ describe("wrap-meta write failure: rollback + orphan-wrap guard", () => {
   });
 
   afterEach(async () => {
+    clearHermesParityHook();
     errSpy.mockRestore();
     exitSpy.mockRestore();
     vi.restoreAllMocks();
@@ -76,6 +81,13 @@ describe("wrap-meta write failure: rollback + orphan-wrap guard", () => {
   });
 
   function makeDeps(overrides: Record<string, unknown> = {}) {
+    // Agree with the scanner via the test-only sidecar hook so these Hermes
+    // rollback/meta mechanics tests do not depend on the CI host carrying
+    // PyYAML (the parse-parity guard is proven separately in
+    // hermes-yaml-parse-parity.test.ts). The sidecar seam is NOT a public
+    // runWrap dep (DI-bypass closed 2026-07-03), so it is installed here
+    // rather than passed through deps/overrides.
+    installHermesParityHook(agreeingHermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
@@ -91,11 +103,6 @@ describe("wrap-meta write failure: rollback + orphan-wrap guard", () => {
         location: "test-keychain",
         source: "generated" as const,
       }),
-      // Agree with the scanner so these Hermes rollback/meta mechanics tests
-      // do not depend on the CI host carrying PyYAML (the parse-parity guard
-      // is proven separately in hermes-yaml-parse-parity.test.ts). Kept
-      // before the spread so a test may still override it.
-      hermesParity: agreeingHermesParity,
       ...overrides,
     };
   }

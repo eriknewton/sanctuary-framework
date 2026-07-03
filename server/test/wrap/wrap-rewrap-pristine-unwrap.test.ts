@@ -43,7 +43,11 @@ import {
   saveWrapMeta,
 } from "../../src/wrap/config-reader.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
-import { agreeingHermesParity } from "../helpers/hermes-parity.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
 
 describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", () => {
   let tmpHome: string;
@@ -65,6 +69,7 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
   });
 
   afterEach(async () => {
+    clearHermesParityHook();
     stderrSpy?.mockRestore();
     if (originalHome !== undefined) process.env.HOME = originalHome;
     else delete process.env.HOME;
@@ -77,6 +82,11 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
   });
 
   function makeDeps() {
+    // Agree with the scanner via the test-only sidecar hook so these Hermes
+    // rewrap/unwrap mechanics tests do not depend on the CI host carrying
+    // PyYAML (the parse-parity guard is proven separately in
+    // hermes-yaml-parse-parity.test.ts).
+    installHermesParityHook(agreeingHermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
@@ -92,10 +102,6 @@ describe("wrap -> wrap -> unwrap restores the pristine pre-wrap config (F6)", ()
         location: "test-keychain",
         source: "generated" as const,
       }),
-      // Agree with the scanner so these Hermes rewrap/unwrap mechanics tests
-      // do not depend on the CI host carrying PyYAML (the parse-parity guard
-      // is proven separately in hermes-yaml-parse-parity.test.ts).
-      hermesParity: agreeingHermesParity,
     };
   }
 

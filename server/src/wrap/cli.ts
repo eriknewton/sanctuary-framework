@@ -830,10 +830,7 @@ async function pathExists(path: string): Promise<boolean> {
  * exact entry the real run would write because it shares
  * buildSanctuaryEnv / resolveSanctuaryCommand with the write path.
  */
-async function reportHermesYamlDryRun(
-  options: WrapOptions,
-  parity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions
-): Promise<void> {
+async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   const yamlPath = hermesConfigYamlPath();
   let existingYaml: string | null = null;
   try {
@@ -846,8 +843,9 @@ async function reportHermesYamlDryRun(
   try {
     // Preview the parse-parity guard too: a dry run should report that the
     // real run would refuse (disagreement or PyYAML-unavailable) rather than
-    // previewing an edit that would not actually happen.
-    await assertHermesYamlParseParity(existingYaml, parity);
+    // previewing an edit that would not actually happen. Production uses the
+    // real sidecar; only test code overrides it via __hermesParityTestHook.
+    await assertHermesYamlParseParity(existingYaml, __hermesParityTestHook.parity);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
       args,
@@ -1072,17 +1070,26 @@ export interface RunWrapDeps {
   checkPinResolvability?: (
     version: string,
   ) => Promise<PinnedVersionResolvability>;
-  /**
-   * Override the Hermes config.yaml parse-parity guard's PyYAML sidecar
-   * (for tests). Production callers leave this undefined and get a real
-   * one-shot `python3` PyYAML parse; the guard refuses to edit config.yaml
-   * when the line-scanner's view disagrees with that parse or when the
-   * parser cannot run (fail-closed). Tests inject an agreeing exec so a
-   * legitimate wrap does not depend on the CI host carrying PyYAML, or a
-   * refusing exec to pin the disagreement / sidecar-unavailable paths.
-   */
-  hermesParity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions;
 }
+
+/**
+ * Test-only injection seam for the Hermes config.yaml parse-parity guard's
+ * PyYAML sidecar. This is DELIBERATELY not a field on RunWrapDeps: a public
+ * dep would let a programmatic production caller pass an agreeing / no-op
+ * parity and edit config.yaml WITHOUT the real PyYAML validator, defeating
+ * the fail-closed guarantee (HIGH: DI-bypass on the mutating path, closed
+ * 2026-07-03). The production runWrap paths always call the guard with the
+ * real default sidecar; only test code reaches in here to override it.
+ *
+ * Named `__`-prefixed and NOT re-exported from wrap/index.ts, matching the
+ * `__wrapMetaLockTestHooks` convention (config-reader.ts): a test sets
+ * `__hermesParityTestHook.parity` before driving runWrap and clears it after.
+ * When unset (every production path), `parity` is undefined and the guard
+ * spawns the real one-shot `python3` PyYAML parse.
+ */
+export const __hermesParityTestHook: {
+  parity?: import("./hermes-yaml-parse-parity.js").ParseParityOptions;
+} = {};
 
 export async function runWrap(
   options: WrapOptions,
@@ -1173,7 +1180,7 @@ export async function runWrap(
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`  Would bootstrap a fresh config at ${canonicalPath}.`);
       if (platformHint === "hermes") {
-        await reportHermesYamlDryRun(options, deps.hermesParity);
+        await reportHermesYamlDryRun(options);
       }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Dry run. No changes made.\n`);
@@ -1317,7 +1324,7 @@ export async function runWrap(
     // keeps this path guaranteed write-free (the gate sits above every
     // write: config bootstrap, fortress state, agent-record persistence).
     if (agentConfig.platform === "hermes") {
-      await reportHermesYamlDryRun(options, deps.hermesParity);
+      await reportHermesYamlDryRun(options);
     }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Dry run. No changes made.\n`);
@@ -1708,7 +1715,16 @@ export async function runWrap(
       // the scanner agree on the facts this edit depends on. Runs BEFORE any
       // surface is backed up or rewritten, so a refusal leaves everything
       // untouched.
-      await assertHermesYamlParseParity(existingYaml, deps.hermesParity);
+      //
+      // The sidecar is NON-injectable on this production mutating path: it
+      // always uses the real default python3 PyYAML parse. Only test code can
+      // override it, via __hermesParityTestHook (not a public dep), so a
+      // programmatic caller cannot pass an agreeing no-op parity and edit
+      // config.yaml without the real validator (DI-bypass closed 2026-07-03).
+      await assertHermesYamlParseParity(
+        existingYaml,
+        __hermesParityTestHook.parity
+      );
       const plan = planHermesYamlInjection(existingYaml, {
         command: sanctuaryCommand,
         args: sanctuaryArgs,

@@ -1,4 +1,5 @@
 import { scannerMcpServersView } from "../../src/wrap/hermes-yaml.js";
+import { __hermesParityTestHook } from "../../src/wrap/cli.js";
 import type { ParseParityOptions } from "../../src/wrap/hermes-yaml-parse-parity.js";
 
 /**
@@ -31,3 +32,21 @@ export const agreeingHermesParity: ParseParityOptions = {
     };
   },
 };
+
+/**
+ * Install a parse-parity override into the test-only injection hook. The
+ * sidecar seam is NOT a public runWrap dep (that would let a production
+ * caller bypass the real PyYAML validator; DI-bypass closed 2026-07-03), so
+ * tests reach the seam through this module-level hook. Call in beforeEach /
+ * before driving runWrap; ALWAYS pair with clearHermesParityHook() in
+ * afterEach so the override never leaks into another test whose expectation
+ * is the real sidecar.
+ */
+export function installHermesParityHook(parity: ParseParityOptions): void {
+  __hermesParityTestHook.parity = parity;
+}
+
+/** Clear the test-only parse-parity override. Pair with install in afterEach. */
+export function clearHermesParityHook(): void {
+  delete __hermesParityTestHook.parity;
+}

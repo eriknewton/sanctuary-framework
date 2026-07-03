@@ -34,7 +34,11 @@ import {
 import { runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
 import { yamlContainsSanctuaryEntry } from "../../src/wrap/hermes-yaml.js";
 import type { DashboardHandle } from "../../src/dashboard/index.js";
-import { agreeingHermesParity } from "../helpers/hermes-parity.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
 
 // -- Mock sidecar helpers -------------------------------------------------
 
@@ -246,6 +250,78 @@ describe("assertHermesYamlParseParity - sidecar unavailable REFUSES fail-closed 
   });
 });
 
+describe("assertHermesYamlParseParity - case-insensitive sanctuary collision REFUSES (mocked)", () => {
+  it("refuses when PyYAML resolves both `Sanctuary` and `sanctuary` (P1: replace-one silent no-wrap)", async () => {
+    // The scanner records BOTH keys, and PyYAML keeps them as DISTINCT dict
+    // keys (they differ as exact-case keys), so the case-insensitive multiset
+    // check AGREES (both lowercase to two `sanctuary`). But the injection
+    // planner replaces only the FIRST case-insensitive `sanctuary` match,
+    // leaving the second stale + unwrapped while the post-write scanner
+    // reports success. FAIL-BEFORE: without the collision count this passes
+    // parity and wrap silently mis-edits. PASS-AFTER: refuse.
+    const yaml = [
+      "mcp_servers:",
+      "  Sanctuary:",
+      '    command: "old"',
+      "  sanctuary:",
+      '    command: "new"',
+      "",
+    ].join("\n");
+    const err = await assertHermesYamlParseParity(yaml, {
+      // Parser agrees with the scanner's two-name view (both distinct keys).
+      exec: mockAgreeing({
+        hasBlock: true,
+        entryNames: ["Sanctuary", "sanctuary"],
+      }),
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe("disagreement");
+    expect((err as HermesYamlParityRefusedError).detail).toContain(
+      "case-insensitively"
+    );
+  });
+
+  it("does NOT refuse a single canonical `sanctuary` entry (no false positive)", async () => {
+    const yaml = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "x"',
+      "  weather:",
+      '    command: "y"',
+      "",
+    ].join("\n");
+    await expect(
+      assertHermesYamlParseParity(yaml, {
+        exec: mockAgreeing({
+          hasBlock: true,
+          entryNames: ["sanctuary", "weather"],
+        }),
+      })
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("assertHermesYamlParseParity - top-level non-mapping REFUSES (mocked)", () => {
+  it("refuses when PyYAML signals the whole document is not a mapping (exit 23)", async () => {
+    // A top-level sequence: scanner sees no mcp_servers block (hasBlock=false)
+    // and, before the fix, PyYAML collapsed to hasBlock=false too -> they
+    // AGREE -> add-key appends a top-level `mcp_servers:` mapping onto a
+    // sequence, producing mixed types PyYAML then rejects. The distinct exit
+    // 23 makes the guard refuse fail-closed instead.
+    const yaml = "- a\n- b\n";
+    const err = await assertHermesYamlParseParity(yaml, {
+      exec: mockExit(23),
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect((err as HermesYamlParityRefusedError).detail).toContain(
+      "non-mapping"
+    );
+  });
+});
+
 // -- Real-sidecar tests (skipped when python3 + PyYAML absent) ------------
 
 function hasRealPyYaml(): boolean {
@@ -335,6 +411,56 @@ describeReal("assertHermesYamlParseParity - REAL python3 + PyYAML", () => {
       "sidecar-unavailable"
     );
   });
+
+  it("REFUSES the real case-insensitive `Sanctuary`/`sanctuary` collision (P1, real parser)", async () => {
+    // PyYAML keeps `Sanctuary` and `sanctuary` as DISTINCT keys (verified
+    // here as ground truth). The planner would replace only the first, so the
+    // guard must refuse rather than let a stale unwrapped sibling survive.
+    const yaml = [
+      "mcp_servers:",
+      "  Sanctuary:",
+      '    command: "old"',
+      "  sanctuary:",
+      '    command: "new"',
+      "",
+    ].join("\n");
+    const realNames = JSON.parse(
+      execFileSync(
+        "python3",
+        [
+          "-c",
+          "import sys,json,yaml; d=yaml.safe_load(sys.stdin.read()); print(json.dumps(list(d['mcp_servers'].keys())))",
+        ],
+        { input: yaml }
+      )
+        .toString()
+        .trim()
+    ) as string[];
+    expect(realNames).toEqual(["Sanctuary", "sanctuary"]); // two distinct keys
+
+    const err = await assertHermesYamlParseParity(yaml).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe("disagreement");
+    expect((err as HermesYamlParityRefusedError).detail).toContain(
+      "case-insensitively"
+    );
+  });
+
+  it("REFUSES fail-closed when the real document top-level is a sequence (exit 23)", async () => {
+    // A top-level YAML sequence: the scanner sees no mcp_servers block, and a
+    // naive block=false would AGREE and drive an add-key that appends a
+    // mapping onto a sequence (mixed types Hermes then rejects). The real
+    // parser's exit 23 makes the guard refuse.
+    const yaml = "- one\n- two\n";
+    const err = await assertHermesYamlParseParity(yaml).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect((err as HermesYamlParityRefusedError).detail).toContain(
+      "non-mapping"
+    );
+  });
 });
 
 // -- CLI end-to-end fail-before / pass-after ------------------------------
@@ -343,8 +469,9 @@ describeReal("assertHermesYamlParseParity - REAL python3 + PyYAML", () => {
 // prove the wired behaviour through `runWrap`, which is the acceptance
 // contract: a refusal must leave config.yaml UNTOUCHED (no mutation), and a
 // legitimate wrap (agreement) must still edit as before (no regression).
-// The sidecar is injected via deps.hermesParity so these are deterministic
-// on any host; one real-sidecar case is included where PyYAML is present.
+// The sidecar is injected via the test-only __hermesParityTestHook (NOT a
+// public runWrap dep - DI-bypass closed 2026-07-03) so the deterministic
+// cases run on any host; the real-sidecar cases run where PyYAML is present.
 
 describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
   let tmpHome: string;
@@ -368,6 +495,9 @@ describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
   });
 
   afterEach(async () => {
+    // Clear the test-only parse-parity override so it never leaks into a
+    // test whose expectation is the real sidecar.
+    clearHermesParityHook();
     errSpy.mockRestore();
     exitSpy.mockRestore();
     vi.restoreAllMocks();
@@ -383,7 +513,14 @@ describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
     }
   });
 
-  function baseDeps(hermesParity: ParseParityOptions): RunWrapDeps {
+  /**
+   * Base runWrap deps WITHOUT a parse-parity override: the sidecar seam is a
+   * test-only module hook, not a public dep (DI-bypass closed 2026-07-03).
+   * Tests that want a specific parity install it via installHermesParityHook()
+   * BEFORE calling runWrap; tests that omit that get the real python3 sidecar.
+   */
+  function baseDeps(hermesParity?: ParseParityOptions): RunWrapDeps {
+    if (hermesParity) installHermesParityHook(hermesParity);
     const fakeHandle: DashboardHandle = {
       url: "http://127.0.0.1:0",
       port: 0,
@@ -399,7 +536,6 @@ describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
         location: "test-keychain",
         source: "generated",
       }),
-      hermesParity,
     };
   }
 
@@ -529,9 +665,92 @@ describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
     // guard refuses and the duplicate the scanner would have mis-edited is
     // left exactly as the operator had it.
     await expect(
-      runWrap({ hermes: true, noOpen: true }, baseDeps({}))
+      runWrap({ hermes: true, noOpen: true }, baseDeps())
     ).rejects.toThrow("process.exit:1");
 
     expect(await readFile(yamlPath, "utf-8")).toBe(original);
+  });
+
+  it("(P1 end-to-end) case-insensitive `Sanctuary`/`sanctuary` collision -> wrap REFUSES, no mutation", async () => {
+    if (!realPyYaml) return; // real python3 + PyYAML required
+    // Sanctuary first, sanctuary later: parity passes the multiset check
+    // (both lowercase to two `sanctuary`) but the planner would replace only
+    // `Sanctuary` and leave the later `sanctuary` stale + unwrapped. The
+    // collision count in the REAL parse makes the guard refuse. FAIL-BEFORE:
+    // without the count, wrap silently mis-edits and Hermes routes to the
+    // stale entry. PASS-AFTER: refuse, file byte-for-byte untouched.
+    const original = [
+      "mcp_servers:",
+      "  Sanctuary:",
+      '    command: "old"',
+      "  sanctuary:",
+      '    command: "new"',
+      "",
+    ].join("\n");
+    const yamlPath = await writeHermesConfig(original);
+
+    await expect(
+      runWrap({ hermes: true, noOpen: true }, baseDeps())
+    ).rejects.toThrow("process.exit:1");
+
+    expect(await readFile(yamlPath, "utf-8")).toBe(original);
+    expect(stderrOutput()).toContain("Not Editable");
+  });
+
+  it("(MED end-to-end) top-level-sequence config.yaml -> wrap REFUSES, no mutation", async () => {
+    if (!realPyYaml) return; // real python3 + PyYAML required
+    // The whole document is a sequence. The scanner sees no mcp_servers
+    // block; before the exit-23 signal, PyYAML collapsed to hasBlock=false
+    // too -> agreement -> add-key would append a top-level `mcp_servers:`
+    // mapping onto the sequence (mixed types Hermes rejects) while the
+    // post-write scanner falsely reported success. FAIL-BEFORE: silent
+    // corruption. PASS-AFTER: refuse, file untouched.
+    const original = "- one\n- two\n";
+    const yamlPath = await writeHermesConfig(original);
+
+    await expect(
+      runWrap({ hermes: true, noOpen: true }, baseDeps())
+    ).rejects.toThrow("process.exit:1");
+
+    expect(await readFile(yamlPath, "utf-8")).toBe(original);
+    expect(stderrOutput()).toContain("Not Editable");
+  });
+
+  it("(HIGH end-to-end) production runWrap CANNOT bypass the real sidecar via a deps property", async () => {
+    if (!realPyYaml) return; // real python3 + PyYAML required
+    // A top-level-SEQUENCE config the REAL sidecar refuses (exit 23). The
+    // scanner sees no mcp_servers block, so an AGREEING no-op parity (which
+    // echoes the scanner's hasBlock=false) would slip past the disagreement
+    // check and let add-key append a top-level `mcp_servers:` mapping onto
+    // the sequence - corrupting the file into mixed types. A programmatic
+    // caller tries to inject exactly that agreeing parity through the deps
+    // object under the OLD public property name.
+    //
+    // FAIL-BEFORE (old code, deps.hermesParity honored on the mutating
+    // path): the injected agreeing parity bypasses the real sidecar, wrap
+    // proceeds, and the file is rewritten to `- one\n- two\nmcp_servers:...`
+    // (verified: MUTATED=true). PASS-AFTER: the mutating path always runs the
+    // real python3 PyYAML validator, ignores the injected parity, refuses on
+    // exit 23, and leaves the file byte-for-byte untouched.
+    const original = "- one\n- two\n";
+    const yamlPath = await writeHermesConfig(original);
+
+    // The hook is deliberately NOT installed. The cast models a programmatic
+    // caller passing an unexpected extra property; it must have no effect on
+    // the production mutating path.
+    const bypassDeps = {
+      ...baseDeps(),
+      hermesParity: agreeingHermesParity,
+    } as unknown as RunWrapDeps;
+
+    await expect(
+      runWrap({ hermes: true, noOpen: true }, bypassDeps)
+    ).rejects.toThrow("process.exit:1");
+
+    // The real sidecar ran and refused despite the injected agreeing parity:
+    // the file is unchanged, no mcp_servers mapping was appended onto the
+    // sequence.
+    expect(await readFile(yamlPath, "utf-8")).toBe(original);
+    expect(await readFile(yamlPath, "utf-8")).not.toContain("mcp_servers");
   });
 });

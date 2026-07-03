@@ -131,7 +131,21 @@ export class HermesYamlParityRefusedError extends Error {
  *   - unparseable YAML          -> exit 21 (a real parser rejects the file;
  *                                  the scanner must not edit what Hermes
  *                                  itself would refuse to load)
- *   - top-level doc not a map   -> {"hasBlock": false, "entryNames": []}
+ *   - top-level doc empty/null  -> {"hasBlock": false, "entryNames": []}
+ *                                  (an empty, whitespace-only, or
+ *                                  comment-only file: the plan's add-key
+ *                                  appends a fresh top-level mcp_servers
+ *                                  mapping, which is valid; the scanner also
+ *                                  sees no block, so they agree and proceed)
+ *   - top-level doc not a map   -> exit 23 (a sequence or scalar document:
+ *                                  the scanner also sees no top-level
+ *                                  mcp_servers block, so it would collapse to
+ *                                  hasBlock=false and AGREE, then add-key
+ *                                  would append a top-level mcp_servers
+ *                                  mapping onto a sequence/scalar document,
+ *                                  producing mixed types PyYAML rejects. This
+ *                                  distinct signal makes the guard refuse
+ *                                  fail-closed instead of silently agreeing)
  *   - mcp_servers absent/null   -> {"hasBlock": false, "entryNames": []}
  *   - mcp_servers not a mapping -> exit 22 (scalar/sequence: a shape the
  *                                  scanner also refuses; surface as a hard
@@ -154,9 +168,11 @@ const PYYAML_PARSE_PROGRAM = [
   "    doc = yaml.safe_load(raw)",
   "except Exception:",
   "    sys.exit(21)",
-  "if not isinstance(doc, dict):",
+  "if doc is None:",
   '    print(json.dumps({"hasBlock": False, "entryNames": []}))',
   "    sys.exit(0)",
+  "if not isinstance(doc, dict):",
+  "    sys.exit(23)",
   '"""find the mcp_servers key exactly (top-level, case-sensitive)"""',
   'block = doc.get("mcp_servers", None)',
   "if block is None:",
@@ -242,6 +258,7 @@ const PYYAML_EXIT = {
   IMPORT_MISSING: 20,
   UNPARSEABLE: 21,
   MCP_SERVERS_NOT_A_MAP: 22,
+  TOP_LEVEL_NOT_A_MAP: 23,
 } as const;
 
 /**
@@ -289,6 +306,20 @@ async function pyYamlView(
     throw new HermesYamlParityRefusedError(
       "sidecar-unavailable",
       "PyYAML reads mcp_servers as a non-mapping value (scalar or sequence); wrap only edits a block mapping"
+    );
+  }
+  if (result.code === PYYAML_EXIT.TOP_LEVEL_NOT_A_MAP) {
+    // A real parser sees the WHOLE document as a sequence or scalar (not a
+    // mapping). The line scanner sees no top-level mcp_servers block and
+    // would collapse to hasBlock=false, AGREEING with the naive block=false
+    // this case used to emit; the plan's add-key would then append a
+    // top-level `mcp_servers:` mapping onto a sequence/scalar document,
+    // producing mixed types PyYAML then rejects (Hermes fails to load) while
+    // the same-family post-write scanner check falsely reports success.
+    // Surface it as a distinct hard signal and refuse (fail-closed).
+    throw new HermesYamlParityRefusedError(
+      "sidecar-unavailable",
+      "PyYAML reads the whole config.yaml document as a non-mapping value (a top-level sequence or scalar); wrap can only add mcp_servers to a mapping document"
     );
   }
   if (result.code !== 0) {
@@ -396,6 +427,31 @@ export async function assertHermesYamlParseParity(
       `line-scanner sees ${scanner.entryNames.length} entr${
         scanner.entryNames.length === 1 ? "y" : "ies"
       } under mcp_servers but PyYAML sees ${real.entryNames.length}`
+    );
+  }
+
+  // Case-insensitive `sanctuary` collision (P1 fail-open closed 2026-07-03):
+  // planHermesYamlInjection matches the existing sanctuary entry
+  // case-INSENSITIVELY (name.toLowerCase() === "sanctuary") and replaces only
+  // the FIRST match. PyYAML keeps DISTINCT keys for `Sanctuary` and
+  // `sanctuary` (they differ as exact-case dict keys), and entryNamesAgree
+  // lowercases before comparing, so a config carrying both passes the
+  // multiset check above. Wrap would then rewrite only the first and leave a
+  // stale UNWRAPPED sibling that Hermes routes to, while the same-family
+  // post-write scanner check reports success (a silent no-wrap: the agent is
+  // not actually behind the proxy). Count sanctuary-collisions in the REAL
+  // parse (the authority for what keys exist) and refuse fail-closed when the
+  // target is ambiguous.
+  const realSanctuaryCount = real.entryNames.filter(
+    (n) => n.toLowerCase() === "sanctuary"
+  ).length;
+  if (realSanctuaryCount > 1) {
+    throw new HermesYamlParityRefusedError(
+      "disagreement",
+      `config.yaml has ${realSanctuaryCount} mcp_servers entries whose name ` +
+        `matches "sanctuary" case-insensitively (e.g. Sanctuary and sanctuary); ` +
+        `wrap replaces only one and would leave the other stale and unwrapped. ` +
+        `Consolidate them to a single "sanctuary" entry and re-run wrap`
     );
   }
 }

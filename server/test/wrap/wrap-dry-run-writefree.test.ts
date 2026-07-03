@@ -19,7 +19,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { runWrap, type RunWrapDeps } from "../../src/wrap/cli.js";
-import { agreeingHermesParity } from "../helpers/hermes-parity.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
 
 /** Recursive content+mtime snapshot of every file under root. */
 async function snapshotTree(root: string): Promise<Map<string, string>> {
@@ -57,6 +61,7 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
   });
 
   afterEach(async () => {
+    clearHermesParityHook();
     vi.restoreAllMocks();
     if (originalHome !== undefined) process.env.HOME = originalHome;
     else delete process.env.HOME;
@@ -74,6 +79,12 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
    * neither hook may fire.
    */
   function tripwireDeps(): RunWrapDeps {
+    // The parse-parity guard runs in the dry-run preview too; install an
+    // agreeing parity into the test-only sidecar hook so these write-free
+    // mechanics tests do not depend on the CI host carrying PyYAML. The
+    // guard's real refusal behaviour is proven in
+    // hermes-yaml-parse-parity.test.ts (including the dry-run preview path).
+    installHermesParityHook(agreeingHermesParity);
     return {
       startDashboard: async () => {
         throw new Error("dry-run must not start the dashboard");
@@ -84,11 +95,6 @@ describe("Wrap — --dry-run guarantees zero filesystem writes (D4 Bug 1)", () =
       resolvePassphrase: async () => {
         throw new Error("dry-run must not resolve or generate a passphrase");
       },
-      // The parse-parity guard runs in the dry-run preview too; agree with
-      // the scanner so these write-free mechanics tests do not depend on the
-      // CI host carrying PyYAML. (One test below asserts a genuine sidecar
-      // refusal by NOT using these deps.)
-      hermesParity: agreeingHermesParity,
     };
   }
 
