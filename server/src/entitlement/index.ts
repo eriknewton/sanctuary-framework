@@ -11,7 +11,6 @@ export {
   ENTITLEMENT_TIERS,
   COMMUNITY_TIER,
   isEntitlementTier,
-  tierRank,
   tierAtLeast,
   type EntitlementTier,
 } from "./tier.js";

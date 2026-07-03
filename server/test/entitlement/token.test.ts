@@ -26,7 +26,6 @@ import {
   buildEntitlementMessage,
   resolveEntitlement,
   tierAtLeast,
-  tierRank,
   type EntitlementClaims,
   type EntitlementDenyReason,
   type EntitlementToken,
@@ -229,8 +228,8 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
       expect(result.tier).toBe(COMMUNITY_TIER);
       expect(result.granted).toBe(false);
       expect(result.reason).toBe(c.expectedReason);
-      // Safe-degrade invariant: never above the community floor on failure.
-      expect(tierRank(result.tier)).toBe(tierRank(COMMUNITY_TIER));
+      // Safe-degrade invariant: exactly the community floor, never above it.
+      expect(result.tier).toBe(COMMUNITY_TIER);
       expect(tierAtLeast(result.tier, "team")).toBe(false);
     });
   }
@@ -283,6 +282,103 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
     expect(result.tier).toBe(COMMUNITY_TIER);
   });
 
+  it("a mutating tier getter cannot raise the tier after signing (snapshot chokepoint)", () => {
+    // HIGH regression: the claims object is untrusted. Here `tier` is an
+    // ACCESSOR that returns "community" on the reads used to validate and
+    // build the signing message (so a valid signature is produced over the
+    // community claims), then flips to "enterprise" on the read that once
+    // populated the returned resolution. Before the snapshot fix, the final
+    // read at the return site saw "enterprise" and resolved
+    // {tier:"enterprise", granted:true} despite the signature covering only
+    // "community". After the fix, every downstream read uses the single frozen
+    // snapshot, so this either resolves to "community" (granted) or fails
+    // closed - it must NEVER return a paid tier.
+    let reads = 0;
+    const base = {
+      version: ENTITLEMENT_TOKEN_VERSION,
+      subject: "fleet-op-1",
+      notBefore: NOW - 100,
+      notAfter: NOW + 100,
+    };
+    const malicious = Object.defineProperty(
+      { ...base } as Record<string, unknown>,
+      "tier",
+      {
+        enumerable: true,
+        get() {
+          reads += 1;
+          // First read (validation) and second read (canonical message) see
+          // community; any later read sees enterprise.
+          return reads <= 2 ? "community" : "enterprise";
+        },
+      },
+    );
+
+    // Sign the message that the SERVER will build for the community view. The
+    // canonicalJson call inside buildEntitlementMessage reads `tier` once; we
+    // reset the counter so signing sees community.
+    reads = 0;
+    const signMessage = buildEntitlementMessage({
+      ...base,
+      tier: "community",
+    } as EntitlementClaims);
+    const signature = ed25519.sign(signMessage, issuer.privateKey);
+
+    reads = 0;
+    const result = resolveEntitlement({
+      token: {
+        claims: malicious as unknown as EntitlementClaims,
+        signature: toBase64url(signature),
+      },
+      issuerPublicKey: issuer.publicKey,
+      now: NOW,
+    });
+
+    // The paid tier must never leak through the accessor.
+    expect(result.tier).not.toBe("enterprise");
+    expect(tierAtLeast(result.tier, "team")).toBe(false);
+    if (result.granted) {
+      // If it grants at all, it grants only what was actually signed.
+      expect(result.tier).toBe("community");
+    }
+  });
+
+  it("a prototype-backed tier cannot grant a tier the signature never covered", () => {
+    // A partial claims object whose `tier` lives on the PROTOTYPE, not as an
+    // own property. `canonicalJson` (the SIGNING view) walks own-enumerable
+    // props only, so the prototype `tier` is invisible to the message an
+    // issuer would sign - yet a plain `claims.tier` property read still sees
+    // it. Before the snapshot fix, validation and the returned tier read the
+    // prototype value while the signed message omitted it, a split view. The
+    // snapshot resolves `tier` once into an OWN primitive, so the message that
+    // is verified always includes exactly the tier that would be granted: an
+    // "enterprise" prototype tier can only grant if the signature covers an
+    // enterprise snapshot, which a community-issued signature does not. Here
+    // we sign a benign community token, then swap in a prototype "enterprise"
+    // tier: it must fail closed, never granting enterprise.
+    const communityToken = signToken(
+      paidClaims({ tier: "community" }),
+    );
+    const proto = { tier: "enterprise" };
+    const ownOnly = {
+      version: ENTITLEMENT_TOKEN_VERSION,
+      subject: "fleet-op-1",
+      notBefore: NOW - 100,
+      notAfter: NOW + 100,
+    };
+    const claimsLike = Object.assign(Object.create(proto), ownOnly);
+    const result = resolveEntitlement({
+      token: {
+        claims: claimsLike as unknown as EntitlementClaims,
+        signature: communityToken.signature,
+      },
+      issuerPublicKey: issuer.publicKey,
+      now: NOW,
+    });
+    expect(result.tier).not.toBe("enterprise");
+    expect(tierAtLeast(result.tier, "team")).toBe(false);
+  });
+
   it("a boundary flip of one second past notAfter expires the grant", () => {
     const claims = paidClaims({ notBefore: NOW - 100, notAfter: NOW });
     const valid = resolveEntitlement({
@@ -321,6 +417,18 @@ describe("tierAtLeast - fails closed on malformed operands", () => {
     expect(tierAtLeast("fleet", "team")).toBe(true);
     expect(tierAtLeast("community", "fleet")).toBe(false);
     expect(tierAtLeast("team", "team")).toBe(true);
+  });
+
+  it("does NOT export the raw fail-open tierRank primitive (chokepoint)", async () => {
+    // MED regression: `tierRank` used to be exported and, applied directly as
+    // `tierRank(held) >= tierRank(required)`, fails OPEN when `required` is a
+    // typo (indexOf -> -1). Removing it from the module surface forces every
+    // sibling caller through `tierAtLeast`, which validates both operands.
+    const surface = await import("../../src/entitlement/index.js");
+    expect("tierRank" in surface).toBe(false);
+    expect(
+      (surface as Record<string, unknown>).tierRank,
+    ).toBeUndefined();
   });
 });
 

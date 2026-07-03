@@ -159,29 +159,69 @@ export function buildEntitlementMessage(claims: EntitlementClaims): Uint8Array {
 }
 
 /**
- * Structural validation of claims WITHOUT touching the signature. Returns a
- * deny reason for a malformed shape, or null when the shape is well-formed.
+ * The result of normalizing claims: either a deny reason for a malformed
+ * shape, or a frozen own-property snapshot of primitive claim values that is
+ * safe to sign, window-check, and return. Never null on the success side.
  */
-function claimsShapeReason(
-  claims: unknown,
-): EntitlementDenyReason | null {
-  if (typeof claims !== "object" || claims === null) return "malformed";
+type NormalizedClaims =
+  | { reason: EntitlementDenyReason; claims?: undefined }
+  | { reason?: undefined; claims: EntitlementClaims };
+
+/**
+ * Validate the claim shape AND, on success, capture each field into a single
+ * frozen plain-data snapshot in ONE pass.
+ *
+ * This is the security chokepoint for the whole "claims object is untrusted"
+ * class: the caller's `token.claims` may be a proxy or a prototype/accessor
+ * object whose getters return DIFFERENT values on repeated reads. If any
+ * later step (signing message, window comparison, returned tier) re-read the
+ * caller's object, a getter could sign a `community` payload and then hand
+ * back `enterprise`, granting a paid tier after a valid signature over a
+ * lower one. We read every field EXACTLY ONCE here, into own, non-accessor
+ * primitives, and everything downstream uses this snapshot only. The returned
+ * record is frozen so no later mutation can reintroduce the class.
+ *
+ * Does NOT touch the signature; that is checked against the snapshot's
+ * canonical message afterward.
+ */
+function normalizeClaims(claims: unknown): NormalizedClaims {
+  if (typeof claims !== "object" || claims === null) {
+    return { reason: "malformed" };
+  }
+  // Read each field exactly once into a local primitive. From here on the
+  // caller's object is never consulted again.
   const c = claims as Record<string, unknown>;
-  if (c.version !== ENTITLEMENT_TOKEN_VERSION) return "malformed";
-  if (typeof c.subject !== "string" || c.subject.length === 0) {
-    return "malformed";
+  const version = c.version;
+  const subject = c.subject;
+  const tier = c.tier;
+  const notBefore = c.notBefore;
+  const notAfter = c.notAfter;
+
+  if (version !== ENTITLEMENT_TOKEN_VERSION) return { reason: "malformed" };
+  if (typeof subject !== "string" || subject.length === 0) {
+    return { reason: "malformed" };
   }
   if (
-    typeof c.notBefore !== "number" ||
-    typeof c.notAfter !== "number" ||
-    !Number.isFinite(c.notBefore) ||
-    !Number.isFinite(c.notAfter) ||
-    c.notAfter < c.notBefore
+    typeof notBefore !== "number" ||
+    typeof notAfter !== "number" ||
+    !Number.isFinite(notBefore) ||
+    !Number.isFinite(notAfter) ||
+    notAfter < notBefore
   ) {
-    return "malformed";
+    return { reason: "malformed" };
   }
-  if (!isEntitlementTier(c.tier)) return "unknown_tier";
-  return null;
+  if (!isEntitlementTier(tier)) return { reason: "unknown_tier" };
+
+  // A frozen own-property plain record: no getters, no prototype surprises,
+  // no shared mutable identity with the caller's object.
+  const snapshot: EntitlementClaims = Object.freeze({
+    version: ENTITLEMENT_TOKEN_VERSION,
+    subject,
+    tier,
+    notBefore,
+    notAfter,
+  });
+  return { claims: snapshot };
 }
 
 /** Build a denied resolution at the community floor. */
@@ -211,10 +251,13 @@ export function resolveEntitlement(
       return deny("malformed");
     }
 
-    const shapeReason = claimsShapeReason(token.claims);
-    if (shapeReason !== null) return deny(shapeReason);
-
-    const claims = token.claims;
+    // Normalize ONCE into a frozen own-property snapshot. Every downstream
+    // step (message, window checks, returned tier) reads only `claims`, never
+    // the caller's possibly-accessor `token.claims`, so a getter cannot sign a
+    // low tier and then return a higher one.
+    const normalized = normalizeClaims(token.claims);
+    if (normalized.reason !== undefined) return deny(normalized.reason);
+    const claims = normalized.claims;
 
     const message = buildEntitlementMessage(claims);
     // Decode STRICTLY: a lenient decoder would let a malformed/non-canonical

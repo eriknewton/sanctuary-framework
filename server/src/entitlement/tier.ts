@@ -41,26 +41,31 @@ export function isEntitlementTier(value: unknown): value is EntitlementTier {
 }
 
 /**
- * Capability rank of a tier: the higher the number, the more capability.
- * COMMUNITY is 0. An unknown string ranks below COMMUNITY (-1) so any
- * comparison treats it as strictly less capable than the floor.
+ * Capability rank of a known tier: the higher the number, the more capability.
+ * COMMUNITY is 0.
+ *
+ * MODULE-PRIVATE ON PURPOSE. This is NOT a gating primitive and is not
+ * exported. `indexOf` returns -1 for an unknown string, and a naive
+ * `rank(a) >= rank(b)` fails OPEN when the REQUIRED tier `b` is a typo:
+ * `rank("community")` (0) >= `rank("fleeet")` (-1) is true, granting the floor
+ * tier a paid gate. Every capability comparison MUST go through `tierAtLeast`,
+ * which validates both operands first; this helper is only ever called on
+ * inputs already proven to be known tiers, so its -1 branch is unreachable
+ * from the public surface.
  */
-export function tierRank(tier: EntitlementTier | string): number {
-  const index = (ENTITLEMENT_TIERS as readonly string[]).indexOf(tier);
-  return index;
+function tierRank(tier: EntitlementTier): number {
+  return (ENTITLEMENT_TIERS as readonly string[]).indexOf(tier);
 }
 
 /**
- * True when `a` grants at least as much capability as `b`. Used by callers
- * that gate a paid feature: `tierAtLeast(resolved, "fleet")`.
+ * True when `a` grants at least as much capability as `b`. This is the ONLY
+ * exported capability-comparison boundary; callers gate a paid feature with
+ * `tierAtLeast(resolved, "fleet")`.
  *
- * Fails CLOSED on any malformed operand. `tierRank` returns -1 for an unknown
- * string, so a comparison that only ranked the operands would fail OPEN when
- * the REQUIRED tier (`b`) is a typo or bad config: `tierRank("community")` (0)
- * is >= `tierRank("fleeet")` (-1), which would grant a paid gate to the floor
- * tier. This is the single boundary that decides "does `a` clear the bar `b`",
- * so both operands are validated here rather than at each call site; if either
- * is not a known tier we deny.
+ * Fails CLOSED on any malformed operand. Both operands are validated here
+ * (not at each call site) so the raw rank comparison never sees an unknown
+ * string: if either operand is not a known tier we deny. This closes the
+ * malformed-required-tier fail-open at a single chokepoint.
  */
 export function tierAtLeast(
   a: EntitlementTier | string,
