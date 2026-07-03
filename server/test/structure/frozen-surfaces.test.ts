@@ -211,10 +211,6 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   // in-progress rotation's staged record / journal):
   "trust-root-v1-next",
   "rotate-root-journal",
-  // federation sync-state baseline sentinel at-rest key (B1 / F3 residual close;
-  // renaming orphans the provisioning witness that catches a deleted sync-state
-  // record on an eviction-only fortress):
-  "sync-state-baseline-v1",
 
   // --- frozen versioned HTTP / served route paths ---
   "/v1/agents/protect",

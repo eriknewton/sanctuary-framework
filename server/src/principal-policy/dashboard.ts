@@ -2154,24 +2154,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // an empty revoked-root set and a zero serial). Only THEN do we latch. This
     // never trips on a fresh fortress and never bricks the first sync.
     //
-    // F3 residual close (B1): a durable PROVISIONING BASELINE SENTINEL is a
-    // SECOND, independent per-fortress witness (a separate at-rest record under
-    // the SAME purpose key) that a sync-state baseline WAS provisioned. It closes
-    // the node-eviction-only residual the trust-root witness could not: the two
-    // records are written TOGETHER at provisioning and only an out-of-band delete
-    // of the main record can leave the sentinel present with the record absent.
-    // So the deletion signal is now the UNION of two independent witnesses:
-    //   - the trust-root revoked-root evidence (catches root-revocation history),
-    //   - the baseline sentinel (catches ANY provisioned fortress, incl. a
-    //     node-eviction-only one, once its baseline is provisioned).
-    // On a genuinely fresh fortress NEITHER witness is present, so the first boot
-    // is never bricked; instead it PROVISIONS the baseline (writes both records)
-    // so every subsequent deletion is caught.
+    // Documented residual: a fortress whose ONLY revocation history is NODE
+    // evictions (which live solely in the deleted sync-state record, with no
+    // independent trust-root witness) cannot be distinguished from fresh after a
+    // deletion, so its node-revocation memory still resets to empty on that boot
+    // (the pre-existing status quo). Deleting a root-revocation-bearing fortress's
+    // record IS caught. Closing the node-eviction residual would require
+    // provisioning to write a baseline record (a ceremony change across the mesh
+    // trust-root stores, out of this fix's scope); tracked as follow-up.
     let recordPresent: boolean;
-    let sentinelPresent: boolean;
     try {
       recordPresent = await store.recordExists();
-      sentinelPresent = await store.baselineSentinelExists();
     } catch {
       // A read fault (not a clean absence) is treated as unavailable: fail
       // closed rather than mis-classify a transient backend error as "fresh".
@@ -2181,56 +2174,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (
       !recordPresent &&
       this.isFederationProvisioned() &&
-      (sentinelPresent || this.hasIndependentFederationRevocationHistory())
+      this.hasIndependentFederationRevocationHistory()
     ) {
-      // Provisioned + main record absent + an independent witness (baseline
-      // sentinel OR trust-root revocation evidence) shows a baseline once existed
-      // -> the record was DELETED. Fail closed. Do NOT touch the live fields (no
-      // half-applied state); latch so every sync/revoke path denies.
+      // Provisioned + record absent + independent evidence of prior revocation
+      // history -> the record was DELETED. Fail closed. Do NOT touch the live
+      // fields (no half-applied state); latch so every sync/revoke path denies.
       this._federationSyncStateUnavailable = true;
       return;
-    }
-    if (
-      !recordPresent &&
-      !sentinelPresent &&
-      this.isFederationProvisioned() &&
-      !this.hasIndependentFederationRevocationHistory()
-    ) {
-      // Genuinely fresh provisioned fortress, first boot: NO record, NO sentinel,
-      // NO independent revocation history. PROVISION the baseline now - write the
-      // empty baseline record AND the sentinel (idempotently, under a lock) - so
-      // that from this boot on, absence of the main record means DELETION and is
-      // caught (even for a fortress whose only later history is node evictions).
-      // This does NOT latch and does NOT brick the first sync: the record now
-      // exists (empty), and the first accepted sync folds over it monotonically.
-      // A provisioning write failure fails closed (latch), never silently serves.
-      try {
-        await store.provisionBaselineIfAbsent();
-      } catch {
-        this._federationSyncStateUnavailable = true;
-        return;
-      }
-    }
-    if (recordPresent && !sentinelPresent && this.isFederationProvisioned()) {
-      // Crash-window self-repair (B1 F3 residual). The baseline is provisioned
-      // record-FIRST, sentinel-second (see provisionBaselineIfAbsent). A crash
-      // between those two writes leaves "record-present, sentinel-absent" - a
-      // provisioned fortress that is missing its independent deletion witness.
-      // Without this repair that state persists across every boot (the fresh-
-      // provisioning branch above never fires because the record IS present),
-      // so a later attacker who deletes ONLY the main record leaves NO witness
-      // and the fortress silently re-provisions empty and un-revokes evicted
-      // nodes - the exact eviction-only fail-open the sentinel exists to close.
-      // Repair it now: provisionBaselineIfAbsent is idempotent and folds an
-      // EMPTY baseline over the existing real record MONOTONICALLY (it cannot
-      // lower a floor or drop a revocation), writing ONLY the missing sentinel.
-      // A repair write failure fails closed (latch), never serves half-repaired.
-      try {
-        await store.provisionBaselineIfAbsent();
-      } catch {
-        this._federationSyncStateUnavailable = true;
-        return;
-      }
     }
     let snapshot: FederationSyncStateSnapshot;
     try {
