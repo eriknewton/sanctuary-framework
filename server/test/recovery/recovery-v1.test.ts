@@ -1339,3 +1339,971 @@ describe("no LLM at gate (structural)", () => {
     expect(result.triggered).toBe(true);
   });
 });
+
+// ===================================================================
+// Harden wave A3 (2026-07-04): recovery-cascade trust-boundary
+// regression tests. Each test in this block fails on the pre-harden
+// code and passes after the fix (fail-before / pass-after).
+//
+// Defect classes confirmed by adversarial audit:
+//   A. cross-roster-version signature reuse (quorum bypass): a quorum
+//      signed under roster vN verified against roster vM (N != M).
+//   B. unauthenticated approval envelope-field confusion: an approval's
+//      self-declared cascade_id / recovery_action were never bound to the
+//      input the signature actually covered, nor to the cascade action.
+//   C. DMswitch-triggered cascade on non-expired input (fail-open):
+//      initiateCascade recorded a dmswitch_trigger after evaluateDmswitch
+//      but never rejected evaluation.triggered === false, so a cascade
+//      attributed to the dead-man switch reached awaiting_threshold while
+//      the operator absence window was still open. Guardians could then
+//      satisfy the M-of-N threshold and execute BEFORE the window elapsed.
+//      Fixed by failing closed with WindowNotExpiredError in initiateCascade
+//      (covering initRecovery and any direct caller); no cascade is created
+//      or stored for non-expired DMswitch input.
+//
+// Classes that yielded NO real defect after audit (stated for the record):
+//   - cross-cascade replay: already blocked; cascade_id is inside the
+//     signed canonical input, so a signature for cascade A does not verify
+//     against cascade B.
+//   - execute-time raised threshold: executeCascade re-evaluates against
+//     the current roster and fails closed when M was raised.
+//   - m=0 / empty partial set: issueGuardianRoster rejects m<1 at issuance,
+//     AND (harden A3 follow-up) evaluateThreshold / executeCascade now
+//     independently fail closed on a malformed roster handed to them directly,
+//     rather than assuming issuance already screened it. Covered by the
+//     "malformed roster fails closed at the evaluation boundary" block below.
+// ===================================================================
+
+describe("harden A3: cross-roster-version signature reuse is closed", () => {
+  it("evaluateThreshold does not count a v1-signed quorum against a v2 roster", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    // Roster v2 (e.g., after a guardian was revoked and version bumped).
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+
+    // A quorum signed under roster_version = 1 (stale).
+    const cascadeId = "cascade-stale-roster";
+    const staleApprovals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const signingInputV1 = buildApprovalSigningInput({
+      cascade_id: cascadeId,
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+
+    const result = evaluateThreshold({
+      approvals: staleApprovals,
+      roster: rosterV2,
+      signing_input: signingInputV1,
+    });
+
+    // Fail closed: a stale-version quorum must not meet threshold.
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("enforceThreshold throws RosterStaleError when signing input version != roster version, even without expected_roster_version", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+
+    const cascadeId = "cascade-stale-enforce";
+    const staleApprovals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    expect(() =>
+      enforceThreshold({
+        approvals: staleApprovals,
+        roster: rosterV2,
+        signing_input: buildApprovalSigningInput({
+          cascade_id: cascadeId,
+          recovery_action: "key_rotation",
+          fortress_id: fix.fortressId,
+          roster_version: 1,
+        }),
+      })
+    ).toThrow(RosterStaleError);
+  });
+
+  it("a matched-version quorum still succeeds (bind does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const rosterV2 = buildRoster(fix, guardians, 3, 2);
+    const cascadeId = "cascade-matched-version";
+    const approvals = buildSignedApprovals(
+      guardians,
+      3,
+      cascadeId,
+      "key_rotation",
+      fix.fortressId,
+      2
+    );
+    const result = evaluateThreshold({
+      approvals,
+      roster: rosterV2,
+      signing_input: buildApprovalSigningInput({
+        cascade_id: cascadeId,
+        recovery_action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster_version: 2,
+      }),
+    });
+    expect(result.threshold_met).toBe(true);
+    expect(result.valid_count).toBe(3);
+  });
+});
+
+describe("harden A3: unauthenticated approval-envelope fields are bound", () => {
+  it("evaluateThreshold does not count an approval whose declared recovery_action differs from the signing input", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const cascadeId = "cascade-field-confusion";
+    // Guardians sign the canonical input for key_rotation, but the approval
+    // objects declare recovery_action = emergency_freeze in their envelope.
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: cascadeId,
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const lyingApprovals = guardians.slice(0, 3).map((g) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.kp.privateKey,
+        recovery_action: "emergency_freeze",
+        cascade_id: cascadeId,
+      })
+    );
+
+    const result = evaluateThreshold({
+      approvals: lyingApprovals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    // Fail closed: mismatched declared action must not count.
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("evaluateThreshold does not count an approval whose declared cascade_id differs from the signing input", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "real-cascade",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const lyingApprovals = guardians.slice(0, 3).map((g) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: g.identity.guardian_id,
+        guardian_private_key: g.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "some-other-cascade",
+      })
+    );
+
+    const result = evaluateThreshold({
+      approvals: lyingApprovals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("registerApproval rejects an approval whose recovery_action does not match the cascade action", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    let cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+    });
+    cascade = beginAwaitingThreshold(cascade);
+
+    // An approval that targets this cascade_id but declares emergency_freeze.
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: cascade.cascade_id,
+      recovery_action: "emergency_freeze",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const mismatchedApproval = signApproval({
+      signing_input: signingInput,
+      guardian_id: guardians[0]!.identity.guardian_id,
+      guardian_private_key: guardians[0]!.kp.privateKey,
+      recovery_action: "emergency_freeze",
+      cascade_id: cascade.cascade_id,
+    });
+
+    expect(() => registerApproval(cascade, mismatchedApproval)).toThrow(
+      CascadeStateError
+    );
+  });
+
+  it("registerApproval still accepts a correctly-actioned approval (bind does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    let cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+    });
+    cascade = beginAwaitingThreshold(cascade);
+    const [approval] = buildSignedApprovals(
+      guardians,
+      1,
+      cascade.cascade_id,
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+    const next = registerApproval(cascade, approval!);
+    expect(next.approvals.length).toBe(1);
+  });
+});
+
+describe("harden A3: DMswitch-triggered cascade on non-expired input fails closed", () => {
+  it("initiateCascade throws WindowNotExpiredError for a not-yet-expired DMswitch window (direct caller)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // Operator active a few seconds ago against a 30-day window: window open.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    // Fail closed: no cascade is created for a non-expired DMswitch input.
+    // Pre-fix this returned an awaiting_threshold cascade with a
+    // dmswitch_trigger; post-fix it throws before any cascade exists.
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(WindowNotExpiredError);
+  });
+
+  it("initiateCascade still succeeds once the DMswitch window has expired (guard does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const activity = buildActivity(DEFAULT_DMSWITCH_WINDOW_MS + 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    const cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+      dmswitch_trigger: { last_activity: activity, config },
+    });
+    expect(cascade.state).toBe("triggered");
+    expect(cascade.dmswitch_trigger).toBeTruthy();
+  });
+
+  it("initRecovery does not create or store a cascade for a non-expired DMswitch window, so no guardian quorum can execute early", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    // Operator active seconds ago: absence window is still open.
+    const activity = buildActivity(5_000);
+
+    // Pre-fix: initRecovery returned an awaiting_threshold cascade whose
+    // threshold guardians could then satisfy and execute before the window
+    // expired. Post-fix: it fails closed with WindowNotExpiredError and
+    // stores nothing.
+    expect(() =>
+      initRecovery({ ctx, action: "key_rotation", last_activity: activity })
+    ).toThrow(WindowNotExpiredError);
+
+    // No cascade was persisted, so there is nothing for a guardian quorum to
+    // drive to execution.
+    expect(store.list().length).toBe(0);
+    expect(store.listActive().length).toBe(0);
+  });
+
+  it("shared-public-key roster: one key cannot satisfy M-of-N via distinct-id slots", () => {
+    // Regression (A3 harden 2026-07-04). A roster with distinct guardian_ids
+    // that share one Ed25519 public key lets a single private key sign N
+    // approval envelopes (labeled g0/g1/g2) that each verify. Pre-fix,
+    // evaluateThreshold counted all N and returned threshold_met=true from one
+    // key. Post-fix it counts a key at most once, so the quorum's independence
+    // holds and the single key cannot clear m=3. verifyGuardianRoster already
+    // rejects such a roster at the door; this exercises evaluateThreshold's own
+    // defense-in-depth against an evaluation run on an unvalidated roster.
+    const fix = buildFixture();
+    const shared = buildGuardians(1)[0]!;
+    const ids = ["g0", "g1", "g2"];
+    const guardians: GuardianIdentity[] = ids.map((id) => ({
+      guardian_id: id,
+      public_key: shared.identity.public_key,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    // Forge a genuinely master-signed roster that bypasses issuance validation.
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fix.fortressId,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fix.masterSecret);
+    const roster: GuardianRoster = { ...body, master_signature: toBase64url(masterSig) };
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "shared-key",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    // One private key signs three envelopes under three distinct guardian_ids.
+    const approvals: GuardianApproval[] = ids.map((id) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: id,
+        guardian_private_key: shared.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "shared-key",
+      })
+    );
+
+    const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
+    // A roster with distinct guardian_ids sharing one key is a malformed roster
+    // shape (validateRosterShape rejects duplicate public keys), so the A3
+    // follow-up shape gate now rejects the WHOLE roster before any per-approval
+    // counting. That is a strictly stronger fail-closed outcome than the
+    // per-approval dedup path (which would have kept the first slot): zero valid
+    // approvals, every slot invalid, threshold unmet. The security property this
+    // test guards, one key cannot satisfy M-of-N, holds a fortiori.
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+    expect(result.valid_guardian_ids).toHaveLength(0);
+    expect(result.invalid_guardian_ids).toContain("g0");
+    expect(result.invalid_guardian_ids).toContain("g1");
+    expect(result.invalid_guardian_ids).toContain("g2");
+  });
+
+  it("NON-CANONICAL shared-key roster: padded/whitespace spellings of one key cannot satisfy M-of-N", () => {
+    // Regression (A3 harden 2026-07-04, non-canonical encoding path). The prior
+    // shared-key guard compared raw base64url strings for uniqueness, but
+    // fromBase64url decodes permissively: "KEY", "KEY=", and "KEY " all decode
+    // to the same 32 bytes and every slot verifies against the one key. Distinct
+    // spellings therefore passed the string-equality uniqueness check while a
+    // single private key satisfied M-of-N. Post-fix, uniqueness is on the
+    // canonical decoded key, so the non-canonical slots are rejected, not
+    // counted (and a non-canonical roster key fails closed). After the A3
+    // follow-up shape gate, such a roster (distinct ids collapsing to one
+    // canonical key) is rejected wholesale as a malformed roster before any
+    // per-approval counting, a strictly stronger fail-closed outcome. This test
+    // FAILS before the canonical-key + shape fixes (valid_count 3, threshold_met
+    // true) and PASSES after (valid_count 0, threshold_met false).
+    const fix = buildFixture();
+    const shared = buildGuardians(1)[0]!;
+    const canonical = shared.identity.public_key;
+    // Prove the variants really are distinct STRINGS that decode to one key.
+    const padded = `${canonical}==`;
+    const spaced = `${canonical} `;
+    expect(padded).not.toBe(canonical);
+    expect(spaced).not.toBe(canonical);
+    expect(toBase64url(fromBase64url(padded))).toBe(canonical);
+    expect(toBase64url(fromBase64url(spaced))).toBe(canonical);
+
+    const slots: Array<{ id: string; spelling: string }> = [
+      { id: "g0", spelling: canonical },
+      { id: "g1", spelling: padded },
+      { id: "g2", spelling: spaced },
+    ];
+    const guardians: GuardianIdentity[] = slots.map((s) => ({
+      guardian_id: s.id,
+      public_key: s.spelling,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fix.fortressId,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fix.masterSecret);
+    const roster: GuardianRoster = { ...body, master_signature: toBase64url(masterSig) };
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "noncanon-key",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    // One private key signs three envelopes under three distinct guardian_ids.
+    const approvals: GuardianApproval[] = slots.map((s) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: s.id,
+        guardian_private_key: shared.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "noncanon-key",
+      })
+    );
+
+    const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
+    // The non-canonical spellings of one key collapse to a single canonical key,
+    // so the roster is malformed (duplicate public keys) and the shape gate
+    // rejects it wholesale: zero valid, threshold unmet. One key cannot clear
+    // m=3.
+    expect(result.valid_count).toBe(0);
+    expect(result.threshold_met).toBe(false);
+    expect(result.invalid_guardian_ids).toContain("g0");
+    expect(result.invalid_guardian_ids).toContain("g1");
+    expect(result.invalid_guardian_ids).toContain("g2");
+  });
+
+  it("manual guardian-requested recovery (no last_activity) is unaffected by the window guard", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const roster = buildRoster(fix, guardians, 2, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    const { cascade } = initRecovery({ ctx, action: "emergency_freeze" });
+    expect(cascade.state).toBe("awaiting_threshold");
+    expect(cascade.dmswitch_trigger).toBeUndefined();
+    expect(store.list().length).toBe(1);
+  });
+
+  // -----------------------------------------------------------------
+  // Regression (A3 harden 2026-07-04): the DMswitch gate consumed a
+  // DmswitchConfig without validating it, so a below-minimum / zero /
+  // non-finite window made evaluateDmswitch return triggered=true immediately
+  // (elapsed_ms >= 0) and a DMswitch cascade was created + stored before the
+  // 7-day minimum absence window. The fix runs validateDmswitchConfig at the
+  // cascade-creation gate (initiateCascade) and at the initRecovery entry-event
+  // gate, BEFORE any window arithmetic. These tests FAIL before the guard (a
+  // cascade is created/stored) and PASS after (RecoveryConfigError, nothing
+  // stored).
+  // -----------------------------------------------------------------
+
+  it("initiateCascade rejects a zero-window DMswitch config and creates no cascade", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // Operator active seconds ago. A zero window makes elapsed_ms >= 0 true, so
+    // pre-fix evaluateDmswitch reported triggered and a cascade was built before
+    // the mandatory minimum window. Post-fix the config is rejected first.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initiateCascade rejects a below-minimum (1-day) DMswitch window", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // 8 days of absence against a 1-day window would trigger, but 1 day is below
+    // the 7-day minimum, so the config must be rejected before the arithmetic.
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initiateCascade rejects a non-finite DMswitch window", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.NaN,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initRecovery rejects a below-minimum DMswitch window, emitting no entry event and storing no cascade", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          // Below the 7-day minimum: pre-fix this fired the switch and stored a
+          // DMswitch cascade before the mandatory window. Post-fix it fails
+          // closed at the entry-event gate before any arithmetic.
+          max_offline_window_ms: 0,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    const activity = buildActivity(5_000);
+
+    expect(() =>
+      initRecovery({ ctx, action: "key_rotation", last_activity: activity })
+    ).toThrow(RecoveryConfigError);
+
+    // No cascade was persisted and no DMswitch cascade exists to drive to
+    // execution.
+    expect(store.list().length).toBe(0);
+    expect(store.listActive().length).toBe(0);
+  });
+
+  it("validateDmswitchConfig rejects a non-finite window directly (finiteness gate)", () => {
+    expect(() =>
+      validateDmswitchConfig({
+        max_offline_window_ms: Number.POSITIVE_INFINITY,
+        estate_planning_enabled: false,
+      })
+    ).toThrow(RecoveryConfigError);
+    expect(() =>
+      validateDmswitchConfig({
+        max_offline_window_ms: Number.NaN,
+        estate_planning_enabled: false,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  // -----------------------------------------------------------------
+  // Residual (A3 harden 2026-07-04): the lower-level enforcement primitive
+  // enforceDmswitchExpired called evaluateDmswitch directly without validating
+  // the config, and emitCascadeEntry routes through enforceDmswitchExpired, so
+  // the same malformed-window class stayed open on the public event-emission
+  // path (a direct caller could sign a DMSWITCH_CASCADE_ENTRY with a zero /
+  // below-minimum / non-finite window). The fix runs validateDmswitchConfig at
+  // the START of enforceDmswitchExpired -- the single chokepoint both the
+  // direct-enforce path and the emit path pass through -- BEFORE any window
+  // arithmetic. These tests FAIL before the guard (elapsed_ms >= window_ms was
+  // true for a zero window, so enforce returned an evaluation / emit signed an
+  // event) and PASS after (RecoveryConfigError before arithmetic).
+  // -----------------------------------------------------------------
+
+  it("enforceDmswitchExpired rejects a zero window before firing the switch", () => {
+    // Operator active 5 seconds ago. With a zero window, elapsed_ms >= 0 makes
+    // pre-fix evaluateDmswitch report triggered, so enforceDmswitchExpired
+    // returned an evaluation instead of failing closed. Post-fix the config is
+    // rejected before the comparison.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired rejects a below-minimum (1-day) window", () => {
+    // 8 days of absence against a 1-day window would trigger, but 1 day is
+    // below the 7-day minimum, so the config must be rejected before arithmetic.
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired rejects a non-finite window", () => {
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.NaN,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a zero window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    // Active 5 seconds ago; a zero window let pre-fix emitCascadeEntry sign a
+    // DMSWITCH_CASCADE_ENTRY (window_ms 0) before the mandatory minimum window.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a below-minimum window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a non-finite window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.POSITIVE_INFINITY,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired still returns an evaluation for a valid, expired window", () => {
+    // Guard against over-rejection: a well-formed, elapsed window must still
+    // enforce as triggered (the finiteness/shape gate only rejects malformed
+    // configs, not valid ones).
+    const activity = buildActivity(DEFAULT_DMSWITCH_WINDOW_MS + 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    const evaluation = enforceDmswitchExpired({ last_activity: activity, config });
+    expect(evaluation.triggered).toBe(true);
+    expect(evaluation.window_ms).toBe(DEFAULT_DMSWITCH_WINDOW_MS);
+  });
+});
+
+// ===================================================================
+// Harden wave A3 follow-up (2026-07-04): malformed roster fails closed
+// at the evaluation boundary.
+//
+// Defect: evaluateThreshold computed threshold_met = validIds.length >=
+// roster.m without ever validating the roster shape. A caller that supplies
+// an unvalidated GuardianRoster (m=0, or m>n, or guardians.length !== n)
+// bypasses issuance screening, so a degenerate roster reached the count
+// comparison. The worst case, m=0 with an empty approval set, yields
+// validIds.length (0) >= m (0) === true, authorizing a cascade with zero
+// guardian signatures.
+//
+// Fix: evaluateThreshold rejects any structurally invalid roster before the
+// count comparison (fail closed: threshold_met === false, valid_count === 0),
+// which also protects executeCascade (it re-evaluates before execution).
+//
+// Each test below FAILS on the pre-fix code (the m=0 case returned
+// threshold_met === true) and PASSES after the fix.
+// ===================================================================
+
+describe("harden A3: malformed roster fails closed at the evaluation boundary", () => {
+  // A roster is only a GuardianRoster by shape. An untrusted caller can hand
+  // the evaluator one that issuance would have rejected, so we build a valid
+  // roster and override the field under test rather than routing through
+  // issueGuardianRoster (which refuses m<1 etc.).
+  function malformedRoster(
+    base: GuardianRoster,
+    overrides: Partial<GuardianRoster>
+  ): GuardianRoster {
+    return { ...base, ...overrides };
+  }
+
+  it("m=0 with empty approvals returns threshold_met=false (was true pre-fix)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-m0",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+
+    const result = evaluateThreshold({
+      approvals: [],
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("executeCascade will not execute a threshold_met cascade backed by an m=0 roster (no signatures)", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    // Force the cascade into threshold_met to simulate a caller that trusted
+    // a pre-fix evaluateCascade transition. executeCascade re-evaluates and
+    // must refuse because the roster is malformed and no approvals are valid.
+    const cascade = initiateCascade({
+      fortress_id: fix.fortressId,
+      action: "key_rotation",
+      roster,
+    });
+    const awaiting = beginAwaitingThreshold(cascade);
+    const forced: CascadeState = {
+      ...awaiting,
+      state: "threshold_met",
+      threshold_met_at: new Date().toISOString(),
+    };
+
+    let executed = false;
+    await expect(
+      executeCascade({
+        cascade: forced,
+        roster,
+        executor: async () => {
+          executed = true;
+        },
+        emitter_node: fix.nodeId,
+        emitter_principal: "principal-a",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).rejects.toBeInstanceOf(ThresholdNotMetError);
+    expect(executed).toBe(false);
+  });
+
+  it("evaluateCascade does not transition an m=0 roster to threshold_met", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    const cascade = initiateCascade({
+      fortress_id: fix.fortressId,
+      action: "key_rotation",
+      roster,
+    });
+    const awaiting = beginAwaitingThreshold(cascade);
+
+    const evaluated = evaluateCascade(awaiting, roster);
+    expect(evaluated.state).toBe("awaiting_threshold");
+  });
+
+  it("m > n fails closed even with a full valid quorum present", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    // Valid roster is m=3 of n=3; override m to 4 (m > n) to malform it.
+    const validRoster = buildRoster(fix, guardians, 3, 1);
+    const roster = malformedRoster(validRoster, { m: 4 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-mgtn",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      3,
+      "c-mgtn",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("guardians.length !== n fails closed", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    // Claim n=5 while only 3 guardians are listed.
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { n: 5 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-nlen",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      2,
+      "c-nlen",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("a well-formed roster still meets threshold (guard does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const roster = buildRoster(fix, guardians, 2, 1);
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-ok",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      2,
+      "c-ok",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(true);
+    expect(result.valid_count).toBe(2);
+  });
+});

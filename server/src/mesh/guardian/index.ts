@@ -24,6 +24,9 @@ export * from "./constants.js";
 export * from "./errors.js";
 export * from "./types.js";
 export {
+  canonicalGuardianKey,
+  assertValidRosterShape,
+  isValidRosterShape,
   issueGuardianRoster,
   verifyGuardianRoster,
   verifyGuardianQuorum,

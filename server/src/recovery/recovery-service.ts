@@ -26,6 +26,7 @@ import {
 import {
   evaluateDmswitch,
   emitCascadeEntry,
+  validateDmswitchConfig,
 } from "./dmswitch.js";
 import { CascadeStateError } from "./errors.js";
 import { evaluateMultiPrincipalBoundary } from "./multi-principal.js";
@@ -90,6 +91,18 @@ export function initRecovery(params: {
   last_activity?: ActivityRecord;
 }): { cascade: CascadeState; entry_event?: RecoveryEvent } {
   let entry_event: RecoveryEvent | undefined;
+
+  // Fail-closed config gate: a DMswitch-initiated recovery runs window
+  // arithmetic in BOTH the entry-event emission (below) and initiateCascade. An
+  // out-of-range window (below-minimum, zero, or non-finite) would fire the
+  // switch immediately and emit an entry event before initiateCascade rejects
+  // it. Validate once here, before any arithmetic, so the entire DMswitch path
+  // fails closed on a malformed config with no event emitted and no cascade
+  // stored. Manual (no last_activity) recovery supplies no config and is
+  // unaffected.
+  if (params.last_activity) {
+    validateDmswitchConfig(params.ctx.config.dmswitch);
+  }
 
   const dmswitchTrigger = params.last_activity
     ? {

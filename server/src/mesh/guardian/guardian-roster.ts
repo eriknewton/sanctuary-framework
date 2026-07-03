@@ -39,6 +39,45 @@ import type {
 } from "./types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
+// Canonical guardian-key identity
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Reduce a guardian public_key to a canonical identity string for uniqueness
+ * checks. Ed25519 verification decodes base64url permissively (fromBase64url
+ * pads and tolerates whitespace), so the SAME 32-byte key can appear under
+ * many distinct strings ("KEY", "KEY=", "KEY ", "-"/"+" swaps). Comparing the
+ * raw strings for uniqueness therefore lets one key holder occupy several
+ * guardian slots under non-canonical spellings and satisfy M-of-N alone, even
+ * though every slot verifies against one key. Fail closed: decode, require a
+ * 32-byte Ed25519 key, and require the input to already be the canonical
+ * base64url spelling of those bytes. Anything else is rejected, not silently
+ * accepted, so a non-canonical spelling can never masquerade as a new key.
+ */
+export function canonicalGuardianKey(public_key: string): string {
+  let decoded: Uint8Array;
+  try {
+    decoded = fromBase64url(public_key);
+  } catch {
+    throw new GuardianRosterError(
+      `guardian public_key is not valid base64url`
+    );
+  }
+  if (decoded.length !== 32) {
+    throw new GuardianRosterError(
+      `guardian public_key must decode to 32 bytes (Ed25519); got ${decoded.length}`
+    );
+  }
+  const canonical = toBase64url(decoded);
+  if (canonical !== public_key) {
+    throw new GuardianRosterError(
+      `guardian public_key must be canonical base64url (unpadded, no whitespace); got a non-canonical spelling`
+    );
+  }
+  return canonical;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Issuance (master-side)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -98,6 +137,43 @@ export function issueGuardianRoster(params: {
   return { ...body, master_signature: toBase64url(sig) };
 }
 
+/**
+ * Assert a roster body is structurally sound before it is trusted for any
+ * quorum decision. This is the SAME shape contract issuance enforces, exported
+ * so receiver-side quorum evaluators (recovery threshold, master-rotation
+ * quorum) can fail closed on a malformed roster rather than assuming issuance
+ * already screened it. Enforced invariants: integer m and n, 1 <= m <= n,
+ * guardians.length === n, unique guardian_ids, and canonical distinct public
+ * keys. Throws GuardianRosterError on any violation.
+ */
+export function assertValidRosterShape(params: {
+  m: number;
+  n: number;
+  guardians: GuardianIdentity[];
+}): void {
+  validateRosterShape(params);
+}
+
+/**
+ * Non-throwing predicate form of assertValidRosterShape. Returns true only when
+ * the roster body satisfies every shape invariant. Callers that must not throw
+ * (for example a pure evaluator that returns a fail-closed result object) use
+ * this to reject a malformed roster before comparing an approval count against
+ * m, so a degenerate roster such as m=0 can never report threshold_met.
+ */
+export function isValidRosterShape(params: {
+  m: number;
+  n: number;
+  guardians: GuardianIdentity[];
+}): boolean {
+  try {
+    validateRosterShape(params);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validateRosterShape(params: {
   m: number;
   n: number;
@@ -120,6 +196,7 @@ function validateRosterShape(params: {
     );
   }
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   for (const g of params.guardians) {
     if (seen.has(g.guardian_id)) {
       throw new GuardianRosterError(
@@ -127,6 +204,20 @@ function validateRosterShape(params: {
       );
     }
     seen.add(g.guardian_id);
+    // Fail closed on a shared public key across distinct guardian_ids. Without
+    // this, one key holder can occupy multiple guardian slots under different
+    // ids and satisfy M-of-N alone (approval signatures bind the signing input
+    // and the guardian's key, not the guardian_id), collapsing the quorum's
+    // independence assumption. Each guardian must hold a distinct key. The
+    // uniqueness key is the CANONICAL decoded form, not the raw string, so a
+    // non-canonical re-spelling of one key cannot pass as a distinct guardian.
+    const canonicalKey = canonicalGuardianKey(g.public_key);
+    if (seenKeys.has(canonicalKey)) {
+      throw new GuardianRosterError(
+        `duplicate guardian public_key in roster: guardian_id ${g.guardian_id} reuses a key already assigned to another guardian`
+      );
+    }
+    seenKeys.add(canonicalKey);
   }
 }
 
@@ -209,6 +300,18 @@ export function verifyGuardianQuorum(params: {
   pinned_roster: GuardianRoster;
 }): void {
   const { input, proof, pinned_roster: roster } = params;
+  // Fail-closed shape gate: this evaluator compares proof.signatures.length and
+  // validCount against roster.m/roster.n, so a structurally invalid pinned
+  // roster must be rejected BEFORE any threshold comparison, not assumed to have
+  // been screened at issuance. A degenerate roster (m=0, or m>n, or
+  // guardians.length !== n, or duplicate ids/keys) would otherwise let the
+  // empty-signature path pass: with m=0 and an empty proof, `0 < 0` is false and
+  // `validCount(0) < m(0)` is false, returning success with zero guardian
+  // signatures. validateRosterShape is the SAME shape contract issuance enforces;
+  // running it first closes this class at the boundary for the master-rotation
+  // quorum path (the recovery threshold path guards with the same contract via
+  // isValidRosterShape). Throws GuardianRosterError on any violation.
+  validateRosterShape({ m: roster.m, n: roster.n, guardians: roster.guardians });
   if (proof.roster_version !== roster.version) {
     throw new GuardianQuorumError(
       `quorum proof roster_version=${proof.roster_version} != pinned roster version=${roster.version}`
@@ -220,6 +323,7 @@ export function verifyGuardianQuorum(params: {
     );
   }
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   const byId = new Map<string, GuardianIdentity>();
   for (const g of roster.guardians) byId.set(g.guardian_id, g);
 
@@ -238,6 +342,26 @@ export function verifyGuardianQuorum(params: {
         `quorum signature from unknown guardian ${sig.guardian_id}; not in pinned roster v${roster.version}`
       );
     }
+    // Fail closed on a shared public key across distinct guardian_ids within a
+    // single proof. verifyGuardianRoster already rejects such rosters, but this
+    // is defense in depth for a proof evaluated against a roster that skipped
+    // that path: one key must not be counted toward the quorum more than once.
+    // Compare on the CANONICAL decoded key so a non-canonical re-spelling of one
+    // key cannot slip a second slot past this counter.
+    let quorumKey: string;
+    try {
+      quorumKey = canonicalGuardianKey(guardian.public_key);
+    } catch {
+      throw new GuardianQuorumError(
+        `guardian ${sig.guardian_id} has a non-canonical or malformed public key in the pinned roster`
+      );
+    }
+    if (seenKeys.has(quorumKey)) {
+      throw new GuardianQuorumError(
+        `guardian ${sig.guardian_id} reuses a public key already counted in this quorum proof`
+      );
+    }
+    seenKeys.add(quorumKey);
     const ok = ed25519.verify(
       fromBase64url(sig.signature),
       signedBytes,

@@ -17,10 +17,11 @@ import {
   type CascadeStateCode,
   type RecoveryAction,
 } from "./constants.js";
-import { evaluateDmswitch } from "./dmswitch.js";
+import { evaluateDmswitch, validateDmswitchConfig } from "./dmswitch.js";
 import {
   CascadeStateError,
   ThresholdNotMetError,
+  WindowNotExpiredError,
 } from "./errors.js";
 import { packRecoveryEvent } from "./recovery-event.js";
 import {
@@ -71,6 +72,14 @@ function assertTransition(
  *
  * The cascade can be initiated either by DMswitch (automatic, after operator
  * absence threshold) or manually (guardian-initiated recovery request).
+ *
+ * Fail-closed invariant: when a `dmswitch_trigger` is supplied, the operator
+ * absence window MUST have expired. If it has not, this throws
+ * WindowNotExpiredError and no cascade is created. This blocks the path where
+ * a DMswitch-attributed cascade reaches `awaiting_threshold` on non-expired
+ * input, letting guardians satisfy the M-of-N threshold and execute before the
+ * absence window elapses. Manual (guardian-requested) recovery does not supply
+ * `dmswitch_trigger` and is unaffected.
  */
 export function initiateCascade(params: {
   action: RecoveryAction;
@@ -87,11 +96,27 @@ export function initiateCascade(params: {
 
   let dmswitch_trigger: CascadeState["dmswitch_trigger"];
   if (params.dmswitch_trigger) {
+    // Fail-closed config gate: the DMswitch window feeds the trigger arithmetic
+    // (elapsed_ms >= window_ms). A below-minimum, zero, or non-finite window
+    // would make the switch fire immediately, letting a DMswitch-attributed
+    // cascade reach awaiting_threshold and execute before the mandatory absence
+    // window elapses. Validate the config at this gate BEFORE evaluateDmswitch,
+    // so an out-of-range window throws RecoveryConfigError and no cascade is
+    // created or stored. This is the same shape contract emitCascadeEntry's
+    // callers must honor; running it here closes the class at the cascade-
+    // creation boundary.
+    validateDmswitchConfig(params.dmswitch_trigger.config);
     const evaluation = evaluateDmswitch({
       last_activity: params.dmswitch_trigger.last_activity,
       config: params.dmswitch_trigger.config,
       now_ms: params.dmswitch_trigger.now_ms,
     });
+    if (!evaluation.triggered) {
+      throw new WindowNotExpiredError({
+        remaining_ms: evaluation.remaining_ms,
+        expires_at: evaluation.expires_at,
+      });
+    }
     dmswitch_trigger = {
       last_activity_at: params.dmswitch_trigger.last_activity.last_activity_at,
       triggered_at: now,
@@ -144,6 +169,15 @@ export function registerApproval(
   if (approval.cascade_id !== cascade.cascade_id) {
     throw new CascadeStateError(
       `approval cascade_id "${approval.cascade_id}" does not match cascade "${cascade.cascade_id}"`
+    );
+  }
+  // Reject an approval whose declared recovery_action does not match this
+  // cascade's action. The declared action is unauthenticated envelope metadata;
+  // binding it here keeps a guardian's approval for one action from being
+  // parked on a cascade for a different action (fail closed).
+  if (approval.recovery_action !== cascade.action) {
+    throw new CascadeStateError(
+      `approval recovery_action "${approval.recovery_action}" does not match cascade action "${cascade.action}"`
     );
   }
   // Reject duplicate guardian.
