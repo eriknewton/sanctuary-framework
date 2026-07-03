@@ -1726,6 +1726,77 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     expect(result.invalid_guardian_ids).toContain("g2");
   });
 
+  it("NON-CANONICAL shared-key roster: padded/whitespace spellings of one key cannot satisfy M-of-N", () => {
+    // Regression (A3 harden 2026-07-04, non-canonical encoding path). The prior
+    // shared-key guard compared raw base64url strings for uniqueness, but
+    // fromBase64url decodes permissively: "KEY", "KEY=", and "KEY " all decode
+    // to the same 32 bytes and every slot verifies against the one key. Distinct
+    // spellings therefore passed the string-equality uniqueness check while a
+    // single private key satisfied M-of-N. Post-fix, uniqueness is on the
+    // canonical decoded key, so the non-canonical slots are rejected, not
+    // counted (and a non-canonical roster key fails closed). This test FAILS
+    // before the canonical-key fix (valid_count 3, threshold_met true) and
+    // PASSES after (valid_count 1, threshold_met false).
+    const fix = buildFixture();
+    const shared = buildGuardians(1)[0]!;
+    const canonical = shared.identity.public_key;
+    // Prove the variants really are distinct STRINGS that decode to one key.
+    const padded = `${canonical}==`;
+    const spaced = `${canonical} `;
+    expect(padded).not.toBe(canonical);
+    expect(spaced).not.toBe(canonical);
+    expect(toBase64url(fromBase64url(padded))).toBe(canonical);
+    expect(toBase64url(fromBase64url(spaced))).toBe(canonical);
+
+    const slots: Array<{ id: string; spelling: string }> = [
+      { id: "g0", spelling: canonical },
+      { id: "g1", spelling: padded },
+      { id: "g2", spelling: spaced },
+    ];
+    const guardians: GuardianIdentity[] = slots.map((s) => ({
+      guardian_id: s.id,
+      public_key: s.spelling,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fix.fortressId,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fix.masterSecret);
+    const roster: GuardianRoster = { ...body, master_signature: toBase64url(masterSig) };
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "noncanon-key",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    // One private key signs three envelopes under three distinct guardian_ids.
+    const approvals: GuardianApproval[] = slots.map((s) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: s.id,
+        guardian_private_key: shared.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "noncanon-key",
+      })
+    );
+
+    const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
+    // Only the one canonical slot counts; the non-canonical spellings of the
+    // same key fail closed. One key cannot clear m=3.
+    expect(result.valid_count).toBe(1);
+    expect(result.threshold_met).toBe(false);
+    expect(result.invalid_guardian_ids).toContain("g1");
+    expect(result.invalid_guardian_ids).toContain("g2");
+  });
+
   it("manual guardian-requested recovery (no last_activity) is unaffected by the window guard", async () => {
     const fix = buildFixture();
     const guardians = buildGuardians(3);

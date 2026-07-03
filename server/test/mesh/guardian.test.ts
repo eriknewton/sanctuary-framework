@@ -431,6 +431,119 @@ describe("shared-public-key quorum collapse: fail closed", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// Regression: NON-CANONICAL shared-key quorum collapse (A3 harden 2026-07-04)
+//
+// The first shared-key guard compared raw base64url strings for uniqueness,
+// but fromBase64url decodes permissively: "KEY", "KEY==", "KEY " all decode to
+// the same 32 bytes and every slot verifies against the one key. Distinct
+// spellings of ONE key therefore slipped past the string-equality uniqueness
+// check while a single private key satisfied M-of-N. The fix compares on the
+// canonical decoded key and rejects non-canonical spellings outright. These
+// tests FAIL before the canonical-key fix and PASS after.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("non-canonical shared-public-key quorum collapse: fail closed", () => {
+  it("issueGuardianRoster rejects a non-canonical re-spelling of one key", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g1");
+    const canonical = shared.identity.public_key;
+    const padded = `${canonical}==`;
+    const spaced = `${canonical} `;
+    // The spellings differ as strings but decode to the identical key.
+    expect(padded).not.toBe(canonical);
+    expect(spaced).not.toBe(canonical);
+    expect(toBase64url(fromBase64url(padded))).toBe(canonical);
+    expect(toBase64url(fromBase64url(spaced))).toBe(canonical);
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g1", public_key: canonical },
+      { ...shared.identity, guardian_id: "g2", public_key: padded },
+      { ...shared.identity, guardian_id: "g3", public_key: spaced },
+    ];
+    expect(() =>
+      issueGuardianRoster({
+        m: 3,
+        n: 3,
+        guardians,
+        fortress_id: fortress.public.fortress_id,
+        version: 1,
+        master_private_key: fortress.private_key,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("verifyGuardianRoster rejects a forged roster with non-canonical shared-key spellings", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const canonical = shared.identity.public_key;
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g0", public_key: canonical },
+      { ...shared.identity, guardian_id: "g1", public_key: `${canonical}==` },
+      { ...shared.identity, guardian_id: "g2", public_key: `${canonical} ` },
+    ];
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    const roster = { ...body, master_signature: toBase64url(sig) };
+    // master_signature is genuine, so the rejection is on shape (a non-canonical
+    // spelling of an already-seen key), not on the signature.
+    expect(() => verifyGuardianRoster(roster, fortress.public)).toThrow(
+      GuardianRosterError
+    );
+  });
+
+  it("verifyGuardianQuorum does not count non-canonical spellings of one key twice", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const canonical = shared.identity.public_key;
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g0", public_key: canonical },
+      { ...shared.identity, guardian_id: "g1", public_key: `${canonical}==` },
+      { ...shared.identity, guardian_id: "g2", public_key: `${canonical} ` },
+    ];
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    const roster = { ...body, master_signature: toBase64url(masterSig) };
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    const input: MasterRotationQuorumInput = {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sigs = ["g0", "g1", "g2"].map((id) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: id,
+        guardian_private_key: shared.private_key,
+      })
+    );
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: sigs },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianQuorumError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // Spawn-prompt acceptance #4 — master_rotation flow + cascade
 // ═══════════════════════════════════════════════════════════════════════
 

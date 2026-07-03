@@ -16,6 +16,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
+import { canonicalGuardianKey } from "../mesh/guardian/guardian-roster.js";
 import type { GuardianRoster } from "../mesh/guardian/types.js";
 import {
   RosterStaleError,
@@ -193,12 +194,22 @@ export function evaluateThreshold(params: {
     // key holder occupying multiple slots under distinct ids must not satisfy
     // M-of-N alone. The approval signature binds the signing input and the key,
     // not the guardian_id, so distinct-id + shared-key approvals all verify;
-    // counting only the first per key preserves quorum independence.
-    if (seenKeys.has(guardian.public_key)) {
+    // counting only the first per key preserves quorum independence. The
+    // uniqueness key is the CANONICAL decoded form so a non-canonical spelling
+    // of one roster key cannot be counted as a second, independent slot; a
+    // malformed/non-canonical roster key fails closed (approval discarded).
+    let canonicalKey: string;
+    try {
+      canonicalKey = canonicalGuardianKey(guardian.public_key);
+    } catch {
       invalidIds.push(approval.guardian_id);
       continue;
     }
-    seenKeys.add(guardian.public_key);
+    if (seenKeys.has(canonicalKey)) {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+    seenKeys.add(canonicalKey);
 
     // Signature verification.
     try {

@@ -39,6 +39,45 @@ import type {
 } from "./types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
+// Canonical guardian-key identity
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Reduce a guardian public_key to a canonical identity string for uniqueness
+ * checks. Ed25519 verification decodes base64url permissively (fromBase64url
+ * pads and tolerates whitespace), so the SAME 32-byte key can appear under
+ * many distinct strings ("KEY", "KEY=", "KEY ", "-"/"+" swaps). Comparing the
+ * raw strings for uniqueness therefore lets one key holder occupy several
+ * guardian slots under non-canonical spellings and satisfy M-of-N alone, even
+ * though every slot verifies against one key. Fail closed: decode, require a
+ * 32-byte Ed25519 key, and require the input to already be the canonical
+ * base64url spelling of those bytes. Anything else is rejected, not silently
+ * accepted, so a non-canonical spelling can never masquerade as a new key.
+ */
+export function canonicalGuardianKey(public_key: string): string {
+  let decoded: Uint8Array;
+  try {
+    decoded = fromBase64url(public_key);
+  } catch {
+    throw new GuardianRosterError(
+      `guardian public_key is not valid base64url`
+    );
+  }
+  if (decoded.length !== 32) {
+    throw new GuardianRosterError(
+      `guardian public_key must decode to 32 bytes (Ed25519); got ${decoded.length}`
+    );
+  }
+  const canonical = toBase64url(decoded);
+  if (canonical !== public_key) {
+    throw new GuardianRosterError(
+      `guardian public_key must be canonical base64url (unpadded, no whitespace); got a non-canonical spelling`
+    );
+  }
+  return canonical;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Issuance (master-side)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -132,13 +171,16 @@ function validateRosterShape(params: {
     // this, one key holder can occupy multiple guardian slots under different
     // ids and satisfy M-of-N alone (approval signatures bind the signing input
     // and the guardian's key, not the guardian_id), collapsing the quorum's
-    // independence assumption. Each guardian must hold a distinct key.
-    if (seenKeys.has(g.public_key)) {
+    // independence assumption. Each guardian must hold a distinct key. The
+    // uniqueness key is the CANONICAL decoded form, not the raw string, so a
+    // non-canonical re-spelling of one key cannot pass as a distinct guardian.
+    const canonicalKey = canonicalGuardianKey(g.public_key);
+    if (seenKeys.has(canonicalKey)) {
       throw new GuardianRosterError(
         `duplicate guardian public_key in roster: guardian_id ${g.guardian_id} reuses a key already assigned to another guardian`
       );
     }
-    seenKeys.add(g.public_key);
+    seenKeys.add(canonicalKey);
   }
 }
 
@@ -255,12 +297,22 @@ export function verifyGuardianQuorum(params: {
     // single proof. verifyGuardianRoster already rejects such rosters, but this
     // is defense in depth for a proof evaluated against a roster that skipped
     // that path: one key must not be counted toward the quorum more than once.
-    if (seenKeys.has(guardian.public_key)) {
+    // Compare on the CANONICAL decoded key so a non-canonical re-spelling of one
+    // key cannot slip a second slot past this counter.
+    let quorumKey: string;
+    try {
+      quorumKey = canonicalGuardianKey(guardian.public_key);
+    } catch {
+      throw new GuardianQuorumError(
+        `guardian ${sig.guardian_id} has a non-canonical or malformed public key in the pinned roster`
+      );
+    }
+    if (seenKeys.has(quorumKey)) {
       throw new GuardianQuorumError(
         `guardian ${sig.guardian_id} reuses a public key already counted in this quorum proof`
       );
     }
-    seenKeys.add(guardian.public_key);
+    seenKeys.add(quorumKey);
     const ok = ed25519.verify(
       fromBase64url(sig.signature),
       signedBytes,
