@@ -1,7 +1,7 @@
 # server/src - Module Map
 
 This is the first thing to read before you touch the Sanctuary server. `server/src` is the
-TypeScript MCP server: 56 module directories plus a small set of root files. It is the in-process
+TypeScript MCP server: 57 module directories plus a small set of root files. It is the in-process
 "fortress" runtime - crypto core, the four sovereignty layers, enforcement surfaces, networking,
 identity, and the operator CLI. The native OS-level enforcers (Rust/Swift) live OUTSIDE this tree
 (see "Adjacent out-of-scope systems").
@@ -34,13 +34,13 @@ edit the wire token.
 
 ---
 
-## MODULE INDEX TABLE (56 modules)
+## MODULE INDEX TABLE (57 modules)
 
-All 56 module directories under `server/src` are listed. Status legend: **canonical** = a real,
+All 57 module directories under `server/src` are listed. Status legend: **canonical** = a real,
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =
 a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a thin re-export
-`index.ts` (48 of 56 do today).
+`index.ts` (49 of 57 do today).
 
 | Module | Subject area | Status | What it owns | Distinct from | Barrel? | Do-not-touch |
 |--------|-------------|--------|--------------|---------------|---------|--------------|
@@ -58,6 +58,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | shr | Verifiable-Reputation / Selective-Disclosure | versioned-frozen (v1.0) | Sovereignty Health Report: a signed, versioned, portable capability advertisement an agent presents to counterparties; plus the decommissioning-certificate variant | health (unsigned internal); audit (local score) | Yes | tools `shr_generate`/`shr_verify`/`shr_gateway_export`; schema `shr_version:"1.0"` + `layers.l1..l4` parsed by external counterparties; Ed25519-over-canonical-body; reuses mesh `SignatureScheme` |
 | compliance | Compliance (EU AI Act + NIST AI RMF) | canonical | EU AI Act (2024/1689) toolset under `eu_ai_act/`: Annex III classifier, coverage matrix, signed bundle generator (6 MD + manifest + zero-dep PDF), each file hashed + Ed25519-signed. NIST AI RMF 1.0 crosswalk under `nist_ai_rmf/`: maps AI RMF subcategories to the SAME control catalog (the EU matrix's evidence_emitter tool names) and renders a tooling-coverage Markdown via `compliance nist-ai-rmf`; pure data->doc, no server boot/no keychain | audit (sovereignty posture, not regulatory) | No | tools `compliance_eu_ai_act_annex_iii_classify`/`compliance_generate_eu_ai_act_bundle` (the `eu_ai_act` token is ALSO in these wire strings - a dir rename must NOT touch them); CLI verbs `compliance eu-ai-act` / `compliance nist-ai-rmf`; Apache-2.0 SPDX headers; `templates/*` assets |
 | errors | Cross-cutting (typed load errors) | thin/utility (2 files) | Two typed Error subclasses: `ConfigLoadError` + `ProfileLoadError`, carrying path/classification/recovery for fail-loud config and profile loading | `mesh/errors.ts` and `attestation/errors.ts` (SEPARATE local files) | Yes | symbols `ConfigLoadError`/`ProfileLoadError`; classification literals `corrupted`/`schema-mismatch`/`invalid-value`/`unreadable`/`wrong-key` (`invalid-value` = scalar-value typo on a structurally-valid config file: refuse-to-start but NOT quarantined); `.name` strings (used in messages/tests) |
+| entitlement | Cross-cutting (paid-fleet tier gating) | canonical (S1 scaffold) | Offline Ed25519 entitlement-token verify + tier resolution for the paid fleet control plane. FAIL-CLOSED: absent/invalid/expired/tampered/malformed all resolve to the COMMUNITY tier and never grant a paid tier. S1 = verify/resolve core + tier model ONLY; issuance/billing/revocation are NOT built | NOT an enforcement gate (a caller consumes the resolved tier); NOT identity/attestation (verifies an issuer-signed grant, not an agent identity) | Yes | domain label `sanctuary.fleet.entitlement.v1`; closed tier set `ENTITLEMENT_TIERS` (community/team/fleet/enterprise) with `COMMUNITY_TIER` as the floor; `resolveEntitlement` never throws + never returns key material; Ed25519-over-canonical-JSON, offline, no network |
 | http | Cross-cutting (HTTP safety helpers) | thin/utility | Shared HTTP response helpers for production route surfaces, including the caught-exception error envelope that logs redacted operator diagnostics while returning stable public codes | console/auth-middleware (auth only); dashboard/console route modules (callers) | Yes | `PublicErrorCode` literals; `sendCaughtError` must never serialize `err.message`, stack, or `String(err)` to a client (hard invariant); operator-log redaction is best-effort allow-list (Bearer tokens, keyed secrets, PEM private-key blocks), not fail-closed |
 | security | Enforcement-surface (injection) | canonical (single file) | The `InjectionDetector`: fast, zero-dep, never-throws scanner of tool args for prompt-injection signals; returns allow/escalate/block; outbound secret-leak scanning | NOT the approval gate (principal-policy calls this); NOT crypto (core). Name overpromises | Yes | symbols `InjectionDetector`/`DetectionResult`/`InjectionSignal`; the never-throws invariant; SEC-034/035 (Unicode sanitization + decoded re-scan); detection PATTERN strings are behavior. 1,353-line god-file split candidate (Phase 5) |
 | mesh | Networking | versioned-frozen (v1) | The intra-operator mesh fabric (internally titled "Sanctuary Federation Protocol v0.1"): libp2p transport, node lifecycle/join, guardian, v0.1 trust-root, additive hybrid trust-root v2 cert-chain module, audit-batch sync, recovery flows | federation (inter-instance); `v1/federation.ts` (HTTP wrapper around mesh) | Yes | `PROTOCOL_VERSION='0.1'`; libp2p protocols `/sanctuary/fed/v0.1/...`; HKDF `sanctuary-fed-v0.1-transport` / `...-audit-chain`; `SIGNATURE_SCHEME_V1='ed25519-v1'`; event-type + capability-bit masks; `NodeMode` union |
@@ -101,7 +102,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | reputation | Verifiable-Reputation | canonical | Heralds / Verifiable Reputation: Ed25519-signed EAS-compatible attestations of interaction OUTCOMES; queries return aggregates only; sovereignty-tier weighting; export/import; trust bootstrapping (escrow + guarantees) | l2 audit log (l4 = portable cross-agent; l2 = local operation log); l1 attestations | No | tools reputation_record/query/export/import/query_weighted, bootstrap_create_escrow/provide_guarantee, reputation_publish; HKDF `l4-reputation`/`identity-encryption`; EAS format; `sovereignty_tier` enum + `TIER_WEIGHTS`; `reputation_publish` emits frozen display labels 'L1'..'L4' + 'Cognitive Sovereignty' etc. (user-visible, NOT renamable); queries-return-aggregates invariant |
 | cli | CLI | canonical | The per-subcommand handler library for the `sanctuary` binary: one `run*Command` per subcommand (status, doctor, audit, identity, federation, transparency, secrets, sentinel, anomaly, policy, etc.) + the large `castle-wall.ts` command + the `agents/` multi-tenant sub-CLI | root `cli.ts` (the FILE = the argv router that lazy-imports these handlers) | No (sub-barrels only) | `TOP_LEVEL_SUBCOMMANDS` string array (the public command surface); basename-dispatched bins `verify-exit-bundle`/`import-exit-bundle`/`verify-transparency`; `cli/transparency.ts` anchoring-off-by-default; many dynamic-import path strings `./cli/<name>.js` (a rename grep must cover them) |
 
-Gaps note: none. All 56 module directories under `server/src` (verified by `ls`) have a row above,
+Gaps note: none. All 57 module directories under `server/src` (verified by `ls`) have a row above,
 and every row maps to a real directory (verified by diff). No best-effort placeholder rows were needed.
 
 **Two reading notes.** (1) The `default-off-allocated` modules - `composition`, `substrate`,
@@ -370,7 +371,7 @@ not its internal file layout. Deep imports are the documented exception (used wh
 deliberately partial - e.g. `core/` re-exports only the primitives and keeps the master-key security
 trio out of the barrel on purpose; `contracts/` uses per-version barrels with no top-level barrel).
 
-**Status today: 48 of 56 modules have a barrel** (backfilled 2026-06-14). This is additive (adding a
+**Status today: 49 of 57 modules have a barrel** (backfilled 2026-06-14). This is additive (adding a
 barrel never changes existing deep-import call sites). The 8 without one are intentional or deferred:
 the four layer dirs (`cognitive`, `operational`, `disclosure`, `reputation`) get theirs in a
 follow-up; `operational`'s in particular shrinks that follow-up's blast radius (100+ files reach
