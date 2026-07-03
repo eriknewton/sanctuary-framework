@@ -18,7 +18,7 @@
  * insertion order and cannot be replayed under a different domain.
  */
 
-import { fromBase64url } from "../core/encoding.js";
+import { fromBase64urlStrict } from "../core/encoding.js";
 import { verify } from "../core/identity.js";
 import {
   COMMUNITY_TIER,
@@ -217,7 +217,16 @@ export function resolveEntitlement(
     const claims = token.claims;
 
     const message = buildEntitlementMessage(claims);
-    const signature = fromBase64url(token.signature);
+    // Decode STRICTLY: a lenient decoder would let a malformed/non-canonical
+    // signature (trailing "!", whitespace, or "==" padding) decode to the same
+    // 64 bytes as a valid one and verify, granting a paid tier fail-open. A
+    // non-canonical signature string is a bad signature, not a soft malformed.
+    let signature: Uint8Array;
+    try {
+      signature = fromBase64urlStrict(token.signature);
+    } catch {
+      return deny("bad_signature");
+    }
     if (signature.length !== 64) return deny("bad_signature");
     if (!verify(message, signature, issuerPublicKey)) {
       return deny("bad_signature");

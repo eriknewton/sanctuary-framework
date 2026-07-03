@@ -93,6 +93,18 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
 
   const wrongIssuer = generateKeypair();
 
+  // A correctly-signed, in-window token whose base64url signature has been
+  // made NON-CANONICAL (suffixed "!", padding "==", or embedded whitespace).
+  // A lenient decoder collapses all of these back to the same 64 valid bytes,
+  // so without a strict decode gate they verify and GRANT the paid tier
+  // fail-open. Each must resolve to community with reason "bad_signature".
+  const canonicalSigned = signToken(paidClaims());
+  const canonicalSig = canonicalSigned.signature;
+  const nonCanonicalSig = (suffix: string, prefixInsert?: string): string =>
+    prefixInsert === undefined
+      ? canonicalSig + suffix
+      : canonicalSig.slice(0, 4) + prefixInsert + canonicalSig.slice(4);
+
   // A token whose signature is valid but was made by a DIFFERENT issuer.
   const foreignSigned = signToken(paidClaims(), wrongIssuer.privateKey);
 
@@ -138,9 +150,8 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
       expectedReason: "bad_signature",
     },
     {
-      // A non-base64url signature decodes (leniently) to a wrong-length byte
-      // string, so it is rejected as a bad signature. Either way it is a
-      // denial that resolves to community; the reason is a signature failure.
+      // A non-base64url signature is rejected by the strict decode gate
+      // before verify, resolving to community as a signature failure.
       name: "bad signature - not valid base64url",
       token: { claims: paidClaims(), signature: "!!!not-base64url!!!" },
       expectedReason: "bad_signature",
@@ -148,6 +159,47 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
     {
       name: "bad signature - wrong length",
       token: { claims: paidClaims(), signature: toBase64url(new Uint8Array(10)) },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Fail-open regression: valid signature bytes with a "!" suffix. A
+      // lenient decoder drops the "!" and verifies; the strict gate rejects.
+      name: "bad signature - valid bytes, non-canonical '!' suffix",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("!") },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Fail-open regression: valid signature bytes with "==" padding. The
+      // canonical no-padding form omits it; a lenient decoder tolerates it.
+      name: "bad signature - valid bytes, non-canonical '==' padding",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("==") },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Fail-open regression: valid signature bytes with a single "=" pad.
+      name: "bad signature - valid bytes, non-canonical '=' padding",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("=") },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Fail-open regression: valid signature bytes with an embedded newline.
+      // A lenient decoder strips ASCII whitespace before decoding.
+      name: "bad signature - valid bytes, embedded newline",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("", "\n") },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Fail-open regression: valid signature bytes with an embedded space.
+      name: "bad signature - valid bytes, embedded space",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("", " ") },
+      expectedReason: "bad_signature",
+    },
+    {
+      // Sanity anchor: the same signature UNMODIFIED grants, proving the
+      // cases above fail solely on the non-canonical encoding, not bad bytes.
+      // (Asserted directly below the table as well.)
+      name: "bad signature - trailing whitespace suffix",
+      token: { claims: paidClaims(), signature: nonCanonicalSig("\t") },
       expectedReason: "bad_signature",
     },
     {
@@ -182,6 +234,16 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
       expect(tierAtLeast(result.tier, "team")).toBe(false);
     });
   }
+
+  it("the same signature bytes UNMODIFIED grant (non-canonical cases fail only on encoding)", () => {
+    const control = resolveEntitlement({
+      token: { claims: paidClaims(), signature: canonicalSig },
+      issuerPublicKey: issuer.publicKey,
+      now: NOW,
+    });
+    expect(control.granted).toBe(true);
+    expect(control.tier).toBe("fleet");
+  });
 
   it("denies an otherwise-valid token on a non-finite clock (NaN)", () => {
     // Regression: a NaN clock makes both `now < notBefore` and
