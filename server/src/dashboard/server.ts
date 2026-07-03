@@ -30,11 +30,13 @@ export interface DashboardServerOptions {
   approvals?: ApprovalHandlers;
   /**
    * Read-only fleet-roster provider for the wrap dashboard's fleet-roster
-   * panel (`GET /api/fleet/roster`). Forwarded verbatim onto the per-request
-   * `APIDeps`. When omitted the route serves the honest absent roster (no
-   * fabricated fleet). See `APIDeps.fleetRoster`.
+   * panel. Forwarded verbatim onto the per-request `APIDeps`, where it feeds
+   * BOTH `GET /api/fleet/roster` and the posture-route `GET /api/posture/fleet`
+   * that the posture-home fleet panel fetches. MAY be async (the wrap process
+   * reads the roster from disk). When omitted the routes serve the honest absent
+   * roster / 404 (no fabricated fleet). See `APIDeps.fleetRoster`.
    */
-  fleetRoster?: () => FleetRoster;
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
 }
 
 export interface DashboardHandle {

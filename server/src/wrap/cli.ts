@@ -75,6 +75,7 @@ import {
   PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
+import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -2257,6 +2258,26 @@ export async function runWrap(
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
+
+  // Fleet Console: wire the wrap ("Protect") dashboard's fleet-roster panel to
+  // the REAL, read-only, disk-backed federation projection. Without this the
+  // panel's `GET /api/posture/fleet` (and `GET /api/fleet/roster`) always read
+  // the honest-absent shape even when federation IS provisioned, so a real fleet
+  // was invisible on the wrap dashboard. The provider reads the at-rest fortress
+  // records (trust root + durable revocation projection) under the custody
+  // master; it is strictly read-only (no sync loop, no mutation, no key
+  // material) and resolved lazily per request so a post-start
+  // `sanctuary federation provision` is observed without a wrap restart. Only
+  // wired when custody is established (federation records are encrypted under the
+  // master key); otherwise the panel stays honestly absent.
+  const wrapFleetRoster =
+    wrapCustody !== undefined
+      ? buildWrapFleetRosterProvider({
+          storage: new FilesystemStorage(`${storagePath}/state`),
+          masterKey: wrapCustody.masterKey,
+        })
+      : undefined;
+
   const startFn: DashboardStarter =
     deps.startDashboard ??
     ((opts) =>
@@ -2266,6 +2287,7 @@ export async function runWrap(
         mode: opts.mode,
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
+        ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
       }));
   // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
   // distinct starting ports without both racing for 3501.

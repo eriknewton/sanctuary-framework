@@ -106,12 +106,18 @@ export interface APIDeps {
   supervisorStatus?: () => "wired" | "unwired" | "n/a";
   /**
    * Read-only fleet-roster provider for the wrap ("Protect") dashboard's
-   * fleet-roster panel (`GET /api/fleet/roster`). Returns the presenter output
-   * of `buildFleetRoster` over this process's federation read-seam.
+   * fleet-roster panel. Returns the presenter output of `buildFleetRoster` over
+   * this process's federation read-seam. Wired by the wrap CLI to a REAL,
+   * disk-backed provider (`buildWrapFleetRosterProvider`) that reads the at-rest
+   * fortress records; MAY be async because the wrap process runs no live
+   * federation daemon and resolves the roster by reading disk per request.
    *
-   * The dashboard owns the federation deps and the eviction-serial / operator-
-   * policy projection; this provider is the ONLY seam the route touches. It is
-   * strictly read-only: there is no admit/revoke/rotate route here (those are a
+   * The SAME provider feeds two consumers on this server: the standalone-parity
+   * `GET /api/fleet/roster` route AND the posture-route `GET /api/posture/fleet`
+   * that the already-served posture-home fleet panel fetches. Passing one
+   * provider to both keeps a single source of truth (no second trust path).
+   *
+   * Strictly read-only: there is no admit/revoke/rotate route here (those are a
    * later, deliberately separate slice), so the panel SEES and monitors the
    * fleet, it never manages trust. No key material crosses this seam - the
    * roster shape carries only public identifiers and posture metadata.
@@ -121,7 +127,7 @@ export interface APIDeps {
    * configured" shape - never a fabricated roster or a greyed-green "all
    * admitted" shell. It must report REAL federation state, never a guess.
    */
-  fleetRoster?: () => FleetRoster;
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
 }
 
 export interface DashboardSession {
@@ -285,6 +291,13 @@ export async function handleRequest(
           deps.sources.resolveBrokerPinnedProducerKey,
         brokerProducerKeyExpectedButUnavailable:
           deps.sources.brokerProducerKeyExpectedButUnavailable === true,
+        // Fleet Console: pass the SAME read-only fleet-roster provider the
+        // `/api/fleet/roster` route uses to the posture routes, so the already-
+        // served posture-home fleet panel (`GET /api/posture/fleet`) lights up
+        // on this wrap dashboard instead of 404ing. One provider, one trust
+        // path. Absent -> the posture route 404s and the panel stays hidden
+        // (honest "no fleet"), exactly as on an unfederated fortress.
+        ...(deps.fleetRoster ? { fleetRoster: deps.fleetRoster } : {}),
       },
       req,
       res,
@@ -487,7 +500,9 @@ export async function handleRequest(
   // `available: false`, empty nodes, all-zero summaries - never a fabricated
   // roster or a greyed-green "all admitted" shell over a fortress with no fleet.
   if (method === "GET" && path === "/api/fleet/roster") {
-    const roster = deps.fleetRoster ? deps.fleetRoster() : absentFleetRoster();
+    const roster = deps.fleetRoster
+      ? await deps.fleetRoster()
+      : absentFleetRoster();
     writeJSON(res, 200, roster);
     return true;
   }
