@@ -177,8 +177,13 @@ export interface PostureRouteDeps {
    * Resolved lazily per request so post-provision wiring is observed. When
    * ABSENT, the fleet route is disabled (404 within the namespace); additive,
    * so an unwired dashboard simply has no fleet panel rather than a broken one.
+   *
+   * MAY be async: the standalone daemon path resolves it synchronously from live
+   * in-memory federation deps, but the wrap ("Protect") dashboard resolves it by
+   * reading the at-rest fortress records (it runs no live federation daemon), so
+   * the route awaits whatever the closure returns.
    */
-  fleetRoster?: () => FleetRoster;
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
   /**
    * Castle Wall reach rules visible for the fortress. Phase 1 sources these
    * from the curated allowlist (the structured destination set the dashboard
@@ -856,7 +861,7 @@ async function buildUnwrapped(deps: PostureRouteDeps): Promise<UnwrappedRoster> 
  * caller has already guarded `deps.fleetRoster` non-null (404 otherwise).
  */
 async function buildFleet(deps: PostureRouteDeps): Promise<FleetRoster> {
-  const resolve = deps.fleetRoster as () => FleetRoster;
+  const resolve = deps.fleetRoster as () => FleetRoster | Promise<FleetRoster>;
   return (deps.auditLog as AuditLog).runEagerReads(async () => resolve());
 }
 

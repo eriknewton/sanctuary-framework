@@ -22,6 +22,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  absentFleetRoster,
   buildFleetRoster,
   FLEET_REACH_FRESHNESS_WINDOW_MS,
 } from "../../src/principal-policy/fleet-roster.js";
@@ -584,5 +585,65 @@ describe("buildFleetRoster - no key material on the roster shape", () => {
         "trust_state",
       ].sort(),
     );
+  });
+});
+
+describe("absentFleetRoster - the one honest 'no fleet' shape (no fabrication)", () => {
+  it("is available:false, enabled:false, empty, all-zero, and never green", () => {
+    const absent = absentFleetRoster();
+
+    expect(absent.available).toBe(false);
+    expect(absent.enabled).toBe(false);
+    expect(absent.fortress_id).toBeNull();
+    expect(absent.node_id).toBeNull();
+    expect(absent.eviction_serial).toBe(0);
+    expect(absent.nodes).toEqual([]);
+    // No fabricated "all admitted": every summary count is a hard zero, so
+    // nothing can render a greyed-green posture over an absent fleet.
+    expect(absent.summary).toEqual({
+      total: 0,
+      admitted: 0,
+      revoked: 0,
+      untrusted: 0,
+    });
+    expect(absent.sync_health.reachable).toBe(0);
+    expect(absent.sync_health.stale).toBe(0);
+    expect(absent.sync_health.never).toBe(0);
+    expect(absent.sync_health.oldest_last_sync).toBeNull();
+    // The distribution rail is unbuilt when there is no fleet: not available,
+    // no operator policy, all-zero rollup (unknown is never silently in-sync).
+    expect(absent.policy_distribution.available).toBe(false);
+    expect(absent.policy_distribution.operator_policy).toBeNull();
+    expect(absent.policy_distribution.summary).toEqual({
+      in_sync: 0,
+      drifted: 0,
+      unknown: 0,
+    });
+  });
+
+  it("is byte-identical to the unprovisioned-fortress path from buildFleetRoster", () => {
+    // The two absent paths MUST render the same shape so the panel never has to
+    // distinguish "federation seam present but unprovisioned" from "no seam at
+    // all". Both mean "no fleet"; the honest answer is identical.
+    const fromPresenter = buildFleetRoster(
+      deps({ context: null, nodes: [], isNodeRevoked: () => false }),
+      { now: () => NOW },
+    );
+    expect(JSON.stringify(fromPresenter)).toBe(
+      JSON.stringify(absentFleetRoster()),
+    );
+  });
+
+  it("carries no key material and no fabricated node", () => {
+    const serialized = JSON.stringify(absentFleetRoster()).toLowerCase();
+    for (const forbidden of [
+      "private",
+      "secret",
+      "privatekey",
+      "private_key",
+      "seed",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 });

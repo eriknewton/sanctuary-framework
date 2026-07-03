@@ -357,6 +357,50 @@ function buildPolicyDistribution(
 }
 
 /**
+ * The honest ABSENT roster: what a fortress with no fleet to present shows.
+ *
+ * This is the single source of truth for "there is no fleet here." Two paths
+ * MUST render it byte-identically so the panel never has to distinguish them:
+ *
+ *   1. `buildFleetRoster` when the fortress IS federation-capable but is not
+ *      provisioned (`getContext()` is null): there is a seam, but no root, so
+ *      there is no fleet.
+ *   2. The wrap ("Protect") dashboard's fleet-roster panel when this process has
+ *      NO federation read-seam wired at all (the common single-machine case):
+ *      there is nothing to present, so it presents the same honest absence.
+ *
+ * In both cases the operator has no fleet, so the honest answer is identical.
+ * This is the hard guarantee against a fabricated roster and against a
+ * greyed-green "all admitted" posture shell over a fortress with no federation:
+ * `available: false` + `enabled: false` + empty `nodes` + all-zero summaries is
+ * the ONLY absent shape. It is never green, carries no fabricated node, and
+ * carries no key material (there are no nodes to carry any).
+ */
+export function absentFleetRoster(
+  freshnessWindowMs: number = FLEET_REACH_FRESHNESS_WINDOW_MS,
+): FleetRoster {
+  return {
+    available: false,
+    enabled: false,
+    fortress_id: null,
+    node_id: null,
+    eviction_serial: 0,
+    nodes: [],
+    summary: { total: 0, admitted: 0, revoked: 0, untrusted: 0 },
+    // Honest zeros for an absent fleet: no nodes => no reach, and the
+    // distribution rail is unbuilt regardless of provisioning.
+    sync_health: {
+      reachable: 0,
+      stale: 0,
+      never: 0,
+      oldest_last_sync: null,
+      freshness_window_ms: freshnessWindowMs,
+    },
+    policy_distribution: buildPolicyDistribution([], null, false),
+  };
+}
+
+/**
  * Resolve the federation trust verdict for ONE node, fail-closed.
  *
  * The verdict comes from `deps.isNodeRevoked`, the same grow-only projection the
@@ -419,27 +463,11 @@ export function buildFleetRoster(
   const operatorPolicy = markerFromAppliedPolicy(options?.operatorPolicy);
 
   // Honest absence: an unprovisioned fortress has no fleet. Do not fabricate a
-  // green "all admitted" roster over a fortress with no federation root.
+  // green "all admitted" roster over a fortress with no federation root. This is
+  // the SAME shape the wrap dashboard's fleet-roster panel serves when no
+  // federation seam is wired at all, so the two absent paths stay byte-identical.
   if (ctx === null) {
-    return {
-      available: false,
-      enabled: false,
-      fortress_id: null,
-      node_id: null,
-      eviction_serial: 0,
-      nodes: [],
-      summary: { total: 0, admitted: 0, revoked: 0, untrusted: 0 },
-      // Honest zeros for an absent fleet: no nodes => no reach, and the
-      // distribution rail is unbuilt regardless of provisioning.
-      sync_health: {
-        reachable: 0,
-        stale: 0,
-        never: 0,
-        oldest_last_sync: null,
-        freshness_window_ms: freshnessWindowMs,
-      },
-      policy_distribution: buildPolicyDistribution([], null, false),
-    };
+    return absentFleetRoster(freshnessWindowMs);
   }
 
   const enabled = deps.isEnabled();

@@ -19,6 +19,7 @@ import type {
 import { handleRequest, type ApprovalHandlers, type StreamEvent } from "./api.js";
 import { sendCaughtError } from "../http/error-envelope.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
+import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export interface DashboardServerOptions {
   port?: number;
@@ -27,6 +28,15 @@ export interface DashboardServerOptions {
   mode: "co-located" | "standalone";
   sources: AggregatorSources;
   approvals?: ApprovalHandlers;
+  /**
+   * Read-only fleet-roster provider for the wrap dashboard's fleet-roster
+   * panel. Forwarded verbatim onto the per-request `APIDeps`, where it feeds
+   * BOTH `GET /api/fleet/roster` and the posture-route `GET /api/posture/fleet`
+   * that the posture-home fleet panel fetches. MAY be async (the wrap process
+   * reads the roster from disk). When omitted the routes serve the honest absent
+   * roster / 404 (no fabricated fleet). See `APIDeps.fleetRoster`.
+   */
+  fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
 }
 
 export interface DashboardHandle {
@@ -176,6 +186,7 @@ export async function startDashboardServer(
         onEvent,
         v11Bindings,
         loopbackAutoAuth: v11LoopbackAutoAuth,
+        fleetRoster: options.fleetRoster,
       };
       const served = await handleRequest(deps, req, res);
       if (!served) {
