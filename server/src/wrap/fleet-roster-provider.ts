@@ -40,11 +40,16 @@
  *      operator on/off switch is a live daemon flag this read-only process
  *      cannot observe, so the panel shows "Fleet off" rather than claiming the
  *      operator turned it on.
- *   4. The durable sync-state record is PRESENT-BUT-CORRUPT (at-rest tamper) ->
- *      `isNodeRevoked` THROWS, which `buildFleetRoster`/`resolveTrust` fail-close
- *      to `untrusted`. Because the node list is empty here that path carries no
- *      node today, but the fail-closed contract is wired so a future durable
- *      roster cannot silently launder a node to `admitted` over a corrupt record.
+ *   4. The durable sync-state record is PRESENT-BUT-CORRUPT (at-rest tamper /
+ *      decrypt / decode failure) -> the whole roster is UNAVAILABLE
+ *      (`absentFleetRoster()` / `available: false`), NOT `available: true`. A
+ *      corrupt revocation projection means the fleet's trust standing is
+ *      UNREADABLE, so the honest answer is "cannot show the fleet" (fail closed),
+ *      never a green-looking "Fleet off / no machines" panel that reads as
+ *      fine-but-empty over an unreadable record. This is the SAME honest
+ *      `available: false` shape as unprovisioned / mid-rotation; the panel does
+ *      not distinguish "no fleet" from "fleet unreadable" because both mean the
+ *      operator has no proven fleet to act on.
  *
  * The provider closure is resolved lazily per request by the route, so a
  * federation that is provisioned AFTER the wrap dashboard started is observed on
@@ -54,14 +59,16 @@
 import type { StorageBackend } from "../storage/interface.js";
 import type {
   FederationContext,
-  FederationEvent,
   V1FederationDeps,
 } from "../v1/federation.js";
 import { FederationSyncStateStore } from "../v1/federation-sync-state-store.js";
 import { federationRotateRootInProgress } from "../mesh/federation-rotate-root.js";
 import { provisionOrLoadFederationTrustRoot } from "../mesh/federation-trust-root-store.js";
 import { loadFederationJoinerTrustRoot } from "../mesh/federation-joiner-trust-root-store.js";
-import { provisionOrLoadOperatorCloudJoinedNode } from "../mesh/operator-cloud-joined-node-store.js";
+import {
+  OperatorCloudJoinedNodeStore,
+  operatorCloudContextFromRecord,
+} from "../mesh/operator-cloud-joined-node-store.js";
 import {
   absentFleetRoster,
   buildFleetRoster,
@@ -84,20 +91,44 @@ interface WrapReadContext {
 
 /**
  * A read-only projection of the durable federation state the wrap process can
- * honestly read from disk. `null` when federation is not provisioned (or held
- * off during a root rotation) - the caller renders the honest absent roster.
+ * honestly read from disk. Only ever constructed when BOTH the trust root AND
+ * the durable sync-state record loaded cleanly, so every field is proven-real:
+ * `revokedNodeIds` is the successfully-decoded grow-only projection, never a
+ * fail-closed placeholder. A corrupt sync-state does NOT produce this shape (see
+ * {@link loadWrapFederationReadState}, which returns `"unavailable"` instead).
+ *
+ * Exported ONLY so the read-only-deps fail-loud contract can be unit-tested; it
+ * is not part of the wrap dashboard's public surface.
  */
-interface WrapFederationReadState {
+export interface WrapFederationReadState {
   context: WrapReadContext;
-  /**
-   * The durable revoked-node set from the sync-state record, or `null` when the
-   * record is PRESENT-BUT-CORRUPT. `null` latches fail-closed: `isNodeRevoked`
-   * throws so any node fail-closes to `untrusted`, never silently `admitted`.
-   */
-  revokedNodeIds: Set<string> | null;
+  /** The durable, successfully-decoded revoked-node set. Never a placeholder. */
+  revokedNodeIds: Set<string>;
   evictionSerial: number;
   operatorPolicy: FederationAppliedPolicyVersion | null;
 }
+
+/**
+ * The three honest outcomes of a read-only federation load:
+ *
+ *   - `WrapFederationReadState` -> federation is provisioned AND its durable
+ *     sync-state read cleanly; the caller builds the real provisioned roster.
+ *   - `"absent"` -> federation is not provisioned, or held off mid root-rotation;
+ *     the caller renders the honest absent roster.
+ *   - `"unavailable"` -> federation IS provisioned but its durable sync-state
+ *     record is PRESENT-BUT-CORRUPT (at-rest tamper / decrypt / decode failure).
+ *     The fleet's trust standing is UNREADABLE, so the caller fails CLOSED and
+ *     renders the same `available: false` shape rather than a green-looking
+ *     "Fleet off / no machines" panel over an unreadable record.
+ *
+ * `"absent"` and `"unavailable"` both render `available: false`; they are kept
+ * distinct in the loader so the fail-closed reason is explicit at the call site
+ * (and so a future surface could disclose "unreadable" separately if desired).
+ */
+type WrapFederationReadOutcome =
+  | WrapFederationReadState
+  | "absent"
+  | "unavailable";
 
 /**
  * Load the read-only federation state from the at-rest records, mirroring the
@@ -106,11 +137,11 @@ interface WrapFederationReadState {
 async function loadWrapFederationReadState(
   storage: StorageBackend,
   masterKey: Uint8Array,
-): Promise<WrapFederationReadState | null> {
+): Promise<WrapFederationReadOutcome> {
   // A rotate-root journal means the signing master is mid-rotation: a
   // half-rotated root must NEVER serve. Report absent (fail closed) until the
   // operator completes `sanctuary federation rotate-root --resume`.
-  if (await federationRotateRootInProgress(storage)) return null;
+  if (await federationRotateRootInProgress(storage)) return "absent";
 
   // Load-only trust-root resolution, in the same precedence the daemon uses:
   // issuer, then local joiner, then operator_cloud joined-node. Absence at every
@@ -135,60 +166,99 @@ async function loadWrapFederationReadState(
         nodeId: joiner.context.nodeId,
       };
     } else {
-      const operatorCloud = await provisionOrLoadOperatorCloudJoinedNode({
-        storage,
-        masterKey,
-      });
-      if (operatorCloud !== null) {
-        context = {
-          fortressId: operatorCloud.context.fortressId,
-          nodeId: operatorCloud.context.nodeId,
-        };
+      // Operator-cloud tier, LOAD-ONLY BY CONSTRUCTION. We call the store's
+      // `load()` primitive directly rather than `provisionOrLoadOperatorCloudJoinedNode`
+      // so that read-only intent is STRUCTURAL, not merely a comment: even if a
+      // future change gave the `provisionOrLoad*` wrapper a provision/mint path
+      // (the way `provisionOrLoadFederationTrustRoot` mints when `mint: true`),
+      // this read-only GET could never reach it. `OperatorCloudJoinedNodeStore.load()`
+      // only ever calls `storage.read` (proven above), so a read against an EMPTY
+      // or PARTIAL store creates or modifies nothing. Absence -> null (federation
+      // honestly off at this tier); a present-but-corrupt joined-node blob THROWS,
+      // which we fail-close to `"unavailable"` (federation is provisioned-shaped
+      // but its trust anchor is unreadable), never a silently-minted replacement.
+      try {
+        const operatorCloudRecord = await new OperatorCloudJoinedNodeStore(
+          storage,
+          masterKey,
+        ).load();
+        // Derive the context INSIDE the try: `operatorCloudContextFromRecord`
+        // re-runs `validateJoinedNodeRecord`, so a record that decoded but fails
+        // the pinned-master cert-chain / issuer-field checks must ALSO fail
+        // closed here, never propagate an uncaught exception out of the provider.
+        if (operatorCloudRecord !== null) {
+          const operatorCloudContext =
+            operatorCloudContextFromRecord(operatorCloudRecord);
+          context = {
+            fortressId: operatorCloudContext.fortressId,
+            nodeId: operatorCloudContext.nodeId,
+          };
+        }
+      } catch {
+        // Present-but-unreadable operator-cloud trust anchor (corrupt / tampered
+        // / cross-operator): federation is provisioned-shaped but its anchor is
+        // unprovable. Fail closed, never a silently-minted replacement.
+        return "unavailable";
       }
     }
   }
 
-  if (context === null) return null;
+  if (context === null) return "absent";
 
   // Durable folded revocation projection + eviction serial + operator policy.
-  // A present-but-corrupt record latches `revokedNodeIds: null` so trust
-  // fail-closes; a genuinely fresh (absent) record loads an empty projection and
-  // serves normally.
-  let revokedNodeIds: Set<string> | null;
-  let evictionSerial = 0;
-  let operatorPolicy: FederationAppliedPolicyVersion | null = null;
+  // A genuinely fresh (absent) record loads an empty projection and serves
+  // normally. A PRESENT-BUT-CORRUPT record THROWS `FederationSyncStateStoreError`:
+  // the fleet's trust standing is unreadable, so we fail CLOSED to `"unavailable"`
+  // (the whole roster reports `available: false`) rather than serving an
+  // `available: true` roster over an unreadable revocation projection.
   try {
     const snapshot = await new FederationSyncStateStore({
       storage,
       masterKey,
     }).load();
-    revokedNodeIds = snapshot.revokedNodeIds;
-    evictionSerial = snapshot.highestEvictionSerial;
-    operatorPolicy = snapshot.operatorPolicy;
+    return {
+      context,
+      revokedNodeIds: snapshot.revokedNodeIds,
+      evictionSerial: snapshot.highestEvictionSerial,
+      operatorPolicy: snapshot.operatorPolicy,
+    };
   } catch {
-    // Present-but-corrupt sync-state: fail closed. Federation stays provisioned
-    // (context is real) but trust is unprovable, so `isNodeRevoked` throws.
-    revokedNodeIds = null;
+    return "unavailable";
   }
-
-  return { context, revokedNodeIds, evictionSerial, operatorPolicy };
 }
 
 /**
  * A minimal, strictly READ-ONLY `V1FederationDeps` for the fleet-roster
- * presenter. Only the four read methods `buildFleetRoster` calls
- * (`getContext`, `isEnabled`, `listNodes`, `isNodeRevoked`) do real work; every
- * mutation / signing / sync method THROWS so a mis-wire is loud, never a silent
- * fabrication. The wrap process has no live node roster, so `listNodes` is
- * empty by construction.
+ * presenter. EXACTLY the four read methods `buildFleetRoster` calls
+ * (`getContext`, `isEnabled`, `listNodes`, `isNodeRevoked`) do real work; EVERY
+ * OTHER method throws the SAME shared `notReadOnly()` error so a mis-wire is
+ * LOUD (a thrown mustNotCall), never a silent no-op or a fabricated empty/null
+ * that could quietly launder a wrong roster. The wrap process has no live node
+ * roster, so `listNodes` is empty by construction.
+ *
+ * The allow-list is deliberately narrow: only a method PROVEN to be called by
+ * the presenter (verified against `buildFleetRoster` / `resolveTrust` in
+ * ../principal-policy/fleet-roster.ts, which touches only those four) and safe
+ * to answer read-only is exempted from the throw. Nothing here signs, mutates,
+ * appends events, advances a high-water, renews a cert, or discloses posture;
+ * all of those throw. `isRootRevoked` is NOT called by the presenter, so it
+ * throws too (it is not one of the four) - a read-only wrap process cannot
+ * evaluate root revocation, and failing loud is safer than a fail-closed `false`
+ * that some future caller might read as "root known-good".
+ *
+ * Exported ONLY so the fail-loud enumeration can be unit-tested; it is not part
+ * of the wrap dashboard's public surface.
  */
-function readOnlyFederationDeps(state: WrapFederationReadState): V1FederationDeps {
+export function readOnlyFederationDeps(
+  state: WrapFederationReadState,
+): V1FederationDeps {
   const notReadOnly = (): never => {
     throw new Error(
-      "wrap fleet-roster provider is read-only: no mutation/sync/sign method may be called",
+      "wrap fleet-roster provider is read-only: only getContext/isEnabled/listNodes/isNodeRevoked may be called",
     );
   };
   return {
+    // ── The FOUR presenter reads (the only intentionally-allowed methods). ──
     // The presenter reads ONLY `fortressId` / `nodeId` off the context (plus
     // its non-null-ness to mean "provisioned"); it never touches the live join
     // `approver` or any signing material. Narrowed to `WrapReadContext` above
@@ -202,33 +272,27 @@ function readOnlyFederationDeps(state: WrapFederationReadState): V1FederationDep
     // other machines are currently visible. The presenter renders the empty
     // state, never a fabricated node.
     listNodes: () => [],
-    // Fail-closed: a corrupt sync-state record (revokedNodeIds === null) throws,
-    // so any node fail-closes to `untrusted`. Never silently `admitted`.
-    isNodeRevoked: (nodeId: string): boolean => {
-      if (state.revokedNodeIds === null) {
-        throw new Error(
-          "federation revocation state unavailable (durable record corrupt)",
-        );
-      }
-      return state.revokedNodeIds.has(nodeId);
-    },
-    // Root-revocation is likewise unprovable read-only: fail closed (deny).
-    isRootRevoked: (): boolean => {
-      throw new Error("federation root-revocation state not evaluated read-only");
-    },
-    // ── Everything below is mutation / signing / sync: never called by the
-    // presenter. Throwing keeps a mis-wire loud rather than silently wrong. ──
+    // The durable, successfully-decoded revoked-node set. A corrupt sync-state
+    // never reaches here: it fails closed to `"unavailable"` in the loader BEFORE
+    // any roster is built, so `state.revokedNodeIds` is always the real projection.
+    isNodeRevoked: (nodeId: string): boolean => state.revokedNodeIds.has(nodeId),
+    // ── EVERYTHING BELOW is NOT one of the four presenter reads. Each throws the
+    // shared notReadOnly() so a mis-wire is loud, never silently wrong. This
+    // includes read-shaped methods (isRootRevoked, resolveOperatorPublicKey,
+    // rosterNodeIds, listFederationEvents, acceptedHighWaterFor, federationPosture)
+    // AND the mutation/sign/sync methods: none is on the proven presenter path. ──
+    isRootRevoked: notReadOnly,
     setEnabled: notReadOnly,
-    resolveOperatorPublicKey: () => null,
-    audit: async () => {},
-    rosterNodeIds: () => [],
+    resolveOperatorPublicKey: notReadOnly,
+    audit: notReadOnly,
+    rosterNodeIds: notReadOnly,
     recordJoin: notReadOnly,
-    listFederationEvents: (): FederationEvent[] => [],
+    listFederationEvents: notReadOnly,
     appendFederationEvents: notReadOnly,
-    acceptedHighWaterFor: () => null,
+    acceptedHighWaterFor: notReadOnly,
     recordAcceptedHighWater: notReadOnly,
     nextOutboundHighWater: notReadOnly,
-    renewLocalNodeCertificate: () => {},
+    renewLocalNodeCertificate: notReadOnly,
     issueReissueChallenge: notReadOnly,
     consumeReissueChallenge: notReadOnly,
     federationPosture: notReadOnly,
@@ -242,23 +306,31 @@ function readOnlyFederationDeps(state: WrapFederationReadState): V1FederationDep
  * disk reads) happens per call so a post-start `sanctuary federation provision`
  * is observed without a wrap restart; the reads are small, local, and cheap.
  *
- * Every path returns a real, honest roster: absent when unprovisioned or
- * mid-rotation, the provisioned shape (with an empty node list) otherwise. It
- * never fabricates a roster and never renders green from absence.
+ * Every path returns a real, honest roster: the `available: false` absent shape
+ * when unprovisioned, mid-rotation, OR when the durable sync-state is present
+ * but corrupt (fail closed - unreadable trust standing is never shown green);
+ * the provisioned shape (with an empty node list) only when the trust root AND
+ * sync-state both read cleanly. It never fabricates a roster and never renders
+ * green from absence or from an unreadable record.
  */
 export function buildWrapFleetRosterProvider(params: {
   storage: StorageBackend;
   masterKey: Uint8Array;
 }): () => Promise<FleetRoster> {
   return async (): Promise<FleetRoster> => {
-    const state = await loadWrapFederationReadState(
+    const outcome = await loadWrapFederationReadState(
       params.storage,
       params.masterKey,
     );
-    if (state === null) return absentFleetRoster();
-    return buildFleetRoster(readOnlyFederationDeps(state), {
-      evictionSerial: state.evictionSerial,
-      operatorPolicy: state.operatorPolicy,
+    // "absent" (not provisioned / mid-rotation) AND "unavailable" (provisioned
+    // but the durable sync-state is corrupt) BOTH fail closed to the honest
+    // `available: false` roster. Only a fully-clean read builds the real one.
+    if (outcome === "absent" || outcome === "unavailable") {
+      return absentFleetRoster();
+    }
+    return buildFleetRoster(readOnlyFederationDeps(outcome), {
+      evictionSerial: outcome.evictionSerial,
+      operatorPolicy: outcome.operatorPolicy,
     });
   };
 }
