@@ -29,6 +29,17 @@ import type { ActivityRecord, DmswitchConfig, RecoveryEvent } from "./types.js";
  * Validate a DMswitch configuration.
  */
 export function validateDmswitchConfig(config: DmswitchConfig): void {
+  // Fail-closed finiteness gate: the window feeds directly into the DMswitch
+  // arithmetic (elapsed_ms >= window_ms). A non-finite window (NaN/Infinity) or
+  // a below-minimum/zero window would let the switch fire immediately or behave
+  // undefined, so reject it here BEFORE any comparison rather than assuming the
+  // config was screened upstream. This runs first so the minimum/maximum checks
+  // below operate only on finite numbers.
+  if (!Number.isFinite(config.max_offline_window_ms)) {
+    throw new RecoveryConfigError(
+      `max_offline_window_ms must be a finite number; got ${config.max_offline_window_ms}`
+    );
+  }
   if (config.max_offline_window_ms < MIN_DMSWITCH_WINDOW_MS) {
     throw new RecoveryConfigError(
       `max_offline_window_ms (${config.max_offline_window_ms}) is below the minimum ${MIN_DMSWITCH_WINDOW_MS}ms (7 days)`

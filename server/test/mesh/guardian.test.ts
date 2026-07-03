@@ -420,13 +420,20 @@ describe("shared-public-key quorum collapse: fail closed", () => {
         guardian_private_key: shared.private_key,
       })
     );
+    // After the A3 follow-up shape gate, verifyGuardianQuorum runs
+    // validateRosterShape first, so this shared-key roster (duplicate canonical
+    // keys) is rejected wholesale as a malformed roster BEFORE the per-key
+    // quorum counter runs, a strictly stronger fail-closed rejection than the
+    // earlier per-key GuardianQuorumError. GuardianRosterError and
+    // GuardianQuorumError both extend GuardianError; the rejection is now a
+    // roster-shape error because the roster, not the proof, is malformed.
     expect(() =>
       verifyGuardianQuorum({
         input,
         proof: { roster_version: roster.version, signatures: sigs },
         pinned_roster: roster,
       })
-    ).toThrow(GuardianQuorumError);
+    ).toThrow(GuardianRosterError);
   });
 });
 
@@ -533,13 +540,187 @@ describe("non-canonical shared-public-key quorum collapse: fail closed", () => {
         guardian_private_key: shared.private_key,
       })
     );
+    // After the A3 follow-up shape gate, the non-canonical shared-key roster
+    // (three spellings collapsing to one canonical key) is rejected at
+    // validateRosterShape as a malformed roster before the per-key quorum
+    // counter, a strictly stronger fail-closed rejection surfaced as
+    // GuardianRosterError (roster malformed, not proof).
     expect(() =>
       verifyGuardianQuorum({
         input,
         proof: { roster_version: roster.version, signatures: sigs },
         pinned_roster: roster,
       })
-    ).toThrow(GuardianQuorumError);
+    ).toThrow(GuardianRosterError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: malformed pinned roster fails closed at verifyGuardianQuorum
+// (A3 harden 2026-07-04)
+//
+// verifyGuardianQuorum compared proof.signatures.length and validCount against
+// an UNVALIDATED roster.m/roster.n. A master-signed but structurally degenerate
+// roster (m=0,n=1) let the empty-signature path succeed: `0 < 0` (length < m) is
+// false, the signature loop is empty, and `validCount(0) < m(0)` is false, so
+// the quorum "verified" with ZERO guardian signatures. The fix runs
+// validateRosterShape at the START of verifyGuardianQuorum, so any malformed
+// pinned roster throws GuardianRosterError before any threshold comparison.
+// Each test FAILS before the shape gate (quorum returns success / wrong error)
+// and PASSES after (throws GuardianRosterError). GuardianRosterError and
+// GuardianQuorumError both extend GuardianError; the roster-shape violation
+// surfaces as the roster error because the roster, not the proof, is malformed.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("malformed pinned roster: verifyGuardianQuorum fails closed", () => {
+  // Forge a master-signed roster with an arbitrary (possibly invalid) shape.
+  // The master_signature is genuine over the body, so any rejection is on shape,
+  // not on the signature, proving the shape gate itself is the closed boundary.
+  function forgeRoster(
+    fortress: ReturnType<typeof makeFortress>,
+    body: {
+      m: number;
+      n: number;
+      guardians: GuardianIdentity[];
+    }
+  ): ReturnType<typeof issueGuardianRoster> {
+    const full = {
+      m: body.m,
+      n: body.n,
+      guardians: body.guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(full), fortress.private_key);
+    return { ...full, master_signature: toBase64url(sig) };
+  }
+
+  function buildInput(
+    fortress: ReturnType<typeof makeFortress>
+  ): MasterRotationQuorumInput {
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    return {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+  }
+
+  it("m=0 with an empty proof does NOT verify (the empty-signature success path is closed)", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    // Degenerate roster: m=0, n=1, one real guardian. Pre-fix an empty proof
+    // whose roster_version matches slipped through with zero signatures.
+    const roster = forgeRoster(fortress, {
+      m: 0,
+      n: 1,
+      guardians: [g0.identity],
+    });
+    const input = buildInput(fortress);
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("m>n fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    const roster = forgeRoster(fortress, {
+      m: 2,
+      n: 1,
+      guardians: [g0.identity],
+    });
+    const input = buildInput(fortress);
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("guardians.length !== n fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("g0");
+    const g1 = makeGuardian("g1");
+    // n claims 3 but only 2 guardians listed.
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 3,
+      guardians: [g0.identity, g1.identity],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "g0",
+      guardian_private_key: g0.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("duplicate guardian_id in the roster fails closed", () => {
+    const fortress = makeFortress();
+    const g0 = makeGuardian("dup");
+    const g1 = makeGuardian("dup"); // same id, distinct key
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 2,
+      guardians: [g0.identity, g1.identity],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "dup",
+      guardian_private_key: g0.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("duplicate canonical public key in the roster fails closed", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g0");
+    const roster = forgeRoster(fortress, {
+      m: 1,
+      n: 2,
+      guardians: [
+        { ...shared.identity, guardian_id: "g0" },
+        { ...shared.identity, guardian_id: "g1" },
+      ],
+    });
+    const input = buildInput(fortress);
+    const sig = signMasterRotationAsGuardian({
+      input,
+      guardian_id: "g0",
+      guardian_private_key: shared.private_key,
+    });
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: [sig] },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianRosterError);
   });
 });
 

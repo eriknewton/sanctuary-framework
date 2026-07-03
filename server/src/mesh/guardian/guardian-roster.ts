@@ -300,6 +300,18 @@ export function verifyGuardianQuorum(params: {
   pinned_roster: GuardianRoster;
 }): void {
   const { input, proof, pinned_roster: roster } = params;
+  // Fail-closed shape gate: this evaluator compares proof.signatures.length and
+  // validCount against roster.m/roster.n, so a structurally invalid pinned
+  // roster must be rejected BEFORE any threshold comparison, not assumed to have
+  // been screened at issuance. A degenerate roster (m=0, or m>n, or
+  // guardians.length !== n, or duplicate ids/keys) would otherwise let the
+  // empty-signature path pass: with m=0 and an empty proof, `0 < 0` is false and
+  // `validCount(0) < m(0)` is false, returning success with zero guardian
+  // signatures. validateRosterShape is the SAME shape contract issuance enforces;
+  // running it first closes this class at the boundary for the master-rotation
+  // quorum path (the recovery threshold path guards with the same contract via
+  // isValidRosterShape). Throws GuardianRosterError on any violation.
+  validateRosterShape({ m: roster.m, n: roster.n, guardians: roster.guardians });
   if (proof.roster_version !== roster.version) {
     throw new GuardianQuorumError(
       `quorum proof roster_version=${proof.roster_version} != pinned roster version=${roster.version}`

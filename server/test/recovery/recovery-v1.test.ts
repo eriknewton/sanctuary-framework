@@ -1839,6 +1839,136 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     expect(cascade.dmswitch_trigger).toBeUndefined();
     expect(store.list().length).toBe(1);
   });
+
+  // -----------------------------------------------------------------
+  // Regression (A3 harden 2026-07-04): the DMswitch gate consumed a
+  // DmswitchConfig without validating it, so a below-minimum / zero /
+  // non-finite window made evaluateDmswitch return triggered=true immediately
+  // (elapsed_ms >= 0) and a DMswitch cascade was created + stored before the
+  // 7-day minimum absence window. The fix runs validateDmswitchConfig at the
+  // cascade-creation gate (initiateCascade) and at the initRecovery entry-event
+  // gate, BEFORE any window arithmetic. These tests FAIL before the guard (a
+  // cascade is created/stored) and PASS after (RecoveryConfigError, nothing
+  // stored).
+  // -----------------------------------------------------------------
+
+  it("initiateCascade rejects a zero-window DMswitch config and creates no cascade", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // Operator active seconds ago. A zero window makes elapsed_ms >= 0 true, so
+    // pre-fix evaluateDmswitch reported triggered and a cascade was built before
+    // the mandatory minimum window. Post-fix the config is rejected first.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initiateCascade rejects a below-minimum (1-day) DMswitch window", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // 8 days of absence against a 1-day window would trigger, but 1 day is below
+    // the 7-day minimum, so the config must be rejected before the arithmetic.
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initiateCascade rejects a non-finite DMswitch window", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.NaN,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("initRecovery rejects a below-minimum DMswitch window, emitting no entry event and storing no cascade", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          // Below the 7-day minimum: pre-fix this fired the switch and stored a
+          // DMswitch cascade before the mandatory window. Post-fix it fails
+          // closed at the entry-event gate before any arithmetic.
+          max_offline_window_ms: 0,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    const activity = buildActivity(5_000);
+
+    expect(() =>
+      initRecovery({ ctx, action: "key_rotation", last_activity: activity })
+    ).toThrow(RecoveryConfigError);
+
+    // No cascade was persisted and no DMswitch cascade exists to drive to
+    // execution.
+    expect(store.list().length).toBe(0);
+    expect(store.listActive().length).toBe(0);
+  });
+
+  it("validateDmswitchConfig rejects a non-finite window directly (finiteness gate)", () => {
+    expect(() =>
+      validateDmswitchConfig({
+        max_offline_window_ms: Number.POSITIVE_INFINITY,
+        estate_planning_enabled: false,
+      })
+    ).toThrow(RecoveryConfigError);
+    expect(() =>
+      validateDmswitchConfig({
+        max_offline_window_ms: Number.NaN,
+        estate_planning_enabled: false,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
 });
 
 // ===================================================================

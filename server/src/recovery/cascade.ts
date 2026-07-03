@@ -17,7 +17,7 @@ import {
   type CascadeStateCode,
   type RecoveryAction,
 } from "./constants.js";
-import { evaluateDmswitch } from "./dmswitch.js";
+import { evaluateDmswitch, validateDmswitchConfig } from "./dmswitch.js";
 import {
   CascadeStateError,
   ThresholdNotMetError,
@@ -96,6 +96,16 @@ export function initiateCascade(params: {
 
   let dmswitch_trigger: CascadeState["dmswitch_trigger"];
   if (params.dmswitch_trigger) {
+    // Fail-closed config gate: the DMswitch window feeds the trigger arithmetic
+    // (elapsed_ms >= window_ms). A below-minimum, zero, or non-finite window
+    // would make the switch fire immediately, letting a DMswitch-attributed
+    // cascade reach awaiting_threshold and execute before the mandatory absence
+    // window elapses. Validate the config at this gate BEFORE evaluateDmswitch,
+    // so an out-of-range window throws RecoveryConfigError and no cascade is
+    // created or stored. This is the same shape contract emitCascadeEntry's
+    // callers must honor; running it here closes the class at the cascade-
+    // creation boundary.
+    validateDmswitchConfig(params.dmswitch_trigger.config);
     const evaluation = evaluateDmswitch({
       last_activity: params.dmswitch_trigger.last_activity,
       config: params.dmswitch_trigger.config,
