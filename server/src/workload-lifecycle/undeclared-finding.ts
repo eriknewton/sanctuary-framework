@@ -265,9 +265,15 @@ export interface UndeclaredFindingTrust {
    */
   trustedPublicKey?: string | Uint8Array;
   /**
-   * The expected signer kid. When set, the finding's bound `signer_kid` MUST
-   * match it, so a bundle from an unexpected signer identity is rejected even if
-   * self-consistent.
+   * The expected signer kid. This is an ADJUNCT to `trustedPublicKey`, never a
+   * standalone trust input: `signer_kid` is attacker-controlled (it is copied
+   * into the signed body, so a forger self-signs it to any value they like).
+   * Pinning a kid WITHOUT also pinning `trustedPublicKey` is therefore rejected
+   * outright (fail-closed) rather than performing a kid-only check against the
+   * self-declared key, which would give false forgery-assurance. When both are
+   * set, the finding's bound `signer_kid` MUST match it, so a bundle from an
+   * unexpected signer identity is rejected even when it verifies under the
+   * pinned key.
    */
   expectedSignerKid?: string;
 }
@@ -297,7 +303,11 @@ export interface UndeclaredFindingTrust {
  * when `trust.expectedSignerKid` is set the bound `signer_kid` must equal it.
  * This closes the self-signed-forgery fail-open (a forged suppression finding
  * minted under an attacker key is rejected because it does not verify under the
- * pinned key).
+ * pinned key). `expectedSignerKid` is only ever an ADJUNCT to `trustedPublicKey`,
+ * never the sole trust input: because `signer_kid` is attacker-controlled,
+ * pinning a kid WITHOUT a trusted key would only compare the forger's
+ * self-declared kid and still verify against the forger's own key, giving false
+ * forgery-assurance. That combination is therefore rejected outright.
  */
 export function verifyUndeclaredFinding(
   finding: SignedUndeclaredFinding,
@@ -329,6 +339,17 @@ export function verifyUndeclaredFinding(
     // (c) FIX 4 expected-signer pinning. An expected kid must match the bound
     // signer_kid; a pinned trusted key REPLACES the caller's key for the check,
     // so the envelope's self-declared public_key cannot authenticate a forgery.
+    //
+    // `expectedSignerKid` is an ADJUNCT to `trustedPublicKey`, never standalone:
+    // `signer_kid` is attacker-controlled (a forger self-signs it to the victim
+    // kid), so a kid-only check against the self-declared key gives false
+    // forgery-assurance. Fail closed if a kid is pinned without a trusted key.
+    if (
+      trust?.expectedSignerKid !== undefined &&
+      trust.trustedPublicKey === undefined
+    ) {
+      return false;
+    }
     if (
       trust?.expectedSignerKid !== undefined &&
       body.signer_kid !== trust.expectedSignerKid

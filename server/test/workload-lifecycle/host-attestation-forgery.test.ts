@@ -144,6 +144,55 @@ describe("host attestation: FORGED seal is rejected (class 1)", () => {
     ).toBe(false);
   });
 
+  it("expectedSignerKid ALONE (no trusted key) is REJECTED for a same-kid self-signed forgery (fail-closed)", () => {
+    // The API footgun: `expectedSignerKid` reads as an origin-auth pin, but on
+    // its own it only compares the attacker-controlled `signer_kid`. The attacker
+    // sets body.signer_kid to the victim kid, self-signs under their OWN key, and
+    // (before the fix) `{expectedSignerKid:'victim'}` with NO trustedPublicKey
+    // returned true because the kid matched and the signature was checked against
+    // the self-declared attacker key. Fail-closed: a kid pinned WITHOUT a trusted
+    // key is now rejected outright, so `expectedSignerKid` can never be the sole
+    // trust input.
+    const forged = forgeAttestation(forgedBody());
+    // The forged envelope self-declares the victim kid.
+    expect(forged.body.signer_kid).toBe("victim-fortress-signer");
+    // BEFORE the fix this returned true (false forgery-assurance); AFTER it is
+    // rejected because a kid is pinned with no trusted key.
+    expect(
+      verifyHostWorkloadAttestation(forged, forged.public_key, {
+        expectedSignerKid: "victim-fortress-signer",
+      }),
+    ).toBe(false);
+  });
+
+  it("trustedPublicKey + matching expectedSignerKid still ACCEPTS a genuine bundle (adjunct behavior preserved)", async () => {
+    const auditLog = newAuditLog();
+    const signer = makeSigner("fortress-1-signer");
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const att = await buildHostWorkloadAttestation({
+      registry,
+      signer,
+      fortressId: "fortress-1",
+      now: new Date(1_700_000_900_000).toISOString(),
+    });
+    // Both pins present and correct: accepted.
+    expect(
+      verifyHostWorkloadAttestation(att, att.public_key, {
+        trustedPublicKey: signer.publicKey,
+        expectedSignerKid: "fortress-1-signer",
+      }),
+    ).toBe(true);
+    // Trusted key present but the pinned kid does not match: rejected.
+    expect(
+      verifyHostWorkloadAttestation(att, att.public_key, {
+        trustedPublicKey: signer.publicKey,
+        expectedSignerKid: "some-other-kid",
+      }),
+    ).toBe(false);
+    // The plain 2-arg form is unchanged: self-consistency verifies.
+    expect(verifyHostWorkloadAttestation(att, att.public_key)).toBe(true);
+  });
+
   it("sealHostAttestation REFUSES to bind a forged attestation when given the trusted key (fail-closed)", async () => {
     const auditLog = newAuditLog();
     const trusted = makeSigner("victim-fortress-signer");
@@ -312,6 +361,80 @@ describe("undeclared finding: forged suppression is rejected (class 3)", () => {
         trustedPublicKey: trusted.publicKey,
       }),
     ).toBe(false);
+  });
+
+  it("expectedSignerKid ALONE (no trusted key) is REJECTED for a same-kid self-signed forgery (fail-closed)", () => {
+    // Same API footgun as the host-attestation path: a forger self-signs a
+    // suppression finding under their OWN key and self-declares the victim kid.
+    // BEFORE the fix `{expectedSignerKid:'victim'}` with NO trustedPublicKey
+    // returned true (the kid matched and the signature was checked against the
+    // self-declared attacker key). AFTER: a kid pinned without a trusted key is
+    // rejected outright.
+    const forgedBody: UndeclaredFindingBody = {
+      schema: "sanctuary.workload-undeclared-finding.v1",
+      fortress_id: "fortress-1",
+      attested_at: new Date(1_700_000_900_000).toISOString(),
+      scope: "forged",
+      undeclared: [],
+      undeclared_count: 0,
+      live_count: 1,
+      declared_count: 0,
+      signer_kid: "fortress-1-signer",
+      signature_algorithm: "Ed25519",
+      payload_encoding: "domain-separated-canonical-json-v1",
+    };
+    const { publicKey: attackerPub, privateKey: attackerPriv } =
+      generateKeypair();
+    const forged = {
+      body: forgedBody,
+      signer_kid: forgedBody.signer_kid,
+      signature: toBase64url(
+        ed25519.sign(undeclaredFindingSigningBytes(forgedBody), attackerPriv),
+      ),
+      signature_algorithm: "Ed25519" as const,
+      payload_encoding: "domain-separated-canonical-json-v1" as const,
+      public_key: toBase64url(attackerPub),
+    };
+    // The forged envelope self-declares the victim kid.
+    expect(forged.body.signer_kid).toBe("fortress-1-signer");
+    // Kid pinned, no trusted key: fail-closed rejection (was true before fix).
+    expect(
+      verifyUndeclaredFinding(forged, forged.public_key, {
+        expectedSignerKid: "fortress-1-signer",
+      }),
+    ).toBe(false);
+  });
+
+  it("trustedPublicKey + matching expectedSignerKid still ACCEPTS a genuine finding (adjunct behavior preserved)", async () => {
+    const auditLog = newAuditLog();
+    const signer = makeSigner("fortress-1-signer");
+    const registry = await WorkloadRegistry.fromAuditLog(auditLog);
+    const detection = detectUndeclaredWorkloads({
+      liveStatuses: [live("agent_x")],
+      registry,
+    });
+    const finding = await buildUndeclaredFinding({
+      detection,
+      signer,
+      fortressId: "fortress-1",
+      now: new Date(1_700_000_900_000).toISOString(),
+    });
+    // Both pins present and correct: accepted.
+    expect(
+      verifyUndeclaredFinding(finding, finding.public_key, {
+        trustedPublicKey: signer.publicKey,
+        expectedSignerKid: "fortress-1-signer",
+      }),
+    ).toBe(true);
+    // Trusted key present but the pinned kid does not match: rejected.
+    expect(
+      verifyUndeclaredFinding(finding, finding.public_key, {
+        trustedPublicKey: signer.publicKey,
+        expectedSignerKid: "some-other-kid",
+      }),
+    ).toBe(false);
+    // The plain 2-arg form is unchanged: self-consistency verifies.
+    expect(verifyUndeclaredFinding(finding, finding.public_key)).toBe(true);
   });
 
   it("sealUndeclaredFinding REFUSES to bind a forged finding when given the trusted key (fail-closed)", async () => {
