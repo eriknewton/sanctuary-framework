@@ -388,6 +388,7 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
   const entries: EntryLocation[] = [];
   let entryIndent = 2;
   let sawFirstEntry = false;
+  let sawSanctuaryEntry = false;
   for (let i = keyLine + 1; i < blockEnd; i++) {
     const line = lines[i]!;
     if (isBlankOrComment(line)) continue;
@@ -429,6 +430,16 @@ function scanMcpServersBlock(lines: string[]): McpServersBlock | null {
       );
     }
     const decoded = canonicalFieldKey(m)!;
+    if (decoded.toLowerCase() === "sanctuary") {
+      if (sawSanctuaryEntry) {
+        throw new HermesYamlUnsupportedError(
+          "config.yaml mcp_servers has duplicate sanctuary entries; " +
+            "PyYAML keeps only the last duplicate key, so this tool cannot " +
+            "safely choose which entry to replace. Remove the duplicate and re-run wrap."
+        );
+      }
+      sawSanctuaryEntry = true;
+    }
     entries.push({
       name: decoded,
       start: i,

@@ -430,6 +430,39 @@ describe("planHermesYamlInjection (pure)", () => {
     );
   });
 
+  it("refuses duplicate sanctuary entries instead of replacing the first while PyYAML loads the last", () => {
+    const existing = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "old-first"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "first"',
+      "  sanctuary:",
+      '    command: "old-last"',
+      "    env:",
+      '      SANCTUARY_DASHBOARD_AUTH_TOKEN: "last-wins"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+    expect(() => planHermesYamlInjection(existing, ENTRY)).toThrow(
+      /duplicate sanctuary entries/
+    );
+
+    const escapedDuplicate = [
+      "mcp_servers:",
+      "  sanctuary:",
+      '    command: "old-first"',
+      '  "sanctuar\\u0079":',
+      '    command: "old-last"',
+      "",
+    ].join("\n");
+    expect(() => planHermesYamlInjection(escapedDuplicate, ENTRY)).toThrow(
+      HermesYamlUnsupportedError
+    );
+  });
+
   it("refuses a fully flow-style top-level mcp_servers config instead of adding a duplicate key", () => {
     const existing = [
       '{mcp_servers: {sanctuary: {command: "npx", env: {SANCTUARY_DASHBOARD_AUTH_TOKEN: tok}}}}',
