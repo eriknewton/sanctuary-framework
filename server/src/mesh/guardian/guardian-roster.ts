@@ -137,6 +137,43 @@ export function issueGuardianRoster(params: {
   return { ...body, master_signature: toBase64url(sig) };
 }
 
+/**
+ * Assert a roster body is structurally sound before it is trusted for any
+ * quorum decision. This is the SAME shape contract issuance enforces, exported
+ * so receiver-side quorum evaluators (recovery threshold, master-rotation
+ * quorum) can fail closed on a malformed roster rather than assuming issuance
+ * already screened it. Enforced invariants: integer m and n, 1 <= m <= n,
+ * guardians.length === n, unique guardian_ids, and canonical distinct public
+ * keys. Throws GuardianRosterError on any violation.
+ */
+export function assertValidRosterShape(params: {
+  m: number;
+  n: number;
+  guardians: GuardianIdentity[];
+}): void {
+  validateRosterShape(params);
+}
+
+/**
+ * Non-throwing predicate form of assertValidRosterShape. Returns true only when
+ * the roster body satisfies every shape invariant. Callers that must not throw
+ * (for example a pure evaluator that returns a fail-closed result object) use
+ * this to reject a malformed roster before comparing an approval count against
+ * m, so a degenerate roster such as m=0 can never report threshold_met.
+ */
+export function isValidRosterShape(params: {
+  m: number;
+  n: number;
+  guardians: GuardianIdentity[];
+}): boolean {
+  try {
+    validateRosterShape(params);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validateRosterShape(params: {
   m: number;
   n: number;

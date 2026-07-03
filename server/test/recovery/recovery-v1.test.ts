@@ -1367,7 +1367,11 @@ describe("no LLM at gate (structural)", () => {
 //     against cascade B.
 //   - execute-time raised threshold: executeCascade re-evaluates against
 //     the current roster and fails closed when M was raised.
-//   - m=0 / empty partial set: issueGuardianRoster rejects m<1 at issuance.
+//   - m=0 / empty partial set: issueGuardianRoster rejects m<1 at issuance,
+//     AND (harden A3 follow-up) evaluateThreshold / executeCascade now
+//     independently fail closed on a malformed roster handed to them directly,
+//     rather than assuming issuance already screened it. Covered by the
+//     "malformed roster fails closed at the evaluation boundary" block below.
 // ===================================================================
 
 describe("harden A3: cross-roster-version signature reuse is closed", () => {
@@ -1718,10 +1722,17 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     );
 
     const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
-    expect(result.valid_count).toBe(1);
+    // A roster with distinct guardian_ids sharing one key is a malformed roster
+    // shape (validateRosterShape rejects duplicate public keys), so the A3
+    // follow-up shape gate now rejects the WHOLE roster before any per-approval
+    // counting. That is a strictly stronger fail-closed outcome than the
+    // per-approval dedup path (which would have kept the first slot): zero valid
+    // approvals, every slot invalid, threshold unmet. The security property this
+    // test guards, one key cannot satisfy M-of-N, holds a fortiori.
     expect(result.threshold_met).toBe(false);
-    // The two extra shared-key slots are rejected, not counted.
-    expect(result.valid_guardian_ids).toHaveLength(1);
+    expect(result.valid_count).toBe(0);
+    expect(result.valid_guardian_ids).toHaveLength(0);
+    expect(result.invalid_guardian_ids).toContain("g0");
     expect(result.invalid_guardian_ids).toContain("g1");
     expect(result.invalid_guardian_ids).toContain("g2");
   });
@@ -1734,9 +1745,12 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     // spellings therefore passed the string-equality uniqueness check while a
     // single private key satisfied M-of-N. Post-fix, uniqueness is on the
     // canonical decoded key, so the non-canonical slots are rejected, not
-    // counted (and a non-canonical roster key fails closed). This test FAILS
-    // before the canonical-key fix (valid_count 3, threshold_met true) and
-    // PASSES after (valid_count 1, threshold_met false).
+    // counted (and a non-canonical roster key fails closed). After the A3
+    // follow-up shape gate, such a roster (distinct ids collapsing to one
+    // canonical key) is rejected wholesale as a malformed roster before any
+    // per-approval counting, a strictly stronger fail-closed outcome. This test
+    // FAILS before the canonical-key + shape fixes (valid_count 3, threshold_met
+    // true) and PASSES after (valid_count 0, threshold_met false).
     const fix = buildFixture();
     const shared = buildGuardians(1)[0]!;
     const canonical = shared.identity.public_key;
@@ -1789,10 +1803,13 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     );
 
     const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
-    // Only the one canonical slot counts; the non-canonical spellings of the
-    // same key fail closed. One key cannot clear m=3.
-    expect(result.valid_count).toBe(1);
+    // The non-canonical spellings of one key collapse to a single canonical key,
+    // so the roster is malformed (duplicate public keys) and the shape gate
+    // rejects it wholesale: zero valid, threshold unmet. One key cannot clear
+    // m=3.
+    expect(result.valid_count).toBe(0);
     expect(result.threshold_met).toBe(false);
+    expect(result.invalid_guardian_ids).toContain("g0");
     expect(result.invalid_guardian_ids).toContain("g1");
     expect(result.invalid_guardian_ids).toContain("g2");
   });
@@ -1821,5 +1838,209 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     expect(cascade.state).toBe("awaiting_threshold");
     expect(cascade.dmswitch_trigger).toBeUndefined();
     expect(store.list().length).toBe(1);
+  });
+});
+
+// ===================================================================
+// Harden wave A3 follow-up (2026-07-04): malformed roster fails closed
+// at the evaluation boundary.
+//
+// Defect: evaluateThreshold computed threshold_met = validIds.length >=
+// roster.m without ever validating the roster shape. A caller that supplies
+// an unvalidated GuardianRoster (m=0, or m>n, or guardians.length !== n)
+// bypasses issuance screening, so a degenerate roster reached the count
+// comparison. The worst case, m=0 with an empty approval set, yields
+// validIds.length (0) >= m (0) === true, authorizing a cascade with zero
+// guardian signatures.
+//
+// Fix: evaluateThreshold rejects any structurally invalid roster before the
+// count comparison (fail closed: threshold_met === false, valid_count === 0),
+// which also protects executeCascade (it re-evaluates before execution).
+//
+// Each test below FAILS on the pre-fix code (the m=0 case returned
+// threshold_met === true) and PASSES after the fix.
+// ===================================================================
+
+describe("harden A3: malformed roster fails closed at the evaluation boundary", () => {
+  // A roster is only a GuardianRoster by shape. An untrusted caller can hand
+  // the evaluator one that issuance would have rejected, so we build a valid
+  // roster and override the field under test rather than routing through
+  // issueGuardianRoster (which refuses m<1 etc.).
+  function malformedRoster(
+    base: GuardianRoster,
+    overrides: Partial<GuardianRoster>
+  ): GuardianRoster {
+    return { ...base, ...overrides };
+  }
+
+  it("m=0 with empty approvals returns threshold_met=false (was true pre-fix)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-m0",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+
+    const result = evaluateThreshold({
+      approvals: [],
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("executeCascade will not execute a threshold_met cascade backed by an m=0 roster (no signatures)", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    // Force the cascade into threshold_met to simulate a caller that trusted
+    // a pre-fix evaluateCascade transition. executeCascade re-evaluates and
+    // must refuse because the roster is malformed and no approvals are valid.
+    const cascade = initiateCascade({
+      fortress_id: fix.fortressId,
+      action: "key_rotation",
+      roster,
+    });
+    const awaiting = beginAwaitingThreshold(cascade);
+    const forced: CascadeState = {
+      ...awaiting,
+      state: "threshold_met",
+      threshold_met_at: new Date().toISOString(),
+    };
+
+    let executed = false;
+    await expect(
+      executeCascade({
+        cascade: forced,
+        roster,
+        executor: async () => {
+          executed = true;
+        },
+        emitter_node: fix.nodeId,
+        emitter_principal: "principal-a",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).rejects.toBeInstanceOf(ThresholdNotMetError);
+    expect(executed).toBe(false);
+  });
+
+  it("evaluateCascade does not transition an m=0 roster to threshold_met", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { m: 0 });
+
+    const cascade = initiateCascade({
+      fortress_id: fix.fortressId,
+      action: "key_rotation",
+      roster,
+    });
+    const awaiting = beginAwaitingThreshold(cascade);
+
+    const evaluated = evaluateCascade(awaiting, roster);
+    expect(evaluated.state).toBe("awaiting_threshold");
+  });
+
+  it("m > n fails closed even with a full valid quorum present", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    // Valid roster is m=3 of n=3; override m to 4 (m > n) to malform it.
+    const validRoster = buildRoster(fix, guardians, 3, 1);
+    const roster = malformedRoster(validRoster, { m: 4 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-mgtn",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      3,
+      "c-mgtn",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("guardians.length !== n fails closed", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    // Claim n=5 while only 3 guardians are listed.
+    const validRoster = buildRoster(fix, guardians, 2, 1);
+    const roster = malformedRoster(validRoster, { n: 5 });
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-nlen",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      2,
+      "c-nlen",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(false);
+    expect(result.valid_count).toBe(0);
+  });
+
+  it("a well-formed roster still meets threshold (guard does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const roster = buildRoster(fix, guardians, 2, 1);
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "c-ok",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    const approvals = buildSignedApprovals(
+      guardians,
+      2,
+      "c-ok",
+      "key_rotation",
+      fix.fortressId,
+      1
+    );
+
+    const result = evaluateThreshold({
+      approvals,
+      roster,
+      signing_input: signingInput,
+    });
+
+    expect(result.threshold_met).toBe(true);
+    expect(result.valid_count).toBe(2);
   });
 });

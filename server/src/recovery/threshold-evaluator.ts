@@ -16,7 +16,10 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
-import { canonicalGuardianKey } from "../mesh/guardian/guardian-roster.js";
+import {
+  canonicalGuardianKey,
+  isValidRosterShape,
+} from "../mesh/guardian/guardian-roster.js";
 import type { GuardianRoster } from "../mesh/guardian/types.js";
 import {
   RosterStaleError,
@@ -131,6 +134,26 @@ export function evaluateThreshold(params: {
   signing_input: ApprovalSigningInput;
 }): ThresholdEvaluationResult {
   const { approvals, roster, signing_input } = params;
+
+  // Fail-closed shape gate: a threshold decision compares a validated-approval
+  // count against roster.m, so a structurally invalid roster must be rejected
+  // BEFORE that comparison, not assumed to have been screened at issuance. A
+  // degenerate roster (for example m=0, or m>n, or guardians.length !== n)
+  // would otherwise report threshold_met with too few or zero real approvals:
+  // m=0 with an empty approval set yields validIds.length (0) >= m (0) = true,
+  // authorizing a cascade with no guardian signatures. This runs first so even
+  // a version-matched malformed roster cannot be trusted; on any shape
+  // violation every approval is treated as invalid and the threshold is unmet.
+  if (!isValidRosterShape({ m: roster.m, n: roster.n, guardians: roster.guardians })) {
+    return {
+      threshold_met: false,
+      valid_count: 0,
+      threshold_m: roster.m,
+      total_n: roster.n,
+      valid_guardian_ids: [],
+      invalid_guardian_ids: approvals.map((a) => a.guardian_id),
+    };
+  }
 
   // Fail-closed bind: the roster the quorum is verified against MUST be the
   // same version the approvals were signed over. On a version mismatch no
