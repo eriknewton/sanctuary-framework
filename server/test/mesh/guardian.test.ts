@@ -330,6 +330,107 @@ describe("verifyGuardianQuorum — M-of-N enforcement", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// Regression: shared-public-key quorum collapse (A3 harden 2026-07-04)
+//
+// One key holder must not occupy multiple guardian slots under distinct
+// guardian_ids. Approval/quorum signatures bind the signing input and the
+// guardian key, never the guardian_id, so N distinct ids sharing one public
+// key let a single private key satisfy M-of-N alone. Both issuance/verification
+// (root-cause) and the quorum counter (defense-in-depth) must fail closed.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("shared-public-key quorum collapse: fail closed", () => {
+  // Forge a master-signed roster whose guardians have distinct ids but a shared
+  // public key. Mirrors issueGuardianRoster's body shape so the master_signature
+  // is genuine; the only deviation is that it bypasses validateRosterShape.
+  function forgeSharedKeyRoster(
+    fortress: ReturnType<typeof makeFortress>,
+    ids: string[]
+  ): { roster: ReturnType<typeof issueGuardianRoster>; shared: GuardianKp } {
+    const shared = makeGuardian(ids[0]);
+    const guardians: GuardianIdentity[] = ids.map((id) => ({
+      guardian_id: id,
+      public_key: shared.identity.public_key,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    const body = {
+      m: guardians.length,
+      n: guardians.length,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    const sig = ed25519.sign(canonicalizeToBytes(body), fortress.private_key);
+    return {
+      roster: { ...body, master_signature: toBase64url(sig) },
+      shared,
+    };
+  }
+
+  it("issueGuardianRoster rejects distinct guardian_ids that share a public key", () => {
+    const fortress = makeFortress();
+    const shared = makeGuardian("g1");
+    const guardians: GuardianIdentity[] = [
+      { ...shared.identity, guardian_id: "g1" },
+      { ...shared.identity, guardian_id: "g2" },
+      { ...shared.identity, guardian_id: "g3" },
+    ];
+    expect(() =>
+      issueGuardianRoster({
+        m: 3,
+        n: 3,
+        guardians,
+        fortress_id: fortress.public.fortress_id,
+        version: 1,
+        master_private_key: fortress.private_key,
+      })
+    ).toThrow(GuardianRosterError);
+  });
+
+  it("verifyGuardianRoster rejects a forged roster with a shared public key", () => {
+    const fortress = makeFortress();
+    const { roster } = forgeSharedKeyRoster(fortress, ["g0", "g1", "g2"]);
+    // master_signature is genuine, so this fails on shape (duplicate key), not
+    // on the signature, proving the roster body itself is the closed gate.
+    expect(() => verifyGuardianRoster(roster, fortress.public)).toThrow(
+      GuardianRosterError
+    );
+  });
+
+  it("verifyGuardianQuorum does not let one key satisfy M-of-N via shared-key slots", () => {
+    const fortress = makeFortress();
+    const { roster, shared } = forgeSharedKeyRoster(fortress, ["g0", "g1", "g2"]);
+    const newMaster = generateFortressMaster();
+    newMaster.public.fortress_id = fortress.public.fortress_id;
+    const input: MasterRotationQuorumInput = {
+      old_master_pubkey: fortress.public.public_key,
+      new_master_pubkey: newMaster.public,
+      rotated_at: new Date().toISOString(),
+      fortress_id: fortress.public.fortress_id,
+    };
+    // One private key signs three envelopes labeled g0/g1/g2. Each individual
+    // signature verifies against the (shared) key; pre-fix all three counted.
+    const sigs = ["g0", "g1", "g2"].map((id) =>
+      signMasterRotationAsGuardian({
+        input,
+        guardian_id: id,
+        guardian_private_key: shared.private_key,
+      })
+    );
+    expect(() =>
+      verifyGuardianQuorum({
+        input,
+        proof: { roster_version: roster.version, signatures: sigs },
+        pinned_roster: roster,
+      })
+    ).toThrow(GuardianQuorumError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // Spawn-prompt acceptance #4 — master_rotation flow + cascade
 // ═══════════════════════════════════════════════════════════════════════
 

@@ -120,6 +120,7 @@ function validateRosterShape(params: {
     );
   }
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   for (const g of params.guardians) {
     if (seen.has(g.guardian_id)) {
       throw new GuardianRosterError(
@@ -127,6 +128,17 @@ function validateRosterShape(params: {
       );
     }
     seen.add(g.guardian_id);
+    // Fail closed on a shared public key across distinct guardian_ids. Without
+    // this, one key holder can occupy multiple guardian slots under different
+    // ids and satisfy M-of-N alone (approval signatures bind the signing input
+    // and the guardian's key, not the guardian_id), collapsing the quorum's
+    // independence assumption. Each guardian must hold a distinct key.
+    if (seenKeys.has(g.public_key)) {
+      throw new GuardianRosterError(
+        `duplicate guardian public_key in roster: guardian_id ${g.guardian_id} reuses a key already assigned to another guardian`
+      );
+    }
+    seenKeys.add(g.public_key);
   }
 }
 
@@ -220,6 +232,7 @@ export function verifyGuardianQuorum(params: {
     );
   }
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   const byId = new Map<string, GuardianIdentity>();
   for (const g of roster.guardians) byId.set(g.guardian_id, g);
 
@@ -238,6 +251,16 @@ export function verifyGuardianQuorum(params: {
         `quorum signature from unknown guardian ${sig.guardian_id}; not in pinned roster v${roster.version}`
       );
     }
+    // Fail closed on a shared public key across distinct guardian_ids within a
+    // single proof. verifyGuardianRoster already rejects such rosters, but this
+    // is defense in depth for a proof evaluated against a roster that skipped
+    // that path: one key must not be counted toward the quorum more than once.
+    if (seenKeys.has(guardian.public_key)) {
+      throw new GuardianQuorumError(
+        `guardian ${sig.guardian_id} reuses a public key already counted in this quorum proof`
+      );
+    }
+    seenKeys.add(guardian.public_key);
     const ok = ed25519.verify(
       fromBase64url(sig.signature),
       signedBytes,

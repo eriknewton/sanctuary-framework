@@ -151,6 +151,7 @@ export function evaluateThreshold(params: {
   );
 
   const seen = new Set<string>();
+  const seenKeys = new Set<string>();
   const validIds: string[] = [];
   const invalidIds: string[] = [];
   const signedBytes = canonicalizeToBytes(signing_input);
@@ -184,6 +185,20 @@ export function evaluateThreshold(params: {
       invalidIds.push(approval.guardian_id);
       continue;
     }
+
+    // Fail-closed bind: a guardian public key must not be counted toward the
+    // threshold more than once. verifyGuardianRoster already rejects a roster
+    // that assigns one key to multiple guardian_ids, but this is defense in
+    // depth for an evaluation run against a roster that skipped that check: one
+    // key holder occupying multiple slots under distinct ids must not satisfy
+    // M-of-N alone. The approval signature binds the signing input and the key,
+    // not the guardian_id, so distinct-id + shared-key approvals all verify;
+    // counting only the first per key preserves quorum independence.
+    if (seenKeys.has(guardian.public_key)) {
+      invalidIds.push(approval.guardian_id);
+      continue;
+    }
+    seenKeys.add(guardian.public_key);
 
     // Signature verification.
     try {

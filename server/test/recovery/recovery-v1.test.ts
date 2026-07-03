@@ -1669,6 +1669,63 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
     expect(store.listActive().length).toBe(0);
   });
 
+  it("shared-public-key roster: one key cannot satisfy M-of-N via distinct-id slots", () => {
+    // Regression (A3 harden 2026-07-04). A roster with distinct guardian_ids
+    // that share one Ed25519 public key lets a single private key sign N
+    // approval envelopes (labeled g0/g1/g2) that each verify. Pre-fix,
+    // evaluateThreshold counted all N and returned threshold_met=true from one
+    // key. Post-fix it counts a key at most once, so the quorum's independence
+    // holds and the single key cannot clear m=3. verifyGuardianRoster already
+    // rejects such a roster at the door; this exercises evaluateThreshold's own
+    // defense-in-depth against an evaluation run on an unvalidated roster.
+    const fix = buildFixture();
+    const shared = buildGuardians(1)[0]!;
+    const ids = ["g0", "g1", "g2"];
+    const guardians: GuardianIdentity[] = ids.map((id) => ({
+      guardian_id: id,
+      public_key: shared.identity.public_key,
+      kind: "human" as const,
+      invited_at: new Date().toISOString(),
+    }));
+    // Forge a genuinely master-signed roster that bypasses issuance validation.
+    const body = {
+      m: 3,
+      n: 3,
+      guardians,
+      signature_scheme: SIGNATURE_SCHEME_V1,
+      version: 1,
+      created_at: new Date().toISOString(),
+      fortress_id: fix.fortressId,
+    };
+    const masterSig = ed25519.sign(canonicalizeToBytes(body), fix.masterSecret);
+    const roster: GuardianRoster = { ...body, master_signature: toBase64url(masterSig) };
+
+    const signingInput = buildApprovalSigningInput({
+      cascade_id: "shared-key",
+      recovery_action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster_version: 1,
+    });
+    // One private key signs three envelopes under three distinct guardian_ids.
+    const approvals: GuardianApproval[] = ids.map((id) =>
+      signApproval({
+        signing_input: signingInput,
+        guardian_id: id,
+        guardian_private_key: shared.kp.privateKey,
+        recovery_action: "key_rotation",
+        cascade_id: "shared-key",
+      })
+    );
+
+    const result = evaluateThreshold({ approvals, roster, signing_input: signingInput });
+    expect(result.valid_count).toBe(1);
+    expect(result.threshold_met).toBe(false);
+    // The two extra shared-key slots are rejected, not counted.
+    expect(result.valid_guardian_ids).toHaveLength(1);
+    expect(result.invalid_guardian_ids).toContain("g1");
+    expect(result.invalid_guardian_ids).toContain("g2");
+  });
+
   it("manual guardian-requested recovery (no last_activity) is unaffected by the window guard", async () => {
     const fix = buildFixture();
     const guardians = buildGuardians(3);
