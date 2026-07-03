@@ -52,6 +52,8 @@ import {
   signDescriptor,
   loadBundledPlugin,
   loadBundledReferenceBlocklist,
+  loadReferenceBlocklistBundle,
+  pinnedSignerFor,
   spawnReferencePlugin,
   readBundledSignerFrom,
   enumerateBundleDir,
@@ -59,6 +61,7 @@ import {
   parseGovernance,
   type SpawnedPlugin,
   type SignatureFile,
+  type TrustedSigner,
 } from "../../../src/substrate/index.js";
 import { runPluginCommand } from "../../../src/cli/plugin.js";
 
@@ -522,5 +525,237 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
     await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
       reason: "signature_signer_mismatch",
     });
+  });
+
+  /**
+   * Materialize a fully self-signed evil bundle at `dir` whose governance claims
+   * `pluginId` and whose self-shipped first-party-signer.json carries the CHOSEN
+   * (signerId, keyId) tuple - but the key BYTES are an attacker key, and the SIGNATURE.json
+   * verifies under that attacker key. This is the "same-tuple attacker key": every string
+   * matches the registry, only the pinned public key differs.
+   */
+  async function stageEvilBundleWithTuple(
+    pluginId: string,
+    signerId: string,
+    keyId: string,
+  ): Promise<string> {
+    const dir = await mkdtemp(path.join(tmpdir(), "sanctuary-evil-tuple-"));
+    evilDirs.push(dir);
+    await fs.mkdir(path.join(dir, "bin"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "bin", "blocklist.mjs"),
+      "process.stdout.write('EVIL-CODE-RAN');\n",
+      { mode: 0o755 },
+    );
+    const governanceText =
+      `plugin_id: ${pluginId}\n` +
+      "version: 1.0.0\n" +
+      "channel: stable\n" +
+      "entry: bin/blocklist.mjs\n" +
+      "hooks:\n" +
+      "  - hook_class: egress_decision\n" +
+      "    fields:\n" +
+      "      - egress.host\n" +
+      "      - egress.port\n" +
+      "    fail_mode: deny\n" +
+      "endpoints: []\n" +
+      "signal_keys:\n" +
+      "  - blocked_rule\n";
+    await fs.writeFile(path.join(dir, "governance.yaml"), governanceText);
+
+    const attackerPriv = ed25519.utils.randomPrivateKey();
+    const attackerPub = ed25519.getPublicKey(attackerPriv);
+    // Self-ship the EXACT registry tuple, but attacker key bytes.
+    await fs.writeFile(
+      path.join(dir, "first-party-signer.json"),
+      `${JSON.stringify(
+        { signer_id: signerId, key_id: keyId, public_key_b64: Buffer.from(attackerPub).toString("base64") },
+        null,
+        2,
+      )}\n`,
+    );
+
+    // Sign the descriptor with the ATTACKER key but stamp the registry (signerId, keyId)
+    // into the descriptor so the descriptor's own tuple also matches the registry.
+    const { descriptor } = await buildReferenceDescriptor(dir, governanceText);
+    const stamped = { ...descriptor, signer_id: signerId, key_id: keyId };
+    const signatureFile = signDescriptor(stamped, attackerPriv);
+    await fs.writeFile(path.join(dir, "SIGNATURE.json"), `${JSON.stringify(signatureFile, null, 2)}\n`);
+    return dir;
+  }
+
+  it("(e) a SAME-TUPLE attacker key (self-shipped signer_id/key_id match the registry, key bytes differ) is REJECTED", async () => {
+    // FAIL-BEFORE (old code): the loader verified against the bundle's OWN self-shipped
+    // key, so a bundle self-shipping the exact (first-party, hosts-blocklist-v1) tuple with
+    // ATTACKER key bytes verified and was spawnable. PASS-AFTER: the signature is checked
+    // against the REGISTRY-PINNED key, and the self-shipped key must EQUAL it, so an
+    // attacker key with a matching tuple is rejected fail-closed.
+    const spec = bundledPluginSpec(HOSTS_PLUGIN_ID);
+    const foreign = await stageEvilBundleWithTuple(HOSTS_PLUGIN_ID, spec.signer_id, spec.key_id);
+    // Sanity: the attacker's self-shipped key does NOT equal the registry-pinned key.
+    const attackerSigner = await readBundledSignerFrom(foreign);
+    const pinned: TrustedSigner = pinnedSignerFor(spec);
+    expect(Buffer.from(attackerSigner.publicKey).toString("base64")).not.toBe(
+      Buffer.from(pinned.publicKey).toString("base64"),
+    );
+
+    const realDir = bundledPluginDir(spec);
+    const backup = `${realDir}.bak-tuple-${Date.now()}`;
+    await fs.rename(realDir, backup);
+    swappedBack.push(async () => {
+      await rm(realDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rename(backup, realDir).catch(() => {});
+    });
+    // Copy (not symlink) so the realpath gate passes and the PINNED-KEY gate is under test.
+    await fs.cp(foreign, realDir, { recursive: true });
+
+    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toBeInstanceOf(SubstrateError);
+  });
+
+  it("(f) a SAME-BASENAME in-tree SYMLINK to a foreign bundle is REJECTED (realpath EQUALITY, not descendant)", async () => {
+    // FAIL-BEFORE (old code used startsWith/descendant matching): a symlink whose final
+    // segment keeps the registry basename but whose realpath lands on a DIFFERENT foreign
+    // directory (that itself sits under the module tree) could slip past a prefix check.
+    // PASS-AFTER: the realpath of the resolved dir must EQUAL the registry location exactly;
+    // any redirect (even same-basename, even in-tree) breaks equality and is rejected.
+    const spec = bundledPluginSpec(HOSTS_PLUGIN_ID);
+    const realDir = bundledPluginDir(spec);
+    const parent = path.dirname(realDir); // .../reference-plugin
+    // A foreign bundle that lives IN-TREE (under reference-plugin/.evil/) with the SAME
+    // basename as the registry dir, so basename + ancestor-prefix checks would both pass.
+    const evilParent = path.join(parent, ".evil");
+    const evilBundle = path.join(evilParent, spec.dirName);
+    await fs.mkdir(evilParent, { recursive: true });
+    // Reuse the self-signed evil bundle materializer, then move it to the in-tree location.
+    const staged = await stageEvilSelfSignedBundle(HOSTS_PLUGIN_ID);
+    await fs.cp(staged, evilBundle, { recursive: true });
+
+    const backup = `${realDir}.bak-symlink-${Date.now()}`;
+    await fs.rename(realDir, backup);
+    swappedBack.push(async () => {
+      await rm(realDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rename(backup, realDir).catch(() => {});
+      await rm(evilParent, { recursive: true, force: true }).catch(() => {});
+    });
+    // Same-basename in-tree symlink: reference-plugin/hosts-blocklist -> reference-plugin/.evil/hosts-blocklist
+    await fs.symlink(evilBundle, realDir);
+
+    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
+      reason: "bundle_path_traversal",
+    });
+  });
+});
+
+/**
+ * SECURITY (P1, arbitrary-code-execution fail-open via a SIBLING export): the P1 fix
+ * routed the NEW loadBundledPlugin through the frozen registry, but the pre-existing
+ * blocklist.ts exports loadReferenceBlocklistBundle(opts) and
+ * loadBundledReferenceBlocklist(bundleDir?) STILL accepted a caller path / a
+ * caller-supplied signer and returned a spawnable entryPath - the SAME arbitrary-code-exec
+ * class reachable through a different exported symbol. After the chokepoint fix, every
+ * exported blocklist loader delegates ONLY to loadBundledPlugin('ai.sanctuary.blocklist')
+ * and ignores/rejects any caller-supplied path or signer.
+ */
+describe("S5 sibling blocklist loaders funnel through the ONE chokepoint (no arbitrary-path/self-signed input)", () => {
+  const evilDirs: string[] = [];
+  afterEach(async () => {
+    while (evilDirs.length > 0) {
+      const d = evilDirs.pop();
+      if (d) await rm(d, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  async function stageEvilBlocklistBundle(): Promise<string> {
+    const dir = await mkdtemp(path.join(tmpdir(), "sanctuary-evil-sibling-"));
+    evilDirs.push(dir);
+    await fs.mkdir(path.join(dir, "bin"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "bin", "blocklist.mjs"),
+      "process.stdout.write('EVIL-CODE-RAN');\n",
+      { mode: 0o755 },
+    );
+    const governanceText =
+      "plugin_id: ai.sanctuary.blocklist\n" +
+      "version: 1.0.0\n" +
+      "channel: stable\n" +
+      "entry: bin/blocklist.mjs\n" +
+      "hooks:\n" +
+      "  - hook_class: egress_decision\n" +
+      "    fields:\n" +
+      "      - egress.host\n" +
+      "      - egress.port\n" +
+      "    fail_mode: deny\n" +
+      "endpoints: []\n" +
+      "signal_keys:\n" +
+      "  - blocked_rule\n";
+    await fs.writeFile(path.join(dir, "governance.yaml"), governanceText);
+    const attackerPriv = ed25519.utils.randomPrivateKey();
+    const attackerPub = ed25519.getPublicKey(attackerPriv);
+    await fs.writeFile(
+      path.join(dir, "first-party-signer.json"),
+      `${JSON.stringify(
+        { signer_id: "ai.sanctuary.first-party", key_id: "release-v1", public_key_b64: Buffer.from(attackerPub).toString("base64") },
+        null,
+        2,
+      )}\n`,
+    );
+    const { descriptor } = await buildReferenceDescriptor(dir, governanceText);
+    const signatureFile = signDescriptor(descriptor, attackerPriv);
+    await fs.writeFile(path.join(dir, "SIGNATURE.json"), `${JSON.stringify(signatureFile, null, 2)}\n`);
+    return dir;
+  }
+
+  it("(g) loadBundledReferenceBlocklist(evilDir) IGNORES the caller path and returns the REAL registry bundle", async () => {
+    // FAIL-BEFORE: passing an attacker dir made the loader read + self-verify that dir and
+    // return its evil entryPath (spawnable arbitrary code). PASS-AFTER: the argument is
+    // ignored; the loader returns the registry blocklist bundle from its real in-tree
+    // location, verified against the registry-pinned key.
+    const evil = await stageEvilBlocklistBundle();
+    const loaded = await loadBundledReferenceBlocklist(evil);
+    expect(loaded.governance.plugin_id).toBe(BLOCKLIST_PLUGIN_ID);
+    // The returned entry is the REAL registry bundle, never the attacker temp dir.
+    expect(loaded.bundleDir.startsWith(evil)).toBe(false);
+    expect(loaded.entryPath.includes(evil)).toBe(false);
+    expect(loaded.descriptor.key_id).toBe("release-v1");
+  });
+
+  it("(h) loadReferenceBlocklistBundle({bundleDir: evil, signer: attacker}) IGNORES caller path + signer", async () => {
+    // FAIL-BEFORE: the opts.signer + opts.bundleDir were the trust root, so an attacker
+    // dir signed by an attacker key verified and returned a spawnable evil entry.
+    // PASS-AFTER: opts is ignored entirely; the registry blocklist bundle is returned.
+    const evil = await stageEvilBlocklistBundle();
+    const attackerSigner: TrustedSigner = await readBundledSignerFrom(evil);
+    const signatureRaw = await fs.readFile(path.join(evil, "SIGNATURE.json"), "utf8");
+    const signatureFile = JSON.parse(signatureRaw) as SignatureFile;
+
+    const loaded = await loadReferenceBlocklistBundle({
+      bundleDir: evil,
+      signer: attackerSigner,
+      signatureFile,
+    });
+    expect(loaded.governance.plugin_id).toBe(BLOCKLIST_PLUGIN_ID);
+    expect(loaded.bundleDir.startsWith(evil)).toBe(false);
+    expect(loaded.entryPath.includes(evil)).toBe(false);
+  });
+
+  it("(i) NO exported symbol in the barrel is a path-taking self-verifying spawnable loader", async () => {
+    // Grep-in-code: enumerate the barrel and assert the only bundle-returning loaders are
+    // the registry-keyed loadBundledPlugin + the two now-delegating blocklist wrappers.
+    // No exported symbol accepts an arbitrary path AND returns a verified spawnable bundle.
+    const substrate = await import("../../../src/substrate/index.js");
+    const names = Object.keys(substrate);
+    for (const forbidden of [
+      "loadBundleFromDir",
+      "loadBundleFromDirInternal",
+      "loadBundleFromPath",
+      "loadBundleFromDirectory",
+    ]) {
+      expect(names).not.toContain(forbidden);
+    }
+    // The wrappers exist (frozen names) but only delegate: calling with an evil path is
+    // covered by (g)/(h). loadBundledPlugin takes a plugin_id, not a path (compile-time).
+    expect(names).toContain("loadBundledPlugin");
+    expect(names).toContain("loadBundledReferenceBlocklist");
+    expect(names).toContain("loadReferenceBlocklistBundle");
   });
 });

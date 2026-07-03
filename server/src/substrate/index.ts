@@ -138,6 +138,7 @@ export {
   type LoadedBundledPlugin,
   BUNDLED_PLUGINS,
   bundledPluginSpec,
+  pinnedSignerFor,
   bundledPluginDir,
   enumerateBundleDir,
   readBundledSignerFrom,

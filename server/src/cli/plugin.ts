@@ -70,28 +70,28 @@ function bundledPlugins(): BundledPluginRef[] {
 }
 
 /**
- * Integrity-verify a bundled plugin using its COMMITTED SIGNATURE.json and the
- * COMMITTED first-party signer pubkey shipped in that same bundle. This proves the
- * on-disk file set matches the signed descriptor and that the Ed25519 signature
- * verifies under the bundle's own first-party signer key (trust = release integrity;
- * there is no independent host-policy pin until the third-party signer registry lands,
- * which is F1-gated) - the production-honest path, no ephemeral keys.
+ * Integrity-verify a bundled plugin using its COMMITTED SIGNATURE.json, checked against
+ * the PUBLIC KEY PINNED in the compiled-in BUNDLED_PLUGINS registry (the trust root),
+ * NOT the bundle's self-shipped key. This proves the on-disk file set matches the signed
+ * descriptor and that the Ed25519 signature verifies under the registry-pinned first-party
+ * key (trust = ships-in-the-signed-release; third-party install stays F1-gated) - the
+ * production-honest path, no ephemeral keys.
  */
 async function verifyBundledPlugin(ref: BundledPluginRef): Promise<{
   loaded: LoadedBundledPlugin;
   signerNote: string;
 }> {
   // Load BY REGISTRY PLUGIN ID (fail-closed): the loader resolves the directory
-  // internally from the frozen registry, realpath-checks it, and asserts the loaded
-  // identity against the registry spec. Never pass a caller-derived path.
+  // internally from the frozen registry, realpath-equality-checks it, and verifies the
+  // signature against the registry-pinned key. Never pass a caller-derived path.
   const loaded = await loadBundledPlugin(ref.id);
   return {
     loaded,
     signerNote:
       "integrity verified: on-disk file set matches the signed descriptor and the " +
-      "Ed25519 signature verifies against the first-party signer key shipped in the " +
-      "signed release (trust = release integrity; there is no independent host-policy " +
-      "pin until the third-party signer registry lands, which is F1-gated).",
+      "Ed25519 signature verifies against the first-party signer key PINNED in the " +
+      "compiled-in registry and shipped in the signed release (trust = release integrity; " +
+      "third-party install stays F1-gated).",
   };
 }
 

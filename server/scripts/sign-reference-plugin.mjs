@@ -10,18 +10,22 @@
  * or marketplace plugins; third-party install stays F1-gated.
  *
  * First-party bundling (design §7, review L1): each reference plugin ships inside the
- * signed release. Trust = release integrity: the signer pubkey travels with the bundle,
- * so there is no independent host-policy pin until the third-party signer registry lands
- * (F1-gated). This script bakes a real, verifiable SIGNATURE.json into each bundle and
- * writes the matching public key alongside it (first-party-signer.json) so the host can
- * verify each bundle against its own self-shipped release key with NO third-party signer
- * registry (that path stays F1-gated for third-party plugins).
+ * signed release. The ROOT OF TRUST is the PUBLIC KEY PINNED IN THE COMPILED-IN REGISTRY
+ * (BUNDLED_PLUGINS.public_key_b64 in src/substrate/reference-plugin/bundled-plugins.ts),
+ * which is baked into the signed release. The bundle's self-shipped first-party-signer.json
+ * is NOT the trust root: the host verifies each bundle's signature against the
+ * registry-pinned key and rejects a self-shipped key that diverges from it. This script
+ * bakes a real, verifiable SIGNATURE.json into each bundle and writes the matching public
+ * key alongside it (first-party-signer.json) so the on-disk echo stays in sync; the
+ * REGISTRY constant remains the source of truth.
  *
  * Determinism: by default this script is IDEMPOTENT - per bundle, if a valid
  * SIGNATURE.json + first-party-signer.json already exist and verify against that
  * bundle's current on-disk file set, it does nothing (so `npm run build` does not
  * churn signatures on every run). Pass --force to re-key and re-sign every bundle
- * (rotates each first-party signer).
+ * (rotates each first-party signer); after a --force re-key you MUST re-pin the new
+ * pubkeys in BUNDLED_PLUGINS. Pass --print-registry to emit each bundle's current
+ * (signer_id, key_id, public_key_b64) so the registry constant can be updated to match.
  *
  * The PRIVATE key is never written to the tree; it exists only for the duration of a
  * --force re-sign. In a production release this would be the release signer's key,
@@ -44,12 +48,14 @@ const SIGNER_PUBKEY_FILENAME = "first-party-signer.json";
 // key. Each bundle carries a DISTINCT (signerId, keyId) tuple so the identity tuple is
 // unique across bundles (a future third-party signer registry may key signers by this
 // tuple). These MUST match the (signer_id, key_id) in BUNDLED_PLUGINS in
-// src/substrate/reference-plugin/bundled-plugins.ts; the host asserts the bundle's
-// self-shipped tuple against that frozen registry.
+// src/substrate/reference-plugin/bundled-plugins.ts; the host verifies each bundle's
+// signature against the public_key_b64 PINNED in that frozen registry (the trust root),
+// not the bundle's self-shipped key.
 //
 // To add a bundle: add its {dir, entry, signerId, keyId} here, its dir name to
-// REFERENCE_PLUGIN_BUNDLES in copy-templates.js, and its row to BUNDLED_PLUGINS.
-// First-party bundled only.
+// REFERENCE_PLUGIN_BUNDLES in copy-templates.js, and its row to BUNDLED_PLUGINS; then run
+// `node scripts/sign-reference-plugin.mjs --print-registry` and paste the pinned pubkey
+// into that row's public_key_b64. First-party bundled only.
 const BUNDLES = [
   {
     dir: join(REFERENCE_PLUGIN_ROOT, "blocklist"),
@@ -208,7 +214,36 @@ function signBundle(bundleDir, entry, signerId, keyId) {
   );
 }
 
+/**
+ * Emit each bundle's current (signer_id, key_id, public_key_b64) as the registry rows
+ * expect them, so BUNDLED_PLUGINS.public_key_b64 can be updated to match after a re-sign.
+ * The registry pin - not the on-disk first-party-signer.json - is the trust root.
+ */
+function printRegistry() {
+  const rows = [];
+  for (const bundle of BUNDLES) {
+    const pubPath = join(bundle.dir, SIGNER_PUBKEY_FILENAME);
+    if (!existsSync(pubPath)) {
+      console.error(`sign-reference-plugin: ${pubPath} missing; run without --print-registry first`);
+      process.exitCode = 1;
+      continue;
+    }
+    const pub = JSON.parse(readFileSync(pubPath, "utf8"));
+    rows.push({
+      signer_id: pub.signer_id,
+      key_id: pub.key_id,
+      public_key_b64: pub.public_key_b64,
+    });
+  }
+  // Machine-readable: paste each public_key_b64 into the matching BUNDLED_PLUGINS row.
+  console.log(JSON.stringify({ pinned_registry_keys: rows }, null, 2));
+}
+
 function main() {
+  if (process.argv.includes("--print-registry")) {
+    printRegistry();
+    return;
+  }
   for (const bundle of BUNDLES) {
     signBundle(bundle.dir, bundle.entry, bundle.signerId, bundle.keyId);
   }
