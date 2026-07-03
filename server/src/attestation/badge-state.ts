@@ -9,6 +9,7 @@
 
 import {
   BADGE_STATE_LABELS,
+  BADGE_STATES,
   type BadgeStateColor,
   type LayerType,
 } from "./constants.js";
@@ -50,89 +51,171 @@ function getStore(layer: LayerType): Map<string, StoredBadgeState> {
 }
 
 // -----------------------------------------------------------------------
+// Fail-closed input normalization (anti-false-green)
+// -----------------------------------------------------------------------
+
+/**
+ * True only for values that are members of the closed BADGE_STATES enum.
+ *
+ * Badge derivation inputs (node states, agent states, annex states, audit /
+ * policy / guardian states) are typed BadgeStateColor, but the context
+ * objects are assembled by callers from live signals and may carry a value
+ * outside the enum if a producer is buggy, a payload is truncated, or an
+ * input is tampered with. Such a value must never be treated as nominal.
+ */
+function isKnownBadgeState(value: unknown): value is BadgeStateColor {
+  return (
+    typeof value === "string" &&
+    (BADGE_STATES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Fail-closed classification of a single derivation input.
+ *
+ * Returns "nominal" ONLY for a positively-recognized healthy state: an
+ * explicit "green" or the valid "local_only" steady state. Every other
+ * value, including "yellow", "red", "offline", and any UNRECOGNIZED value,
+ * is not nominal, so an aggregate badge can only reach green when every
+ * input independently earns it.
+ *
+ * This is the anti-false-green invariant: green is positively earned by
+ * every input, not merely the absence of a listed bad value. An unknown or
+ * corrupt input degrades to a truthful state ("yellow", walls watch) rather
+ * than silently rendering green.
+ */
+function classifyInput(value: unknown): {
+  nominal: boolean;
+  degradedTo: BadgeStateColor;
+} {
+  if (value === "green" || value === "local_only") {
+    return { nominal: true, degradedTo: value };
+  }
+  if (isKnownBadgeState(value)) {
+    // A recognized non-nominal state (yellow / red / offline): degrade to it.
+    return { nominal: false, degradedTo: value };
+  }
+  // Unrecognized / corrupt / absent: truthful "look at this" degrade, never green.
+  return { nominal: false, degradedTo: "yellow" };
+}
+
+/**
+ * Worst-of reducer over a set of derivation inputs. Any value that is not a
+ * positively-recognized nominal state pulls the aggregate away from green.
+ *
+ * Aggregate severity order (worst first): red, then yellow. A single input
+ * that is "offline" is a degraded ("look at this") condition at the
+ * aggregate level, not a whole-fortress offline: it maps into the yellow
+ * tier so a missing sub-signal surfaces as "walls watch" rather than being
+ * masked as green (design brief section 3, Layer 1: an unreachable node
+ * surfaces yellow while the fortress stays watchful). A whole-scope offline
+ * (no nodes / scope absent) is decided by the callers before this reducer.
+ * "local_only" is a valid nominal steady state and does not degrade.
+ */
+function worstOf(values: readonly unknown[]): BadgeStateColor {
+  let sawRed = false;
+  let sawDegraded = false;
+  for (const value of values) {
+    const { nominal, degradedTo } = classifyInput(value);
+    if (nominal) continue;
+    if (degradedTo === "red") {
+      sawRed = true;
+    } else {
+      // yellow, offline, and any unknown-degraded input all surface as
+      // "walls watch" at the aggregate: truthfully degraded, never green.
+      sawDegraded = true;
+    }
+  }
+  if (sawRed) return "red";
+  if (sawDegraded) return "yellow";
+  return "green";
+}
+
+// -----------------------------------------------------------------------
 // Badge derivation: pure-logic functions
 // -----------------------------------------------------------------------
 
 /**
  * Derive global (fortress-level) badge from context.
  *
- * Aggregation rule (design brief section 3, Layer 1):
- * worst-of among reachable nodes, plus unreachable node count.
+ * Aggregation rule (design brief section 3, Layer 1): worst-of among
+ * reachable nodes, the audit chain, policy sync, guardian presence, and
+ * per-agent states.
+ *
+ * Fail-closed: green requires every input to positively present a nominal
+ * state. A "red" or "offline" on audit / policy / guardian (previously only
+ * "yellow" was inspected on the latter two) now propagates, and any
+ * unrecognized input degrades rather than falling through to green.
  */
 export function deriveGlobalBadge(ctx: GlobalLayerContext): BadgeStateColor {
   const nodeStates = Object.values(ctx.node_states);
-  const agentStates = Object.values(ctx.agent_badge_states);
 
-  // If no nodes at all, offline
+  // If no nodes at all, offline (no signal).
   if (nodeStates.length === 0) {
     return "offline";
   }
 
-  // Check for red conditions (design brief section 3, Layer 1 red states)
-  if (
-    nodeStates.includes("red") ||
-    ctx.audit_chain_state === "red" ||
-    agentStates.includes("red")
-  ) {
-    return "red";
-  }
-
-  // Check for yellow conditions
-  if (
-    nodeStates.includes("yellow") ||
-    nodeStates.includes("offline") ||
-    ctx.audit_chain_state === "yellow" ||
-    ctx.policy_sync_state === "yellow" ||
-    ctx.guardian_state === "yellow" ||
-    agentStates.includes("yellow")
-  ) {
-    return "yellow";
-  }
-
-  return "green";
+  // Worst-of across every input. Each aggregate input is classified
+  // fail-closed: unknown values degrade to yellow, and red/offline on any
+  // subsystem propagates rather than being ignored.
+  return worstOf([
+    ...nodeStates,
+    ...Object.values(ctx.agent_badge_states),
+    ctx.audit_chain_state,
+    ctx.policy_sync_state,
+    ctx.guardian_state,
+  ]);
 }
 
 /**
  * Derive per-agent badge from context.
  *
- * Aggregation rule (design brief section 3, Layer 2):
- * worst-of among identity, node attestation, policy, annex states, and egress.
+ * Aggregation rule (design brief section 3, Layer 2): worst-of among
+ * identity, node attestation, policy, annex states, and egress.
+ *
+ * Fail-closed: green requires node attestation and every annex to positively
+ * present a nominal state, identity to be valid, policy pinned, and egress
+ * enforcing. An unrecognized node or annex state degrades to yellow rather
+ * than rendering green.
  */
 export function deriveAgentBadge(ctx: AgentLayerContext): BadgeStateColor {
-  // local_only if node attestation is local_only and no annexes are degraded
   const annexStates = Object.values(ctx.annex_states);
+
+  // local_only is a valid steady state only when node attestation is a clean
+  // local_only AND no annex is in any non-nominal state (including unknown).
   if (
     ctx.node_attestation_state === "local_only" &&
-    !annexStates.some((s) => s === "yellow" || s === "red")
+    annexStates.every((s) => classifyInput(s).nominal)
   ) {
     return "local_only";
   }
 
-  // Red conditions
-  if (
-    ctx.node_attestation_state === "red" ||
-    annexStates.includes("red") ||
-    !ctx.identity_valid
-  ) {
+  // Hard-red inputs that are not captured by the worst-of over enum states:
+  // an invalid identity is always red regardless of the other signals.
+  if (!ctx.identity_valid) {
     return "red";
   }
 
-  // Offline
-  if (ctx.node_attestation_state === "offline") {
+  // The agent's bound node is a singular binding (unlike the global layer's
+  // node set): if its attestation state is offline, and nothing else is red,
+  // the agent surfaces offline (no signal) explicitly. A red annex still wins.
+  if (
+    ctx.node_attestation_state === "offline" &&
+    !annexStates.some((s) => classifyInput(s).degradedTo === "red")
+  ) {
     return "offline";
   }
 
-  // Yellow conditions
-  if (
-    ctx.node_attestation_state === "yellow" ||
-    annexStates.includes("yellow") ||
-    !ctx.policy_pinned ||
-    !ctx.egress_enforcing
-  ) {
-    return "yellow";
-  }
+  // Boolean posture inputs degrade to yellow when not satisfied.
+  const posture: BadgeStateColor[] = [];
+  if (!ctx.policy_pinned) posture.push("yellow");
+  if (!ctx.egress_enforcing) posture.push("yellow");
 
-  return "green";
+  return worstOf([
+    ctx.node_attestation_state,
+    ...annexStates,
+    ...posture,
+  ]);
 }
 
 /**
@@ -141,8 +224,18 @@ export function deriveAgentBadge(ctx: AgentLayerContext): BadgeStateColor {
  * Design brief section 3, Layer 3: "Two surfaces of the same fact."
  * The embedded attestation reflects the moment-of-action (immutable).
  * The live glyph reflects the current verifier check.
+ *
+ * Fail-closed: an unrecognized time-of-action state must never pass through
+ * verbatim (it would render as an unknown/absent badge). It degrades to
+ * yellow. Green is returned only when the action was attested green AND the
+ * current verifier still positively confirms green.
  */
 export function deriveActionBadge(ctx: ActionLayerContext): BadgeStateColor {
+  // Unrecognized time-of-action state: degrade truthfully, never emit raw.
+  if (!isKnownBadgeState(ctx.time_of_action_state)) {
+    return "yellow";
+  }
+
   // If time-of-action was local_only, that is the steady state
   if (ctx.time_of_action_state === "local_only") {
     return "local_only";
@@ -158,20 +251,18 @@ export function deriveActionBadge(ctx: ActionLayerContext): BadgeStateColor {
     return "offline";
   }
 
-  // If time-of-action was green but current verifier disagrees
-  if (
-    ctx.time_of_action_state === "green" &&
-    ctx.current_verifier_state !== "green"
-  ) {
-    return "yellow"; // "attested then; uncertain now"
-  }
-
   // If time-of-action was yellow, stays yellow
   if (ctx.time_of_action_state === "yellow") {
     return "yellow";
   }
 
-  return ctx.time_of_action_state;
+  // time_of_action_state is "green" here. Green survives ONLY if the current
+  // verifier positively confirms green; any other or unrecognized verifier
+  // state degrades to yellow ("attested then; uncertain now").
+  if (ctx.current_verifier_state === "green") {
+    return "green";
+  }
+  return "yellow";
 }
 
 // -----------------------------------------------------------------------
