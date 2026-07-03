@@ -1724,36 +1724,48 @@ export async function importExitBundle(
   const verification = await verifyExitBundle(opts.bundleDir, {
     acceptUnverifiableAttestations: opts.acceptUnverifiableAttestations,
   });
+  // A "not verified, nothing staged" result. Used when the read-only preview
+  // verdict fails AND when the pre-staging reputation signature gate rejects a
+  // bundle that only the relaxed previewer let through, so both refusals return
+  // the same clean shape instead of one path throwing and the other returning.
+  const notVerifiedResult = (
+    invalidAttestations: number,
+    unverifiableAttestations: number
+  ): ImportExitBundleResult => ({
+    verified: false,
+    activated: false,
+    conflicts: {
+      public_identity_exists: false,
+      state_conflicts: [],
+      reputation_conflicts: [],
+      policy_set_exists: false,
+      audit_receipts_exist: false,
+      commitments_exist: false,
+      import_record_exists: false,
+    },
+    state: {
+      status: "not_requested",
+      imported_keys: 0,
+      skipped_keys: 0,
+      skipped_invalid_sig: 0,
+      skipped_unknown_kid: 0,
+      conflicts: 0,
+    },
+    reputation: {
+      imported_attestations: 0,
+      invalid_attestations: invalidAttestations,
+      unverifiable_attestations: unverifiableAttestations,
+    },
+    staged_artifacts: [],
+    warnings: verification.warnings,
+    unsupported_artifacts: verification.unsupported_artifacts,
+  });
+
   if (!verification.passed) {
-    return {
-      verified: false,
-      activated: false,
-      conflicts: {
-        public_identity_exists: false,
-        state_conflicts: [],
-        reputation_conflicts: [],
-        policy_set_exists: false,
-        audit_receipts_exist: false,
-        commitments_exist: false,
-        import_record_exists: false,
-      },
-      state: {
-        status: "not_requested",
-        imported_keys: 0,
-        skipped_keys: 0,
-        skipped_invalid_sig: 0,
-        skipped_unknown_kid: 0,
-        conflicts: 0,
-      },
-      reputation: {
-        imported_attestations: 0,
-        invalid_attestations: 0,
-        unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
-      },
-      staged_artifacts: [],
-      warnings: verification.warnings,
-      unsupported_artifacts: verification.unsupported_artifacts,
-    };
+    return notVerifiedResult(
+      0,
+      verification.reputation?.unverifiable_attestations ?? 0
+    );
   }
 
   const manifest = await readManifest(opts.bundleDir);
@@ -1804,10 +1816,25 @@ export async function importExitBundle(
     ? opts.reputationStore ?? new ReputationStore(opts.storage, opts.masterKey)
     : null;
   if (opts.activate === true && reputationArtifact && reputationStore) {
-    reputationStore.verifyBundle(reputationArtifact.json, publicKeys.byDid, {
-      allowUnverifiableAttestations:
-        opts.acceptUnverifiableAttestations === true,
-    });
+    // This verify gates a store write (activation), so signature verification
+    // is not bypassable: acceptUnverifiableAttestations does NOT relax it. A
+    // forged or unknown-signer attestation fails the bundle before any write.
+    // The relaxed, write-free "accept unverifiable" verdict lives only in the
+    // read-only previewer (exit/verifier.ts, verifyExitBundle). When the
+    // relaxed previewer let an unverifiable-signer bundle through, this gate is
+    // where the import is refused: return the clean "not verified" result
+    // (nothing staged, nothing written) rather than proceeding to activation.
+    try {
+      reputationStore.verifyBundle(reputationArtifact.json, publicKeys.byDid);
+    } catch (err) {
+      if (err instanceof ReputationBundleVerificationError) {
+        return notVerifiedResult(
+          err.invalidAttestations,
+          err.unverifiableAttestations
+        );
+      }
+      throw err;
+    }
   }
 
   // Recognition-Layer Path C primary build 2: did:web cross-check.
@@ -2166,14 +2193,15 @@ export async function importExitBundle(
     await opts.auditLog.flush();
 
     if (reputationArtifact && reputationStore) {
+      // Signature verification is not bypassable on the import path:
+      // acceptUnverifiableAttestations does NOT admit an unknown-signer or
+      // otherwise unverifiable attestation into the store. A forged bundle is
+      // rejected here with zero writes. The relaxed verdict is confined to the
+      // read-only previewer (exit/verifier.ts, verifyExitBundle).
       const imported = await reputationStore.importBundle(
         reputationArtifact.json,
         true,
-        publicKeys.byDid,
-        {
-          allowUnverifiableAttestations:
-            opts.acceptUnverifiableAttestations === true,
-        }
+        publicKeys.byDid
       );
       reputationResult = {
         imported_attestations: imported.imported,

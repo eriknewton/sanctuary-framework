@@ -196,7 +196,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(audit.total).toBeGreaterThanOrEqual(1);
   });
 
-  it("#55: verifier fails bundle when an attestation has an unverifiable signer; passes with explicit opt-in", async () => {
+  it("#55/B2: read-only verifier may relax unverifiable signers, but IMPORT never admits them (no signature-verification bypass)", async () => {
     const source = await makeHarness();
     const primary = await callTool(source.tools, "identity_create", {
       label: "source-default",
@@ -224,6 +224,8 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     tempDirs.push(bundleDir);
     await exportFromSource(source, bundleDir);
 
+    // The read-only previewer keeps its strict-by-default / opt-in-relax
+    // behavior: it produces a VERDICT and never writes to any store.
     const strict = await verifyExitBundle(bundleDir);
     expect(strict.passed).toBe(false);
     // Full-sweep #77 narrowed this from generic "other" to the
@@ -240,6 +242,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(relaxed.passed).toBe(true);
     expect(relaxed.reputation?.unverifiable_attestations).toBe(1);
 
+    // Import path, strict: rejected, no activation, nothing staged.
     const destination = await makeHarness();
     const importStrict = await importExitBundle({
       bundleDir,
@@ -254,6 +257,12 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(importStrict.activated).toBe(false);
     expect(importStrict.staged_artifacts).toEqual([]);
 
+    // B2 fix: import with acceptUnverifiableAttestations:true must ALSO be
+    // rejected. Signature verification is NOT bypassable on the import path,
+    // so an unverifiable-signer attestation can never be admitted into the
+    // store. FAIL-BEFORE this fix, importRelaxed.activated was true and the
+    // forged attestation was credited; PASS-AFTER, the import is refused with
+    // zero reputation writes.
     const destination2 = await makeHarness();
     const importRelaxed = await importExitBundle({
       bundleDir,
@@ -265,9 +274,12 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
       activate: true,
       acceptUnverifiableAttestations: true,
     });
-    expect(importRelaxed.verified).toBe(true);
-    expect(importRelaxed.activated).toBe(true);
-    expect(importRelaxed.reputation.unverifiable_attestations).toBe(1);
+    expect(importRelaxed.verified).toBe(false);
+    expect(importRelaxed.activated).toBe(false);
+    // Nothing was credited into the reputation store.
+    await expect(
+      destination2.storage.list("_reputation")
+    ).resolves.toHaveLength(0);
   });
 
   // Per full-sweep #77: helpers for tampering with internal artifact
