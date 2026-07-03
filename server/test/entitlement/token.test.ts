@@ -302,6 +302,28 @@ describe("resolveEntitlement - fail-closed to community (table-driven)", () => {
   });
 });
 
+describe("tierAtLeast - fails closed on malformed operands", () => {
+  // Regression for the fail-open where a malformed REQUIRED tier (a typo or
+  // bad config in `b`) would grant a paid gate to the floor. tierRank returns
+  // -1 for an unknown string, so tierRank("community") (0) >= tierRank(bad)
+  // (-1) used to be true. tierAtLeast must validate both operands and deny.
+  it("denies when the required tier is a typo (fail-open regression)", () => {
+    expect(tierAtLeast("community", "fleeet" as never)).toBe(false);
+    expect(tierAtLeast("enterprise", "fleeet" as never)).toBe(false);
+  });
+
+  it("denies when the held tier is malformed", () => {
+    expect(tierAtLeast("bogus" as never, "team")).toBe(false);
+    expect(tierAtLeast("" as never, "community")).toBe(false);
+  });
+
+  it("still answers correctly for two valid tiers", () => {
+    expect(tierAtLeast("fleet", "team")).toBe(true);
+    expect(tierAtLeast("community", "fleet")).toBe(false);
+    expect(tierAtLeast("team", "team")).toBe(true);
+  });
+});
+
 describe("resolveEntitlement - no key material ever leaks (Hard Rule 6)", () => {
   it("never returns or serializes the issuer private key", () => {
     const result = resolveEntitlement({

@@ -53,10 +53,21 @@ export function tierRank(tier: EntitlementTier | string): number {
 /**
  * True when `a` grants at least as much capability as `b`. Used by callers
  * that gate a paid feature: `tierAtLeast(resolved, "fleet")`.
+ *
+ * Fails CLOSED on any malformed operand. `tierRank` returns -1 for an unknown
+ * string, so a comparison that only ranked the operands would fail OPEN when
+ * the REQUIRED tier (`b`) is a typo or bad config: `tierRank("community")` (0)
+ * is >= `tierRank("fleeet")` (-1), which would grant a paid gate to the floor
+ * tier. This is the single boundary that decides "does `a` clear the bar `b`",
+ * so both operands are validated here rather than at each call site; if either
+ * is not a known tier we deny.
  */
 export function tierAtLeast(
-  a: EntitlementTier,
-  b: EntitlementTier,
+  a: EntitlementTier | string,
+  b: EntitlementTier | string,
 ): boolean {
+  if (!isEntitlementTier(a) || !isEntitlementTier(b)) {
+    return false;
+  }
   return tierRank(a) >= tierRank(b);
 }
