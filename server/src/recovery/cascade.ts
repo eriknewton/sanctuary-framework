@@ -21,6 +21,7 @@ import { evaluateDmswitch } from "./dmswitch.js";
 import {
   CascadeStateError,
   ThresholdNotMetError,
+  WindowNotExpiredError,
 } from "./errors.js";
 import { packRecoveryEvent } from "./recovery-event.js";
 import {
@@ -71,6 +72,14 @@ function assertTransition(
  *
  * The cascade can be initiated either by DMswitch (automatic, after operator
  * absence threshold) or manually (guardian-initiated recovery request).
+ *
+ * Fail-closed invariant: when a `dmswitch_trigger` is supplied, the operator
+ * absence window MUST have expired. If it has not, this throws
+ * WindowNotExpiredError and no cascade is created. This blocks the path where
+ * a DMswitch-attributed cascade reaches `awaiting_threshold` on non-expired
+ * input, letting guardians satisfy the M-of-N threshold and execute before the
+ * absence window elapses. Manual (guardian-requested) recovery does not supply
+ * `dmswitch_trigger` and is unaffected.
  */
 export function initiateCascade(params: {
   action: RecoveryAction;
@@ -92,6 +101,12 @@ export function initiateCascade(params: {
       config: params.dmswitch_trigger.config,
       now_ms: params.dmswitch_trigger.now_ms,
     });
+    if (!evaluation.triggered) {
+      throw new WindowNotExpiredError({
+        remaining_ms: evaluation.remaining_ms,
+        expires_at: evaluation.expires_at,
+      });
+    }
     dmswitch_trigger = {
       last_activity_at: params.dmswitch_trigger.last_activity.last_activity_at,
       triggered_at: now,

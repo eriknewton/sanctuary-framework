@@ -1351,6 +1351,15 @@ describe("no LLM at gate (structural)", () => {
 //   B. unauthenticated approval envelope-field confusion: an approval's
 //      self-declared cascade_id / recovery_action were never bound to the
 //      input the signature actually covered, nor to the cascade action.
+//   C. DMswitch-triggered cascade on non-expired input (fail-open):
+//      initiateCascade recorded a dmswitch_trigger after evaluateDmswitch
+//      but never rejected evaluation.triggered === false, so a cascade
+//      attributed to the dead-man switch reached awaiting_threshold while
+//      the operator absence window was still open. Guardians could then
+//      satisfy the M-of-N threshold and execute BEFORE the window elapsed.
+//      Fixed by failing closed with WindowNotExpiredError in initiateCascade
+//      (covering initRecovery and any direct caller); no cascade is created
+//      or stored for non-expired DMswitch input.
 //
 // Classes that yielded NO real defect after audit (stated for the record):
 //   - cross-cascade replay: already blocked; cascade_id is inside the
@@ -1359,8 +1368,6 @@ describe("no LLM at gate (structural)", () => {
 //   - execute-time raised threshold: executeCascade re-evaluates against
 //     the current roster and fails closed when M was raised.
 //   - m=0 / empty partial set: issueGuardianRoster rejects m<1 at issuance.
-//   - DMswitch false-trigger: the evaluator is pure "elapsed >= window"
-//     arithmetic and only gates cascade ENTRY, never the guardian threshold.
 // ===================================================================
 
 describe("harden A3: cross-roster-version signature reuse is closed", () => {
@@ -1575,5 +1582,116 @@ describe("harden A3: unauthenticated approval-envelope fields are bound", () => 
     );
     const next = registerApproval(cascade, approval!);
     expect(next.approvals.length).toBe(1);
+  });
+});
+
+describe("harden A3: DMswitch-triggered cascade on non-expired input fails closed", () => {
+  it("initiateCascade throws WindowNotExpiredError for a not-yet-expired DMswitch window (direct caller)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    // Operator active a few seconds ago against a 30-day window: window open.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    // Fail closed: no cascade is created for a non-expired DMswitch input.
+    // Pre-fix this returned an awaiting_threshold cascade with a
+    // dmswitch_trigger; post-fix it throws before any cascade exists.
+    expect(() =>
+      initiateCascade({
+        action: "key_rotation",
+        fortress_id: fix.fortressId,
+        roster,
+        dmswitch_trigger: { last_activity: activity, config },
+      })
+    ).toThrow(WindowNotExpiredError);
+  });
+
+  it("initiateCascade still succeeds once the DMswitch window has expired (guard does not over-block)", () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+
+    const activity = buildActivity(DEFAULT_DMSWITCH_WINDOW_MS + 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    const cascade = initiateCascade({
+      action: "key_rotation",
+      fortress_id: fix.fortressId,
+      roster,
+      dmswitch_trigger: { last_activity: activity, config },
+    });
+    expect(cascade.state).toBe("triggered");
+    expect(cascade.dmswitch_trigger).toBeTruthy();
+  });
+
+  it("initRecovery does not create or store a cascade for a non-expired DMswitch window, so no guardian quorum can execute early", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(5);
+    const roster = buildRoster(fix, guardians, 3, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    // Operator active seconds ago: absence window is still open.
+    const activity = buildActivity(5_000);
+
+    // Pre-fix: initRecovery returned an awaiting_threshold cascade whose
+    // threshold guardians could then satisfy and execute before the window
+    // expired. Post-fix: it fails closed with WindowNotExpiredError and
+    // stores nothing.
+    expect(() =>
+      initRecovery({ ctx, action: "key_rotation", last_activity: activity })
+    ).toThrow(WindowNotExpiredError);
+
+    // No cascade was persisted, so there is nothing for a guardian quorum to
+    // drive to execution.
+    expect(store.list().length).toBe(0);
+    expect(store.listActive().length).toBe(0);
+  });
+
+  it("manual guardian-requested recovery (no last_activity) is unaffected by the window guard", async () => {
+    const fix = buildFixture();
+    const guardians = buildGuardians(3);
+    const roster = buildRoster(fix, guardians, 2, 1);
+    const store = new RecoveryStore();
+    const ctx = {
+      fortress_id: fix.fortressId,
+      emitter_node: fix.nodeId,
+      emitter_principal: "root",
+      node_signing_key: fix.nodeKp.privateKey,
+      roster,
+      config: {
+        dmswitch: {
+          max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+          estate_planning_enabled: false,
+        },
+      },
+      store,
+    };
+
+    const { cascade } = initRecovery({ ctx, action: "emergency_freeze" });
+    expect(cascade.state).toBe("awaiting_threshold");
+    expect(cascade.dmswitch_trigger).toBeUndefined();
+    expect(store.list().length).toBe(1);
   });
 });
