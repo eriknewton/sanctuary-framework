@@ -81,7 +81,10 @@ async function verifyBundledPlugin(ref: BundledPluginRef): Promise<{
   loaded: LoadedBundledPlugin;
   signerNote: string;
 }> {
-  const loaded = await loadBundledPlugin(ref.bundleDir);
+  // Load BY REGISTRY PLUGIN ID (fail-closed): the loader resolves the directory
+  // internally from the frozen registry, realpath-checks it, and asserts the loaded
+  // identity against the registry spec. Never pass a caller-derived path.
+  const loaded = await loadBundledPlugin(ref.id);
   return {
     loaded,
     signerNote:

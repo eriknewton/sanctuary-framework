@@ -3,7 +3,7 @@
     "schema": "sanctuary.plugin.bundle/v1",
     "alg": "ed25519",
     "signer_id": "ai.sanctuary.first-party",
-    "key_id": "release-v1",
+    "key_id": "hosts-blocklist-v1",
     "plugin_id": "ai.sanctuary.hosts-blocklist",
     "version": "1.0.0",
     "channel": "stable",
@@ -20,8 +20,8 @@
         "path": "first-party-signer.json",
         "type": "file",
         "mode_exec": false,
-        "size": 140,
-        "sha256": "518705b9ef54f7cef7e2adcf9d5b6fd9af350673713883ea4504670baae7733f"
+        "size": 148,
+        "sha256": "7c4c7eeeb923dc8c30473522e6bf7ef88d49a76b89b3d6e0623467f607c34ffb"
       },
       {
         "path": "governance.yaml",
@@ -39,5 +39,5 @@
       }
     ]
   },
-  "signature": "F6bXg+ryq6ZpEdozqEcT3TVDaZWs65BQ10kNB7PxU7USldt2qS0IBPBLHVpU7KQqCAalEJv1Zlrgd86QGJU0CA=="
+  "signature": "Ug+29GjDKi/ZaNS+w4rez+q12zsytp+qZ2pF7vfmEgvA3cw0fy9b+NffD4gVD5UvBEiTl0GQFWiaxefufgGUAQ=="
 }

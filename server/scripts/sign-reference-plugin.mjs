@@ -39,16 +39,30 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REFERENCE_PLUGIN_ROOT = join(__dirname, "..", "src", "substrate", "reference-plugin");
 const SIGNATURE_FILENAME = "SIGNATURE.json";
 const SIGNER_PUBKEY_FILENAME = "first-party-signer.json";
-const SIGNER_ID = "ai.sanctuary.first-party";
-const KEY_ID = "release-v1";
 
 // Every first-party bundled reference plugin, each independently signed with its own
-// key. To add a bundle: add its {dir, entry} here, its dir name to
-// REFERENCE_PLUGIN_BUNDLES in copy-templates.js, and its row to BUNDLED_PLUGINS in
-// src/substrate/reference-plugin/bundled-plugins.ts. First-party bundled only.
+// key. Each bundle carries a DISTINCT (signerId, keyId) tuple so the identity tuple is
+// unique across bundles (a future third-party signer registry may key signers by this
+// tuple). These MUST match the (signer_id, key_id) in BUNDLED_PLUGINS in
+// src/substrate/reference-plugin/bundled-plugins.ts; the host asserts the bundle's
+// self-shipped tuple against that frozen registry.
+//
+// To add a bundle: add its {dir, entry, signerId, keyId} here, its dir name to
+// REFERENCE_PLUGIN_BUNDLES in copy-templates.js, and its row to BUNDLED_PLUGINS.
+// First-party bundled only.
 const BUNDLES = [
-  { dir: join(REFERENCE_PLUGIN_ROOT, "blocklist"), entry: "bin/blocklist.mjs" },
-  { dir: join(REFERENCE_PLUGIN_ROOT, "hosts-blocklist"), entry: "bin/hosts-blocklist.mjs" },
+  {
+    dir: join(REFERENCE_PLUGIN_ROOT, "blocklist"),
+    entry: "bin/blocklist.mjs",
+    signerId: "ai.sanctuary.first-party",
+    keyId: "release-v1",
+  },
+  {
+    dir: join(REFERENCE_PLUGIN_ROOT, "hosts-blocklist"),
+    entry: "bin/hosts-blocklist.mjs",
+    signerId: "ai.sanctuary.first-party",
+    keyId: "hosts-blocklist-v1",
+  },
 ];
 
 const force = process.argv.includes("--force");
@@ -118,7 +132,7 @@ function enumerate(dir, entry) {
   return out;
 }
 
-function buildDescriptor(bundleDir, files) {
+function buildDescriptor(bundleDir, files, signerId, keyId) {
   const governanceText = readFileSync(join(bundleDir, "governance.yaml"), "utf8");
   const version = /^version:\s*(\S+)/m.exec(governanceText)?.[1] ?? "0.0.0";
   const channel = /^channel:\s*(\S+)/m.exec(governanceText)?.[1] ?? "stable";
@@ -126,8 +140,8 @@ function buildDescriptor(bundleDir, files) {
   return {
     schema: "sanctuary.plugin.bundle/v1",
     alg: "ed25519",
-    signer_id: SIGNER_ID,
-    key_id: KEY_ID,
+    signer_id: signerId,
+    key_id: keyId,
     plugin_id: pluginId,
     version,
     channel,
@@ -136,7 +150,7 @@ function buildDescriptor(bundleDir, files) {
   };
 }
 
-function alreadyValid(bundleDir, entry) {
+function alreadyValid(bundleDir, entry, signerId, keyId) {
   const sigPath = join(bundleDir, SIGNATURE_FILENAME);
   const pubPath = join(bundleDir, SIGNER_PUBKEY_FILENAME);
   if (!existsSync(sigPath) || !existsSync(pubPath)) return false;
@@ -144,10 +158,12 @@ function alreadyValid(bundleDir, entry) {
     const sig = JSON.parse(readFileSync(sigPath, "utf8"));
     const pub = JSON.parse(readFileSync(pubPath, "utf8"));
     // Re-build the descriptor from current disk; the existing signature must match
-    // it AND verify against the committed pubkey, else we need to re-sign.
+    // it AND verify against the committed pubkey, else we need to re-sign. A changed
+    // signer tuple (signerId/keyId) also forces a re-sign here.
     const files = enumerate(bundleDir, entry);
-    const expected = buildDescriptor(bundleDir, files);
+    const expected = buildDescriptor(bundleDir, files, signerId, keyId);
     if (canonicalize(sig.descriptor) !== canonicalize(expected)) return false;
+    if (pub.signer_id !== signerId || pub.key_id !== keyId) return false;
     const signedBytes = new TextEncoder().encode(canonicalize(sig.descriptor));
     const signature = Uint8Array.from(Buffer.from(sig.signature, "base64"));
     const publicKey = Uint8Array.from(Buffer.from(pub.public_key_b64, "base64"));
@@ -157,8 +173,8 @@ function alreadyValid(bundleDir, entry) {
   }
 }
 
-function signBundle(bundleDir, entry) {
-  if (!force && alreadyValid(bundleDir, entry)) {
+function signBundle(bundleDir, entry, signerId, keyId) {
+  if (!force && alreadyValid(bundleDir, entry, signerId, keyId)) {
     console.log(`sign-reference-plugin: ${bundleDir} signature already valid (use --force to re-key)`);
     return;
   }
@@ -172,14 +188,14 @@ function signBundle(bundleDir, entry) {
   writeFileSync(
     join(bundleDir, SIGNER_PUBKEY_FILENAME),
     `${JSON.stringify(
-      { signer_id: SIGNER_ID, key_id: KEY_ID, public_key_b64: Buffer.from(publicKey).toString("base64") },
+      { signer_id: signerId, key_id: keyId, public_key_b64: Buffer.from(publicKey).toString("base64") },
       null,
       2,
     )}\n`,
   );
 
   const files = enumerate(bundleDir, entry);
-  const descriptor = buildDescriptor(bundleDir, files);
+  const descriptor = buildDescriptor(bundleDir, files, signerId, keyId);
   const signedBytes = new TextEncoder().encode(canonicalize(descriptor));
   const signature = Buffer.from(ed25519.sign(signedBytes, privateKey)).toString("base64");
 
@@ -188,13 +204,13 @@ function signBundle(bundleDir, entry) {
     `${JSON.stringify({ descriptor, signature }, null, 2)}\n`,
   );
   console.log(
-    `sign-reference-plugin: signed ${descriptor.files.length} files in ${descriptor.plugin_id}; wrote SIGNATURE.json + ${SIGNER_PUBKEY_FILENAME}`,
+    `sign-reference-plugin: signed ${descriptor.files.length} files in ${descriptor.plugin_id} as (${signerId}, ${keyId}); wrote SIGNATURE.json + ${SIGNER_PUBKEY_FILENAME}`,
   );
 }
 
 function main() {
   for (const bundle of BUNDLES) {
-    signBundle(bundle.dir, bundle.entry);
+    signBundle(bundle.dir, bundle.entry, bundle.signerId, bundle.keyId);
   }
 }
 

@@ -31,6 +31,7 @@ export {
   type BundledPluginSpec,
   type LoadedBundledPlugin,
   BUNDLED_PLUGINS,
+  bundledPluginSpec,
   bundledPluginDir,
   enumerateBundleDir,
   readBundledSignerFrom,
