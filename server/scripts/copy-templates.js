@@ -39,7 +39,7 @@ for (const name of TEMPLATE_DIRS) {
 // dist/reference-plugin/<name>/, which referenceBlocklistBundleDir() resolves.
 const srcRefPlugins = join(__dirname, "..", "src", "substrate", "reference-plugin");
 const distRefPlugins = join(__dirname, "..", "dist", "reference-plugin");
-const REFERENCE_PLUGIN_BUNDLES = ["blocklist"];
+const REFERENCE_PLUGIN_BUNDLES = ["blocklist", "hosts-blocklist"];
 mkdirSync(distRefPlugins, { recursive: true });
 for (const name of REFERENCE_PLUGIN_BUNDLES) {
   const src = join(srcRefPlugins, name);

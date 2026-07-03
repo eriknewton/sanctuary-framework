@@ -133,4 +133,12 @@ export {
   readBundledSigner,
   loadBundledReferenceBlocklist,
   spawnReferencePlugin,
+  FIRST_PARTY_SIGNER_FILENAME,
+  type BundledPluginSpec,
+  type LoadedBundledPlugin,
+  BUNDLED_PLUGINS,
+  bundledPluginDir,
+  enumerateBundleDir,
+  readBundledSignerFrom,
+  loadBundledPlugin,
 } from "./reference-plugin/index.js";

@@ -1,19 +1,23 @@
 /**
  * `sanctuary plugin list | status | test` (plugin-host slice S5).
  *
- * Minimal operator surface over the bundled reference plugins. It is intentionally
- * read-only + liveness-only:
- *   - list    — every bundled plugin, its id/version/channel + declared hooks.
- *   - status  — integrity-verify the bundle against the first-party signer and print
- *               the descriptor summary (bundle hash, file count, entry).
- *   - test    — LIVENESS probe: spawn the plugin, send one host-generated randomized
+ * Minimal operator surface over the first-party BUNDLED reference plugins. It is
+ * intentionally read-only + liveness-only:
+ *   - list    - EVERY bundled plugin, its id/version/channel + declared hooks.
+ *   - status  - integrity-verify EACH bundle against its own first-party signer and
+ *               print the descriptor summary (bundle hash, file count, entry). A
+ *               tampered bundle fails closed here (integrity: FAILED, non-zero exit).
+ *   - test    - LIVENESS probe: spawn the plugin, send one host-generated randomized
  *               request through the real wire path, print the verdict. UX copy says
  *               this proves the plugin is ALIVE and answering the contract, NOT that
  *               its detection quality is good (RFC §11).
  *
- * There is no install/enable/disable/evict verb here — third-party install is
- * F1-gated (design D2) and the bundled reference plugin needs no install ceremony.
- * Lifecycle ceremonies are Tier-1 and live elsewhere.
+ * There is now more than one first-party bundled reference plugin; list/status
+ * enumerate and integrity-verify EACH independently. These are FIRST-PARTY BUNDLED
+ * reference plugins, NOT third-party or marketplace plugins. There is no
+ * install/enable/disable/evict verb here - third-party install is F1-gated (design
+ * D2) and the bundled reference plugins need no install ceremony. Lifecycle
+ * ceremonies are Tier-1 and live elsewhere.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
@@ -24,10 +28,12 @@ import type { Writable } from "node:stream";
 import { SubstrateError } from "../substrate/errors.js";
 import { parseGovernance } from "../substrate/governance.js";
 import {
-  loadBundledReferenceBlocklist,
-  referenceBlocklistBundleDir,
+  BUNDLED_PLUGINS,
+  bundledPluginDir,
+  loadBundledPlugin,
   spawnReferencePlugin,
-  type LoadedReferenceBundle,
+  type BundledPluginSpec,
+  type LoadedBundledPlugin,
 } from "../substrate/reference-plugin/index.js";
 
 const PLUGIN_HELP = `sanctuary plugin - bundled plugin inspection (read-only + liveness)
@@ -38,8 +44,10 @@ Usage:
   sanctuary plugin test [<id>]       liveness probe: send a randomized request, print the verdict
 
 Notes:
-  - Only the first-party bundled reference plugin (ai.sanctuary.blocklist) is present.
-    Third-party install is gated until the registry-integrity work lands.
+  - Only first-party bundled reference plugins (ai.sanctuary.blocklist,
+    ai.sanctuary.hosts-blocklist) are present. These are bundled reference plugins,
+    not third-party or marketplace plugins. Third-party install is gated until the
+    registry-integrity work lands.
   - "test" proves the plugin is ALIVE and answers the contract. It does NOT grade
     detection quality.
 `;
@@ -51,29 +59,29 @@ interface BundledPluginRef {
 }
 
 function bundledPlugins(): BundledPluginRef[] {
-  const blocklistDir = referenceBlocklistBundleDir();
-  return [
-    {
-      id: "ai.sanctuary.blocklist",
-      bundleDir: blocklistDir,
-      governanceText: fs.readFile(path.join(blocklistDir, "governance.yaml"), "utf8"),
-    },
-  ];
+  return BUNDLED_PLUGINS.map((spec: BundledPluginSpec) => {
+    const bundleDir = bundledPluginDir(spec);
+    return {
+      id: spec.plugin_id,
+      bundleDir,
+      governanceText: fs.readFile(path.join(bundleDir, "governance.yaml"), "utf8"),
+    };
+  });
 }
 
 /**
  * Integrity-verify a bundled plugin using its COMMITTED SIGNATURE.json and the
- * COMMITTED first-party signer pubkey. This proves the on-disk file set matches the
- * signed descriptor and that the Ed25519 signature verifies under the first-party
- * signer key shipped in the signed release (trust = release integrity; there is no
- * independent host-policy pin until the third-party signer registry lands, which is
- * F1-gated) — the production-honest path, no ephemeral keys.
+ * COMMITTED first-party signer pubkey shipped in that same bundle. This proves the
+ * on-disk file set matches the signed descriptor and that the Ed25519 signature
+ * verifies under the bundle's own first-party signer key (trust = release integrity;
+ * there is no independent host-policy pin until the third-party signer registry lands,
+ * which is F1-gated) - the production-honest path, no ephemeral keys.
  */
 async function verifyBundledPlugin(ref: BundledPluginRef): Promise<{
-  loaded: LoadedReferenceBundle;
+  loaded: LoadedBundledPlugin;
   signerNote: string;
 }> {
-  const loaded = await loadBundledReferenceBlocklist(ref.bundleDir);
+  const loaded = await loadBundledPlugin(ref.bundleDir);
   return {
     loaded,
     signerNote:
@@ -140,7 +148,7 @@ async function runTest(out: Writable, err: Writable, id?: string): Promise<numbe
   }
   const ref = refs[0]!;
   // First integrity-verify; never run a plugin whose bundle does not verify.
-  let loaded: LoadedReferenceBundle;
+  let loaded: LoadedBundledPlugin;
   try {
     ({ loaded } = await verifyBundledPlugin(ref));
   } catch (e) {
