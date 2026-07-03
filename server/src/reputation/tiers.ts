@@ -36,6 +36,62 @@ export const TIER_WEIGHTS: Record<SovereigntyTier, number> = {
   "unverified": 0.2,
 };
 
+/**
+ * The maximum sovereignty tier an IMPORTED attestation may carry once trusted
+ * locally.
+ *
+ * A locally recorded attestation's tier is trustworthy because THIS store's
+ * resolveTier set it from a handshake this instance actually witnessed. An
+ * imported attestation's tier is a claim made by a foreign signer: import
+ * proves the signer's identity (their Ed25519 signature over their own data),
+ * but it does NOT prove that the importing instance ever witnessed a
+ * sovereignty handshake with that signer. Trusting a self-asserted
+ * "verified-sovereign"/"verified-degraded" tier at face value would let a
+ * malicious exporter self-sign a top-weight (1.0) attestation and have it
+ * dominate weighted scoring on every instance that imports it.
+ *
+ * The honest ceiling for an imported attestation is therefore "self-attested":
+ * the signature proves the signer holds the identity, nothing stronger.
+ */
+export const MAX_IMPORTED_SOVEREIGNTY_TIER: SovereigntyTier = "self-attested";
+
+/**
+ * Rank tiers by credibility so a clamp can pick the lower of two tiers without
+ * hard-coding pairwise comparisons. Higher number == more credible.
+ * Kept in lockstep with the tier enum; an exhaustive Record forces a compile
+ * error if a new tier is added without ranking it.
+ */
+const TIER_RANK: Record<SovereigntyTier, number> = {
+  "verified-sovereign": 3,
+  "verified-degraded": 2,
+  "self-attested": 1,
+  "unverified": 0,
+};
+
+/**
+ * Clamp an imported attestation's self-asserted sovereignty tier to the
+ * non-privileged import ceiling (MAX_IMPORTED_SOVEREIGNTY_TIER). A tier at or
+ * below the ceiling passes through unchanged; a privileged claim
+ * ("verified-sovereign"/"verified-degraded") is lowered to the ceiling.
+ *
+ * Fail-closed by construction: an undefined tier stays undefined (it already
+ * scores as the lowest weight downstream), and an unknown/out-of-enum string is
+ * lowered to the ceiling rather than trusted. There is no path by which this
+ * function RAISES a tier.
+ */
+export function clampImportedSovereigntyTier(
+  tier: SovereigntyTier | undefined
+): SovereigntyTier | undefined {
+  if (tier === undefined) return undefined;
+  const rank = TIER_RANK[tier];
+  const ceilingRank = TIER_RANK[MAX_IMPORTED_SOVEREIGNTY_TIER];
+  // An unknown tier (rank undefined) is not trusted above the ceiling.
+  if (rank === undefined || rank > ceilingRank) {
+    return MAX_IMPORTED_SOVEREIGNTY_TIER;
+  }
+  return tier;
+}
+
 /** Tier metadata embedded in attestations */
 export interface TierMetadata {
   sovereignty_tier: SovereigntyTier;

@@ -23,11 +23,13 @@ import {
   bytesToString,
   toBase64url,
   fromBase64url,
+  fromBase64urlStrict,
 } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import { sign, verify } from "../core/identity.js";
 import type { StoredIdentity } from "../core/identity.js";
 import type { SovereigntyTier } from "./tiers.js";
+import { clampImportedSovereigntyTier } from "./tiers.js";
 import { hashToString } from "../core/hashing.js";
 import { verifyBridgeCommitment } from "../bridge/bridge.js";
 import type { BridgeCommitment, ConcordiaOutcome } from "../bridge/types.js";
@@ -77,6 +79,27 @@ export interface StoredAttestation {
   counterparty_attestation?: string;
   counterparty_confirmed: boolean;
   recorded_at: string;
+  /**
+   * Provenance marker used by tier-weighted reads to decide whether a stored
+   * attestation's self-asserted sovereignty_tier may be trusted.
+   *
+   *   - false  => recorded locally from a handshake THIS instance witnessed;
+   *               the tier is trustworthy and is NOT clamped.
+   *   - true   => accepted via importBundle; the tier is a foreign signer's
+   *               uncorroborated claim and is clamped to
+   *               MAX_IMPORTED_SOVEREIGNTY_TIER at every weighted read.
+   *   - absent => unknown provenance. FAIL CLOSED: a record whose imported
+   *               field is undefined is treated as untrusted and clamped like
+   *               an import. Legacy attestations written before this marker
+   *               existed land here, so a pre-patch imported "verified-sovereign"
+   *               claim cannot keep a privileged weight just because it predates
+   *               the marker. Only an explicit imported:false escapes the clamp.
+   *
+   * The signed attestation.data is left byte-intact so re-export signatures still
+   * verify; this marker drives the trust clamp at the consumption boundary
+   * instead of mutating the signed payload.
+   */
+  imported?: boolean;
 }
 
 /** Aggregated metric statistics */
@@ -207,6 +230,35 @@ export interface Guarantee {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * The sovereignty tier that may be TRUSTED for weighting from a stored
+ * attestation, as opposed to the raw self-asserted tier in the signed data.
+ *
+ * The recorded tier passes through verbatim ONLY when provenance is provably
+ * local (imported === false): it was set from a handshake this instance
+ * witnessed. In EVERY other case the tier is clamped to
+ * MAX_IMPORTED_SOVEREIGNTY_TIER:
+ *
+ *   - imported === true  => a foreign signer's uncorroborated tier claim.
+ *   - imported undefined => unknown provenance. Fail CLOSED. Legacy records
+ *                           written before the marker existed have no imported
+ *                           field; a pre-patch imported "verified-sovereign"
+ *                           claim must NOT keep a privileged weight merely
+ *                           because it predates the marker.
+ *
+ * This is the single chokepoint every tier-weighted read must go through so a
+ * forged or provenance-unknown attestation cannot inflate its scoring weight.
+ * It never RAISES a tier.
+ */
+export function trustedSovereigntyTier(
+  stored: StoredAttestation
+): SovereigntyTier | undefined {
+  const declared = stored.attestation.data.sovereignty_tier;
+  return stored.imported === false
+    ? declared
+    : clampImportedSovereigntyTier(declared);
+}
 
 function computeMedian(values: number[]): number {
   if (values.length === 0) return 0;
@@ -547,6 +599,10 @@ export class ReputationStore {
       counterparty_attestation: counterpartyAttestation,
       counterparty_confirmed: !!counterpartyAttestation,
       recorded_at: now,
+      // Provably local provenance: this tier came from a handshake this
+      // instance witnessed, so trustedSovereigntyTier leaves it unclamped.
+      // Stamped explicitly (not left absent) because absent now fails closed.
+      imported: false,
     };
 
     // Persist encrypted
@@ -843,6 +899,13 @@ export class ReputationStore {
    * The verifySignatures parameter is retained for older internal callers but
    * no longer disables per-attestation verification.
    *
+   * Signature verification is NOT bypassable on this path: there is no
+   * "accept unverifiable" option. A missing signer key, an absent, a malformed,
+   * or a tampered per-attestation signature makes the whole bundle invalid and
+   * NOTHING is written. An operator who wants a relaxed, write-free verdict must
+   * use the read-only exit-bundle previewer (exit/verifier.ts), which never
+   * admits an attestation into the store.
+   *
    * @param publicKeys - Map of DID → public key bytes for signature verification
    */
   async importBundle(
@@ -851,7 +914,6 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
-      allowUnverifiableAttestations?: boolean;
     } = {}
   ): Promise<{
     imported: number;
@@ -876,11 +938,15 @@ export class ReputationStore {
 
     for (const attestation of bundle.attestations) {
       // Store the imported attestation only after all bundle-level and
-      // per-attestation validation succeeds.
+      // per-attestation validation succeeds. Mark it imported so tier-weighted
+      // reads clamp its self-asserted sovereignty_tier to the non-privileged
+      // import ceiling: a foreign signer's "verified-sovereign" claim is not
+      // trustworthy on this instance, which never witnessed that handshake.
       const stored: StoredAttestation = {
         attestation,
         counterparty_confirmed: false,
         recorded_at: new Date().toISOString(),
+        imported: true,
       };
 
       const serialized = stringToBytes(JSON.stringify(stored));
@@ -915,7 +981,6 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
-      allowUnverifiableAttestations?: boolean;
     } = {}
   ): {
     invalid: number;
@@ -929,10 +994,14 @@ export class ReputationStore {
       options.allowUnverifiedLegacy === true
     );
 
+    // Per-attestation signature verification is NOT bypassable on any path that
+    // reaches a store write. A missing signer key, an absent, a malformed, or a
+    // tampered signature is invalid, and any invalid attestation fails the whole
+    // bundle below. The relaxed "accept unverifiable" verdict is confined to the
+    // read-only exit-bundle previewer (exit/verifier.ts), which never writes.
     const attestationVerification = this.inspectAttestationSignatures(
       bundle,
-      publicKeys,
-      options.allowUnverifiableAttestations === true
+      publicKeys
     );
     const { invalid, unverifiable } = attestationVerification;
     if (invalid > 0) {
@@ -973,7 +1042,6 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
-      allowUnverifiableAttestations?: boolean;
     } = {}
   ): Promise<{
     invalid: number;
@@ -1274,10 +1342,23 @@ export class ReputationStore {
     }
   }
 
+  /**
+   * Verify every per-attestation Ed25519 signature in a bundle. This runs on
+   * the IMPORT path (verifyBundle / verifyBundleForImport / importBundle), where
+   * signature verification is NOT bypassable: a missing signer key, an absent,
+   * a malformed, or a tampered signature all count as `invalid`, and the caller
+   * refuses the whole bundle (zero writes) when `invalid > 0`.
+   *
+   * `unverifiable` is retained as a reported COUNT (how many attestations had an
+   * unknown signer key) for diagnostics, but an unverifiable attestation is
+   * ALSO counted as invalid here, so it can never be admitted into the store.
+   * The only relaxed, write-free "accept unverifiable" verdict lives in the
+   * standalone read-only exit-bundle previewer (exit/verifier.ts), which does
+   * not route through this method and never writes to the store.
+   */
   private inspectAttestationSignatures(
     bundle: ReputationBundle,
-    publicKeys: Map<string, Uint8Array>,
-    allowUnverifiableAttestations: boolean
+    publicKeys: Map<string, Uint8Array>
   ): { invalid: number; unverifiable: number } {
     let invalid = 0;
     let unverifiable = 0;
@@ -1289,17 +1370,24 @@ export class ReputationStore {
 
       const signerKey = publicKeys.get(attestation.signer);
       if (!signerKey) {
+        // Unknown signer: the signature cannot be verified, so it cannot be
+        // trusted. Fail closed on the import path regardless of any caller
+        // preference. Counted as unverifiable (for the diagnostic total) AND
+        // invalid (so the bundle is rejected before any write).
         unverifiable++;
-        if (allowUnverifiableAttestations) {
-          continue;
-        }
         invalid++;
         continue;
       }
 
+      // Strict decode: an absent, non-string, or non-canonical base64url
+      // signature is rejected here rather than silently coerced. fromBase64url
+      // is lenient (it skips junk and tolerates trailing padding), which is a
+      // signature-malleability fail-open on the import path; fromBase64urlStrict
+      // throws on any deviation, so a tampered or malformed signature counts as
+      // invalid and the bundle is refused before any write.
       let sigBytes: Uint8Array;
       try {
-        sigBytes = fromBase64url(attestation.signature);
+        sigBytes = fromBase64urlStrict(attestation.signature);
       } catch {
         invalid++;
         continue;
@@ -1472,7 +1560,9 @@ export class ReputationStore {
     let disputeCount = 0;
 
     for (const a of filtered) {
-      const tier = a.attestation.data.sovereignty_tier;
+      // Trust-clamped tier: an imported attestation cannot claim a privileged
+      // tier this instance never witnessed (see trustedSovereigntyTier).
+      const tier = trustedSovereigntyTier(a);
       if (tier) tierDist[tier]++;
 
       const ctx = a.attestation.data.context;
@@ -1500,8 +1590,22 @@ export class ReputationStore {
 
   /**
    * Load attestations for tier-weighted scoring.
-   * Applies basic context/counterparty filtering, returns full StoredAttestations
-   * so callers can access sovereignty_tier from attestation data.
+   *
+   * Applies basic context/counterparty filtering AND normalizes each record's
+   * scoring-visible `attestation.data.sovereignty_tier` through
+   * trustedSovereigntyTier, so this is the single trust chokepoint for scoring:
+   * a caller cannot feed a raw privileged tier into computeWeightedScore or a
+   * tier distribution by forgetting to clamp. An imported or unknown-provenance
+   * attestation that self-asserts a privileged ("verified-*") tier is returned
+   * clamped to the non-privileged import ceiling (self-attested); a provably
+   * local record (imported === false) is returned unchanged.
+   *
+   * The clamp is applied to a SCORING VIEW built on a fresh object spine, not to
+   * the persisted record: the signed `attestation.data` on disk is left
+   * byte-intact so re-export signatures still verify. The returned objects are a
+   * read-only scoring projection and are never re-persisted or re-exported. The
+   * per-record `imported` provenance marker is preserved so callers that still
+   * call trustedSovereigntyTier directly get the same (idempotent) verdict.
    */
   async loadAllForTierScoring(options?: {
     context?: string;
@@ -1518,7 +1622,26 @@ export class ReputationStore {
       );
     }
 
-    return all;
+    return all.map((stored) => {
+      const trusted = trustedSovereigntyTier(stored);
+      if (trusted === stored.attestation.data.sovereignty_tier) {
+        // No clamp needed (already trusted-local, already at/below ceiling, or
+        // both undefined): return the record unchanged to avoid an allocation.
+        return stored;
+      }
+      // Scoring view: override only the tier, on a fresh spine, leaving the
+      // persisted record and its signed data byte-image untouched.
+      return {
+        ...stored,
+        attestation: {
+          ...stored.attestation,
+          data: {
+            ...stored.attestation.data,
+            sovereignty_tier: trusted,
+          },
+        },
+      };
+    });
   }
 
   // ─── Internal ─────────────────────────────────────────────────────────

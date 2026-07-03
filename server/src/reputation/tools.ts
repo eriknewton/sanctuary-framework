@@ -10,6 +10,7 @@ import { toolResult } from "../router.js";
 import {
   ReputationBundleVerificationError,
   ReputationStore,
+  trustedSovereigntyTier,
   type InteractionOutcome,
   type StoredAttestation,
 } from "./reputation-store.js";
@@ -635,14 +636,17 @@ export function createReputationTools(
           .filter((a) => a.attestation.data.metrics[metric] !== undefined)
           .map((a) => ({
             value: a.attestation.data.metrics[metric]!,
-            tier: (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier,
+            // Trust-clamped tier: an imported attestation cannot claim a
+            // privileged (verified-*) tier this instance never witnessed, so a
+            // forged import cannot inflate its own scoring weight.
+            tier: (trustedSovereigntyTier(a) ?? "unverified") as SovereigntyTier,
           }));
 
         const weightedScore = computeWeightedScore(tieredAttestations) ?? 0;
 
-        // Compute tier distribution
+        // Compute tier distribution over the same trust-clamped tiers.
         const tiers = allAttestations.map(
-          (a) => (a.attestation.data.sovereignty_tier ?? "unverified") as SovereigntyTier
+          (a) => (trustedSovereigntyTier(a) ?? "unverified") as SovereigntyTier
         );
         const dist = tierDistribution(tiers);
         const bridgeMetricPolicy = await bridgeMetricPolicyDisclosure({

@@ -219,8 +219,12 @@ Options:
   --force-rebind                    On import: explicitly replace an existing fortress
                                     public identity (Tier 1 confirmation)
   --accept-unverifiable-attestations
-                                    On import: accept reputation attestations whose
-                                    signer DID is not in the bundle (Tier 1 confirmation)
+                                    On verify only: relax the read-only preview verdict
+                                    to tolerate reputation attestations whose signer DID
+                                    is not in the bundle. This is a non-authoritative
+                                    preview flag; it does NOT affect import, which always
+                                    verifies strictly and never admits an unverifiable
+                                    attestation.
   --did-web <identifier>            Embed a specific did:web identifier in the export
                                     manifest. Requires --did-web-authority-host.
                                     Overrides fortress-config auto-inclusion.
@@ -586,10 +590,6 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
       const activate = hasFlag(argv, "--activate");
       const importState = hasFlag(argv, "--import-state");
       const forceRebind = hasFlag(argv, "--force-rebind");
-      const acceptUnverifiableAttestations = hasFlag(
-        argv,
-        "--accept-unverifiable-attestations"
-      );
       const sourcePassphrase = flagValue(argv, "--source-passphrase");
       const sourceRecoveryKey = flagValue(argv, "--source-recovery-key");
       if (importState && !activate) {
@@ -633,18 +633,6 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           write(err, "Aborted.\n");
           return 1;
         }
-        if (acceptUnverifiableAttestations) {
-          const acceptApproved = await confirmTier1(
-            "Tier 1 approval required: accept unverifiable reputation attestations on import?",
-            hasFlag(argv, "--yes") || hasFlag(argv, "-y"),
-            stdin,
-            err
-          );
-          if (!acceptApproved) {
-            write(err, "Aborted.\n");
-            return 1;
-          }
-        }
       }
       const ctx = await openExitContext(argv, env);
       const conflict =
@@ -676,7 +664,6 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
           reputationStore: ctx.reputationStore,
           activate,
           forceRebind,
-          acceptUnverifiableAttestations,
           conflictResolution: conflict,
           ...(importState && sourcePassphrase
             ? { sourcePassphrase }
