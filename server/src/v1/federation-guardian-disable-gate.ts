@@ -135,11 +135,19 @@ export function breakGlassVetoCascadeId(
  *   - `current !== null && next === null` -> decrease (disable).
  *   - both non-null: compare `next.roster.m` vs `current.roster.m`. A strictly
  *     lower M is a decrease; a strictly higher M is an increase; an EQUAL M is
- *     a noop for gate purposes (a guardian re-pin at equal M is a
- *     roster-integrity concern already covered by the master-signed roster
- *     verification, not a threshold weakening - gating it would reintroduce a
+ *     a noop for THIS gate's threshold-weakening purposes (no quorum/master-
+ *     disable-authorization is demanded) - gating it too would reintroduce a
  *     lockout: an operator who lost a guardian's key could never re-pin a
- *     replacement without the very quorum that is now short a member).
+ *     replacement without the very quorum that is now short a member.
+ *     Roster-integrity for EVERY non-null transition (increase, noop, AND
+ *     decrease) - including this one - is enforced separately, by the caller
+ *     (`setFederationGuardianRevocationRequirement` in `principal-policy/
+ *     dashboard.ts`) verifying the new roster's fortress-master signature via
+ *     `verifyGuardianRoster` before any install, the same check the boot
+ *     rehydrate path runs. That check is what actually makes an equal-M
+ *     re-pin safe: an attacker cannot install an unsigned/forged roster
+ *     through this "noop" classification, because the caller refuses it
+ *     before this classifier's result is ever acted on.
  */
 export function classifyRequirementTransition(
   current: GuardianRevocationRequirement | null,

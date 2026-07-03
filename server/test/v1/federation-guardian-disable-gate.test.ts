@@ -352,6 +352,139 @@ describe("F1 E1: drill 1 - instant disable requires a valid quorum or master aut
   });
 });
 
+describe("F1 E1: roster-forgery fail-open (adversarial review finding, P1) - equal-M re-pin must verify the master signature", () => {
+  it("an equal-M re-pin with a FORGED roster (attacker guardian keys, bogus master_signature) is REFUSED, and a subsequent attacker-quorum disable against the real roster still fails", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+
+    // Start with a valid master-signed 3-of-5 requirement.
+    const realKeypairs = buildGuardianKeypairs(5);
+    const realRoster = buildRosterFromKeypairs(fortress, "mini-1", realKeypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster: realRoster });
+    expect(signOff(dashboard)).not.toBeNull();
+
+    // Attacker builds a FAKE 3-of-3 roster made entirely of attacker-controlled
+    // guardian keys, "signed" by an attacker keypair rather than the real
+    // fortress master (a forged master_signature - the attacker does not hold
+    // the fortress master private key). nextM === currentM (3 === 3), so this
+    // classifies as "noop" and would previously skip all authorization AND
+    // all roster verification.
+    const attackerGuardianKeypairs = buildGuardianKeypairs(3);
+    const attackerMasterKeypair = generateKeypair();
+    const fakeRoster = issueGuardianRoster({
+      m: 3,
+      n: 3,
+      guardians: attackerGuardianKeypairs.map((k) => k.identity),
+      fortress_id: fortress.fortressId,
+      version: 1,
+      master_private_key: attackerMasterKeypair.privateKey, // NOT the real fortress master
+    });
+    expect(
+      classifyRequirementTransition({ roster: realRoster }, { roster: fakeRoster }),
+    ).toBe("noop");
+
+    // The setter must THROW/refuse - the fake roster must NOT install.
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement({ roster: fakeRoster }),
+    ).rejects.toMatchObject({ code: "guardian_roster_signature_invalid" });
+
+    // The live requirement is UNCHANGED (still the real roster).
+    const live = signOff(dashboard) as GuardianRevocationRequirement | null;
+    expect(live).not.toBeNull();
+    expect(live!.roster.version).toBe(realRoster.version);
+    expect(live!.roster.guardians.map((g) => g.guardian_id).sort()).toEqual(
+      realKeypairs.map((k) => k.identity.guardian_id).sort(),
+    );
+
+    // An attacker-quorum disable attempt (3 attacker guardian signatures)
+    // against the REAL (unchanged) requirement must still fail: the attacker
+    // guardians are not members of the real roster.
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const attackerApprovals = attackerGuardianKeypairs.map((g) =>
+      signGuardianDisableApproval({
+        guardianId: g.identity.guardian_id,
+        guardianPrivateKey: g.privateKey,
+        fortressId: fortress.fortressId,
+        disableNonce: nonce,
+        intent: "disable",
+        targetM: null,
+        rosterVersion: realRoster.version,
+      }),
+    );
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null, {
+        quorumApprovals: attackerApprovals,
+      }),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+
+    // The requirement is STILL the real, unmodified roster after the attack.
+    expect(signOff(dashboard)).not.toBeNull();
+    const stillLive = signOff(dashboard) as GuardianRevocationRequirement;
+    expect(stillLive.roster.guardians.map((g) => g.guardian_id).sort()).toEqual(
+      realKeypairs.map((k) => k.identity.guardian_id).sort(),
+    );
+  });
+
+  it("a LEGITIMATE master-signed equal-M re-pin still SUCCEEDS (no lockout regression)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+
+    const originalKeypairs = buildGuardianKeypairs(5);
+    const originalRoster = buildRosterFromKeypairs(
+      fortress,
+      "mini-1",
+      originalKeypairs,
+      3,
+    );
+    await dashboard.setFederationGuardianRevocationRequirement({ roster: originalRoster });
+
+    // Operator lost one guardian's key and re-pins a REPLACEMENT roster at the
+    // SAME m=3, n=5, genuinely signed by the real fortress master - the exact
+    // scenario the "noop" carve-out exists to keep frictionless.
+    const replacementKeypairs = buildGuardianKeypairs(5);
+    const replacementRoster = buildRosterFromKeypairs(
+      fortress,
+      "mini-1",
+      replacementKeypairs,
+      3,
+      2, // bump version
+    );
+    expect(
+      classifyRequirementTransition(
+        { roster: originalRoster },
+        { roster: replacementRoster },
+      ),
+    ).toBe("noop");
+
+    await dashboard.setFederationGuardianRevocationRequirement({
+      roster: replacementRoster,
+    });
+
+    const live = signOff(dashboard) as GuardianRevocationRequirement;
+    expect(live.roster.version).toBe(2);
+    expect(live.roster.guardians.map((g) => g.guardian_id).sort()).toEqual(
+      replacementKeypairs.map((k) => k.identity.guardian_id).sort(),
+    );
+  });
+
+  it("refuses to install ANY roster when no pinned fortress-master is available", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+
+    // Simulate an unprovisioned/absent federation context.
+    dashboard.setFederationContext(null);
+
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement({ roster }),
+    ).rejects.toMatchObject({ code: "federation_not_provisioned" });
+  });
+});
+
 describe("F1 E1: drill 2 - replay firewall, cross-action (kill sign-off cannot authorize a disable, and vice versa)", () => {
   it("a valid KILL quorum is refused as a disable authorization", async () => {
     const fortress = makeMultiNodeFortress(["mini-1"]);

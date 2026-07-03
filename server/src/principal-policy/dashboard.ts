@@ -2063,17 +2063,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *
    * F1 E1 (the disable-gate): the transition is classified against the
    * CURRENTLY-persisted requirement ({@link classifyRequirementTransition}).
-   * `increase` (enable, or raise M) and `noop` (equal-M re-pin) behave EXACTLY
-   * as before this slice landed - operator-only, no authorization needed, that
-   * direction only makes the fleet safer. `decrease` (disable, or lower M) now
-   * REQUIRES a valid {@link GuardianDisableAuthorization}: either a master-key
-   * instant authorization (the fortress trust root, top authority, checked
-   * first) or an M-of-N guardian quorum over the CURRENT roster. Without one,
-   * the decrease is REFUSED - the instant path simply does not fire; the
-   * operator's only remaining route is {@link initiateFederationGuardianBreakGlass}.
-   * The `omit authorization entirely` call shape (used by every pre-E1 caller
-   * to ENABLE the requirement) is unchanged and still succeeds, because enable
-   * is always an `increase`.
+   * `increase` (enable, or raise M) and `noop` (equal-M re-pin) do not require
+   * a {@link GuardianDisableAuthorization} - operator-only, that direction
+   * only makes the fleet safer (or reasserts it). `decrease` (disable, or
+   * lower M) REQUIRES a valid `GuardianDisableAuthorization`: either a
+   * master-key instant authorization (the fortress trust root, top authority,
+   * checked first) or an M-of-N guardian quorum over the CURRENT roster.
+   * Without one, the decrease is REFUSED - the instant path simply does not
+   * fire; the operator's only remaining route is
+   * {@link initiateFederationGuardianBreakGlass}. The `omit authorization
+   * entirely` call shape (used by every pre-E1 caller to ENABLE the
+   * requirement) is unchanged and still succeeds, because enable is always an
+   * `increase`.
+   *
+   * Roster-forgery precondition (applies to EVERY transition, independent of
+   * the above): whenever `requirement` is non-null, its `roster` MUST verify
+   * against the pinned fortress-master public key ({@link verifyGuardianRoster},
+   * the same check the boot rehydrate path runs) before it is installed live.
+   * This closes an equal-M "noop" path that would otherwise let an
+   * operator-authority caller install an unsigned/forged roster (attacker
+   * guardian keys, bogus `master_signature`) without ever passing through the
+   * decrease-branch authorization above, since `nextM === currentM` classifies
+   * as `noop`. FAIL CLOSED: no pinned master, or a roster that does not
+   * verify, refuses the call entirely (nothing installs). A genuinely
+   * master-signed re-pin - including a legitimate equal-M one - is unaffected.
    */
   async setFederationGuardianRevocationRequirement(
     requirement: GuardianRevocationRequirement | null,
@@ -2164,6 +2177,43 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           "guardian_disable_authorization_required",
           disableDecisionDetail ??
             "disabling/lowering the guardian requirement requires a master-key authorization or an M-of-N guardian quorum; use the break-glass path if neither is available",
+        );
+      }
+    }
+
+    // E1 fix (roster-forgery fail-open): EVERY transition that installs a
+    // non-null roster - increase, noop (equal-M re-pin), AND decrease - MUST
+    // verify the new roster's fortress-master signature before it goes live,
+    // using the identical `verifyGuardianRoster` check the boot rehydrate path
+    // uses (`rehydrateGuardianRevocationRequirement`, above). Without this, an
+    // operator-authority attacker could call this setter with an equal-M
+    // "noop" roster built from attacker-controlled guardian keys and a forged
+    // `master_signature`: the decrease-only auth block above never runs for a
+    // noop transition, so the fake roster would otherwise install LIVE, and a
+    // subsequent attacker-quorum decrease would then verify against it. This
+    // check makes the module doc's claim (`classifyRequirementTransition`
+    // comment: equal-M re-pin is "already covered by the master-signed roster
+    // verification") actually true on the setter path, not just at rehydrate.
+    // FAIL CLOSED: no pinned master / no federation context, or a roster that
+    // does not verify, refuses the whole call - nothing is installed. A
+    // legitimate operator re-pin is unaffected because the fortress trust
+    // root can always sign a genuine replacement roster; only an unsigned or
+    // forged roster is refused, so this does not reintroduce the guardian-
+    // quorum lockout the noop carve-out was designed to avoid.
+    if (requirement !== null) {
+      const pinnedMasterForRoster = this._federationContext?.pinnedMasterPubkey ?? null;
+      if (pinnedMasterForRoster === null) {
+        throw new GuardianDisableGateRefusedError(
+          "federation_not_provisioned",
+          "no pinned fortress-master public key is available to verify the supplied guardian roster; refusing to install it",
+        );
+      }
+      try {
+        verifyGuardianRoster(requirement.roster, pinnedMasterForRoster);
+      } catch {
+        throw new GuardianDisableGateRefusedError(
+          "guardian_roster_signature_invalid",
+          "the supplied guardian roster does not verify against the pinned fortress-master public key; refusing to install it",
         );
       }
     }

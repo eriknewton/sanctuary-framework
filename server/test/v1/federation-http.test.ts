@@ -607,7 +607,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       guardians: guardians.map((g) => g.identity),
       fortress_id: materials.fortressId,
       version: 1,
-      master_private_key: materials.masterSecret,
+      master_private_key: materials.context.getMasterPrivateKey!(),
     });
     await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
@@ -640,7 +640,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       guardians: guardians.map((g) => g.identity),
       fortress_id: materials.fortressId,
       version: 1,
-      master_private_key: materials.masterSecret,
+      master_private_key: materials.context.getMasterPrivateKey!(),
     });
     await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
@@ -679,7 +679,7 @@ describe("/v1/federation/revoke: optional M-of-N guardian sign-off", { retry: 2 
       guardians: guardians.map((g) => g.identity),
       fortress_id: materials.fortressId,
       version: 1,
-      master_private_key: materials.masterSecret,
+      master_private_key: materials.context.getMasterPrivateKey!(),
     });
     await rig.dashboard.setFederationGuardianRevocationRequirement({ roster });
 
