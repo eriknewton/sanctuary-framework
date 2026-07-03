@@ -42,6 +42,7 @@ export type EgressProxyDecision =
       reason:
         | "canonicalization_failed"
         | "allowlist_miss"
+        | "resolution_failed"
         | "non_public_resolved_address"
         | "plugin_decision"
         | "audit_failed";
@@ -170,6 +171,15 @@ export function allowlistAllowsTarget(rules: AllowlistRule[], target: CanonicalC
   return rules.some((rule) => rule.disposition === "allow" && ruleMatchesTarget(rule, target));
 }
 
+/**
+ * Decide one CONNECT request. CONTRACT: this function NEVER rejects; every
+ * failure mode resolves to a deny decision. Both CONNECT handlers (the
+ * castle-wall proxy below and `egress-gate/gate-server.ts`) invoke it from a
+ * void-discarded async path, so an escaping rejection would become an
+ * unhandledRejection that kills the whole enforcement process -- and a
+ * rejecting DNS lookup (ENOTFOUND on an allowlisted-but-unresolvable name,
+ * or a transient outage on a legit one) is agent-triggerable at will.
+ */
 export async function decideEgressProxyConnect(
   authority: string,
   options: EgressProxyOptions
@@ -185,9 +195,23 @@ export async function decideEgressProxyConnect(
     return applyEgressPlugins(authority, { disposition: "deny", reason: "allowlist_miss" }, target, options);
   }
 
-  const addresses = target.isIpLiteral
-    ? [target.host]
-    : await (options.resolver ?? defaultResolver).resolve(target.host);
+  let addresses: string[];
+  if (target.isIpLiteral) {
+    addresses = [target.host];
+  } else {
+    try {
+      addresses = await (options.resolver ?? defaultResolver).resolve(target.host);
+    } catch {
+      // Fail-closed chokepoint (see the never-rejects contract above): a
+      // resolver rejection is a DENY, never an escaping rejection.
+      return applyEgressPlugins(
+        authority,
+        { disposition: "deny", reason: "resolution_failed" },
+        target,
+        options
+      );
+    }
+  }
   const routableCheck = options.isRoutable ?? isPublicRoutableIp;
   const publicAddress = addresses.find(routableCheck);
   if (!publicAddress) {
@@ -268,7 +292,15 @@ async function appendPluginAuditIfConfigured(
 export function createCastleWallEgressProxyServer(options: EgressProxyOptions): http.Server {
   const server = http.createServer();
   server.on("connect", (request, clientSocket, head) => {
-    void handleConnect(request, clientSocket, head, options);
+    handleConnect(request, clientSocket, head, options).catch(() => {
+      // Backstop (deny-direction): a rejection escaping the handler would
+      // surface as an unhandledRejection and kill the whole proxy process
+      // (letting the client kill its own enforcement path). Same hardened
+      // shape as the exclusive-egress gate (egress-gate/gate-server.ts).
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+    });
   });
   return server;
 }
@@ -280,6 +312,18 @@ async function handleConnect(
   options: EgressProxyOptions
 ): Promise<void> {
   const authority = request.url ?? "";
+
+  // Swallow client-socket errors BEFORE the first await (same hazard and fix
+  // as the exclusive-egress gate's handler, egress-gate/gate-server.ts): the
+  // client can reset the connection during the async decision window below
+  // (which performs real DNS resolution), and a listener-less 'error' event
+  // would crash the whole proxy process (uncaughtException). The handler
+  // also tears down the upstream leg once one exists.
+  let upstream: net.Socket | null = null;
+  clientSocket.on("error", () => {
+    upstream?.destroy();
+  });
+
   const decision = await decideEgressProxyConnect(authority, options);
   options.onDecision?.(authority, decision);
   if (decision.disposition === "deny") {
@@ -287,20 +331,35 @@ async function handleConnect(
     return;
   }
 
-  const upstream = net.connect({
+  // The client may have reset during the async window above; don't dial the
+  // upstream for a dead client leg.
+  if (clientSocket.destroyed) {
+    return;
+  }
+  const upstreamSocket = net.connect({
     host: decision.address,
     port: decision.target.port,
   });
-  upstream.once("connect", () => {
+  upstream = upstreamSocket;
+  let established = false;
+  upstreamSocket.once("connect", () => {
+    established = true;
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head.length > 0) {
-      upstream.write(head);
+      upstreamSocket.write(head);
     }
-    upstream.pipe(clientSocket);
-    clientSocket.pipe(upstream);
+    upstreamSocket.pipe(clientSocket);
+    clientSocket.pipe(upstreamSocket);
   });
-  upstream.once("error", () => {
-    clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+  upstreamSocket.once("error", () => {
+    // Pre-establishment: report a clean 502. Post-establishment the client
+    // treats the stream as raw tunneled bytes (e.g. mid-TLS); injecting an
+    // HTTP status line would be in-band garbage, so just drop the client leg.
+    if (established) {
+      clientSocket.destroy();
+    } else {
+      clientSocket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    }
   });
 }
 

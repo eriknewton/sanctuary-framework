@@ -33,6 +33,11 @@ import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../constants.js";
 import {
   deriveDnsRuleForHostnameRules,
 } from "./dns-derivation.js";
+import {
+  DERIVED_GATE_RULE_ID,
+  deriveGateAllowRule,
+  type ExclusiveEgressGatePolicy,
+} from "./gate-derivation.js";
 
 /**
  * Every reserved habeas rule id starts with this prefix. Operator-authored
@@ -452,6 +457,13 @@ export interface ComposeEffectiveRulesInput {
   resolvers: readonly unknown[];
   /** Validated distress webhook target, when configured. */
   distressWebhook?: HabeasWebhookTarget | undefined;
+  /**
+   * Validated exclusive-egress gate policy (Unified Protect Slice 1). When
+   * present, the composer injects the derived `.agent`-scoped loopback allow
+   * rule for the gate channel (`127.0.0.1/32`, gate port, TCP). Absent means
+   * no gate rule (the pre-exclusive-egress composition, unchanged).
+   */
+  exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
   /** Timestamp stamped onto every derived rule. */
   createdAt: string;
 }
@@ -468,6 +480,22 @@ export interface ComposeEffectiveRulesInput {
  * testable; the daemon supplies resolvers/config.
  */
 export function composeEffectiveRules(input: ComposeEffectiveRulesInput): AllowlistRule[] {
+  // Reserved derived-gate id (Unified Protect Slice 1): like the habeas
+  // reserved ids, "derived_exclusive_egress_gate" is derived, never
+  // authored. An operator rule claiming it would either duplicate the id in
+  // the signed manifest (wedging the Slice-8 parity gate, which requires
+  // EXACTLY one) or, when no gate policy is configured, plant a
+  // derived-looking rule the parity/introspection surfaces would
+  // misattribute. Rejected up front whether or not a gate policy is present.
+  // (Contrast with the DNS derivation, where an operator override wins:
+  // that rule is a convenience derivation, not a parity-checked enforcement
+  // surface.)
+  if (input.operatorRules.some((rule) => rule.id === DERIVED_GATE_RULE_ID)) {
+    throw new Error(
+      `Castle Wall policy rejected: rule id "${DERIVED_GATE_RULE_ID}" is reserved for the ` +
+        "derived exclusive-egress gate rule; reserved rules are derived, never authored.",
+    );
+  }
   const issues = findHabeasConflicts(input.operatorRules, input.distressWebhook);
   if (issues.length > 0) {
     throw new HabeasConflictError(issues);
@@ -486,6 +514,13 @@ export function composeEffectiveRules(input: ComposeEffectiveRulesInput): Allowl
   });
   if (derivedDns) {
     rules.push(derivedDns);
+  }
+  // Exclusive-egress gate channel (Unified Protect Slice 1): a single
+  // derived allow rule pinning the agent's gate channel to loopback TCP on
+  // the gate port. `deriveGateAllowRule` re-validates and throws on a
+  // malformed policy, so a bad config can never sign a malformed rule.
+  if (input.exclusiveEgressGate !== undefined) {
+    rules.push(deriveGateAllowRule(input.exclusiveEgressGate, input.createdAt));
   }
   // Self-check: the composed output must pass the same composed-manifest gate
   // the Linux daemon applies before putting a manifest into force

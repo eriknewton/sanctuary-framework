@@ -12,6 +12,11 @@ import { validateRule } from "../allowlist/schema.js";
 import { composeEffectiveRules } from "../allowlist/habeas-port.js";
 import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
+import {
+  EXCLUSIVE_EGRESS_GATE_FILENAME,
+  validateExclusiveEgressGatePolicy,
+  type ExclusiveEgressGatePolicy,
+} from "../allowlist/gate-derivation.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
@@ -144,6 +149,14 @@ export interface MacOSCastleWallDaemonInput {
    */
   operatorBaseline?: unknown;
   /**
+   * Optional exclusive-egress gate policy (config / test fixture; Unified
+   * Protect Slice 1). When absent, the daemon loads
+   * `policy/egress/exclusive-egress-gate.json` from the fortress. When BOTH
+   * are absent (or the candidate is malformed), the manifest carries no gate
+   * allow rule (fail closed: no derived grant).
+   */
+  exclusiveEgressGate?: unknown;
+  /**
    * Explicit signing handle. When provided it is used verbatim (tests inject a
    * fake). When absent the daemon builds one via the helper path (default) or
    * the local path (`localSign`).
@@ -263,12 +276,17 @@ export async function startMacOSCastleWallDaemon(
     input.fortressPath,
     input.operatorBaseline,
   );
+  const exclusiveEgressGate = await resolveExclusiveEgressGate(
+    input.fortressPath,
+    input.exclusiveEgressGate,
+  );
   let manifestState = await loadManifestState({
     fortressPath: input.fortressPath,
     fortressId: input.fortressId,
     signer,
     agentOrigin,
     operatorBaseline,
+    exclusiveEgressGate,
     ...(input.globalPinnedPublicKeyPath
       ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
       : {}),
@@ -511,12 +529,17 @@ export async function startMacOSCastleWallDaemon(
         input.fortressPath,
         input.operatorBaseline,
       );
+      const reloadedGate = await resolveExclusiveEgressGate(
+        input.fortressPath,
+        input.exclusiveEgressGate,
+      );
       manifestState = await loadManifestState({
         fortressPath: input.fortressPath,
         fortressId: input.fortressId,
         signer,
         agentOrigin: reloadedOrigin,
         operatorBaseline: reloadedBaseline,
+        exclusiveEgressGate: reloadedGate,
         ...(input.globalPinnedPublicKeyPath
           ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
           : {}),
@@ -625,6 +648,54 @@ function buildArmLease(input: {
 
 const AGENT_ORIGIN_FILENAME = "agent-origin.json";
 const OPERATOR_BASELINE_FILENAME = "operator-baseline.json";
+
+/**
+ * Resolve the exclusive-egress gate policy (Unified Protect Slice 1): prefer
+ * the explicit input, fall back to `policy/egress/exclusive-egress-gate.json`
+ * in the fortress. BOTH branches run through
+ * `validateExclusiveEgressGatePolicy`; a malformed candidate resolves to
+ * `undefined` (fail closed: the manifest carries no gate allow rule, so no
+ * derived grant is ever signed from bad bytes).
+ */
+async function resolveExclusiveEgressGate(
+  fortressPath: string,
+  explicitInput: unknown,
+): Promise<ExclusiveEgressGatePolicy | undefined> {
+  if (explicitInput !== undefined) {
+    const validated = validateExclusiveEgressGatePolicy(explicitInput);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        "[castle-wall] warning: explicit exclusive-egress gate policy is structurally invalid; ignoring (no gate rule derived)",
+      );
+      return undefined;
+    }
+    return validated;
+  }
+  const filePath = join(fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME);
+  try {
+    const raw = await readFileCustody(filePath, {
+      encoding: "utf8",
+      verifyPathIdentity: true,
+    });
+    const parsed = JSON.parse(raw) as unknown;
+    const validated = validateExclusiveEgressGatePolicy(parsed);
+    if (validated === null) {
+      // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+      console.warn(
+        `[castle-wall] warning: ${EXCLUSIVE_EGRESS_GATE_FILENAME} is structurally invalid; ignoring (no gate rule derived)`,
+      );
+      return undefined;
+    }
+    return validated;
+  } catch (err) {
+    const code = err instanceof Error && "code" in err
+      ? (err as NodeJS.ErrnoException).code
+      : undefined;
+    if (code === "ENOENT") return undefined;
+    throw err;
+  }
+}
 
 /**
  * Resolve the agent-origin descriptor from config: prefer the explicit input,
@@ -880,6 +951,7 @@ async function loadManifestState(input: {
   signer: DaemonSigner;
   agentOrigin?: unknown;
   operatorBaseline?: unknown;
+  exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
   globalPinnedPublicKeyPath?: string;
 }): Promise<ManifestState> {
   // Defense-in-depth: cross-check the persisted root-owned pin against the live
@@ -924,6 +996,7 @@ async function loadManifestState(input: {
     operatorRules: rules,
     resolvers: getServers(),
     distressWebhook: distressConfig.webhook_target,
+    exclusiveEgressGate: input.exclusiveEgressGate,
     createdAt: new Date().toISOString(),
   });
   const { signed } = await buildSignedManifest({
