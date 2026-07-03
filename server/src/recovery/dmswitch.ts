@@ -131,6 +131,14 @@ export function enforceDmswitchExpired(params: {
   config: DmswitchConfig;
   now_ms?: number;
 }): DmswitchEvaluation {
+  // Fail-closed shape gate at the enforcement boundary. This is the single
+  // chokepoint through which cascade-entry enforcement flows: emitCascadeEntry
+  // calls this, and any direct caller of enforceDmswitchExpired also passes
+  // here. Validating the config BEFORE evaluateDmswitch closes the malformed-
+  // window class (zero/below-minimum/non-finite) on the public event-emission
+  // path, so a degenerate window can never make elapsed_ms >= window_ms fire a
+  // signed DMSWITCH_CASCADE_ENTRY before the mandatory minimum absence window.
+  validateDmswitchConfig(params.config);
   const evaluation = evaluateDmswitch(params);
   if (!evaluation.triggered) {
     throw new WindowNotExpiredError({

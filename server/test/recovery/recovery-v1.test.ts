@@ -1969,6 +1969,139 @@ describe("harden A3: DMswitch-triggered cascade on non-expired input fails close
       })
     ).toThrow(RecoveryConfigError);
   });
+
+  // -----------------------------------------------------------------
+  // Residual (A3 harden 2026-07-04): the lower-level enforcement primitive
+  // enforceDmswitchExpired called evaluateDmswitch directly without validating
+  // the config, and emitCascadeEntry routes through enforceDmswitchExpired, so
+  // the same malformed-window class stayed open on the public event-emission
+  // path (a direct caller could sign a DMSWITCH_CASCADE_ENTRY with a zero /
+  // below-minimum / non-finite window). The fix runs validateDmswitchConfig at
+  // the START of enforceDmswitchExpired -- the single chokepoint both the
+  // direct-enforce path and the emit path pass through -- BEFORE any window
+  // arithmetic. These tests FAIL before the guard (elapsed_ms >= window_ms was
+  // true for a zero window, so enforce returned an evaluation / emit signed an
+  // event) and PASS after (RecoveryConfigError before arithmetic).
+  // -----------------------------------------------------------------
+
+  it("enforceDmswitchExpired rejects a zero window before firing the switch", () => {
+    // Operator active 5 seconds ago. With a zero window, elapsed_ms >= 0 makes
+    // pre-fix evaluateDmswitch report triggered, so enforceDmswitchExpired
+    // returned an evaluation instead of failing closed. Post-fix the config is
+    // rejected before the comparison.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired rejects a below-minimum (1-day) window", () => {
+    // 8 days of absence against a 1-day window would trigger, but 1 day is
+    // below the 7-day minimum, so the config must be rejected before arithmetic.
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired rejects a non-finite window", () => {
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.NaN,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      enforceDmswitchExpired({ last_activity: activity, config })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a zero window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    // Active 5 seconds ago; a zero window let pre-fix emitCascadeEntry sign a
+    // DMSWITCH_CASCADE_ENTRY (window_ms 0) before the mandatory minimum window.
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 0,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a below-minimum window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    const activity = buildActivity(8 * 24 * 60 * 60 * 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: 1 * 24 * 60 * 60 * 1000,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("emitCascadeEntry rejects a non-finite window and signs no cascade-entry event", () => {
+    const fix = buildFixture();
+    const activity = buildActivity(5_000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: Number.POSITIVE_INFINITY,
+      estate_planning_enabled: false,
+    };
+
+    expect(() =>
+      emitCascadeEntry({
+        last_activity: activity,
+        config,
+        fortress_id: fix.fortressId,
+        emitter_node: fix.nodeId,
+        emitter_principal: "root",
+        signing_key: fix.nodeKp.privateKey,
+      })
+    ).toThrow(RecoveryConfigError);
+  });
+
+  it("enforceDmswitchExpired still returns an evaluation for a valid, expired window", () => {
+    // Guard against over-rejection: a well-formed, elapsed window must still
+    // enforce as triggered (the finiteness/shape gate only rejects malformed
+    // configs, not valid ones).
+    const activity = buildActivity(DEFAULT_DMSWITCH_WINDOW_MS + 1000);
+    const config: DmswitchConfig = {
+      max_offline_window_ms: DEFAULT_DMSWITCH_WINDOW_MS,
+      estate_planning_enabled: false,
+    };
+
+    const evaluation = enforceDmswitchExpired({ last_activity: activity, config });
+    expect(evaluation.triggered).toBe(true);
+    expect(evaluation.window_ms).toBe(DEFAULT_DMSWITCH_WINDOW_MS);
+  });
 });
 
 // ===================================================================
