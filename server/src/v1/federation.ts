@@ -695,6 +695,23 @@ export interface FederationPostureSummary {
   provider_in_trust_boundary: boolean;
   tee_attested: boolean;
   disclosure: string | null;
+  /**
+   * F1 E1: the guardian-requirement DISABLE-gate's break-glass countdown, when
+   * armed. `active: false` when IDLE (no countdown in flight). Additive field
+   * so an older reader ignores it. Surfaced so any operator or guardian who
+   * opens the dashboard cannot miss an in-flight teardown of the fleet-kill
+   * guard (design 6.3).
+   */
+  guardian_break_glass:
+    | {
+        active: true;
+        intent: "disable" | "lower";
+        target_m: number | null;
+        initiated_at: string;
+        completes_at: string;
+        time_remaining_ms: number;
+      }
+    | { active: false };
 }
 
 export interface FederationEvent {

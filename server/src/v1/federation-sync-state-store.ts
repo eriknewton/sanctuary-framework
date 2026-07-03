@@ -63,6 +63,7 @@ import {
   type PersistedGuardianRevocationRequirement,
 } from "./federation-guardian-revocation-policy.js";
 import type { GuardianRevocationRequirement } from "./federation-revocation-guardian-gate.js";
+import type { BreakGlassState } from "./federation-guardian-disable-gate.js";
 
 /**
  * At-rest location + HKDF label for the durable sync-state record. ADDITIVE and
@@ -136,6 +137,41 @@ export interface FederationSyncStateSnapshot {
    * ever set).
    */
   guardianRevocationRequirementGeneration: number;
+  /**
+   * F1 E1: monotonic anti-replay counter for the guardian DISABLE-gate (distinct
+   * from {@link guardianRevocationRequirementGeneration}, which tracks the
+   * requirement's own config generation). Burns (advances) on every terminal
+   * disable-gate transition (instant quorum/master-key authorize, break-glass
+   * vetoed, break-glass cancelled, break-glass completed) so a quorum or
+   * master-key signature collected for a consumed nonce can never be replayed.
+   * Merged by `Math.max` (same treatment as `highestEvictionSerial`) AS A FLOOR;
+   * the authoritative live value while a break-glass is armed is
+   * `guardianBreakGlass.nonce` (see that field's doc for why the two can never
+   * disagree). Defaults to 0 (fresh fortress / gate never used).
+   */
+  guardianDisableNonce: number;
+  /**
+   * F1 E1: the in-flight break-glass countdown, or `null` when IDLE (no
+   * countdown armed). NOT grow-only (it is set on initiate and cleared on
+   * veto/cancel/complete), so - exactly like {@link guardianRevocationRequirement}
+   * - it CANNOT be merged by union or `Math.max`. It travels under the SAME
+   * generation counter as the requirement
+   * ({@link guardianRevocationRequirementGeneration}), and it is a HARD,
+   * TESTED invariant that EVERY break-glass transition (initiate, veto, cancel,
+   * complete) bumps that shared generation exactly like the dashboard setter
+   * already does for the requirement itself. This is required so the
+   * sub-object and the generation integer can never decouple: if a transition
+   * changed `guardianBreakGlass` without bumping the generation, two on-disk
+   * states could tie at the same generation with different break-glass
+   * payloads, and the `nextGen > baseGen` merge could not tell them apart. With
+   * the shared-bump invariant held, the existing generation-selector logic
+   * (`selectGuardianRevocationRequirementByGeneration`, extended below to also
+   * carry this field) is sufficient: a stale writer's lower generation can
+   * never clobber a fresher armed-or-cleared break-glass state, and the
+   * `guardianBreakGlass.nonce` it carries is therefore always the authoritative
+   * live nonce (never behind the `guardianDisableNonce` floor).
+   */
+  guardianBreakGlass: BreakGlassState | null;
 }
 
 interface PersistedSyncState {
@@ -178,6 +214,27 @@ interface PersistedSyncState {
    * higher generation so a stale writer cannot clobber a fresher requirement.
    */
   guardian_revocation_requirement_generation?: number;
+  /**
+   * F1 E1. Optional on read (a pre-E1 record omits it -> 0). Merged as a
+   * `Math.max` floor; see {@link FederationSyncStateSnapshot.guardianDisableNonce}.
+   */
+  guardian_disable_nonce?: number;
+  /**
+   * F1 E1. Optional on read (a pre-E1 record omits it, or a fresh IDLE state,
+   * both decode to `null`: no countdown armed). Rides under the SAME generation
+   * as `guardian_revocation_requirement_generation`; see
+   * {@link FederationSyncStateSnapshot.guardianBreakGlass}.
+   */
+  guardian_break_glass?: PersistedBreakGlassState | null;
+}
+
+interface PersistedBreakGlassState {
+  nonce: number;
+  intent: "disable" | "lower";
+  target_m: number | null;
+  initiated_at: string;
+  completes_at: string;
+  delay_ms: number;
 }
 
 interface PersistedAppliedPolicyVersion {
@@ -208,6 +265,8 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     appliedPolicyVersions: new Map(),
     guardianRevocationRequirement: null,
     guardianRevocationRequirementGeneration: 0,
+    guardianDisableNonce: 0,
+    guardianBreakGlass: null,
   };
 }
 
@@ -385,6 +444,10 @@ export class FederationSyncStateStore {
             : null,
           guardian_revocation_requirement_generation:
             merged.guardianRevocationRequirementGeneration,
+          guardian_disable_nonce: merged.guardianDisableNonce,
+          guardian_break_glass: merged.guardianBreakGlass
+            ? encodeBreakGlassState(merged.guardianBreakGlass)
+            : null,
         };
         const serialized = stringToBytes(JSON.stringify(persisted));
         try {
@@ -431,7 +494,19 @@ function cloneSnapshot(
     guardianRevocationRequirementGeneration:
       (snapshot as Partial<FederationSyncStateSnapshot>)
         .guardianRevocationRequirementGeneration ?? 0,
+    guardianDisableNonce:
+      (snapshot as Partial<FederationSyncStateSnapshot>).guardianDisableNonce ?? 0,
+    guardianBreakGlass: cloneBreakGlassState(
+      (snapshot as Partial<FederationSyncStateSnapshot>).guardianBreakGlass ?? null,
+    ),
   };
+}
+
+function cloneBreakGlassState(
+  state: BreakGlassState | null | undefined,
+): BreakGlassState | null {
+  if (state === null || state === undefined) return null;
+  return { ...state };
 }
 
 function cloneGuardianRevocationRequirement(
@@ -525,16 +600,43 @@ function mergeSyncStateMonotonic(
     // lower generation can never lower or clobber a fresher on-disk value; the
     // store's locked read-modify-write re-reads the on-disk generation, so the
     // fresher value always wins the merge regardless of interleaving.
+    //
+    // F1 E1: guardianBreakGlass travels under the SAME generation (see that
+    // field's doc for why every break-glass transition MUST bump it), so the
+    // exact same selector resolves both fields atomically - they can never
+    // diverge across a rotate-root merge (H1 fix).
     ...selectGuardianRevocationRequirementByGeneration(base, next),
+    // F1 E1: guardianDisableNonce is a Math.max FLOOR (same treatment as
+    // highestEvictionSerial), independent of the generation selector. It exists
+    // so a burned nonce can never regress even if a break-glass sub-object is
+    // momentarily absent (e.g. just after completion, before the next
+    // generation-carried write); the AUTHORITATIVE live nonce while a
+    // break-glass is armed is `guardianBreakGlass.nonce` (H2 fix - the two
+    // cannot disagree because both derive from the same monotonically-bumped
+    // source of truth in the dashboard).
+    guardianDisableNonce: Math.max(base.guardianDisableNonce, next.guardianDisableNonce),
   };
 }
 
 /**
- * Choose the guardian revocation requirement + its generation by the HIGHER
- * generation counter. On a tie (neither writer bumped the generation) the values
- * are identical, so `base` is kept deterministically. This is the stale-clobber
- * guard: `base` is the freshly re-read on-disk state and `next` is the caller's
- * (possibly stale) snapshot; a stale `next` carries an OLD generation and loses.
+ * Choose the guardian revocation requirement + its generation + its in-flight
+ * break-glass state, ALL THREE, by the HIGHER generation counter. On a tie
+ * (neither writer bumped the generation) the values are identical, so `base`
+ * is kept deterministically. This is the stale-clobber guard: `base` is the
+ * freshly re-read on-disk state and `next` is the caller's (possibly stale)
+ * snapshot; a stale `next` carries an OLD generation and loses.
+ *
+ * F1 E1 (H1 fix): `guardianBreakGlass` is folded into this SAME selector
+ * rather than merged independently, because it is not grow-only either (armed
+ * -> cleared is a valid transition) and it must never decouple from the
+ * generation integer. Every break-glass-mutating call site in dashboard.ts
+ * (initiate/veto/cancel/complete) bumps
+ * `_federationGuardianRevocationRequirementGeneration` in the SAME set as it
+ * mutates `_federationGuardianBreakGlass`, exactly mirroring how the setter
+ * already bumps the generation on every requirement change - so a rotate-root
+ * CLI persist carrying a stale (lower-generation) break-glass snapshot always
+ * loses to a concurrently-committed dashboard transition, and can never revive
+ * a cancelled/completed countdown nor silently drop an armed one.
  */
 function selectGuardianRevocationRequirementByGeneration(
   base: FederationSyncStateSnapshot,
@@ -542,6 +644,7 @@ function selectGuardianRevocationRequirementByGeneration(
 ): {
   guardianRevocationRequirement: GuardianRevocationRequirement | null;
   guardianRevocationRequirementGeneration: number;
+  guardianBreakGlass: BreakGlassState | null;
 } {
   const baseGen = base.guardianRevocationRequirementGeneration;
   const nextGen = next.guardianRevocationRequirementGeneration;
@@ -551,6 +654,7 @@ function selectGuardianRevocationRequirementByGeneration(
       winner.guardianRevocationRequirement,
     ),
     guardianRevocationRequirementGeneration: Math.max(baseGen, nextGen),
+    guardianBreakGlass: cloneBreakGlassState(winner.guardianBreakGlass),
   };
 }
 
@@ -612,6 +716,15 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
           obj.guardian_revocation_requirement_generation,
           "guardian_revocation_requirement_generation",
         );
+  // F1 E1 fields. Optional on read (a pre-E1 record omits them). Absent ->
+  // nonce 0 / no break-glass armed (NOT a corruption). PRESENT-but-malformed
+  // THROWS (same fail-closed-on-corrupt contract as every other optional field
+  // in this record).
+  const guardianDisableNonce =
+    obj.guardian_disable_nonce === undefined
+      ? 0
+      : decodeNonNegativeInt(obj.guardian_disable_nonce, "guardian_disable_nonce");
+  const guardianBreakGlass = decodeBreakGlassState(obj.guardian_break_glass);
 
   return {
     acceptedHighWater,
@@ -624,6 +737,63 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     appliedPolicyVersions,
     guardianRevocationRequirement,
     guardianRevocationRequirementGeneration,
+    guardianDisableNonce,
+    guardianBreakGlass,
+  };
+}
+
+function encodeBreakGlassState(state: BreakGlassState): PersistedBreakGlassState {
+  return {
+    nonce: state.nonce,
+    intent: state.intent,
+    target_m: state.targetM,
+    initiated_at: state.initiatedAt,
+    completes_at: state.completesAt,
+    delay_ms: state.delayMs,
+  };
+}
+
+function decodeBreakGlassState(value: unknown): BreakGlassState | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("guardian_break_glass is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const nonce = obj.nonce;
+  const intent = obj.intent;
+  const targetM = obj.target_m;
+  const initiatedAt = obj.initiated_at;
+  const completesAt = obj.completes_at;
+  const delayMs = obj.delay_ms;
+  if (typeof nonce !== "number" || !Number.isSafeInteger(nonce) || nonce < 0) {
+    throw new FederationSyncStateStoreError("guardian_break_glass nonce is invalid");
+  }
+  if (intent !== "disable" && intent !== "lower") {
+    throw new FederationSyncStateStoreError("guardian_break_glass intent is invalid");
+  }
+  if (targetM !== null && (typeof targetM !== "number" || !Number.isSafeInteger(targetM))) {
+    throw new FederationSyncStateStoreError("guardian_break_glass target_m is invalid");
+  }
+  if (typeof initiatedAt !== "string" || initiatedAt.length === 0) {
+    throw new FederationSyncStateStoreError(
+      "guardian_break_glass initiated_at is invalid",
+    );
+  }
+  if (typeof completesAt !== "string" || completesAt.length === 0) {
+    throw new FederationSyncStateStoreError(
+      "guardian_break_glass completes_at is invalid",
+    );
+  }
+  if (typeof delayMs !== "number" || !Number.isSafeInteger(delayMs) || delayMs < 0) {
+    throw new FederationSyncStateStoreError("guardian_break_glass delay_ms is invalid");
+  }
+  return {
+    nonce,
+    intent,
+    targetM: targetM ?? null,
+    initiatedAt,
+    completesAt,
+    delayMs,
   };
 }
 

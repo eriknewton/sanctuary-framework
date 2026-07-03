@@ -44,13 +44,19 @@ import {
 } from "../../src/v1/federation-sync-state-store.js";
 import type { V1FederationDeps } from "../../src/v1/federation.js";
 import type { GuardianRevocationRequirement } from "../../src/v1/federation-revocation-guardian-gate.js";
+import {
+  signMasterDisableAuthorization,
+  type GuardianDisableAuthorization,
+} from "../../src/v1/federation-guardian-disable-gate.js";
 import { makeMultiNodeFortress, type MultiNodeFortress } from "./fed-materials.js";
 
 type DepsAccess = DashboardApprovalChannel & {
   buildV1FederationDeps(): V1FederationDeps;
   setFederationGuardianRevocationRequirement(
     r: GuardianRevocationRequirement | null,
+    authorization?: GuardianDisableAuthorization | null,
   ): Promise<void>;
+  nextFederationGuardianDisableNonce(): number;
   _federationEnabled: boolean;
 };
 
@@ -186,10 +192,19 @@ describe("F2: setFederationGuardianRevocationRequirement is atomic on persist fa
     expect(enabled).not.toBeNull();
     expect(enabled.roster.master_signature).toBe(roster.master_signature);
 
-    // Now arm the failure and attempt to DISABLE (set null).
+    // Now arm the failure and attempt to DISABLE (set null), authorized via
+    // the master key (F1 E1: a decrease requires an authorization).
     storage.armed = true;
+    const disableNonce = dashboard.nextFederationGuardianDisableNonce();
+    const masterAuthorization = signMasterDisableAuthorization({
+      fortressId: fortress.fortressId,
+      disableNonce,
+      intent: "disable",
+      targetM: null,
+      masterPrivateKey: fortress.nodes["mini-1"]!.context.getMasterPrivateKey!(),
+    });
     await expect(
-      dashboard.setFederationGuardianRevocationRequirement(null),
+      dashboard.setFederationGuardianRevocationRequirement(null, { masterAuthorization }),
     ).rejects.toThrow(/disk write failed/);
 
     // The guard stayed ON: the hook still returns the SAME enabled requirement,
