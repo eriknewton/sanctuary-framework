@@ -1590,8 +1590,22 @@ export class ReputationStore {
 
   /**
    * Load attestations for tier-weighted scoring.
-   * Applies basic context/counterparty filtering, returns full StoredAttestations
-   * so callers can access sovereignty_tier from attestation data.
+   *
+   * Applies basic context/counterparty filtering AND normalizes each record's
+   * scoring-visible `attestation.data.sovereignty_tier` through
+   * trustedSovereigntyTier, so this is the single trust chokepoint for scoring:
+   * a caller cannot feed a raw privileged tier into computeWeightedScore or a
+   * tier distribution by forgetting to clamp. An imported or unknown-provenance
+   * attestation that self-asserts a privileged ("verified-*") tier is returned
+   * clamped to the non-privileged import ceiling (self-attested); a provably
+   * local record (imported === false) is returned unchanged.
+   *
+   * The clamp is applied to a SCORING VIEW built on a fresh object spine, not to
+   * the persisted record: the signed `attestation.data` on disk is left
+   * byte-intact so re-export signatures still verify. The returned objects are a
+   * read-only scoring projection and are never re-persisted or re-exported. The
+   * per-record `imported` provenance marker is preserved so callers that still
+   * call trustedSovereigntyTier directly get the same (idempotent) verdict.
    */
   async loadAllForTierScoring(options?: {
     context?: string;
@@ -1608,7 +1622,26 @@ export class ReputationStore {
       );
     }
 
-    return all;
+    return all.map((stored) => {
+      const trusted = trustedSovereigntyTier(stored);
+      if (trusted === stored.attestation.data.sovereignty_tier) {
+        // No clamp needed (already trusted-local, already at/below ceiling, or
+        // both undefined): return the record unchanged to avoid an allocation.
+        return stored;
+      }
+      // Scoring view: override only the tier, on a fresh spine, leaving the
+      // persisted record and its signed data byte-image untouched.
+      return {
+        ...stored,
+        attestation: {
+          ...stored.attestation,
+          data: {
+            ...stored.attestation.data,
+            sovereignty_tier: trusted,
+          },
+        },
+      };
+    });
   }
 
   // ─── Internal ─────────────────────────────────────────────────────────

@@ -626,7 +626,9 @@ export async function verifyExitBundle(
   if (unverifiableFailed) {
     warnings.push(
       `${unverifiableCount} reputation attestation(s) have unknown signer public keys; ` +
-        `pass --accept-unverifiable-attestations to import anyway`
+        `pass --accept-unverifiable-attestations to relax this read-only preview ` +
+        `verdict. Import is unaffected: it always verifies strictly and never ` +
+        `admits an unverifiable attestation.`
     );
   }
 

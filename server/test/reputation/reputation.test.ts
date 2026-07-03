@@ -81,6 +81,42 @@ function cloneBundle(bundle: ReputationBundle): ReputationBundle {
   return JSON.parse(JSON.stringify(bundle)) as ReputationBundle;
 }
 
+/**
+ * Observe the reputation_query_weighted MCP tool output over the same
+ * storage + masterKey a ReputationStore persists to. The tool builds its own
+ * store over that storage, so it reads exactly the records under test. This is
+ * the end-to-end scoring surface an agent actually calls, used to prove the
+ * tier clamp is enforced at the loadAllForTierScoring boundary rather than only
+ * when a caller remembers to call trustedSovereigntyTier.
+ */
+async function queryWeighted(
+  store: ReputationStore,
+  masterKey: Uint8Array,
+  metric: string
+): Promise<{
+  weighted_score: number;
+  tier_distribution: Record<SovereigntyTier, number>;
+}> {
+  // The store already holds the storage; reuse it so the tool sees the same
+  // persisted _reputation records.
+  const storage = (store as unknown as { storage: StorageBackend }).storage;
+  const identityManager = new IdentityManager(storage, masterKey);
+  const auditLog = new AuditLog(storage, masterKey);
+  const { tools } = createReputationTools(
+    storage,
+    masterKey,
+    identityManager,
+    auditLog
+  );
+  const tool = tools.find((t) => t.name === "reputation_query_weighted");
+  if (!tool) throw new Error("reputation_query_weighted tool not found");
+  const result = await tool.handler({ metric });
+  return JSON.parse(result.content[0]!.text) as {
+    weighted_score: number;
+    tier_distribution: Record<SovereigntyTier, number>;
+  };
+}
+
 function stripManifest(bundle: ReputationBundle): ReputationBundle {
   const legacy = cloneBundle(bundle);
   delete legacy.completeness_manifest;
@@ -2041,6 +2077,18 @@ describe("L4 Reputation Store", () => {
       const stored = await store2.loadAllForTierScoring({});
       expect(stored).toHaveLength(1);
       expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+      // B2 round-2 finding 2 (boundary chokepoint): the clamp is applied AT the
+      // loadAllForTierScoring API, so a caller reading the RAW tier field of the
+      // returned scoring view sees the clamped tier WITHOUT having to remember
+      // to call trustedSovereigntyTier. FAIL-BEFORE: this field was the forged
+      // "verified-sovereign". PASS-AFTER: the boundary returns "self-attested".
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe("self-attested");
+
+      // The forged import must also score as self-attested weight (0.6), never
+      // the privileged 1.0, observed through the reputation_query_weighted tool.
+      const weighted = await queryWeighted(store2, masterKey, "rate");
+      expect(weighted.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(weighted.tier_distribution["self-attested"]).toBe(1);
     });
 
     it("does NOT clamp a locally recorded verified-sovereign tier", async () => {
@@ -2157,9 +2205,21 @@ describe("L4 Reputation Store", () => {
       // record whose imported field was undefined (a pre-patch imported claim
       // kept top weight). PASS-AFTER: absent provenance is clamped.
       expect(trustedSovereigntyTier(stored[0]!)).toBe("self-attested");
+      // B2 round-2 finding 2 (boundary chokepoint): the RAW tier field of the
+      // scoring view returned by loadAllForTierScoring is already clamped, so a
+      // caller that reads attestation.data.sovereignty_tier directly (without
+      // calling trustedSovereigntyTier) still scores a legacy verified-sovereign
+      // record as self-attested. FAIL-BEFORE this was "verified-sovereign".
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe("self-attested");
       const summary = await store.summarizeForSHR();
       expect(summary.tier_distribution["verified-sovereign"]).toBe(0);
       expect(summary.tier_distribution["self-attested"]).toBe(1);
+
+      // End-to-end through the reputation_query_weighted tool: a legacy
+      // no-marker verified-sovereign record scores as self-attested weight.
+      const weighted = await queryWeighted(store, masterKey, "rate");
+      expect(weighted.tier_distribution["verified-sovereign"]).toBe(0);
+      expect(weighted.tier_distribution["self-attested"]).toBe(1);
     });
 
     it("does NOT clamp a record explicitly marked imported:false", async () => {
@@ -2187,6 +2247,11 @@ describe("L4 Reputation Store", () => {
       expect(stored).toHaveLength(1);
       expect(stored[0]!.imported).toBe(false);
       expect(trustedSovereigntyTier(stored[0]!)).toBe("verified-sovereign");
+      // Boundary chokepoint regression: a provably-local record is NOT clamped,
+      // so the raw tier field of the scoring view is left at verified-sovereign.
+      expect(stored[0]!.attestation.data.sovereignty_tier).toBe(
+        "verified-sovereign"
+      );
     });
 
     it("record() stamps genuinely-local attestations with imported:false", async () => {

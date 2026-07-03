@@ -242,7 +242,7 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(relaxed.passed).toBe(true);
     expect(relaxed.reputation?.unverifiable_attestations).toBe(1);
 
-    // Import path, strict: rejected, no activation, nothing staged.
+    // Import path, ACTIVATE: rejected, no activation, nothing staged.
     const destination = await makeHarness();
     const importStrict = await importExitBundle({
       bundleDir,
@@ -256,30 +256,51 @@ describe("Exit bundle hardening (full-sweep #54 + #55)", () => {
     expect(importStrict.verified).toBe(false);
     expect(importStrict.activated).toBe(false);
     expect(importStrict.staged_artifacts).toEqual([]);
-
-    // B2 fix: import with acceptUnverifiableAttestations:true must ALSO be
-    // rejected. Signature verification is NOT bypassable on the import path,
-    // so an unverifiable-signer attestation can never be admitted into the
-    // store. FAIL-BEFORE this fix, importRelaxed.activated was true and the
-    // forged attestation was credited; PASS-AFTER, the import is refused with
-    // zero reputation writes.
-    const destination2 = await makeHarness();
-    const importRelaxed = await importExitBundle({
-      bundleDir,
-      storage: destination2.storage,
-      masterKey: destination2.masterKey,
-      identityManager: destination2.identityManager,
-      auditLog: destination2.auditLog,
-      reputationStore: destination2.reputationStore,
-      activate: true,
-      acceptUnverifiableAttestations: true,
-    });
-    expect(importRelaxed.verified).toBe(false);
-    expect(importRelaxed.activated).toBe(false);
-    // Nothing was credited into the reputation store.
     await expect(
-      destination2.storage.list("_reputation")
+      destination.storage.list("_reputation")
     ).resolves.toHaveLength(0);
+
+    // B2 round-2 finding 1 (dry-run reporting fail-open): the DRY-RUN
+    // (activate:false) import path must ALSO verify strictly. The
+    // accept-unverifiable relaxation has been removed from the import surface
+    // entirely (it no longer type-checks as an ImportExitBundleOptions field),
+    // so there is no caller-facing knob that can flip a dry-run verdict.
+    //
+    // FAIL-BEFORE this round-2 fix: importExitBundle({activate:false}) on a
+    // bundle with an unverifiable reputation signer returned verified:true (the
+    // strict reputation gate only ran on the activate:true path), and the
+    // did:web branch could schedule audit appends before the dry-run return.
+    // PASS-AFTER: the dry-run is verified:false with ZERO reputation writes and
+    // ZERO audit writes.
+    const destinationDry = await makeHarness();
+    // Baseline audit-entry count BEFORE the dry-run import: the harness may have
+    // written anchor/checkpoint markers at setup, so assert the import ADDS
+    // nothing rather than assuming the namespace starts empty.
+    await destinationDry.auditLog.flush();
+    const auditBefore = (
+      await destinationDry.storage.list("_audit")
+    ).length;
+    const importDryRun = await importExitBundle({
+      bundleDir,
+      storage: destinationDry.storage,
+      masterKey: destinationDry.masterKey,
+      identityManager: destinationDry.identityManager,
+      auditLog: destinationDry.auditLog,
+      reputationStore: destinationDry.reputationStore,
+      activate: false,
+    });
+    expect(importDryRun.verified).toBe(false);
+    expect(importDryRun.activated).toBe(false);
+    expect(importDryRun.staged_artifacts).toEqual([]);
+    // Nothing credited into the reputation store, and no audit entry scheduled.
+    await expect(
+      destinationDry.storage.list("_reputation")
+    ).resolves.toHaveLength(0);
+    await destinationDry.auditLog.flush();
+    const auditAfter = (
+      await destinationDry.storage.list("_audit")
+    ).length;
+    expect(auditAfter).toBe(auditBefore);
   });
 
   // Per full-sweep #77: helpers for tampering with internal artifact
