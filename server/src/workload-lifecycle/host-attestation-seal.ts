@@ -34,9 +34,20 @@ import type { AuditEntryInput, AuditLog } from "../operational/audit-log.js";
 import { WORKLOAD_LIFECYCLE_OPS } from "./constants.js";
 import {
   hostAttestationBundleHash,
+  verifyHostWorkloadAttestation,
   WORKLOAD_HOST_ATTESTATION_SCHEMA,
   type SignedHostWorkloadAttestation,
 } from "./host-attestation.js";
+
+/** Thrown when the seal REFUSES to bind an attestation whose signature does not
+ * verify (fail-closed: constraint #5, never silently degrade to sealing an
+ * unauthenticated bundle). */
+export class HostAttestationSealError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HostAttestationSealError";
+  }
+}
 
 /** Standing context the seal needs (the recording fortress/identity). */
 export interface HostAttestationSealContext {
@@ -44,20 +55,57 @@ export interface HostAttestationSealContext {
   recording_identity_id: string;
   /** Optional explicit timestamp for the audit entry (defaults to now). */
   timestamp?: string;
+  /**
+   * The out-of-band trusted public key the attestation MUST verify under before
+   * it is sealed (FIX 4). When set, a bundle forged under any other key is
+   * REJECTED (the seal throws and writes nothing). When ABSENT, the seal still
+   * refuses to bind a bundle whose signature does not verify against its OWN
+   * self-declared `public_key` (verify-before-seal), which rejects a corrupted /
+   * non-verifying envelope; but WITHOUT a trusted key it cannot distinguish a
+   * self-signed forgery from a genuine one, so a caller that needs origin
+   * authentication MUST supply `trustedPublicKey`.
+   */
+  trustedPublicKey?: string | Uint8Array;
 }
 
 /**
  * Seal a signed host attestation into the audit chain.
  *
+ * Verify-before-seal (FIX 4): the signature is verified BEFORE the entry is
+ * bound; a bundle whose signature does not verify is REJECTED (throws
+ * {@link HostAttestationSealError}, writes nothing). Supply
+ * `ctx.trustedPublicKey` to pin the accepted signer and reject a self-signed
+ * forgery; without it the check is self-consistency only (a non-verifying
+ * envelope is still rejected, but a forgery self-signed under the attacker's own
+ * key cannot be told apart from a genuine bundle).
+ *
  * Returns the bundle hash the entry was bound to (so a caller can cross-check a
  * later chain walk). Throws on a persistence failure (the underlying
- * `appendCritical` contract) — never silently degrades.
+ * `appendCritical` contract), never silently degrades.
  */
 export async function sealHostAttestation(
   auditLog: AuditLog,
   attestation: SignedHostWorkloadAttestation,
   ctx: HostAttestationSealContext
 ): Promise<string> {
+  // Verify-before-seal: never bind an attestation whose signature does not
+  // verify. With a trusted key, this also rejects a self-signed forgery.
+  const verified = verifyHostWorkloadAttestation(
+    attestation,
+    attestation.public_key,
+    ctx.trustedPublicKey !== undefined
+      ? { trustedPublicKey: ctx.trustedPublicKey }
+      : undefined
+  );
+  if (!verified) {
+    throw new HostAttestationSealError(
+      "refusing to seal a host attestation whose signature does not verify" +
+        (ctx.trustedPublicKey !== undefined
+          ? " against the trusted signer key"
+          : " against its own public key") +
+        "; nothing was written"
+    );
+  }
   const bundleHash = hostAttestationBundleHash(attestation);
   const entry: AuditEntryInput = {
     layer: "l2",

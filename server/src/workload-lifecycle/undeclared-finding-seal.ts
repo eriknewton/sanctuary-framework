@@ -34,9 +34,20 @@ import type { AuditEntryInput, AuditLog } from "../operational/audit-log.js";
 import { WORKLOAD_LIFECYCLE_OPS } from "./constants.js";
 import {
   undeclaredFindingBundleHash,
+  verifyUndeclaredFinding,
   WORKLOAD_UNDECLARED_FINDING_SCHEMA,
   type SignedUndeclaredFinding,
 } from "./undeclared-finding.js";
+
+/** Thrown when the seal REFUSES to bind a finding whose signature does not
+ * verify (fail-closed: constraint #5, never silently degrade to sealing an
+ * unauthenticated bundle). */
+export class UndeclaredFindingSealError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UndeclaredFindingSealError";
+  }
+}
 
 /** Standing context the seal needs (the recording fortress/identity). */
 export interface UndeclaredFindingSealContext {
@@ -44,20 +55,54 @@ export interface UndeclaredFindingSealContext {
   recording_identity_id: string;
   /** Optional explicit timestamp for the audit entry (defaults to now). */
   timestamp?: string;
+  /**
+   * The out-of-band trusted public key the finding MUST verify under before it is
+   * sealed (mirrors #513 FIX-4). When set, a bundle forged under any other key is
+   * REJECTED (the seal throws and writes nothing). When ABSENT, the seal still
+   * refuses to bind a bundle whose signature does not verify against its OWN
+   * self-declared `public_key` (verify-before-seal); but WITHOUT a trusted key it
+   * cannot distinguish a self-signed forgery from a genuine one, so a caller that
+   * needs origin authentication MUST supply `trustedPublicKey`.
+   */
+  trustedPublicKey?: string | Uint8Array;
 }
 
 /**
  * Seal a signed undeclared finding into the audit chain.
  *
+ * Verify-before-seal (mirrors #513 FIX-4): the signature is verified BEFORE the
+ * entry is bound; a bundle whose signature does not verify is REJECTED (throws
+ * {@link UndeclaredFindingSealError}, writes nothing). Supply
+ * `ctx.trustedPublicKey` to pin the accepted signer and reject a forged
+ * suppression finding; without it the check is self-consistency only.
+ *
  * Returns the bundle hash the entry was bound to (so a caller can cross-check a
  * later chain walk). Throws on a persistence failure (the underlying
- * `appendCritical` contract) — never silently degrades.
+ * `appendCritical` contract), never silently degrades.
  */
 export async function sealUndeclaredFinding(
   auditLog: AuditLog,
   finding: SignedUndeclaredFinding,
   ctx: UndeclaredFindingSealContext,
 ): Promise<string> {
+  // Verify-before-seal: never bind a finding whose signature does not verify.
+  // With a trusted key, this also rejects a self-signed forgery.
+  const verified = verifyUndeclaredFinding(
+    finding,
+    finding.public_key,
+    ctx.trustedPublicKey !== undefined
+      ? { trustedPublicKey: ctx.trustedPublicKey }
+      : undefined,
+  );
+  if (!verified) {
+    throw new UndeclaredFindingSealError(
+      "refusing to seal an undeclared finding whose signature does not verify" +
+        (ctx.trustedPublicKey !== undefined
+          ? " against the trusted signer key"
+          : " against its own public key") +
+        "; nothing was written",
+    );
+  }
   const bundleHash = undeclaredFindingBundleHash(finding);
   const entry: AuditEntryInput = {
     layer: "l2",
