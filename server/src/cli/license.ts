@@ -36,6 +36,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { sign } from "../core/identity.js";
+import type { EncryptedPayload } from "../core/encryption.js";
 import { toBase64url } from "../core/encoding.js";
 import { randomBytes } from "../core/random.js";
 import { loadConfig } from "../config.js";
@@ -49,7 +50,6 @@ import {
   issueLicense,
   listLicenses,
   revokeLicense,
-  verifyLedgerIntegrity,
   type IssuerSigner,
   type LicenseListEntry,
 } from "../entitlement/ledger.js";
@@ -57,7 +57,14 @@ import {
   loadLedger,
   resolveLedgerPath,
   saveLedger,
+  withLedgerMutationLock,
 } from "../entitlement/ledger-io.js";
+import {
+  checkLedgerFreshness,
+  readLedgerGenerationAnchor,
+  writeLedgerGenerationAnchor,
+} from "../entitlement/ledger-antirollback.js";
+import type { StorageBackend } from "../storage/interface.js";
 
 /** Default feature set for the standard Team offering (sold set, not tier-implied). */
 const DEFAULT_TEAM_FEATURES = ["roster", "policy-dist"] as const;
@@ -91,21 +98,29 @@ function parseTime(value: string): number | null {
 }
 
 /**
- * Open the fortress headless (keychain-safe), resolve the DEFAULT operator
- * identity as the ISSUER, and return an {@link IssuerSigner} bound to it plus
- * the issuer id (the public-key fingerprint verifiers pin). Fail-closed: throws
- * when custody cannot be unlocked or no default operator identity exists. The
- * caller owns zeroing `masterKey`.
+ * The custody unlock shared by `issue`, `revoke`, AND verified `list`: open the
+ * fortress headless (keychain-safe), unlock the master, resolve the DEFAULT
+ * operator identity, and PIN its public key (the fingerprint verifiers trust),
+ * NOT from the ledger file. Returns the master key, the storage backend (for the
+ * external generation anchor in `_meta`), the pinned issuer public key + id, and
+ * the encrypted private key + encryption key so an ISSUER caller can build a
+ * signer without re-doing the unlock. A VERIFIER (list) ignores the signing
+ * fields. Fail-closed: throws when custody cannot be unlocked or no default
+ * operator identity exists. The caller owns zeroing `masterKey`.
  */
-async function openIssuer(opts: {
+async function openVerifier(opts: {
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
 }): Promise<{
-  sign: IssuerSigner;
   issuerId: string;
   issuerPublicKey: Uint8Array;
   masterKey: Uint8Array;
+  storage: StorageBackend;
+  /** Encrypted issuer private key (for the signer); never key material in the clear. */
+  encryptedPrivateKey: EncryptedPayload;
+  /** The purpose-derived key that decrypts the issuer key transiently in sign(). */
+  identityEncryptionKey: Uint8Array;
 }> {
   if (!opts.passphrase && !opts.recoveryKey) {
     throw new Error(
@@ -147,24 +162,51 @@ async function openIssuer(opts: {
   }
 
   const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
-  const encryptedPrivateKey = identity.encrypted_private_key;
   const issuerPublicKey = decodePublicKey(identity.public_key);
   if (issuerPublicKey === null) {
     masterKey.fill(0);
     throw new Error("default operator identity public key is malformed");
   }
 
+  return {
+    issuerId: identity.identity_id,
+    issuerPublicKey,
+    masterKey,
+    storage,
+    encryptedPrivateKey: identity.encrypted_private_key,
+    identityEncryptionKey,
+  };
+}
+
+/**
+ * Open the fortress and additionally bind an {@link IssuerSigner} to the DEFAULT
+ * operator identity. Thin wrapper over {@link openVerifier} so `issue`/`revoke`
+ * and `list` share ONE unlock + key-pin path (no copy-paste). Fail-closed as
+ * `openVerifier`; the caller owns zeroing `masterKey`.
+ */
+async function openIssuer(opts: {
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}): Promise<{
+  sign: IssuerSigner;
+  issuerId: string;
+  issuerPublicKey: Uint8Array;
+  masterKey: Uint8Array;
+  storage: StorageBackend;
+}> {
+  const v = await openVerifier(opts);
   const signer: IssuerSigner = (message: Uint8Array): Uint8Array =>
     // core/identity.sign decrypts the private key transiently and zeroes it in
     // a finally (NEVER #6). We return the raw 64-byte signature; the caller
     // base64url-encodes it. No key material is exposed here.
-    sign(message, encryptedPrivateKey, identityEncryptionKey);
-
+    sign(message, v.encryptedPrivateKey, v.identityEncryptionKey);
   return {
     sign: signer,
-    issuerId: identity.identity_id,
-    issuerPublicKey,
-    masterKey,
+    issuerId: v.issuerId,
+    issuerPublicKey: v.issuerPublicKey,
+    masterKey: v.masterKey,
+    storage: v.storage,
   };
 }
 
@@ -228,10 +270,14 @@ async function runIssue(
     write(err, "issue: --tier must be one of team | fleet | enterprise\n");
     return 1;
   }
+  // Capture the validated, narrowed values so the mutation closure below (which
+  // TS does not flow-narrow into) uses typed locals, not `!` assertions.
+  const tier: EntitlementClaimsV2["tier"] = flags.tier;
   if (!flags.subject || flags.subject.length === 0) {
     write(err, "issue: --subject <id> is required\n");
     return 1;
   }
+  const subject = flags.subject;
   if (!flags.nodes) {
     write(err, "issue: --nodes <N|unlimited> is required\n");
     return 1;
@@ -309,50 +355,78 @@ async function runIssue(
 
   try {
     const ledgerPath = await resolveLedgerPath();
-    const ledger = await loadLedger(ledgerPath);
-    // Verify the existing ledger BEFORE appending: never extend a tampered
-    // ledger (fail-closed).
-    if (ledger.rows.length > 0) {
-      const integrity = verifyLedgerIntegrity(ledger, issuer.issuerPublicKey);
-      if (!integrity.ok) {
-        write(
-          err,
-          `issue: existing license ledger failed its integrity check (${integrity.reason}); refusing to append\n`,
+    // Serialize the WHOLE load -> verify+freshness -> mutate -> save -> advance
+    // anchor sequence under the advisory lock so two concurrent `issue`/`revoke`
+    // cannot lost-update the ledger or race the anchor (spec §5).
+    const encoded = await withLedgerMutationLock(ledgerPath, async () => {
+      const ledger = await loadLedger(ledgerPath);
+      // Verify integrity AND freshness BEFORE appending: never extend a tampered
+      // OR rolled-back ledger (fail-closed, spec §6). checkLedgerFreshness pins
+      // the fortress issuer key (NOT the ledger file) and compares the ledger
+      // generation against the external master-MAC'd anchor.
+      const fresh = await checkLedgerFreshness(
+        ledger,
+        issuer.issuerPublicKey,
+        issuer.storage,
+        issuer.masterKey,
+      );
+      if (!fresh.ok) {
+        throw new LedgerFailClosed(
+          `existing license ledger failed its integrity/freshness check (${fresh.reason}); refusing to append`,
         );
-        return 1;
       }
-    }
 
-    const { token, row } = issueLicense(
-      {
-        licenseId: generateLicenseId(),
-        subject: flags.subject,
-        tier: flags.tier,
-        pricingUnit,
-        entitledCount,
-        period,
+      // Freshness coordinate: bump strictly above BOTH the on-disk ledger
+      // generation and the external anchor, so a rolled-back on-disk ledger
+      // cannot re-issue at a stale generation the anchor already passed.
+      const anchor = await readLedgerGenerationAnchor(
+        issuer.storage,
+        issuer.masterKey,
+      );
+      const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
+      const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
+
+      const { token, row } = issueLicense(
+        {
+          licenseId: generateLicenseId(),
+          subject,
+          tier,
+          pricingUnit,
+          entitledCount,
+          period,
+          notBefore,
+          notAfter,
+          graceUntil,
+          featureFlags: featureList,
+          issuer: issuer.issuerId,
+        },
+        issuer.sign,
         notBefore,
-        notAfter,
-        graceUntil,
-        featureFlags: featureList,
-        issuer: issuer.issuerId,
-      },
-      issuer.sign,
-      notBefore,
-    );
-    const nextLedger = appendRow(
-      ledger,
-      row,
-      issuer.sign,
-      issuer.issuerPublicKey,
-    );
-    await saveLedger(ledgerPath, nextLedger);
+      );
+      const nextLedger = appendRow(
+        ledger,
+        row,
+        issuer.sign,
+        issuer.issuerPublicKey,
+        nextGeneration,
+      );
+      // WRITE ORDERING (spec §4, the F1 failure class): persist the BLOB (durable
+      // rename) FIRST, THEN advance the anchor. A crash between leaves
+      // ledger.generation >= anchor.generation -> verify uses `>=` -> benign lag,
+      // never a false-brick. The dangerous order (anchor first) would leave
+      // ledger.generation < anchor.generation on a crash and false-brick.
+      await saveLedger(ledgerPath, nextLedger);
+      await writeLedgerGenerationAnchor(
+        issuer.storage,
+        issuer.masterKey,
+        nextGeneration,
+      );
 
-    // The license token the operator pastes into Activate: base64url of the
-    // JSON {claims,signature}. NEVER any secret-key material.
-    const encoded = toBase64url(
-      new TextEncoder().encode(JSON.stringify(token)),
-    );
+      // The license token the operator pastes into Activate: base64url of the
+      // JSON {claims,signature}. NEVER any secret-key material.
+      return toBase64url(new TextEncoder().encode(JSON.stringify(token)));
+    });
+
     write(out, `${encoded}\n`);
     return 0;
   } catch (e) {
@@ -362,6 +436,13 @@ async function runIssue(
     issuer.masterKey.fill(0);
   }
 }
+
+/**
+ * A fail-closed ledger condition surfaced as a clean operator message (the CLI
+ * maps it to a non-zero exit). Thrown from inside the mutation lock so the lock
+ * is released in its `finally` before the message is printed.
+ */
+class LedgerFailClosed extends Error {}
 
 function formatShortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 12)}…` : id;
@@ -375,75 +456,141 @@ function formatTime(unix: number): string {
   }
 }
 
+/**
+ * The banner+note printed for UNVERIFIED (no-custody) list output, so an
+ * unverified glance can never be mistaken for a verified/valid claim.
+ */
+const UNVERIFIED_NOTE =
+  "UNVERIFIED: this is a raw read of the ledger file WITHOUT integrity or " +
+  "freshness checking. It may be tampered, rolled back, or wholesale forged. " +
+  "To VERIFY, pass --passphrase / SANCTUARY_PASSPHRASE (or SANCTUARY_RECOVERY_KEY) " +
+  "so `list` pins the trusted issuer key from your fortress and checks the " +
+  "anti-rollback anchor.";
+
 async function runList(
   argv: string[],
   out: Writable,
   err: Writable,
+  env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const fortress = flagValue(argv, "--fortress");
-  if (fortress) process.env.SANCTUARY_STORAGE_PATH = fortress;
   const asJson = hasFlag(argv, "--json");
-  try {
-    const ledgerPath = await resolveLedgerPath();
-    const ledger = await loadLedger(ledgerPath);
+  const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
+  const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
+  const verified = Boolean(passphrase) || Boolean(recoveryKey);
 
-    // Never render a ledger as trusted without checking its integrity. `list`
-    // has no custody unlock, so it pins the issuer key from the ledger's own
-    // signed anchor (`issuerPublicKey`). That anchor is NOT taken on faith:
-    // `verifyLedgerIntegrity` cross-checks its fingerprint against each row's
-    // SIGNED `claims.issuer` and re-verifies every token/revocation/head
-    // signature under it, so a swapped anchor key is rejected. A non-empty
-    // ledger with no anchor is itself a tamper signal (fail-closed).
-    if (ledger.rows.length > 0) {
-      const pinned =
-        typeof ledger.issuerPublicKey === "string"
-          ? decodePublicKey(ledger.issuerPublicKey)
-          : null;
-      const integrity =
-        pinned === null
-          ? {
-              ok: false as const,
-              tampered: true as const,
-              reason:
-                "ledger has no signed issuer anchor (issuerPublicKey missing/malformed)",
-            }
-          : verifyLedgerIntegrity(ledger, pinned);
-      if (!integrity.ok) {
+  // ── VERIFIED mode: custody unlocked → pin the issuer key from the fortress
+  // (NOT the ledger file) and run integrity + freshness. A whole-ledger
+  // substitution under an attacker keypair fails (pinned key ≠ attacker key);
+  // an old/empty snapshot fails the external generation anchor. This closes the
+  // `list` self-cert residual: the trust root is the operator's own key, not a
+  // claim inside the file being verified.
+  if (verified) {
+    let verifier: Awaited<ReturnType<typeof openVerifier>>;
+    try {
+      verifier = await openVerifier({
+        ...(passphrase !== undefined ? { passphrase } : {}),
+        ...(recoveryKey !== undefined ? { recoveryKey } : {}),
+        ...(fortress !== undefined ? { fortressPath: fortress } : {}),
+      });
+    } catch (e) {
+      write(err, `list: ${(e as Error).message}\n`);
+      return 1;
+    }
+    try {
+      const ledgerPath = await resolveLedgerPath();
+      const ledger = await loadLedger(ledgerPath);
+      // Freshness (integrity + external anti-rollback anchor). An empty ledger
+      // passes integrity but its generation is 0, so an empty substitution is
+      // caught here when the anchor is non-zero.
+      const fresh = await checkLedgerFreshness(
+        ledger,
+        verifier.issuerPublicKey,
+        verifier.storage,
+        verifier.masterKey,
+      );
+      if (!fresh.ok) {
         write(
           err,
-          "WARNING: license ledger FAILED its integrity check " +
-            `(${integrity.reason}` +
-            (integrity.rowIndex !== undefined
-              ? ` at row ${integrity.rowIndex}`
-              : "") +
-            "). This ledger has been TAMPERED with and is NOT trustworthy; " +
-            "refusing to display it as valid.\n",
+          "WARNING: license ledger FAILED its integrity/freshness check " +
+            `(${fresh.reason}` +
+            (fresh.rowIndex !== undefined ? ` at row ${fresh.rowIndex}` : "") +
+            "). This ledger has been TAMPERED with or ROLLED BACK and is NOT " +
+            "trustworthy; refusing to display it as valid.\n",
         );
         return 1;
       }
+      return emitList(listLicenses(ledger), asJson, out, /*unverified*/ false, err);
+    } catch (e) {
+      write(err, `list: ${(e as Error).message}\n`);
+      return 1;
+    } finally {
+      verifier.masterKey.fill(0);
     }
+  }
 
-    const entries = listLicenses(ledger);
-    if (asJson) {
-      write(out, JSON.stringify(entries, null, 2) + "\n");
-      return 0;
-    }
-    if (entries.length === 0) {
-      write(out, "No licenses issued yet.\n");
-      return 0;
-    }
-    write(
-      out,
-      "LICENSE       SUBJECT              TIER        NODES      PERIOD   EXPIRES                   GRACE   REVOKED\n",
-    );
-    for (const e of entries) {
-      write(out, formatListRow(e) + "\n");
-    }
-    return 0;
+  // ── UNVERIFIED mode: no custody unlock. `list` stays usable for a quick read,
+  // but it MUST NOT claim the ledger is valid/verified. Print the entries
+  // clearly labeled UNVERIFIED with the how-to-verify note. Exit 0 (it is a
+  // read), but never emit a green/verified claim. This removes the old FALSE
+  // "valid" (the self-cert finding) without forcing a custody unlock for a
+  // glance.
+  if (fortress) process.env.SANCTUARY_STORAGE_PATH = fortress;
+  try {
+    const ledgerPath = await resolveLedgerPath();
+    const ledger = await loadLedger(ledgerPath);
+    return emitList(listLicenses(ledger), asJson, out, /*unverified*/ true, err);
   } catch (e) {
     write(err, `list: ${(e as Error).message}\n`);
     return 1;
   }
+}
+
+/**
+ * Emit a license listing. In UNVERIFIED mode a loud note is written to stderr
+ * (JSON) or interleaved into the table header (text) so no reader can mistake an
+ * unchecked read for a verified one. Zero rows prints the same empty message in
+ * both modes. Returns exit 0.
+ */
+function emitList(
+  entries: LicenseListEntry[],
+  asJson: boolean,
+  out: Writable,
+  unverified: boolean,
+  err: Writable,
+): number {
+  if (asJson) {
+    if (unverified) write(err, `${UNVERIFIED_NOTE}\n`);
+    // Machine-readable output carries an explicit verification status so a
+    // consumer parsing JSON cannot treat unverified rows as trusted.
+    write(
+      out,
+      JSON.stringify(
+        { verified: !unverified, entries },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
+  if (entries.length === 0) {
+    // Same as today: an empty ledger is not a tamper signal by itself.
+    if (unverified) write(err, `${UNVERIFIED_NOTE}\n`);
+    write(out, "No licenses issued yet.\n");
+    return 0;
+  }
+  if (unverified) {
+    write(out, "*** UNVERIFIED READ (no --passphrase): see the note below ***\n");
+  }
+  write(
+    out,
+    "LICENSE       SUBJECT              TIER        NODES      PERIOD   EXPIRES                   GRACE   REVOKED\n",
+  );
+  for (const e of entries) {
+    write(out, formatListRow(e) + "\n");
+  }
+  if (unverified) write(out, `\n${UNVERIFIED_NOTE}\n`);
+  return 0;
 }
 
 function formatListRow(e: LicenseListEntry): string {
@@ -492,32 +639,48 @@ async function runRevoke(
 
   try {
     const ledgerPath = await resolveLedgerPath();
-    const ledger = await loadLedger(ledgerPath);
-    if (ledger.rows.length > 0) {
-      const integrity = verifyLedgerIntegrity(ledger, issuer.issuerPublicKey);
-      if (!integrity.ok) {
-        write(
-          err,
-          `revoke: license ledger failed its integrity check (${integrity.reason}); refusing to modify\n`,
+    // Serialize the whole sequence under the advisory lock (spec §5).
+    await withLedgerMutationLock(ledgerPath, async () => {
+      const ledger = await loadLedger(ledgerPath);
+      // Verify integrity AND freshness before mutating: never modify a tampered
+      // OR rolled-back ledger (fail-closed, spec §6). Pins the fortress issuer
+      // key + the external anti-rollback anchor.
+      const fresh = await checkLedgerFreshness(
+        ledger,
+        issuer.issuerPublicKey,
+        issuer.storage,
+        issuer.masterKey,
+      );
+      if (!fresh.ok) {
+        throw new LedgerFailClosed(
+          `license ledger failed its integrity/freshness check (${fresh.reason}); refusing to modify`,
         );
-        return 1;
       }
-    }
-    let next;
-    try {
-      next = revokeLicense(
+
+      const anchor = await readLedgerGenerationAnchor(
+        issuer.storage,
+        issuer.masterKey,
+      );
+      const anchorGen = anchor.status === "valid" ? anchor.data.generation : 0;
+      const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
+
+      const next = revokeLicense(
         ledger,
         licenseId,
         Math.floor(Date.now() / 1000),
         reason,
         issuer.sign,
         issuer.issuerPublicKey,
+        nextGeneration,
       );
-    } catch (e) {
-      write(err, `revoke: ${(e as Error).message}\n`);
-      return 1;
-    }
-    await saveLedger(ledgerPath, next);
+      // WRITE ORDERING (spec §4): durable blob FIRST, then advance the anchor.
+      await saveLedger(ledgerPath, next);
+      await writeLedgerGenerationAnchor(
+        issuer.storage,
+        issuer.masterKey,
+        nextGeneration,
+      );
+    });
     write(out, `Revoked license ${formatShortId(licenseId)}.\n`);
     return 0;
   } catch (e) {
@@ -561,7 +724,7 @@ export async function runLicenseCommand(args: {
     case "issue":
       return runIssue(rest, out, err, env);
     case "list":
-      return runList(rest, out, err);
+      return runList(rest, out, err, env);
     case "revoke":
       return runRevoke(rest, out, err, env);
     case undefined:

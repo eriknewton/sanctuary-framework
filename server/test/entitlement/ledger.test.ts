@@ -52,14 +52,18 @@ function params(overrides: Partial<IssueLicenseParams> = {}): IssueLicenseParams
   };
 }
 
-/** Issue N licenses into a fresh ledger; return {ledger, ids}. */
+/**
+ * Issue N licenses into a fresh ledger; return {ledger, ids}. The monotonic
+ * generation is bumped on every append (1..N), mirroring the CLI's
+ * `max(ledger.generation ?? 0, anchor.generation) + 1`.
+ */
 function seed(n: number): { ledger: Ledger; ids: string[] } {
   let ledger = emptyLedger();
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
     const p = params({ licenseId: `lic-${i}` });
     const { row } = issueLicense(p, sign, NOW + i);
-    ledger = appendRow(ledger, row, sign, issuer.publicKey);
+    ledger = appendRow(ledger, row, sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     ids.push(p.licenseId);
   }
   return { ledger, ids };
@@ -96,16 +100,16 @@ describe("ledger — issue/list round-trip", () => {
   it("rejects a duplicate licenseId on append", () => {
     let ledger = emptyLedger();
     const { row } = issueLicense(params({ licenseId: "dup" }), sign, NOW);
-    ledger = appendRow(ledger, row, sign, issuer.publicKey);
+    ledger = appendRow(ledger, row, sign, issuer.publicKey, 1);
     const { row: row2 } = issueLicense(params({ licenseId: "dup" }), sign, NOW + 1);
-    expect(() => appendRow(ledger, row2, sign, issuer.publicKey)).toThrow(/duplicate/);
+    expect(() => appendRow(ledger, row2, sign, issuer.publicKey, 2)).toThrow(/duplicate/);
   });
 });
 
 describe("ledger — revoke", () => {
   it("marks the row revoked, surfaces in list, and stays intact", () => {
     const { ledger, ids } = seed(3);
-    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign, issuer.publicKey);
+    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     const entries = listLicenses(revoked);
     expect(entries[1]!.revoked).toBe(true);
     expect(entries[1]!.revokedAt).toBe(NOW + 500);
@@ -119,18 +123,18 @@ describe("ledger — revoke", () => {
 
   it("fails closed on an unknown licenseId", () => {
     const { ledger } = seed(2);
-    expect(() => revokeLicense(ledger, "nope", NOW, null, sign, issuer.publicKey)).toThrow(/unknown/);
+    expect(() => revokeLicense(ledger, "nope", NOW, null, sign, issuer.publicKey, (ledger.generation ?? 0) + 1)).toThrow(/unknown/);
   });
 
   it("refuses to double-revoke", () => {
     const { ledger, ids } = seed(2);
-    const once = revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey);
-    expect(() => revokeLicense(once, ids[0]!, NOW + 1, null, sign, issuer.publicKey)).toThrow(/already revoked/);
+    const once = revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
+    expect(() => revokeLicense(once, ids[0]!, NOW + 1, null, sign, issuer.publicKey, (once.generation ?? 0) + 1)).toThrow(/already revoked/);
   });
 
   it("does not mutate the input ledger (pure)", () => {
     const { ledger, ids } = seed(2);
-    revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey);
+    revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     expect(listLicenses(ledger)[0]!.revoked).toBe(false);
   });
 });
@@ -138,7 +142,7 @@ describe("ledger — revoke", () => {
 describe("ledger — tamper-evidence (fail-closed)", () => {
   it("detects a flipped revoked bit on disk (revocation status un-does without a valid re-sign)", () => {
     const { ledger, ids } = seed(2);
-    const revoked = revokeLicense(ledger, ids[0]!, NOW + 10, "x", sign, issuer.publicKey);
+    const revoked = revokeLicense(ledger, ids[0]!, NOW + 10, "x", sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     // Simulate a disk edit: flip revoked back to false WITHOUT re-signing. The
     // row-hash check catches the metadata edit; even if an attacker also fixed
     // the rowHash to match, the per-row revocation signature — which is signed
@@ -163,7 +167,7 @@ describe("ledger — tamper-evidence (fail-closed)", () => {
     // rowHash by re-appending the edited row via the same code path.
     const { ledger, ids } = seed(1);
     // A signature asserting the OPPOSITE status than the metadata will carry.
-    const oppositeStatusSig = revokeLicense(ledger, ids[0]!, NOW + 10, null, sign, issuer.publicKey)
+    const oppositeStatusSig = revokeLicense(ledger, ids[0]!, NOW + 10, null, sign, issuer.publicKey, (ledger.generation ?? 0) + 1)
       .rows[0]!.revocationSignature;
     // Rebuild a clean single-row ledger, then swap only the revocation signature
     // for the opposite-status one and repair the rowHash to match by re-running
@@ -179,6 +183,7 @@ describe("ledger — tamper-evidence (fail-closed)", () => {
       },
       sign,
       issuer.publicKey,
+      1,
     );
     const verdict = verifyLedgerIntegrity(rebuilt, issuer.publicKey);
     expect(verdict.ok).toBe(false);
@@ -226,7 +231,7 @@ describe("ledger — tamper-evidence (fail-closed)", () => {
     const { ledger } = seed(1);
     const forgedSign: IssuerSigner = (m) => ed25519.sign(m, wrongIssuer.privateKey);
     const { row } = issueLicense(params({ licenseId: "forged" }), forgedSign, NOW);
-    const withForged = appendRow(ledger, row, sign, issuer.publicKey);
+    const withForged = appendRow(ledger, row, sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     // The genuine issuer key is pinned; the forged row's token + revocation
     // signatures were made with the WRONG key and will not verify against it.
     const verdict = verifyLedgerIntegrity(withForged, issuer.publicKey);

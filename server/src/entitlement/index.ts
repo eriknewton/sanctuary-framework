@@ -60,4 +60,15 @@ export {
   resolveLedgerPath,
   loadLedger,
   saveLedger,
+  withLedgerMutationLock,
+  type LedgerLockOptions,
 } from "./ledger-io.js";
+
+export {
+  LEDGER_GENERATION_ANCHOR_META_KEY,
+  readLedgerGenerationAnchor,
+  writeLedgerGenerationAnchor,
+  checkLedgerFreshness,
+  type LedgerGenerationAnchorData,
+  type LedgerFreshnessVerdict,
+} from "./ledger-antirollback.js";
