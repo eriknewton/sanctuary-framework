@@ -24,6 +24,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "inbox",
   "init",
   "intelligence",
+  "license",
   "nodes",
   "plugin",
   "policy",
