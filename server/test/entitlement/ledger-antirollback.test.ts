@@ -224,6 +224,69 @@ describe("ledger anti-rollback — checkLedgerFreshness (the acceptance criteria
   });
 });
 
+describe("ledger anti-rollback — one-mutation self-healing lag (Fix 3, honest residual)", () => {
+  it("a crash-lagged anchor self-heals on the NEXT mutation to N+2, then the lagged snapshots read tampered", async () => {
+    // Reproduce the exact crash state the residual documents: the durable BLOB
+    // advanced to gen N+1 but the process crashed BEFORE the anchor bump, so the
+    // anchor lags at N. This is benign (verify uses `>=`), but the last mutation
+    // is not yet rollback-protected. The NEXT mutation must self-heal.
+    const N = 1;
+    let ledger = emptyLedger();
+    ledger = issueInto(ledger, "a"); // gen 1  (N)
+    ledger = issueInto(ledger, "b"); // gen 2  (N+1) — the durable blob
+    const blobGen = ledger.generation!;
+    expect(blobGen).toBe(N + 1);
+
+    // Snapshots that must become tampered once the anchor self-heals past them.
+    let atGenN = emptyLedger();
+    atGenN = issueInto(atGenN, "a"); // a genuine gen-1 (N) snapshot
+    const atGenNplus1 = structuredClone(ledger); // genuine gen-2 (N+1) snapshot
+
+    // Anchor lagged at N (the crash window). The current blob (N+1 >= N) still
+    // verifies — a benign lag, NOT a brick.
+    const storage = await storageWithAnchor(N); // anchor at gen 1
+    const benign = await checkLedgerFreshness(ledger, issuer.publicKey, storage, master);
+    expect(benign.ok).toBe(true);
+    if (benign.ok) {
+      expect(benign.ledgerGeneration).toBe(N + 1);
+      expect(benign.anchorGeneration).toBe(N);
+    }
+
+    // The NEXT mutation self-heals: it computes
+    // nextGeneration = max(ledgerGen=N+1, anchorGen=N) + 1 = N+2, mutates, and
+    // advances the anchor to N+2 (mirroring the CLI mutate path).
+    const anchorRead = await readLedgerGenerationAnchor(storage, master);
+    const anchorGen = anchorRead.status === "valid" ? anchorRead.data.generation : 0;
+    const nextGeneration = Math.max(ledger.generation ?? 0, anchorGen) + 1;
+    expect(nextGeneration).toBe(N + 2); // 3
+
+    const healed = appendRow(
+      ledger,
+      issueLicense(params({ licenseId: "c" }), sign, NOW).row,
+      sign,
+      issuer.publicKey,
+      nextGeneration,
+    );
+    await writeLedgerGenerationAnchor(storage, master, nextGeneration); // anchor → N+2
+
+    // The healed ledger verifies fresh at the self-healed floor.
+    const healedVerdict = await checkLedgerFreshness(healed, issuer.publicKey, storage, master);
+    expect(healedVerdict.ok).toBe(true);
+    if (healedVerdict.ok) expect(healedVerdict.anchorGeneration).toBe(N + 2);
+
+    // The residual is now BOUNDED + closed: replaying EITHER the gen-N or the
+    // gen-(N+1) snapshot below the self-healed anchor (N+2) reads as tampered.
+    const replayN = await checkLedgerFreshness(atGenN, issuer.publicKey, storage, master);
+    expect(replayN.ok).toBe(false);
+    if (!replayN.ok) expect(replayN.reason).toMatch(/below the external anchor|rollback|older or empty/);
+
+    const replayNplus1 = await checkLedgerFreshness(atGenNplus1, issuer.publicKey, storage, master);
+    expect(replayNplus1.ok).toBe(false);
+    if (!replayNplus1.ok)
+      expect(replayNplus1.reason).toMatch(/below the external anchor|rollback|older or empty/);
+  });
+});
+
 describe("ledger anti-rollback — legacy #868 back-compat (no false-brick)", () => {
   it("a legacy ledger with NO generation field still verifies (v1 head fallback), anchor absent → ok", async () => {
     // Build a legacy-shaped ledger: sign the head under the V1 message

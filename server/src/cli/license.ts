@@ -379,6 +379,19 @@ async function runIssue(
       // Freshness coordinate: bump strictly above BOTH the on-disk ledger
       // generation and the external anchor, so a rolled-back on-disk ledger
       // cannot re-issue at a stale generation the anchor already passed.
+      //
+      // HONEST RESIDUAL - the one-mutation self-healing lag (issuer-local, NOT a
+      // token bypass): the durable blob write below lands BEFORE the anchor bump.
+      // If the process crashes AFTER the durable blob (gen N+1) but BEFORE the
+      // anchor advances, the anchor lags at N. The ledger (N+1 >= N) still
+      // verifies (benign lag under the `>=` freshness rule), but that LAST
+      // mutation is not yet rollback-protected until the NEXT mutation, whose
+      // `max(ledgerGen, anchorGen) + 1` self-heals the anchor to N+2, after
+      // which replaying the N or N+1 snapshot reads as tampered. This is the
+      // inherent one-mutation bound of an on-disk monotonic anchor (the same
+      // class `core/anti-rollback.ts` documents as its Stage-1 residual). It is
+      // issuer-local bookkeeping and does NOT forge a customer token: the token
+      // layer gates enforcement and verifies against the real issuer key.
       const anchor = await readLedgerGenerationAnchor(
         issuer.storage,
         issuer.masterKey,
@@ -657,6 +670,12 @@ async function runRevoke(
         );
       }
 
+      // Self-healing anchor: `max(ledgerGen, anchorGen) + 1` heals a
+      // one-mutation crash lag (durable blob at N+1, anchor still at N) up to
+      // N+2 on this next mutation. See the fuller HONEST RESIDUAL note on the
+      // `issue` path above: the last pre-crash mutation is benign-lagged, not
+      // rollback-protected, until the next mutation self-heals; issuer-local,
+      // NOT a customer-token bypass.
       const anchor = await readLedgerGenerationAnchor(
         issuer.storage,
         issuer.masterKey,
