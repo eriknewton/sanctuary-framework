@@ -9,7 +9,7 @@
  * that fails its integrity check.
  */
 
-import { readFile, mkdir, open, stat, unlink } from "node:fs/promises";
+import { readFile, mkdir, open, stat, unlink, link } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { loadConfig } from "../config.js";
@@ -166,13 +166,23 @@ function isProcessAlive(pid: number): boolean {
  * distributed lock), so the guard is the pid-liveness + token-verify pair, with
  * NO dependency and NO heartbeat thread:
  *   - ACQUIRE writes a unique token `${pid}\n${ts}\n${nonce}` (nonce =
- *     `randomUUID`) and remembers the nonce.
+ *     `randomUUID`) to a PRIVATE temp file, then `link()`s the temp onto
+ *     `lockPath` atomically. `link` fails EEXIST when the lock is held (the same
+ *     exclusive-create guarantee as `open('wx')`), but the PUBLISHED lockfile
+ *     already carries the token  -  it is NEVER observably empty. This closes the
+ *     empty-window fail-open (Fix 3): the old two-step
+ *     `open('wx')`-then-`writeFile` published an EMPTY lockfile that a contender
+ *     could observe, fail to parse, mistake for an ownerless dead holder, and
+ *     stale-break out from under a LIVE mid-create acquirer -> double-acquire.
  *   - STALE-BREAK happens ONLY when the lockfile is BOTH older than `staleMs`
  *     AND its recorded pid is provably gone (`process.kill(pid, 0)` -> ESRCH).
  *     A live-but-slow holder (age > staleMs but pid still alive) is NEVER
- *     broken, so a stale-break can no longer create two live holders. A
- *     malformed/unparseable lockfile past staleMs is treated as debris and
- *     broken (there is no live owner to protect).
+ *     broken, so a stale-break can no longer create two live holders. An
+ *     UNparseable lockfile is NEVER stale-broken in the fail-open direction: it
+ *     is treated as owner-unknown and left in place (the contender backs off and,
+ *     if truly orphaned, eventually fails closed with a recoverable "could not
+ *     acquire" error) rather than unlinked. With the atomic-link publish above a
+ *     lockfile is never empty, so this is a belt-and-suspenders fail-safe.
  *   - RELEASE reads the lockfile and unlinks ONLY if it still carries OUR nonce.
  *     If it holds a different token (a peer broke ours as stale and now holds
  *     it), we leave it (never unlink a foreign token).
@@ -200,18 +210,37 @@ export async function withLedgerMutationLock<T>(
     nonce: randomUUID(),
   };
 
+  // Private temp that carries our token BEFORE it is published as the lockfile.
+  // The nonce makes it collision-free even if two acquirers share our pid.
+  const acqTmpPath = `${lockPath}.acq-${ourToken.pid}-${ourToken.nonce}`;
+
   let acquired = false;
   for (let attempt = 0; attempt < maxAttempts && !acquired; attempt++) {
     try {
-      // 'wx' = O_CREAT | O_EXCL: fails with EEXIST if the lockfile already
-      // exists, giving an atomic test-and-set across processes on one host.
-      const handle = await open(lockPath, "wx", 0o600);
+      // Write the token to a PRIVATE temp first (`wx` = O_CREAT|O_EXCL, so a
+      // stray temp from a crashed prior attempt with this exact nonce cannot be
+      // silently reused), then atomically LINK it onto the lockfile. `link` is
+      // atomic and fails EEXIST when the lock is held  -  the same exclusive
+      // test-and-set as `open('wx')`  -  but the PUBLISHED lockfile already
+      // contains the token, so it is NEVER observably empty. This closes the
+      // empty-window fail-open (a contender can no longer observe an empty
+      // lockfile, fail to parse it, and stale-break a live mid-create holder).
+      const handle = await open(acqTmpPath, "wx", 0o600);
       try {
         await handle.writeFile(serializeLockToken(ourToken));
       } finally {
         await handle.close();
       }
-      acquired = true;
+      try {
+        await link(acqTmpPath, lockPath);
+        acquired = true;
+      } finally {
+        // The lockfile is now its own hard link to the same inode (or the link
+        // failed); either way the temp name has served its purpose. Remove it so
+        // no debris accumulates. Best-effort: a leftover temp never blocks a
+        // future acquire (each carries a fresh nonce).
+        await unlink(acqTmpPath).catch(() => {});
+      }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       // Contended. Only break a lock that is BOTH stale by age AND whose
@@ -224,9 +253,13 @@ export async function withLedgerMutationLock<T>(
           try {
             const holder = parseLockToken(await readFile(lockPath, "utf-8"));
             // A parseable token: break only if its pid is provably gone. An
-            // UNparseable/legacy lockfile past staleMs has no owner we can
-            // protect, so treat it as debris and break it.
-            holderAlive = holder ? isProcessAlive(holder.pid) : false;
+            // UNparseable lockfile is owner-UNKNOWN: never stale-break it in the
+            // fail-open direction (that is exactly the empty-window
+            // double-acquire). Treat it as alive/held so the contender backs off
+            // and, if truly orphaned, fails closed with the recoverable "could
+            // not acquire" error. With the atomic-link publish a lockfile is
+            // never actually empty, so this branch is belt-and-suspenders.
+            holderAlive = holder ? isProcessAlive(holder.pid) : true;
           } catch {
             // The lockfile vanished between stat and read (holder released).
             holderAlive = true; // nothing to break; fall through to retry.
@@ -249,7 +282,8 @@ export async function withLedgerMutationLock<T>(
     throw new Error(
       `could not acquire the license ledger lock at ${lockPath} after ` +
         `${maxAttempts} attempts; another 'sanctuary license' mutation may be ` +
-        "in progress. Retry shortly.",
+        "in progress. Retry shortly. If no mutation is running and this persists, " +
+        `a stale lockfile may need manual removal: rm '${lockPath}'.`,
     );
   }
   try {

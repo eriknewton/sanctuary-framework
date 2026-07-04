@@ -132,6 +132,52 @@ describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
     }
   });
 
+  it("does NOT stale-break a LIVE but EMPTY/unparseable lockfile (empty-window fail-open closed)", async () => {
+    // Codex's exact repro of the empty-lockfile fail-open: the OLD acquire path
+    // created the lockfile with `open(lockPath,'wx')` (EMPTY) and wrote the token
+    // in a SEPARATE step, so a contender could observe an empty lockfile while a
+    // LIVE acquirer was mid-create. `parseLockToken` returned null for the empty
+    // file → the contender treated it as an ownerless dead holder → unlinked it →
+    // DOUBLE-ACQUIRE. Here we pin that window open deterministically: an
+    // empty-but-HELD lockfile (open handle kept alive = a live mid-create holder)
+    // with a backdated mtime, and a real contender at a small staleMs. The
+    // contender must NOT break it and must NOT enter (no overlap / no
+    // double-acquire).
+    const lockPath = `${path}.lock`;
+    // A live holder that has created the lockfile but not yet written its token:
+    // an empty, held (open FD) lockfile — the exact mid-create state.
+    const heldHandle = await open(lockPath, "wx", 0o600);
+    try {
+      // Backdate the mtime so it looks older than the contender's staleMs — this
+      // is what tempted the old code into a mtime-only stale-break of a file it
+      // could not parse.
+      const { utimes } = await import("node:fs/promises");
+      const old = new Date(Date.now() - 10_000);
+      await utimes(lockPath, old, old);
+
+      let contenderEntered = false;
+      // The contender must fail closed (never enter) — the empty/unparseable lock
+      // is owner-unknown and must NOT be stale-broken in the fail-open direction.
+      await expect(
+        withLedgerMutationLock(
+          path,
+          async () => {
+            contenderEntered = true;
+            return "should-not-run";
+          },
+          { staleMs: 20, maxAttempts: 4, backoffMs: 5 },
+        ),
+      ).rejects.toThrow(/could not acquire/);
+      // No overlap: the contender never entered the critical section while the
+      // live holder still held the (empty) lockfile.
+      expect(contenderEntered).toBe(false);
+      // The live holder's lockfile was left intact (never broken as debris).
+      await expect(stat(lockPath)).resolves.toBeTruthy();
+    } finally {
+      await heldHandle.close();
+    }
+  });
+
   it("does NOT break a live-but-slow holder even past staleMs (no two holders)", async () => {
     // Holder A takes longer than staleMs. A contender B must NOT steal the lock,
     // because A's recorded pid (this very process) is provably ALIVE — the
