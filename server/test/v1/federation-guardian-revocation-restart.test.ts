@@ -50,13 +50,22 @@ type DepsAccess = DashboardApprovalChannel & {
 };
 
 const MASTER_KEY = new Uint8Array(32).fill(13);
+// A FIXED audit-log encryption key reused across every simulated "restart" (a
+// real daemon derives its audit key from the PERSISTENT master, never a fresh
+// random one). A per-restart random key would mint a NEW key each boot, so the
+// post-restart audit read (now consulted by the §8 anti-rollback floor) would
+// try to decrypt the PRIOR process's entries under the WRONG key and fail
+// integrity -> the anti-rollback floor would fail TOWARD latch. That is a
+// test-rig artifact, not a product defect (mirrors the AUDIT_KEY convention in
+// federation-guardian-disable-gate.test.ts).
+const AUDIT_KEY = new Uint8Array(32).fill(29);
 
 async function buildDashboard(
   fortress: MultiNodeFortress,
   nodeId: string,
   storage: MemoryStorage,
 ): Promise<DepsAccess> {
-  const auditLog = new AuditLog(storage, randomBytes(32));
+  const auditLog = new AuditLog(storage, AUDIT_KEY);
   const dashboard = new DashboardApprovalChannel({
     port: 0,
     host: "127.0.0.1",

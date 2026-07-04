@@ -30,6 +30,7 @@ import {
   FEDERATION_SYNC_STATE_STORE_NAMESPACE,
   FEDERATION_SYNC_STATE_STORE_KEY,
   FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+  FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
 import { verifyLoadedGuardianRevocationRequirement } from "../../src/v1/federation-guardian-revocation-policy.js";
 import type { V1FederationDeps } from "../../src/v1/federation.js";
@@ -1515,6 +1516,7 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
         fortressId: fortress.fortressId,
         syncStateUnavailable: false,
         nextDisableNonce: 5,
+        guardianLoweredHighWater: 0,
       },
       { kind: "operator_set", next: null, auth: null },
     );
@@ -1546,7 +1548,7 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
     expect(hook && hook.unavailable).toBe(true);
     // Direct proof the sentinel was established under the master.
     const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
-    expect(await store.guardianRequirementEstablished()).toBe(true);
+    expect((await store.guardianRequirementEstablished()).status).toBe("established");
   });
 
   // FIX 2 (brick-safety): a genuinely FRESH fortress (no requirement ever
@@ -1563,7 +1565,7 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
     const hook = signOff(dashboard) as { unavailable?: boolean } | null;
     expect(hook === null || hook.unavailable !== true).toBe(true);
     const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
-    expect(await store.guardianRequirementEstablished()).toBe(false);
+    expect((await store.guardianRequirementEstablished()).status).toBe("absent");
     expect(
       await storage.exists("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
     ).toBe(false);
@@ -1662,5 +1664,443 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
       pinned,
     );
     expect(tamperedResult.kind).toBe("invalid");
+  });
+});
+
+// ── F1 RE-GATE: keyless anti-rollback (§1 anchor + §8 audit-witnessed floor) ──
+//
+// The prior fix-round modeled a MASTER-KEY attacker and a stale-in-memory
+// writer; it MISSED the keyless whole-blob-restore attacker. These tests do NOT
+// hand the attacker the master: they capture + restore RAW on-disk bytes
+// (exactly what a filesystem-write attacker can do). "raw" restore = read the
+// bytes out with storage.read and write them back with storage.write; the
+// attacker never decrypts or re-MACs anything.
+describe("F1 re-gate: keyless whole-blob rollback latches (§1 + §8)", () => {
+  const NS = FEDERATION_SYNC_STATE_STORE_NAMESPACE;
+  const KEY = FEDERATION_SYNC_STATE_STORE_KEY;
+  const ANCHOR_KEY = FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY;
+
+  function masterKeyOf(fortress: MultiNodeFortress, nodeId: string): Uint8Array {
+    return fortress.nodes[nodeId]!.context.getMasterPrivateKey!();
+  }
+  function mintLowered(
+    fortress: MultiNodeFortress,
+    nodeId: string,
+    rosterVersion: number,
+    effectiveM: number,
+    disableNonce: number,
+  ): LoweredThresholdAuthorization {
+    return signLoweredThresholdAuthorization({
+      fortressId: fortress.fortressId,
+      rosterVersion,
+      effectiveM,
+      disableNonce,
+      masterPrivateKey: masterKeyOf(fortress, nodeId),
+    });
+  }
+
+  // Bring a fortress to a lowered-then-raised state, capturing the LOW-floor
+  // on-disk bytes (blob + anchor) BEFORE the raise. Returns the raw snapshots and
+  // the shared storage/fortress so a test can restore + reboot.
+  async function loweredThenRaised(): Promise<{
+    fortress: MultiNodeFortress;
+    storage: MemoryStorage;
+    lowBlob: Uint8Array;
+    lowAnchor: Uint8Array;
+    staleLowered: LoweredThresholdAuthorization;
+  }> {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Lower to M=2 (burns a nonce; a lowered record is present).
+    const nonceLower = dashboard.nextFederationGuardianDisableNonce();
+    const staleLowered = mintLowered(fortress, "mini-1", roster.version, 2, nonceLower);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: staleLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nonceLower,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+        }),
+      },
+    );
+
+    // CAPTURE the attacker's snapshot: the raw blob + raw anchor at the LOW floor.
+    // No master used - just the on-disk bytes.
+    const lowBlob = (await storage.read(NS, KEY))!;
+    const lowAnchor = (await storage.read("_meta", ANCHOR_KEY))!;
+    expect(lowBlob).not.toBeNull();
+    expect(lowAnchor).not.toBeNull();
+
+    // Operator RAISES back to M=3 (drops the lowered record, advances the floor +
+    // the anchor + the audit generation).
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    expect(
+      effectiveThresholdM(signOff(dashboard) as GuardianRevocationRequirement),
+    ).toBe(3);
+
+    return { fortress, storage, lowBlob, lowAnchor, staleLowered };
+  }
+
+  // T1: keyless SINGLE-record rollback (blob alone) latches via the §1 anchor.
+  it("T1: restoring ONLY the old blob (anchor stays high) latches syncStateUnavailable", async () => {
+    const { fortress, storage, lowBlob, staleLowered } = await loweredThenRaised();
+
+    // Attacker restores ONLY the captured LOW blob, leaving the CURRENT (higher)
+    // anchor in place (a keyless attacker cannot forge a higher anchor).
+    await storage.write(NS, KEY, lowBlob);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // blob.floor < anchor.floor -> LATCH.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+    // The stale lowered-M record never becomes live (never effective M=2).
+    if ((after as { unavailable?: boolean }).unavailable !== true) {
+      expect(
+        effectiveThresholdM(after as GuardianRevocationRequirement),
+      ).not.toBe(2);
+    }
+    void staleLowered;
+  });
+
+  // T1b (THE HEADLINE): keyless TWO-record restore (blob + anchor BOTH rolled
+  // back) latches via the §8 audit-witnessed generation floor. This is the test
+  // that FAILS on a §1-only design and MUST pass with §8.
+  it("T1b: restoring BOTH the old blob AND the old anchor latches via the audit floor", async () => {
+    const { fortress, storage, lowBlob, lowAnchor } = await loweredThenRaised();
+
+    // Attacker restores BOTH captured records at the LOW floor. The guardian
+    // AUDIT entries (which remember the higher generation reached by the raise)
+    // are left intact.
+    await storage.write(NS, KEY, lowBlob);
+    await storage.write("_meta", ANCHOR_KEY, lowAnchor);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // blob.generation < auditFloor.generation (from the surviving audit trail)
+    // -> LATCH. §1 alone would NOT catch this (both blob and anchor are low).
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // T1c: audit-INCLUSIVE wipe is the documented residual (§8.3). Restoring the
+  // low blob + low anchor AND wiping the guardian audit entries removes the
+  // witness that would remember the higher generation. We document the honest
+  // boundary rather than asserting on-disk detection.
+  it("T1c: an audit-inclusive coordinated wipe is the documented residual (no over-claim)", async () => {
+    const { fortress, storage, lowBlob, lowAnchor } = await loweredThenRaised();
+    await storage.write(NS, KEY, lowBlob);
+    await storage.write("_meta", ANCHOR_KEY, lowAnchor);
+    // Remove EVERY audit entry so the audit trail no longer remembers the higher
+    // generation (a wholesale audit destruction - itself separately surfaced as
+    // an empty/truncated chain, out of this fix's on-disk detection scope).
+    for (const meta of await storage.list("_audit")) {
+      await storage.delete("_audit", meta.key);
+    }
+
+    // The code does NOT CLAIM to detect this on-disk here. This test encodes the
+    // §8.3 residual as an intended, honest boundary: reboot must not THROW, and
+    // whatever verdict it reaches (it may still latch via other signals) is
+    // acceptable - we only assert we did not crash and did not over-claim.
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted);
+    // Any of: latched, null, or a live requirement is a valid outcome for the
+    // residual; the point is the reboot completed without throwing.
+    expect(after === null || typeof after === "object").toBe(true);
+  });
+
+  // T1d: no false positive. A fortress that NEVER configured a guardian
+  // requirement (no guardian audit entries, no anchor) hydrates normally, and a
+  // legitimate full-consistent state hydrates without latching.
+  it("T1d: a never-guarded fortress does NOT latch (auditFloor 0, no false positive)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    // No requirement ever set: the kill hook is the legacy single-operator null.
+    const hook = signOff(dashboard) as { unavailable?: boolean } | null;
+    expect(hook === null || hook.unavailable !== true).toBe(true);
+
+    // A legitimate reboot of a consistently-guarded fortress does NOT latch.
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((after as { unavailable?: boolean }).unavailable).not.toBe(true);
+    expect(effectiveThresholdM(after as GuardianRevocationRequirement)).toBe(3);
+  });
+
+  // T2: sentinel write-ordering crash window (Finding #2). A crash between the
+  // sentinel write and the record persist must leave sentinel-present +
+  // record-absent, which hydrate latches. The dangerous pre-fix pair
+  // (record-present + sentinel-absent) must NEVER be produced.
+  it("T2: sentinel is written BEFORE the record; the crash window latches, never boots fresh", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // The sentinel is present after a successful enable.
+    expect(
+      await storage.exists("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
+    ).toBe(true);
+
+    // Simulate the crash between (1) sentinel write and (2) record persist:
+    // sentinel present, record deleted. Hydrate must latch (established +
+    // !recordPresent), never boot fresh.
+    await storage.delete(NS, KEY);
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(restarted) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true);
+  });
+
+  // T3: pre-upgrade backfill (Finding #3). A pre-fix fortress has a guard
+  // configured in its record but NO sentinel. On boot, the sentinel is
+  // backfilled; a subsequent record-delete is then caught.
+  it("T3: hydrate backfills the sentinel for a pre-upgrade guarded fortress; a later delete latches", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Simulate a PRE-FIX fortress: a guard IS in the durable record, but the
+    // sentinel does not exist yet (delete it to model the pre-upgrade state).
+    await storage.delete("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY);
+    expect(
+      await storage.exists("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
+    ).toBe(false);
+
+    // Boot the fixed binary: the record is present + configures a guard, so the
+    // sentinel is backfilled.
+    const rebooted = await buildDashboard(fortress, "mini-1", storage);
+    expect(
+      await storage.exists("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
+    ).toBe(true);
+    // The guard is still live (backfill does not disturb it).
+    expect((signOff(rebooted) as { unavailable?: boolean }).unavailable).not.toBe(
+      true,
+    );
+
+    // Now DELETE the record and reboot: the backfilled sentinel catches it.
+    await storage.delete(NS, KEY);
+    const afterDelete = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(afterDelete) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true);
+  });
+
+  // T4: break-glass completion advances the lowered high-water (Finding #4).
+  // Lower to M', arm+complete break-glass (disable), then re-inject the old
+  // still-signed lowered-M' record: the reboot rejects it (nonce <= high-water).
+  it("T4: break-glass completion advances the lowered high-water; a replayed lowered-M' is rejected on reboot", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Lower to M=2 (present lowered record, nonce N_low).
+    const nLow = dashboard.nextFederationGuardianDisableNonce();
+    const staleLowered = mintLowered(fortress, "mini-1", roster.version, 2, nLow);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: staleLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nLow,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+        }),
+      },
+    );
+
+    // Arm break-glass (disable) with a short delay and complete it. Use fake
+    // timers via a delay that is already elapsed at the poll tick: initiate then
+    // manually drive completion by rebuilding past the deadline is heavy; instead
+    // complete via the countdown floor. Simplest: initiate, then advance the
+    // clock by mocking Date.now through the poll. We rely on the boot re-arm +
+    // immediate tick: reboot with the countdown already elapsed completes it.
+    await dashboard.initiateFederationGuardianBreakGlass(
+      "disable",
+      null,
+      MIN_BREAK_GLASS_DELAY_MS,
+    );
+    // Fast-forward: rewrite the persisted completesAt to the past so the boot
+    // re-arm's immediate tick completes the countdown. This is a KEYLESS-safe
+    // operation only in test (we hold the master here purely to re-encode the
+    // blob); it models "the countdown elapsed", not the attack.
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const snap = await store.load();
+    if (snap.guardianBreakGlass) {
+      snap.guardianBreakGlass = {
+        ...snap.guardianBreakGlass,
+        completesAt: new Date(Date.now() - 1000).toISOString(),
+      };
+    }
+    await storage.delete(NS, KEY);
+    await store.persist(snap);
+
+    // Reboot: the elapsed countdown completes on the immediate poll tick, which
+    // disables the guard AND (Finding #4) advances the lowered high-water past
+    // N_low. Give the poll a tick to fire.
+    const rebooted = await buildDashboard(fortress, "mini-1", storage);
+    await new Promise((r) => setTimeout(r, 20));
+    // The guard is now disabled (single-operator) OR still latched-clear; either
+    // way, re-enable a guard and re-inject the stale lowered record.
+    await rebooted.setFederationGuardianRevocationRequirement({ roster });
+    const store2 = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const snap2 = await store2.load();
+    // The lowered high-water must have advanced to >= N_low from the completion.
+    expect(snap2.guardianLoweredHighWater).toBeGreaterThanOrEqual(nLow);
+    // Re-inject the stale lowered-M' record and reboot: it must be REJECTED.
+    snap2.guardianRevocationRequirement!.loweredThreshold = staleLowered;
+    await storage.delete(NS, KEY);
+    await store2.persist(snap2);
+    const afterReplay = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(afterReplay) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // The replayed M=2 lowering must NOT be honored: either latched, or effective
+    // M is not the attacker's 2.
+    const latched = (after as { unavailable?: boolean }).unavailable === true;
+    if (!latched) {
+      expect(effectiveThresholdM(after as GuardianRevocationRequirement)).not.toBe(2);
+    } else {
+      expect(latched).toBe(true);
+    }
+  });
+
+  // T5: runtime install floor check (Finding #5). A runtime install carrying a
+  // lowered record whose nonce is at/below the high-water is REFUSED at runtime,
+  // not merely at the next boot. A positive control (nonce above the floor)
+  // installs.
+  it("T5: a runtime install of a below-high-water lowered record is refused; above-floor installs", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Establish a lowered high-water by lowering then raising (drops nonce N_low
+    // into the high-water).
+    const nLow = dashboard.nextFederationGuardianDisableNonce();
+    const droppedLowered = mintLowered(fortress, "mini-1", roster.version, 2, nLow);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: droppedLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nLow,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+        }),
+      },
+    );
+    await dashboard.setFederationGuardianRevocationRequirement({ roster }); // raise (high-water = nLow)
+
+    // Attempt a RUNTIME install carrying a lowered record at nonce == nLow (<=
+    // high-water) with a VALID signature: it must be refused with
+    // lowered_threshold_invalid.
+    const replayNonce = dashboard.nextFederationGuardianDisableNonce();
+    const staleAtFloor = mintLowered(fortress, "mini-1", roster.version, 2, nLow);
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(
+        { roster, loweredThreshold: staleAtFloor },
+        {
+          masterAuthorization: signMasterDisableAuthorization({
+            fortressId: fortress.fortressId,
+            disableNonce: replayNonce,
+            intent: "lower",
+            targetM: 2,
+            masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({ code: "lowered_threshold_invalid" });
+
+    // Positive control: a lowered record whose nonce is ABOVE the high-water (the
+    // fresh nonce being burned) installs fine.
+    const freshNonce = dashboard.nextFederationGuardianDisableNonce();
+    const freshLowered = mintLowered(fortress, "mini-1", roster.version, 2, freshNonce);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: freshLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: freshNonce,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+        }),
+      },
+    );
+    expect(
+      effectiveThresholdM(signOff(dashboard) as GuardianRevocationRequirement),
+    ).toBe(2);
+  });
+
+  // T6-hydrate: record ABSENT + sentinel present-but-INVALID latches (the NEW
+  // Finding #6 latch; old code booted fresh). Rotation-safety control: record
+  // PRESENT + sentinel invalid does NOT brick (re-stamps + serves).
+  it("T6: record-absent + corrupt-sentinel latches; record-present + corrupt-sentinel re-stamps (no brick)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Corrupt the sentinel bytes (a keyless attacker mangling, not deleting) AND
+    // delete the record. Old code: !recordPresent && established===false -> boot
+    // fresh. New code: invalid + !recordPresent -> LATCH.
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      new TextEncoder().encode(JSON.stringify({ v: 1, mac: "forged-mac" })),
+    );
+    await storage.delete(NS, KEY);
+    const latchedBoot = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(latchedBoot) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true);
+
+    // Rotation-safety control: rebuild the record (re-enable) but keep a corrupt
+    // sentinel; the record-PRESENT path re-stamps a clean marker and does NOT
+    // brick (the guard serves).
+    const recovery = await buildDashboard(fortress, "mini-1", storage);
+    await recovery.setFederationGuardianRevocationRequirement({ roster });
+    // Corrupt the sentinel again while the record is present.
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      new TextEncoder().encode(JSON.stringify({ v: 1, mac: "stale-prior-master-mac" })),
+    );
+    const restamped = await buildDashboard(fortress, "mini-1", storage);
+    const afterRestamp = signOff(restamped) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // Not bricked: the guard is live (effective M=3), and the sentinel was
+    // re-stamped clean under the current master.
+    expect((afterRestamp as { unavailable?: boolean }).unavailable).not.toBe(true);
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    expect((await store.guardianRequirementEstablished()).status).toBe("established");
   });
 });

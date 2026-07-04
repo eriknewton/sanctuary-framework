@@ -56,7 +56,14 @@ import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hmacSha256 } from "../core/hashing.js";
-import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
+import {
+  bytesToString,
+  stringToBytes,
+  toBase64url,
+  fromBase64url,
+  constantTimeEqual,
+} from "../core/encoding.js";
+import { canonicalJson } from "../audit/chain.js";
 import type { FederationAppliedPolicyVersion } from "./federation-policy-bundle.js";
 import {
   decodeGuardianRevocationRequirement,
@@ -123,6 +130,69 @@ export const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY =
  */
 const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
   "sanctuary.federation.guardian-requirement.established.v1";
+
+/**
+ * F1 re-gate (§1): the EXTERNAL, MAC'd, monotonic anti-rollback ANCHOR for the
+ * security-load-bearing guardian sync-state floors. It lives in `_meta` (a
+ * SEPARATE deletable namespace from the `_federation/sync-state-v1` blob it
+ * protects), so a KEYLESS filesystem attacker who captures an OLD copy of the
+ * sync-state blob and restores it AFTER the operator raised the threshold back
+ * up cannot silently regress the floor: on load we take `Math.max(blob, anchor)`
+ * and LATCH fail-closed on any regression. Mirrors the shipped
+ * `core/anti-rollback.ts` epoch-witness precedent (`custody-epoch-witness-v1`):
+ * the `{marker,data,mac}` record shape, the tri-state read (valid/absent/
+ * invalid), and the non-decreasing write are copied verbatim; NO new crypto
+ * scheme is invented.
+ *
+ * HONEST RESIDUAL (§8.3, do not over-claim): Anti-rollback covers a KEYLESS
+ * same-master filesystem attacker. A single-record rollback (the sync-state blob
+ * alone) is caught by the external `_meta` anchor; a two-record restore (blob +
+ * anchor) is caught by the guardian audit-trail floor on any fortress with
+ * preserved guardian audit history. The irreducible residual is a coordinated
+ * restore/wipe that ALSO self-consistently rolls back or deletes the guardian
+ * audit entries, the audit head anchor + its established marker, and the
+ * checkpoints, i.e. a wholesale audit destruction, which is itself separately
+ * surfaced (empty/truncated chain) and is bounded only by an OFF-HOST or
+ * HARDWARE witness (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk
+ * detection of a full self-consistent tree+audit restore.
+ */
+export const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY =
+  "federation-guardian-antirollback-anchor-v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER =
+  "__sanctuary_federation_guardian_antirollback_anchor_v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN =
+  "sanctuary.federation.guardian-antirollback-anchor.v1\n";
+
+/**
+ * The monotonic floors carried in the anti-rollback anchor. Each mirrors a
+ * `Math.max` floor that also lives inside the rollbackable sync-state blob; the
+ * anchor is the external witness that keeps the blob from silently regressing
+ * them. `updated_at` is advisory provenance only (NOT compared).
+ */
+export interface GuardianAntiRollbackAnchorData {
+  /** Floor for `guardianLoweredHighWater` (the superseded-lowering replay floor). */
+  lowered_high_water: number;
+  /** Floor for `guardianDisableNonce` (the general burned-nonce floor). */
+  disable_nonce: number;
+  /** Floor for `guardianRevocationRequirementGeneration` (the config generation). */
+  requirement_generation: number;
+  /** Advisory provenance only (never part of the monotonic comparison). */
+  updated_at: string;
+}
+
+/**
+ * Tri-state read of the anti-rollback anchor, mirroring `readEpochWitness`
+ * (`core/anti-rollback.ts`):
+ *  - "valid": authenticates under the store's purpose key -> a trustworthy floor.
+ *  - "absent": no anchor record at all (pre-fix fortress, or first boot).
+ *  - "invalid": present but tampered/malformed/wrong-key -> the caller LATCHES
+ *    fail-closed (present-but-untrusted is a positively-detected tamper, never
+ *    read as absent).
+ */
+export type GuardianAntiRollbackAnchorRead =
+  | { status: "valid"; data: GuardianAntiRollbackAnchorData }
+  | { status: "absent" }
+  | { status: "invalid" };
 
 /** The derived security state this store persists and rehydrates. */
 export interface FederationSyncStateSnapshot {
@@ -419,40 +489,182 @@ export class FederationSyncStateStore {
   }
 
   /**
-   * FIX 2: has a guardian requirement EVER been configured on this fortress
-   * (per the tamper-evident `_meta` sentinel)? Returns true ONLY when the marker
-   * is present AND its MAC verifies against the current master's purpose key.
+   * FIX 2 + Finding #6 (tri-state, tamper-evident): has a guardian requirement
+   * EVER been configured on this fortress (per the tamper-evident `_meta`
+   * sentinel)? The return contract distinguishes ABSENT from PRESENT-BUT-INVALID
+   * so the hydrate path can fail closed on tamper instead of booting fresh.
    *
-   *   - absent -> false (fresh fortress, or a fortress that never enabled a
-   *     guard). Not anomalous on its own.
-   *   - present + MAC verifies -> true. A guard was configured; if the
-   *     sync-state record is now absent, the caller fails closed.
-   *   - present + MAC does NOT verify (a stale marker from a PRIOR master after a
-   *     legitimate rotation, or a forged marker) -> false. A marker we cannot
-   *     attribute to the current master must NOT brick a rotated fortress; the
-   *     rotation ceremony re-establishes the marker under the new master.
+   *   - "absent": no marker at all (fresh fortress, or a fortress that never
+   *     enabled a guard). Not anomalous on its own; a guard-in-record still
+   *     backfills per finding #3.
+   *   - "established": present AND its MAC verifies under the current master's
+   *     purpose key. A guard was configured; if the sync-state record is now
+   *     absent, the caller fails closed.
+   *   - "invalid": present but unparseable, malformed, OR MAC-mismatched. The
+   *     MAC-mismatch case is EITHER tamper OR a stale marker from a PRIOR master
+   *     after a legitimate rotation; we CANNOT distinguish the two here (doing so
+   *     would brick a rotated fortress), so we return "invalid" and let the
+   *     CALLER combine it with `recordPresent`: record-ABSENT + marker-invalid is
+   *     the attack (LATCH); record-PRESENT + marker-invalid is the rotation case
+   *     (re-stamp a clean marker). This is the same combine-with-independent-
+   *     evidence move the epoch-witness uses.
    *
    * A read fault (not a clean absence) PROPAGATES so the caller can fail closed
    * rather than mis-read a transient backend error as "never established".
    */
-  async guardianRequirementEstablished(): Promise<boolean> {
+  async guardianRequirementEstablished(): Promise<
+    { status: "absent" } | { status: "established" } | { status: "invalid" }
+  > {
     const raw = await this.storage.read(
       "_meta",
       FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
     );
-    if (raw === null) return false;
+    if (raw === null) return { status: "absent" };
+    let parsed: { mac?: unknown };
     try {
-      const parsed = JSON.parse(bytesToString(raw)) as { mac?: unknown };
-      return (
-        typeof parsed.mac === "string" &&
-        parsed.mac === this.guardianRequirementEstablishedMac()
+      parsed = JSON.parse(bytesToString(raw)) as { mac?: unknown };
+    } catch {
+      // Present-but-unparseable = tamper (a legit marker is always well-formed
+      // JSON). NOT read as absent: the caller latches when the record is gone.
+      return { status: "invalid" };
+    }
+    if (typeof parsed.mac !== "string") return { status: "invalid" };
+    if (parsed.mac === this.guardianRequirementEstablishedMac()) {
+      return { status: "established" };
+    }
+    // Present, well-formed, but the MAC mismatches under the CURRENT master:
+    // tamper OR a stale marker from a prior master (legit rotation). We cannot
+    // hard-latch on mismatch alone (that would brick a rotated fortress), so we
+    // return "invalid" and let the caller key the fail-closed decision on
+    // recordPresent (see the hydrate rule in dashboard.ts).
+    return { status: "invalid" };
+  }
+
+  /** The MAC bytes over the anti-rollback anchor `data`, base64url. */
+  private guardianAntiRollbackAnchorMac(
+    data: GuardianAntiRollbackAnchorData,
+  ): string {
+    return toBase64url(
+      hmacSha256(
+        this.encryptionKey,
+        stringToBytes(
+          FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN + canonicalJson(data),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * F1 re-gate (§1): read + authenticate the external anti-rollback anchor,
+   * tri-state, mirroring `readEpochWitness`. "invalid" (present-but-tampered)
+   * makes the caller LATCH fail-closed; "absent" is neutral (pre-fix / first
+   * boot). A read FAULT (storage throws) is treated as "invalid" (fail toward
+   * latch), never as "absent": an anchor we cannot read is one we cannot trust.
+   */
+  async readGuardianAntiRollbackAnchor(): Promise<GuardianAntiRollbackAnchorRead> {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        "_meta",
+        FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
       );
     } catch {
-      // A present-but-unparseable marker is treated as not-established (it
-      // cannot be attributed to the current master). It never falsely brings a
-      // guard back; the enable path re-writes a clean marker on the next enable.
-      return false;
+      // Unreadable storage is an anchor we cannot trust -> suspected, not absent.
+      return { status: "invalid" };
     }
+    if (raw === null) return { status: "absent" };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed as Record<string, unknown>)[
+        FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER
+      ] !== true
+    ) {
+      return { status: "invalid" };
+    }
+    const obj = parsed as Record<string, unknown>;
+    const data = obj.data as Partial<GuardianAntiRollbackAnchorData> | undefined;
+    const mac = obj.mac;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      !isNonNegSafeInt(data.lowered_high_water) ||
+      !isNonNegSafeInt(data.disable_nonce) ||
+      !isNonNegSafeInt(data.requirement_generation) ||
+      typeof data.updated_at !== "string" ||
+      typeof mac !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    const fullData: GuardianAntiRollbackAnchorData = {
+      lowered_high_water: data.lowered_high_water,
+      disable_nonce: data.disable_nonce,
+      requirement_generation: data.requirement_generation,
+      updated_at: data.updated_at,
+    };
+    let provided: Uint8Array;
+    try {
+      provided = fromBase64url(mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        provided,
+        fromBase64url(this.guardianAntiRollbackAnchorMac(fullData)),
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return { status: "valid", data: fullData };
+  }
+
+  /**
+   * F1 re-gate (§1): persist (or RAISE) the anti-rollback anchor. The anchor is
+   * MONOTONIC: it NEVER regresses. Each field is folded `Math.max` over the
+   * currently-authenticated anchor, so a caller passing floors LOWER than what is
+   * already anchored leaves the higher values in place (a lower write can never
+   * launder a rollback). Mirrors `writeEpochWitness`'s non-decreasing guard. An
+   * "invalid" current anchor is treated as absent for the raise (we re-establish
+   * a clean anchor at the supplied floors); the hydrate-side latch is what
+   * catches a tampered anchor, not this writer.
+   */
+  async writeGuardianAntiRollbackAnchor(floors: {
+    loweredHighWater: number;
+    disableNonce: number;
+    requirementGeneration: number;
+    now?: () => Date;
+  }): Promise<void> {
+    const current = await this.readGuardianAntiRollbackAnchor();
+    const prior =
+      current.status === "valid"
+        ? current.data
+        : { lowered_high_water: 0, disable_nonce: 0, requirement_generation: 0 };
+    const data: GuardianAntiRollbackAnchorData = {
+      lowered_high_water: Math.max(prior.lowered_high_water, floors.loweredHighWater),
+      disable_nonce: Math.max(prior.disable_nonce, floors.disableNonce),
+      requirement_generation: Math.max(
+        prior.requirement_generation,
+        floors.requirementGeneration,
+      ),
+      updated_at: (floors.now ?? (() => new Date()))().toISOString(),
+    };
+    const record = {
+      [FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER]: true,
+      data,
+      mac: this.guardianAntiRollbackAnchorMac(data),
+    };
+    await this.storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(record)),
+    );
   }
 
   /**
@@ -545,6 +757,22 @@ export class FederationSyncStateStore {
         // committed state with a stale subset.
         const onDisk = await this.load();
         const merged = mergeSyncStateMonotonic(onDisk, snapshot);
+        // F1 re-gate (§1 / §3A write-ordering): ADVANCE the external anti-rollback
+        // anchor to the merged floors BEFORE writing the blob, inside this same
+        // cross-process lock. The anchor is non-decreasing (never lowers), so this
+        // is idempotent and safe under the lock. Ordering matters: the only
+        // interrupted-crash state (anchor advanced, blob not yet written) is the
+        // SAFE direction, a higher anchor over a lower blob, which the hydrate
+        // reconcile LATCHES fail-closed (the operator's next persist re-writes the
+        // blob at the anchor floor and clears the latch). The dangerous direction
+        // (blob advanced past the anchor) is impossible because the anchor is
+        // written first and never lowered. Mirrors the epoch-witness "witness leads
+        // the protected record" ordering.
+        await this.writeGuardianAntiRollbackAnchor({
+          loweredHighWater: merged.guardianLoweredHighWater,
+          disableNonce: merged.guardianDisableNonce,
+          requirementGeneration: merged.guardianRevocationRequirementGeneration,
+        });
         const persisted: PersistedSyncState = {
           v: 1,
           accepted_high_water: [...merged.acceptedHighWater],
@@ -1132,6 +1360,11 @@ function decodeNonNegativeInt(value: unknown, label: string): number {
     throw new FederationSyncStateStoreError(`${label} is invalid`);
   }
   return value;
+}
+
+/** Non-throwing non-negative-safe-integer check for the anchor tri-state read. */
+function isNonNegSafeInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function publicErrorReason(err: unknown): string {

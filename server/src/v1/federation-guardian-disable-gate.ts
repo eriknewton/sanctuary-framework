@@ -749,6 +749,16 @@ export interface GuardianRequirementState {
   syncStateUnavailable: boolean;
   /** The nonce a NEW authorization must target (current disable nonce + 1). */
   nextDisableNonce: number;
+  /**
+   * Finding #5: the dedicated superseded-lowering high-water. Every non-null
+   * install that carries a lowered-threshold record must refuse a record whose
+   * `disable_nonce` is at-or-below this floor (a replayed, already-dropped
+   * lowering), enforcing at RUNTIME the exact `disable_nonce <= loweredHighWater`
+   * rule the boot rehydrate already enforces. Closes the runtime/boot asymmetry
+   * where a stale-but-signature-valid lowered record could be installed at
+   * runtime and only fail on the next reboot.
+   */
+  guardianLoweredHighWater: number;
 }
 
 /** Every distinct way the guardian requirement / latch may transition. */
@@ -840,6 +850,18 @@ export function authorizeGuardianRequirementTransition(
     // disable-only (lower is refused at initiate - OR-1), so it installs null
     // and, being NON-master, leaves the latch as-is (the caller only completes
     // when the latch is clear anyway; belt-and-suspenders here).
+    //
+    // Finding #4: completion DROPS any present lowered record (it disables the
+    // whole requirement), so it MUST advance the dedicated lowered high-water
+    // past that record's nonce, exactly like the raise/re-pin and decrease
+    // supersede paths do. The pre-fix branch returned supersedesLoweredNonce:
+    // null, so an attacker could lower to M', arm+complete break-glass, re-enable
+    // a guard, then inject the old still-signed lowered-M' record and have it
+    // accepted on reboot (its nonce was never folded into the high-water). Read
+    // the dropped lowered nonce directly from the live state (the completion
+    // branch runs BEFORE next/live are derived below).
+    const supersededLoweredNonce =
+      state.requirement?.loweredThreshold?.body.disable_nonce ?? null;
     return {
       ok: true,
       effect: {
@@ -848,7 +870,7 @@ export function authorizeGuardianRequirementTransition(
         masterAuthorizedNull: false,
         authMethod: "break_glass",
         burnedNonce: null,
-        supersedesLoweredNonce: null,
+        supersedesLoweredNonce: supersededLoweredNonce,
         classification: "decrease",
       },
     };
@@ -1178,6 +1200,22 @@ function requireLoweredThresholdForNext(
       ok: false,
       reason: "lowered_threshold_invalid",
       detail: decision.reason,
+    };
+  }
+  // Finding #5: even a SIGNATURE-VALID lowered record must be refused at RUNTIME
+  // when its nonce is at-or-below the superseded-lowering high-water (a replayed,
+  // already-dropped lowering). The boot rehydrate already enforces this; without
+  // it here, a stale lowered record whose signature still verifies could be
+  // installed via a runtime re-pin and only fail on the NEXT reboot (or not at
+  // all, if the floor were meanwhile rolled back per finding #1). `<=` matches
+  // the rehydrate semantics (the high-water is the EXACT nonce of a dropped
+  // record), so every runtime path now enforces the identical floor as boot.
+  if (lowered.body.disable_nonce <= state.guardianLoweredHighWater) {
+    return {
+      ok: false,
+      reason: "lowered_threshold_invalid",
+      detail:
+        "lowered-threshold disable_nonce is at or below the superseded-lowering high-water (a replayed, already-dropped lowering)",
     };
   }
   return { ok: true };

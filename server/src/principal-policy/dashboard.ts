@@ -38,7 +38,7 @@ import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog } from "../operational/audit-log.js";
+import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
@@ -433,6 +433,28 @@ interface FederationDashboardState {
   operatorPolicy: FederationAppliedPolicyVersion | null;
   appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
   nodes: Map<string, FederationNodeView>;
+}
+
+/**
+ * §8: the exact set of critical audit operations emitted by every committed
+ * guardian-requirement transition (see `commitGuardianRequirementTransition`,
+ * `initiateFederationGuardianBreakGlass`, and the break-glass terminal helper).
+ * The audit-witnessed floor scans ONLY these so a forged non-guardian entry
+ * cannot poison the floor, and each carries `details.generation` (the monotonic
+ * primary witness) and, on the transitions that burn a nonce, `details.
+ * disable_nonce` / `details.nonce`.
+ */
+const GUARDIAN_AUDIT_OPERATIONS: ReadonlySet<string> = new Set([
+  "federation_guardian_revocation_requirement_set",
+  "federation_guardian_revocation_requirement_disabled",
+  "federation_guardian_disable_master_authorized",
+  "federation_guardian_disable_quorum_authorized",
+  "federation_guardian_break_glass_initiated",
+  "federation_guardian_break_glass_completed",
+]);
+
+function isGuardianAuditOperation(operation: string): boolean {
+  return GUARDIAN_AUDIT_OPERATIONS.has(operation);
 }
 
 function newerAppliedPolicy(
@@ -2147,6 +2169,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       fortressId: this._federationContext?.fortressId ?? null,
       syncStateUnavailable: this._federationSyncStateUnavailable,
       nextDisableNonce: this._federationGuardianDisableNonce + 1,
+      // Finding #5: thread the superseded-lowering high-water so the authorizer
+      // rejects a below-floor lowered record on EVERY runtime install, matching
+      // the boot-rehydrate floor check.
+      guardianLoweredHighWater: this._federationGuardianLoweredHighWater,
     };
 
     // 2. AUTHORIZE (pure).
@@ -2258,16 +2284,24 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             : {}),
         },
       });
-      await this.persistFederationSyncState();
-      // FIX 2 (P0): once a non-null requirement is DURABLY committed, record the
-      // tamper-evident "ever-established" sentinel so a later deletion of the
-      // sync-state record is caught on boot (see hydrateFederationSyncState).
-      // Written AFTER the record persist so the marker only ever exists for a
-      // guard that durably committed; a throw here rolls the transition back
-      // like any other commit failure (the marker is part of "committed").
+      // Finding #2 (P0) write-ordering: write the tamper-evident "ever-
+      // established" sentinel BEFORE the record persist on any transition that
+      // installs OR retains a non-null requirement. The pre-fix order (record
+      // first, sentinel second) left a crash window in the DANGEROUS state:
+      // record-present + sentinel-absent, where a later single-file delete of the
+      // record boots UN-latched (the sentinel that would have caught it was never
+      // written), restoring single-operator kill. With the sentinel first, the
+      // only interrupted state is sentinel-present + record-absent, which the
+      // hydrate path already latches fail-closed. The sentinel is grow-only and
+      // idempotent (fixed bytes), so writing it before a persist that later throws
+      // is safe: the transition rolls back its live fields in the catch below, and
+      // a stale sentinel with no record simply latches until the operator re-pins.
+      // Kept inside the same try/rollback so a sentinel-write throw still rolls
+      // back the transition.
       if (effect.requirement !== null) {
         await this._federationSyncStateStore?.markGuardianRequirementEstablished();
       }
+      await this.persistFederationSyncState();
     } catch (err) {
       this._federationGuardianRevocationRequirement = priorRequirement;
       this._federationGuardianRevocationRequirementInvalid = priorInvalid;
@@ -2822,15 +2856,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // was EVER configured (per the MAC'd `_meta` marker) but the sync-state
     // record is now absent, the record was deleted - fail closed regardless of
     // root-revocation history. A read fault on the sentinel also fails closed.
+    // Finding #6 (tamper-evident sentinel, tri-state): read the sentinel once and
+    // branch on absent/established/invalid. A read fault fails closed.
+    let established: { status: "absent" } | { status: "established" } | { status: "invalid" };
+    try {
+      established = await store.guardianRequirementEstablished();
+    } catch {
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
     if (!recordPresent) {
-      let everEstablished: boolean;
-      try {
-        everEstablished = await store.guardianRequirementEstablished();
-      } catch {
-        this._federationSyncStateUnavailable = true;
-        return;
-      }
-      if (everEstablished) {
+      // Record ABSENT. Both "established" (FIX 2, the deletion signal) AND
+      // "invalid" (Finding #6, a corrupted sentinel that used to read as absent
+      // and boot fresh) now LATCH: with the record gone there is nothing to
+      // legitimize a marker we cannot attribute to the current master, so a
+      // corrupt-marker + absent-record is the attack, not a rotation. Only a
+      // genuinely absent marker falls through (a fresh fortress, or a guard
+      // configured before this fix which the record-present backfill below would
+      // have protected on a prior boot).
+      if (established.status === "established" || established.status === "invalid") {
         this._federationSyncStateUnavailable = true;
         return;
       }
@@ -2841,6 +2885,41 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     } catch {
       // Present-but-corrupt -> fail closed. Do NOT touch the live fields (no
       // half-applied state); latch unavailability so every sync path denies.
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    // Finding #3 (pre-upgrade backfill) + Finding #6 (record-present re-stamp).
+    // We are on the RECORD-PRESENT path (load succeeded). Two record-present
+    // cases need a sentinel WRITE, both idempotent and grow-only:
+    //   - the durable record configures a guard (guardianRevocationRequirement
+    //     !== null) but the sentinel is ABSENT: a guard was configured before
+    //     this fix shipped (or a crash landed the record without the sentinel per
+    //     finding #2). Backfill it now so a subsequent record-delete is caught
+    //     from the NEXT boot onward.
+    //   - the sentinel is INVALID under the current master while the record IS
+    //     present: this is the legitimate post-rotation stale-marker case (the
+    //     record proves the guard is real and current-master-decryptable), so
+    //     re-stamp a clean marker rather than brick.
+    // A write fault fails closed. (Backfill closes the window from the next boot
+    // on; it does NOT retroactively protect a record deleted before the fortress
+    // ever boots under the fixed binary. That residual is irreducible without an
+    // off-host witness, identical to the epoch-witness delete-both residual.)
+    if (
+      (snapshot.guardianRevocationRequirement !== null &&
+        established.status === "absent") ||
+      established.status === "invalid"
+    ) {
+      try {
+        await store.markGuardianRequirementEstablished();
+      } catch {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+    }
+    // Finding #1 + §8: reconcile the security-load-bearing floors against the
+    // external anti-rollback anchor AND the guardian audit-trail floor, and LATCH
+    // fail-closed on ANY regression, BEFORE adopting the snapshot's floors.
+    if (await this.reconcileGuardianAntiRollbackFloors(store, snapshot)) {
       this._federationSyncStateUnavailable = true;
       return;
     }
@@ -2950,6 +3029,168 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationRevokedRoots.size > 0 ||
       this._federationHighestRevocationSerial > 0
     );
+  }
+
+  /**
+   * F1 re-gate (§1 + §8): reconcile the security-load-bearing guardian sync-state
+   * floors against BOTH the external `_meta` anti-rollback anchor (§1) AND the
+   * guardian AUDIT-trail floor (§8). Returns `true` when a rollback is
+   * positively detected and the caller MUST LATCH fail-closed; `false` when the
+   * floors are consistent (no regression).
+   *
+   * The threat (§1): every guardian floor (`guardianLoweredHighWater`,
+   * `guardianDisableNonce`, the requirement generation) is a `Math.max` floor
+   * that lives INSIDE the same rollbackable `_federation/sync-state-v1` blob as
+   * the record it gates. A KEYLESS filesystem attacker captures an OLD copy of
+   * that blob and, after the operator raises the threshold back up, restores it,
+   * regressing the floor to the old blob's value.
+   *
+   *   - The external anchor (§1) catches the SINGLE-record restore (blob alone):
+   *     the anchor lives in a SEPARATE `_meta` location the blob restore does not
+   *     touch, so `blob.floor < anchor.floor` is a positively-detected rollback.
+   *   - The audit-trail floor (§8) catches the TWO-record restore (blob + anchor
+   *     BOTH rolled back): the finding-#1 attack requires a guardian transition
+   *     (the raise) between capture and restore, which increments the requirement
+   *     GENERATION and is critically audited BEFORE persist. The audit trail
+   *     durably remembers the highest generation reached, in a location the
+   *     two-record anchor+blob restore does NOT touch, so `blob.generation <
+   *     auditFloor.generation` is a positively-detected rollback.
+   *
+   * FAIL DIRECTION: an "invalid" (present-but-tampered) anchor latches; an
+   * unreadable/failed-integrity audit read fails TOWARD latch (never toward a
+   * spuriously-low floor). A forged HIGH audit entry only causes an over-latch
+   * (fail-closed = safe); LOWERING the audit floor requires DELETING higher
+   * guardian entries, which is audit truncation, caught separately by the audit
+   * head-anchor machinery.
+   *
+   * NO federation->core master coupling: the store retains only
+   * `derivePurposeKey(master, "federation-sync-state")`, never the raw master; the
+   * anchor MACs under that purpose key, and the audit floor is a read-only
+   * composition over the integrity-judged audit log the dashboard already holds.
+   */
+  private async reconcileGuardianAntiRollbackFloors(
+    store: FederationSyncStateStore,
+    snapshot: FederationSyncStateSnapshot,
+  ): Promise<boolean> {
+    // Read the external anchor (tri-state). A present-but-tampered anchor is a
+    // positively-detected tamper: latch. Absent is neutral (pre-fix / first
+    // boot). A read fault is surfaced as "invalid" by the store (fail toward
+    // latch).
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    if (anchor.status === "invalid") return true;
+    const anchorFloor =
+      anchor.status === "valid"
+        ? {
+            loweredHighWater: anchor.data.lowered_high_water,
+            disableNonce: anchor.data.disable_nonce,
+            generation: anchor.data.requirement_generation,
+          }
+        : { loweredHighWater: 0, disableNonce: 0, generation: 0 };
+
+    // §8: derive the audit-witnessed floor. Unreadable / failed-integrity ->
+    // fail TOWARD latch (returns null -> latch).
+    const auditFloor = await this.deriveGuardianFloorFromAudit();
+    if (auditFloor === null) return true;
+
+    // Regression detection: the on-disk blob floors must be >= both witnesses.
+    // The blob floor for the generation is the persisted generation; for the
+    // nonce/lowered-high-water it is the persisted snapshot fields.
+    const blobLoweredHighWater = snapshot.guardianLoweredHighWater;
+    const blobDisableNonce = snapshot.guardianDisableNonce;
+    const blobGeneration = snapshot.guardianRevocationRequirementGeneration;
+
+    if (
+      // §1 anchor regressions.
+      blobLoweredHighWater < anchorFloor.loweredHighWater ||
+      blobDisableNonce < anchorFloor.disableNonce ||
+      blobGeneration < anchorFloor.generation ||
+      // §8 audit-floor regressions (generation is the robust primary witness;
+      // the other two are best-effort reinforcement, 0 when not recoverable).
+      blobGeneration < auditFloor.generation ||
+      blobLoweredHighWater < auditFloor.loweredHighWater ||
+      blobDisableNonce < auditFloor.disableNonce
+    ) {
+      return true; // positively-detected rollback -> latch fail-closed
+    }
+    return false;
+  }
+
+  /**
+   * §8: derive the audit-witnessed guardian floor from the INTEGRITY-VERIFIED
+   * guardian audit entries. Returns `null` when the audit read is unreadable or
+   * fails integrity verification (the caller fails TOWARD latch), and a neutral
+   * `{0,0,0}` floor when there is no guardian audit history at all (no first-boot
+   * false positive; mirrors the epoch-witness "absent -> neutral").
+   *
+   * Primary witness = the requirement GENERATION recorded on every committed
+   * guardian transition (`details.generation`); it is monotonic and always
+   * audited, so the highest-generation guardian entry is the most recent one.
+   * disable_nonce / the dropped-lowering nonce are best-effort reinforcement when
+   * recoverable from an entry's `details`.
+   *
+   * We use `AuditLog.query` (the agent-facing read that re-verifies the chain on
+   * every call and returns `integrity_findings`), filtered to the l2 guardian
+   * operations. A non-empty `integrity_findings` (or a throw) means the audit
+   * trail cannot be trusted -> fail toward latch. Because the generation is
+   * monotonic, a BOUNDED recent tail suffices: audit truncation of the higher
+   * entries fails toward latch via the head-anchor integrity finding, so a
+   * bounded read never under-reports without ALSO surfacing a finding.
+   */
+  private async deriveGuardianFloorFromAudit(): Promise<
+    | { generation: number; disableNonce: number; loweredHighWater: number }
+    | null
+  > {
+    const auditLog = this.auditLog;
+    if (auditLog === null) {
+      // No audit log wired (minimal in-memory rig): no audit witness to compose.
+      // Neutral floor, exactly like "no guardian audit history".
+      return { generation: 0, disableNonce: 0, loweredHighWater: 0 };
+    }
+    let entries: AuditEntry[];
+    let integrityFindings: unknown[];
+    try {
+      // Bounded l2 read: the guardian operations are all l2. `query` re-verifies
+      // the on-disk chain and returns integrity_findings; a bounded recent slice
+      // is sufficient because the generation is monotonic and truncation of the
+      // higher entries surfaces a finding (which we fail toward latch on).
+      const result = await auditLog.query({ layer: "l2", limit: 1000 });
+      entries = result.entries;
+      integrityFindings = result.integrity_findings;
+    } catch {
+      // Unreadable / integrity throw -> fail toward latch.
+      return null;
+    }
+    if (integrityFindings.length > 0) {
+      // The audit trail failed integrity verification -> fail toward latch (never
+      // toward a spuriously-low floor).
+      return null;
+    }
+    let generation = 0;
+    let disableNonce = 0;
+    // loweredHighWater is not directly recorded per guardian audit entry today,
+    // so it stays 0 (best-effort reinforcement per §8.2). The GENERATION floor
+    // alone catches the two-record restore, which is the load-bearing guarantee;
+    // when there are no guardian entries at all the whole floor is neutral {0,0,0}
+    // (no first-boot false positive).
+    const loweredHighWater = 0;
+    for (const entry of entries) {
+      if (!isGuardianAuditOperation(entry.operation)) continue;
+      const details = entry.details;
+      if (details === undefined) continue;
+      const gen = details.generation;
+      if (typeof gen === "number" && Number.isSafeInteger(gen) && gen > generation) {
+        generation = gen;
+      }
+      // Best-effort reinforcement: disable_nonce (on transition entries) and
+      // nonce (on break-glass-initiated entries) both burn the disable nonce.
+      for (const field of ["disable_nonce", "nonce"] as const) {
+        const v = details[field];
+        if (typeof v === "number" && Number.isSafeInteger(v) && v > disableNonce) {
+          disableNonce = v;
+        }
+      }
+    }
+    return { generation, disableNonce, loweredHighWater };
   }
 
   /**

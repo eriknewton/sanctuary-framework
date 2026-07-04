@@ -1275,6 +1275,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       reason:
         "sentinel background watcher: windowed read on its own cadence; internal scoring.",
     },
+    {
+      module: "principal-policy/dashboard.ts",
+      fn: "deriveGuardianFloorFromAudit",
+      kind: "operator-background",
+      reason:
+        "F1 anti-rollback (§8): a bounded l2 guardian-audit read run ONCE on boot (hydrateFederationSyncState) to derive the audit-witnessed anti-rollback floor. It MUST re-verify the on-disk chain per call and fail TOWARD latch on any integrity finding, so it deliberately uses query (not the throttled eager view); not the SSE board hot path.",
+    },
     // ── operator-per-request: deliberately per-request operator reads ───────
     {
       module: "principal-policy/dashboard.ts",

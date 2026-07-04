@@ -459,7 +459,9 @@ type MetaKeyClass =
   | "transparency-anchor-config" // master-MAC'd record → restamp
   | "transparency-counter-floor" // master-MAC'd record → restamp
   | "epoch-witness" // anti-rollback witness → finalize re-stamps (advanced)
-  | "rollback-freeze"; // anti-rollback freeze marker → restamp under new master
+  | "rollback-freeze" // anti-rollback freeze marker → restamp under new master
+  | "federation-guardian-antirollback" // {marker,data,mac} anchor → restamp
+  | "federation-guardian-established"; // dataless MAC sentinel → inline re-derive
 
 // Duplicated marker/MAC constants (see the recipe-table drift note above —
 // the verify-before-write rule makes drift refuse, never corrupt).
@@ -489,6 +491,32 @@ const ROLLBACK_FREEZE_MARKER = "__sanctuary_custody_rollback_freeze_v1";
 const ROLLBACK_FREEZE_MAC_PURPOSE = "custody-rollback-freeze-mac";
 const ROLLBACK_FREEZE_MAC_DOMAIN = "sanctuary.custody-rollback-freeze.v1\n";
 
+// Finding #7 (duplicated from v1/federation-sync-state-store.ts; the
+// verify-before-write rule makes drift refuse, never corrupt). BOTH guardian
+// `_meta` keys MAC under the STORE purpose key ("federation-sync-state"), not a
+// bespoke *-mac purpose, so no new HKDF label is minted (§7 reuse). Two shapes:
+//  - the anti-rollback ANCHOR is a {marker,data,mac} record whose MAC is over
+//    canonicalJson(data), so it FITS restampMacRecord (via macPurpose =
+//    FEDERATION_SYNC_STATE_STORE_HKDF_INFO).
+//  - the established SENTINEL is a DATALESS {v,mac} record whose MAC is over a
+//    FIXED domain string (not `data`), so it does NOT fit restampMacRecord and
+//    is re-derived inline in convertMeta.
+// The established-sentinel classification ALSO fixes a PRE-EXISTING latent break
+// independent of this fix: before this, a fortress that ever enabled a guardian
+// requirement wrote that `_meta` key and then could NOT rotate its custody
+// master (convertMeta hit default -> null -> throw).
+const FEDERATION_SYNC_STATE_STORE_HKDF_INFO = "federation-sync-state";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_META_KEY =
+  "federation-guardian-antirollback-anchor-v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER =
+  "__sanctuary_federation_guardian_antirollback_anchor_v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN =
+  "sanctuary.federation.guardian-antirollback-anchor.v1\n";
+const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_META_KEY =
+  "federation-guardian-requirement-established-v1";
+const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
+  "sanctuary.federation.guardian-requirement.established.v1";
+
 function classifyMetaKey(key: string): MetaKeyClass | null {
   switch (key) {
     case "key-params":
@@ -515,6 +543,10 @@ function classifyMetaKey(key: string): MetaKeyClass | null {
       return "epoch-witness";
     case ROLLBACK_FREEZE_META_KEY:
       return "rollback-freeze";
+    case FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_META_KEY:
+      return "federation-guardian-antirollback";
+    case FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_META_KEY:
+      return "federation-guardian-established";
     default:
       return null; // Unknown → preflight aborts (fail closed).
   }
@@ -577,6 +609,63 @@ function restampMacRecord(args: {
       mac: toBase64url(macFor(args.newMaster)),
     })
   );
+}
+
+/**
+ * Finding #7 (4b): re-derive the DATALESS federation-guardian established
+ * sentinel under the new master. Unlike restampMacRecord, this record's MAC is
+ * over a FIXED domain string (not `data`), so we recompute it directly. The
+ * record shape is `{ v: 1, mac }` where
+ * `mac = HMAC(derivePurposeKey(master, "federation-sync-state"), DOMAIN)`.
+ *
+ * Verify-before-write (mirror restampMacRecord's dual-master check): a marker
+ * that already authenticates under the NEW master is "already-new"; one that
+ * authenticates under the OLD master is re-stamped; one that authenticates under
+ * NEITHER is tampered -> abort (never restamp a forged marker). A structurally
+ * malformed record aborts.
+ */
+function restampFederationGuardianEstablishedSentinel(args: {
+  raw: Uint8Array;
+  where: string;
+  oldMaster: Uint8Array;
+  newMaster: Uint8Array;
+}): Uint8Array | "already-new" {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(args.raw));
+  } catch {
+    throw new RotationPreflightError(`${args.where} is not valid JSON`);
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (!obj || typeof obj !== "object" || typeof obj.mac !== "string") {
+    throw new RotationPreflightError(`${args.where} is malformed`);
+  }
+  const macFor = (master: Uint8Array): string => {
+    const macKey = derivePurposeKey(master, FEDERATION_SYNC_STATE_STORE_HKDF_INFO);
+    const out = hmacSha256(
+      macKey,
+      stringToBytes(FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN)
+    );
+    macKey.fill(0);
+    return toBase64url(out);
+  };
+  const newMac = macFor(args.newMaster);
+  let provided: Uint8Array;
+  let newMacBytes: Uint8Array;
+  try {
+    provided = fromBase64url(obj.mac);
+    newMacBytes = fromBase64url(newMac);
+  } catch {
+    throw new RotationPreflightError(`${args.where} MAC is malformed`);
+  }
+  if (constantTimeEqual(provided, newMacBytes)) return "already-new";
+  if (!constantTimeEqual(provided, fromBase64url(macFor(args.oldMaster)))) {
+    throw new RotationPreflightError(
+      `${args.where} failed authentication under both the old and the new ` +
+        "master (tampered); rotation must not restamp it"
+    );
+  }
+  return stringToBytes(JSON.stringify({ v: 1, mac: newMac }));
 }
 
 // ── AAD candidates ──────────────────────────────────────────────────
@@ -1001,6 +1090,19 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
         newMasterKey: ctx.newMaster,
       });
       next = result === null ? "leave" : result;
+    } else if (cls === "federation-guardian-established") {
+      // Finding #7 (4b): the established sentinel is a DATALESS {v,mac} record
+      // whose MAC is over a FIXED domain string (not `data`), so restampMacRecord
+      // (which re-MACs canonicalJson(data)) does NOT fit it. Re-derive inline:
+      // verify under the old master first (refuse a tampered marker), then
+      // recompute the MAC under the new master's purpose key over the same fixed
+      // domain and rewrite {v:1, mac}.
+      next = restampFederationGuardianEstablishedSentinel({
+        raw,
+        where: `_meta/${key}`,
+        oldMaster: ctx.oldMaster,
+        newMaster: ctx.newMaster,
+      });
     } else {
       const restampParams =
         cls === "transparency-anchor-config"
@@ -1015,11 +1117,22 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
                 macPurpose: ROLLBACK_FREEZE_MAC_PURPOSE,
                 macDomain: ROLLBACK_FREEZE_MAC_DOMAIN,
               }
-            : {
-                marker: TRANSPARENCY_FLOOR_MARKER,
-                macPurpose: TRANSPARENCY_FLOOR_MAC_PURPOSE,
-                macDomain: TRANSPARENCY_FLOOR_MAC_DOMAIN,
-              };
+            : cls === "federation-guardian-antirollback"
+              ? {
+                  // Finding #7 (4a): the anchor is a {marker,data,mac} record with
+                  // the MAC over canonicalJson(data), so it fits restampMacRecord
+                  // exactly. macPurpose is the STORE purpose key label (no new
+                  // HKDF label; §7 reuse), so restampMacRecord re-derives the
+                  // identical key the store used.
+                  marker: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER,
+                  macPurpose: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+                  macDomain: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN,
+                }
+              : {
+                  marker: TRANSPARENCY_FLOOR_MARKER,
+                  macPurpose: TRANSPARENCY_FLOOR_MAC_PURPOSE,
+                  macDomain: TRANSPARENCY_FLOOR_MAC_DOMAIN,
+                };
       next = restampMacRecord({
         raw,
         where: `_meta/${key}`,
