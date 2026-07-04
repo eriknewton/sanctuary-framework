@@ -85,6 +85,13 @@ export const LEDGER_REVOCATION_DOMAIN = "sanctuary.fleet.ledger.revocation.v1";
  * whole-ledger substitution to a shorter/rewritten chain is detected: the
  * recomputed head no longer matches the signed one. Distinct domain so a head
  * signature can never be replayed as a token or revocation signature.
+ *
+ * The head message is VERSIONED: a legacy ledger (from #868, before the signed
+ * `generation`) signs `(rowCount, finalRowHash)` (v1); a ledger that carries a
+ * `generation` signs `(rowCount, finalRowHash, generation)` (v2). The DOMAIN
+ * label itself is FROZEN (the version is carried by which fields the canonical
+ * body contains, not by a new label), so an already-signed v1 head keeps
+ * verifying (additive back-compat, never a false-brick).
  */
 export const LEDGER_HEAD_DOMAIN = "sanctuary.fleet.ledger.head.v1";
 
@@ -150,6 +157,25 @@ export interface Ledger {
    * is detected.
    */
   headSignature?: string;
+  /**
+   * Monotonic mutation counter, bumped by +1 on EVERY mutation (append/revoke)
+   * and bound into the signed head ({@link headMessage} v2). It is the
+   * anti-rollback FRESHNESS coordinate: paired with the external master-MAC'd
+   * generation anchor (see `entitlement/ledger-antirollback.ts`), a verifier
+   * requires `(ledger.generation ?? 0) >= anchor.generation`, so an OLDER
+   * genuine snapshot (lower generation) or an empty ledger (generation 0)
+   * substituted while the anchor is higher is detected as a rollback even though
+   * the old snapshot's own head/chain signatures still verify.
+   *
+   * ADDITIVE back-compat (MANDATORY, no false-brick): a legacy ledger from #868
+   * has NO `generation` (undefined). {@link verifyLedgerIntegrity} then verifies
+   * the head under the v1 message `(rowCount, finalRowHash)` and treats the
+   * generation as 0. Any ledger the current code MUTATES carries a numeric
+   * `generation` and verifies under the v2 message. Because it is bound into the
+   * issuer-signed head, an attacker cannot forge a higher generation without the
+   * issuer key.
+   */
+  generation?: number;
 }
 
 /** A fresh empty ledger. */
@@ -198,15 +224,34 @@ function computeRowHash(input: {
 
 /**
  * The canonical byte string the issuer signs for the ledger HEAD ANCHOR. Domain
- * separated + canonical-JSON of exactly `(rowCount, finalRowHash)`. `finalRowHash`
- * is the last row's `rowHash`, or {@link LEDGER_GENESIS} for a zero-row head.
- * Because the row count is signed, dropping/adding rows (truncation, splicing a
- * shorter chain) changes this message and the stored `headSignature` no longer
- * verifies. Because the final row hash chains back to genesis, rewriting any row
- * also changes it.
+ * separated + canonical-JSON. VERSIONED by which fields the body contains:
+ *
+ *  - v1 (legacy, `generation === undefined`): `(rowCount, finalRowHash)`. This
+ *    is exactly the #868 head; a legacy ledger with no `generation` keeps
+ *    verifying under it (additive back-compat, never a false-brick).
+ *  - v2 (`generation` is a number): `(rowCount, finalRowHash, generation)`. The
+ *    signed generation binds the freshness coordinate into the issuer signature,
+ *    so an attacker cannot forge a higher generation without the issuer key.
+ *
+ * `finalRowHash` is the last row's `rowHash`, or {@link LEDGER_GENESIS} for a
+ * zero-row head. Because the row count is signed, dropping/adding rows changes
+ * this message and the stored `headSignature` no longer verifies; because the
+ * final row hash chains back to genesis, rewriting any row also changes it.
+ *
+ * The DOMAIN label is FROZEN across versions (v1 heads must keep verifying); the
+ * version is expressed purely by the presence/absence of the `generation` field
+ * in the canonical body, so v1 and v2 messages are byte-distinct and a v1
+ * signature can never be replayed as a v2 head or vice versa.
  */
-function headMessage(rowCount: number, finalRowHash: string): Uint8Array {
-  const body = canonicalJson({ rowCount, finalRowHash });
+function headMessage(
+  rowCount: number,
+  finalRowHash: string,
+  generation?: number,
+): Uint8Array {
+  const body =
+    generation === undefined
+      ? canonicalJson({ rowCount, finalRowHash })
+      : canonicalJson({ rowCount, finalRowHash, generation });
   return new TextEncoder().encode(`${LEDGER_HEAD_DOMAIN}\n${body}`);
 }
 
@@ -216,21 +261,36 @@ function finalRowHash(rows: readonly LedgerRow[]): string {
 }
 
 /**
- * Re-sign the ledger HEAD ANCHOR over the current `(rowCount, finalRowHash)` and
- * return a NEW ledger carrying the fresh `headSignature` and the pinned
+ * Re-sign the ledger HEAD ANCHOR over the current
+ * `(rowCount, finalRowHash, generation)` and return a NEW ledger carrying the
+ * fresh `headSignature`, the bumped `generation`, and the pinned
  * `issuerPublicKey`. Called after every mutation (append/revoke) so the anchor
- * always matches the current chain tip + length. PURE: does not mutate `ledger`.
- * `sign` is the injected issuer signer (the pure core never holds a raw secret
- * key); `issuerPublicKey` is the matching public key stored as the anchor.
+ * always matches the current chain tip + length + freshness coordinate. PURE:
+ * does not mutate `ledger`. `sign` is the injected issuer signer (the pure core
+ * never holds a raw secret key); `issuerPublicKey` is the matching public key
+ * stored as the anchor.
+ *
+ * `nextGeneration` is the caller-computed monotonic mutation counter for the
+ * post-mutation ledger (the CLI computes it as
+ * `max(ledger.generation ?? 0, anchor.generation) + 1`, so a rolled-back on-disk
+ * ledger cannot re-issue at a stale generation that the external anchor already
+ * passed). The signed head is v2 (carries the generation), so the new ledger is
+ * no longer a legacy v1 ledger.
  */
 function signLedgerHead(
   ledger: Ledger,
   sign: IssuerSigner,
   issuerPublicKey: Uint8Array,
+  nextGeneration: number,
 ): Ledger {
-  const message = headMessage(ledger.rows.length, finalRowHash(ledger.rows));
+  const message = headMessage(
+    ledger.rows.length,
+    finalRowHash(ledger.rows),
+    nextGeneration,
+  );
   return {
     ...ledger,
+    generation: nextGeneration,
     issuerPublicKey: toBase64url(issuerPublicKey),
     headSignature: toBase64url(sign(message)),
   };
@@ -327,12 +387,19 @@ function canonicalizeForToken(flags: string[]): string[] {
  * key (stored as the ledger's self-verification anchor). Re-signing the head on
  * every append is what makes truncation of the newest row(s) detectable: the
  * signed row count no longer matches the on-disk count.
+ *
+ * `nextGeneration` is the monotonic mutation counter for the appended ledger,
+ * bound into the signed head. The caller supplies it as
+ * `max(ledger.generation ?? 0, anchor.generation) + 1` (see
+ * `entitlement/ledger-antirollback.ts`) so the freshness coordinate never
+ * regresses relative to the external anchor.
  */
 export function appendRow(
   ledger: Ledger,
   row: Omit<LedgerRow, "prevHash" | "rowHash">,
   sign: IssuerSigner,
   issuerPublicKey: Uint8Array,
+  nextGeneration: number,
 ): Ledger {
   const licenseId = row.token.claims.licenseId;
   if (typeof licenseId !== "string" || licenseId.length === 0) {
@@ -355,7 +422,7 @@ export function appendRow(
     }),
   };
   const appended: Ledger = { ...ledger, rows: [...ledger.rows, full] };
-  return signLedgerHead(appended, sign, issuerPublicKey);
+  return signLedgerHead(appended, sign, issuerPublicKey, nextGeneration);
 }
 
 /** A read-only view of a ledger row for listing (no secret material exists here). */
@@ -409,6 +476,9 @@ export function listLicenses(ledger: Ledger): LicenseListEntry[] {
  * unknown (fail-closed: the CLI maps this to a non-zero exit) or already revoked.
  *
  * `issuerPublicKey` is the matching public key stored as the ledger's anchor.
+ * `nextGeneration` is the monotonic mutation counter for the revoked ledger,
+ * bound into the signed head (caller supplies
+ * `max(ledger.generation ?? 0, anchor.generation) + 1`).
  *
  * SCOPE: local bookkeeping ONLY. The distributed signed revocation list pushed
  * to fleets is PR-3; this does not build that push rail.
@@ -420,6 +490,7 @@ export function revokeLicense(
   reason: string | null,
   sign: IssuerSigner,
   issuerPublicKey: Uint8Array,
+  nextGeneration: number,
 ): Ledger {
   const idx = ledger.rows.findIndex(
     (r) => r.token.claims.licenseId === licenseId,
@@ -460,7 +531,7 @@ export function revokeLicense(
     rows[i] = { ...r, metadata, revocationSignature, prevHash, rowHash };
     prevHash = rowHash;
   }
-  return signLedgerHead({ ...ledger, rows }, sign, issuerPublicKey);
+  return signLedgerHead({ ...ledger, rows }, sign, issuerPublicKey, nextGeneration);
 }
 
 /** The outcome of a ledger integrity check. */
@@ -488,10 +559,21 @@ export type LedgerIntegrity =
  *     `(licenseId, revoked, revokedAt)`  -  catches a revoked-bit flip on disk.
  *
  * Then, if the ledger has any rows, the signed HEAD ANCHOR is verified: the
- * issuer's `headSignature` over `(rowCount, finalRowHash)` must be present and
- * validate  -  catches truncation of trailing rows, whole-ledger substitution to
- * a shorter chain, and reorder/drop that a per-row chain alone might tolerate at
- * the tail. `issuerPublicKey` pins the single issuer this ledger was signed by.
+ * issuer's `headSignature` over the VERSIONED head must be present and validate
+ * -  catches truncation of trailing rows, whole-ledger substitution to a shorter
+ * chain, and reorder/drop that a per-row chain alone might tolerate at the tail.
+ * The head is `(rowCount, finalRowHash)` for a legacy ledger with no
+ * `generation` (v1) and `(rowCount, finalRowHash, generation)` for a ledger that
+ * carries one (v2); a legacy #868 ledger keeps verifying (additive back-compat).
+ * `issuerPublicKey` pins the single issuer this ledger was signed by.
+ *
+ * This function is the WITHIN-CHAIN integrity check; it does NOT compare the
+ * ledger's `generation` against the EXTERNAL master-MAC'd generation anchor
+ * (the freshness / anti-rollback floor). That comparison needs the master to
+ * read the anchor, which this pure core never holds, so it lives in
+ * `entitlement/ledger-antirollback.ts` (invoked by the CLI). An OLDER genuine
+ * snapshot passes THIS check (its own signatures are valid) but fails the
+ * external freshness check because its generation is below the anchor's.
  */
 export function verifyLedgerIntegrity(
   ledger: Ledger,
@@ -613,12 +695,41 @@ export function verifyLedgerIntegrity(
     expectedPrev = r.rowHash;
   }
 
+  // The signed `generation`, if present, must be a valid non-negative safe
+  // integer. A present-but-garbage generation is a forged/corrupted field, not
+  // a legacy absence: fail closed rather than coerce it to a number that might
+  // spuriously satisfy the freshness comparison. Absent (`undefined`) is the
+  // legacy v1 case, handled by which head message we verify below.
+  if (ledger.generation !== undefined) {
+    if (
+      typeof ledger.generation !== "number" ||
+      !Number.isSafeInteger(ledger.generation) ||
+      ledger.generation < 0
+    ) {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "ledger generation is present but malformed",
+      };
+    }
+  }
+
   // HEAD ANCHOR: a non-empty ledger MUST carry a valid signed head over its
-  // current row count + chain tip. This is the anti-rollback / anti-truncation
-  // guarantee: dropping trailing rows or substituting a shorter (even fully
-  // self-consistent) chain changes `(rowCount, finalRowHash)`, so the stored
-  // signature no longer verifies. An empty ledger has no head to anchor (the
-  // well-defined genesis floor).
+  // current row count + chain tip + generation. This is the anti-rollback /
+  // anti-truncation guarantee: dropping trailing rows or substituting a shorter
+  // (even fully self-consistent) chain changes `(rowCount, finalRowHash)`, so
+  // the stored signature no longer verifies. An empty ledger has no head to
+  // anchor (the well-defined genesis floor). The external generation anchor
+  // (freshness) is what catches an EMPTY-ledger substitution when the anchor is
+  // non-zero; that check lives in the CLI/ledger-antirollback layer because it
+  // needs the master to read the anchor, which the pure core never holds.
+  //
+  // VERSIONED verify (additive back-compat, MANDATORY no-false-brick): a legacy
+  // ledger with NO `generation` (undefined) verifies under the v1 head message
+  // `(rowCount, finalRowHash)`; a ledger that carries a numeric `generation`
+  // verifies under the v2 message `(rowCount, finalRowHash, generation)`. So a
+  // #868 ledger keeps verifying, and any ledger the current code mutated is
+  // pinned to its signed generation.
   if (ledger.rows.length > 0) {
     if (
       typeof ledger.headSignature !== "string" ||
@@ -640,7 +751,11 @@ export function verifyLedgerIntegrity(
         reason: "head signature not canonical base64url",
       };
     }
-    const headMsg = headMessage(ledger.rows.length, finalRowHash(ledger.rows));
+    const headMsg = headMessage(
+      ledger.rows.length,
+      finalRowHash(ledger.rows),
+      ledger.generation, // undefined -> v1 message; number -> v2 message
+    );
     if (!verify(headMsg, headSig, issuerPublicKey)) {
       return {
         ok: false,

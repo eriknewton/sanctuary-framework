@@ -339,11 +339,13 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
       env,
     });
     expect(listCode).toBe(0);
-    const listed = JSON.parse(listOut.text) as Array<{
-      licenseId: string;
-      subject: string;
-      revoked: boolean;
-    }>;
+    const listedDoc = JSON.parse(listOut.text) as {
+      verified: boolean;
+      entries: Array<{ licenseId: string; subject: string; revoked: boolean }>;
+    };
+    // Verified mode (recovery key present) → the JSON is marked verified.
+    expect(listedDoc.verified).toBe(true);
+    const listed = listedDoc.entries;
     expect(listed).toHaveLength(1);
     expect(listed[0]!.licenseId).toBe(licenseId);
     expect(listed[0]!.subject).toBe("beta-co");
@@ -366,9 +368,13 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
       err: new StringWritable(),
       env,
     });
-    const listed2 = JSON.parse(list2.text) as Array<{ revoked: boolean; revokeReason: string | null }>;
-    expect(listed2[0]!.revoked).toBe(true);
-    expect(listed2[0]!.revokeReason).toBe("test");
+    const listed2Doc = JSON.parse(list2.text) as {
+      verified: boolean;
+      entries: Array<{ revoked: boolean; revokeReason: string | null }>;
+    };
+    expect(listed2Doc.verified).toBe(true);
+    expect(listed2Doc.entries[0]!.revoked).toBe(true);
+    expect(listed2Doc.entries[0]!.revokeReason).toBe("test");
   });
 
   it("revoke of an unknown licenseId → exit 1", async () => {
@@ -431,18 +437,20 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
     const { writeFile } = await import("node:fs/promises");
     await writeFile(ledgerPath, JSON.stringify(raw, null, 2) + "\n");
 
-    // list must FAIL closed: non-zero exit + a loud tamper warning on stderr,
-    // and it must NOT print the (tampered) license rows as if trusted.
+    // VERIFIED list (recovery key present) must FAIL closed: non-zero exit + a
+    // loud tamper warning on stderr, and it must NOT print the (tampered)
+    // license rows as if trusted. The verified path pins the issuer key from the
+    // fortress (NOT the ledger file) and runs integrity + freshness.
     const out = new StringWritable();
     const err = new StringWritable();
     const code = await runLicenseCommand({
       argv: ["list", "--fortress", fortressPath],
       out,
       err,
-      env: {},
+      env,
     });
     expect(code).toBe(1);
-    expect(err.text).toMatch(/FAILED its integrity check|TAMPERED/);
+    expect(err.text).toMatch(/FAILED its integrity\/freshness check|TAMPERED/);
     expect(out.text).not.toContain("victim");
 
     // Same for --json: no trusted rows are emitted on tamper.
@@ -452,10 +460,247 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
       argv: ["list", "--fortress", fortressPath, "--json"],
       out: jsonOut,
       err: jsonErr,
-      env: {},
+      env,
     });
     expect(jsonCode).toBe(1);
     expect(jsonOut.text).toBe("");
-    expect(jsonErr.text).toMatch(/TAMPERED|integrity check/);
+    expect(jsonErr.text).toMatch(/TAMPERED|integrity\/freshness check/);
+  });
+});
+
+describe("sanctuary license — anti-rollback fast-follow (list key-pin + external anchor)", () => {
+  let tmp: string;
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-license-ar-"));
+  });
+  afterEach(async () => {
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    delete process.env.SANCTUARY_RECOVERY_KEY;
+    try {
+      await rm(tmp, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  });
+
+  it("UNVERIFIED list (no passphrase) prints entries labeled UNVERIFIED, never claims valid, exit 0", async () => {
+    const fortressPath = join(tmp, "f");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    // Issue a real license so there is a ledger to read.
+    await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "acme", "--nodes", "5", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+
+    // Unverified list: NO passphrase / recovery key.
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath],
+      out,
+      err,
+      env: {},
+    });
+    expect(code).toBe(0); // a read is allowed
+    // The entry is shown (usable read) but LOUDLY labeled UNVERIFIED, and it
+    // NEVER claims the ledger is valid/verified.
+    expect(out.text).toContain("acme");
+    expect(out.text).toMatch(/UNVERIFIED/);
+    expect(out.text).not.toMatch(/\bvalid\b/i);
+    expect(out.text).not.toMatch(/\bverified\b/i);
+
+    // --json unverified: the document is explicitly marked verified:false.
+    const jsonOut = new StringWritable();
+    const jsonErr = new StringWritable();
+    const jsonCode = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath, "--json"],
+      out: jsonOut,
+      err: jsonErr,
+      env: {},
+    });
+    expect(jsonCode).toBe(0);
+    const doc = JSON.parse(jsonOut.text) as { verified: boolean; entries: unknown[] };
+    expect(doc.verified).toBe(false);
+    expect(doc.entries).toHaveLength(1);
+    expect(jsonErr.text).toMatch(/UNVERIFIED/);
+  });
+
+  it("VERIFIED list of a whole-ledger substitution under an ATTACKER keypair → tampered + exit ≠ 0", async () => {
+    const fortressPath = join(tmp, "f2");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    const env = { SANCTUARY_RECOVERY_KEY: recoveryKey };
+
+    // Issue a real license so the anchor advances to generation 1.
+    await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "victim", "--nodes", "5", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      env,
+    });
+
+    // The attacker replaces the ledger file WHOLESALE with a self-consistent
+    // ledger they built under their OWN keypair (forging an enterprise/unlimited
+    // grant). Every signature inside it is valid — under the ATTACKER key. The
+    // old self-cert bug would trust the file's own `issuerPublicKey`; the fix
+    // pins the operator key from the fortress, so the attacker key ≠ pinned key.
+    const { generateKeypair, generateIdentityId } = await import(
+      "../../src/core/identity.js"
+    );
+    const { ed25519 } = await import("@noble/curves/ed25519");
+    const {
+      appendRow,
+      emptyLedger,
+      issueLicense,
+    } = await import("../../src/entitlement/ledger.js");
+    const { saveLedger } = await import("../../src/entitlement/ledger-io.js");
+    const attacker = generateKeypair();
+    const attackerId = generateIdentityId(attacker.publicKey);
+    const attackerSign = (m: Uint8Array): Uint8Array =>
+      ed25519.sign(m, attacker.privateKey);
+    const { row } = issueLicense(
+      {
+        licenseId: "attacker-forged",
+        subject: "attacker",
+        tier: "enterprise",
+        pricingUnit: "fleet",
+        entitledCount: null,
+        period: "annual",
+        notBefore: Math.floor(Date.now() / 1000),
+        notAfter: Math.floor(Date.parse(FUTURE) / 1000),
+        graceUntil: null,
+        featureFlags: ["roster", "policy-dist"],
+        issuer: attackerId,
+      },
+      attackerSign,
+      Math.floor(Date.now() / 1000),
+    );
+    const forged = appendRow(emptyLedger(), row, attackerSign, attacker.publicKey, 99);
+    const ledgerPath = join(fortressPath, "state", "fleet-license-ledger.json");
+    await saveLedger(ledgerPath, forged);
+
+    // Verified list must report tampered and exit non-zero (pinned key mismatch).
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath],
+      out,
+      err,
+      env,
+    });
+    expect(code).toBe(1);
+    expect(err.text).toMatch(/FAILED its integrity\/freshness check|TAMPERED/);
+    expect(out.text).not.toContain("attacker");
+  });
+
+  it("VERIFIED list of an OLD genuine snapshot (rolled back below the anchor) → tampered + exit ≠ 0", async () => {
+    const fortressPath = join(tmp, "f3");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    const env = { SANCTUARY_RECOVERY_KEY: recoveryKey };
+    const ledgerPath = join(fortressPath, "state", "fleet-license-ledger.json");
+
+    // Issue #1 → ledger + anchor at generation 1. Snapshot the genuine file.
+    await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "co-1", "--nodes", "5", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      env,
+    });
+    const genuineSnapshotGen1 = await readFile(ledgerPath, "utf-8");
+
+    // Issue #2 → ledger + anchor advance to generation 2.
+    await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "co-2", "--nodes", "5", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      env,
+    });
+
+    // The attacker restores the GENUINE gen-1 snapshot (e.g. to erase co-2's
+    // issuance). Its own signatures are all valid, but its generation (1) is
+    // below the external anchor (2) → rollback.
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(ledgerPath, genuineSnapshotGen1);
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath],
+      out,
+      err,
+      env,
+    });
+    expect(code).toBe(1);
+    expect(err.text).toMatch(/FAILED its integrity\/freshness check|rollback|TAMPERED/);
+    // The stale view (co-1 only, co-2 erased) is NOT rendered as valid.
+    expect(out.text).not.toContain("co-1");
+  });
+
+  it("CONCURRENT issue: two racing mutations serialize; both rows land, generation is consistent", async () => {
+    const fortressPath = join(tmp, "f4");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    const env = { SANCTUARY_RECOVERY_KEY: recoveryKey };
+
+    // Fire two `issue` commands concurrently against the same fortress. The
+    // advisory lock must serialize them so neither lost-updates the ledger.
+    const [c1, c2] = await Promise.all([
+      runLicenseCommand({
+        argv: [
+          "issue", "--fortress", fortressPath, "--tier", "fleet",
+          "--subject", "race-a", "--nodes", "5", "--expires", FUTURE,
+        ],
+        out: new StringWritable(),
+        err: new StringWritable(),
+        env,
+      }),
+      runLicenseCommand({
+        argv: [
+          "issue", "--fortress", fortressPath, "--tier", "fleet",
+          "--subject", "race-b", "--nodes", "5", "--expires", FUTURE,
+        ],
+        out: new StringWritable(),
+        err: new StringWritable(),
+        env,
+      }),
+    ]);
+    expect(c1).toBe(0);
+    expect(c2).toBe(0);
+
+    // BOTH rows must be present (no lost update), and a verified list must pass
+    // (chain + anchor consistent, generation == 2).
+    const listOut = new StringWritable();
+    const listErr = new StringWritable();
+    const listCode = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath, "--json"],
+      out: listOut,
+      err: listErr,
+      env,
+    });
+    expect(listCode).toBe(0);
+    const doc = JSON.parse(listOut.text) as {
+      verified: boolean;
+      entries: Array<{ subject: string }>;
+    };
+    expect(doc.verified).toBe(true);
+    const subjects = doc.entries.map((e) => e.subject).sort();
+    expect(subjects).toEqual(["race-a", "race-b"]);
   });
 });

@@ -65,14 +65,14 @@ function params(overrides: Partial<IssueLicenseParams> = {}): IssueLicenseParams
   };
 }
 
-/** Issue n rows signed by the real issuer. */
+/** Issue n rows signed by the real issuer (generation bumped 1..n). */
 function seed(n: number): { ledger: Ledger; ids: string[] } {
   let ledger = emptyLedger();
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
     const p = params({ licenseId: `lic-${i}` });
     const { row } = issueLicense(p, sign, NOW + i);
-    ledger = appendRow(ledger, row, sign, issuer.publicKey);
+    ledger = appendRow(ledger, row, sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     ids.push(p.licenseId);
   }
   return { ledger, ids };
@@ -101,6 +101,7 @@ function rebuildChain(
       },
       headSign,
       headPub,
+      (rebuilt.generation ?? 0) + 1,
     );
   }
   return rebuilt;
@@ -195,6 +196,7 @@ describe("ledger fix-round — (B) truncation / substitution to a shorter chain 
       ).row,
       attackerSign,
       attacker.publicKey,
+      1,
     );
     const verdict = verifyLedgerIntegrity(forged, issuer.publicKey);
     expect(verdict.ok).toBe(false);
@@ -241,6 +243,7 @@ describe("ledger fix-round — reorder still caught, and the issuer anchor is pi
       issueLicense(params({ licenseId: "mismatch", issuer: wrongIssuerId }), attackerSign, NOW).row,
       attackerSign,
       attacker.publicKey,
+      1,
     );
     const verdict = verifyLedgerIntegrity(forged, issuer.publicKey);
     expect(verdict.ok).toBe(false);
@@ -250,7 +253,7 @@ describe("ledger fix-round — reorder still caught, and the issuer anchor is pi
   it("a legitimately built ledger verifies ok, and re-signing after revoke keeps it ok", () => {
     const { ledger, ids } = seed(3);
     expect(verifyLedgerIntegrity(ledger, issuer.publicKey).ok).toBe(true);
-    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign, issuer.publicKey);
+    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign, issuer.publicKey, (ledger.generation ?? 0) + 1);
     expect(verifyLedgerIntegrity(revoked, issuer.publicKey).ok).toBe(true);
   });
 
