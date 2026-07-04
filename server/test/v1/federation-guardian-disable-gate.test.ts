@@ -19,7 +19,8 @@ import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.j
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateKeypair } from "../../src/core/identity.js";
-import { toBase64url } from "../../src/core/encoding.js";
+import { toBase64url, bytesToString, stringToBytes } from "../../src/core/encoding.js";
+import type { PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import {
   issueGuardianRoster,
   verifyGuardianRoster,
@@ -2102,5 +2103,221 @@ describe("F1 re-gate: keyless whole-blob rollback latches (§1 + §8)", () => {
     expect((afterRestamp as { unavailable?: boolean }).unavailable).not.toBe(true);
     const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
     expect((await store.guardianRequirementEstablished()).status).toBe("established");
+  });
+
+  // Append `count` NON-guardian l2 audit entries to inflate the l2 window.
+  async function appendFillerL2(
+    storage: MemoryStorage,
+    count: number,
+    startIndex = 0,
+  ): Promise<void> {
+    const log = new AuditLog(storage, AUDIT_KEY);
+    for (let i = 0; i < count; i++) {
+      await log.appendCritical({
+        layer: "l2",
+        operation: "filler_non_guardian_op",
+        identity_id: "filler",
+        result: "success",
+        details: { i: startIndex + i },
+      });
+    }
+    await log.flush();
+  }
+
+  // §8.6 P0 REGRESSION (the round-1 merge-blocker). The guardian raise entry is
+  // BURIED under >1000 later l2 entries. The round-1 bounded read
+  // (query({layer:"l2", limit:1000})) sliced the last 1000 l2 entries AFTER the
+  // layer filter, so the guardian raise fell OUT of the window, the audit floor
+  // collapsed to 0 with ZERO integrity findings (benign forward growth, not
+  // truncation), and the two-record blob+anchor restore LANDED (effectiveM=2,
+  // unavailable=false). The window-independent streamVerifiedChain read finds the
+  // buried guardian raise and LATCHES. This test MUST fail on 5787324c (restore
+  // limit:1000 to confirm) and pass now.
+  it("P0: a guardian raise buried under >1000 later l2 entries still LATCHES a two-record restore", async () => {
+    const { fortress, storage, lowBlob, lowAnchor } = await loweredThenRaised();
+
+    // Bury the guardian entries under >1000 later l2 audit entries (the normal
+    // busy-l2 steady state: break-glass ticks, transparency checkpoints, etc).
+    await appendFillerL2(storage, 1100);
+
+    // Two-record restore (blob + anchor at the LOW floor); guardian audit entries
+    // (and the buried raise) remain intact on disk.
+    await storage.write(NS, KEY, lowBlob);
+    await storage.write("_meta", ANCHOR_KEY, lowAnchor);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // Window-independent floor finds the buried raise -> blob.generation <
+    // auditFloor.generation -> LATCH. The stale lowered-M never goes live.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+    if ((after as { unavailable?: boolean }).unavailable !== true) {
+      expect(
+        effectiveThresholdM(after as GuardianRevocationRequirement),
+      ).not.toBe(2);
+    }
+  });
+
+  // Build a fortress with: a FILLER non-guardian l2 entry FIRST (so it sits
+  // strictly BELOW the guardian entries), then a guardian requirement (the
+  // guardian entries), then a two-record restore staged. Returns the pieces a P1
+  // test needs plus the ordered on-disk audit keys.
+  async function stagedTwoRecordRestoreWithFillerBelow(): Promise<{
+    fortress: MultiNodeFortress;
+    storage: MemoryStorage;
+    auditKeys: () => Promise<string[]>;
+  }> {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+
+    // One NON-guardian l2 entry FIRST (sequence 1), below every guardian entry.
+    await appendFillerL2(storage, 1);
+
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    const nonceLower = dashboard.nextFederationGuardianDisableNonce();
+    const staleLowered = mintLowered(fortress, "mini-1", roster.version, 2, nonceLower);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: staleLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nonceLower,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKeyOf(fortress, "mini-1"),
+        }),
+      },
+    );
+    const lowBlob = (await storage.read(NS, KEY))!;
+    const lowAnchor = (await storage.read("_meta", ANCHOR_KEY))!;
+    await dashboard.setFederationGuardianRevocationRequirement({ roster }); // raise
+
+    // Stage the two-record restore (blob + anchor low); audit trail intact.
+    await storage.write(NS, KEY, lowBlob);
+    await storage.write("_meta", ANCHOR_KEY, lowAnchor);
+
+    const auditKeys = async () =>
+      (await storage.list("_audit")).map((m) => m.key).sort();
+    return { fortress, storage, auditKeys };
+  }
+
+  // §8.6 P1(a) - THE AVAILABILITY WIN: a fortress that NEVER configured a
+  // guardian requirement (no guardian audit entries, no established sentinel)
+  // must NOT be bricked by an unrelated l2 audit corruption. The round-1
+  // `findings.length > 0 -> null` latch bricked ALL federation serving on ANY l2
+  // finding; the scoped rule leaves a never-guarded fortress AVAILABLE (a missing
+  // guardian raise cannot be hidden if none ever existed). This is the concrete
+  // "a benign historical corruption does not brick serving" case.
+  it("P1(a): a never-guarded fortress with an unrelated l2 corruption does NOT latch", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    // Never configure a guardian requirement. Just some l2 audit history, one of
+    // which is then corrupted (a decrypt-failure, the harshest single-entry
+    // corruption class).
+    await appendFillerL2(storage, 3);
+    const keys = (await storage.list("_audit")).map((m) => m.key).sort();
+    const env = JSON.parse(
+      bytesToString((await storage.read("_audit", keys[1]!))!),
+    ) as PersistedAuditEnvelopeV2;
+    env.encrypted_payload_bytes = "AAAA" + env.encrypted_payload_bytes.slice(4);
+    await storage.write("_audit", keys[1]!, stringToBytes(JSON.stringify(env)));
+
+    // Boot: no guard was ever configured, so the (unrelated) audit finding must
+    // NOT brick federation serving. The kill hook is the legacy single-operator
+    // null (no requirement), NOT the unavailable sentinel.
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(dashboard) as { unavailable?: boolean } | null;
+    expect(hook === null || hook.unavailable !== true).toBe(true);
+  });
+
+  // §8.6 P1(a2) - HONEST FAIL-CLOSED BOUNDARY: on a GUARDED fortress, a real
+  // in-place corruption of a below-guardian entry produces `entry_decrypt_failed`
+  // (a coverage class: we cannot read the entry, so it COULD have been a guardian
+  // raise). The scoped rule correctly fails TOWARD latch. This documents that the
+  // scoping does NOT weaken safety: any corruption whose content is unreadable is
+  // treated as a coverage risk, even below the observed guardian sequence.
+  it("P1(a2): a below-guardian decrypt-failure on a guarded fortress fails closed (coverage)", async () => {
+    const { fortress, storage, auditKeys } =
+      await stagedTwoRecordRestoreWithFillerBelow();
+
+    // Corrupt the FILLER entry (sequence 1, below the guardian entries). A payload
+    // byte-flip yields entry_hash_mismatch AND entry_decrypt_failed (coverage).
+    const keys = await auditKeys();
+    const fillerKey = keys[0]!;
+    const env = JSON.parse(
+      bytesToString((await storage.read("_audit", fillerKey))!),
+    ) as PersistedAuditEnvelopeV2;
+    env.encrypted_payload_bytes = "AAAA" + env.encrypted_payload_bytes.slice(4);
+    await storage.write("_audit", fillerKey, stringToBytes(JSON.stringify(env)));
+
+    // The unreadable below entry could have been a guardian entry -> coverage ->
+    // fail toward latch. (The two-record rollback is also staged, so latching is
+    // the correct outcome regardless; the point is we never SILENTLY accept the
+    // restore on a coverage finding.)
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // §8.6 P1(b): a TRUNCATION / tail / gap finding (coverage class) DOES latch,
+  // even though it is not at a known guardian sequence, because a coverage
+  // finding could have HIDDEN a higher-generation guardian raise.
+  it("P1(b): a sequence_gap_or_reorder (coverage) finding LATCHES", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    // Append a couple of filler entries so a middle deletion is a GAP, not a tail
+    // truncation (either coverage kind latches; a gap is the cleaner signal).
+    await appendFillerL2(storage, 3);
+
+    // Delete a middle entry -> sequence_gap_or_reorder (a coverage finding).
+    const keys = (await storage.list("_audit")).map((m) => m.key).sort();
+    await storage.delete("_audit", keys[Math.floor(keys.length / 2)]!);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // Coverage finding -> the guardian set may be incomplete -> fail toward latch.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // §8.6 P1(c): a finding whose sequence is ON/ABOVE a guardian entry LATCHES,
+  // because a corruption at or above a guardian entry could alter/hide a
+  // higher-generation guardian raise.
+  it("P1(c): an entry_hash_mismatch AT a guardian entry LATCHES", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // The FIRST audit entry is the guardian enable (sequence 1). Byte-flip it to
+    // trigger an entry_hash_mismatch AT a guardian entry's sequence.
+    const keys = (await storage.list("_audit")).map((m) => m.key).sort();
+    const guardianKey = keys[0]!;
+    const env = JSON.parse(
+      bytesToString((await storage.read("_audit", guardianKey))!),
+    ) as PersistedAuditEnvelopeV2;
+    env.encrypted_payload_bytes = "CCCC" + env.encrypted_payload_bytes.slice(4);
+    await storage.write("_audit", guardianKey, stringToBytes(JSON.stringify(env)));
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // Finding sequence >= lowest guardian sequence -> fail toward latch.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
   });
 });

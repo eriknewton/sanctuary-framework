@@ -38,7 +38,13 @@ import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import type {
+  AuditLog,
+  AuditEntry,
+  AuditIntegrityFinding,
+  AuditIntegrityFindingKind,
+} from "../operational/audit-log.js";
+import { AuditIntegrityError } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
@@ -456,6 +462,35 @@ const GUARDIAN_AUDIT_OPERATIONS: ReadonlySet<string> = new Set([
 function isGuardianAuditOperation(operation: string): boolean {
   return GUARDIAN_AUDIT_OPERATIONS.has(operation);
 }
+
+/**
+ * §8.6 P1: the audit integrity-finding kinds that indicate the audit COVERAGE
+ * could be compromised such that a guardian entry might be HIDDEN or a higher
+ * generation removed (truncation / structural / anchor / checkpoint classes). A
+ * finding of any of these kinds forces the anti-rollback floor to fail TOWARD
+ * latch regardless of its sequence, because it can mean the guardian set the
+ * floor is derived from is INCOMPLETE. The complement (a single in-place
+ * corruption, `entry_hash_mismatch` / `entry_malformed`, strictly BELOW every
+ * guardian entry) does NOT compromise guardian coverage, so it does not latch.
+ */
+const GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS: ReadonlySet<AuditIntegrityFindingKind> =
+  new Set<AuditIntegrityFindingKind>([
+    "storage_unavailable",
+    "entry_unreadable",
+    "entry_decrypt_failed",
+    "sequence_gap_or_reorder",
+    "prev_hash_mismatch",
+    "tail_anchor_missing",
+    "tail_anchor_invalid",
+    "rotation_anchor_missing",
+    "rotation_anchor_invalid",
+    "legacy_anchor_missing",
+    "legacy_anchor_mismatch",
+    "checkpoint_malformed",
+    "checkpoint_root_mismatch",
+    "checkpoint_signature_mismatch",
+    "checkpoint_signature_unverifiable",
+  ]);
 
 function newerAppliedPolicy(
   base: FederationAppliedPolicyVersion | null,
@@ -2918,8 +2953,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
     // Finding #1 + §8: reconcile the security-load-bearing floors against the
     // external anti-rollback anchor AND the guardian audit-trail floor, and LATCH
-    // fail-closed on ANY regression, BEFORE adopting the snapshot's floors.
-    if (await this.reconcileGuardianAntiRollbackFloors(store, snapshot)) {
+    // fail-closed on ANY regression, BEFORE adopting the snapshot's floors. Pass
+    // the established-sentinel status so the §8.6 scoped-latch rule can tell a
+    // never-guarded fortress (do not brick on an unrelated audit finding) from
+    // one that ever configured a guard (fail closed on a coverage finding).
+    if (
+      await this.reconcileGuardianAntiRollbackFloors(store, snapshot, established.status)
+    ) {
       this._federationSyncStateUnavailable = true;
       return;
     }
@@ -3071,6 +3111,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   private async reconcileGuardianAntiRollbackFloors(
     store: FederationSyncStateStore,
     snapshot: FederationSyncStateSnapshot,
+    establishedStatus: "absent" | "established" | "invalid",
   ): Promise<boolean> {
     // Read the external anchor (tri-state). A present-but-tampered anchor is a
     // positively-detected tamper: latch. Absent is neutral (pre-fix / first
@@ -3087,9 +3128,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           }
         : { loweredHighWater: 0, disableNonce: 0, generation: 0 };
 
-    // §8: derive the audit-witnessed floor. Unreadable / failed-integrity ->
+    // §8: derive the audit-witnessed floor over the WHOLE verified guardian audit
+    // set (window-independent, §8.6 P0). Unreadable / coverage-compromised ->
     // fail TOWARD latch (returns null -> latch).
-    const auditFloor = await this.deriveGuardianFloorFromAudit();
+    const auditFloor = await this.deriveGuardianFloorFromAudit(establishedStatus);
     if (auditFloor === null) return true;
 
     // Regression detection: the on-disk blob floors must be >= both witnesses.
@@ -3116,27 +3158,46 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * §8: derive the audit-witnessed guardian floor from the INTEGRITY-VERIFIED
-   * guardian audit entries. Returns `null` when the audit read is unreadable or
-   * fails integrity verification (the caller fails TOWARD latch), and a neutral
+   * §8 + §8.6: derive the audit-witnessed guardian floor from the
+   * INTEGRITY-VERIFIED guardian audit entries. Returns `null` when the audit
+   * COVERAGE could be compromised such that a guardian entry might be hidden or a
+   * higher generation removed (the caller fails TOWARD latch), and a neutral
    * `{0,0,0}` floor when there is no guardian audit history at all (no first-boot
    * false positive; mirrors the epoch-witness "absent -> neutral").
    *
    * Primary witness = the requirement GENERATION recorded on every committed
-   * guardian transition (`details.generation`); it is monotonic and always
-   * audited, so the highest-generation guardian entry is the most recent one.
-   * disable_nonce / the dropped-lowering nonce are best-effort reinforcement when
-   * recoverable from an entry's `details`.
+   * guardian transition (`details.generation`); it is monotonic. disable_nonce /
+   * the break-glass nonce are best-effort reinforcement when recoverable.
    *
-   * We use `AuditLog.query` (the agent-facing read that re-verifies the chain on
-   * every call and returns `integrity_findings`), filtered to the l2 guardian
-   * operations. A non-empty `integrity_findings` (or a throw) means the audit
-   * trail cannot be trusted -> fail toward latch. Because the generation is
-   * monotonic, a BOUNDED recent tail suffices: audit truncation of the higher
-   * entries fails toward latch via the head-anchor integrity finding, so a
-   * bounded read never under-reports without ALSO surfacing a finding.
+   * §8.6 P0 (WINDOW-INDEPENDENT): the read must cover the WHOLE verified chain,
+   * not a bounded recent tail. The prior `query({layer:"l2", limit:1000})` sliced
+   * the last 1000 l2 entries AFTER the layer filter, so on a busy l2 layer (>1000
+   * l2 entries since the last guardian transition, the normal steady state) the
+   * guardian raise fell out of the window and the floor collapsed to 0 with ZERO
+   * findings (benign forward growth, not a truncation) -> a two-record restore
+   * landed. We instead stream the ENTIRE surviving verified chain
+   * ({@link AuditLog.streamVerifiedChain}, which is window-independent by
+   * construction and yields each entry's chain SEQUENCE) and take the max
+   * generation over ALL guardian entries. Guardian transitions are rare +
+   * monotonic, so this is cheap.
+   *
+   * §8.6 P1 (SCOPED integrity latch): `streamVerifiedChain` throws
+   * `AuditIntegrityError` in strict mode when the chain does not verify; we catch
+   * it and SCOPE the fail-closed decision to findings that could hide a guardian
+   * entry, rather than latching on ANY finding. We fail TOWARD latch when a
+   * COVERAGE/structural finding is present (truncation / gap / anchor /
+   * checkpoint), OR any finding sits at-or-above the lowest guardian entry's
+   * sequence, OR a finding lacks a sequence. A benign in-place single-entry
+   * corruption STRICTLY BELOW every guardian entry (with no coverage finding)
+   * does NOT latch: the guardian set is complete and each guardian entry
+   * individually hash-verifies, so the max generation is trustworthy. When NO
+   * guardian entries are found and only a coverage finding is present, we latch
+   * ONLY when the established-sentinel says a guard was ever configured (else a
+   * never-guarded fortress is not bricked by an unrelated l2 finding).
    */
-  private async deriveGuardianFloorFromAudit(): Promise<
+  private async deriveGuardianFloorFromAudit(
+    establishedStatus: "absent" | "established" | "invalid",
+  ): Promise<
     | { generation: number; disableNonce: number; loweredHighWater: number }
     | null
   > {
@@ -3146,51 +3207,103 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // Neutral floor, exactly like "no guardian audit history".
       return { generation: 0, disableNonce: 0, loweredHighWater: 0 };
     }
-    let entries: AuditEntry[];
-    let integrityFindings: unknown[];
-    try {
-      // Bounded l2 read: the guardian operations are all l2. `query` re-verifies
-      // the on-disk chain and returns integrity_findings; a bounded recent slice
-      // is sufficient because the generation is monotonic and truncation of the
-      // higher entries surfaces a finding (which we fail toward latch on).
-      const result = await auditLog.query({ layer: "l2", limit: 1000 });
-      entries = result.entries;
-      integrityFindings = result.integrity_findings;
-    } catch {
-      // Unreadable / integrity throw -> fail toward latch.
-      return null;
-    }
-    if (integrityFindings.length > 0) {
-      // The audit trail failed integrity verification -> fail toward latch (never
-      // toward a spuriously-low floor).
-      return null;
-    }
-    let generation = 0;
-    let disableNonce = 0;
-    // loweredHighWater is not directly recorded per guardian audit entry today,
-    // so it stays 0 (best-effort reinforcement per §8.2). The GENERATION floor
-    // alone catches the two-record restore, which is the load-bearing guarantee;
-    // when there are no guardian entries at all the whole floor is neutral {0,0,0}
-    // (no first-boot false positive).
-    const loweredHighWater = 0;
-    for (const entry of entries) {
-      if (!isGuardianAuditOperation(entry.operation)) continue;
-      const details = entry.details;
-      if (details === undefined) continue;
+
+    // Collect guardian entries WITH their chain sequence over the WHOLE verified
+    // chain. `onEntry` fires only after each entry is decrypt + hash verified, so
+    // a collected guardian entry's `details` are individually trustworthy even if
+    // the FULL-CHAIN (coverage) check later throws. `reset` drops an abandoned
+    // torn-read pass so the kept set is exactly the single accepted pass.
+    let guardianEntries: Array<{
+      sequence: number;
+      generation: number;
+      disableNonce: number;
+    }> = [];
+    const collect = (item: { sequence: number; entry: AuditEntry }): void => {
+      if (!isGuardianAuditOperation(item.entry.operation)) return;
+      const details = item.entry.details;
+      if (details === undefined) return;
       const gen = details.generation;
-      if (typeof gen === "number" && Number.isSafeInteger(gen) && gen > generation) {
-        generation = gen;
-      }
-      // Best-effort reinforcement: disable_nonce (on transition entries) and
-      // nonce (on break-glass-initiated entries) both burn the disable nonce.
+      const generation =
+        typeof gen === "number" && Number.isSafeInteger(gen) && gen >= 0 ? gen : 0;
+      let disableNonce = 0;
       for (const field of ["disable_nonce", "nonce"] as const) {
         const v = details[field];
         if (typeof v === "number" && Number.isSafeInteger(v) && v > disableNonce) {
           disableNonce = v;
         }
       }
+      guardianEntries.push({ sequence: item.sequence, generation, disableNonce });
+    };
+
+    let findings: readonly AuditIntegrityFinding[] = [];
+    try {
+      await auditLog.streamVerifiedChain({
+        onEntry: collect,
+        reset: () => {
+          guardianEntries = [];
+        },
+      });
+    } catch (err) {
+      if (err instanceof AuditIntegrityError) {
+        // The chain did not verify. Keep the guardian entries the (final) pass
+        // streamed and SCOPE the latch decision to `err.findings` below.
+        findings = err.findings;
+      } else {
+        // A non-integrity failure (storage unreadable, etc.): fail toward latch.
+        return null;
+      }
     }
-    return { generation, disableNonce, loweredHighWater };
+
+    // The floor = max generation / disable-nonce over ALL guardian entries.
+    let generation = 0;
+    let disableNonce = 0;
+    let lowestGuardianSeq = Number.POSITIVE_INFINITY;
+    for (const g of guardianEntries) {
+      if (g.generation > generation) generation = g.generation;
+      if (g.disableNonce > disableNonce) disableNonce = g.disableNonce;
+      if (g.sequence < lowestGuardianSeq) lowestGuardianSeq = g.sequence;
+    }
+    const haveGuardianEntries = guardianEntries.length > 0;
+
+    // §8.6 P1: scope the fail-closed decision to findings that could HIDE a
+    // guardian entry or remove a higher generation.
+    if (findings.length > 0) {
+      // Guard-configured but NO guardian entry recovered from the trail while
+      // findings are present: the guardian evidence itself may have been the
+      // corrupted/hidden entry (a corrupted guardian entry never reaches onEntry).
+      // Fail TOWARD latch. A never-guarded fortress (sentinel not established)
+      // with an unrelated finding is NOT bricked (falls through to the scoped
+      // per-finding checks, where a non-coverage below-only finding is benign).
+      if (!haveGuardianEntries && establishedStatus === "established") {
+        return null;
+      }
+      for (const f of findings) {
+        // A coverage/structural finding can hide a guardian entry anywhere ->
+        // fail toward latch.
+        if (GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS.has(f.kind)) {
+          // Exception: when NO guardian entries exist AND the fortress never
+          // configured a guard, an unrelated l2 coverage finding must not brick a
+          // never-guarded fortress (neutral). (The guard-configured + no-guardian
+          // case already returned null above.)
+          if (!haveGuardianEntries && establishedStatus !== "established") {
+            continue;
+          }
+          return null;
+        }
+        // A finding lacking a sequence cannot be proven below the guardian set ->
+        // fail toward latch (conservative).
+        if (f.sequence === undefined) return null;
+        // A finding AT OR ABOVE the lowest guardian entry could alter/hide a
+        // higher-generation guardian raise -> fail toward latch. (When there are
+        // guardian entries; the no-guardian cases are handled above.)
+        if (f.sequence >= lowestGuardianSeq) return null;
+      }
+    }
+
+    // loweredHighWater is not directly recorded per guardian audit entry today,
+    // so it stays 0 (best-effort reinforcement per §8.2). The GENERATION floor
+    // alone catches the two-record restore, which is the load-bearing guarantee.
+    return { generation, disableNonce, loweredHighWater: 0 };
   }
 
   /**

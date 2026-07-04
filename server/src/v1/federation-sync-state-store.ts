@@ -144,17 +144,21 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
  * invalid), and the non-decreasing write are copied verbatim; NO new crypto
  * scheme is invented.
  *
- * HONEST RESIDUAL (§8.3, do not over-claim): Anti-rollback covers a KEYLESS
- * same-master filesystem attacker. A single-record rollback (the sync-state blob
- * alone) is caught by the external `_meta` anchor; a two-record restore (blob +
- * anchor) is caught by the guardian audit-trail floor on any fortress with
- * preserved guardian audit history. The irreducible residual is a coordinated
- * restore/wipe that ALSO self-consistently rolls back or deletes the guardian
- * audit entries, the audit head anchor + its established marker, and the
- * checkpoints, i.e. a wholesale audit destruction, which is itself separately
- * surfaced (empty/truncated chain) and is bounded only by an OFF-HOST or
- * HARDWARE witness (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk
- * detection of a full self-consistent tree+audit restore.
+ * HONEST RESIDUAL (§8.3, round 2, do not over-claim): Anti-rollback covers a
+ * KEYLESS same-master filesystem attacker. A single-record rollback (the
+ * sync-state blob alone) is caught by the external `_meta` anchor; a two-record
+ * restore (blob + anchor BOTH rolled back) is caught by the guardian AUDIT-trail
+ * floor, which is derived WINDOW-INDEPENDENTLY over the WHOLE verified chain (not
+ * a bounded tail, §8.6 P0), so a surviving guardian raise entry is always found
+ * regardless of how much unrelated audit volume was appended after it. The
+ * irreducible residual is therefore specifically a coordinated restore that ALSO
+ * truncates or removes the guardian audit entries themselves (together with the
+ * audit head anchor + its established marker and the checkpoints), i.e. a
+ * wholesale guardian-audit-coverage destruction, which is itself separately
+ * surfaced (empty/truncated chain, a coverage integrity finding that fails the
+ * floor TOWARD latch) and is bounded only by an OFF-HOST or HARDWARE witness
+ * (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk detection of a full
+ * self-consistent tree+audit restore that ALSO removes the guardian audit trail.
  */
 export const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY =
   "federation-guardian-antirollback-anchor-v1";
