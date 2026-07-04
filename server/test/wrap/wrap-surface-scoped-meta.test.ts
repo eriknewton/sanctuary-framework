@@ -1340,19 +1340,29 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
 
   describe("checkPinnedVersionResolvable", () => {
     let server: Server | undefined;
-    let savedKnob: string | undefined;
+    let savedNoUpdateKnob: string | undefined;
+    let savedUpdateKnob: string | undefined;
 
     beforeEach(() => {
-      // The suite-wide vitest env sets the zero-outbound knob; these tests
-      // exercise the probe itself against a loopback server.
-      savedKnob = process.env.SANCTUARY_NO_UPDATE_CHECK;
+      // Zero-outbound-by-default (2026-07-05): the suite-wide vitest env sets
+      // the back-compat alias knob (SANCTUARY_NO_UPDATE_CHECK), which alone
+      // now forces the probe off regardless of the opt-in var. These tests
+      // exercise the probe itself against a loopback server, so they must
+      // both clear the alias AND set the opt-in var to actually arm the
+      // probe under the new default.
+      savedNoUpdateKnob = process.env.SANCTUARY_NO_UPDATE_CHECK;
+      savedUpdateKnob = process.env.SANCTUARY_UPDATE_CHECK;
       delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+      process.env.SANCTUARY_UPDATE_CHECK = "1";
     });
 
     afterEach(async () => {
-      if (savedKnob !== undefined)
-        process.env.SANCTUARY_NO_UPDATE_CHECK = savedKnob;
+      if (savedNoUpdateKnob !== undefined)
+        process.env.SANCTUARY_NO_UPDATE_CHECK = savedNoUpdateKnob;
       else delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+      if (savedUpdateKnob !== undefined)
+        process.env.SANCTUARY_UPDATE_CHECK = savedUpdateKnob;
+      else delete process.env.SANCTUARY_UPDATE_CHECK;
       if (server) {
         await new Promise<void>((resolve) => server!.close(() => resolve()));
         server = undefined;
@@ -1512,6 +1522,26 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     });
 
     it("SANCTUARY_NO_UPDATE_CHECK=1 skips the probe entirely (zero outbound)", async () => {
+      process.env.SANCTUARY_NO_UPDATE_CHECK = "1";
+      expect(
+        await checkPinnedVersionResolvable("9.9.9", {
+          registryBaseUrl: "http://127.0.0.1:1",
+        }),
+      ).toBe("skipped");
+    });
+
+    it("zero-outbound-by-default: skips the probe when neither env var is set", async () => {
+      delete process.env.SANCTUARY_NO_UPDATE_CHECK;
+      delete process.env.SANCTUARY_UPDATE_CHECK;
+      expect(
+        await checkPinnedVersionResolvable("9.9.9", {
+          registryBaseUrl: "http://127.0.0.1:1",
+        }),
+      ).toBe("skipped");
+    });
+
+    it("SANCTUARY_NO_UPDATE_CHECK=1 wins even when SANCTUARY_UPDATE_CHECK=1 is also set (alias cannot be overridden)", async () => {
+      process.env.SANCTUARY_UPDATE_CHECK = "1";
       process.env.SANCTUARY_NO_UPDATE_CHECK = "1";
       expect(
         await checkPinnedVersionResolvable("9.9.9", {

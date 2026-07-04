@@ -6,6 +6,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "auto-trigger",
   "broker-server",
   "castle-wall",
+  "check-updates",
   "completion",
   "compliance",
   "concierge",

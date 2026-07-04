@@ -37,6 +37,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { get as httpsGet } from "node:https";
 import { get as httpGet } from "node:http";
+import { outboundUpdateChecksEnabled } from "../update-check.js";
 import {
   detectAgentConfigWithDiagnostics,
   backupConfig,
@@ -414,10 +415,13 @@ export async function validateDevDist(devDist: string): Promise<void> {
  *                    requests, or proxy-only egress) and the answer was
  *                    not an affirmative 200. Honest-unknown, never treated
  *                    as either of the affirmative outcomes.
- *   - "skipped":     the probe was disabled (SANCTUARY_NO_UPDATE_CHECK=1,
- *                    the documented zero-outbound knob - this probe is the
- *                    same registry-metadata class of egress as the update
- *                    check, so the one knob silences both).
+ *   - "skipped":     the probe is OFF. ZERO-OUTBOUND-BY-DEFAULT (2026-07-05):
+ *                    with neither env var set, this is the default outcome -
+ *                    this probe is the same registry-metadata class of egress
+ *                    as the update check, so it is gated by the same helper
+ *                    (`outboundUpdateChecksEnabled`). Opt in with
+ *                    SANCTUARY_UPDATE_CHECK=1. SANCTUARY_NO_UPDATE_CHECK=1 is
+ *                    a back-compat alias that also keeps this off.
  */
 export type PinnedVersionResolvability =
   | "resolvable"
@@ -720,7 +724,7 @@ export async function checkPinnedVersionResolvable(
   version: string,
   opts: { registryBaseUrl?: string; timeoutMs?: number } = {},
 ): Promise<PinnedVersionResolvability> {
-  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") return "skipped";
+  if (!outboundUpdateChecksEnabled()) return "skipped";
   let base: string;
   let notFoundIsAffirmative: boolean;
   if (opts.registryBaseUrl !== undefined) {
