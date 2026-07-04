@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
-import { generateKeypair } from "../../src/core/identity.js";
+import { generateKeypair, generateIdentityId } from "../../src/core/identity.js";
 import { resolveEntitlement } from "../../src/entitlement/index.js";
 import {
   appendRow,
@@ -27,7 +27,10 @@ import {
 const issuer = generateKeypair();
 const wrongIssuer = generateKeypair();
 const NOW = 1_800_000_000;
-const ISSUER_ID = "issuer-fp-1";
+// The signed `claims.issuer` MUST be the fingerprint of the issuer public key:
+// verifyLedgerIntegrity cross-checks it against the pinned key, and every row's
+// token signature covers it. A fake string here would (correctly) read as tampered.
+const ISSUER_ID = generateIdentityId(issuer.publicKey);
 
 /** A raw-key issuer signer (the CLI supplies an encrypted-key one). */
 const sign: IssuerSigner = (message) => ed25519.sign(message, issuer.privateKey);
@@ -56,7 +59,7 @@ function seed(n: number): { ledger: Ledger; ids: string[] } {
   for (let i = 0; i < n; i++) {
     const p = params({ licenseId: `lic-${i}` });
     const { row } = issueLicense(p, sign, NOW + i);
-    ledger = appendRow(ledger, row);
+    ledger = appendRow(ledger, row, sign, issuer.publicKey);
     ids.push(p.licenseId);
   }
   return { ledger, ids };
@@ -93,16 +96,16 @@ describe("ledger — issue/list round-trip", () => {
   it("rejects a duplicate licenseId on append", () => {
     let ledger = emptyLedger();
     const { row } = issueLicense(params({ licenseId: "dup" }), sign, NOW);
-    ledger = appendRow(ledger, row);
+    ledger = appendRow(ledger, row, sign, issuer.publicKey);
     const { row: row2 } = issueLicense(params({ licenseId: "dup" }), sign, NOW + 1);
-    expect(() => appendRow(ledger, row2)).toThrow(/duplicate/);
+    expect(() => appendRow(ledger, row2, sign, issuer.publicKey)).toThrow(/duplicate/);
   });
 });
 
 describe("ledger — revoke", () => {
   it("marks the row revoked, surfaces in list, and stays intact", () => {
     const { ledger, ids } = seed(3);
-    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign);
+    const revoked = revokeLicense(ledger, ids[1]!, NOW + 500, "chargeback", sign, issuer.publicKey);
     const entries = listLicenses(revoked);
     expect(entries[1]!.revoked).toBe(true);
     expect(entries[1]!.revokedAt).toBe(NOW + 500);
@@ -116,18 +119,18 @@ describe("ledger — revoke", () => {
 
   it("fails closed on an unknown licenseId", () => {
     const { ledger } = seed(2);
-    expect(() => revokeLicense(ledger, "nope", NOW, null, sign)).toThrow(/unknown/);
+    expect(() => revokeLicense(ledger, "nope", NOW, null, sign, issuer.publicKey)).toThrow(/unknown/);
   });
 
   it("refuses to double-revoke", () => {
     const { ledger, ids } = seed(2);
-    const once = revokeLicense(ledger, ids[0]!, NOW, null, sign);
-    expect(() => revokeLicense(once, ids[0]!, NOW + 1, null, sign)).toThrow(/already revoked/);
+    const once = revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey);
+    expect(() => revokeLicense(once, ids[0]!, NOW + 1, null, sign, issuer.publicKey)).toThrow(/already revoked/);
   });
 
   it("does not mutate the input ledger (pure)", () => {
     const { ledger, ids } = seed(2);
-    revokeLicense(ledger, ids[0]!, NOW, null, sign);
+    revokeLicense(ledger, ids[0]!, NOW, null, sign, issuer.publicKey);
     expect(listLicenses(ledger)[0]!.revoked).toBe(false);
   });
 });
@@ -135,7 +138,7 @@ describe("ledger — revoke", () => {
 describe("ledger — tamper-evidence (fail-closed)", () => {
   it("detects a flipped revoked bit on disk (revocation status un-does without a valid re-sign)", () => {
     const { ledger, ids } = seed(2);
-    const revoked = revokeLicense(ledger, ids[0]!, NOW + 10, "x", sign);
+    const revoked = revokeLicense(ledger, ids[0]!, NOW + 10, "x", sign, issuer.publicKey);
     // Simulate a disk edit: flip revoked back to false WITHOUT re-signing. The
     // row-hash check catches the metadata edit; even if an attacker also fixed
     // the rowHash to match, the per-row revocation signature — which is signed
@@ -160,18 +163,23 @@ describe("ledger — tamper-evidence (fail-closed)", () => {
     // rowHash by re-appending the edited row via the same code path.
     const { ledger, ids } = seed(1);
     // A signature asserting the OPPOSITE status than the metadata will carry.
-    const oppositeStatusSig = revokeLicense(ledger, ids[0]!, NOW + 10, null, sign)
+    const oppositeStatusSig = revokeLicense(ledger, ids[0]!, NOW + 10, null, sign, issuer.publicKey)
       .rows[0]!.revocationSignature;
     // Rebuild a clean single-row ledger, then swap only the revocation signature
     // for the opposite-status one and repair the rowHash to match by re-running
     // append on a reconstructed row.
     const clean = structuredClone(ledger);
     const row0 = clean.rows[0]!;
-    const rebuilt = appendRow(emptyLedger(), {
-      token: row0.token,
-      metadata: row0.metadata, // revoked=false
-      revocationSignature: oppositeStatusSig, // says revoked=true
-    });
+    const rebuilt = appendRow(
+      emptyLedger(),
+      {
+        token: row0.token,
+        metadata: row0.metadata, // revoked=false
+        revocationSignature: oppositeStatusSig, // says revoked=true
+      },
+      sign,
+      issuer.publicKey,
+    );
     const verdict = verifyLedgerIntegrity(rebuilt, issuer.publicKey);
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) {
@@ -218,9 +226,9 @@ describe("ledger — tamper-evidence (fail-closed)", () => {
     const { ledger } = seed(1);
     const forgedSign: IssuerSigner = (m) => ed25519.sign(m, wrongIssuer.privateKey);
     const { row } = issueLicense(params({ licenseId: "forged" }), forgedSign, NOW);
-    const withForged = appendRow(ledger, row);
-    // The genuine issuer key is pinned; the forged row's revocation signature
-    // will not verify against it.
+    const withForged = appendRow(ledger, row, sign, issuer.publicKey);
+    // The genuine issuer key is pinned; the forged row's token + revocation
+    // signatures were made with the WRONG key and will not verify against it.
     const verdict = verifyLedgerIntegrity(withForged, issuer.publicKey);
     expect(verdict.ok).toBe(false);
     if (!verdict.ok) expect(verdict.tampered).toBe(true);

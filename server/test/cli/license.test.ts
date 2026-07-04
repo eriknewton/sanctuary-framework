@@ -400,4 +400,62 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
     expect(code).toBe(0);
     expect(out.text).toContain("No licenses issued yet");
   });
+
+  it("list on a TAMPERED on-disk ledger exits non-zero with a loud warning, never renders it as trusted", async () => {
+    const fortressPath = join(tmp, "f5");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    const env = { SANCTUARY_RECOVERY_KEY: recoveryKey };
+
+    // Issue a real license so there is a signed ledger on disk.
+    const issueOut = new StringWritable();
+    const issueCode = await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "victim", "--nodes", "5", "--expires", FUTURE,
+      ],
+      out: issueOut,
+      err: new StringWritable(),
+      env,
+    });
+    expect(issueCode).toBe(0);
+
+    // Tamper the ledger file on disk: inflate the signed entitledCount. (We do
+    // NOT repair the rowHash here; the point is the CLI runs the integrity check
+    // AT ALL and refuses to display a tampered ledger — exit non-zero.)
+    const ledgerPath = join(fortressPath, "state", "fleet-license-ledger.json");
+    const raw = JSON.parse(await readFile(ledgerPath, "utf-8")) as {
+      rows: Array<{ token: { claims: { entitledCount: number } } }>;
+    };
+    raw.rows[0]!.token.claims.entitledCount = 999_999;
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(ledgerPath, JSON.stringify(raw, null, 2) + "\n");
+
+    // list must FAIL closed: non-zero exit + a loud tamper warning on stderr,
+    // and it must NOT print the (tampered) license rows as if trusted.
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath],
+      out,
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toMatch(/FAILED its integrity check|TAMPERED/);
+    expect(out.text).not.toContain("victim");
+
+    // Same for --json: no trusted rows are emitted on tamper.
+    const jsonOut = new StringWritable();
+    const jsonErr = new StringWritable();
+    const jsonCode = await runLicenseCommand({
+      argv: ["list", "--fortress", fortressPath, "--json"],
+      out: jsonOut,
+      err: jsonErr,
+      env: {},
+    });
+    expect(jsonCode).toBe(1);
+    expect(jsonOut.text).toBe("");
+    expect(jsonErr.text).toMatch(/TAMPERED|integrity check/);
+  });
 });

@@ -39,6 +39,7 @@ export {
   LEDGER_SCHEMA_VERSION,
   LEDGER_GENESIS,
   LEDGER_REVOCATION_DOMAIN,
+  LEDGER_HEAD_DOMAIN,
   emptyLedger,
   issueLicense,
   appendRow,

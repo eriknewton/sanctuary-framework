@@ -340,7 +340,12 @@ async function runIssue(
       issuer.sign,
       notBefore,
     );
-    const nextLedger = appendRow(ledger, row);
+    const nextLedger = appendRow(
+      ledger,
+      row,
+      issuer.sign,
+      issuer.issuerPublicKey,
+    );
     await saveLedger(ledgerPath, nextLedger);
 
     // The license token the operator pastes into Activate: base64url of the
@@ -381,6 +386,43 @@ async function runList(
   try {
     const ledgerPath = await resolveLedgerPath();
     const ledger = await loadLedger(ledgerPath);
+
+    // Never render a ledger as trusted without checking its integrity. `list`
+    // has no custody unlock, so it pins the issuer key from the ledger's own
+    // signed anchor (`issuerPublicKey`). That anchor is NOT taken on faith:
+    // `verifyLedgerIntegrity` cross-checks its fingerprint against each row's
+    // SIGNED `claims.issuer` and re-verifies every token/revocation/head
+    // signature under it, so a swapped anchor key is rejected. A non-empty
+    // ledger with no anchor is itself a tamper signal (fail-closed).
+    if (ledger.rows.length > 0) {
+      const pinned =
+        typeof ledger.issuerPublicKey === "string"
+          ? decodePublicKey(ledger.issuerPublicKey)
+          : null;
+      const integrity =
+        pinned === null
+          ? {
+              ok: false as const,
+              tampered: true as const,
+              reason:
+                "ledger has no signed issuer anchor (issuerPublicKey missing/malformed)",
+            }
+          : verifyLedgerIntegrity(ledger, pinned);
+      if (!integrity.ok) {
+        write(
+          err,
+          "WARNING: license ledger FAILED its integrity check " +
+            `(${integrity.reason}` +
+            (integrity.rowIndex !== undefined
+              ? ` at row ${integrity.rowIndex}`
+              : "") +
+            "). This ledger has been TAMPERED with and is NOT trustworthy; " +
+            "refusing to display it as valid.\n",
+        );
+        return 1;
+      }
+    }
+
     const entries = listLicenses(ledger);
     if (asJson) {
       write(out, JSON.stringify(entries, null, 2) + "\n");
@@ -463,7 +505,14 @@ async function runRevoke(
     }
     let next;
     try {
-      next = revokeLicense(ledger, licenseId, Math.floor(Date.now() / 1000), reason, issuer.sign);
+      next = revokeLicense(
+        ledger,
+        licenseId,
+        Math.floor(Date.now() / 1000),
+        reason,
+        issuer.sign,
+        issuer.issuerPublicKey,
+      );
     } catch (e) {
       write(err, `revoke: ${(e as Error).message}\n`);
       return 1;

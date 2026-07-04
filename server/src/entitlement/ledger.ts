@@ -5,21 +5,34 @@
  * One row per issued license: the full signed v2 token (claims + signature)
  * plus mutable issuance metadata (revocation status). The license TERMS are
  * already Ed25519-signed by the issuer, so a row's terms cannot be forged
- * without the issuer key. This module protects the MUTABLE metadata too:
+ * without the issuer key. This module makes that tamper-EVIDENT end to end:
  *
  *  1. Append-only hash chain  -  each row commits to the prior row's `rowHash`
  *     (genesis for the first). Reordering, splicing, or dropping a row breaks
  *     the chain, so the ORDER and COMPLETENESS of the log are tamper-evident.
  *     Reuses the audit-chain `sha256Hex` + canonical-JSON hashing primitive
  *     (the same shape as `computeAuditEntryHash`) rather than inventing one.
- *  2. Per-row revocation signature  -  the revocation status `(licenseId ||
+ *  2. Per-row LICENSE TOKEN signature  -  `verifyLedgerIntegrity` re-verifies
+ *     each row's v2 token signature against the pinned issuer key. Because that
+ *     signature covers every claim field, editing a claim (entitledCount,
+ *     featureFlags, tier, ...) and repairing the (public, unkeyed) rowHash + the
+ *     chain STILL fails here: the stale token signature no longer verifies. The
+ *     pinned key's fingerprint must also equal the row's signed `claims.issuer`.
+ *  3. Per-row revocation signature  -  the revocation status `(licenseId ||
  *     revoked || revokedAt)` is Ed25519-signed by the issuer, so a
  *     revoked→active flip (or vice versa) on disk cannot pass verification
  *     without the issuer key.
+ *  4. Signed HEAD ANCHOR  -  the issuer signs `(rowCount, finalRowHash)` (see
+ *     {@link LEDGER_HEAD_DOMAIN}), re-signed on every mutation. Truncating
+ *     trailing rows, reordering, or substituting a shorter/rewritten chain
+ *     changes the head, so the stored signature no longer verifies. This closes
+ *     the "drop the newest row leaves a still-valid shorter chain" gap that a
+ *     bare hash chain (no external anchor) cannot detect on its own.
  *
- * FAIL-CLOSED: `verifyLedgerIntegrity` returns `tampered` on ANY chain break or
- * bad row/revocation signature; a ledger that fails its integrity check is
- * reported as tampered and MUST NOT be silently trusted.
+ * FAIL-CLOSED: `verifyLedgerIntegrity` returns `tampered` on the FIRST chain
+ * break, bad token/revocation signature, or bad/absent head anchor; a ledger
+ * that fails its integrity check is reported as tampered and MUST NOT be
+ * silently trusted.
  *
  * SCOPE BOUND (do not exceed in this module): `revokeLicense` is LOCAL ledger
  * bookkeeping only  -  it marks the row revoked in this issuer-local record. The
@@ -34,7 +47,7 @@
 
 import { sha256Hex, canonicalJson } from "../audit/chain.js";
 import { toBase64url } from "../core/encoding.js";
-import { verify } from "../core/identity.js";
+import { verify, generateIdentityId } from "../core/identity.js";
 import { fromBase64urlStrict } from "../core/encoding.js";
 import {
   ENTITLEMENT_TOKEN_VERSION_V2,
@@ -64,6 +77,16 @@ export const LEDGER_GENESIS = "GENESIS";
  * signature or vice versa.
  */
 export const LEDGER_REVOCATION_DOMAIN = "sanctuary.fleet.ledger.revocation.v1";
+
+/**
+ * Domain separator for the signed ledger HEAD ANCHOR (mirrors the #805 /
+ * guardian anti-rollback pattern). The issuer signs a canonical head over the
+ * final row hash + the row count, so truncation, row-drop, reordering, or
+ * whole-ledger substitution to a shorter/rewritten chain is detected: the
+ * recomputed head no longer matches the signed one. Distinct domain so a head
+ * signature can never be replayed as a token or revocation signature.
+ */
+export const LEDGER_HEAD_DOMAIN = "sanctuary.fleet.ledger.head.v1";
 
 /**
  * Signs a message with the issuer key. Injected (never a raw secret key passed
@@ -109,6 +132,24 @@ export interface LedgerRow {
 export interface Ledger {
   schemaVersion: typeof LEDGER_SCHEMA_VERSION;
   rows: LedgerRow[];
+  /**
+   * The raw issuer Ed25519 public key (base64url, 32 bytes) this ledger is
+   * anchored to. Present on any ledger that has ever been mutated by an issuer.
+   * It is NOT a secret (public key only, NEVER #6). It is a self-verification
+   * anchor, not an unchecked root of trust: `verifyLedgerIntegrity` cross-checks
+   * that its fingerprint (`generateIdentityId`) equals each row's signed
+   * `claims.issuer`, so an attacker cannot swap in their own key without
+   * breaking the token signature that covers `claims.issuer`.
+   */
+  issuerPublicKey?: string;
+  /**
+   * base64url Ed25519 signature over the canonical ledger head (see
+   * {@link headMessage}). Present on any non-empty issuer-signed ledger; absent
+   * on a fresh/empty ledger (nothing to anchor). Anchors the row count + final
+   * row hash so truncation/reorder/substitution to a shorter or rewritten chain
+   * is detected.
+   */
+  headSignature?: string;
 }
 
 /** A fresh empty ledger. */
@@ -153,6 +194,46 @@ function computeRowHash(input: {
       revocationSignature: input.revocationSignature,
     }),
   );
+}
+
+/**
+ * The canonical byte string the issuer signs for the ledger HEAD ANCHOR. Domain
+ * separated + canonical-JSON of exactly `(rowCount, finalRowHash)`. `finalRowHash`
+ * is the last row's `rowHash`, or {@link LEDGER_GENESIS} for a zero-row head.
+ * Because the row count is signed, dropping/adding rows (truncation, splicing a
+ * shorter chain) changes this message and the stored `headSignature` no longer
+ * verifies. Because the final row hash chains back to genesis, rewriting any row
+ * also changes it.
+ */
+function headMessage(rowCount: number, finalRowHash: string): Uint8Array {
+  const body = canonicalJson({ rowCount, finalRowHash });
+  return new TextEncoder().encode(`${LEDGER_HEAD_DOMAIN}\n${body}`);
+}
+
+/** The final row's hash (chain tip), or GENESIS for an empty ledger. */
+function finalRowHash(rows: readonly LedgerRow[]): string {
+  return rows.length === 0 ? LEDGER_GENESIS : rows[rows.length - 1]!.rowHash;
+}
+
+/**
+ * Re-sign the ledger HEAD ANCHOR over the current `(rowCount, finalRowHash)` and
+ * return a NEW ledger carrying the fresh `headSignature` and the pinned
+ * `issuerPublicKey`. Called after every mutation (append/revoke) so the anchor
+ * always matches the current chain tip + length. PURE: does not mutate `ledger`.
+ * `sign` is the injected issuer signer (the pure core never holds a raw secret
+ * key); `issuerPublicKey` is the matching public key stored as the anchor.
+ */
+function signLedgerHead(
+  ledger: Ledger,
+  sign: IssuerSigner,
+  issuerPublicKey: Uint8Array,
+): Ledger {
+  const message = headMessage(ledger.rows.length, finalRowHash(ledger.rows));
+  return {
+    ...ledger,
+    issuerPublicKey: toBase64url(issuerPublicKey),
+    headSignature: toBase64url(sign(message)),
+  };
 }
 
 /** Parameters for issuing a license (the signed claim fields, issuer-supplied). */
@@ -237,13 +318,21 @@ function canonicalizeForToken(flags: string[]): string[] {
 }
 
 /**
- * Append a freshly-issued row to the ledger, linking it into the hash chain.
- * PURE: returns a NEW ledger (does not mutate the input). Rejects a duplicate
+ * Append a freshly-issued row to the ledger, linking it into the hash chain and
+ * re-signing the HEAD ANCHOR over the new `(rowCount, finalRowHash)`. PURE:
+ * returns a NEW ledger (does not mutate the input). Rejects a duplicate
  * licenseId (a re-issue of the same id would make the ledger ambiguous).
+ *
+ * `sign` is the injected issuer signer and `issuerPublicKey` its matching public
+ * key (stored as the ledger's self-verification anchor). Re-signing the head on
+ * every append is what makes truncation of the newest row(s) detectable: the
+ * signed row count no longer matches the on-disk count.
  */
 export function appendRow(
   ledger: Ledger,
   row: Omit<LedgerRow, "prevHash" | "rowHash">,
+  sign: IssuerSigner,
+  issuerPublicKey: Uint8Array,
 ): Ledger {
   const licenseId = row.token.claims.licenseId;
   if (typeof licenseId !== "string" || licenseId.length === 0) {
@@ -252,10 +341,7 @@ export function appendRow(
   if (ledger.rows.some((r) => r.token.claims.licenseId === licenseId)) {
     throw new Error(`appendRow: duplicate licenseId ${licenseId}`);
   }
-  const prevHash =
-    ledger.rows.length === 0
-      ? LEDGER_GENESIS
-      : ledger.rows[ledger.rows.length - 1]!.rowHash;
+  const prevHash = finalRowHash(ledger.rows);
   const full: LedgerRow = {
     token: row.token,
     metadata: row.metadata,
@@ -268,7 +354,8 @@ export function appendRow(
       revocationSignature: row.revocationSignature,
     }),
   };
-  return { ...ledger, rows: [...ledger.rows, full] };
+  const appended: Ledger = { ...ledger, rows: [...ledger.rows, full] };
+  return signLedgerHead(appended, sign, issuerPublicKey);
 }
 
 /** A read-only view of a ledger row for listing (no secret material exists here). */
@@ -315,11 +402,13 @@ export function listLicenses(ledger: Ledger): LicenseListEntry[] {
 /**
  * Mark a license revoked in the ledger. PURE: returns a NEW ledger.
  *
- * This re-signs the row's revocation status (so the flip is tamper-evident) and
+ * This re-signs the row's revocation status (so the flip is tamper-evident),
  * re-derives EVERY subsequent row's hash chain from the mutated row forward (the
- * chain commits to metadata, so a metadata change must re-link the tail).
- * Throws if `licenseId` is unknown (fail-closed: the CLI maps this to a non-zero
- * exit) or already revoked.
+ * chain commits to metadata, so a metadata change must re-link the tail), and
+ * re-signs the HEAD ANCHOR over the new chain tip. Throws if `licenseId` is
+ * unknown (fail-closed: the CLI maps this to a non-zero exit) or already revoked.
+ *
+ * `issuerPublicKey` is the matching public key stored as the ledger's anchor.
  *
  * SCOPE: local bookkeeping ONLY. The distributed signed revocation list pushed
  * to fleets is PR-3; this does not build that push rail.
@@ -330,6 +419,7 @@ export function revokeLicense(
   now: number,
   reason: string | null,
   sign: IssuerSigner,
+  issuerPublicKey: Uint8Array,
 ): Ledger {
   const idx = ledger.rows.findIndex(
     (r) => r.token.claims.licenseId === licenseId,
@@ -370,7 +460,7 @@ export function revokeLicense(
     rows[i] = { ...r, metadata, revocationSignature, prevHash, rowHash };
     prevHash = rowHash;
   }
-  return { ...ledger, rows };
+  return signLedgerHead({ ...ledger, rows }, sign, issuerPublicKey);
 }
 
 /** The outcome of a ledger integrity check. */
@@ -380,19 +470,28 @@ export type LedgerIntegrity =
 
 /**
  * Verify the ledger is intact and untampered. FAIL-CLOSED: returns
- * `{ ok:false, tampered:true }` on the FIRST anomaly.
+ * `{ ok:false, tampered:true }` on the FIRST anomaly; a ledger that fails ANY
+ * check is reported tampered and MUST NOT be silently trusted.
  *
  * Checks, per row in order:
  *  1. the hash chain links correctly (prevHash matches the prior rowHash, or
- *     GENESIS for row 0) and the stored rowHash equals the recomputed hash  - 
+ *     GENESIS for row 0) and the stored rowHash equals the recomputed hash  -
  *     catches reordering, splicing, dropped rows, and any content edit;
- *  2. the per-row revocation signature verifies against `issuerPublicKey` over
+ *  2. the LICENSE TOKEN signature verifies against `issuerPublicKey` over the
+ *     v2 signing message rebuilt from the stored claims  -  catches a claim edit
+ *     (e.g. raising entitledCount or adding a featureFlag) even when the attacker
+ *     also repairs the rowHash + hash chain, because the token signature covers
+ *     every claim field and cannot be re-forged without the issuer key. The
+ *     pinned `issuerPublicKey`'s fingerprint must also equal the row's signed
+ *     `claims.issuer`, so a swapped anchor key is rejected;
+ *  3. the per-row revocation signature verifies against `issuerPublicKey` over
  *     `(licenseId, revoked, revokedAt)`  -  catches a revoked-bit flip on disk.
  *
- * It does NOT re-verify the license token signature here (that is the token
- * layer's job via `resolveEntitlement`); a caller wanting full assurance
- * resolves each token too. `issuerPublicKey` pins the single issuer this ledger
- * was signed by.
+ * Then, if the ledger has any rows, the signed HEAD ANCHOR is verified: the
+ * issuer's `headSignature` over `(rowCount, finalRowHash)` must be present and
+ * validate  -  catches truncation of trailing rows, whole-ledger substitution to
+ * a shorter chain, and reorder/drop that a per-row chain alone might tolerate at
+ * the tail. `issuerPublicKey` pins the single issuer this ledger was signed by.
  */
 export function verifyLedgerIntegrity(
   ledger: Ledger,
@@ -405,6 +504,13 @@ export function verifyLedgerIntegrity(
   ) {
     return { ok: false, tampered: true, reason: "malformed ledger" };
   }
+  // The fingerprint of the pinned key, cross-checked against each row's signed
+  // `claims.issuer`. Computing it once here binds the anchor to the signed
+  // claims: an attacker who swaps in their own public key gets a different
+  // fingerprint, which no longer matches the `claims.issuer` the (still
+  // issuer-signed) token covers  -  so either this check or the token-signature
+  // check fails.
+  const pinnedFingerprint = generateIdentityId(issuerPublicKey);
   let expectedPrev = LEDGER_GENESIS;
   for (let i = 0; i < ledger.rows.length; i++) {
     const r = ledger.rows[i]!;
@@ -427,6 +533,54 @@ export function verifyLedgerIntegrity(
         ok: false,
         tampered: true,
         reason: "row hash mismatch (content edited)",
+        rowIndex: i,
+      };
+    }
+    // The pinned key must be the issuer this row's claims name. (Defense in
+    // depth: also enforced by the token-signature check below, since
+    // `claims.issuer` is a signed field.)
+    if (r.token.claims.issuer !== pinnedFingerprint) {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "row issuer does not match pinned issuer key",
+        rowIndex: i,
+      };
+    }
+    // License TOKEN signature: rebuild the v2 signing message from the STORED
+    // claims and verify it against the pinned issuer key. This is what closes
+    // claim-tampering: editing entitledCount/featureFlags/tier and repairing the
+    // rowHash + chain leaves the token signature (over the ORIGINAL claims)
+    // stale, so it no longer verifies here.
+    let tokenSig: Uint8Array;
+    try {
+      tokenSig = fromBase64urlStrict(r.token.signature);
+    } catch {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "token signature not canonical base64url",
+        rowIndex: i,
+      };
+    }
+    let tokenMessage: Uint8Array;
+    try {
+      tokenMessage = buildEntitlementMessageV2(r.token.claims);
+    } catch {
+      // Malformed claims (e.g. bad featureFlags) cannot yield a signable
+      // message; treat as tampered rather than trusting the row.
+      return {
+        ok: false,
+        tampered: true,
+        reason: "token claims malformed (unsignable)",
+        rowIndex: i,
+      };
+    }
+    if (!verify(tokenMessage, tokenSig, issuerPublicKey)) {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "token signature invalid (claims edited)",
         rowIndex: i,
       };
     }
@@ -457,6 +611,43 @@ export function verifyLedgerIntegrity(
       };
     }
     expectedPrev = r.rowHash;
+  }
+
+  // HEAD ANCHOR: a non-empty ledger MUST carry a valid signed head over its
+  // current row count + chain tip. This is the anti-rollback / anti-truncation
+  // guarantee: dropping trailing rows or substituting a shorter (even fully
+  // self-consistent) chain changes `(rowCount, finalRowHash)`, so the stored
+  // signature no longer verifies. An empty ledger has no head to anchor (the
+  // well-defined genesis floor).
+  if (ledger.rows.length > 0) {
+    if (
+      typeof ledger.headSignature !== "string" ||
+      ledger.headSignature.length === 0
+    ) {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "missing signed head anchor (truncated or unsigned ledger)",
+      };
+    }
+    let headSig: Uint8Array;
+    try {
+      headSig = fromBase64urlStrict(ledger.headSignature);
+    } catch {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "head signature not canonical base64url",
+      };
+    }
+    const headMsg = headMessage(ledger.rows.length, finalRowHash(ledger.rows));
+    if (!verify(headMsg, headSig, issuerPublicKey)) {
+      return {
+        ok: false,
+        tampered: true,
+        reason: "head anchor invalid (truncated/reordered/substituted chain)",
+      };
+    }
   }
   return { ok: true };
 }
